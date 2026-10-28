@@ -12,6 +12,7 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -41,6 +42,7 @@ use super::compatibility_rustc::CAPTURE_ENV;
 use super::compatibility_rustc::CAPTURE_SCHEMA;
 use super::compatibility_rustc::Captured;
 use super::compatibility_rustc::Compiler;
+use super::compatibility_rustc::CompilerInput;
 use super::compatibility_rustc::Completion;
 use super::compatibility_rustc::FileIdentity;
 use super::compatibility_rustc::GATE_ENV;
@@ -97,6 +99,169 @@ fn read(path: &Path, limit: usize) -> Result<Vec<u8>> {
         path.display()
     );
     Ok(bytes)
+}
+
+fn source_file(argv: &[Vec<u8>], cwd: &Path, argument: usize) -> Result<CompilerInput> {
+    let name = Path::new(std::ffi::OsStr::from_bytes(&argv[argument]));
+    let path = if name.is_absolute() {
+        name.to_owned()
+    } else {
+        cwd.join(name)
+    };
+    let canonical = path.canonicalize()?;
+    let mut file = File::open(&path)?;
+    let before = identity(&file)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take((MAX_COMMAND_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_COMMAND_BYTES,
+        "compiler source exceeds its finite capture bound"
+    );
+    ensure!(
+        identity(&file)? == before
+            && identity(&File::open(&path)?)? == before
+            && path.canonicalize()? == canonical,
+        "compiler source changed while captured"
+    );
+    Ok(CompilerInput::File {
+        argument,
+        path: path.as_os_str().as_bytes().to_vec(),
+        canonical_path: canonical.as_os_str().as_bytes().to_vec(),
+        identity: before,
+        sha256: digest(&bytes),
+        bytes,
+    })
+}
+
+/// Read only rustc's declared `-` input. Polling bounds a stalled producer;
+/// no flags on the inherited open-file description are changed.
+fn compiler_stdin() -> Result<Vec<u8>> {
+    let start = Instant::now();
+    let mut bytes = Vec::new();
+    loop {
+        ensure!(
+            start.elapsed() < Duration::from_secs(10),
+            "compiler stdin capture exceeded10seconds"
+        );
+        let mut poll = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll, 1, 50) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if ready == 0 {
+            continue;
+        }
+        ensure!(
+            poll.revents & libc::POLLNVAL == 0,
+            "compiler stdin is invalid"
+        );
+        let mut buffer = [0u8; 4096];
+        let count =
+            unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if count == 0 {
+            return Ok(bytes);
+        }
+        ensure!(
+            bytes.len() + count as usize <= MAX_COMMAND_BYTES,
+            "compiler stdin exceeds its finite capture bound"
+        );
+        bytes.extend_from_slice(&buffer[..count as usize]);
+    }
+}
+
+const INPUT_SEALS: i32 =
+    libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+
+fn sealed_stdin(bytes: &[u8]) -> Result<File> {
+    let fd = unsafe {
+        libc::memfd_create(
+            c"hermit-rustc-input".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    ensure!(fd >= 0, "cannot create compiler stdin replay descriptor");
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(bytes)?;
+    ensure!(
+        unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, INPUT_SEALS) } == 0
+            && unsafe { libc::fcntl(fd, libc::F_GET_SEALS) } == INPUT_SEALS,
+        "cannot seal exact compiler stdin replay"
+    );
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
+}
+
+fn source_input(argv: &[Vec<u8>], cwd: &Path) -> Result<(Option<CompilerInput>, Option<File>)> {
+    let candidates: Vec<_> = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| {
+            arg.as_slice() == b"-" || (!arg.starts_with(b"-") && arg.ends_with(b".rs"))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    ensure!(
+        candidates.len() <= 1,
+        "compiler input is ambiguous in actual argv"
+    );
+    let Some(&argument) = candidates.first() else {
+        return Ok((None, None));
+    };
+    if argv[argument] == b"-" {
+        let bytes = compiler_stdin()?;
+        let file = sealed_stdin(&bytes)?;
+        return Ok((
+            Some(CompilerInput::Stdin {
+                argument,
+                sha256: digest(&bytes),
+                bytes,
+            }),
+            Some(file),
+        ));
+    }
+    Ok((Some(source_file(argv, cwd, argument)?), None))
+}
+
+fn source_unchanged(command: &Invocation, replay: &mut Option<File>) -> Result<bool> {
+    match &command.source {
+        Some(input @ CompilerInput::File { argument, .. }) => Ok(source_file(
+            &command.argv,
+            Path::new(std::ffi::OsStr::from_bytes(&command.cwd)),
+            *argument,
+        )? == *input),
+        Some(CompilerInput::Stdin { bytes, .. }) => {
+            let file = replay
+                .as_mut()
+                .context("sealed compiler stdin descriptor is absent")?;
+            ensure!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) } == INPUT_SEALS,
+                "compiler stdin replay seals changed"
+            );
+            file.seek(SeekFrom::Start(0))?;
+            let mut actual = Vec::new();
+            file.take((MAX_COMMAND_BYTES + 1) as u64)
+                .read_to_end(&mut actual)?;
+            Ok(actual == *bytes)
+        }
+        None => Ok(replay.is_none()),
+    }
 }
 
 fn exclusive(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -362,7 +527,7 @@ fn response_files(argv: &[Vec<u8>], cwd: &Path) -> Result<Vec<ResponseFile>> {
     Ok(result)
 }
 
-fn gate(command: &Invocation, config: &Config) -> Result<()> {
+fn gate(command: &Invocation, config: &Config, completion: Option<&Completion>) -> Result<()> {
     let Some(input) = std::env::var_os(GATE_ENV) else {
         return Ok(());
     };
@@ -379,8 +544,9 @@ fn gate(command: &Invocation, config: &Config) -> Result<()> {
         target_directory: config.target_directory.clone(),
         commands: Vec::new(),
     };
-    if let Some(semantics) = compatibility_rustc::for_invocation(&graph, &current, command)
-        .map_err(anyhow::Error::msg)?
+    if let Some(semantics) =
+        compatibility_rustc::for_invocation_with_reference(&graph, &current, &expected, command)
+            .map_err(anyhow::Error::msg)?
     {
         let expected =
             compatibility_rustc::shared(&graph, &expected).map_err(anyhow::Error::msg)?;
@@ -389,10 +555,38 @@ fn gate(command: &Invocation, config: &Config) -> Result<()> {
             "final actual rustc shared-unit semantics differ before compiler execution"
         );
     }
+    if let Some(actual) =
+        compatibility_rustc::auxiliary_for_invocation(&graph, &current, &expected, command)
+            .map_err(anyhow::Error::msg)?
+    {
+        let known =
+            compatibility_rustc::auxiliary(&graph, &expected).map_err(anyhow::Error::msg)?;
+        let mut matched = false;
+        for key in known.keys() {
+            let (expected, exit_code, signal): (
+                compatibility_rustc::Auxiliary,
+                Option<i32>,
+                Option<i32>,
+            ) = serde_json::from_str(key)?;
+            if expected == actual
+                && completion.is_none_or(|end| end.exit_code == exit_code && end.signal == signal)
+            {
+                matched = true;
+            }
+        }
+        ensure!(
+            matched,
+            "final auxiliary compiler inputs/options/outcome differ from the actual cold populations"
+        );
+    }
     Ok(())
 }
 
-fn invocation(config: &Config, compiler_path: &Path, args: &[OsString]) -> Result<Invocation> {
+fn invocation(
+    config: &Config,
+    compiler_path: &Path,
+    args: &[OsString],
+) -> Result<(Invocation, Option<File>)> {
     let cwd = std::env::current_dir()?;
     let argv: Vec<_> = args
         .iter()
@@ -404,6 +598,7 @@ fn invocation(config: &Config, compiler_path: &Path, args: &[OsString]) -> Resul
         manifest_directory: std::env::var_os("CARGO_MANIFEST_DIR")
             .map(|path| path.as_os_str().as_bytes().to_vec()),
     };
+    let (source, replay) = source_input(&argv, &cwd)?;
     let command = Invocation {
         schema: CAPTURE_SCHEMA.to_owned(),
         pid: std::process::id(),
@@ -412,9 +607,18 @@ fn invocation(config: &Config, compiler_path: &Path, args: &[OsString]) -> Resul
         response_files: response_files(&argv, &cwd)?,
         argv,
         context,
+        source,
     };
-    gate(&command, config)?;
-    Ok(command)
+    if let Some(source) = &command.source {
+        source.validate(&command).map_err(anyhow::Error::msg)?;
+    } else {
+        ensure!(
+            compatibility_rustc::compiler_probe(&command),
+            "emitting compiler has no captured source"
+        );
+    }
+    gate(&command, config, None)?;
+    Ok((command, replay))
 }
 
 fn run(config_path: &Path) -> Result<ExitCode> {
@@ -424,7 +628,7 @@ fn run(config_path: &Path) -> Result<ExitCode> {
         .next()
         .context("RUSTC_WRAPPER did not receive the actual compiler")?;
     let arguments: Vec<_> = arguments.collect();
-    let command = invocation(&config, Path::new(&compiler), &arguments)?;
+    let (command, mut replay) = invocation(&config, Path::new(&compiler), &arguments)?;
     let encoded = serde_json::to_vec(&command)?;
     ensure!(
         encoded.len() <= MAX_COMMAND_BYTES,
@@ -436,12 +640,18 @@ fn run(config_path: &Path) -> Result<ExitCode> {
         &config.directory.join(format!("{name}.invocation.json")),
         &encoded,
     )?;
-    // No argv/env rewrite, selected toolchain change, second compiler group or
-    // stdio capture is inserted into the actual compilation itself.
-    let status = Command::new(&compiler).args(&arguments).status();
+    // Only a declared rustc stdin input is replayed from the exact sealed
+    // bytes above; argv/environment and the inherited stdout/stderr remain.
+    let mut actual = Command::new(&compiler);
+    actual.args(&arguments);
+    if let Some(file) = &replay {
+        actual.stdin(Stdio::from(file.try_clone()?));
+    }
+    let status = actual.status();
     let unchanged = (|| -> Result<bool> {
         Ok(
             response_files(&command.argv, &std::env::current_dir()?)? == command.response_files
+                && source_unchanged(&command, &mut replay)?
                 && self::compiler(Path::new(&compiler))? == command.compiler,
         )
     })();
@@ -456,7 +666,7 @@ fn run(config_path: &Path) -> Result<ExitCode> {
     let inputs_unchanged = match unchanged {
         Ok(unchanged) => unchanged,
         Err(error) => {
-            capture_error = Some(format!("response-file recapture failed: {error:#}"));
+            capture_error = Some(format!("compiler input recapture failed: {error:#}"));
             false
         }
     };
@@ -482,6 +692,7 @@ fn run(config_path: &Path) -> Result<ExitCode> {
         completion.inputs_unchanged && completion.capture_error.is_none(),
         "actual compiler input/capture changed"
     );
+    gate(&command, &config, Some(&completion))?;
     let status = status.context("actual compiler was not started")?;
     if let Some(signal) = status.signal() {
         // Preserve WIFSIGNALED after retaining the actual status. This is the
@@ -582,4 +793,34 @@ pub fn bundle(config_path: &Path) -> Result<Bundle> {
         target_directory: config.target_directory,
         commands,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiler_stdin_replay_is_exact_and_sealed() {
+        let expected = b"// compiler input\nfn main() {}\0\xff";
+        let mut replay = sealed_stdin(expected).expect("seal actual compiler input");
+        let mut actual = Vec::new();
+        replay.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            unsafe { libc::fcntl(replay.as_raw_fd(), libc::F_GET_SEALS) },
+            INPUT_SEALS
+        );
+        assert_eq!(
+            replay.write(b"changed").unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            replay.set_len(0).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        replay.seek(SeekFrom::Start(0)).unwrap();
+        let mut second = Vec::new();
+        replay.read_to_end(&mut second).unwrap();
+        assert_eq!(second, expected);
+    }
 }
