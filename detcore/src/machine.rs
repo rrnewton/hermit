@@ -176,7 +176,7 @@ pub struct KernelLimits {
     /// which says that no asynchronous I/O context can be set up.)
     pub aio_max_nr: u64,
     /// `fs/pipe-max-size`: the capacity Detcore pins every pipe at
-    /// (`DETERMINISTIC_PIPE_CAPACITY_BYTES`), which is also the most that
+    /// (`deterministic_pipe_capacity_bytes`, two pages), which is also the most that
     /// `F_SETPIPE_SZ` allows.
     pub pipe_max_size: u32,
 }
@@ -194,7 +194,7 @@ impl Default for KernelLimits {
             mmap_min_addr: 65536,
             file_max: i64::MAX as u64,
             aio_max_nr: 65536,
-            pipe_max_size: crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES as u32,
+            pipe_max_size: crate::syscalls::deterministic_pipe_capacity_bytes() as u32,
         }
     }
 }
