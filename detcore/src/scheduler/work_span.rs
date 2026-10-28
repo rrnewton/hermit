@@ -1036,7 +1036,7 @@ impl Scheduler {
     /// exit of its process's last live thread.
     fn work_span_ending_process(&self, tid: DetTid, group: bool) -> Option<DetPid> {
         let process = self.registered_process(tid)?;
-        let last = group || !self.live_thread_group(&process).any(|other| other != tid);
+        let last = group || !self.live_process_threads(process).any(|other| other != tid);
         last.then_some(process)
     }
 

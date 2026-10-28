@@ -241,12 +241,7 @@ impl Scheduler {
             .iter()
             .copied()
             .filter(|process| self.thread_tree.process_group(*process) == Some(pgid))
-            .filter(|process| {
-                self.thread_tree
-                    .my_thread_group(process)
-                    .into_iter()
-                    .any(|tid| self.next_turns.contains_key(&tid))
-            })
+            .filter(|process| self.live_process_threads(*process).next().is_some())
             .collect();
         members.sort();
         self.reserve_sigkill_processes(sender, &members, uid)
@@ -283,12 +278,7 @@ impl Scheduler {
             }
             let own = self.registered_process(sender) == Some(*target);
             includes_sender |= own;
-            let mut threads: Vec<DetTid> = self
-                .thread_tree
-                .my_thread_group(target)
-                .into_iter()
-                .filter(|tid| self.next_turns.contains_key(tid))
-                .collect();
+            let mut threads: Vec<DetTid> = self.live_process_threads(*target).collect();
             if threads.is_empty() {
                 return Err(SigkillRefusal::NoTarget);
             }
