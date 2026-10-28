@@ -3088,15 +3088,15 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the
 # a13d0205 entry.
-# CARRY TO ce9afbd47b0aa3d247844ac3d3e853ebc082a088 (2026-10-27): from
+# CARRY TO d1d44c562e28f4c435b75a42b772e3307734c61e (2026-10-27): from
 # ab248a36f83edbcb6b8705dad38b094bd61f1c74. Three commits whose net tree change is
 # empty: 72e73f10 and 882c91c0 (in-guest runtime descriptors invisible to
 # the guest, pinned by Hermit 330a8b84) and ce9afbd4, their revert, whose
 # tree equals ab248a36. git diff is empty for the whole repository, so the
 # inventory (1015), SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the ab248a36 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ce9afbd47b0aa3d247844ac3d3e853ebc082a088 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ce9afbd47b0aa3d247844ac3d3e853ebc082a088 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d1d44c562e28f4c435b75a42b772e3307734c61e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d1d44c562e28f4c435b75a42b772e3307734c61e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
