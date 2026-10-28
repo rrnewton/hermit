@@ -452,9 +452,9 @@ pub(crate) fn read_guest_exact<M: MemoryAccess>(
 ///
 /// Two pages is attainable and independent of host load on Linux 5.14 and later (whose quota
 /// fallback is two pages, not one) when `pipe-max-size` is at least two pages (the default is
-/// 1 MiB; a host that hardens it to one 64 KiB page caps new pipes at one page). Otherwise the
-/// creation pin fails closed (`pipe_capacity_failure`), and a pipe Hermit did not create is
-/// refused when it reads below two pages (`pipe_capacity_floor_is_two_pages`).
+/// 1 MiB). A host that hardens it to one 64 KiB page gives a new pipe one page, or two under the
+/// quota, so there every pipe creation and capacity read is refused
+/// (`host_pipe_floor_is_two_pages`).
 ///
 /// This is also the ceiling the guest is allowed to raise a pipe to, and the
 /// value `/proc/sys/fs/pipe-max-size` reports. Those three must be ONE value:
@@ -512,17 +512,28 @@ pub(crate) fn reported_pipe_capacity(host: i64) -> i64 {
     host.min(i64::from(deterministic_pipe_capacity_bytes()))
 }
 
-/// Whether a pipe the host reports `host` bytes for has that capacity
-/// whatever the host's load, given the host's `pipe-max-size`
-/// (`host_pipe_max_size`, `None` when unreadable). At or above the ceiling it
-/// reads as the ceiling either way. Below it, it is a capacity its creator
-/// chose only when no pipe is created below two pages: Linux caps a new pipe
-/// at `pipe-max-size` and, under `pipe-user-pages-soft`, gives it two pages
-/// instead (fs/pipe.c `alloc_pipe_info`), so with a `pipe-max-size` below two
-/// pages host load decides between one page and two.
-pub(crate) fn pipe_capacity_floor_is_two_pages(host: i64, host_pipe_max_size: Option<i64>) -> bool {
-    let ceiling = i64::from(deterministic_pipe_capacity_bytes());
-    host >= ceiling || host_pipe_max_size.is_some_and(|max| max >= ceiling)
+/// Whether two pages is the capacity no host load can change on this host,
+/// given its `pipe-max-size` (`host_pipe_max_size`, `None` when unreadable).
+/// Linux caps a new unprivileged pipe at `pipe-max-size` and, under
+/// `pipe-user-pages-soft`, gives it two pages instead (fs/pipe.c
+/// `alloc_pipe_info`). With a `pipe-max-size` below two pages, host load
+/// therefore decides between one page and two, whatever capacity a given pipe
+/// shows, so the answer depends on the setting alone, never on an observed
+/// capacity.
+pub(crate) fn host_pipe_floor_is_two_pages(host_pipe_max_size: Option<i64>) -> bool {
+    host_pipe_max_size.is_some_and(|max| max >= i64::from(deterministic_pipe_capacity_bytes()))
+}
+
+/// Ends the run because this host's `pipe-max-size` is below two pages
+/// ([`host_pipe_floor_is_two_pages`]), for `what`.
+fn below_two_page_pipe_floor(what: &str) -> String {
+    format!(
+        "[detcore] {what}: this host's pipe-max-size ({:?}) is below two pages ({} bytes), so host \
+         load decides whether a pipe has one page or two. Determinism is unavailable for this \
+         run.",
+        host_pipe_max_size(),
+        deterministic_pipe_capacity_bytes(),
+    )
 }
 
 /// The host's `/proc/sys/fs/pipe-max-size`, read once.
@@ -10916,16 +10927,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the ceiling it may raise a pipe to.
             F_GETPIPE_SZ => {
                 let host = self.record_or_replay(guest, call).await?;
-                if !pipe_capacity_floor_is_two_pages(host, host_pipe_max_size()) {
+                if !host_pipe_floor_is_two_pages(host_pipe_max_size()) {
                     error!(
-                        "[detcore] fd {} is a pipe of {} bytes, below the deterministic {}, on a \
-                         host whose pipe-max-size ({:?}) is below two pages: host load decides \
-                         whether such a pipe has one page or two. Determinism is unavailable for \
-                         this run.",
-                        fd,
-                        host,
-                        deterministic_pipe_capacity_bytes(),
-                        host_pipe_max_size(),
+                        "{}",
+                        below_two_page_pipe_floor(&format!(
+                            "F_GETPIPE_SZ on fd {fd} read {host} bytes"
+                        ))
                     );
                     unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await;
                 }
@@ -12420,13 +12427,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(pipefd) = call.pipefd() {
             let fds: [i32; 2] = memory.read_value(pipefd)?;
             if internally_nonblocking {
-                let capacity_result = guest
-                    .inject(
-                        syscalls::Fcntl::new()
-                            .with_fd(fds[0])
-                            .with_cmd(F_SETPIPE_SZ(deterministic_pipe_capacity_bytes())),
-                    )
-                    .await;
+                // Where host load decides a new pipe's size, no pin is the same in every
+                // run, even one that happens to succeed (a pipe created under the quota
+                // already has two pages).
+                let capacity_result = if host_pipe_floor_is_two_pages(host_pipe_max_size()) {
+                    guest
+                        .inject(
+                            syscalls::Fcntl::new()
+                                .with_fd(fds[0])
+                                .with_cmd(F_SETPIPE_SZ(deterministic_pipe_capacity_bytes())),
+                        )
+                        .await
+                } else {
+                    error!(
+                        "{}",
+                        below_two_page_pipe_floor("a new pipe cannot be pinned")
+                    );
+                    Err(Errno::EPERM)
+                };
                 if let Some(failure) = pipe_capacity_failure(fds, capacity_result) {
                     // Release the descriptors Linux already created, THEN stop the run.
                     //
@@ -12446,7 +12464,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     //
                     // Defensive, not expected: pinning on a freshly created EMPTY pipe is a
                     // shrink or a no-op. EBUSY needs buffered data and EPERM needs to exceed
-                    // `pipe-max-size`; neither can hold here.
+                    // `pipe-max-size`; neither can hold here (below a two-page
+                    // `pipe-max-size` the pin is refused before it is tried).
                     for close in failure.close_syscalls() {
                         let _ = guest.inject(close).await;
                     }
@@ -17059,19 +17078,19 @@ mod test {
         assert_eq!(super::reported_pipe_capacity(page), page);
     }
 
-    /// A pipe below two pages is the creator's choice only where no pipe is
-    /// created below two pages; on a host whose `pipe-max-size` is one page,
-    /// host load decides between one page and two, so it is refused.
+    /// Two pages is load-independent only where `pipe-max-size` is at least
+    /// two pages. On a host whose `pipe-max-size` is one page, a new pipe has
+    /// one page below the quota and two above it, so the decision rests on the
+    /// setting alone: both allocation states are refused alike, and so is an
+    /// unreadable setting.
     #[test]
-    fn a_pipe_below_two_pages_is_trusted_only_with_a_two_page_pipe_max_size() {
+    fn two_pages_is_trusted_only_with_a_two_page_pipe_max_size() {
         let ceiling = i64::from(deterministic_pipe_capacity_bytes());
         let page = ceiling / 2;
-        assert!(super::pipe_capacity_floor_is_two_pages(ceiling, Some(page)));
-        assert!(super::pipe_capacity_floor_is_two_pages(16 * page, None));
-        assert!(super::pipe_capacity_floor_is_two_pages(page, Some(1 << 20)));
-        assert!(super::pipe_capacity_floor_is_two_pages(page, Some(ceiling)));
-        assert!(!super::pipe_capacity_floor_is_two_pages(page, Some(page)));
-        assert!(!super::pipe_capacity_floor_is_two_pages(page, None));
+        assert!(super::host_pipe_floor_is_two_pages(Some(ceiling)));
+        assert!(super::host_pipe_floor_is_two_pages(Some(1 << 20)));
+        assert!(!super::host_pipe_floor_is_two_pages(Some(page)));
+        assert!(!super::host_pipe_floor_is_two_pages(None));
     }
 
     /// Shrinking stays legal. `tests/c/pipe_capacity.c`
