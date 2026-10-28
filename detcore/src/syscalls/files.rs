@@ -5292,32 +5292,42 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 if let (true, Some(stat)) = (guest.config().record_host_inputs, &host_stat) {
                     let identity = detcore_model::host_input::HostFileIdentity::from_stat(stat);
-                    // Where the tool can open the guest's descriptor: whether
-                    // it reached a kernel object whatever path the guest
-                    // spelled, and otherwise, for a regular file, its bytes,
-                    // which the guest sees where it does not see the host's
-                    // inode or times. A kernel object is never read: its size
-                    // says nothing and a read can block.
-                    let descriptor = crate::fifo_peer::guest_descriptors_are_visible(
+                    let file_type = stat.st_mode & libc::S_IFMT;
+                    // Where the tool can name the guest's descriptor, the
+                    // kernel's path for it (a readlink, which raises no
+                    // inotify event the guest could see): whether it reached
+                    // a kernel object whatever path the guest spelled, and
+                    // otherwise, for a regular file or a directory, where the
+                    // run's end reads its bytes or names, which the guest
+                    // sees where it does not see the host's inode or times
+                    // (`crate::host_inputs::content_at_end`). Nothing is read
+                    // now, while the guest runs.
+                    let target = crate::fifo_peer::guest_descriptors_are_visible(
                         &self.cfg.backend,
                         guest.thread_state().physical_tid,
                     )
-                    .then(|| PathBuf::from(format!("/proc/{}/fd/{fd}", guest.tid().as_raw())));
-                    let kernel_object = descriptor.as_deref().is_some_and(|descriptor| {
-                        crate::util::raw_read_link(descriptor).is_ok_and(|target| {
-                            detcore_model::host_input::is_kernel_object(&target.to_string_lossy())
-                        })
+                    .then(|| {
+                        crate::util::raw_read_link(Path::new(&format!(
+                            "/proc/{}/fd/{fd}",
+                            guest.tid().as_raw()
+                        )))
+                        .ok()
+                    })
+                    .flatten();
+                    let kernel_object = target.as_deref().is_some_and(|target| {
+                        detcore_model::host_input::is_kernel_object(&target.to_string_lossy())
                     });
-                    let content = descriptor
-                        .filter(|_| !kernel_object && stat.st_mode & libc::S_IFMT == libc::S_IFREG)
-                        .and_then(|descriptor| {
-                            crate::host_inputs::content_digest(&descriptor, identity)
-                        });
+                    let source = target
+                        .filter(|_| {
+                            !kernel_object && matches!(file_type, libc::S_IFREG | libc::S_IFDIR)
+                        })
+                        .and_then(|target| target.to_str().map(str::to_owned));
                     crate::tool_global::record_host_input(
                         guest,
                         observed_path.to_string_lossy().into_owned(),
                         identity,
-                        content,
+                        source,
+                        file_type == libc::S_IFREG,
                         false,
                         kernel_object,
                     )

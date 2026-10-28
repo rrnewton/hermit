@@ -18626,6 +18626,17 @@ fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
     assert_eq!(named(&err).len(), 1, "{err}");
     assert_eq!(changed(&summary).len(), 1, "{summary}");
 
+    // Other bytes of the recorded size: named once, by the bytes, which
+    // Hermit reads when the run has ended.
+    fs::write(&replacement, "INPUT\n").unwrap();
+    fs::rename(&replacement, &input).unwrap();
+    let (out, err, summary) = run(replay(), &directory.path().join("same-size.json"));
+    assert_eq!(out, "INPUT\n");
+    let lines = named(&err);
+    assert_eq!(lines.len(), 1, "{err}");
+    assert!(lines[0].contains("size 6 mtime"), "{}", lines[0]);
+    assert_eq!(changed(&summary).len(), 1, "{summary}");
+
     // Rewritten with the recorded bytes under a new inode: not a change.
     fs::write(&replacement, "input\n").unwrap();
     fs::rename(&replacement, &input).unwrap();
@@ -18669,6 +18680,140 @@ fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
             "{summary}"
         );
     }
+}
+
+/// Recording the host files a run reads changes nothing the guest can see:
+/// a guest that watches a directory with inotify and reads one file in it
+/// sees the events of its own open, read and close, as natively, whether or
+/// not the run keeps its host-input set (`--summary-json`). Hermit reads a
+/// file's bytes for the set only after every guest process has exited; a
+/// read while the guest runs queues inotify events in the guest's watch
+/// (`fsnotify_access`, fs/read_write.c), which it reads back.
+#[test]
+fn recording_host_inputs_queues_no_inotify_event_for_the_guest() {
+    let guest = program_break_guest("inotify-read-watch", "inotify_read_watch.c", &[]);
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    fs::write(directory.path().join("F"), "input\n").unwrap();
+    let watched = directory.path().to_str().unwrap();
+    let native = Command::new(&guest)
+        .args([watched, "F"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(stdout(&native), "OPEN ACCESS CLOSE_NOWRITE\n");
+    let summary = directory.path().join("summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let guest = guest.to_str().unwrap();
+    for extra in [None, Some(summary_arg.as_str())] {
+        let mut args = vec![
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        ];
+        args.extend(extra);
+        args.extend(["--", guest, watched, "F"]);
+        let output = hermit_test::hermit_output(
+            "inotify host-input run",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), stdout(&native), "{args:?}");
+    }
+    // The run with the summary did keep the set, and read `F`'s bytes.
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+    let path = directory.path().join("F");
+    let file = summary["host_inputs"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == path.to_str().unwrap())
+        .unwrap_or_else(|| panic!("the summary does not hold F: {summary}"))
+        .clone();
+    assert_eq!(
+        file["content"], "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453",
+        "{file}"
+    );
+}
+
+/// A guest that lists, then writes into, the `/tmp` Hermit makes afresh for
+/// each run is recorded and replayed without any host input named as
+/// changed, and the two runs' digests agree. Each run's `/tmp` is a new
+/// directory, with its own inode and times, and the guest's write changes
+/// its times; the guest sees neither, only the names in it, which are the
+/// same. So a directory is compared by the names in it (leaving out those
+/// the guest made or removed itself), not by its identity: a run whose guest
+/// makes another name there read the same `/tmp` from the host.
+#[test]
+fn a_schedule_replay_of_a_guest_using_its_private_tmp_names_no_host_input() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let run = |schedule_arg: String, summary: &Path, made: &str| {
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let script = format!("ls -a /tmp; echo made > /tmp/{made}; ls -a /tmp");
+        let mut args = vec![
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            &summary_arg,
+        ];
+        if !schedule_arg.is_empty() {
+            args.push(&schedule_arg);
+        }
+        args.extend(["--", "/bin/sh", "-c", &script]);
+        let output = hermit_test::hermit_output(
+            "private /tmp schedule run",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(summary).unwrap()).unwrap();
+        (stdout(&output), stderr(&output), summary)
+    };
+    let (recorded_out, _, recorded) = run(
+        format!("--record-preemptions-to={}", schedule.display()),
+        &directory.path().join("record.json"),
+        "made",
+    );
+    assert!(recorded_out.ends_with("made\n"), "{recorded_out}");
+
+    let (out, err, replayed) = run(
+        format!("--replay-preemptions-from={}", schedule.display()),
+        &directory.path().join("replay.json"),
+        "made",
+    );
+    assert_eq!(out, recorded_out);
+    assert!(
+        !err.contains("HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING"),
+        "{err}"
+    );
+    assert_eq!(replayed.get("host_inputs_changed"), None, "{replayed}");
+    assert_eq!(
+        replayed["host_inputs"]["digest"], recorded["host_inputs"]["digest"],
+        "{replayed}"
+    );
+    // `/tmp` is in the set, compared by the names in it, which leave out
+    // the one the guest made.
+    let tmp = |summary: &serde_json::Value| {
+        summary["host_inputs"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "/tmp")
+            .unwrap_or_else(|| panic!("the set does not hold /tmp: {summary}"))
+            .clone()
+    };
+    assert!(tmp(&recorded)["content"].is_string(), "{recorded}");
+    let (out, _, other) = run(String::new(), &directory.path().join("other.json"), "other");
+    assert!(out.lines().any(|line| line == "other"), "{out}");
+    assert_eq!(
+        tmp(&other)["content"],
+        tmp(&recorded)["content"],
+        "{} {}",
+        tmp(&other),
+        tmp(&recorded)
+    );
 }
 
 /// The program interpreter (`PT_INTERP`) an ELF64 executable names, or `None`

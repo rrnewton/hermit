@@ -474,7 +474,8 @@ Advanced investigations can save preemption decisions with
 A replay reproduces the recording only if the guest reads the same host
 files. The recorded schedule therefore keeps the set of host files the run
 read (`host_inputs`: each path with its host identity and, for a regular file
-of at most 32 MiB, the SHA-256 of its bytes), and a replay (with
+of at most 32 MiB, the SHA-256 of its bytes, or for a directory, of the names
+in it), and a replay (with
 `--replay-preemptions-from` or `--replay-schedule-from`) prints one line for
 each such file that changed since:
 
@@ -487,9 +488,17 @@ for its execs: each program image and its ELF interpreter (for a `#!`
 script, the interpreter the kernel ran, not the script). A file whose bytes
 were hashed in both runs counts as changed only if its bytes differ, so a
 file rewritten unchanged, as `ldconfig` rewrites `/etc/ld.so.cache`, is not
-reported; a file that was not hashed (larger than 32 MiB, or on a backend
-whose tool cannot read the guest's descriptors) counts as changed when its
-host inode, size or modification time differs. Kernel objects (paths under
+reported; a directory counts as changed only if the names in it differ,
+leaving out the names the guest made or removed itself, so the `/tmp` Hermit
+makes afresh for each run is not reported. A file that was not hashed (larger
+than 32 MiB, changed again before the run ended, or on a backend whose tool
+cannot name the guest's descriptors) counts as changed when its host inode,
+size or modification time differs. Hermit reads the bytes and names only
+after every guest process has exited, never while the guest runs: Linux
+raises an inotify event for every open and read of a file, and a guest
+watching the file's directory would see those reads. So a regular file whose
+size changed is reported at the guest's first open of it, and any other
+change when the run ends. Kernel objects (paths under
 `/proc`, `/sys` and `/dev`, and names that lead there, such as `/etc/mtab`)
 are left out, and so are paths the guest itself renamed, linked or unlinked,
 or opened with `O_CREAT`. Under `--backend=dbt` nothing is recorded. The

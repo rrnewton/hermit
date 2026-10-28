@@ -90,8 +90,8 @@ pub struct HostInputRecord {
     pub syscall: u64,
     #[serde(flatten)]
     pub identity: HostFileIdentity,
-    /// The SHA-256 (lowercase hex) of the file's bytes at the open, where
-    /// Detcore could read them ([`HostInput::content`]).
+    /// The content of the file the open found, as [`HostInput::content`],
+    /// read when the run had ended; absent where Detcore could not read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Whether the kernel opened the file for an exec, as the new image or
@@ -137,12 +137,20 @@ pub struct HostInput {
     pub path: String,
     #[serde(flatten)]
     pub identity: HostFileIdentity,
-    /// The SHA-256 (lowercase hex) of the file's bytes at that open: present
-    /// for a regular file of at most [`HOST_INPUT_CONTENT_LIMIT`] bytes on a
-    /// backend whose tool can read the guest's descriptor. The guest sees a
-    /// host file's bytes and size, not its host inode or times (Hermit
-    /// virtualizes those), so where both runs have it, the content decides
-    /// whether the file changed ([`host_input_changed`]).
+    /// The SHA-256 (lowercase hex) of what the guest can read of the file:
+    /// a regular file's bytes, or the sorted names in a directory, without
+    /// those the guest itself made or removed there ([`guest_rebound`]).
+    /// Read when the run has ended, after every guest process exited, never
+    /// while the guest runs (Linux raises an inotify event the guest could
+    /// see for every open and read of a file), and only where the file still
+    /// has the identity that open found (a directory, the same device and
+    /// inode); present for a regular file of at most
+    /// [`HOST_INPUT_CONTENT_LIMIT`] bytes or a directory on a backend whose
+    /// tool can name the guest's descriptor. The guest sees a host file's
+    /// bytes and size, and a directory's names, not their host inodes or
+    /// times (Hermit virtualizes those, and makes some directories, such as
+    /// its private `/tmp`, afresh for each run), so where both runs have it,
+    /// the content decides whether the file changed ([`host_input_changed`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 }

@@ -20,13 +20,24 @@
 //! the log stays empty while any guest runs; a run that does not end normally
 //! writes nothing, which leaves its divergence unexplained rather than
 //! explained by partial evidence.
+//!
+//! Nothing here opens or reads a guest's file while any guest process runs.
+//! Linux raises an inotify or fanotify event for every open, read and close
+//! of a file, whoever makes it (`fsnotify_open`, `fsnotify_access` and
+//! `fsnotify_close`, fs/namei.c, fs/read_write.c and fs/file_table.c), so a
+//! guest watching the file's directory would see Hermit's reads among its
+//! own. While the guest runs, Detcore takes only what raises no event: a
+//! file's status, and the kernel's path for the guest's descriptor (a
+//! `readlink` of `/proc/<tid>/fd/<n>`). The bytes, and a directory's names,
+//! are read when the run has ended ([`content_at_end`]), and only where the
+//! file still has the identity the guest's open found.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::collections::HashSet;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::path::PathBuf;
 
 use detcore_model::host_input::HOST_INPUT_CONTENT_LIMIT;
 use detcore_model::host_input::HostFileIdentity;
@@ -126,40 +137,56 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The SHA-256 of the bytes of the regular file whose host identity is
-/// `identity`, read through `path` (a guest descriptor's `/proc/<tid>/fd/<n>`
-/// link, which opens the same file with an offset of its own), or `None` for
-/// a file larger than [`HOST_INPUT_CONTENT_LIMIT`] or one the tool cannot
-/// read. Kept per identity for the process, so a file opened again unchanged
-/// is not read again.
-pub(crate) fn content_digest(path: &Path, identity: HostFileIdentity) -> Option<String> {
-    static DIGESTS: Mutex<Option<HashMap<HostFileIdentity, Option<String>>>> = Mutex::new(None);
-    if u64::try_from(identity.size).map_or(true, |size| size > HOST_INPUT_CONTENT_LIMIT) {
-        return None;
+/// What a run's end reads for the first open of `path` (the guest's path)
+/// that found `identity`, through `source` (the kernel's path for the
+/// guest's descriptor, or for an exec's image, at that open): the SHA-256 of
+/// a regular file's bytes, when it still has that identity and holds at most
+/// [`HOST_INPUT_CONTENT_LIMIT`] bytes, or of the names in a directory that is
+/// still the same directory (device and inode; its size and times change
+/// with every name made in it) as [`directory_digest`] lists them; `None`
+/// otherwise, and for any other kind of file, which is never opened. Called
+/// only when every guest process has exited (see the module documentation).
+/// Raw syscalls only, as for [`read_digest`].
+pub(crate) fn content_at_end(
+    source: &Path,
+    path: &str,
+    identity: HostFileIdentity,
+    mutated: &BTreeSet<String>,
+) -> Option<String> {
+    let stat = crate::util::raw_stat(source).ok()?;
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG => {
+            if HostFileIdentity::from_stat(&stat) != identity
+                || u64::try_from(identity.size).map_or(true, |size| size > HOST_INPUT_CONTENT_LIMIT)
+            {
+                return None;
+            }
+            let file = crate::util::RawFd::open(source, libc::O_RDONLY | libc::O_NONBLOCK).ok()?;
+            // The file opened is the one whose status was compared.
+            (HostFileIdentity::from_stat(&file.stat().ok()?) == identity)
+                .then(|| read_digest(&file))
+                .flatten()
+        }
+        libc::S_IFDIR => {
+            if (stat.st_dev, stat.st_ino) != (identity.dev, identity.ino) {
+                return None;
+            }
+            let directory =
+                crate::util::RawFd::open(source, libc::O_RDONLY | libc::O_DIRECTORY).ok()?;
+            let opened = directory.stat().ok()?;
+            ((opened.st_dev, opened.st_ino) == (identity.dev, identity.ino))
+                .then(|| directory_digest(&directory, path, mutated))
+                .flatten()
+        }
+        _ => None,
     }
-    if let Some(known) = DIGESTS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|digests| digests.get(&identity))
-    {
-        return known.clone();
-    }
-    let digest = read_digest(path);
-    DIGESTS
-        .lock()
-        .unwrap()
-        .get_or_insert_with(HashMap::new)
-        .insert(identity, digest.clone());
-    digest
 }
 
-/// The SHA-256 of the file at `path`, read to its end but no further than
-/// [`HOST_INPUT_CONTENT_LIMIT`] bytes, or `None` when it cannot be read or is
-/// longer than that. Raw syscalls only: in-guest Detcore must not call
+/// The SHA-256 of the file open at `file`, read to its end but no further
+/// than [`HOST_INPUT_CONTENT_LIMIT`] bytes, or `None` when it cannot be read
+/// or is longer than that. Raw syscalls only: in-guest Detcore must not call
 /// libc's wrappers, which the guest may define (`crate::util::raw_syscall`).
-fn read_digest(path: &Path) -> Option<String> {
-    let file = crate::util::RawFd::open(path, libc::O_RDONLY | libc::O_NONBLOCK).ok()?;
+fn read_digest(file: &crate::util::RawFd) -> Option<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1 << 16];
     let mut read = 0_u64;
@@ -177,16 +204,86 @@ fn read_digest(path: &Path) -> Option<String> {
     Some(hex(&hasher.finalize()))
 }
 
+/// The SHA-256 of the names in the directory open at `directory`, which the
+/// guest names `path`: sorted, each followed by a NUL, after `directory\0`,
+/// without `.` and `..` and without each name whose path the guest itself
+/// rebound (`mutated`, [`guest_rebound`]), so that what the guest made or
+/// removed in it (in its private `/tmp`, say) does not count. `None` when
+/// the names are longer in all than [`HOST_INPUT_CONTENT_LIMIT`] bytes or
+/// cannot be read. A directory's identity is not compared: Hermit makes some
+/// afresh for each run (its private `/tmp`), and the guest sees only the
+/// names in one, not its host inode or times.
+fn directory_digest(
+    directory: &crate::util::RawFd,
+    path: &str,
+    mutated: &BTreeSet<String>,
+) -> Option<String> {
+    let mut names = Vec::new();
+    let mut total = 0_u64;
+    let too_long = crate::util::find_in_open_directory(directory, |name| {
+        total += name.len() as u64 + 1;
+        if total > HOST_INPUT_CONTENT_LIMIT {
+            return Some(());
+        }
+        let child = Path::new(path).join(name);
+        if !guest_rebound(mutated, &child.to_string_lossy()) {
+            names.push(name.as_bytes().to_vec());
+        }
+        None
+    })
+    .ok()?;
+    if too_long.is_some() {
+        return None;
+    }
+    names.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"directory\0");
+    for name in &names {
+        hasher.update(name);
+        hasher.update(b"\0");
+    }
+    Some(hex(&hasher.finalize()))
+}
+
+/// The program interpreter (`PT_INTERP`) of the exec image the guest names
+/// `image` and the kernel named `source`, read at the run's end when the
+/// image still has the identity it had at the exec: the path the image
+/// names, and where that path is from the tool's root, inside the root the
+/// guest's process had (`source` without `image` at its end). `None` for an
+/// image without one, a changed or unreadable image, and an interpreter path
+/// that is not absolute. Under a chroot an absolute symbolic link on the
+/// interpreter's path resolves from the tool's root, not the guest's (as for
+/// `fifo_peer::fifo_at`).
+pub(crate) fn interpreter_at_end(
+    image: &str,
+    source: &Path,
+    identity: HostFileIdentity,
+) -> Option<(String, PathBuf)> {
+    let stat = crate::util::raw_stat(source).ok()?;
+    if HostFileIdentity::from_stat(&stat) != identity {
+        return None;
+    }
+    let image = Path::new(image).strip_prefix("/").ok()?;
+    let root = source.ancestors().nth(image.components().count())?;
+    if root.join(image) != source {
+        return None;
+    }
+    let interpreter = crate::exec_record::program_interpreter(source)?;
+    let host = root.join(interpreter.strip_prefix("/").ok()?);
+    Some((interpreter.to_str()?.to_owned(), host))
+}
+
 impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
-    /// Report the files the kernel opened for the exec this image came from
+    /// Report the image the kernel opened for the exec this image came from
     /// to the global state's host-input records ([`HostInputRecord::exec`]):
-    /// the image, read through the kernel's own `exe` link, and its program
-    /// interpreter, looked up in the process's root. For a `#!` script the
-    /// image is the interpreter the kernel finally ran, not the script. Under
-    /// a chroot an absolute symbolic link on the interpreter's path resolves
-    /// from the tool's root, not the guest's (as for `fifo_peer::fifo_at`).
-    /// Nothing where the tool cannot see the thread's procfs directory. Raw
-    /// syscalls only, as for [`read_digest`].
+    /// its path in the process's root and its identity, through the kernel's
+    /// own `exe` link, and where the tool finds it, for the run's end to read
+    /// its bytes and its program interpreter (`interpreter_at_end`), which
+    /// joins the records then. Nothing is opened now (see the module
+    /// documentation). For a `#!` script the image is the interpreter the
+    /// kernel finally ran, not the script. Nothing where the tool cannot see
+    /// the thread's procfs directory. Raw syscalls only, as for
+    /// [`read_digest`].
     pub(crate) async fn record_exec_host_inputs<G: reverie::Guest<Self>>(&self, guest: &mut G) {
         let Some(task) = self.guest_task_directory(guest) else {
             return;
@@ -195,48 +292,47 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
             return;
         };
         let exe = task.join("exe");
-        let mut files = Vec::new();
-        if let Some(image) = crate::util::raw_read_link(&exe)
+        let Ok(source) = crate::util::raw_read_link(&exe) else {
+            return;
+        };
+        let Some(image) = source
+            .strip_prefix(&root)
             .ok()
-            .and_then(|image| Some(Path::new("/").join(image.strip_prefix(&root).ok()?)))
-        {
-            files.push((image, exe.clone()));
-        }
-        if let Some(interpreter) = crate::exec_record::program_interpreter(&exe)
-            && let Ok(relative) = interpreter.strip_prefix("/")
-        {
-            let host = root.join(relative);
-            files.push((interpreter, host));
-        }
-        for (path, host) in files {
-            let Ok(stat) = crate::util::raw_stat(&host) else {
-                continue;
-            };
-            let identity = HostFileIdentity::from_stat(&stat);
-            let content = (stat.st_mode & libc::S_IFMT == libc::S_IFREG)
-                .then(|| content_digest(&host, identity))
-                .flatten();
-            crate::tool_global::record_host_input(
-                guest,
-                path.to_string_lossy().into_owned(),
-                identity,
-                content,
-                true,
-                false,
-            )
-            .await;
-        }
+            .map(|image| Path::new("/").join(image))
+        else {
+            return;
+        };
+        let Ok(stat) = crate::util::raw_stat(&exe) else {
+            return;
+        };
+        crate::tool_global::record_host_input(
+            guest,
+            image.to_string_lossy().into_owned(),
+            HostFileIdentity::from_stat(&stat),
+            source.to_str().map(str::to_owned),
+            stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+            true,
+            false,
+        )
+        .await;
     }
 }
 
 /// A schedule replay's comparison of the host files its guest opens against
-/// the recorded run's [`HostInputSet`]. Each path is compared once, at its
+/// the recorded run's [`HostInputSet`]. Each path is compared once, for its
 /// first open in this run; a path the recorded set does not hold, a kernel
-/// object, or one the guest has rebound by then is not compared.
+/// object, or one the guest has rebound by then is not compared. A change
+/// the open's status already proves is reported at the open
+/// ([`Self::observe`]): another identity where the recording has no content,
+/// another size of a regular file. Any other is decided by the content the
+/// run's end reads ([`Self::finish`]), as [`host_input_changed`] decides.
 #[derive(Debug)]
 pub(crate) struct ReplayHostInputs {
     recorded: HostInputSet,
     opened: HashSet<String>,
+    /// First opens left for [`Self::finish`]: the path and the identity the
+    /// open found.
+    pending: Vec<(String, HostFileIdentity)>,
     changes: Vec<HostInputChange>,
 }
 
@@ -246,20 +342,24 @@ impl ReplayHostInputs {
         Self {
             recorded,
             opened: HashSet::new(),
+            pending: Vec::new(),
             changes: Vec::new(),
         }
     }
 
-    /// Compare an open of `path` that found `identity` and, where it was
-    /// hashed, `content` (`kernel_object` when the descriptor's own path is a
+    /// Compare an open of `path` that found `identity` (`regular` for a
+    /// regular file; `kernel_object` when the descriptor's own path is a
     /// kernel object), with `mutated` the paths the guest has rebound so
-    /// far. Returns the change when this first open of the path found a
-    /// different file than the recording ([`host_input_changed`]).
+    /// far. Returns the change when this first open of the path already
+    /// shows a different file than the recording: where the recording holds
+    /// no content its identity decides, and a regular file of another size
+    /// holds other bytes whatever either run could read. Otherwise the path
+    /// waits for [`Self::finish`].
     pub(crate) fn observe(
         &mut self,
         path: &str,
         identity: HostFileIdentity,
-        content: Option<&str>,
+        regular: bool,
         kernel_object: bool,
         mutated: &BTreeSet<String>,
     ) -> Option<&HostInputChange> {
@@ -271,23 +371,59 @@ impl ReplayHostInputs {
             return None;
         }
         let recorded = self.recorded.file(path)?;
-        let now = HostInput {
-            path: path.to_owned(),
-            identity,
-            content: content.map(str::to_owned),
+        let proven = match recorded.content {
+            None => recorded.identity != identity,
+            Some(_) => regular && recorded.identity.size != identity.size,
         };
-        if !host_input_changed(recorded, &now) {
+        if !proven {
+            self.pending.push((path.to_owned(), identity));
             return None;
         }
         self.changes.push(HostInputChange {
-            path: now.path,
+            path: path.to_owned(),
             recorded: recorded.identity,
             now: identity,
         });
         self.changes.last()
     }
 
-    /// The changes found so far, in the order of their first opens.
+    /// Decide the opens [`Self::observe`] left, once the run has ended, with
+    /// `content` the content the run's end read for a path's first open
+    /// ([`content_at_end`]) and `mutated` every path the guest rebound in
+    /// the run, which the run's own set leaves out too. Returns the changes
+    /// this finds, in the order of their first opens, after those reported
+    /// at the opens.
+    pub(crate) fn finish(
+        &mut self,
+        mut content: impl FnMut(&str) -> Option<String>,
+        mutated: &BTreeSet<String>,
+    ) -> &[HostInputChange] {
+        let found = self.changes.len();
+        for (path, identity) in std::mem::take(&mut self.pending) {
+            if guest_rebound(mutated, &path) {
+                continue;
+            }
+            let Some(recorded) = self.recorded.file(&path) else {
+                continue;
+            };
+            let now = HostInput {
+                content: content(&path),
+                path,
+                identity,
+            };
+            if host_input_changed(recorded, &now) {
+                self.changes.push(HostInputChange {
+                    path: now.path,
+                    recorded: recorded.identity,
+                    now: identity,
+                });
+            }
+        }
+        &self.changes[found..]
+    }
+
+    /// The changes found so far: those reported at their opens, in the order
+    /// of those opens, then those [`Self::finish`] found.
     pub(crate) fn changes(&self) -> &[HostInputChange] {
         &self.changes
     }
@@ -378,7 +514,7 @@ mod tests {
         );
         let mut replay = ReplayHostInputs::new(recorded);
         assert_eq!(
-            replay.observe("/etc/ld.so.cache", identity(11), None, false, &none),
+            replay.observe("/etc/ld.so.cache", identity(11), true, false, &none),
             Some(&HostInputChange {
                 path: "/etc/ld.so.cache".to_owned(),
                 recorded: identity(9),
@@ -387,86 +523,200 @@ mod tests {
         );
         // A later open of the same path is not compared again.
         assert_eq!(
-            replay.observe("/etc/ld.so.cache", identity(12), None, false, &none),
+            replay.observe("/etc/ld.so.cache", identity(12), true, false, &none),
             None
         );
         // An unchanged file, one the recording did not open, and a kernel
         // object are not reported.
         assert_eq!(
-            replay.observe("/lib", identity(10), None, false, &none),
+            replay.observe("/lib", identity(10), false, false, &none),
             None
         );
         assert_eq!(
-            replay.observe("/new", identity(13), None, false, &none),
+            replay.observe("/new", identity(13), true, false, &none),
             None
         );
         assert_eq!(
-            replay.observe("/proc/self/maps", identity(14), None, false, &none),
+            replay.observe("/proc/self/maps", identity(14), true, false, &none),
             None
         );
+        // Unhashed in the recording: nothing is left for the run's end.
+        assert_eq!(replay.finish(|_| Some("aa".to_owned()), &none), []);
         assert_eq!(replay.changes().len(), 1);
     }
 
+    /// Where the recording hashed a file, an open whose status cannot prove
+    /// a change leaves it to the content the run's end reads: a new inode
+    /// with the same bytes is no change, the same inode with other bytes is
+    /// one. A regular file of another size is reported at its open.
     #[test]
     fn a_replay_compares_hashed_content_before_identity() {
         let none = BTreeSet::new();
-        let mut recorded = open("/etc/ld.so.cache", 9, 6);
-        recorded.content = Some("aa".to_owned());
-        let mut replay = ReplayHostInputs::new(input_set(&[recorded], &none));
-        // Rewritten with the same bytes under a new inode: not reported.
+        let hashed = |path: &str, ino: u64, content: &str| HostInputRecord {
+            content: Some(content.to_owned()),
+            ..open(path, ino, 6)
+        };
+        let recorded = input_set(
+            &[
+                hashed("/etc/ld.so.cache", 9, "aa"),
+                hashed("/etc/hosts", 10, "cc"),
+                hashed("/etc/passwd", 11, "dd"),
+                hashed("/etc", 12, "ee"),
+            ],
+            &none,
+        );
+        let mut replay = ReplayHostInputs::new(recorded);
+        let resized = HostFileIdentity {
+            size: 1,
+            ..identity(11)
+        };
+        // Rewritten under a new inode, edited in place, resized.
         assert_eq!(
-            replay.observe("/etc/ld.so.cache", identity(11), Some("aa"), false, &none),
+            replay.observe(
+                "/etc/ld.so.cache",
+                HostFileIdentity {
+                    ino: 13,
+                    ..identity(9)
+                },
+                true,
+                false,
+                &none
+            ),
             None
         );
-        let mut replay = ReplayHostInputs::new(replay.recorded.clone());
+        assert_eq!(
+            replay.observe("/etc/hosts", identity(10), true, false, &none),
+            None
+        );
         assert!(
             replay
-                .observe("/etc/ld.so.cache", identity(9), Some("bb"), false, &none)
+                .observe("/etc/passwd", resized, true, false, &none)
                 .is_some()
         );
-        // A recorded set out of path order (a hand-edited file) is searched
-        // sorted, and an open whose descriptor is a kernel object is not
-        // compared.
-        let mut unsorted = input_set(&[open("/a", 1, 1), open("/b", 2, 2)], &none);
+        // A directory's size says nothing about its names.
+        let directory = HostFileIdentity {
+            size: 1,
+            ..identity(14)
+        };
+        assert_eq!(replay.observe("/etc", directory, false, false, &none), None);
+        let content = |path: &str| {
+            match path {
+                "/etc/ld.so.cache" => Some("aa"),
+                "/etc/hosts" => Some("ff"),
+                "/etc" => Some("ee"),
+                _ => None,
+            }
+            .map(str::to_owned)
+        };
+        let found: Vec<&str> = replay
+            .finish(content, &none)
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert_eq!(found, ["/etc/hosts"]);
+        assert_eq!(replay.changes().len(), 2);
+
+        // Unread at the end (changed meanwhile, or too large): the identity
+        // decides. A recorded set out of path order (a hand-edited file) is
+        // searched sorted, and an open whose descriptor is a kernel object
+        // is not compared.
+        let mut unsorted = input_set(
+            &[
+                hashed("/a", 1, "aa"),
+                hashed("/b", 2, "bb"),
+                hashed("/c", 3, "cc"),
+            ],
+            &none,
+        );
         unsorted.files.reverse();
         let mut replay = ReplayHostInputs::new(unsorted);
-        assert!(
-            replay
-                .observe("/a", identity(5), None, false, &none)
-                .is_some()
-        );
-        assert_eq!(replay.observe("/b", identity(6), None, true, &none), None);
+        let moved = HostFileIdentity {
+            ino: 5,
+            ..identity(1)
+        };
+        assert_eq!(replay.observe("/a", moved, true, false, &none), None);
+        assert_eq!(replay.observe("/b", identity(6), true, true, &none), None);
+        assert_eq!(replay.observe("/c", identity(3), true, false, &none), None);
+        let found: Vec<&str> = replay
+            .finish(|_| None, &none)
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert_eq!(found, ["/a"]);
     }
 
+    /// The run's end reads a regular file's bytes only while it has the
+    /// identity the open found and no more than the limit, and a directory's
+    /// names (not those the guest made or removed itself), whatever its size
+    /// and times.
     #[test]
-    fn a_digest_reads_the_whole_file_and_only_a_bounded_one() {
+    fn the_end_reads_an_unchanged_file_and_a_directory_by_its_names() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("F");
         std::fs::write(&path, "input\n").unwrap();
-        let identity = |size: i64| HostFileIdentity {
-            dev: 1,
-            ino: 2,
-            size,
-            mtime_sec: 3,
-            mtime_nsec: 4,
-        };
+        let none = BTreeSet::new();
+        let found = HostFileIdentity::from_stat(&crate::util::raw_stat(&path).unwrap());
         // `printf 'input\n' | sha256sum`
         let expected = "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453";
         assert_eq!(
-            content_digest(&path, identity(6)).as_deref(),
+            content_at_end(&path, "/F", found, &none).as_deref(),
             Some(expected)
         );
-        // Kept per identity: a rewrite under the same identity is not read again.
+        // Another identity than the open found: not read.
+        let other = HostFileIdentity {
+            mtime_nsec: found.mtime_nsec ^ 1,
+            ..found
+        };
+        assert_eq!(content_at_end(&path, "/F", other, &none), None);
         std::fs::write(&path, "other\n").unwrap();
-        assert_eq!(
-            content_digest(&path, identity(6)).as_deref(),
+        let rewritten = HostFileIdentity::from_stat(&crate::util::raw_stat(&path).unwrap());
+        assert_ne!(
+            content_at_end(&path, "/F", rewritten, &none).as_deref(),
             Some(expected)
         );
+        let large = HostFileIdentity {
+            size: HOST_INPUT_CONTENT_LIMIT as i64 + 1,
+            ..rewritten
+        };
+        assert_eq!(content_at_end(&path, "/F", large, &none), None);
         assert_eq!(
-            content_digest(&path, identity(HOST_INPUT_CONTENT_LIMIT as i64 + 1)),
+            content_at_end(&directory.path().join("missing"), "/missing", found, &none),
             None
         );
-        assert_eq!(read_digest(&directory.path().join("missing")), None);
+
+        let listed = tempfile::tempdir().unwrap();
+        std::fs::write(listed.path().join("b"), "").unwrap();
+        std::fs::write(listed.path().join("a"), "").unwrap();
+        let at =
+            |listed: &Path| HostFileIdentity::from_stat(&crate::util::raw_stat(listed).unwrap());
+        let names = content_at_end(listed.path(), "/tmp", at(listed.path()), &none)
+            .expect("a directory's names");
+        // A name the guest made itself does not count, so neither does the
+        // directory's new size and times.
+        std::fs::write(listed.path().join("made"), "").unwrap();
+        let made = BTreeSet::from(["/tmp/made".to_owned()]);
+        assert_eq!(
+            content_at_end(listed.path(), "/tmp", at(listed.path()), &made).as_deref(),
+            Some(names.as_str())
+        );
+        // One the host made does.
+        assert_ne!(
+            content_at_end(listed.path(), "/tmp", at(listed.path()), &none).as_deref(),
+            Some(names.as_str())
+        );
+        // The same names elsewhere give the same digest; another directory
+        // than the open found is not read.
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("a"), "").unwrap();
+        std::fs::write(elsewhere.path().join("b"), "").unwrap();
+        assert_eq!(
+            content_at_end(elsewhere.path(), "/tmp", at(elsewhere.path()), &none).as_deref(),
+            Some(names.as_str())
+        );
+        assert_eq!(
+            content_at_end(elsewhere.path(), "/tmp", at(listed.path()), &none),
+            None
+        );
     }
 
     #[test]
@@ -475,9 +725,43 @@ mod tests {
         let mut replay = ReplayHostInputs::new(recorded);
         let mutated = BTreeSet::from(["/work".to_owned()]);
         assert_eq!(
-            replay.observe("/work/in", identity(11), None, false, &mutated),
+            replay.observe("/work/in", identity(11), true, false, &mutated),
             None
         );
         assert!(replay.changes().is_empty());
+        // Nor one rebound after its first open, which the run's end leaves
+        // out as the run's own set does.
+        let mut hashed = open("/work/in", 9, 6);
+        hashed.content = Some("aa".to_owned());
+        let mut replay = ReplayHostInputs::new(input_set(&[hashed], &BTreeSet::new()));
+        let none = BTreeSet::new();
+        assert_eq!(
+            replay.observe("/work/in", identity(9), true, false, &none),
+            None
+        );
+        assert_eq!(replay.finish(|_| Some("bb".to_owned()), &mutated), []);
+    }
+
+    /// An exec image's interpreter is the one it names, found under the root
+    /// its process had: the image's host path without its guest path.
+    #[test]
+    fn an_exec_image_names_its_interpreter_under_its_root() {
+        let image = crate::util::raw_read_link(Path::new("/proc/self/exe")).unwrap();
+        let identity = HostFileIdentity::from_stat(&crate::util::raw_stat(&image).unwrap());
+        let (interpreter, host) = interpreter_at_end(image.to_str().unwrap(), &image, identity)
+            .expect("the test binary is dynamically linked");
+        assert!(interpreter.starts_with('/'), "{interpreter}");
+        assert_eq!(host, Path::new(&interpreter));
+        // A guest path that is not the end of the host path names no root.
+        assert_eq!(interpreter_at_end("/elsewhere", &image, identity), None);
+        // Nor does an image that changed since the exec.
+        let changed = HostFileIdentity {
+            ino: identity.ino ^ 1,
+            ..identity
+        };
+        assert_eq!(
+            interpreter_at_end(image.to_str().unwrap(), &image, changed),
+            None
+        );
     }
 }
