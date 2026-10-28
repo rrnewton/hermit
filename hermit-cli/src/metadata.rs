@@ -873,7 +873,12 @@ impl RecordVersion {
 // the open file its send modeled, named without asking the kernel, instead of
 // getting a description of its own. An older recording's table holds other
 // descriptions for those descriptors, so it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18f);
+// 0x18f -> 0x190 (ledger-assigned for this change in landing order; its
+// reserved 0x18d could not be taken after 0x18f shipped): at a fatal
+// signal's delivery Detcore now retires the process's other threads in that
+// turn, where it left them to the host. An older recording's schedule has
+// those threads running on, so it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x190);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -898,7 +903,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18f);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18f;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x190;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
