@@ -22597,6 +22597,7 @@ impl Scheduler {
                 skid_overshoots: None,
                 skid_overshoot_reports: None,
                 seed_reproducible: None,
+                stdio_changed: Vec::new(),
             },
             info_reprio_descrip,
         ))
