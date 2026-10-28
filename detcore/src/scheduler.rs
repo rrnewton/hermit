@@ -20702,6 +20702,7 @@ impl Scheduler {
                 guest_ids: None,
                 host_id_tasks: 0,
                 virtual_timeout_ns,
+                stdio_changed: Vec::new(),
             },
             info_reprio_descrip,
         ))
