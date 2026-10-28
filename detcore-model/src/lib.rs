@@ -163,6 +163,7 @@ const _: () = assert!(
     "a signal death and a policy refusal must not share a code -- that collision is the defect"
 );
 
+pub mod access_trace;
 pub mod collections;
 pub mod config;
 pub mod container_mounts;
