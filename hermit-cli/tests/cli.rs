@@ -10240,7 +10240,8 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
 /// Hermit's entry, and a vfork every kernel refuses (`CLONE_PIDFD` with
 /// `CLONE_DETACHED`) gets `EINVAL` as made, with no host ID reported, as do
 /// the same call with `CLONE_UNTRACED`, which is issued without that flag, and
-/// a 32-byte clone3 struct on a page mapped writable but not readable. An
+/// a 32-byte clone3 struct on a page mapped writable but not readable, and a
+/// clone3 struct pointer in the kernel half (`EFAULT`). An
 /// unmapped `set_tid` array keeps its `EFAULT` when the thread group's leader
 /// has exited too (a thread's own maps are read, not the leader's empty
 /// ones).
@@ -10281,6 +10282,16 @@ fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
             "--summary",
             &["vfork-detached"],
             "clone vfork-detached: Invalid argument",
+        ),
+        (
+            "--pid-base=5000",
+            &["kernel-args"],
+            "clone3 kernel-args: Bad address",
+        ),
+        (
+            "--summary",
+            &["kernel-args"],
+            "clone3 kernel-args: Bad address",
         ),
         (
             "--pid-base=5000",

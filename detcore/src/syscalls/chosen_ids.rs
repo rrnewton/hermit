@@ -815,10 +815,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             ClonePlan::KernelRefuses => self.issue_kernel_refused(guest, call).await,
             ClonePlan::KernelRefusesUntraced => {
-                let (sysno, mut args) = call.into_parts();
-                args.arg0 &= !(libc::CLONE_UNTRACED as usize);
-                self.issue_kernel_refused(guest, Syscall::from_raw(sysno, args))
-                    .await
+                let (sysno, args) = call.into_parts();
+                self.issue_kernel_refused(
+                    guest,
+                    Syscall::from_raw(sysno, traced_legacy_clone(args)),
+                )
+                .await
             }
             ClonePlan::Chosen(chosen) => {
                 self.inject_with_chosen_id(guest, call, chosen, vfork).await
@@ -1009,6 +1011,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+/// A legacy `clone`'s arguments `args` without `CLONE_UNTRACED`, in its
+/// flags (the first argument), and nothing else changed.
+fn traced_legacy_clone(mut args: SyscallArgs) -> SyscallArgs {
+    args.arg0 &= !(libc::CLONE_UNTRACED as usize);
+    args
+}
+
 /// The ID a restarted clone-family call took (`ThreadState::restarted_clone_id`),
 /// and `call`, the call as Detcore normalized it (`RestartedCloneId::call`).
 /// Linux restarts the same call with the same arguments, so the restart
@@ -1104,6 +1113,13 @@ fn read_guest_set_tid<M: MemoryAccess>(
 ) -> Result<Vec<libc::pid_t>, SetTidUnread> {
     let (address, size) = guest_set_tid_shape(args).ok_or(SetTidUnread::Refused)?;
     let mut bytes = vec![0u8; size * std::mem::size_of::<libc::pid_t>()];
+    if !within_user_memory(address as usize, bytes.len()) {
+        return Err(if range_faults(tid, address as usize, bytes.len()) {
+            SetTidUnread::Refused
+        } else {
+            SetTidUnread::Unreadable
+        });
+    }
     // Exactly the array, with the guest's own access, as copy_from_user
     // reads it: a debugger read could reach past it into an unmapped page.
     let read = memory.read_exact_with_user_access(
@@ -1130,11 +1146,12 @@ fn read_guest_set_tid<M: MemoryAccess>(
 enum SetTidUnread {
     /// Every kernel refuses the call before creating a task: the array's
     /// address and size disagree, or it is longer than `MAX_PID_NS_LEVEL`
-    /// (`EINVAL`), or it is not all in the guest's mappings (`EFAULT`).
+    /// (`EINVAL`), or reading it is proved to fault (`EFAULT`,
+    /// [`range_faults`]).
     Refused,
-    /// It lies in the guest's mappings, but Detcore could not read it with
-    /// the guest's own access, while the kernel may (a page mapped writable,
-    /// not readable), so nothing is proved.
+    /// Detcore could not read it with the guest's own access, and no fault
+    /// is proved: the kernel may read it (a page mapped writable, not
+    /// readable).
     Unreadable,
 }
 
@@ -1208,44 +1225,60 @@ fn read_clone_args<M: MemoryAccess>(memory: &M, tid: i32, clone: &syscalls::Clon
     let Ok(page) = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) else {
         return Clone3Read::Unreadable { flags: None };
     };
-    // copy_clone_args_from_user: EINVAL under the first version, E2BIG
-    // over a page, both before reading.
-    if clone.size() < CLONE_ARGS_SIZE_VER0 || clone.size() > page {
+    let size = clone.size();
+    let raw = clone.args().map_or(0, |args| args.as_raw());
+    // Only a range within user memory is read: past it there is nothing to
+    // read, and the address arithmetic of a read near the top of the address
+    // space would overflow.
+    let address = Addr::<u8>::from_raw(raw).filter(|_| within_user_memory(raw, size));
+    clone3_read_decision(
+        size,
+        page,
+        || {
+            // Exactly the struct, with the guest's own access, as
+            // copy_from_user reads it. Detcore cannot read NULL at all.
+            let mut bytes = vec![0u8; size];
+            memory
+                .read_exact_with_user_access(address?, &mut bytes)
+                .ok()
+                .map(|()| bytes)
+        },
+        || range_faults(tid, raw, size),
+        || {
+            // Its flags, read past the protection, still say whether the
+            // call is untraced.
+            let mut flags = [0u8; 8];
+            memory
+                .read_exact(address?, &mut flags)
+                .ok()
+                .map(|()| u64::from_ne_bytes(flags))
+        },
+    )
+}
+
+/// How a guest `clone3`'s `struct clone_args` of `size` bytes is taken, on
+/// pages of `page` bytes: refused before any read (`EINVAL` under the first
+/// version, `E2BIG` over a page, as `copy_clone_args_from_user` checks), its
+/// bytes if `read` gets them, refused if reading it is proved to fault
+/// (`faults`, NULL included: page 0 can be mapped), else unreadable, with
+/// the flags `flags` gets, if any.
+fn clone3_read_decision(
+    size: usize,
+    page: usize,
+    read: impl FnOnce() -> Option<Vec<u8>>,
+    faults: impl FnOnce() -> bool,
+    flags: impl FnOnce() -> Option<u64>,
+) -> Clone3Read {
+    if size < CLONE_ARGS_SIZE_VER0 || size > page {
         return Clone3Read::Refused;
     }
-    let Some(address) = clone
-        .args()
-        .and_then(|args| Addr::<u8>::from_raw(args.as_raw()))
-    else {
-        // NULL faults unless page 0 is mapped (mmap_min_addr 0, or
-        // CAP_SYS_RAWIO); Detcore cannot read it either way.
-        return if range_faults(tid, 0, clone.size()) {
-            Clone3Read::Refused
-        } else {
-            Clone3Read::Unreadable { flags: None }
-        };
-    };
-    let mut bytes = vec![0u8; clone.size()];
-    // Exactly the struct, with the guest's own access, as copy_from_user
-    // reads it.
-    if memory
-        .read_exact_with_user_access(address, &mut bytes)
-        .is_ok()
-    {
+    if let Some(bytes) = read() {
         return Clone3Read::Bytes(bytes);
     }
-    if range_faults(tid, address.as_raw(), bytes.len()) {
+    if faults() {
         return Clone3Read::Refused;
     }
-    // Mapped, but not readable with the guest's access (writable only):
-    // the kernel may read it. Its flags, read past the protection, still
-    // say whether the call is untraced.
-    let mut flags = [0u8; 8];
-    let flags = memory
-        .read_exact(address, &mut flags)
-        .ok()
-        .map(|()| u64::from_ne_bytes(flags));
-    Clone3Read::Unreadable { flags }
+    Clone3Read::Unreadable { flags: flags() }
 }
 
 /// A guest `clone3`'s `struct clone_args`, as Detcore read it to plan the
@@ -1259,9 +1292,9 @@ enum Clone3Read {
     /// (`E2BIG`), or reading it is proved to fault (`EFAULT`,
     /// [`range_faults`]).
     Refused,
-    /// It lies in the guest's mappings, but Detcore could not read it with
-    /// the guest's access, while the kernel may (a page mapped writable, not
-    /// readable); its flags if Detcore could read them otherwise.
+    /// Detcore could not read it with the guest's access, and no fault is
+    /// proved: the kernel may read it (a page mapped writable, not
+    /// readable). Its flags, if Detcore could read them otherwise.
     Unreadable { flags: Option<u64> },
 }
 
@@ -1294,6 +1327,31 @@ fn range_faults(tid: i32, address: usize, len: usize) -> bool {
     range_faults_in(&smaps, limit, address, len)
 }
 
+/// Whether `address..address + len` lies within user memory, where Detcore
+/// can try to read it.
+pub(crate) fn within_user_memory(address: usize, len: usize) -> bool {
+    user_memory_end()
+        .zip(address.checked_add(len))
+        .is_some_and(|(end, last)| last <= end)
+}
+
+/// Whether an address at or beyond the end of user memory faults whatever
+/// the task: one in the kernel half does, but one that may be a tagged user
+/// pointer proves nothing. arm64's `access_ok` untags a pointer for a task
+/// that enabled the tagged-address ABI (`PR_SET_TAGGED_ADDR_CTRL`) by sign
+/// extending bit 55, so bit 55 set is the kernel half and a nonzero top byte
+/// with it clear may be a tag. x86 linear address masking would tag bits 48
+/// (or 57) to 62, never bit 63. Detcore's prctl allowlist does not let a
+/// guest enable tagging today, so the tagged case is a guard, not a path a
+/// guest takes.
+fn past_end_faults(address: usize) -> bool {
+    if cfg!(target_arch = "aarch64") {
+        address & (1 << 55) != 0 || address >> 56 == 0
+    } else {
+        address & (1 << 63) != 0
+    }
+}
+
 /// Whether some byte of `address..address + len` is, by `smaps` (a
 /// `/proc/<tid>/smaps` text), one the kernel's `copy_from_user` faults on in
 /// every case:
@@ -1306,14 +1364,12 @@ fn range_faults(tid: i32, address: usize, len: usize) -> bool {
 ///   on a fault, within the faulting task's own `RLIMIT_STACK`, which is the
 ///   guest's, not the tracer's, so such a hole proves nothing.
 ///
-/// False when nothing is proved, as when `smaps` lists no mapping, or the
-/// address itself is at or beyond `limit`: it may be a tagged pointer (arm64's
-/// top-byte ignore, which bionic enables, or x86's linear address masking),
-/// which the kernel untags for a task that enabled tagging before it checks
-/// the range.
+/// False when nothing is proved, as when `smaps` lists no mapping or a
+/// record is malformed. An address at or beyond `limit` is judged by its
+/// shape alone ([`past_end_faults`]).
 fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> bool {
     if address >= limit {
-        return false;
+        return past_end_faults(address);
     }
     let Some(end) = address.checked_add(len.max(1)) else {
         return true;
@@ -1321,21 +1377,33 @@ fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> boo
     if end > limit {
         return true;
     }
-    // (start, end, any permission, grows down if its VmFlags were read), in
-    // address order.
-    let mut mappings: Vec<(usize, usize, bool, Option<bool>)> = Vec::new();
+    // Each mapping's start, end, whether it permits any access (unknown for
+    // a malformed permission field) and whether it grows down (unknown
+    // until exactly one well-formed VmFlags record follows it).
+    struct Mapping {
+        start: usize,
+        stop: usize,
+        permitted: Option<bool>,
+        grows_down: Option<bool>,
+        flag_records: u32,
+    }
+    let mut mappings: Vec<Mapping> = Vec::new();
     for line in smaps.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(first) = fields.next() else {
-            continue;
-        };
         if let Some(flags) = line.strip_prefix("VmFlags:") {
             if let Some(last) = mappings.last_mut() {
-                last.3 = Some(flags.split_whitespace().any(|flag| flag == "gd"));
+                last.flag_records += 1;
+                let flags: Vec<&str> = flags.split_whitespace().collect();
+                let well_formed = !flags.is_empty()
+                    && flags.iter().all(|flag| {
+                        flag.len() == 2 && flag.bytes().all(|b| b.is_ascii_lowercase())
+                    });
+                last.grows_down =
+                    (well_formed && last.flag_records == 1).then(|| flags.contains(&"gd"));
             }
             continue;
         }
-        let Some((start, stop)) = first.split_once('-') else {
+        let mut fields = line.split_whitespace();
+        let Some((start, stop)) = fields.next().and_then(|range| range.split_once('-')) else {
             continue;
         };
         let (Ok(start), Ok(stop), Some(perms)) = (
@@ -1345,8 +1413,20 @@ fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> boo
         ) else {
             continue;
         };
-        let permitted = perms.bytes().take(3).any(|perm| perm != b'-');
-        mappings.push((start, stop, permitted, None));
+        let perms = perms.as_bytes();
+        let permitted = (perms.len() == 4
+            && matches!(perms[0], b'r' | b'-')
+            && matches!(perms[1], b'w' | b'-')
+            && matches!(perms[2], b'x' | b'-')
+            && matches!(perms[3], b'p' | b's'))
+        .then(|| perms[..3] != *b"---");
+        mappings.push(Mapping {
+            start,
+            stop,
+            permitted,
+            grows_down: None,
+            flag_records: 0,
+        });
     }
     if mappings.is_empty() {
         return false;
@@ -1355,18 +1435,34 @@ fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> boo
     while at < end {
         match mappings
             .iter()
-            .find(|(start, stop, _, _)| (*start..*stop).contains(&at))
+            .find(|mapping| (mapping.start..mapping.stop).contains(&at))
         {
-            Some(&(_, _, false, _)) => return true,
-            Some(&(_, stop, true, _)) => at = stop,
+            Some(Mapping {
+                permitted: Some(false),
+                ..
+            }) => return true,
+            Some(Mapping {
+                permitted: Some(true),
+                stop,
+                ..
+            }) => at = *stop,
+            Some(Mapping {
+                permitted: None, ..
+            }) => return false,
             None => {
                 let above = mappings
                     .iter()
-                    .filter(|(start, _, _, _)| *start > at)
-                    .min_by_key(|(start, _, _, _)| *start);
+                    .filter(|mapping| mapping.start > at)
+                    .min_by_key(|mapping| mapping.start);
                 // Proved only below a mapping known not to grow down (or
                 // below none at all).
-                return matches!(above, None | Some(&(_, _, _, Some(false))));
+                return matches!(
+                    above,
+                    None | Some(Mapping {
+                        grows_down: Some(false),
+                        ..
+                    })
+                );
             }
         }
     }
@@ -1803,9 +1899,10 @@ mod tests {
         ));
     }
 
-    /// A failed read proves EFAULT only for a byte at or past the end of user
-    /// memory, in a mapping without permissions, or in a hole below a
-    /// mapping that does not grow down.
+    /// A failed read proves EFAULT only for a range that starts in user
+    /// memory and crosses its end, or a byte in a mapping without
+    /// permissions, or one in a hole below a mapping known not to grow
+    /// down.
     #[test]
     fn only_a_definite_fault_is_taken_as_the_kernels_refusal() {
         let smaps = "\
@@ -1845,11 +1942,14 @@ VmFlags: rd wr mr mw me gd ac
                 assert!(faults(limit - len + 1, len));
             }
         }
-        // At or beyond the end, an address may be a tagged pointer, which the
-        // kernel untags first: nothing is proved.
-        assert!(!faults(limit, 8));
+        // At or beyond the end, an address in the kernel half faults, but
+        // one that may be a tagged user pointer proves nothing.
+        assert!(faults(usize::MAX - 4095, 88));
+        assert!(faults(usize::MAX - 2, 8));
         assert!(!faults(0x0f00_0000_0000_4000, 8));
-        assert!(!faults(usize::MAX - 2, 8));
+        // Untagged, just past the end: arm64 faults; x86 cannot tell it from
+        // a linear-address-masked pointer.
+        assert_eq!(faults(limit, 8), cfg!(target_arch = "aarch64"));
         // No mappings listed: nothing is proved.
         assert!(!super::range_faults_in("", limit, 0x4000, 8));
         // A mapping whose VmFlags are missing might grow down: a hole below
@@ -1857,12 +1957,32 @@ VmFlags: rd wr mr mw me gd ac
         let unflagged = "5000-6000 rw-p 00000000 00:00 0\n";
         assert!(!super::range_faults_in(unflagged, limit, 0x4000, 8));
         assert!(super::range_faults_in(unflagged, limit, 0x7000, 8));
-        // Page zero, when mapped, is read like any other page.
+        // Page zero, when mapped with some permission, is read like any other
+        // page.
         assert!(!super::range_faults_in(
             "0-1000 rw-p 00000000 00:00 0\nVmFlags: rd wr\n",
             limit,
             0,
             88
+        ));
+        // An empty, malformed or repeated VmFlags record, or a malformed
+        // permission field, is no evidence.
+        for record in [
+            "VmFlags:\n",
+            "VmFlags: rd wr GD\n",
+            "VmFlags: rd wr\nVmFlags: rd wr\n",
+        ] {
+            let smaps = format!("5000-6000 rw-p 00000000 00:00 0\n{record}");
+            assert!(
+                !super::range_faults_in(&smaps, limit, 0x4000, 8),
+                "{record:?}"
+            );
+        }
+        assert!(!super::range_faults_in(
+            "5000-6000 --- 00000000 00:00 0\nVmFlags: mr\n",
+            limit,
+            0x5000,
+            8
         ));
         // The end of user memory is a page boundary, at most four bytes past
         // the last four-byte word access_ok accepts.
@@ -1870,5 +1990,56 @@ VmFlags: rd wr mr mw me gd ac
         let word = super::super::threads::user_ptr_max();
         assert_eq!(end % 4096, 0, "{end:#x}");
         assert!(word < end + 4096 && end <= word + 4, "{word:#x} {end:#x}");
+    }
+
+    /// A clone3 struct is refused before any read for its size, read when it
+    /// can be, refused when reading it is proved to fault (NULL included),
+    /// and otherwise unreadable, with whatever flags could be read.
+    #[test]
+    fn a_clone3_struct_is_refused_only_when_every_kernel_refuses_it() {
+        use super::Clone3Read;
+        let decide = |size: usize, read: Option<Vec<u8>>, faults: bool, flags: Option<u64>| {
+            super::clone3_read_decision(size, 4096, || read, || faults, || flags)
+        };
+        assert_eq!(
+            decide(32, Some(vec![0; 32]), false, None),
+            Clone3Read::Refused
+        );
+        assert_eq!(decide(8192, None, false, None), Clone3Read::Refused);
+        assert_eq!(
+            decide(88, Some(vec![1; 88]), false, None),
+            Clone3Read::Bytes(vec![1; 88])
+        );
+        // NULL, or any other address: unread, and a fault proved or not.
+        assert_eq!(decide(88, None, true, None), Clone3Read::Refused);
+        assert_eq!(
+            decide(88, None, false, None),
+            Clone3Read::Unreadable { flags: None }
+        );
+        assert_eq!(
+            decide(88, None, false, Some(7)),
+            Clone3Read::Unreadable { flags: Some(7) }
+        );
+    }
+
+    /// A legacy clone issued without CLONE_UNTRACED keeps every other bit
+    /// and argument.
+    #[test]
+    fn a_traced_legacy_clone_drops_only_clone_untraced() {
+        let flags = (libc::CLONE_UNTRACED | libc::CLONE_PIDFD | libc::CLONE_DETACHED) as usize
+            | libc::SIGCHLD as usize;
+        let args = SyscallArgs::new(flags, 0x1000, 0x2000, 0x3000, 0x4000, 0x5000);
+        let traced = super::traced_legacy_clone(args);
+        assert_eq!(traced.arg0, flags & !(libc::CLONE_UNTRACED as usize));
+        assert_eq!(
+            (
+                traced.arg1,
+                traced.arg2,
+                traced.arg3,
+                traced.arg4,
+                traced.arg5
+            ),
+            (0x1000, 0x2000, 0x3000, 0x4000, 0x5000)
+        );
     }
 }
