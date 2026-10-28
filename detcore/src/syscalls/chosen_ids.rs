@@ -16,8 +16,9 @@
 //! with a `set_tid` array whose entry for Hermit's PID namespace is the next
 //! ID (after 1 for a new PID namespace's first task, or after the guest's own
 //! entries), so the kernel itself hands out IDs that depend only on the base
-//! and the guest's own order of clone calls. A call Detcore takes an ID for
-//! keeps it whether or not it creates a task, so a failed one leaves a gap. The kernel
+//! and the guest's own order of clone calls. A call Detcore takes an ID
+//! for keeps it whether or not it creates a task, so a failed one leaves a
+//! gap. The kernel
 //! then writes those IDs wherever it writes a task's ID: clone's return value
 //! and `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID` words, `getpid` and
 //! `gettid`, `/proc`, wait results and `si_pid`, PI-futex owner words and
@@ -389,6 +390,11 @@ pub(crate) enum ClonePlan {
     /// is reported only if it creates one after all, and a run that needs
     /// every ID chosen lets the guest have the kernel's error.
     KernelRefuses,
+    /// [`ClonePlan::KernelRefuses`] for a legacy `clone` with
+    /// `CLONE_UNTRACED`, issued without the flag: it is one of
+    /// `CLONE_LEGACY_FLAGS`, which no validity check rejects, so the
+    /// kernel's error is the same, and a task created after all is traced.
+    KernelRefusesUntraced,
     /// As the guest made it: a guest `clone3` that names its task's ID in
     /// Hermit's PID namespace itself, or passes a `set_tid` array the kernel
     /// refuses before creating a task.
@@ -422,9 +428,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(ClonePlan::Kernel);
         };
         let (sysno, args) = call.into_parts();
-        let pid = guest.pid().as_raw();
+        // The calling thread's own maps: the leader's are empty once it has
+        // exited, while the others still run on the same memory.
+        let tid = guest.tid().as_raw();
         let clone3_read = match call {
-            Syscall::Clone3(clone) => Some(read_clone_args(&guest.memory(), pid, clone)),
+            Syscall::Clone3(clone) => Some(read_clone_args(&guest.memory(), tid, clone)),
             _ => None,
         };
         if clone3_read == Some(Clone3Read::Refused) {
@@ -494,7 +502,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // though it is mapped could still be read by the kernel, so
                 // it may create a task whose ID in Hermit's namespace the
                 // kernel picks.
-                let tids = match read_guest_set_tid(&guest.memory(), pid, &args) {
+                let tids = match read_guest_set_tid(&guest.memory(), tid, &args) {
                     Ok(tids) => tids,
                     Err(SetTidUnread::Refused) => return Ok(ClonePlan::GuestChosen),
                     Err(SetTidUnread::Unreadable) => {
@@ -549,6 +557,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
             }
+            // CLONE_UNTRACED is dropped from such a call (a legacy clone's:
+            // a clone3 struct is never Unchanged), keeping the kernel's error,
+            // so that a task it creates after all is traced.
+            ChosenIdCall::Unchanged if untraced => return Ok(ClonePlan::KernelRefusesUntraced),
             ChosenIdCall::Unchanged => return Ok(ClonePlan::KernelRefuses),
             ChosenIdCall::Inexpressible(why) => {
                 return self
@@ -760,6 +772,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
+    /// Issue `call`, which every kernel is expected to refuse before creating
+    /// a task, as made; a task it creates after all has a host ID, reported
+    /// after the call.
+    async fn issue_kernel_refused<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(call).await;
+        if let Ok(child) = result {
+            self.gave_host_id(
+                guest,
+                child,
+                "unexpectedly, as Detcore expected every kernel to refuse it",
+            )
+            .await;
+        }
+        result
+    }
+
     /// Issue the guest's clone-family call `call` as `plan` says; `vfork`
     /// says whether it passes `CLONE_VFORK`.
     pub(crate) async fn inject_clone_planned<G: Guest<Self>>(
@@ -781,17 +813,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 result
             }
-            ClonePlan::KernelRefuses => {
-                let result = guest.inject(call).await;
-                if let Ok(child) = result {
-                    self.gave_host_id(
-                        guest,
-                        child,
-                        "unexpectedly, as Detcore expected every kernel to refuse it",
-                    )
-                    .await;
-                }
-                result
+            ClonePlan::KernelRefuses => self.issue_kernel_refused(guest, call).await,
+            ClonePlan::KernelRefusesUntraced => {
+                let (sysno, mut args) = call.into_parts();
+                args.arg0 &= !(libc::CLONE_UNTRACED as usize);
+                self.issue_kernel_refused(guest, Syscall::from_raw(sysno, args))
+                    .await
             }
             ClonePlan::Chosen(chosen) => {
                 self.inject_with_chosen_id(guest, call, chosen, vfork).await
@@ -1072,7 +1099,7 @@ const MAX_SET_TID: usize = 32;
 /// kernel.
 fn read_guest_set_tid<M: MemoryAccess>(
     memory: &M,
-    pid: i32,
+    tid: i32,
     args: &[u8; CLONE_ARGS_SIZE_VER2],
 ) -> Result<Vec<libc::pid_t>, SetTidUnread> {
     let (address, size) = guest_set_tid_shape(args).ok_or(SetTidUnread::Refused)?;
@@ -1084,7 +1111,7 @@ fn read_guest_set_tid<M: MemoryAccess>(
         &mut bytes,
     );
     if read.is_err() {
-        return Err(if range_is_unmapped(pid, address as usize, bytes.len()) {
+        return Err(if range_is_unmapped(tid, address as usize, bytes.len()) {
             SetTidUnread::Refused
         } else {
             SetTidUnread::Unreadable
@@ -1177,12 +1204,13 @@ fn is_restart(errno: Errno) -> bool {
 
 /// A `clone3` call's `struct clone_args`, all the bytes it passes, if they
 /// can be read and number at most a page, the kernel's limit (E2BIG).
-fn read_clone_args<M: MemoryAccess>(memory: &M, pid: i32, clone: &syscalls::Clone3) -> Clone3Read {
+fn read_clone_args<M: MemoryAccess>(memory: &M, tid: i32, clone: &syscalls::Clone3) -> Clone3Read {
     let Ok(page) = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) else {
         return Clone3Read::Unreadable { flags: None };
     };
-    // copy_clone_args_from_user: E2BIG over a page, before reading.
-    if clone.size() > page {
+    // copy_clone_args_from_user: EINVAL under the first version, E2BIG
+    // over a page, both before reading.
+    if clone.size() < CLONE_ARGS_SIZE_VER0 || clone.size() > page {
         return Clone3Read::Refused;
     }
     let Some(address) = clone
@@ -1200,7 +1228,7 @@ fn read_clone_args<M: MemoryAccess>(memory: &M, pid: i32, clone: &syscalls::Clon
     {
         return Clone3Read::Bytes(bytes);
     }
-    if range_is_unmapped(pid, address.as_raw(), bytes.len()) {
+    if range_is_unmapped(tid, address.as_raw(), bytes.len()) {
         return Clone3Read::Refused;
     }
     // Mapped, but not readable with the guest's access (writable only):
@@ -1230,38 +1258,84 @@ enum Clone3Read {
     Unreadable { flags: Option<u64> },
 }
 
-/// Whether some byte of the guest's `address..address + len` lies in none of
-/// its mappings (`/proc/<pid>/maps`), or beyond user memory, so that the
-/// kernel's `copy_from_user` of it fails with `EFAULT`. False when the maps
-/// cannot be read: then nothing is proved.
-fn range_is_unmapped(pid: i32, address: usize, len: usize) -> bool {
-    let Some(last) = address.checked_add(len.max(1) - 1) else {
-        return true;
-    };
-    if last > super::threads::user_ptr_max() {
-        return true;
-    }
-    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+/// Whether some byte of the guest's `address..address + len` is one the
+/// kernel's `copy_from_user` faults on in every case (`EFAULT`), from the
+/// calling thread `tid`'s mappings (`/proc/<tid>/smaps`; the leader's are
+/// empty once it has exited): see [`range_faults_in`]. False when nothing is
+/// proved, as when the mappings cannot be read.
+fn range_is_unmapped(tid: i32, address: usize, len: usize) -> bool {
+    let Some(limit) = super::threads::user_ptr_max().checked_add(std::mem::size_of::<u32>()) else {
         return false;
     };
-    let ranges: Vec<(usize, usize)> = maps
-        .lines()
-        .filter_map(|line| {
-            let (start, end) = line.split_whitespace().next()?.split_once('-')?;
-            Some((
-                usize::from_str_radix(start, 16).ok()?,
-                usize::from_str_radix(end, 16).ok()?,
-            ))
-        })
-        .collect();
+    let Ok(smaps) = std::fs::read_to_string(format!("/proc/{tid}/smaps")) else {
+        return false;
+    };
+    range_faults_in(&smaps, limit, address, len)
+}
+
+/// Whether some byte of `address..address + len` is, by `smaps` (a
+/// `/proc/<tid>/smaps` text), one the kernel's `copy_from_user` faults on in
+/// every case:
+/// - at or beyond `limit`, the end of user memory (exclusive);
+/// - in a mapping without any permission (`---p`, such as a thread stack's
+///   guard);
+/// - in no mapping, below a mapping that does not grow down. A mapping that
+///   grows down (`VmFlags` `gd`, a stack) is extended into the hole below it
+///   on a fault, within the faulting task's own `RLIMIT_STACK`, which is the
+///   guest's, not the tracer's, so such a hole proves nothing.
+///
+/// False when nothing is proved, as when `smaps` lists no mapping.
+fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> bool {
+    let Some(end) = address.checked_add(len.max(1)) else {
+        return true;
+    };
+    if end > limit {
+        return true;
+    }
+    // (start, end, any permission, grows down), in address order.
+    let mut mappings: Vec<(usize, usize, bool, bool)> = Vec::new();
+    for line in smaps.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(first) = fields.next() else {
+            continue;
+        };
+        if let Some(flags) = line.strip_prefix("VmFlags:") {
+            if let Some(last) = mappings.last_mut() {
+                last.3 = flags.split_whitespace().any(|flag| flag == "gd");
+            }
+            continue;
+        }
+        let Some((start, stop)) = first.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(stop), Some(perms)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(stop, 16),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let permitted = perms.bytes().take(3).any(|perm| perm != b'-');
+        mappings.push((start, stop, permitted, false));
+    }
+    if mappings.is_empty() {
+        return false;
+    }
     let mut at = address;
-    while at <= last {
-        match ranges
+    while at < end {
+        match mappings
             .iter()
-            .find(|(start, end)| (*start..*end).contains(&at))
+            .find(|(start, stop, _, _)| (*start..*stop).contains(&at))
         {
-            Some(&(_, end)) => at = end,
-            None => return true,
+            Some(&(_, _, false, _)) => return true,
+            Some(&(_, stop, true, _)) => at = stop,
+            None => {
+                let above = mappings
+                    .iter()
+                    .filter(|(start, _, _, _)| *start > at)
+                    .min_by_key(|(start, _, _, _)| *start);
+                return !matches!(above, Some(&(_, _, _, true)));
+            }
         }
     }
     false
@@ -1695,5 +1769,48 @@ mod tests {
             clone3_form(Sysno::clone, &args, None),
             ChosenIdCall::Clone3 { .. }
         ));
+    }
+
+    /// A failed read proves EFAULT only for a byte at or past the end of user
+    /// memory, in a mapping without permissions, or in a hole below a
+    /// mapping that does not grow down.
+    #[test]
+    fn only_a_definite_fault_is_taken_as_the_kernels_refusal() {
+        let smaps = "\
+1000-2000 rw-p 00000000 00:00 0
+VmFlags: rd wr mr mw me ac
+2000-3000 ---p 00000000 00:00 0
+VmFlags: mr mw me ac
+5000-6000 -w-p 00000000 00:00 0
+VmFlags: wr mr mw me ac
+9000-a000 rw-p 00000000 00:00 0 [stack]
+VmFlags: rd wr mr mw me gd ac
+";
+        let limit = 0x10000;
+        let faults =
+            |address: usize, len: usize| super::range_faults_in(smaps, limit, address, len);
+        // Mapped and permitted, even writable only: nothing is proved.
+        assert!(!faults(0x1ff0, 0x10));
+        assert!(!faults(0x5000, 88));
+        // A mapping without permissions, entered from a readable one.
+        assert!(faults(0x1ff8, 0x10));
+        // A hole below a mapping that does not grow down.
+        assert!(faults(0x4000, 8));
+        assert!(faults(0x1000 - 4, 8));
+        // A hole below a stack, which the guest's fault may grow into.
+        assert!(!faults(0x8ff8, 8));
+        // The end of user memory, exclusive, for 1, 4, 8 and 88 bytes.
+        for len in [1, 4, 8, 88] {
+            assert!(!super::range_faults_in(
+                "f000-10000 -w-p 00000000 00:00 0\nVmFlags: wr\n",
+                limit,
+                limit - len,
+                len
+            ));
+            assert!(faults(limit - len + 1, len));
+        }
+        assert!(faults(usize::MAX - 2, 8));
+        // No mappings listed: nothing is proved.
+        assert!(!super::range_faults_in("", limit, 0x4000, 8));
     }
 }

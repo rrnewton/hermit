@@ -3093,7 +3093,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // eperm_and_resource_errors_are_attributed_to_their_cause: 2705 + 3 = 2911, listed.
     // And chosen_ids' a_guest_set_tid_the_kernel_refuses_goes_to_the_kernel and
     // a_pid_namespace_depth_counts_from_hermits: 2708 + 2 = 2913, listed.
-    ("test.detcore_unit", 2913),
+    // And the chosen_ids unit for a definite fault
+    // (only_a_definite_fault_is_taken_as_the_kernels_refusal): 2710 + 1 = 2914.
+    ("test.detcore_unit", 2914),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5443,7 +5445,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same untraced-clone unit: 2908.
     // And the same three chosen_ids units: 2705 + 3 = 2911.
     // And the same two chosen_ids units: 2708 + 2 = 2913.
-    ("test.detcore_unit_on_host", 2913),
+    // And the same definite-fault unit: 2710 + 1 = 2914.
+    ("test.detcore_unit_on_host", 2914),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

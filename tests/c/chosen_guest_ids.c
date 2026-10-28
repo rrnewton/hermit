@@ -44,7 +44,11 @@
  *   that an unmapped page follows;
  * - `wronly-args`, `wronly-vfork`: a clone3 (with CLONE_VFORK for the
  *   second) whose struct clone_args is on a page mapped writable but not
- *   readable, which the kernel reads all the same;
+ *   readable, which the kernel reads all the same; `wronly-tid` the same for
+ *   `own-tid 1`'s array; `wronly-short` the first with a size of 32, which
+ *   every kernel refuses (EINVAL);
+ * - `leader-gone CALL`: CALL, by a second thread once the first has exited
+ *   (`pthread_exit`), so that the thread group leader is a zombie;
  * - `vfork-detached`: a raw clone with CLONE_VFORK, CLONE_PIDFD and
  *   CLONE_DETACHED, which every kernel refuses (EINVAL);
  * - `nested`: `own-tid 1` after unshare(CLONE_NEWPID), so that the array is
@@ -261,8 +265,20 @@ static int one_call(int argc, char** argv) {
     args.flags = CLONE_NEWPID;
     args.set_tid = (uint64_t)(uintptr_t)edge;
     args.set_tid_size = 1;
+  } else if (strcmp(what, "wronly-tid") == 0) {
+    pid_t* wronly = mmap(NULL, sysconf(_SC_PAGESIZE), PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (wronly == MAP_FAILED) {
+      printf("mmap: %s\n", strerror(errno));
+      return 1;
+    }
+    *wronly = 1;
+    args.flags = CLONE_NEWPID;
+    args.set_tid = (uint64_t)(uintptr_t)wronly;
+    args.set_tid_size = 1;
   } else if (strcmp(what, "wronly-args") == 0 ||
-             strcmp(what, "wronly-vfork") == 0) {
+             strcmp(what, "wronly-vfork") == 0 ||
+             strcmp(what, "wronly-short") == 0) {
     args.set_tid = 0;
     if (strcmp(what, "wronly-vfork") == 0) {
       args.flags = CLONE_VFORK;
@@ -278,7 +294,8 @@ static int one_call(int argc, char** argv) {
     printf("unknown call %s\n", what);
     return 2;
   }
-  long child = syscall(SYS_clone3, argp, sizeof args);
+  size_t size = strcmp(what, "wronly-short") == 0 ? 32 : sizeof args;
+  long child = syscall(SYS_clone3, argp, size);
   if (child == 0) {
     if (args.set_tid == 0 && args.flags == CLONE_NEWPID) {
       printf("newpid child: own ID %ld\n", (long)getpid());
@@ -316,10 +333,50 @@ static int one_call(int argc, char** argv) {
   return 0;
 }
 
+struct deferred_call {
+  int argc;
+  char** argv;
+};
+
+/* Waits until the thread group leader has exited, then makes the call and
+ * ends the process with its status. */
+static void* call_after_the_leader(void* arg) {
+  struct deferred_call* call = arg;
+  char path[64];
+  snprintf(path, sizeof path, "/proc/self/task/%d/stat", first);
+  for (;;) {
+    char stat[512] = {0};
+    FILE* file = fopen(path, "r");
+    if (file == NULL) {
+      break;
+    }
+    size_t got = fread(stat, 1, sizeof stat - 1, file);
+    fclose(file);
+    char* state = strrchr(stat, ')');
+    if (got == 0 || state == NULL || state[1] == '\0' || state[2] == 'Z' ||
+        state[2] == 'X') {
+      break;
+    }
+    sched_yield();
+  }
+  exit(one_call(call->argc, call->argv));
+}
+
 int main(int argc, char** argv) {
   int collide = argc > 1 && strcmp(argv[1], "collide") == 0;
   setvbuf(stdout, NULL, _IONBF, 0);
   first = getpid();
+  if (argc > 2 && strcmp(argv[1], "leader-gone") == 0) {
+    static struct deferred_call call;
+    call.argc = argc - 1;
+    call.argv = argv + 1;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, call_after_the_leader, &call) != 0) {
+      printf("pthread_create failed\n");
+      return 1;
+    }
+    pthread_exit(NULL);
+  }
   if (argc > 1 && !collide) {
     return one_call(argc, argv);
   }
