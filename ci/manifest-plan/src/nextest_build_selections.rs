@@ -25,7 +25,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "kvm-native-test-support,liteinst",
+            "liteinst,kvm-native-test-support",
             "--lib",
             "--bins",
         ]),
@@ -1295,7 +1295,7 @@ mod tests {
         for tag in ["test.hermit_unit", "test.hermit_unit_on_host"] {
             let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
             let selection: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
-            assert!(selection.contains(&"kvm-native-test-support,liteinst".into()));
+            assert!(selection.contains(&"liteinst,kvm-native-test-support".into()));
             assert!(
                 !selection
                     .iter()
