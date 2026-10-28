@@ -334,6 +334,21 @@ def _history_complete(ledger, ledger_commit, depth):
     return count < depth
 
 
+def _snapshot_trailer_tip(ledger, ledger_commit):
+    """The old tip a snapshot root's trailer names, without any proof check."""
+    try:
+        roots = run(["git", "--no-replace-objects", "-C", ledger, "rev-list",
+                     "--max-parents=0", ledger_commit]).decode().split()
+        if len(roots) != 1:
+            return None
+        body = run(["git", "--no-replace-objects", "-C", ledger, "log", "-1",
+                    "--format=%B", roots[0]]).decode().rstrip("\n").split("\n")
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+    match = re.fullmatch(r"Ledger-Snapshot-Of: ([0-9a-f]{40})", body[-1]) if body else None
+    return match.group(1) if match else None
+
+
 def fetch_ledger(ledger, ledger_commit):
     """Fetch ledger_commit and only the history the builder reads."""
     fetch = ["git", "-C", ledger, "fetch", "--no-tags", "--no-recurse-submodules"]
@@ -350,6 +365,27 @@ def fetch_ledger(ledger, ledger_commit):
         # naming the summarized commit it could not place.
         depth += LEDGER_DEEPEN_STEP
         run([*fetch, "--depth", str(depth), "origin", ledger_commit], timeout=LEDGER_FETCH_TIMEOUT)
+    if summarized not in (None, ledger_commit) and not _is_ancestor_or_folded(
+        ledger, summarized, ledger_commit
+    ):
+        # A cold checkout holds only post-squash history; the folding proof
+        # needs the detached old tip the snapshot trailer names. Fetch it,
+        # bounded like the deepening above, so the proof can be checked
+        # locally instead of the summary being refused for a missing object.
+        tip = _snapshot_trailer_tip(ledger, ledger_commit)
+        if tip is not None:
+            try:
+                run([*fetch, "--depth", "1", "origin", tip], timeout=LEDGER_FETCH_TIMEOUT)
+                proof_depth = 1
+                while (
+                    not _is_ancestor(ledger, summarized, tip)
+                    and proof_depth < LEDGER_DEEPEN_LIMIT
+                ):
+                    proof_depth += LEDGER_DEEPEN_STEP
+                    run([*fetch, "--depth", str(proof_depth), "origin", tip],
+                        timeout=LEDGER_FETCH_TIMEOUT)
+            except subprocess.CalledProcessError:
+                pass  # the builder refuses a summary it cannot place
     # The workflow caches this repository; the next run's fetch offers this
     # commit as already present and downloads only what changed since.
     run(["git", "-C", ledger, "update-ref", LEDGER_CACHE_REF, ledger_commit])
