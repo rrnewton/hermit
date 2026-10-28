@@ -2938,7 +2938,15 @@ fi
 # and 1050 effective-job-second limits carry without recalibration. Rust
 # runtime changes require current artifacts and validation; this carries the
 # SDK budget only, not runtime equivalence or a new cold-SDK timing sample.
-expected_pin=880071e1b24499756c01d052aef11fb65cdd8cba
+# CARRY TO 272411f47319bb0b47c57f560cb7e0d2e19eccb4 (2026-10-27): from
+# 880071e1b24499756c01d052aef11fb65cdd8cba. SDK build.rs and vendor/dynamorio
+# remain object-identical; the selected CMAKE recipe and numeric SDK budgets
+# are unchanged. Native startup failure ownership changes and requires fresh
+# artifacts; current native regressions and maintained caller producers passed.
+# The artifact source catalog only updates its existing root Cargo.toml tuple
+# for the Counter1 fixture exclusion (73 rows). DBT inventory is now 1038.
+# This carries SDK cost only, not native byte equivalence or cold-build timing.
+expected_pin=272411f47319bb0b47c57f560cb7e0d2e19eccb4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
