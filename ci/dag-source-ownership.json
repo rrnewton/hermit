@@ -392,6 +392,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan",
@@ -408,6 +409,7 @@
       "deps": [
         "build.host_hermit_link",
         "build.rust_scripts",
+        "check.dbt_runtime_abi",
         "compatprep.fixtures",
         "gate.manifest",
         "pre.reverie_pin",
@@ -477,6 +479,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan",
@@ -530,6 +533,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan",
@@ -1197,6 +1201,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "privileged-build.manifest_guests_in_pinned_root",
@@ -1232,6 +1237,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "privileged-build.manifest_guests_in_pinned_root",
@@ -4965,11 +4971,23 @@
     "e2e.manifest_c_programs": {
       "check.dbt_runtime_abi": "dynamorio-e2e.manifest_c_programs"
     },
+    "e2e.manifest_chaos_c": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_chaos_c"
+    },
+    "e2e.manifest_compat": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_compat"
+    },
+    "e2e.manifest_data_handling": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_data_handling"
+    },
     "e2e.manifest_debugger_c": {
       "check.dbt_runtime_abi": "dynamorio-e2e.manifest_debugger_c"
     },
     "e2e.manifest_determinism_stress_c": {
       "check.dbt_runtime_abi": "dynamorio-e2e.manifest_determinism_stress_c"
+    },
+    "e2e.manifest_determinism_stress": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_determinism_stress"
     },
     "e2e.manifest_language_runtimes": {
       "check.dbt_runtime_abi": "dynamorio-e2e.manifest_language_runtimes"
@@ -4986,8 +5004,14 @@
     "test.inherited_terminal_read": {
       "check.dbt_runtime_abi": "dynamorio-test.inherited_terminal_read"
     },
+    "privileged-e2e.manifest_applications": {
+      "check.dbt_runtime_abi": "dynamorio-privileged-e2e.manifest_applications"
+    },
     "privileged-e2e.manifest_c_programs": {
       "check.dbt_runtime_abi": "dynamorio-privileged-e2e.manifest_c_programs"
+    },
+    "privileged-e2e.manifest_system_utils": {
+      "check.dbt_runtime_abi": "dynamorio-privileged-e2e.manifest_system_utils"
     }
   },
   "producer_policies": {
