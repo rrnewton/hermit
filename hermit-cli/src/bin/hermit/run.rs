@@ -933,6 +933,14 @@ pub struct RunLatches {
     pub log_sink_failure: Option<String>,
 }
 
+/// Immutable evidence declarations for one common verification pair.
+pub(super) struct VerificationEvidence {
+    requirement: super::backend_hook::EvidenceRequirement,
+    records_run_metadata: bool,
+    transport: Option<super::backend_hook::VerificationLogTransport>,
+    native_identity_diagnostic: Option<&'static str>,
+}
+
 /// One completed physical verification run. DBT's typed statistics remain
 /// deferred until the common owner has checked the run's latches and status.
 pub(super) struct VerificationRunOutput {
@@ -2632,6 +2640,87 @@ fn run_opts_for(argv: &[&str]) -> RunOpts {
         run.adapter_capabilities = Some(capabilities);
     }
     *run
+}
+
+#[test]
+fn application_admission_refuses_missing_immutable_capabilities_before_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let recording = directory.path().join("checkpoint-settings.json");
+    let guest = directory.path().join("nonexistent-admission-guest");
+    // Reuse the complete checkpoint envelope from the CLI admission fixture.
+    let history = serde_json::json!({
+        "global": [],
+        "per_thread": {
+            "3": {
+                "final_prio": 1,
+                "prio_changes": [[1_767_225_600_000_001_000u64, 2]],
+                "preemption_rcbs": [100],
+                "chaos_epochs": []
+            }
+        },
+        "epoch": "2026-01-01T00:00:00Z",
+        "signal_state_copy": true,
+        "callback_checkpoints": {
+            "3": [{
+                "history_index": 0,
+                "origin": {
+                    "callback": "PmuTimer",
+                    "site": "Prehook",
+                    "progress": 0,
+                    "last_op": null,
+                    "time": 1_767_225_600_000_001_000u64,
+                    "rcbs": 100
+                }
+            }]
+        }
+    });
+    fs::write(&recording, serde_json::to_vec(&history).unwrap()).unwrap();
+    let admitted = run_opts_for(&[
+        "hermit",
+        "--backend=e9patch",
+        "run",
+        "--chaos",
+        "--sequentialize-threads",
+        "--max-timeslice=1000000",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--replay-preemptions-from",
+        recording.to_str().unwrap(),
+        "--",
+        guest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        admitted.adapter_capabilities,
+        Some(reverie::BackendCapabilities::PTRACE)
+    );
+    let before = format!("{:#?}", admitted.det_opts.det_config);
+    let mut missing = admitted.clone();
+    missing.adapter_capabilities = None;
+    let validation_error = missing.validate_args_with_perf_support(true).unwrap_err();
+    let annotated_error = missing.annotated_priority_replay_admission().unwrap_err();
+    for (phase, error) in [
+        ("argument validation", validation_error),
+        ("annotated replay admission", annotated_error),
+    ] {
+        assert!(
+            error.downcast_ref::<PolicyRefusal>().is_some(),
+            "{phase}: {error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("missing immutable physical capabilities"),
+            "{phase}: {error:#}"
+        );
+    }
+    assert_eq!(format!("{:#?}", missing.det_opts.det_config), before);
+    admitted.resolve_preemption_settings().unwrap();
+    assert!(admitted.annotated_priority_replay_admission().unwrap());
+    assert_eq!(format!("{:#?}", admitted.det_opts.det_config), before);
+    assert_eq!(admitted.program, guest);
+    assert!(
+        !guest.exists(),
+        "admission must not start the nonexistent guest"
+    );
 }
 
 #[cfg(test)]
@@ -6304,6 +6393,7 @@ fn abstract_bind_notice_is_on_only_for_a_host_network_run_on_ptrace() {
 
     let mut application = run_opts_for(&["hermit", "run", "--network=host", "fakeprog"]);
     application.select_application_backend("dynamorio").unwrap();
+    application = application.with_adapter_capabilities(reverie::BackendCapabilities::DBT);
     application.validate_args_with_perf_support(true).unwrap();
     assert!(
         !application
@@ -6648,6 +6738,7 @@ fn shebang_interpreter(path: &Path) -> Option<PathBuf> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-696): Review sharing ELF entrypoint detection with record.
+#[cfg(test)]
 pub(super) fn is_elf_file(path: &Path) -> Result<bool, Error> {
     let mut file = File::open(path)
         .with_context(|| format!("failed to open executable {}", path.display()))?;
@@ -7380,7 +7471,11 @@ impl RunOpts {
                 hermit::preemption_admission::refuse_unqualified_annotated_replay_with_capabilities(
                     config,
                     name,
-                    self.adapter_capabilities.unwrap_or_default(),
+                    self.adapter_capabilities.ok_or_else(|| {
+                        Error::new(PolicyRefusal).context(
+                            "executable-selected backend is missing immutable physical capabilities",
+                        )
+                    })?,
                 )
             } else {
                 hermit::preemption_admission::refuse_unqualified_annotated_replay(
@@ -7720,15 +7815,6 @@ impl RunOpts {
     /// whose socket carried anything but records is refused. Without the
     /// socket, SaBRe's plugin forwards them on the guest's standard error, from
     /// which they are cut out and appended.
-    fn take_forwarded_detlogs(
-        &self,
-        log: &Path,
-        stderr: &mut Vec<u8>,
-        socket: bool,
-    ) -> Result<Option<usize>, Error> {
-        self.take_forwarded_detlogs_for_transport(log, stderr, socket, None)
-    }
-
     fn take_forwarded_detlogs_for_transport(
         &self,
         log: &Path,
@@ -10853,10 +10939,15 @@ impl RunOpts {
             None
         };
         self.verify_with_evidence(
-            requirement,
-            !(selected && requirement == EvidenceRequirement::NativeCounters),
-            transport,
-            selected.then_some(A::NATIVE_IDENTITY_DIAGNOSTIC).flatten(),
+            VerificationEvidence {
+                requirement,
+                records_run_metadata: !(selected
+                    && requirement == EvidenceRequirement::NativeCounters),
+                transport,
+                native_identity_diagnostic: selected
+                    .then_some(A::NATIVE_IDENTITY_DIAGNOSTIC)
+                    .flatten(),
+            },
             |options, log, path, forwarded, run| {
                 if let Some(session) = &mut session {
                     let captured = adapter
@@ -10927,10 +11018,12 @@ impl RunOpts {
         use super::backend_hook::EvidenceRequirement;
         let adapter = super::core_adapter::CoreApplicationAdapter;
         self.verify_with_evidence(
-            EvidenceRequirement::Common,
-            true,
-            None,
-            None,
+            VerificationEvidence {
+                requirement: EvidenceRequirement::Common,
+                records_run_metadata: true,
+                transport: None,
+                native_identity_diagnostic: None,
+            },
             |options, log, path, forwarded, run| {
                 execute(options, log, path, forwarded, run)
                     .map(VerificationRunOutput::into_physical)
@@ -10947,10 +11040,7 @@ impl RunOpts {
     /// disposition, deferred facts, comparison and reporting stay here.
     pub(super) fn verify_with_evidence<P, F>(
         &self,
-        requirement: super::backend_hook::EvidenceRequirement,
-        records_run_metadata: bool,
-        transport: Option<super::backend_hook::VerificationLogTransport>,
-        native_identity_diagnostic: Option<&'static str>,
+        evidence: VerificationEvidence,
         mut execute: impl FnMut(
             &Self,
             fs::File,
@@ -10961,6 +11051,12 @@ impl RunOpts {
         finish: impl Fn(P, &Output, VerificationRun) -> Result<F, Error>,
         pair_evidence: impl Fn(&F, &F) -> Result<super::backend_hook::PairEvidence, Error>,
     ) -> Result<ExitStatus, Error> {
+        let VerificationEvidence {
+            requirement,
+            records_run_metadata,
+            transport,
+            native_identity_diagnostic,
+        } = evidence;
         self.refuse_unready_exec_stop()?;
         let retained_log_dir = self.retained_verify_log_dir()?;
         let (log1, log2) = temp_log_files_in("run1", "run2", retained_log_dir.as_deref())
@@ -11436,7 +11532,6 @@ impl RunOpts {
     /// with a target under guest `/tmp`, which is where [`Self::mounts`] applies
     /// binds for every backend. It warns about any other bind, which has no
     /// effect.
-
     pub(super) fn adapter_binds(&self) -> Vec<(PathBuf, PathBuf)> {
         let mut binds = Vec::with_capacity(self.bind.len());
         for bind in &self.bind {
@@ -11451,7 +11546,6 @@ impl RunOpts {
 
     /// These options with the DBT adapter's own container inputs added after
     /// the caller's, only for this physical launch.
-
     pub(super) fn with_adapter_mounts(&self, binds: &[Bind], mounts: Vec<MountArg>) -> Self {
         let mut options = self.clone();
         options.backend_mounts.0 += mounts.len();
@@ -11478,9 +11572,6 @@ impl RunOpts {
             .map(|arg| &arg.mount)
             .any(|mount| mount.get_target() == target && mount.clone().fstype("tmpfs") == *mount)
     }
-
-    /// Whether the guest runs in the common container, with its own PID
-    /// namespace and private /tmp, rather than as a plain child.
 
     /// Take the `/etc/ld.so.cache` role the `hermit verify-inputs` holder
     /// sealed, if it sealed one, as this run's snapshot: both runs of the pair
@@ -12000,7 +12091,11 @@ impl RunOpts {
             return hermit::preemption_admission::refuse_unsupported_preemption_with_capabilities(
                 &self.det_opts.det_config,
                 name,
-                self.adapter_capabilities.unwrap_or_default(),
+                self.adapter_capabilities.ok_or_else(|| {
+                    Error::new(PolicyRefusal).context(
+                        "executable-selected backend is missing immutable physical capabilities",
+                    )
+                })?,
                 self.max_timeslice_explicit,
                 self.skid_margin.is_some(),
             )
@@ -12912,7 +13007,6 @@ impl RunOpts {
             detcore::detlog::clear_forwarded_source();
         }
         let (output, skid_overshoots) = result?;
-        self.relabel_e9patch_dispatch_stats(&self.summary_json)?;
         // A flush error counts too.
         let _ = log.clone().flush();
         let latches = RunLatches {
@@ -13507,10 +13601,15 @@ mod tests {
             let mut log_path = None;
             let error = options
                 .verify_with_evidence(
-                    super::super::backend_hook::EvidenceRequirement::NativeCounters,
-                    false,
-                    Some(super::super::backend_hook::VerificationLogTransport::NativeEvidence),
-                    None,
+                    VerificationEvidence {
+                        requirement:
+                            super::super::backend_hook::EvidenceRequirement::NativeCounters,
+                        records_run_metadata: false,
+                        transport: Some(
+                            super::super::backend_hook::VerificationLogTransport::NativeEvidence,
+                        ),
+                        native_identity_diagnostic: None,
+                    },
                     |_, mut log, path, forwarded, run| {
                         calls.push(run);
                         assert_eq!(run, VerificationRun::Run1, "{case}: run 2 must not start");
@@ -13613,10 +13712,14 @@ mod tests {
         let mut runs = Vec::new();
         let error = options
             .verify_with_evidence(
-                super::super::backend_hook::EvidenceRequirement::NativeCounters,
-                false,
-                Some(super::super::backend_hook::VerificationLogTransport::NativeEvidence),
-                None,
+                VerificationEvidence {
+                    requirement: super::super::backend_hook::EvidenceRequirement::NativeCounters,
+                    records_run_metadata: false,
+                    transport: Some(
+                        super::super::backend_hook::VerificationLogTransport::NativeEvidence,
+                    ),
+                    native_identity_diagnostic: None,
+                },
                 |_, mut log, path, forwarded, run| {
                     assert!(forwarded.is_none());
                     let bytes = format!("completed {run:?}: guest exit 23\n");

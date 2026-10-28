@@ -71,10 +71,12 @@ struct RecordOverlay {
     target: PathBuf,
 }
 
+type RecordPrepareCallback<'a> = &'a dyn Fn(&Path) -> Result<Option<PathBuf>, Error>;
+
 #[derive(Clone, Copy)]
 struct RecordPreparation<'a> {
     backend_name: &'static str,
-    prepare: Option<&'a dyn Fn(&Path) -> Result<Option<PathBuf>, Error>>,
+    prepare: Option<RecordPrepareCallback<'a>>,
 }
 
 static TIMEOUT_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
@@ -432,13 +434,11 @@ impl StartOpts {
         let Some(prepare) = preparation.prepare else {
             // No optional built-in preprocessor remains here. Preserve the
             // former unavailable-backend refusal until its CLI enum is retired.
-            if let Some(backend) = global.backend {
-                if backend != Backend::Ptrace {
-                    backend.ensure_available()?;
-                    anyhow::bail!(
-                        "record preprocessing requires its statically selected executable"
-                    );
-                }
+            if let Some(backend) = global.backend
+                && backend != Backend::Ptrace
+            {
+                backend.ensure_available()?;
+                anyhow::bail!("record preprocessing requires its statically selected executable");
             }
             return Ok(None);
         };
@@ -449,7 +449,7 @@ impl StartOpts {
     fn resolve_and_prepare_record_overlay(
         &self,
         backend: &str,
-        prepare: &dyn Fn(&Path) -> Result<Option<PathBuf>, Error>,
+        prepare: RecordPrepareCallback<'_>,
     ) -> Result<Option<RecordOverlay>, Error> {
         let target = self.resolve_record_target(backend)?;
         Ok(prepare(&target)?.map(|source| RecordOverlay { source, target }))
@@ -570,6 +570,7 @@ impl StartOpts {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         self.main_with_backend(global, &super::core_adapter::CoreApplicationAdapter)
     }

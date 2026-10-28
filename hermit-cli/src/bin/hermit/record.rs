@@ -68,10 +68,6 @@ impl RecordOpts {
         }
     }
 
-    pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        self.main_with_backend(global, &super::core_adapter::CoreApplicationAdapter)
-    }
-
     pub fn main_with_backend<A: super::backend_hook::BackendAdapter>(
         &self,
         global: &GlobalOpts,

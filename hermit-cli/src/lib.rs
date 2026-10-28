@@ -2500,9 +2500,6 @@ impl SkidOvershootReport {
 
 // TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
 
-/// `reverie_sabre::TOOL_OUTPUT_ENV`: the descriptor reverie-sabre protects
-/// for the in-guest tool's own output. Hermit does not link reverie-sabre.
-
 /// `detcore_liteinst::DETLOG_FORWARD_ENV`; that crate is a preload `cdylib`, so
 /// Hermit cannot import the constant.
 #[cfg(feature = "liteinst")]
@@ -2649,41 +2646,8 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     ))
 }
 
-/// Run one command with the Detcore tool executing inside a SaBRe plugin and
-/// the single GlobalState held by this Hermit coordinator process.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review SaBRe coordinator lifetime and artifact loading.
-
-/// Classify the existing SaBRe reach evidence without collapsing "never
-/// engaged" into the same zero-valued state as a fully exercised run.
-
-/// Produce the versioned SaBRe backend fact consumed by compatibility reports.
-///
-/// `preplugin_coverage=absent` is a property of SaBRe's launch order: the guest
-/// interpreter runs before the Detcore plugin is loaded. It is recorded rather
-/// than inferred from counters because the ptrace fallback cannot observe that
-/// interval either.
-///
-/// Preserve the originating #1725 measurement as provenance for that field:
-/// on its measurement host, `/bin/true` produced 3 COMMITs under SaBRe versus
-/// 14 under ptrace; the 11 absent records were the loader's libc.so.6 path
-/// resolution. The launch-order fact, not that host-specific count, is the
-/// runtime contract.
-
-/// Explain a SaBRe run whose guest never reached the Detcore coordinator.
-///
-/// `guest_rpc_observed` is set by the coordinator RPC listener the first time a
-/// SaBRe-loaded guest connects. When it stays false the guest completed without
-/// Detcore intercepting anything, so the run carries no determinism guarantee
-/// whatsoever -- its timing, scheduling, PIDs, and clock reads all came from the
-/// host. Reporting that as a successful `hermit run` would be a fail-open
-/// determinism hole, so the caller turns it into a hard error and this function
-/// supplies the diagnosis.
-///
-/// The dominant cause is a guest whose syscall sites SaBRe never rewrote. A
-/// statically linked ELF is the sharp edge: it has no dynamic loader and no
-/// shared library through which SaBRe could regain control, so an unrewritten
-/// static client runs entirely on bare Linux with no second chance.
 
 /// Guest-physical memory available to the single-process KVM personality.
 // The KVM personality is a sparse MAP_NORESERVE address space. QEMU needs room
@@ -3229,8 +3193,6 @@ mod kvm_execution_tests;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-737): Review public DBT dispatch and child environment ownership.
-/// Dispatch a command onto the Detcore-linked reverie-dbt runtime.
-
 // NOTE: A single-threaded executor is used here so that the tokio threads
 // themselves wouldn't contribute non-determinism to the PID namespace. This
 // could also be changed to a specific number of threads and that would be
