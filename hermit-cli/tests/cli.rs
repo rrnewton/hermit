@@ -11819,10 +11819,13 @@ fn run_dbt_private_placement_preserves_cli_echo() {
     let probe = dbt_placement_probe::Probe::new(true);
     let (install, bind) = probe.launch();
     let bind = bind.expect("CLI observation needs its explicit writable bind");
+    let observer = format!("LD_PRELOAD={}", probe.observer().display());
     let args = [
         "--backend=dbt",
         "run",
         bind.as_str(),
+        "--env",
+        observer.as_str(),
         "--",
         "/bin/echo",
         "hello",
@@ -11849,10 +11852,13 @@ fn run_dbt_private_placement_preserves_stdin_verification() {
     let bind = bind.expect("CLI observation needs its explicit writable bind");
     let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report_path = root.path().join("verdict.json");
+    let observer = format!("LD_PRELOAD={}", probe.observer().display());
     let args = [
         "--backend=dbt",
         "run",
         bind.as_str(),
+        "--env",
+        observer.as_str(),
         "--strict",
         "--verify",
         "--verify-strict",

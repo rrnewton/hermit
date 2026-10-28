@@ -4342,7 +4342,7 @@
       "disposition": "support-data",
       "path": "tests/e2e/system-utils/stat-alias",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
-      "why": "tests/e2e/system-utils/stat-alias is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: A symbolic link to /usr/bin/bash through which system-utils/stat-alias-root launches its root image, so the run's root is an ELF executed by an alias name; Detcore's stat, and on KVM its comm reads, name it by the link on ptrace and KVM; the KVM row records the executor's canonical naming, and the DBT row DynamoRIO's naming by the link's target"
+      "why": "tests/e2e/system-utils/stat-alias is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: A symbolic link to /usr/bin/bash through which system-utils/stat-alias-root launches its root image, so the run's root is an ELF executed by an alias name; Detcore's stat, and on KVM its comm reads, name it by the link on ptrace, DBT and KVM; the DBT row matches native alias naming through Reverie's explicit executable selection, while the KVM row retains the executor's canonical status naming"
     },
     {
       "disposition": "manifest-test",

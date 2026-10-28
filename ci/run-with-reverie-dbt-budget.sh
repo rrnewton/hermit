@@ -3119,7 +3119,14 @@ fi
 # and reverie-dbt/native stays c1f267db81c8. The calibrated SDK budget, job
 # width and limits carry unchanged from the e9c54de9 entry; inventory stays
 # 1038 and the LiteInst source catalog 73 rows.
-expected_pin=688a542d75af8310c4ddd97eadbf2434abb067ff
+# CARRY TO 90f9928cf3a2f6dde48bcd5cba7a52f6669faa76 (2026-10-28): forward reland
+# of the reviewed executable-selection source on the revert688a542d.
+# Its complete tree equals a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b,
+# restoring that entry's qualified SDK204 recipe; vendor/build.rs/native
+# are object-identical. The calibrated numeric budgets and widths are
+# unchanged. This is source/SDK-budget carry, not fresh Hermit execution;
+# the companion fixture repair requires its own actual controls.
+expected_pin=90f9928cf3a2f6dde48bcd5cba7a52f6669faa76
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

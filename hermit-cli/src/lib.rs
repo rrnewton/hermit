@@ -9989,6 +9989,7 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env(CHILD, "1")
+                .env(super::dbt_placement_probe::OBSERVER_ENV, probe.observer())
                 .env("HERMIT_INSTALL_DIR", install)
                 .env("HERMIT_REQUIRE_DBT", "1")
                 .output()
@@ -10010,6 +10011,9 @@ mod tests {
 
         let mut command = super::Command::new("/bin/echo");
         command.arg("hello");
+        let observer = std::env::var_os(super::dbt_placement_probe::OBSERVER_ENV)
+            .expect("isolated placement observer path");
+        command.env("LD_PRELOAD", &observer);
         let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
         config.sequentialize_threads = true;
         config.validate();
@@ -10029,6 +10033,7 @@ mod tests {
 
         let mut command = super::Command::new("/bin/sh");
         command.args(["-c", "printf 'guest-stderr\\n' >&2"]);
+        command.env("LD_PRELOAD", &observer);
         let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
         config.sequentialize_threads = true;
         config.validate();
