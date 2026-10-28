@@ -37,6 +37,30 @@ fn config() -> Config {
 
 /// Run `guest` under Detcore and require that it exits 0.
 fn under_detcore(guest: impl FnOnce() + Send) {
+    // The native half of these scenarios forks this process, and the Detcore
+    // half traces its threads: in the shared libtest binary a sibling test's
+    // fork can inherit a session in flight (or leave one for this test's
+    // fork to inherit) and wedge both. Each test therefore runs in a child
+    // process of its own, as nextest already runs it; the native half above
+    // simply runs again there.
+    const CHILD: &str = "HERMIT_PROC_STAT_LIFECYCLE_CHILD";
+    let case = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string();
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(&case)) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
     let (output, _) = detcore_testutils::test_fn_with_config::<Detcore, _>(
         guest,
         detcore_testutils::prepare_ptrace_timer_config(config()),

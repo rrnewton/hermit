@@ -1,0 +1,12 @@
+# Test binaries that drive a debug Detcore session on their test thread need
+# more than Rust's default 2 MiB spawned-thread stack: hermit-cli's own docs
+# measure about 2 MiB for the session alone in a debug build, so under plain
+# `cargo test` (libtest threads) such tests abort with a stack overflow,
+# while under nextest they pass on the 8 MiB main thread. The validation
+# harness already exports this same value for every cargo it runs
+# (VALIDATION_RUST_MIN_STACK in scripts/validate.rs); setting it here gives
+# plain `cargo test` the same test-thread stack without exporting anything.
+# An explicit RUST_MIN_STACK in the environment still wins: Cargo does not
+# override variables that are already set unless `force` is given.
+[env]
+RUST_MIN_STACK = "16777216"

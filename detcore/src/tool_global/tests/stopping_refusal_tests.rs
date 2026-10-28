@@ -109,6 +109,25 @@ fn members(namespace: &std::ffi::OsStr) -> Vec<String> {
 
 #[test]
 fn a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run() {
+    const ISOLATION_CHILD: &str = "HERMIT_TEST_STOPPING_REFUSAL_CHILD";
+    const CASE: &str = "tool_global::tests::stopping_refusal_tests::a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run";
+    if std::env::var_os(ISOLATION_CHILD).is_none() {
+        // The scenario initializes Detcore's global state in this process
+        // and forks from it. In the full libtest binary a sibling test's
+        // session or fork can leave that shared state wedged before this
+        // scenario starts, so it runs in an isolated child process.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+            .env(ISOLATION_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let sentinel = dir.path().join("sentinel");
     let sentinel_path = std::ffi::CString::new(sentinel.as_os_str().as_bytes()).unwrap();
