@@ -38,6 +38,87 @@ def need(ok, why):
         raise RuntimeError(why)
 
 
+def host_checker_profile(profile, optimized=False):
+    """Check Cargo's actual HOST profile without classifying dependency roles.
+
+    Build dependencies retain Cargo's opt0/debug0 override. The independently
+    selected checker and hashing/parser libraries must report opt2/debug2.
+    Every emitted artifact retains assertions and checked arithmetic.
+    """
+    need(type(profile) is dict and set(profile) == {
+        'opt_level', 'debuginfo', 'debug_assertions', 'overflow_checks', 'test'},
+        'HOST checker profile fields differ')
+    need(type(profile['opt_level']) is str and
+         profile['opt_level'] in ('0', '1', '2', '3', 's', 'z') and
+         type(profile['debuginfo']) is int and profile['debuginfo'] in (0, 1, 2) and
+         profile['debug_assertions'] is True and
+         profile['overflow_checks'] is True and profile['test'] is False,
+         'HOST checker profile types or safety fields differ')
+    if optimized:
+        need(profile['opt_level'] == '2' and profile['debuginfo'] == 2,
+             'selected HOST checker library is not opt2/debug2')
+
+
+def host_checker_dependencies(records, lock, cargo_home, target):
+    """Select four actual locked libraries; never infer roles from profiles."""
+    finished = [q for q in records if q.get('reason') == 'build-finished']
+    need(len(finished) == 1 and finished[0].get('success') is True,
+         'Cargo did not complete one successful build')
+    artifacts = [q for q in records if q.get('reason') == 'compiler-artifact']
+    for row in artifacts:
+        host_checker_profile(row.get('profile'))
+    selected = {}
+    for name in ('serde_json', 'sha2', 'digest', 'goblin'):
+        packages = [q for q in lock['package'] if q.get('name') == name]
+        need(len(packages) == 1 and
+             packages[0].get('source') == 'registry+https://github.com/rust-lang/crates.io-index',
+             'HOST checker locked dependency absent/ambiguous: ' + name)
+        package = packages[0]
+        package_id = package['source'] + '#' + name + '@' + package['version']
+        def is_build_script(row):
+            target_info = row.get('target', {})
+            manifest = Path(row.get('manifest_path', ''))
+            outputs = [Path(q) for q in row.get('filenames', [])]
+            source = manifest.parent / 'build.rs'
+            return (target_info.get('name') == 'build-script-build' and
+                    target_info.get('kind') == ['custom-build'] and
+                    target_info.get('crate_types') == ['bin'] and
+                    target_info.get('src_path') == str(source) and
+                    source.resolve() == source and source.is_file() and
+                    manifest.is_relative_to(Path(cargo_home) / 'registry/src') and
+                    manifest.parent.name == name + '-' + package['version'] and
+                    manifest.name == 'Cargo.toml' and manifest.resolve() == manifest and
+                    manifest.is_file() and row.get('executable') is None and
+                    len(outputs) == 1 and outputs[0].name == 'build-script-build' and
+                    outputs[0].is_relative_to(Path(target) / 'debug/build') and
+                    outputs[0].resolve() == outputs[0] and outputs[0].is_file())
+        # Cargo also emits the package's build script. Select the library by
+        # target role before checking profiles; malformed library duplicates
+        # still count, even when their profile would be refused.
+        candidates = [q for q in artifacts if q.get('target', {}).get('name') == name or
+                      (q.get('package_id') == package_id and not is_build_script(q))]
+        need(len(candidates) == 1, 'HOST checker dependency output absent/ambiguous: ' + name)
+        row = candidates[0]
+        manifest = Path(row['manifest_path'])
+        need(row['package_id'] == package_id and
+             row['target']['name'] == name and row['target']['kind'] == ['lib'] and
+             row['target']['crate_types'] == ['lib'] and row['executable'] is None and
+             manifest.is_relative_to(Path(cargo_home) / 'registry/src') and
+             manifest.name == 'Cargo.toml' and
+             manifest.parent.name == name + '-' + package['version'] and
+             manifest.resolve() == manifest and manifest.is_file() and
+             row['target']['src_path'] == str(manifest.parent / 'src/lib.rs'),
+             'HOST checker dependency identity differs: ' + name)
+        host_checker_profile(row['profile'], optimized=True)
+        outputs = [Path(q) for q in row['filenames']]
+        need(sum(q.suffix == '.rlib' for q in outputs) == 1 and
+             all(q.is_absolute() and q.resolve() == q and q.is_file() and
+                 q.is_relative_to(Path(target) / 'debug') for q in outputs),
+             'HOST checker dependency outputs differ: ' + name)
+        selected[name] = row
+    return selected
+
+
 def cancellation(pending, error):
     """Keep the first KeyboardInterrupt/SystemExit to re-raise after every close."""
     return pending if pending is not None or isinstance(error, Exception) else error
@@ -788,12 +869,17 @@ def main():
         package = packages[0]
         targets = [q for q in package['targets'] if q['name'] == 'reverie_liteinst_artifact' and q['kind'] == ['lib'] and q['crate_types'] == ['lib'] and q['src_path'] == str(Path(c['R']) / 'reverie-liteinst-artifact/src/lib.rs')]
         need(len(targets) == 1, 'tool library target ambiguous')
-        raw = command('tool-build', [c['host-cargo'], 'build', '--locked', '--offline', '--manifest-path', manifest, '-p', 'reverie-liteinst-artifact', '--lib', '-j4', '--target-dir', c['target'], '--message-format=json-render-diagnostics'], c['R'], host=True)
+        # Optimize only this HOST qualification tool and its normal dependencies.
+        # The separately built musl runtime keeps its existing codegen profile.
+        raw = command('tool-build', [c['host-cargo'], 'build', '--locked', '--offline', '--manifest-path', manifest, '-p', 'reverie-liteinst-artifact', '--lib', '-j4', '--target-dir', c['target'], '--message-format=json-render-diagnostics', '--config', 'profile.dev.opt-level=2', '--config', 'profile.dev.debug-assertions=true', '--config', 'profile.dev.overflow-checks=true'], c['R'], host=True)
         records = [json.loads(line) for line in raw.splitlines() if line.strip()]
-        need([q['success'] for q in records if q.get('reason') == 'build-finished'] == [True], 'Cargo did not complete one successful build')
+        result['checked_host_dependency_profiles'] = host_checker_dependencies(
+            records, tomllib.loads((Path(c['R']) / 'Cargo.lock').read_text()),
+            c['cargo_home'], c['target'])
         roots = [q for q in records if q.get('reason') == 'compiler-artifact' and (q.get('package_id') == package['id'] or q.get('manifest_path') == manifest)]
         need(len(roots) == 1, 'unexpected/duplicate same-package artifact; no broad build-script exemption')
         selected = roots[0]
+        host_checker_profile(selected['profile'], optimized=True)
         need(selected['target'] == targets[0] and selected['package_id'] == package['id'] and selected['manifest_path'] == manifest, 'complete target/package identity differs')
         need(selected['features'] == [] and selected['profile']['test'] is False and selected['executable'] is None, 'unexpected tool features/test/executable')
         rlibs = [Path(q) for q in selected['filenames'] if q.endswith('.rlib')]

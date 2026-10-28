@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 D = Path(__file__).resolve().parent
-PREPARE_SHA = '81dd48f4d6dd49309ea7fb84f83611092b6011dd9e42afd2edd193af93551bab'
+PREPARE_SHA = 'ad4b38c02fddefd46d7a0fe4aa64c6df828955012040bf9098fe4f8f1d24b7cd'
 PROTOCOL_SHA = 'd6ef0e73d539ba0f8824610ad1140ffa1170eee72e11bd7863e0843993fdafa5'
 EXPECTED = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
 LEGACY = '85e0f1cb9393c1ed11db4d6115f81dbce5d3f0afcfc733aa4d0cd2d6725245c7'
