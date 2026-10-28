@@ -6006,6 +6006,11 @@ impl GlobalState {
                     .await
                     .signal_target_process(named),
             ),
+            GlobalRequest::CpuClockProcess(named) => R::CpuClockProcess(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .cpu_clock_process(named),
+            ),
             GlobalRequest::PosixTimerThread(process, named) => R::PosixTimerThread(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -8931,6 +8936,10 @@ pub enum GlobalRequest {
     /// that learns of the refusal only from the coordinator (DBT). Answered
     /// with `PolicyRefusal`. Appended last.
     PidfdSelfQualificationRefusal(crate::PidfdSelfQualificationRefusal),
+    /// The process a CPU clock id naming this id belongs to, if it names a
+    /// live thread or an existing process (`Scheduler::cpu_clock_process`).
+    /// Appended last.
+    CpuClockProcess(DetPid),
 }
 
 /// Responses from the global object
@@ -9323,6 +9332,8 @@ pub enum GlobalResponse {
     FlockHeldBy(Option<(bool, i64)>),
     /// The answer to `GlobalRequest::ChildSubreaper`. Appended last.
     ChildSubreaper(bool),
+    /// The answer to `GlobalRequest::CpuClockProcess`. Appended last.
+    CpuClockProcess(Option<DetPid>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -13494,6 +13505,20 @@ where
     let response = send_and_update_time(guest, GlobalRequest::SignalTargetProcess(named)).await;
     match response.1 {
         GlobalResponse::SignalTargetProcess(process) => process,
+        _ => unreachable!(),
+    }
+}
+
+/// The process a CPU clock id naming `named` belongs to, if `named` is a live
+/// thread or an existing process (`Scheduler::cpu_clock_process`).
+pub(crate) async fn cpu_clock_process<G, T>(guest: &mut G, named: DetPid) -> Option<DetPid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::CpuClockProcess(named)).await;
+    match response.1 {
+        GlobalResponse::CpuClockProcess(process) => process,
         _ => unreachable!(),
     }
 }
@@ -21883,9 +21908,9 @@ mod tests {
         let t = LogicalTime::from_nanos;
         let [periodic, disarmed, silent] = {
             let mut timers = guest.thread.posix_timers.lock().unwrap();
-            let periodic = timers.create(Some(libc::SIGUSR2), None, None, false);
-            let disarmed = timers.create(Some(libc::SIGALRM), None, None, false);
-            let silent = timers.create(None, None, None, false);
+            let periodic = timers.create(Some(libc::SIGUSR2), None, None, None);
+            let disarmed = timers.create(Some(libc::SIGALRM), None, None, None);
+            let silent = timers.create(None, None, None, None);
             timers.settime(periodic, 50, Some(t(100)), t(0));
             timers.settime(silent, 0, Some(t(200)), t(0));
             [periodic, disarmed, silent]
@@ -21918,7 +21943,7 @@ mod tests {
             }
         }
         let mut timers = guest.thread.posix_timers.lock().unwrap();
-        let new = timers.create(Some(libc::SIGUSR1), None, None, false);
+        let new = timers.create(Some(libc::SIGUSR1), None, None, None);
         assert_eq!(new, 3);
         assert_eq!(timers.settime(new, 0, Some(t(300)), t(10)), Some((0, 0)));
         assert_eq!(timers.gettime(new, t(20)), Some((280, 0)));
