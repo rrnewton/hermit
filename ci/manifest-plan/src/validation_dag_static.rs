@@ -1231,7 +1231,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and hermit-manifest-plan's copy of canonical_verdict::tests::
     // store_exclusive_retries_are_optional_and_strictly_typed (a verify
     // divergence names its store-exclusive retries): 1934.
-    ("test.regular_crates", 1934),
+    // And detcore-model's config::tests::
+    // rewrite_exclusives_overlay_never_enters_the_legacy_form: 1935.
+    ("test.regular_crates", 1935),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -6245,7 +6247,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same legacy-form unit: 1918.
     // Less #4740's tests, which main counts since train 10: 1917.
     // And the same three store-exclusive cause units: 1920.
-    ("test.regular_crates_on_host", 1920),
+    // And the same overlay legacy-form unit: 1921.
+    ("test.regular_crates_on_host", 1921),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

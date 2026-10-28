@@ -551,6 +551,7 @@ pub(crate) fn store_exclusive_retries(
                 failed: counts.failed,
                 executed: counts.executed,
                 fully_counted: counts.fully_counted,
+                counted_per_mille: counts.counted_per_mille,
             })
     };
     let (counts1, counts2) = (counts(run1), counts(run2));
@@ -599,10 +600,13 @@ pub(crate) fn store_exclusive_retries_line(retries: &StoreExclusiveRetries) -> S
                     plural(counts.failed, "store-exclusive")
                 ),
             };
-            if counts.fully_counted {
-                failed
-            } else {
-                format!("{failed} (counted for part of the run)")
+            match (counts.fully_counted, counts.counted_per_mille) {
+                (true, _) => failed,
+                (false, Some(per_mille)) => format!(
+                    "{failed} (counted for {} of the run)",
+                    detcore_model::summary::counted_share(per_mille)
+                ),
+                (false, None) => format!("{failed} (counted for part of the run)"),
             }
         }
     };
@@ -5598,6 +5602,7 @@ mod tests {
                 failed: 1,
                 executed: Some(9),
                 fully_counted: true,
+                counted_per_mille: None,
             }),
             run2: None,
             loops_left: BTreeMap::from([("/bin/guest".to_owned(), 1)]),
@@ -5639,6 +5644,7 @@ mod tests {
                 failed,
                 executed,
                 fully_counted: true,
+                counted_per_mille: Some(1000),
             }),
             exclusive_pairs: pairs
                 .iter()
@@ -5666,11 +5672,13 @@ mod tests {
                     failed: 2,
                     executed: Some(16_641),
                     fully_counted: true,
+                    counted_per_mille: Some(1000),
                 }),
                 run2: Some(StoreExclusiveRunCounts {
                     failed: 0,
                     executed: Some(16_645),
                     fully_counted: true,
+                    counted_per_mille: Some(1000),
                 }),
                 loops_left: BTreeMap::from([
                     ("/bin/guest".to_owned(), 4),
@@ -5697,6 +5705,7 @@ mod tests {
                 failed: 1,
                 executed: None,
                 fully_counted: false,
+                counted_per_mille: None,
             }),
             run2: None,
             loops_left: BTreeMap::from([("/bin/guest".to_owned(), 1)]),
@@ -5718,6 +5727,24 @@ mod tests {
             ),
             "{line}"
         );
+        // A run whose counters covered a known share says it.
+        let share = StoreExclusiveRetries {
+            run1: Some(StoreExclusiveRunCounts {
+                failed: 1,
+                executed: Some(80_002),
+                fully_counted: false,
+                counted_per_mille: Some(632),
+            }),
+            ..left.clone()
+        };
+        assert!(
+            store_exclusive_retries_line(&share).starts_with(
+                "possible cause: run 1 failed 1 of 80002 store-exclusives (counted for 63.2% of \
+                 the run), run 2 did not count them."
+            ),
+            "{}",
+            store_exclusive_retries_line(&share)
+        );
         let elsewhere = StoreExclusiveRetries {
             loops_left: BTreeMap::new(),
             rewrite_exclusives: None,
@@ -5735,7 +5762,7 @@ mod tests {
         );
         let none_left_without_rewrite = StoreExclusiveRetries {
             rewrite_exclusives: Some(false),
-            ..elsewhere
+            ..elsewhere.clone()
         };
         assert!(
             !store_exclusive_retries_line(&none_left_without_rewrite).contains("setting"),
