@@ -3259,7 +3259,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
-    ("test.detcore_unit", 3465),
+    // And the CPU-clock fix-forward's five units (cpu_clock's
+    // the_resolution_is_the_kernels_for_each_kind, cpu_clock::handler_tests'
+    // a_cpu_clock_sleep_that_would_wait_is_refused and
+    // timer_create_checks_the_task_a_cpu_clock_names, thread_cpu_time_tests'
+    // an_exited_leaders_clock_keeps_its_final_time and scheduler's
+    // a_cpu_clock_names_only_tasks_linux_still_has): 3247, listed.
+    // And cpu_clock::handler_tests'
+    // timer_settime_on_a_timer_whose_thread_exited_is_esrch: 3384 + 6 = 3390, listed.
+    // Rebased onto main fcd62385f: 3465 + 6 = 3471.
+    ("test.detcore_unit", 3471),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5866,7 +5875,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
-    ("test.detcore_unit_on_host", 3465),
+    // And the same five CPU-clock fix-forward units: 3247, listed.
+    // And the same timer_settime ESRCH unit: 3384 + 6 = 3390, listed.
+    // Rebased onto main fcd62385f: 3465 + 6 = 3471.
+    ("test.detcore_unit_on_host", 3471),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
