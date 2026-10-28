@@ -539,6 +539,9 @@ mod tests {
     /// test in a process of its own, as the validation DAG does.
     #[test]
     fn bisect_installs_the_replays_skid_margin() {
+        if crate::run_in_fresh_process("bisect::tests::bisect_installs_the_replays_skid_margin") {
+            return;
+        }
         let argv = [
             "hermit",
             "bisect",

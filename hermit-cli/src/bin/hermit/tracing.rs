@@ -1304,6 +1304,11 @@ mod tests {
 
     #[test]
     fn synchronous_pid_alignment_matches_the_file_appender_baseline() {
+        if crate::run_in_fresh_process(
+            "tracing::tests::synchronous_pid_alignment_matches_the_file_appender_baseline",
+        ) {
+            return;
+        }
         let synchronous_pid = pid_namespace()
             .run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
@@ -1328,6 +1333,11 @@ mod tests {
 
     #[test]
     fn pid_alignment_succeeds_when_host_thread_creation_is_denied() {
+        if crate::run_in_fresh_process(
+            "tracing::tests::pid_alignment_succeeds_when_host_thread_creation_is_denied",
+        ) {
+            return;
+        }
         let guest_pid = pid_namespace()
             .run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
@@ -1342,6 +1352,9 @@ mod tests {
 
     #[test]
     fn kvm_pid_alignment_allocates_no_host_task() {
+        if crate::run_in_fresh_process("tracing::tests::kvm_pid_alignment_allocates_no_host_task") {
+            return;
+        }
         let next_pid = pid_namespace()
             .run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
@@ -1816,6 +1829,11 @@ mod tests {
     /// bound. Run with --no-capture to see the delivery rates.
     #[test]
     fn the_final_message_is_the_last_line_when_writers_race_the_crossing() {
+        if crate::run_in_fresh_process(
+            "tracing::tests::the_final_message_is_the_last_line_when_writers_race_the_crossing",
+        ) {
+            return;
+        }
         if let Ok(bound) = std::env::var(LOG_CAP_STRESS_CHILD) {
             race_writers_to_the_crossing(Duration::from_millis(bound.parse().unwrap()));
         }
@@ -1933,6 +1951,11 @@ mod tests {
     /// bound. Also proves the count is shared with a forked child.
     #[test]
     fn crossing_the_cap_exits_with_the_log_cap_status_and_says_why() {
+        if crate::run_in_fresh_process(
+            "tracing::tests::crossing_the_cap_exits_with_the_log_cap_status_and_says_why",
+        ) {
+            return;
+        }
         use std::io::Read;
         use std::os::fd::FromRawFd;
 
@@ -2036,6 +2059,11 @@ mod tests {
     /// finding 5 on <https://github.com/rrnewton/hermit/pull/3686>.)
     #[test]
     fn the_stop_message_is_not_appended_after_the_truncation_marker() {
+        if crate::run_in_fresh_process(
+            "tracing::tests::the_stop_message_is_not_appended_after_the_truncation_marker",
+        ) {
+            return;
+        }
         use std::io::Read;
         use std::os::fd::FromRawFd;
 
@@ -2108,6 +2136,11 @@ mod tests {
     /// https://github.com/rrnewton/hermit/pull/3686, round 1).
     #[test]
     fn crossing_the_cap_exits_even_when_no_sink_can_take_the_message() {
+        if crate::run_in_fresh_process(
+            "tracing::tests::crossing_the_cap_exits_even_when_no_sink_can_take_the_message",
+        ) {
+            return;
+        }
         use std::os::fd::FromRawFd;
         use std::time::Duration;
         use std::time::Instant;
@@ -2242,6 +2275,11 @@ mod tests {
     /// the first report may reach stderr.
     #[test]
     fn the_outer_log_cap_diagnostic_is_attempted_at_most_once() {
+        if crate::run_in_fresh_process(
+            "tracing::tests::the_outer_log_cap_diagnostic_is_attempted_at_most_once",
+        ) {
+            return;
+        }
         use std::io::Read;
         use std::os::fd::FromRawFd;
 
