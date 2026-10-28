@@ -222,7 +222,7 @@ under the other, and `--verify --verify-strict` gave `bitwise_parity: true`
 in 1 of 16 runs: that was the fraction of runs that started under the first
 cache.
 
-Hermit now records the set of host files a run read in its `--summary-json`
+Hermit now records the set of regular host files a run read in its `--summary-json`
 summary and in a `--record-preemptions-to` schedule (`host_inputs`, with a
 digest of the set), and a schedule replay prints
 `HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING` for each file whose bytes (or,

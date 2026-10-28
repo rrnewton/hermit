@@ -17392,7 +17392,8 @@ fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
         "{recorded}"
     );
     // The program the kernel exec'd is in the set too, under the path its
-    // `/proc/<pid>/exe` link names, and so is the ELF interpreter it names.
+    // `/proc/<pid>/exe` link names, and so is the ELF interpreter it names,
+    // under the name the kernel mapped it by (its symbolic links resolved).
     let holds = |path: &str| {
         recorded["host_inputs"]["files"]
             .as_array()
@@ -17407,9 +17408,11 @@ fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
         program.display()
     );
     if let Some(interpreter) = elf_program_interpreter(&program) {
+        let interpreter = fs::canonicalize(&interpreter).unwrap();
         assert!(
-            holds(&interpreter),
-            "the recording does not hold {interpreter}: {recorded}"
+            holds(interpreter.to_str().unwrap()),
+            "the recording does not hold {}: {recorded}",
+            interpreter.display()
         );
     }
 
@@ -17490,6 +17493,184 @@ fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
             "{summary}"
         );
     }
+}
+
+/// Recording the host files a guest opens adds no inotify event the guest
+/// sees. A guest watching its own directory reads a file there and runs a
+/// program from there whose program interpreter is a copy of the host's
+/// dynamic loader in that directory. The events it reports for the file and
+/// for the interpreter are the same whether Hermit records nothing, writes a
+/// summary, records a schedule or replays one. Hermit once hashed each file
+/// through the guest's descriptor as the guest opened it, and hashed each new
+/// image's interpreter at the exec, which the guest saw as one more `ACCESS`
+/// and `CLOSE_NOWRITE` on the file and another `OPEN`, `ACCESS` and
+/// `CLOSE_NOWRITE` on the interpreter. It now hashes the files once the
+/// guest's processes have exited, which the recorded schedule shows by
+/// holding the file's digest.
+///
+/// The program image's own events are not compared: a host's file scanner
+/// may open an image it sees executed, at a time of its own, and native runs
+/// of this guest differ there. The interpreter, which the kernel maps for the
+/// image, draws no such opens. PMU-free: no `--chaos`.
+#[test]
+fn recording_host_inputs_adds_no_inotify_event_the_guest_sees() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let watched = directory.path().join("watched");
+    fs::create_dir(&watched).unwrap();
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_inputs/inotify_reads.c");
+    let compile = |output: &Path, flags: &[&str]| {
+        let compiled = Command::new("cc")
+            .args(["-O1", "-Wall", "-Wextra", "-Werror"])
+            .args(flags)
+            .arg(&source)
+            .arg("-o")
+            .arg(output)
+            .output()
+            .expect("failed to run cc");
+        assert!(
+            compiled.status.success(),
+            "the inotify guest did not compile:\n{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+    };
+    let guest = watched.join("inotify_reads");
+    compile(&guest, &[]);
+    // The child's interpreter: a copy of the one the guest names, in the
+    // watched directory, so that its first exec mapping happens under the
+    // watch.
+    let interpreter = elf_program_interpreter(&guest).expect("cc links dynamically");
+    let loader = watched.join("ld.so");
+    fs::copy(fs::canonicalize(&interpreter).unwrap(), &loader).unwrap();
+    compile(
+        &watched.join("child"),
+        &[&format!("-Wl,--dynamic-linker={}", loader.display())],
+    );
+    fs::write(watched.join("F"), "input\n").unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let run = |options: &[String]| -> Vec<String> {
+        let mut args = vec![
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        ];
+        args.extend(options.iter().map(String::as_str));
+        args.extend(["--", guest.to_str().unwrap()]);
+        let output = hermit_test::hermit_output(
+            "inotify guest run",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        stdout(&output)
+            .lines()
+            .filter(|line| line.starts_with("F ") || line.starts_with("ld.so "))
+            .map(str::to_owned)
+            .collect()
+    };
+    let unrecorded = run(&[]);
+    // The guest's own read; then the kernel's open of the interpreter for the
+    // exec, whose further events depend on the kernel.
+    assert_eq!(unrecorded[..3], ["F OPEN", "F ACCESS", "F CLOSE_NOWRITE"]);
+    assert_eq!(unrecorded.get(3).map(String::as_str), Some("ld.so OPEN"));
+    let summary = |name: &str| format!("--summary-json={}", directory.path().join(name).display());
+    for options in [
+        vec![summary("summary.json")],
+        vec![format!("--record-preemptions-to={}", schedule.display())],
+        vec![
+            format!("--replay-preemptions-from={}", schedule.display()),
+            summary("replay.json"),
+        ],
+    ] {
+        assert_eq!(run(&options), unrecorded, "{options:?}");
+    }
+    // The recording hashed `F` (`printf 'input\n' | sha256sum`), after the
+    // guest had exited.
+    let recorded: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    let input = watched.join("F");
+    let file = recorded["host_inputs"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == input.to_str().unwrap())
+        .unwrap_or_else(|| panic!("the recording does not hold F: {recorded}"))
+        .clone();
+    assert_eq!(
+        file["content"], "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453",
+        "{file}"
+    );
+}
+
+/// A schedule replay of a guest that lists and writes its private `/tmp`
+/// names no host input change. Hermit makes that directory for each run, so
+/// it has a new inode every time, and a directory is not a host input file:
+/// it has no bytes to compare. A file the guest creates there is its own, not
+/// a host input. Before, the replay reported `/tmp` as changed since the
+/// recording. PMU-free: no `--chaos`.
+#[test]
+fn a_replay_of_a_guest_that_uses_its_private_tmp_names_no_change() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let run = |schedule_arg: String, summary: &Path| {
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let args = [
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            &schedule_arg,
+            &summary_arg,
+            "--",
+            "/bin/sh",
+            "-c",
+            "ls -a /tmp && echo written > /tmp/f && cat /tmp/f",
+        ];
+        let output = hermit_test::hermit_output(
+            "private /tmp schedule run",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(summary).unwrap()).unwrap();
+        (stdout(&output), stderr(&output), summary)
+    };
+    let under_tmp = |path: &str| path == "/tmp" || path.starts_with("/tmp/");
+    let (out, _, recorded) = run(
+        format!("--record-preemptions-to={}", schedule.display()),
+        &directory.path().join("record.json"),
+    );
+    assert_eq!(out, ".\n..\nwritten\n");
+    let files = recorded["host_inputs"]["files"].as_array().unwrap();
+    assert!(!files.is_empty(), "{recorded}");
+    assert!(
+        files
+            .iter()
+            .all(|file| !under_tmp(file["path"].as_str().unwrap())),
+        "{recorded}"
+    );
+
+    let (out, err, replayed) = run(
+        format!("--replay-preemptions-from={}", schedule.display()),
+        &directory.path().join("replay.json"),
+    );
+    assert_eq!(out, ".\n..\nwritten\n");
+    assert!(
+        !err.lines().any(|line| {
+            line.starts_with("HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING")
+                && line.contains("host input /tmp")
+        }),
+        "{err}"
+    );
+    // Absent when nothing changed.
+    let changes = replayed["host_inputs_changed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        changes
+            .iter()
+            .all(|change| !under_tmp(change["path"].as_str().unwrap())),
+        "{replayed}"
+    );
 }
 
 /// The program interpreter (`PT_INTERP`) an ELF64 executable names, or `None`

@@ -332,6 +332,8 @@ mod tests {
                     content: None,
                     exec: false,
                     kernel_object: false,
+                    non_regular: false,
+                    reopen: None,
                 })
                 .collect(),
             mutated: Vec::new(),

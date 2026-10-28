@@ -1231,10 +1231,12 @@ pub struct GlobalState {
     host_mutations: Mutex<BTreeSet<String>>,
 
     // When this run replays a schedule whose recording names the host files
-    // its run opened, and `Config::record_host_inputs` is set: the comparison
-    // of this run's opens against them (`crate::host_inputs`). Information
-    // only; no scheduling decision reads it.
-    replay_host_inputs: Option<Mutex<crate::host_inputs::ReplayHostInputs>>,
+    // its run opened, and `Config::record_host_inputs` is set: those files.
+    // This run's files are compared against them when it ends
+    // (`Self::finish_host_inputs`), into `host_inputs_changed`. Information
+    // only; no scheduling decision reads either.
+    recorded_host_inputs: Option<HostInputSet>,
+    host_inputs_changed: Mutex<Vec<detcore_model::host_input::HostInputChange>>,
 
     // The canonical models of open file descriptions that several guest
     // processes share (see `crate::shared_open_files`). Locked after `sched`,
@@ -1779,8 +1781,8 @@ impl GlobalState {
         };
 
         // A replayed recording that names the host files its run opened:
-        // this run's opens are compared against them.
-        let replay_host_inputs = cfg
+        // this run's files are compared against them when it ends.
+        let recorded_host_inputs = cfg
             .record_host_inputs
             .then(|| {
                 preemptions_to_replay
@@ -1789,8 +1791,7 @@ impl GlobalState {
                     .cloned()
                     .or_else(|| sched.lock().unwrap().recorded_host_inputs.clone())
             })
-            .flatten()
-            .map(|recorded| Mutex::new(crate::host_inputs::ReplayHostInputs::new(recorded)));
+            .flatten();
         let range = Self::read_port_range();
         let network = Self::network_engine(cfg).map(Mutex::new);
 
@@ -1831,7 +1832,8 @@ impl GlobalState {
             policy_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
-            replay_host_inputs,
+            recorded_host_inputs,
+            host_inputs_changed: Mutex::new(Vec::new()),
             shared_open_files: process_exit_cleanup.shared_open_files,
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
@@ -2223,6 +2225,9 @@ impl GlobalState {
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
+        // The guest's processes have all exited: hash the files they opened,
+        // and compare them with a replayed recording's.
+        self.finish_host_inputs();
         // The run is over: write what it opened for --verify.
         if let Some(log) = &self.cfg.host_input_log {
             crate::host_inputs::write(
@@ -2312,6 +2317,60 @@ impl GlobalState {
         crate::combine_finalization(summary, flushed)
     }
 
+    /// Hash the host files the guest opened (`crate::host_inputs::hash_at_end`),
+    /// once its processes have all exited, and, for a replay of a recording
+    /// that names its run's files, compare this run's with them
+    /// (`crate::host_inputs::changes_since`): each file that changed goes into
+    /// the summary and gets one line on Hermit's stderr, in the order of its
+    /// first open. Before, this read the files while the guest ran, which the
+    /// guest could observe through inotify. A failed backend's run, whose
+    /// processes may not have exited, is not hashed and compares nothing.
+    /// Neither is a `--kill-daemons` run: the kill switch fires once only
+    /// daemons remain and does not wait for them to exit, so a daemon may
+    /// still be alive here. Its files compare by identity.
+    fn finish_host_inputs(&self) {
+        if !self.cfg.record_host_inputs {
+            return;
+        }
+        let mut records = self
+            .host_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.cfg.kill_daemons {
+            crate::host_inputs::hash_at_end(&mut records);
+        }
+        let Some(recorded) = &self.recorded_host_inputs else {
+            return;
+        };
+        let changes = crate::host_inputs::changes_since(
+            recorded,
+            &records,
+            &self
+                .host_mutations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        drop(records);
+        for change in &changes {
+            // Hermit's own stderr, never the guest's output or the log
+            // `--verify` compares, without panicking where the guest made the
+            // shared stderr nonblocking (`crate::util::RetryingStderr`).
+            let line = format!(
+                "{} {change}\n",
+                detcore_model::host_input::HOST_INPUT_CHANGED_SINCE_RECORDING_MARKER
+            );
+            let _ = if crate::nonwaiting_write::diagnostics_must_not_wait() {
+                std::io::Write::write_all(&mut crate::util::DroppingStderr, line.as_bytes())
+            } else {
+                std::io::Write::write_all(&mut crate::util::RetryingStderr, line.as_bytes())
+            };
+        }
+        *self
+            .host_inputs_changed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = changes;
+    }
+
     /// The host files this run's guest opened (`crate::host_inputs::input_set`),
     /// when `Config::record_host_inputs` is set.
     fn host_input_set(&self) -> Option<HostInputSet> {
@@ -2366,9 +2425,11 @@ impl GlobalState {
         // The host files the guest opened, and those a replay found changed
         // since its recording. Like `preemption`, outside the INFO view.
         summary.host_inputs = host_inputs;
-        if let Some(replay) = &self.replay_host_inputs {
-            summary.host_inputs_changed = replay.lock().unwrap().changes().to_vec();
-        }
+        summary.host_inputs_changed = self
+            .host_inputs_changed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -2987,37 +3048,12 @@ impl GlobalState {
             path,
             syscall,
             identity,
-            content,
+            reopen,
             exec,
             kernel_object,
+            non_regular,
         } = request
         {
-            let change = self.replay_host_inputs.as_ref().and_then(|replay| {
-                let mutated = self
-                    .host_mutations
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                replay
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .observe(&path, identity, content.as_deref(), kernel_object, &mutated)
-                    .cloned()
-            });
-            if let Some(change) = change {
-                // Hermit's own stderr, never the guest's output or the log
-                // `--verify` compares, written with no lock held and without
-                // panicking where the guest made the shared stderr
-                // nonblocking (`crate::util::RetryingStderr`).
-                let line = format!(
-                    "{} {change}\n",
-                    detcore_model::host_input::HOST_INPUT_CHANGED_SINCE_RECORDING_MARKER
-                );
-                let _ = if crate::nonwaiting_write::diagnostics_must_not_wait() {
-                    std::io::Write::write_all(&mut crate::util::DroppingStderr, line.as_bytes())
-                } else {
-                    std::io::Write::write_all(&mut crate::util::RetryingStderr, line.as_bytes())
-                };
-            }
             self.host_inputs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -3026,9 +3062,11 @@ impl GlobalState {
                     dtid: dtid.as_raw() as u64,
                     syscall,
                     identity,
-                    content,
+                    content: None,
                     exec,
                     kernel_object,
+                    non_regular,
+                    reopen,
                 });
             if early_victim_request {
                 return (None, R::Retired);
@@ -6911,15 +6949,18 @@ pub enum GlobalRequest {
         syscall: u64,
         /// Captured actual host file identity.
         identity: HostFileIdentity,
-        /// The SHA-256 of the file's bytes, where the tool could read them
-        /// (`detcore_model::host_input::HostInput::content`).
-        content: Option<String>,
+        /// Where the tool finds the file again when the run ends, to hash its
+        /// bytes then (`detcore_model::host_input::HostReopen`).
+        reopen: Option<detcore_model::host_input::HostReopen>,
         /// Whether the kernel opened the file for an exec
         /// (`detcore_model::host_input::HostInputRecord::exec`).
         exec: bool,
         /// Whether the descriptor's own path is a kernel object
         /// (`detcore_model::host_input::HostInputRecord::kernel_object`).
         kernel_object: bool,
+        /// Whether the open reached something other than a regular file
+        /// (`detcore_model::host_input::HostInputRecord::non_regular`).
+        non_regular: bool,
     },
 
     /// Record that the sending thread rebound `path` in the guest's file
@@ -7828,9 +7869,10 @@ pub(crate) async fn record_host_input<G, T>(
     guest: &mut G,
     path: String,
     identity: HostFileIdentity,
-    content: Option<String>,
+    reopen: Option<detcore_model::host_input::HostReopen>,
     exec: bool,
     kernel_object: bool,
+    non_regular: bool,
 ) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -7842,9 +7884,10 @@ pub(crate) async fn record_host_input<G, T>(
             path,
             syscall,
             identity,
-            content,
+            reopen,
             exec,
             kernel_object,
+            non_regular,
         },
     )
     .await;
@@ -19824,10 +19867,13 @@ mod tests {
     }
 
     /// A run that replays a schedule whose recording names the host files its
-    /// run opened reports each file whose first open now finds another file
-    /// (here, unhashed, another identity), once, in its summary, and keeps its own host-input set in the
-    /// summary and in the schedule it records. The comparison changes no
-    /// clock (`host_input_observations_are_kept_by_the_run_and_written_at_its_end`).
+    /// run opened reports, when it ends, each file whose first open found
+    /// another file (here, unhashed, another identity), once, in its summary,
+    /// and keeps its own host-input set in the summary and in the schedule it
+    /// records. A file is hashed at the end, so one rewritten with the
+    /// recorded bytes under a new inode is not reported, and a directory made
+    /// again for each run is not compared. Recording changes no clock
+    /// (`host_input_observations_are_kept_by_the_run_and_written_at_its_end`).
     #[tokio::test]
     async fn a_schedule_replay_reports_host_inputs_changed_since_its_recording() {
         use detcore_model::host_input::HostFileIdentity;
@@ -19849,14 +19895,29 @@ mod tests {
             content: None,
             exec: false,
             kernel_object: false,
+            non_regular: false,
+            reopen: None,
         };
         let directory = tempfile::tempdir().unwrap();
+        // A file the replay finds rewritten with the recorded bytes under a
+        // new inode, which the run hashes when it ends.
+        let input = directory.path().join("F");
+        std::fs::write(&input, "input\n").unwrap();
+        let stat = crate::util::raw_stat(&input).unwrap();
+        // `printf 'input\n' | sha256sum`
+        let sha = "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453";
         let recorded = directory.path().join("recorded.json");
         let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()));
         writer.set_host_inputs(crate::host_inputs::input_set(
             &[
                 open("/etc/ld.so.cache", 9, 36887),
                 open("/lib64/libc.so.6", 10, 2_000_000),
+                HostInputRecord {
+                    content: Some(sha.to_owned()),
+                    ..open("/F", 7, 6)
+                },
+                // A directory made again for each run (the private `/tmp`).
+                open("/tmp", 8, 4096),
             ],
             &BTreeSet::new(),
         ));
@@ -19876,11 +19937,22 @@ mod tests {
         let dettid = DetTid::from_raw(3);
         let sender_time = DetTime::new(&config);
         let global_before = state.global_time.lock().unwrap().as_nanos();
-        for (path, ino, size) in [
-            ("/etc/ld.so.cache", 11, 36839),
-            ("/lib64/libc.so.6", 10, 2_000_000),
+        let input_identity = HostFileIdentity::from_stat(&stat);
+        for (path, identity, reopen, non_regular) in [
+            ("/etc/ld.so.cache", identity(11, 36839), None, false),
+            ("/lib64/libc.so.6", identity(10, 2_000_000), None, false),
             // A second open of a changed path is not reported again.
-            ("/etc/ld.so.cache", 12, 36887),
+            ("/etc/ld.so.cache", identity(12, 36887), None, false),
+            (
+                "/F",
+                input_identity,
+                Some(detcore_model::host_input::HostReopen::new(
+                    input.clone(),
+                    &stat,
+                )),
+                false,
+            ),
+            ("/tmp", identity(13, 4096), None, true),
         ] {
             let response = state
                 .receive_rpc(
@@ -19891,10 +19963,11 @@ mod tests {
                         GlobalRequest::RecordHostInput {
                             path: path.into(),
                             syscall: 1,
-                            identity: identity(ino, size),
-                            content: None,
+                            identity,
+                            reopen,
                             exec: false,
                             kernel_object: false,
+                            non_regular,
                         },
                     ),
                 )
@@ -19923,9 +19996,17 @@ mod tests {
             inputs
                 .files
                 .iter()
-                .map(|file| (file.path.as_str(), file.identity.ino))
+                .map(|file| (
+                    file.path.as_str(),
+                    file.identity.ino,
+                    file.content.as_deref()
+                ))
                 .collect::<Vec<_>>(),
-            [("/etc/ld.so.cache", 11), ("/lib64/libc.so.6", 10)]
+            [
+                ("/F", input_identity.ino, Some(sha)),
+                ("/etc/ld.so.cache", 11, None),
+                ("/lib64/libc.so.6", 10, None)
+            ]
         );
         let rerecorded =
             crate::preemptions::boundary_recording::Recording::read(&rerecorded).unwrap();
@@ -19977,9 +20058,10 @@ mod tests {
                         path: "/etc/ld.so.cache".into(),
                         syscall: 12,
                         identity,
-                        content: None,
+                        reopen: None,
                         exec: false,
                         kernel_object: false,
+                        non_regular: false,
                     },
                 ),
             )
@@ -20024,6 +20106,8 @@ mod tests {
                 content: None,
                 exec: false,
                 kernel_object: false,
+                non_regular: false,
+                reopen: None,
             }
         );
         // A path rebound twice is one line.

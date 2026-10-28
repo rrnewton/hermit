@@ -2142,8 +2142,8 @@ pub struct Scheduler {
 
     /// The host files the run whose schedule this run replays
     /// (`Config::replay_schedule_from`) opened, if its recording says. The
-    /// global state compares this run's opens against them
-    /// (`crate::host_inputs::ReplayHostInputs`); no scheduling decision reads
+    /// global state compares this run's files against them when the run ends
+    /// (`crate::host_inputs::changes_since`); no scheduling decision reads
     /// them.
     pub(crate) recorded_host_inputs: Option<detcore_model::host_input::HostInputSet>,
 

@@ -460,11 +460,11 @@ Advanced investigations can save preemption decisions with
 `--replay-preemptions-from=FILE`.
 
 A replay reproduces the recording only if the guest reads the same host
-files. The recorded schedule therefore keeps the set of host files the run
-read (`host_inputs`: each path with its host identity and, for a regular file
+files. The recorded schedule therefore keeps the set of regular host files
+the run read (`host_inputs`: each path with its host identity and, for a file
 of at most 32 MiB, the SHA-256 of its bytes), and a replay (with
-`--replay-preemptions-from` or `--replay-schedule-from`) prints one line for
-each such file that changed since:
+`--replay-preemptions-from` or `--replay-schedule-from`) prints, when it
+ends, one line for each such file that changed since:
 
 ```text
 HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (...); the run may diverge where the guest reads it
@@ -472,15 +472,26 @@ HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed si
 
 The comparison counts the files the guest opens and those the kernel opens
 for its execs: each program image and its ELF interpreter (for a `#!`
-script, the interpreter the kernel ran, not the script). A file whose bytes
+script, the interpreter the kernel ran, not the script). Hermit reads none
+of them while the guest runs, which the guest could observe (an inotify
+watch on a directory reports every open and read): it hashes them when the
+run ends, after the guest's processes have exited, each one only if it still
+has the host identity and change time its open found. A run with
+`--kill-daemons` is not hashed, since a daemon may outlive the rest of the
+guest, and neither is the partial recording a failed or timed-out run leaves:
+their files compare by identity. A file whose bytes
 were hashed in both runs counts as changed only if its bytes differ, so a
 file rewritten unchanged, as `ldconfig` rewrites `/etc/ld.so.cache`, is not
-reported; a file that was not hashed (larger than 32 MiB, or on a backend
-whose tool cannot read the guest's descriptors) counts as changed when its
-host inode, size or modification time differs. Kernel objects (paths under
-`/proc`, `/sys` and `/dev`, and names that lead there, such as `/etc/mtab`)
-are left out, and so are paths the guest itself renamed, linked or unlinked,
-or opened with `O_CREAT`. Under `--backend=dbt` nothing is recorded. The
+reported; a file that was not hashed (larger than 32 MiB, changed again or
+removed before the run ended, or on a backend whose tool cannot see the
+guest's descriptors) counts as changed when its host inode, size or
+modification time differs. Kernel objects (paths under `/proc`, `/sys` and
+`/dev`, and names that lead there, such as `/etc/mtab`) are left out, and so
+are directories, FIFOs and sockets (the private `/tmp` Hermit makes for each
+run has a new inode every time), and paths the guest itself renamed, linked
+or unlinked, or opened with `O_CREAT`. So a directory whose entries changed
+between the recording and the replay is not reported, though a file the guest
+then opens in it is. Under `--backend=dbt` nothing is recorded. The
 line is information, not a refusal: Hermit does not make a changing
 filesystem deterministic.
 

@@ -3046,10 +3046,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // copy only where the count proves it): 2691, listed.
     // And passthru_opt_intercepts_the_protection_key_calls (the inotify
     // fault path's protection-key record under --passthru-opt): 2692, listed.
-    // And the host-input set's eight units (host_inputs six, tool_global's
-    // a_schedule_replay_reports_host_inputs_changed_since_its_recording and
-    // exec_record's
-    // an_image_names_its_program_interpreter_as_the_kernel_reads_it): 2703,
+    // And the host-input set's eight units (host_inputs seven and tool_global's
+    // a_schedule_replay_reports_host_inputs_changed_since_its_recording): 2703,
     // listed.
     ("test.detcore_unit", 2703),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
@@ -4332,7 +4330,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 632 + 2 = 634.
     // And a_schedule_replay_names_a_host_input_changed_since_the_recording,
     // which needs no PMU: 638, listed.
-    ("test.cli", 638),
+    // And recording_host_inputs_adds_no_inotify_event_the_guest_sees and
+    // a_replay_of_a_guest_that_uses_its_private_tmp_names_no_change, which
+    // need no PMU either: 640, listed.
+    ("test.cli", 640),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4861,7 +4862,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 551 + 2 = 553.
     // a_schedule_replay_names_a_host_input_changed_since_the_recording needs
     // neither a PMU nor CPUID faulting: 557, listed.
-    ("test.cli_on_host", 557),
+    // And the same two host-input tests, which need neither: 559, listed.
+    ("test.cli_on_host", 559),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

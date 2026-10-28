@@ -23,12 +23,19 @@
 //!
 //! A run that writes a record meant to be reproduced later (a
 //! `--record-preemptions-to` schedule, or a `--summary-json` summary) also
-//! keeps a [`HostInputSet`]: each host file the guest opened, with the
+//! keeps a [`HostInputSet`]: each regular host file the guest opened, with the
 //! identity its first open found, and a digest of the set. A run that replays
-//! such a schedule compares the files it opens against the set and reports
-//! each one that changed ([`HostInputChange`]): Hermit does not make a
-//! changing filesystem deterministic, so a replay that reads different host
-//! files can diverge, and it then says why.
+//! such a schedule compares the files it opened against the set when it ends
+//! and reports each one that changed ([`HostInputChange`]): Hermit does not
+//! make a changing filesystem deterministic, so a replay that reads different
+//! host files can diverge, and it then says why.
+//!
+//! Nothing here touches a file while the guest runs, beyond the `stat` and the
+//! `readlink` of its own descriptor that every open already costs: the guest
+//! could observe a read, as an inotify watch on the file's directory does. A
+//! file's bytes are hashed when the run ends, after the guest's processes
+//! have exited, and only where the file is the one its open found
+//! ([`HostReopen`]).
 
 use std::path::Path;
 
@@ -90,8 +97,9 @@ pub struct HostInputRecord {
     pub syscall: u64,
     #[serde(flatten)]
     pub identity: HostFileIdentity,
-    /// The SHA-256 (lowercase hex) of the file's bytes at the open, where
-    /// Detcore could read them ([`HostInput::content`]).
+    /// The SHA-256 (lowercase hex) of the file's bytes, read when the run
+    /// ended, where Detcore could reach the file then and found it unchanged
+    /// since the open ([`HostReopen`], [`HostInput::content`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Whether the kernel opened the file for an exec, as the new image or
@@ -106,6 +114,56 @@ pub struct HostInputRecord {
     /// leaves out a path spelled under `/proc`, `/sys` or `/dev`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kernel_object: bool,
+    /// Whether the open reached something other than a regular file: a
+    /// directory, a FIFO, a socket or a device. A [`HostInputSet`] leaves it
+    /// out. Hermit has no bytes of it to compare, and its identity changes
+    /// whenever it is made again: a directory Hermit makes for each run (the
+    /// guest's private `/tmp`) has a new inode in every run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_regular: bool,
+    /// Where the tool can find the file again when the run ends, to hash its
+    /// bytes then. Never written: the path is the tool's view, which another
+    /// run need not share.
+    #[serde(skip)]
+    pub reopen: Option<HostReopen>,
+}
+
+/// How Detcore finds a host file the guest opened again when the run ends:
+/// the path the tool's own `readlink` of the guest's descriptor (or of its
+/// `exe` link, or the mapping `/proc/<pid>/maps` shows) gave, which is the
+/// tool's view of the file, and the file's change time at the open. The file
+/// is hashed only if it still has the identity and change time its open found:
+/// a file rewritten in place gets a new change time even where its size and
+/// modification time are set back. Only two writes within one tick of the
+/// filesystem's clock, the second after the open, can go unseen. The same gate
+/// makes a path from another view safe: where Detcore runs inside the guest,
+/// the path is the guest's view, and the global state, which hashes, may see
+/// another file there (after a `chroot`, say); that file has another identity,
+/// so it is not hashed.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct HostReopen {
+    pub path: std::path::PathBuf,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
+}
+
+impl HostReopen {
+    /// The reopening of the file at `path` (the tool's view) whose `stat` at
+    /// the open was `stat`.
+    pub fn new(path: std::path::PathBuf, stat: &libc::stat) -> Self {
+        Self {
+            path,
+            ctime_sec: stat.st_ctime,
+            ctime_nsec: stat.st_ctime_nsec,
+        }
+    }
+
+    /// Whether `stat`, taken when the run ends, shows the file the open
+    /// found: the same identity and change time.
+    pub fn unchanged(&self, identity: &HostFileIdentity, stat: &libc::stat) -> bool {
+        HostFileIdentity::from_stat(stat) == *identity
+            && (stat.st_ctime, stat.st_ctime_nsec) == (self.ctime_sec, self.ctime_nsec)
+    }
 }
 
 /// A path the guest itself rebound in its file namespace during the run:
@@ -137,9 +195,10 @@ pub struct HostInput {
     pub path: String,
     #[serde(flatten)]
     pub identity: HostFileIdentity,
-    /// The SHA-256 (lowercase hex) of the file's bytes at that open: present
-    /// for a regular file of at most [`HOST_INPUT_CONTENT_LIMIT`] bytes on a
-    /// backend whose tool can read the guest's descriptor. The guest sees a
+    /// The SHA-256 (lowercase hex) of the file's bytes: present for a file of
+    /// at most [`HOST_INPUT_CONTENT_LIMIT`] bytes on a backend whose tool can
+    /// see the guest's descriptors, read when the run ended, where the file
+    /// was still the one that open found ([`HostReopen`]). The guest sees a
     /// host file's bytes and size, not its host inode or times (Hermit
     /// virtualizes those), so where both runs have it, the content decides
     /// whether the file changed ([`host_input_changed`]).
@@ -148,8 +207,8 @@ pub struct HostInput {
 }
 
 /// The largest file whose bytes Detcore hashes for a [`HostInput`]: a larger
-/// one is compared by its identity alone, so that a guest that opens big data
-/// files does not pay to read them twice.
+/// one is compared by its identity alone, so that a run whose guest opens big
+/// data files does not pay to read them again at its end.
 pub const HOST_INPUT_CONTENT_LIMIT: u64 = 32 << 20;
 
 /// Whether `now` shows a different file than `recorded`, for the same path:
@@ -172,7 +231,8 @@ pub fn host_input_changed(recorded: &HostInput, now: &HostInput) -> bool {
 /// bytes at the same paths get the same digest whatever the files' inodes
 /// and times. A path is left out when it is not absolute, names a kernel
 /// object ([`is_kernel_object`], also by the descriptor's own path,
-/// [`HostInputRecord::kernel_object`]), or was rebound by the guest itself
+/// [`HostInputRecord::kernel_object`]), is not a regular file
+/// ([`HostInputRecord::non_regular`]), or was rebound by the guest itself
 /// ([`guest_rebound`]): those can change between runs without the host's
 /// files changing.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
