@@ -16,7 +16,6 @@ use sha2::Sha256;
 
 use super::compatibility_source::full_oid;
 use super::compatibility_source::git;
-use super::compatibility_source::source;
 
 pub const STAMP_ENV: &str = "HERMIT_STAMP_COMPATIBILITY";
 const SCHEMA: &str = "hermit-core-compatibility/v1";
@@ -39,7 +38,15 @@ fn resolved_build(
     crate_dir: &Path,
     compiler: &[u8],
     compiler_sha256: &str,
-) -> Result<(serde_json::Value, serde_json::Value, serde_json::Value), String> {
+) -> Result<
+    (
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+    ),
+    String,
+> {
     use super::compatibility_graph::BuildInput;
     use super::compatibility_graph::Graph;
     use super::compatibility_graph::INPUT_ENV;
@@ -50,7 +57,8 @@ fn resolved_build(
     let expected_source: serde_json::Value =
         serde_json::from_slice(&input.source_snapshot.read(64 * 1024 * 1024)?)
             .map_err(|error| error.to_string())?;
-    if super::compatibility_source::snapshot(&input.metadata, true)? != expected_source {
+    let actual_source = super::compatibility_source::snapshot(&input.metadata, true)?;
+    if actual_source != expected_source {
         return Err(
             "complete actual core/Reverie source differs from the measured pre-build snapshot"
                 .to_owned(),
@@ -236,13 +244,20 @@ fn resolved_build(
         "units":common_units.into_values().collect::<Vec<_>>()});
     // A workspace can override the core's assertions/overflow settings without
     // changing any dependency profile. Bind the actual core library unit too.
-    Ok((reverie, core_units[0].profile.clone(), rustc_inputs))
+    let core_source = actual_source
+        .get("core")
+        .and_then(|core| core.get("identity"))
+        .ok_or_else(|| "actual source proof has no canonical core identity".to_owned())?
+        .clone();
+    Ok((
+        reverie,
+        core_units[0].profile.clone(),
+        rustc_inputs,
+        core_source,
+    ))
 }
 
 fn measured(crate_dir: &Path) -> Result<serde_json::Value, String> {
-    let root = crate_dir
-        .parent()
-        .ok_or_else(|| "core crate has no repository parent".to_owned())?;
     let rustc = std::env::var_os("RUSTC").ok_or_else(|| "Cargo did not name rustc".to_owned())?;
     let rustc = Path::new(&rustc);
     if !rustc.is_absolute() {
@@ -318,10 +333,10 @@ fn measured(crate_dir: &Path) -> Result<serde_json::Value, String> {
         .into_iter()
         .map(|(name, value)| serde_json::json!({"name":name,"value":value}))
         .collect();
-    let (reverie, core_profile, rustc_inputs) =
+    let (reverie, core_profile, rustc_inputs, core_source) =
         resolved_build(crate_dir, &output.stdout, &compiler_sha256)?;
     Ok(serde_json::json!({
-        "schema":SCHEMA, "api":API, "source":source(root, true)?,
+        "schema":SCHEMA, "api":API, "source":core_source,
         "release":env_text("CARGO_PKG_VERSION")?, "reverie":reverie,
         "core_profile":core_profile,
         "rustc_inputs":rustc_inputs,

@@ -732,15 +732,32 @@ fn run(args: Args, progress: &mut Progress) -> Result<()> {
     let expected =
         compatibility_rustc::shared(&second, &second_bundle).map_err(anyhow::Error::msg)?;
     for captured in &final_bundle.commands {
-        if let Some(actual) =
-            compatibility_rustc::for_invocation(&final_graph, &final_bundle, &captured.invocation)
-                .map_err(anyhow::Error::msg)?
+        if let Some(actual) = compatibility_rustc::for_invocation_with_reference(
+            &final_graph,
+            &final_bundle,
+            &second_bundle,
+            &captured.invocation,
+        )
+        .map_err(anyhow::Error::msg)?
         {
             ensure!(
                 expected.contains_key(&serde_json::to_string(&actual)?),
                 "final actual shared-unit command differs from the two measured populations"
             );
         }
+    }
+    let expected_auxiliary =
+        compatibility_rustc::auxiliary(&second, &second_bundle).map_err(anyhow::Error::msg)?;
+    let final_auxiliary =
+        compatibility_rustc::auxiliary_with_reference(&final_graph, &final_bundle, &second_bundle)
+            .map_err(anyhow::Error::msg)?;
+    for (actual, count) in final_auxiliary {
+        ensure!(
+            expected_auxiliary
+                .get(&actual)
+                .is_some_and(|expected| count <= *expected),
+            "final auxiliary compiler population is not a subset of the actual cold population"
+        );
     }
     let primary = final_graph
         .named(&args.package)

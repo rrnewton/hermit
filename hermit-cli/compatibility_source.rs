@@ -455,10 +455,74 @@ fn cargo_repository(
     }
     Ok(
         serde_json::json!({"kind":"git", "commit":expected, "tree":before["tree"],
-        "sha256":format!("{:x}",hash.finalize()), "cargo_marker_before":marker,
+        "sha256":format!("{:x}",hash.finalize()), "source_sha256":content,
+        "cargo_marker_before":marker,
         "cargo_marker_after":marker_after,
         "before":before, "after":after, "gitlinks":children}),
     )
+}
+
+/// Path/ordinary core checkouts keep `source`'s exact strict policy. Only an
+/// actual canonical metadata-bound Cargo Git package uses materialization
+/// proof; its shared core identity is still the ordinary canonical digest.
+pub fn metadata_core(package: &Package, track: bool) -> Result<serde_json::Value, String> {
+    if package.source.is_none() {
+        return metadata_core_in(package, None, track);
+    }
+    let home = std::env::var_os("CARGO_HOME")
+        .ok_or_else(|| "Cargo core source has no actual CARGO_HOME".to_owned())?;
+    let cache = std::fs::canonicalize(Path::new(&home).join("git/checkouts"))
+        .map_err(|error| format!("cannot resolve actual Cargo core Git cache: {error}"))?;
+    metadata_core_in(package, Some(&cache), track)
+}
+
+fn metadata_core_in(
+    package: &Package,
+    cache: Option<&Path>,
+    track: bool,
+) -> Result<serde_json::Value, String> {
+    if package.name != "hermit-run" {
+        return Err("metadata core source is not the hermit-run package".to_owned());
+    }
+    let manifest = package
+        .manifest_path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve actual core manifest: {error}"))?;
+    if !manifest.is_file() || manifest.file_name().is_none_or(|name| name != "Cargo.toml") {
+        return Err("metadata core manifest is not an actual Cargo.toml".to_owned());
+    }
+    let root = manifest
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "metadata core has no repository parent".to_owned())?;
+    let Some(source_id) = package.source.as_deref() else {
+        return Ok(serde_json::json!({"path":root,"identity":source(root, track)?}));
+    };
+    let source_id = source_id
+        .strip_prefix("git+https://github.com/rrnewton/hermit?rev=")
+        .or_else(|| source_id.strip_prefix("git+https://github.com/rrnewton/hermit.git?rev="))
+        .ok_or_else(|| "metadata core has a noncanonical or patched source".to_owned())?;
+    let (declared, resolved) = source_id
+        .split_once('#')
+        .ok_or_else(|| "metadata core Git source has no resolved commit".to_owned())?;
+    if !full_oid(declared) || declared != resolved {
+        return Err("metadata core must declare and resolve the same full commit".to_owned());
+    }
+    let materialization = cargo_git_source_in(
+        root,
+        resolved,
+        cache.ok_or_else(|| "metadata core Git source has no actual Cargo cache".to_owned())?,
+        track,
+        unsafe { libc::geteuid() },
+    )?;
+    let content = materialization
+        .get("source_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Cargo core proof has no canonical source digest".to_owned())?;
+    let identity = serde_json::json!({"kind":"git","commit":resolved,
+        "tree":materialization["tree"],"sha256":content});
+    Ok(serde_json::json!({"path":root,"identity":identity,
+        "cargo_materialization":materialization}))
 }
 
 /// The producer checks these complete source measurements around each build;
@@ -483,12 +547,7 @@ pub fn snapshot(metadata: &InputFile, track: bool) -> Result<serde_json::Value, 
     if cores.len() != 1 {
         return Err("source snapshot requires exactly one actual core package".to_owned());
     }
-    let core_root = cores[0]
-        .manifest_path
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| "source snapshot core has no repository parent".to_owned())?;
-    let core = serde_json::json!({"path":core_root,"identity":source(core_root, track)?});
+    let core = metadata_core(cores[0], track)?;
     let mut roots = BTreeMap::new();
     for package in &metadata.packages {
         let Some(value) = package.source.as_deref() else {
@@ -801,5 +860,79 @@ mod tests {
             fixture.measure().is_err(),
             "changed root reference must refuse"
         );
+    }
+
+    #[test]
+    fn metadata_git_core_has_the_same_canonical_identity_and_keeps_path_core_strict() {
+        let mut fixture = Fixture::new();
+        let crate_dir = fixture.root.join("hermit-cli");
+        std::fs::create_dir(&crate_dir).unwrap();
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            b"[package]\nname='hermit-run'\nversion='0.5.4'\n",
+        )
+        .unwrap();
+        command(&fixture.root, &["add", "--", "hermit-cli/Cargo.toml"]);
+        command(
+            &fixture.root,
+            &["commit", "--quiet", "-m", "core fixture package"],
+        );
+        fixture.oid = command(&fixture.root, &["rev-parse", "HEAD"]);
+        let ordinary = fixture.directory.join("ordinary-core");
+        command(
+            &fixture.directory,
+            &[
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                fixture.root.to_str().unwrap(),
+                ordinary.to_str().unwrap(),
+            ],
+        );
+        command(&ordinary, &["submodule", "update", "--init", "--quiet"]);
+        let ordinary_identity = source(&ordinary, false).unwrap();
+        let mut package = Package {
+            id: "actual-core".to_owned(),
+            name: "hermit-run".to_owned(),
+            version: "0.5.4".to_owned(),
+            source: Some(format!(
+                "git+https://github.com/rrnewton/hermit?rev={0}#{0}",
+                fixture.oid
+            )),
+            manifest_path: crate_dir.join("Cargo.toml"),
+            targets: vec![],
+        };
+        let measured = metadata_core_in(&package, Some(&fixture.cache), false).unwrap();
+        assert_eq!(
+            measured["identity"], ordinary_identity,
+            "cache markers must not change the canonical core digest"
+        );
+        assert!(measured["cargo_materialization"]["cargo_marker_before"].is_object());
+        package.source = None;
+        assert!(
+            metadata_core_in(&package, Some(&fixture.cache), false).is_err(),
+            "ordinary/path core must remain strict"
+        );
+        package.source = Some(format!(
+            "git+https://example.invalid/hermit?rev={0}#{0}",
+            fixture.oid
+        ));
+        assert!(metadata_core_in(&package, Some(&fixture.cache), false).is_err());
+        package.source = Some(format!(
+            "git+https://github.com/rrnewton/hermit?rev={}#{}",
+            fixture.oid,
+            "0".repeat(40)
+        ));
+        assert!(metadata_core_in(&package, Some(&fixture.cache), false).is_err());
+        package.source = Some(format!(
+            "git+https://github.com/rrnewton/hermit?rev={0}#{0}",
+            fixture.oid
+        ));
+        std::fs::write(
+            fixture.root.join("unknown-core-input"),
+            b"not Cargo bookkeeping",
+        )
+        .unwrap();
+        assert!(metadata_core_in(&package, Some(&fixture.cache), false).is_err());
     }
 }
