@@ -50,7 +50,11 @@
 //!   thread step 2 chooses, once the forwarded call has succeeded
 //!   (`Scheduler::process_signal_sent`): a call the kernel fails before it
 //!   queues anything, or one Detcore refuses, never reaches
-//!   `complete_signal`. Linux moves it on when that thread exits
+//!   `complete_signal`. That includes a send to the sender's own process
+//!   that Detcore forwards because Linux gives it to the sender
+//!   (`Scheduler::own_process_signal_choice`): when the call names another
+//!   thread, which blocks the signal, the walk is what reaches the sender.
+//!   Linux moves it on when that thread exits
 //!   (`__exit_signal`, kernel/exit.c:187-188); here the walk starts at the
 //!   first live thread at or after it, which is the same thread unless a
 //!   thread was created after the last thread in the list exited.
@@ -330,11 +334,7 @@ impl Scheduler {
             );
             return ProcessSignalReceiver::AlreadyQueued;
         }
-        let curr_target = self
-            .signal_curr_targets
-            .get(&process)
-            .copied()
-            .unwrap_or_else(|| DetTid::from_raw(process.as_raw()));
+        let curr_target = self.signal_curr_target(process);
         let (receiver, moved) = complete_signal(&threads, named, curr_target);
         // A schedule replay decides as its recording did, from the same
         // schedule, and resumes the threads in the recorded order, so the
@@ -399,6 +399,52 @@ impl Scheduler {
             threads
         );
         receiver
+    }
+
+    /// `process`'s `curr_target`: the thread the walk of `complete_signal` last
+    /// chose, or the leader, where Linux starts it.
+    fn signal_curr_target(&self, process: DetPid) -> DetTid {
+        self.signal_curr_targets
+            .get(&process)
+            .copied()
+            .unwrap_or_else(|| DetTid::from_raw(process.as_raw()))
+    }
+
+    /// A send of `signo` that `sender` makes to its own process, naming
+    /// `named`, and that Detcore forwards as it is because Linux gives it to
+    /// the sender (`Detcore::own_process_signal`). Detcore chooses no receiver
+    /// for it, but Linux's `complete_signal` still runs, and when the named
+    /// task does not want the signal its walk reaches the sender, which then
+    /// becomes `curr_target`, as for any walk choice once the call has
+    /// succeeded (`process_signal_sent`). A later send from another process
+    /// starts its walk there (https://github.com/rrnewton/hermit/issues/4034).
+    /// As in `process_signal_receiver`, a standard signal the shared queue
+    /// already holds (`legacy_queue`) and one Linux discards as it is sent
+    /// (`prepare_signal`) reach no walk.
+    pub(crate) fn own_process_signal_choice(&mut self, sender: DetTid, named: DetTid, signo: i32) {
+        self.pending_signal_curr_target = None;
+        if !self.models_signal_targets {
+            return;
+        }
+        let process = self.sigchld_process(sender);
+        let bit = kernel_signal_bit(signo);
+        if bit & STANDARD_SIGNALS != 0
+            && self
+                .read_shared_pending(sender)
+                .is_some_and(|pending| pending & bit != 0)
+        {
+            return;
+        }
+        if self.discarded_when_sent_to(named, signo, Some(sender)) {
+            return;
+        }
+        let threads: Vec<(DetTid, Wants)> = self
+            .process_signal_targets(process)
+            .into_iter()
+            .map(|thread| (thread, self.wants_signal(thread, sender, bit)))
+            .collect();
+        let (_, moved) = complete_signal(&threads, named, self.signal_curr_target(process));
+        self.pending_signal_curr_target = moved.map(|thread| (sender, process, thread));
     }
 
     /// `sender`'s forwarded process-directed send to `process` succeeded: the

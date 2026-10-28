@@ -4191,6 +4191,12 @@ impl GlobalState {
                         .process_signal_receiver(process, named, dtid, signo),
                 )
             }
+            GlobalRequest::OwnProcessSignalChoice(named, signo) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .own_process_signal_choice(dtid, named, signo);
+                R::OwnProcessSignalChoice(())
+            }
             GlobalRequest::ProcessSignalSent(process) => {
                 self.lock_rpc_scheduler(false)
                     .await
@@ -6950,6 +6956,11 @@ pub enum GlobalRequest {
     /// (`Scheduler::process_signal_sent`).
     ProcessSignalSent(DetPid),
 
+    /// The calling thread is about to forward a send of this signal to its own
+    /// process, naming this task, that Linux gives to it
+    /// (`Scheduler::own_process_signal_choice`).
+    OwnProcessSignalChoice(DetTid, i32),
+
     /// The calling thread sends SIGSTKFLT (`Scheduler::record_guest_marker_signal`).
     RecordGuestMarkerSignal,
 
@@ -7541,6 +7552,7 @@ pub enum GlobalResponse {
     OwnProcessSignalInputs(OwnProcessSignalInputs),
     ProcessSignalReceiver(ProcessSignalReceiver),
     ProcessSignalSent(()),
+    OwnProcessSignalChoice(()),
     RecordGuestMarkerSignal(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
@@ -8470,6 +8482,22 @@ where
     {
         GlobalResponse::ProcessSignalSent(()) => {}
         response => unreachable!("unexpected response to ProcessSignalSent: {response:?}"),
+    }
+}
+
+/// The calling thread is about to forward `signo` to its own process, naming
+/// `named`, as Linux gives it to the caller (`Scheduler::own_process_signal_choice`).
+pub(crate) async fn own_process_signal_choice<G, T>(guest: &mut G, named: DetTid, signo: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::OwnProcessSignalChoice(named, signo))
+        .await
+        .1
+    {
+        GlobalResponse::OwnProcessSignalChoice(()) => {}
+        response => unreachable!("unexpected response to OwnProcessSignalChoice: {response:?}"),
     }
 }
 

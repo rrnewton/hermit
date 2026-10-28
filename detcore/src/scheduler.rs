@@ -27814,6 +27814,65 @@ mod test {
         );
     }
 
+    /// The sequence of the Codex review of #4625's second revision: a process
+    /// with leader 10 (blocking SIGUSR1 and SIGUSR2), thread 11 (blocking
+    /// SIGUSR1) and thread 12 (blocking neither). Thread 12's `kill(10,
+    /// SIGUSR1)` is forwarded as it is, since every sibling blocks it, and
+    /// Linux's walk from the leader reaches thread 12, which becomes
+    /// `curr_target` once the call succeeds. A later SIGUSR2 from another
+    /// process names the leader, which blocks it, and the walk starts at
+    /// thread 12, which takes it, ahead of thread 11. Without a reported
+    /// success, or for a send that names the sender (step 1, no walk),
+    /// `curr_target` stays at the leader and thread 11 takes it.
+    #[test]
+    fn an_admitted_own_process_walk_moves_curr_target_for_a_later_foreign_send() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let leader = DetTid::from_raw(10);
+        let eleven = DetTid::from_raw(11);
+        let twelve = DetTid::from_raw(12);
+        let foreign = DetTid::from_raw(20);
+        let process = DetPid::from_raw(10);
+        let setup = || {
+            let mut scheduler = gated_scheduler();
+            signal_process(
+                &mut scheduler,
+                leader,
+                &[(leader, usr1 | usr2), (eleven, usr1), (twelve, 0)],
+                usr1 | usr2,
+            );
+            signal_process(&mut scheduler, foreign, &[(foreign, 0)], usr1 | usr2);
+            scheduler
+        };
+        let foreign_receiver = |scheduler: &mut Scheduler| match scheduler.process_signal_receiver(
+            process,
+            leader,
+            foreign,
+            libc::SIGUSR2,
+        ) {
+            process_signal_receiver::ProcessSignalReceiver::Thread { thread, .. } => thread,
+            other => panic!("no receiver: {other:?}"),
+        };
+
+        let mut scheduler = setup();
+        scheduler.own_process_signal_choice(twelve, leader, libc::SIGUSR1);
+        scheduler.process_signal_sent(twelve, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), Some(&twelve));
+        assert_eq!(foreign_receiver(&mut scheduler), twelve);
+
+        // The own-process send failed: nothing reports, nothing moves.
+        let mut scheduler = setup();
+        scheduler.own_process_signal_choice(twelve, leader, libc::SIGUSR1);
+        assert_eq!(foreign_receiver(&mut scheduler), eleven);
+
+        // It named the sender itself: Linux's step 1 takes it, no walk.
+        let mut scheduler = setup();
+        scheduler.own_process_signal_choice(twelve, twelve, libc::SIGUSR1);
+        scheduler.process_signal_sent(twelve, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+        assert_eq!(foreign_receiver(&mut scheduler), eleven);
+    }
+
     /// The readmission that broke record/replay of make -jN (minibeads
     /// dh-ojrf): make (7), a SIGCHLD taker, is backgrounded in a `pselect6`
     /// and a child (173) in a `connect`. Both calls have finished by one

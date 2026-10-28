@@ -25,6 +25,15 @@
  *               takes it.
  *   usr1-self   worker 1's kill(getpid(), SIGUSR1) in a four-thread process
  *               whose threads all leave it unblocked: the main thread takes it.
+ *   term-after-walk
+ *               in the child, the main thread and worker 3 block SIGUSR1 and
+ *               SIGTERM, worker 1 blocks SIGUSR1 alone and worker 2 neither.
+ *               Worker 2's kill(getpid(), SIGUSR1) names the main thread,
+ *               which blocks it, so the walk from curr_target (the main
+ *               thread) reaches worker 2, which takes it and becomes
+ *               curr_target. The parent's kill(child, SIGTERM) names the main
+ *               thread, which blocks it too, and the walk starts at worker 2,
+ *               which takes it, ahead of worker 1.
  *   segv-pidfd  a two-thread child whose worker sends its own process SIGSEGV
  *               with pidfd_send_signal, at its default disposition: the whole
  *               child dies of SIGSEGV.
@@ -233,6 +242,64 @@ static int term(int queued, int one) {
   return 0;
 }
 
+/* The child of term-after-walk. */
+static void walk_child(int to_parent) {
+  sigset_t usr1, both;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  both = usr1;
+  sigaddset(&both, SIGTERM);
+  worker_masks[1] = usr1;
+  sigemptyset(&worker_masks[2]);
+  worker_masks[3] = both;
+  if (pthread_sigmask(SIG_SETMASK, &both, NULL) != 0) {
+    die("pthread_sigmask");
+  }
+  usr1_sender = 2;
+  start_workers();
+  raise_flag(&go);
+  printf("own-process SIGUSR1:\n");
+  print_report(getpid());
+  char byte = 'r';
+  if (write(to_parent, &byte, 1) != 1) {
+    die("write ready");
+  }
+  printf("parent's SIGTERM:\n");
+  print_report(getppid());
+  fflush(stdout);
+  _exit(0);
+}
+
+static int term_after_walk(void) {
+  int to_parent[2];
+  if (pipe(report_pipe) != 0 || pipe(to_parent) != 0) {
+    die("pipe");
+  }
+  catch(SIGTERM);
+  catch(SIGUSR1);
+  fflush(stdout);
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    walk_child(to_parent[1]);
+  }
+  char byte;
+  if (read(to_parent[0], &byte, 1) != 1) {
+    die("read ready");
+  }
+  if (kill(child, SIGTERM) != 0) {
+    die("kill");
+  }
+  int status;
+  if (waitpid(child, &status, 0) != child) {
+    die("waitpid");
+  }
+  printf("child exit status: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  return 0;
+}
+
 /* The main thread tells the workers to go only once it is past
  * pthread_create, which blocks every signal while it runs. */
 static int usr1_self(void) {
@@ -310,9 +377,13 @@ int main(int argc, char** argv) {
   if (strcmp(mode, "usr1-self") == 0) {
     return usr1_self();
   }
+  if (strcmp(mode, "term-after-walk") == 0) {
+    return term_after_walk();
+  }
   if (strcmp(mode, "segv-pidfd") == 0) {
     return segv_pidfd();
   }
-  fprintf(stderr, "usage: %s term|term-one|term-queued|usr1-self|segv-pidfd\n", argv[0]);
+  fprintf(stderr, "usage: %s term|term-one|term-queued|usr1-self|term-after-walk|segv-pidfd\n",
+          argv[0]);
   return 2;
 }

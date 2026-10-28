@@ -36168,11 +36168,17 @@ fn a_process_directed_signal_to_a_sleeping_sibling_is_refused_by_name() {
 /// - `term-one`: with SIGTERM blocked in every thread but worker 2, worker 2;
 /// - `term-queued`: with SIGTERM blocked in every thread, it stays pending
 ///   until worker 2 unblocks it, and worker 2 takes it;
+/// - `term-after-walk` (the Codex review of the PR's second revision, 30 of 30
+///   native runs identical): worker 2's `kill(getpid(), SIGUSR1)`, which the
+///   main thread and the other workers block, is forwarded as it is, and
+///   Linux's walk makes worker 2 `curr_target`; the parent's SIGTERM, which
+///   the main thread blocks, then goes to worker 2 and not to worker 1, which
+///   would take it from a walk that started at the main thread;
 /// - `segv-pidfd`: a worker's `pidfd_send_signal` of SIGSEGV to its own
 ///   two-thread process, at its default disposition, ends the whole process.
 ///
-/// Every one is `SI_USER` from the sender's pid, as Linux delivers it. The
-/// first three run under `--strict --verify --verify-strict` at bitwise
+/// Every one is `SI_USER` from the sender's pid, as Linux delivers it. All but
+/// `segv-pidfd` run under `--strict --verify --verify-strict` at bitwise
 /// parity. `segv-pidfd` runs under `--strict` alone: the deaths of a group a
 /// fatal signal ends are retired at host-timed moments until
 /// https://github.com/rrnewton/hermit/pull/4589 and the change stacked on it
@@ -36189,6 +36195,15 @@ fn a_process_directed_signal_goes_to_the_thread_linux_chooses() {
         (
             "term-queued",
             "pending after the send: SIGTERM\n".to_owned() + &receiver("worker 2") + exited,
+            true,
+        ),
+        (
+            "term-after-walk",
+            "own-process SIGUSR1:\n".to_owned()
+                + &receiver("worker 2")
+                + "parent's SIGTERM:\n"
+                + &receiver("worker 2")
+                + exited,
             true,
         ),
         (

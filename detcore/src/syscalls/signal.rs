@@ -2733,7 +2733,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Forward an admitted process-directed signal to the sender's own process
     /// unchanged, holding the sender's turn until it takes the signal
     /// (`own_signal_turn_hold`). A call the kernel fails sends nothing and
-    /// holds nothing.
+    /// holds nothing. A call that succeeds moves the process's `curr_target`
+    /// where Linux's walk reached the sender
+    /// (`Scheduler::own_process_signal_choice`).
     async fn forward_own_process_signal<G: Guest<Self>, C>(
         &self,
         guest: &mut G,
@@ -2748,6 +2750,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let token = self
             .discard_pre_send(guest, named, QueueId::Process(self.detpid), sig)
             .await;
+        crate::tool_global::own_process_signal_choice(guest, named, sig).await;
         let call: syscalls::Syscall = call.into();
         let siginfo = sent_siginfo(guest, &call, sig);
         guest.thread_state_mut().own_signal_turn_hold = Some(sig);
@@ -2756,6 +2759,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.thread_state_mut().own_signal_turn_hold = None;
         } else {
             self.discard_sent(guest, token, siginfo).await;
+            crate::tool_global::process_signal_sent(guest, self.detpid).await;
         }
         Ok(result?)
     }
