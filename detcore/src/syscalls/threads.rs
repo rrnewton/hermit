@@ -4588,11 +4588,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         ) {
             return None;
         }
-        super::chosen_ids::read_pid_array(&memory, set_tid as usize, &mut tids)?;
+        if set_tid == 0 {
+            // Linux: EINVAL, before reading anything.
+            return None;
+        }
+        // A fault the kernel must take too is its EFAULT. Otherwise an array
+        // Detcore cannot read (a page mapped writable, not readable) may
+        // still be read by the kernel: it is refused below, once the checks
+        // that need no entry have passed, since its ids cannot be checked.
+        let read =
+            super::chosen_ids::read_pid_array(&memory, set_tid as usize, &mut tids).is_some();
+        if !read
+            && super::chosen_ids::range_faults(
+                guest.tid().as_raw(),
+                set_tid as usize,
+                tids.len() * std::mem::size_of::<libc::pid_t>(),
+            )
+        {
+            return None;
+        }
         // With CLONE_NEWPID the first entry is the pid in the new namespace,
         // which must be 1 since that namespace has no init yet (EINVAL).
         let newpid = flags & libc::CLONE_NEWPID as u64 != 0;
-        if tids.iter().any(|tid| *tid < 1) || (newpid && tids[0] != 1) {
+        if read && (tids.iter().any(|tid| *tid < 1) || (newpid && tids[0] != 1)) {
             return None;
         }
         // Choosing a pid takes CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE over
@@ -4634,6 +4652,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Hermit's container, which Detcore does not track.
         if set_tid_size <= u64::from(newpid) {
             return None;
+        }
+        if !read {
+            let message = "hermit: clone3 set_tid's array cannot be read with the guest's own \
+                           access, so Detcore cannot check its ids against the run's earlier \
+                           tasks (https://github.com/rrnewton/hermit/issues/4370)";
+            tracing::error!(
+                "[detcore, dtid {}] {}",
+                guest.thread_state().dettid,
+                message
+            );
+            if guest.config().panic_on_unsupported_syscalls {
+                use std::io::Write as _;
+                let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            }
+            return Some(
+                self.refuse_unserviceable_operation(
+                    guest,
+                    reverie::syscalls::Sysno::clone3,
+                    Errno::EFAULT,
+                )
+                .await,
+            );
         }
         let tid = tids[usize::from(newpid)];
         if !crate::tool_global::thread_id_refused(guest, DetTid::from_raw(tid)).await {

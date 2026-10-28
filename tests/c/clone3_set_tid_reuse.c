@@ -23,6 +23,10 @@
 //           entry is on an unmapped page
 //   edge    a reaped child's pid, in a one-entry set_tid array in the last
 //           four bytes of a page that an unmapped page follows
+//   unaligned a reaped child's pid, in a one-entry set_tid array at an
+//           address two bytes past a four-byte boundary
+//   wronly  a reaped child's pid, in a one-entry set_tid array on a page
+//           mapped writable but not readable, which the kernel reads
 //   deep    a reaped child's pid, followed by a pid for the namespace holding
 //           the caller's (set_tid = {pid, 1})
 //   nocap   a reaped child's pid, asked for after dropping every effective
@@ -232,6 +236,20 @@ int main(int argc, char** argv) {
     tids = (pid_t*)(pages + page - sizeof(pid_t));
     tids[0] = want;
     args.set_tid_size = strcmp(mode, "edge") ? 2 : 1;
+  }
+  if (!strcmp(mode, "unaligned")) {
+    static char buffer[16] __attribute__((aligned(8)));
+    tids = (pid_t*)(buffer + 2);
+    memcpy(tids, &want, sizeof want);
+    args.set_tid_size = 1;
+  }
+  if (!strcmp(mode, "wronly")) {
+    tids = mmap(NULL, sysconf(_SC_PAGESIZE), PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tids == MAP_FAILED) {
+      return 1;
+    }
+    tids[0] = want;
+    args.set_tid_size = 1;
   }
   args.set_tid = (uint64_t)(uintptr_t)tids;
   if (!strcmp(mode, "newpid") || !strcmp(mode, "newpidzero")) {
