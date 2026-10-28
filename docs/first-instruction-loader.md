@@ -1,12 +1,25 @@
 # First-instruction loader integration
 
-`hermit run --in-guest-exec-stop` reserves an opt-in for the shared first-image
-launcher. It currently fails with the typed policy refusal
-`exec-stop-runtime-not-ready`. This also applies to `hermit oci run` and to
-every backend selection. Refusal precedes host admission, image-store access,
-stdin capture, container creation and guest execution. A requested verification
-file is first replaced with this invocation's NO-RESULT record. Omitting the
-flag preserves the existing launch path.
+`hermit run --in-guest-exec-stop` runs the guest's first image through the
+shared first-image launcher, which initializes the genuine in-guest Detcore
+runtime, with its own private libc, before releasing the guest's first
+instruction (Hermit 059e069bfae, 2026-10-20). `hermit oci run` applies the same
+rule. A request is admitted only when all of these hold:
+
+- Hermit was built with the `exec-stop-launcher` and `liteinst` Cargo features,
+  and the private runtime package (its image and data resources) is installed;
+- the backend is `in-guest-trap`;
+- the run uses none of `--verify`, `--verify-run`, `--namespace-only`,
+  `--strace-only`, `--dap-listen`, `--gdbserver`, or network recording, replay
+  or perturbation.
+
+Only the first image runs this way: guest threads, a later exec and unsupported
+startup events are refused with named reasons when the guest reaches them.
+Every other request fails with the typed policy refusal
+`exec-stop-runtime-not-ready`. That refusal precedes host admission,
+image-store access, stdin capture, container creation and guest execution, and
+a requested verification file is first replaced with this invocation's
+NO-RESULT record. Omitting the flag preserves the existing launch path.
 
 The optional `exec-stop-launcher` Cargo feature exposes the shared launcher
 dependency. The ordinary Hermit unit suite exercises it inside the existing

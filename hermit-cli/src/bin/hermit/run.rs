@@ -1142,8 +1142,15 @@ pub(crate) const LD_SO_CACHE_PATH: &str = "/etc/ld.so.cache";
 #[derive(Debug, Parser, Clone)]
 #[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
 pub struct RunOpts {
-    /// Request the first-image exec-stop launcher. Not ready for production:
-    /// refuses before launch until the genuine Detcore runtime is integrated.
+    /// Run the guest's first image through the exec-stop launcher, which starts
+    /// the in-guest Detcore runtime before the guest's first instruction.
+    /// Admitted only on the in-guest-trap backend, in a build with the
+    /// `exec-stop-launcher` and `liteinst` features whose private runtime
+    /// package is installed, and without --verify, --verify-run,
+    /// --namespace-only, --strace-only, --dap-listen, --gdbserver or network
+    /// recording, replay or perturbation. Any other request refuses before launch with
+    /// exec-stop-runtime-not-ready. Threads and a later exec are refused when
+    /// the guest reaches them.
     #[clap(long)]
     in_guest_exec_stop: bool,
 
