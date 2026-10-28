@@ -12674,6 +12674,13 @@ corpus:
         cell: SelectedCell,
         command_bindings: BTreeMap<String, crate::executable_binding::HeldExecutable>,
     ) -> CellRunSpec {
+        verify_spec_and_context_of_with_bindings(cell, command_bindings).0
+    }
+
+    fn verify_spec_and_context_of_with_bindings(
+        cell: SelectedCell,
+        command_bindings: BTreeMap<String, crate::executable_binding::HeldExecutable>,
+    ) -> (CellRunSpec, RunContext) {
         let context = RunContext {
             command_bindings,
             root: PathBuf::from("/repo"),
@@ -12723,7 +12730,7 @@ corpus:
             );
             assert!(error.attempts.is_empty() && unavailable.attempts.is_empty());
         }
-        build_spec(
+        let spec = build_spec(
             &context,
             &cell,
             PathBuf::from("/repo/results/cell"),
@@ -12732,21 +12739,26 @@ corpus:
             None,
             cell.timeout_seconds,
         )
-        .unwrap()
+        .unwrap();
+        (spec, context)
     }
 
     #[test]
     fn selected_static_entry_reaches_build_spec_and_the_original_strict_invocation_validator() {
         let cell = verify_cell("ptrace", true, BTreeMap::new(), None);
-        let old = verify_spec_of(cell.clone());
+        let (old, old_context) =
+            verify_spec_and_context_of_with_bindings(cell.clone(), BTreeMap::new());
         let binding = crate::executable_binding::current_test_binding("ptrace");
-        let mut spec = verify_spec_of_with_bindings(
-            cell,
+        let (mut spec, context) = verify_spec_and_context_of_with_bindings(
+            cell.clone(),
             BTreeMap::from([("ptrace".into(), binding.clone())]),
         );
         assert_eq!(spec.guest_argv, old.guest_argv);
         assert_eq!(spec.timeout_seconds, old.timeout_seconds);
-        assert_eq!(spec.cpu_timeout_seconds, old.cpu_timeout_seconds);
+        assert_eq!(
+            cell_timeouts(&context, &cell).unwrap().cpu_seconds,
+            cell_timeouts(&old_context, &cell).unwrap().cpu_seconds
+        );
         assert_eq!(spec.comparator, old.comparator);
         assert!(
             spec.argv
