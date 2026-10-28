@@ -822,8 +822,8 @@ fn emitted_unit_options(command: &Invocation) -> Result<EmittedUnitOptions, Stri
             (b"--crate-type".as_slice(), &mut crate_types),
             (b"--out-dir".as_slice(), &mut output),
         ] {
-            if let Some((value, _)) = option(argument, option_name, command.argv.get(index + 1))
-                && slot.replace(value.to_vec()).is_some()
+            if option(argument, option_name, command.argv.get(index + 1))
+                .is_some_and(|(value, _)| slot.replace(value.to_vec()).is_some())
             {
                 return Err("actual rustc repeats a Cargo unit identity option".to_owned());
             }
@@ -835,11 +835,14 @@ fn emitted_unit_options(command: &Invocation) -> Result<EmittedUnitOptions, Stri
                 .strip_prefix(b"-C")
                 .filter(|value| !value.is_empty())
         };
-        if let Some(value) = codegen.and_then(|value| value.strip_prefix(b"opt-level="))
-            && optimization
-                .replace(text(value, "actual optimization level")?)
-                .is_some()
-        {
+        let repeated_optimization =
+            match codegen.and_then(|value| value.strip_prefix(b"opt-level=")) {
+                Some(value) => optimization
+                    .replace(text(value, "actual optimization level")?)
+                    .is_some(),
+                None => false,
+            };
+        if repeated_optimization {
             return Err("actual rustc repeats its optimization level".to_owned());
         }
     }
