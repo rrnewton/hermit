@@ -370,7 +370,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "kvm-execution-tests,liteinst",
+            "liteinst,kvm-execution-tests",
             "--lib",
             "--test",
             "cli",
@@ -943,7 +943,9 @@ mod tests {
             // a_schedule_replay_hands_the_guest_the_recorded_random_values (+1):
             // 694.
             // Seven explicit package-identity cases in version_provenance (+7): 701.
-            assert_eq!(population, 701);
+            // The copied-child TTY case has its own required DynamoRIO owner node.
+            // All other cases remain in this core selection: 700 plus one external.
+            assert_eq!(population, 700);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
