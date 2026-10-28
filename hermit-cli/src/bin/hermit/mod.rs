@@ -748,7 +748,9 @@ impl Subcommand {
             Subcommand::Replay(x) => x.main(global),
             Subcommand::List(x) => x.main(),
             Subcommand::Show(x) => x.main(),
-            Subcommand::LogDiff(x) => x.run(global),
+            Subcommand::LogDiff(x) => {
+                x.run_with_backend::<A>(global, selected_by_executable, adapter)
+            }
             Subcommand::Analyze(x) => x.main(global),
             Subcommand::Bisect(x) => x.main(global),
             Subcommand::InstructionMap(x) => x.main(global),

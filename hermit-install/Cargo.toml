@@ -10,15 +10,10 @@ publish = false
 path = "src/lib.rs"
 
 [features]
-# Core staging includes LiteInst; full installations opt in explicitly.
+# Core staging includes the first-party LiteInst runtime.
 default = []
-third-party-backends = ["dep:reverie-dbt", "dep:reverie-sabre"]
 
 [dependencies]
 reverie-liteinst-artifact = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "688a542d75af8310c4ddd97eadbf2434abb067ff", default-features = false }
 serde_json = "1"
 toml = "0.8"
-
-[build-dependencies]
-reverie-dbt = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "688a542d75af8310c4ddd97eadbf2434abb067ff", default-features = false, optional = true }
-reverie-sabre = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "688a542d75af8310c4ddd97eadbf2434abb067ff", optional = true }

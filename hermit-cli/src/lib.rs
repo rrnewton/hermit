@@ -27,11 +27,9 @@ pub(crate) use app::exec_initial;
 #[cfg(feature = "liteinst")]
 reverie_liteinst::declare_legacy_tool_backing!();
 
-#[cfg(all(test, feature = "dbt"))]
-#[path = "../tests/common/dbt_placement_probe.rs"]
-mod dbt_placement_probe;
 
-mod backend_stats;
+
+pub mod backend_stats;
 pub mod build_info;
 pub mod canonical_verdict;
 pub mod chaos_timeslice;
@@ -2770,6 +2768,12 @@ pub fn forward_in_guest_detlogs_to(socket: std::os::fd::OwnedFd) {
     *IN_GUEST_DETLOG_SINK.lock().unwrap() = Some(socket);
 }
 
+/// Release the coordinator's source endpoint after actual physical teardown.
+#[doc(hidden)]
+pub fn clear_in_guest_detlog_forwarding() {
+    IN_GUEST_DETLOG_SINK.lock().unwrap().take();
+}
+
 /// What Hermit tells the in-guest LiteInst runtime, which travels in the
 /// sealed preload bootstrap rather than the guest's environment
 /// ([`detcore::in_guest_launch`]), so none of it lands on the guest's initial
@@ -2827,8 +2831,8 @@ fn in_guest_liteinst_launch(
 /// [`forward_in_guest_detlogs_to`], or `None` when none was chosen. The
 /// caller passes its number to the guest and keeps it open until the guest
 /// has started.
-#[cfg(any(feature = "sabre", feature = "liteinst"))]
-fn inheritable_in_guest_detlog_socket() -> Result<Option<std::os::fd::OwnedFd>, Error> {
+#[doc(hidden)]
+pub fn inheritable_in_guest_detlog_socket() -> Result<Option<std::os::fd::OwnedFd>, Error> {
     let sink = IN_GUEST_DETLOG_SINK.lock().unwrap();
     let Some(socket) = sink.as_ref() else {
         return Ok(None);
@@ -2852,8 +2856,8 @@ const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
 /// target the CLI's `RUST_LOG` names (the text
 /// `EffectiveFilter::from_default_env` builds every CLI subscriber from) and
 /// for any other target.
-#[cfg(any(feature = "sabre", feature = "liteinst"))]
-fn in_guest_detlog_forward_policy() -> detcore::detlog::ForwardPolicy {
+#[doc(hidden)]
+pub fn in_guest_detlog_forward_policy() -> detcore::detlog::ForwardPolicy {
     let directives = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).unwrap_or_default();
     detcore::detlog::ForwardPolicy::from_current_subscriber(&directives)
 }
@@ -3999,511 +4003,19 @@ mod kvm_failure_tests;
 mod kvm_execution_tests;
 
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
-#[cfg(feature = "dbt")]
-fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
-    status.code() == Some(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
-}
 
-/// The program a DBT launch runs and the working directory it runs from, as
-/// reverie-dbt's launcher finds them: a name without a `/` through `path`,
-/// whose relative entries are taken from the guest's working directory;
-/// `cwd` relative to `current` (the launcher's own directory) when it is
-/// relative, and `current` when there is none. `None` where the search finds
-/// no executable file.
-#[cfg(feature = "dbt")]
-fn dbt_launched_program(
-    program: &std::path::Path,
-    cwd: Option<&std::path::Path>,
-    path: Option<&std::ffi::OsStr>,
-    current: &std::path::Path,
-) -> Option<(PathBuf, PathBuf)> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
-    let cwd = cwd.map_or_else(|| current.to_owned(), |cwd| current.join(cwd));
-    let spelled = if program.as_os_str().as_bytes().contains(&b'/') {
-        program.to_owned()
-    } else {
-        std::env::split_paths(path?)
-            .map(|directory| cwd.join(directory).join(program))
-            .find(|candidate| {
-                candidate.metadata().is_ok_and(|metadata| {
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
-            })?
-    };
-    Some((spelled, cwd))
-}
 
-#[cfg(all(test, feature = "dbt"))]
-mod dbt_launched_program_tests {
-    use std::os::unix::fs::PermissionsExt;
 
-    use super::*;
 
-    fn executable(path: &std::path::Path) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, b"").unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
 
-    #[test]
-    fn a_relative_path_entry_is_taken_from_the_guests_directory_not_the_launchers() {
-        let root = tempfile::tempdir().unwrap();
-        let launcher_dir = root.path().join("launcher");
-        // A decoy where the launcher's own directory would find it, and the
-        // program where the guest's directory does.
-        executable(&launcher_dir.join("bin/prog"));
-        executable(&root.path().join("guest/bin/prog"));
-        std::fs::write(root.path().join("guest/plain"), b"").unwrap();
-        let path = std::ffi::OsStr::new("bin");
-        let found = |program: &str, cwd: Option<&str>| {
-            dbt_launched_program(
-                std::path::Path::new(program),
-                cwd.map(std::path::Path::new),
-                Some(path),
-                &launcher_dir,
-            )
-        };
-        let guest = root.path().join("guest");
-        // An absolute and a relative working directory find the same file.
-        let expected = Some((guest.join("bin/prog"), guest.clone()));
-        assert_eq!(found("prog", Some(guest.to_str().unwrap())), expected);
-        assert_eq!(
-            found("prog", Some("../guest")),
-            Some((
-                launcher_dir.join("../guest/bin/prog"),
-                launcher_dir.join("../guest")
-            ))
-        );
-        // Without a working directory, the launcher's own is the guest's.
-        assert_eq!(
-            found("prog", None),
-            Some((launcher_dir.join("bin/prog"), launcher_dir.clone()))
-        );
-        // A name with a `/` is not searched for.
-        assert_eq!(
-            found("./plain", Some(guest.to_str().unwrap())),
-            Some((std::path::PathBuf::from("./plain"), guest.clone()))
-        );
-        // A file that is not executable is not found.
-        assert_eq!(found("plain", Some(guest.to_str().unwrap())), None);
-    }
-}
 
-/// Records, for a DBT run, the guest's first image: `program`, found and
-/// run from `cwd` with the guest's `PATH`, `path`, as the launch finds it
-/// (`dbt_launched_program`), then resolved as the kernel resolves an
-/// `execve`. Both DBT launch paths call it in the container, whose root is
-/// the guest's, in place of `launched_image`'s search, which takes a
-/// relative `PATH` entry from the coordinator's directory rather than the
-/// guest's. Where nothing is found the record stays unset, and the image's
-/// own `AT_EXECFN` gives it after the exec.
-#[cfg(feature = "dbt")]
-pub fn record_dbt_launched_image(
-    config: &mut DetConfig,
-    program: &std::path::Path,
-    cwd: Option<&std::path::Path>,
-    path: Option<&std::ffi::OsStr>,
-) {
-    let exe = std::env::current_dir()
-        .ok()
-        .and_then(|current| dbt_launched_program(program, cwd, path, &current))
-        .and_then(|(spelled, cwd)| {
-            detcore::exec_record::ExecRecord::resolve(std::path::Path::new("/"), &cwd, &spelled)
-        })
-        .map(|record| record.exe);
-    config
-        .launch_image
-        .get_or_insert(detcore::LaunchImage {
-            exe: None,
-            launcher: None,
-        })
-        .exe = exe;
-}
 
-/// Refuses the DBT runtime at `runtime` unless it exports
-/// [`detcore_dbt::FINGERPRINT_CHECK_SYMBOL`], so unless it refuses a
-/// coordinator from another tree itself
-/// (`detcore_dbt::CONFIG_FINGERPRINT_ENV`). A runtime built before that check
-/// takes this Hermit's configuration whatever its own build, and with the
-/// global RPC changed since, it would keep a host value Detcore now replaces
-/// (an inotify rename cookie, for one) rather than be refused by name.
-#[cfg(feature = "dbt")]
-pub fn require_dbt_runtime_fingerprint_check(runtime: &std::path::Path) -> Result<(), Error> {
-    let symbols = defined_dynamic_symbols(runtime)
-        .map_err(|error| error.context("failed to read the Detcore DBT runtime's exports"))?;
-    if symbols
-        .iter()
-        .any(|symbol| symbol == detcore_dbt::FINGERPRINT_CHECK_SYMBOL)
-    {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "the Detcore DBT runtime {} predates its check of the coordinator's fingerprint (it \
-             exports no {}), so it would run with this hermit whatever tree it was built from. \
-             Rebuild it from Hermit's tree (`cargo build -p detcore-dbt-cdylib`)",
-            runtime.display(),
-            detcore_dbt::FINGERPRINT_CHECK_SYMBOL
-        ))
-    }
-}
 
-/// The names of the symbols the ELF image at `path` defines in its dynamic
-/// symbol table, the table the dynamic loader binds from. This reads only the
-/// parts of the file the loader uses for them -- the ELF and program headers,
-/// the dynamic segment, the symbol hash table, and the dynamic symbol and
-/// string tables: 6,467 bytes of a 19.5 MB release DBT runtime -- and so does
-/// not need the section headers or `.symtab`, which stripping can remove.
-#[cfg(feature = "dbt")]
-fn defined_dynamic_symbols(path: &std::path::Path) -> Result<Vec<String>, Error> {
-    use std::os::unix::fs::FileExt;
-
-    use goblin::container::Ctx;
-    use goblin::elf::dynamic::Dynamic;
-    use goblin::elf::dynamic::DynamicInfo;
-    use goblin::elf::program_header::PT_DYNAMIC;
-    use goblin::elf::program_header::ProgramHeader;
-    use goblin::elf::section_header::SHN_UNDEF;
-    use goblin::elf::sym::Sym;
-    use goblin::elf::sym::Symtab;
-    use goblin::strtab::Strtab;
-
-    let file = fs::File::open(path)
-        .map_err(|error| anyhow!("failed to open {}: {error}", path.display()))?;
-    let length = file
-        .metadata()
-        .map_err(|error| anyhow!("failed to stat {}: {error}", path.display()))?
-        .len();
-    let not_elf = |error: &dyn std::fmt::Display| anyhow!("{} is not ELF: {error}", path.display());
-    let read = |offset: u64, size: usize| -> Result<Vec<u8>, Error> {
-        if offset
-            .checked_add(size as u64)
-            .is_none_or(|end| end > length)
-        {
-            return Err(not_elf(&format_args!(
-                "{size} bytes at {offset:#x} would end past its {length} bytes"
-            )));
-        }
-        let mut bytes = vec![0; size];
-        file.read_exact_at(&mut bytes, offset)
-            .map_err(|error| anyhow!("failed to read {}: {error}", path.display()))?;
-        Ok(bytes)
-    };
-
-    let header = Elf::parse_header(&read(0, goblin::elf64::header::SIZEOF_EHDR)?)
-        .map_err(|error| not_elf(&error))?;
-    let ctx = Ctx::new(
-        header.container().map_err(|error| not_elf(&error))?,
-        header.endianness().map_err(|error| not_elf(&error))?,
-    );
-    let count = usize::from(header.e_phnum);
-    let program_headers = ProgramHeader::parse(
-        &read(header.e_phoff, count * ProgramHeader::size(ctx))?,
-        0,
-        count,
-        ctx,
-    )
-    .map_err(|error| not_elf(&error))?;
-    // An image without a dynamic segment exports nothing.
-    let Some(segment) = program_headers
-        .iter()
-        .find(|header| header.p_type == PT_DYNAMIC)
-    else {
-        return Ok(Vec::new());
-    };
-    // `Dynamic::parse` reads the segment from the bytes it is given at the
-    // segment's file offset, so it is given the segment alone, at offset 0.
-    // Its addresses are then mapped to file offsets with every header.
-    let entries = read(
-        segment.p_offset,
-        usize::try_from(segment.p_filesz).map_err(|error| not_elf(&error))?,
-    )?;
-    let alone = ProgramHeader {
-        p_offset: 0,
-        ..segment.clone()
-    };
-    let Some(dynamic) = Dynamic::parse(&entries, &[alone], ctx).map_err(|error| not_elf(&error))?
-    else {
-        return Ok(Vec::new());
-    };
-    let info = DynamicInfo::new(&dynamic.dyns, &program_headers);
-    let count = dynamic_symbol_count(&read, &info, ctx)?;
-    if count == 0 || info.symtab == 0 || info.strtab == 0 {
-        return Ok(Vec::new());
-    }
-    let symbols = read(
-        info.symtab as u64,
-        count.saturating_mul(Sym::size(ctx.container)),
-    )?;
-    let symbols = Symtab::parse(&symbols, 0, count, ctx).map_err(|error| not_elf(&error))?;
-    let names = read(info.strtab as u64, info.strsz)?;
-    let names = Strtab::parse(&names, 0, info.strsz, 0).map_err(|error| not_elf(&error))?;
-    Ok(symbols
-        .iter()
-        .filter(|symbol| symbol.st_shndx != SHN_UNDEF as usize)
-        .filter_map(|symbol| names.get_at(symbol.st_name).map(str::to_owned))
-        .collect())
-}
-
-/// How many entries an ELF image's dynamic symbol table has, which only the
-/// section headers record; without them it comes from the symbol hash table,
-/// as goblin and readelf find it. A GNU hash table leaves out the first
-/// `symoffset` symbols and chains every later one, so the count is one past
-/// the end of the chain that starts last (a chain's final entry has its low
-/// bit set); a SysV hash table's chain count is the symbol count.
-#[cfg(feature = "dbt")]
-fn dynamic_symbol_count(
-    read: &dyn Fn(u64, usize) -> Result<Vec<u8>, Error>,
-    info: &goblin::elf::dynamic::DynamicInfo,
-    ctx: goblin::container::Ctx,
-) -> Result<usize, Error> {
-    let word = |bytes: &[u8], index: usize| {
-        let bytes: [u8; 4] = bytes[4 * index..4 * index + 4]
-            .try_into()
-            .expect("four bytes");
-        if ctx.is_little_endian() {
-            u32::from_le_bytes(bytes)
-        } else {
-            u32::from_be_bytes(bytes)
-        }
-    };
-    if let Some(table) = info.gnu_hash {
-        // nbuckets, symoffset, bloom_size and bloom_shift; then the bloom
-        // filter's address-sized words, the buckets, and the chains.
-        let header = read(table, 16)?;
-        let buckets = word(&header, 0) as usize;
-        let first = word(&header, 1) as usize;
-        let starts_at = table + 16 + u64::from(word(&header, 2)) * ctx.size() as u64;
-        let starts = read(starts_at, 4 * buckets)?;
-        let Some(last) = (0..buckets)
-            .map(|bucket| word(&starts, bucket) as usize)
-            .max()
-            .filter(|&last| last >= first)
-        else {
-            return Ok(first);
-        };
-        let chains_at = starts_at + 4 * buckets as u64;
-        let mut symbol = last;
-        while word(&read(chains_at + 4 * (symbol - first) as u64, 4)?, 0) & 1 == 0 {
-            symbol += 1;
-        }
-        Ok(symbol + 1)
-    } else if let Some(table) = info.hash {
-        // nbucket, then nchain.
-        Ok(word(&read(table, 8)?, 1) as usize)
-    } else {
-        Ok(0)
-    }
-}
-
-/// Declares, for a DBT run through `drrun`, the image the kernel execs in the
-/// guest's place: DynamoRIO's library (`lib64/release/libdynamorio.so` beside
-/// `drrun`'s `bin64`), which loads the guest itself. So the kernel's `exe`
-/// link and program break are DynamoRIO's (`detcore::LaunchImage::launcher`),
-/// and Detcore answers the guest's brk from its own model; the runner tells
-/// DynamoRIO to reserve nothing for the break
-/// (`reverie_dbt::DbtRunner::tool_answers_brk`).
-/// An error where that library is missing: the run would otherwise
-/// declare a launcher the kernel never execs, and refuse every brk for want
-/// of a record the launcher check can accept.
-#[cfg(feature = "dbt")]
-pub fn declare_dbt_launcher(config: &mut DetConfig, drrun: &std::path::Path) -> Result<(), Error> {
-    let library = drrun
-        .parent()
-        .and_then(std::path::Path::parent)
-        .unwrap_or(std::path::Path::new("/"))
-        .join("lib64/release/libdynamorio.so");
-    if !library.is_file() {
-        return Err(anyhow!(
-            "DynamoRIO's library is not at {} beside drrun {}",
-            library.display(),
-            drrun.display()
-        ));
-    }
-    config
-        .launch_image
-        .get_or_insert(detcore::LaunchImage {
-            exe: None,
-            launcher: None,
-        })
-        .launcher = Some(library);
-    Ok(())
-}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-737): Review public DBT dispatch and child environment ownership.
 /// Dispatch a command onto the Detcore-linked reverie-dbt runtime.
-#[cfg(feature = "dbt")]
-async fn run_dbt(
-    command: Command,
-    config: DetConfig,
-    print_summary: bool,
-    capture_output: bool,
-) -> Result<Output, Error> {
-    if !config.sequentialize_threads {
-        return Err(anyhow!(
-            "the dbt backend requires sequentialized threads; remove \
-             --no-sequentialize-threads (or --strace-only) to run under --backend dbt"
-        ));
-    }
-    // Strict schedule boundaries have never run on this backend: the
-    // configuration form that once carried Detcore's configuration to the DBT
-    // runtime could not express them, which refused such a run. They stay
-    // refused, by name.
-    if config.strict_schedule_boundaries {
-        return Err(anyhow!(
-            "the dbt backend does not run --strict-schedule-boundaries"
-        ));
-    }
 
-    // The DBT runtime receives this configuration through the coordinator's
-    // first RPC frame (`detcore_dbt::initial_dbt_config`), never through the
-    // guest's environment, which carries only what the guest was given.
-    let (drrun, client) = detcore_dbt::prepare_native_client()
-        .map_err(|error| anyhow!("failed to prepare the Detcore DynamoRIO client: {error}"))?;
-    require_dbt_runtime_fingerprint_check(
-        &detcore_dbt::runtime_library_path()
-            .map_err(|error| anyhow!("failed to find the Detcore DBT runtime: {error}"))?,
-    )?;
-    let mut config = config;
-    declare_dbt_launcher(&mut config, &drrun)?;
-    record_dbt_launched_image(
-        &mut config,
-        std::path::Path::new(command.get_program()),
-        command.get_current_dir(),
-        command
-            .get_captured_envs()
-            .get(std::ffi::OsStr::new("PATH"))
-            .map(std::ffi::OsString::as_os_str),
-    );
-    // The coordinator's first RPC frame carries this configuration to the
-    // runtime. One that cannot be serialized (a path option that is not
-    // UTF-8, say) is refused here, before any guest runs.
-    serde_json::to_vec(&config)
-        .map_err(|error| anyhow!("failed to serialize the Detcore config for DBT: {error}"))?;
-    let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
-    // Bind native diagnostics to the controller before guest output capture.
-    let diagnostics = std::fs::File::from(
-        std::io::stderr()
-            .as_fd()
-            .try_clone_to_owned()
-            .map_err(|error| anyhow!("failed to retain DBT diagnostic stderr: {error}"))?,
-    );
-    let mut runner = reverie_dbt::DbtRunner::new(&drrun, &client)
-        .map_err(|error| {
-            anyhow!(
-                "failed to configure the DynamoRIO DBT runner (drrun={}, client={}): {error}",
-                drrun.display(),
-                client.display()
-            )
-        })?
-        .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)?
-        .private_placement(detcore_dbt::PRIVATE_PLACEMENT)
-        .summary(print_summary)
-        .isolated_process_group(panic_on_unsupported_syscalls)
-        .tool_answers_brk(true)
-        .diagnostic_file(&diagnostics)
-        .map_err(|error| anyhow!("failed to configure DBT diagnostic stderr: {error}"))?;
-    drop(diagnostics);
-    if panic_on_unsupported_syscalls {
-        runner = runner.client_argument("-panic-on-unsupported-syscalls");
-    }
-
-    let program = command.get_program().to_owned();
-    let mut environment = command.get_captured_envs();
-    // The runtime checks this against its own build before it reads the
-    // configuration frame (`detcore_dbt::CONFIG_FINGERPRINT_ENV`); the
-    // runner's private prefix keeps it from the guest.
-    environment.insert(
-        detcore_dbt::CONFIG_FINGERPRINT_ENV.into(),
-        detcore::config_wire_fingerprint().into(),
-    );
-    let guest = command.into_std_lossy();
-    tracing::info!(
-        target: "hermit::dbt",
-        program = ?program,
-        drrun = %drrun.display(),
-        client = %client.display(),
-        "launching guest through reverie-dbt with Detcore<DbtGuest>",
-    );
-
-    let (status, stdout, stderr, mut global) = if capture_output {
-        let launch = || {
-            runner.output_with_environment_and_global::<detcore::GlobalState>(
-                &guest,
-                &environment,
-                config.clone(),
-            )
-        };
-        let (mut output, mut global) = launch()
-            .await
-            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
-        if dbt_client_thread_start_failed(&output.status) {
-            tracing::warn!(
-                target: "hermit::dbt",
-                "DynamoRIO client thread failed before guest start; retrying once",
-            );
-            global.force_shutdown_with_error();
-            global.cancel_internal_scheduler().await;
-            global.clean_up(false, &None).await.map_err(|error| {
-                error.context(format!(
-                    "DBT cleanup after observed guest status {:?}",
-                    output.status
-                ))
-            })?;
-            (output, global) = launch().await.map_err(|error| {
-                anyhow!("failed to launch drrun ({}): {error}", drrun.display())
-            })?;
-        }
-        (output.status, output.stdout, output.stderr, global)
-    } else {
-        let launch = || {
-            runner.status_with_environment_and_global::<detcore::GlobalState>(
-                &guest,
-                &environment,
-                config.clone(),
-            )
-        };
-        let (mut status, mut global) = launch()
-            .await
-            .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))?;
-        if dbt_client_thread_start_failed(&status) {
-            tracing::warn!(
-                target: "hermit::dbt",
-                "DynamoRIO client thread failed before guest start; retrying once",
-            );
-            global.force_shutdown_with_error();
-            global.cancel_internal_scheduler().await;
-            global.clean_up(false, &None).await.map_err(|error| {
-                error.context(format!(
-                    "DBT cleanup after observed guest status {status:?}"
-                ))
-            })?;
-            (status, global) = launch().await.map_err(|error| {
-                anyhow!("failed to launch drrun ({}): {error}", drrun.display())
-            })?;
-        }
-        (status, Vec::new(), Vec::new(), global)
-    };
-
-    if !status.success() {
-        global.force_shutdown_with_error();
-        global.cancel_internal_scheduler().await;
-    }
-    global
-        .clean_up(print_summary, &None)
-        .await
-        .map_err(|error| {
-            error.context(format!(
-                "DBT cleanup after observed guest status {status:?}"
-            ))
-        })?;
-    Ok(Output {
-        status: status.into(),
-        stdout,
-        stderr,
-    })
-}
 
 // NOTE: A single-threaded executor is used here so that the tokio threads
 // themselves wouldn't contribute non-determinism to the PID namespace. This
@@ -4937,7 +4449,7 @@ async fn run_with_backend_inner(
 /// whose root is the guest's. A launch through a launcher names it itself
 /// (`run_sabre`). `None` when it cannot be found, which leaves the link to the
 /// kernel, and the launch reports the missing program itself.
-fn launched_image(command: &Command) -> Option<detcore::LaunchImage> {
+pub fn launched_image(command: &Command) -> Option<detcore::LaunchImage> {
     let program = command.find_program().ok()?;
     let cwd = match command.get_current_dir() {
         Some(cwd) => cwd.to_owned(),
@@ -4972,17 +4484,6 @@ async fn dispatch_backend(
         )
         .await?
         .status);
-    }
-    if backend == Backend::Dbt {
-        #[cfg(feature = "dbt")]
-        {
-            return Ok(run_dbt(command, config, print_summary, false).await?.status);
-        }
-        #[cfg(not(feature = "dbt"))]
-        {
-            backend.ensure_available()?;
-            unreachable!("DBT availability must fail when the feature is disabled");
-        }
     }
     if backend == Backend::Sabre {
         return Ok(run_sabre(
@@ -5326,17 +4827,6 @@ async fn dispatch_output_backend(
             true,
         )
         .await;
-    }
-    if backend == Backend::Dbt {
-        #[cfg(feature = "dbt")]
-        {
-            return run_dbt(command, config, print_summary, true).await;
-        }
-        #[cfg(not(feature = "dbt"))]
-        {
-            backend.ensure_available()?;
-            unreachable!("DBT availability must fail when the feature is disabled");
-        }
     }
     if backend == Backend::Sabre {
         #[cfg(not(feature = "sabre"))]
@@ -8543,119 +8033,9 @@ mod tests {
     /// one built before the check does not, is refused before DBT starts
     /// (this test's own executable exports no such symbol), and so is a file
     /// that is not ELF.
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn a_dbt_runtime_without_the_fingerprint_check_is_refused() {
-        let image = std::env::current_exe().unwrap();
-        let refusal = super::require_dbt_runtime_fingerprint_check(&image)
-            .expect_err("an image without the symbol is refused");
-        let message = format!("{refusal:#}");
-        assert!(
-            message.contains("predates its check of the coordinator's fingerprint")
-                && message.contains(detcore_dbt::FINGERPRINT_CHECK_SYMBOL),
-            "{message}"
-        );
-        let refusal = super::require_dbt_runtime_fingerprint_check(std::path::Path::new(
-            "/proc/self/cmdline",
-        ))
-        .expect_err("a file that is not ELF is refused");
-        assert!(format!("{refusal:#}").contains("is not ELF"), "{refusal:#}");
-    }
-
-    #[cfg(feature = "dbt")]
-    #[test]
-    fn defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone() {
-        // The libc this test runs with, against goblin's parse of all of it.
-        let maps = fs::read_to_string("/proc/self/maps").unwrap();
-        let libc = maps
-            .lines()
-            .filter_map(|line| line.split_whitespace().nth(5))
-            .find(|path| {
-                path.rsplit('/')
-                    .next()
-                    .is_some_and(|name| name.starts_with("libc.so"))
-            })
-            .expect("this test runs with a dynamically linked libc");
-        let ours = super::defined_dynamic_symbols(std::path::Path::new(libc)).unwrap();
-        let bytes = fs::read(libc).unwrap();
-        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
-        let named = |symbol: &goblin::elf::sym::Sym| elf.dynstrtab.get_at(symbol.st_name);
-        assert!(
-            elf.dynsyms
-                .iter()
-                .any(|symbol| symbol.st_shndx == 0 && named(&symbol).is_some_and(|n| !n.is_empty())),
-            "{libc} imports a symbol, which is not one of its exports"
-        );
-        let theirs: Vec<String> = elf
-            .dynsyms
-            .iter()
-            .filter(|symbol| symbol.st_shndx != 0)
-            .filter_map(|symbol| named(&symbol).map(str::to_owned))
-            .collect();
-        assert!(ours.iter().any(|name| name == "malloc"), "{ours:?}");
-        assert_eq!(ours, theirs);
-    }
-
-    #[cfg(feature = "dbt")]
-    #[test]
-    fn the_dynamic_symbol_count_comes_from_the_hash_table() {
-        use goblin::container::Container;
-        use goblin::container::Ctx;
-        use goblin::container::Endian;
-        use goblin::elf::dynamic::DynamicInfo;
-
-        let ctx = Ctx::new(Container::Big, Endian::Little);
-        let image = |words: &[u32]| -> Vec<u8> {
-            words.iter().flat_map(|word| word.to_le_bytes()).collect()
-        };
-        let reader = |image: Vec<u8>| {
-            move |offset: u64, size: usize| -> Result<Vec<u8>, anyhow::Error> {
-                let start = offset as usize;
-                image
-                    .get(start..start + size)
-                    .map(<[u8]>::to_vec)
-                    .ok_or_else(|| anyhow::anyhow!("{size} bytes at {offset} are past the end"))
-            }
-        };
-        let gnu = DynamicInfo {
-            gnu_hash: Some(0),
-            ..Default::default()
-        };
-        // nbuckets 2, symoffset 1, bloom_size 1, bloom_shift 6; one 8-byte
-        // bloom word; buckets starting at symbols 1 and 3; the chains of
-        // symbols 1 to 4, where a set low bit ends a chain. Symbol 0 is not
-        // hashed, so the table has 5 symbols.
-        let table = image(&[2, 1, 1, 6, 0, 0, 1, 3, 0x10, 0x21, 0x30, 0x41]);
-        assert_eq!(
-            super::dynamic_symbol_count(&reader(table), &gnu, ctx).unwrap(),
-            5
-        );
-        // With every bucket empty, only the 3 symbols before symoffset.
-        let table = image(&[1, 3, 1, 6, 0, 0, 0]);
-        assert_eq!(
-            super::dynamic_symbol_count(&reader(table), &gnu, ctx).unwrap(),
-            3
-        );
-        // A chain that runs past the image is refused, not counted.
-        let table = image(&[1, 1, 1, 6, 0, 0, 1, 0x10]);
-        super::dynamic_symbol_count(&reader(table), &gnu, ctx).unwrap_err();
-        // A SysV table: nbucket, then nchain.
-        let sysv = DynamicInfo {
-            hash: Some(0),
-            ..Default::default()
-        };
-        let table = image(&[1, 7, 0]);
-        assert_eq!(
-            super::dynamic_symbol_count(&reader(table), &sysv, ctx).unwrap(),
-            7
-        );
-        // With neither, the loader can bind nothing.
-        assert_eq!(
-            super::dynamic_symbol_count(&reader(Vec::new()), &DynamicInfo::default(), ctx).unwrap(),
-            0
-        );
-    }
-    #[cfg(feature = "sabre")]
+    
+    
+        #[cfg(feature = "sabre")]
     use std::ffi::OsStr;
     use std::fs;
     #[cfg(feature = "sabre")]
@@ -9880,58 +9260,11 @@ mod tests {
         );
     }
 
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn dbt_retries_only_the_pre_guest_bootstrap_failure() {
-        use std::os::unix::process::ExitStatusExt as _;
+    
 
-        let failure = std::process::ExitStatus::from_raw(
-            reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE << 8,
-        );
-        assert!(super::dbt_client_thread_start_failed(&failure));
-        assert!(!super::dbt_client_thread_start_failed(
-            &std::process::ExitStatus::from_raw(1 << 8)
-        ));
-    }
+    
 
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn dbt_public_dispatch_refuses_strict_schedule_boundaries() {
-        let command = super::Command::new("/bin/true");
-        let config = super::DetConfig {
-            sequentialize_threads: true,
-            strict_schedule_boundaries: true,
-            ..Default::default()
-        };
-
-        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbt)
-            .expect_err("DBT must refuse strict schedule boundaries");
-        assert!(
-            error
-                .to_string()
-                .contains("dbt backend does not run --strict-schedule-boundaries"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn dbt_public_dispatch_requires_sequentialized_threads() {
-        let command = super::Command::new("/bin/true");
-        let config = super::DetConfig {
-            sequentialize_threads: false,
-            ..Default::default()
-        };
-
-        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbt)
-            .expect_err("DBT must reject non-sequentialized execution");
-        assert!(
-            error
-                .to_string()
-                .contains("dbt backend requires sequentialized threads"),
-            "unexpected error: {error}"
-        );
-    }
+    
 
     #[tokio::test(flavor = "current_thread")]
     async fn dbt_library_environment_privacy_is_caller_selected() {
@@ -9948,202 +9281,14 @@ mod tests {
                  built without the `dbt` feature",
             );
         }
-        #[cfg(feature = "dbt")]
-        {
-            let mut command = super::Command::new("/usr/bin/env");
-            command
-                .env_clear()
-                .env("HERMIT_DBT_PRIVACY_SENTINEL", "known")
-                .env("HERMIT_APP_VISIBLE", "known");
-            let mut config = env_free_detconfig("--epoch=2026-01-01T00:00:00Z", "--seed=0");
-            config.sequentialize_threads = true;
-            config.deterministic_io = true;
-            config.panic_on_unsupported_syscalls = true;
-            config.validate();
-            let config = super::prepare_backend_config(config, Backend::Dbt);
-            let output = super::run_dbt(command, config, false, true)
-                .await
-                .expect("run /usr/bin/env through the real DBT library constructor");
-            assert_eq!(
-                output.status,
-                super::ExitStatus::Exited(0),
-                "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
-                String::from_utf8_lossy(&output.stderr),
-                String::from_utf8_lossy(&output.stdout),
-            );
-            let printed = String::from_utf8(output.stdout).expect("synthetic environment is UTF-8");
-            assert_eq!(
-                printed
-                    .lines()
-                    .filter(|line| *line == "HERMIT_APP_VISIBLE=known")
-                    .count(),
-                1,
-                "public sentinel missing or duplicated: {printed}",
-            );
-            assert!(
-                !printed.contains("HERMIT_DBT_PRIVACY_SENTINEL="),
-                "Hermit private environment sentinel leaked to guest: {printed}",
-            );
-            assert_eq!(printed, "HERMIT_APP_VISIBLE=known\n");
-        }
+        
     }
 
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn dbt_private_placement_preserves_library_dispatch() {
-        use clap::Parser;
+    
 
-        Backend::Dbt
-            .ensure_available()
-            .expect("DBT placement control requires the real packaged runtime");
-        const CHILD: &str = "HERMIT_TEST_DBT_PLACEMENT_LIBRARY_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let probe = super::dbt_placement_probe::Probe::new(false);
-            let (install, bind) = probe.launch();
-            assert!(bind.is_none());
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::dbt_private_placement_preserves_library_dispatch",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .env("HERMIT_INSTALL_DIR", install)
-                .env("HERMIT_REQUIRE_DBT", "1")
-                .output()
-                .expect("run isolated DBT library placement and output checks");
-            let diagnostics = String::from_utf8_lossy(&output.stderr);
-            assert!(output.status.success(), "{output:?}");
-            assert!(
-                diagnostics
-                    .lines()
-                    .filter(|line| line.starts_with("reverie-dbt: tool=Detcore "))
-                    .count()
-                    >= 2,
-                "DBT native summaries did not prove both Detcore dispatches: {diagnostics}"
-            );
-            assert!(!diagnostics.contains("guest-stderr"), "{diagnostics}");
-            probe.assert_zero(2, false);
-            return;
-        }
+    
 
-        let mut command = super::Command::new("/bin/echo");
-        command.arg("hello");
-        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
-        config.sequentialize_threads = true;
-        config.validate();
-        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
-            .expect("run /bin/echo through DbtGuest<Detcore>");
-
-        // Include captured output so a failed backend launch reports its diagnostics.
-        assert_eq!(
-            output.status,
-            super::ExitStatus::Exited(0),
-            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout),
-        );
-        assert_eq!(output.stdout, b"hello\n");
-        assert_eq!(output.stderr, b"");
-
-        let mut command = super::Command::new("/bin/sh");
-        command.args(["-c", "printf 'guest-stderr\\n' >&2"]);
-        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
-        config.sequentialize_threads = true;
-        config.validate();
-        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
-            .expect("capture nonempty guest stderr through DbtGuest<Detcore>");
-        assert_eq!(output.status, super::ExitStatus::Exited(0), "{output:?}");
-        assert_eq!(output.stdout, b"");
-        assert_eq!(output.stderr, b"guest-stderr\n");
-    }
-
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn dbt_public_dispatch_runs_echo_through_detcore() {
-        use clap::Parser;
-
-        if Backend::Dbt.ensure_available().is_err() {
-            return;
-        }
-
-        // Isolate the controller's fd 2 in a subprocess, without redirecting a
-        // descriptor shared by other tests in this process.
-        const CHILD: &str = "HERMIT_TEST_DBT_LIBRARY_DIAGNOSTICS_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::dbt_public_dispatch_runs_echo_through_detcore",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .expect("run isolated DBT library output checks");
-            let diagnostics = String::from_utf8_lossy(&output.stderr);
-            assert!(output.status.success(), "{output:?}");
-            assert!(
-                diagnostics
-                    .lines()
-                    .filter(|line| line.starts_with("reverie-dbt: tool=Detcore "))
-                    .count()
-                    >= 2,
-                "DBT native summaries did not prove both Detcore dispatches: {diagnostics}"
-            );
-            assert!(!diagnostics.contains("guest-stderr"), "{diagnostics}");
-            return;
-        }
-
-        let mut command = super::Command::new("/bin/echo");
-        command.arg("hello");
-        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
-        config.sequentialize_threads = true;
-        config.validate();
-        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
-            .expect("run /bin/echo through DbtGuest<Detcore>");
-
-        // Include captured output so a failed backend launch reports its diagnostics.
-        assert_eq!(
-            output.status,
-            super::ExitStatus::Exited(0),
-            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout),
-        );
-        assert_eq!(output.stdout, b"hello\n");
-        assert_eq!(output.stderr, b"");
-
-        let mut command = super::Command::new("/bin/sh");
-        command.args(["-c", "printf 'guest-stderr\\n' >&2"]);
-        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
-        config.sequentialize_threads = true;
-        config.validate();
-        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
-            .expect("capture nonempty guest stderr through DbtGuest<Detcore>");
-        assert_eq!(output.status, super::ExitStatus::Exited(0), "{output:?}");
-        assert_eq!(output.stdout, b"");
-        assert_eq!(output.stderr, b"guest-stderr\n");
-    }
-
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn dbt_public_status_dispatch_runs_true_through_detcore() {
-        use clap::Parser;
-
-        if Backend::Dbt.ensure_available().is_err() {
-            return;
-        }
-
-        let command = super::Command::new("/bin/true");
-        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
-        config.sequentialize_threads = true;
-        config.validate();
-        let status = super::run_with_backend(command, config, true, &None, Backend::Dbt)
-            .expect("run /bin/true through DbtGuest<Detcore>");
-
-        assert_eq!(status, super::ExitStatus::Exited(0));
-    }
+    
 
     #[test]
     fn kvm_runs_dynamic_echo_through_detcore() {

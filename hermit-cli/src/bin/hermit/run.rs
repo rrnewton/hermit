@@ -816,6 +816,73 @@ fn verification_log(
     ))
 }
 
+fn verification_log_with_tracing(
+    file: File,
+    level: tracing::metadata::LevelFilter,
+    budget: Option<super::tracing::LogBudget>,
+    backend: Backend,
+) -> Result<(SharedLog, super::tracing::TracingGuard), Error> {
+    let limit = log_max_bytes().map_err(Error::msg)?;
+    let log = verification_log(file, limit, budget);
+    let guard = init_sync_file_tracing(Some(level), log.clone(), backend);
+    Ok((log, guard))
+}
+
+/// Affine core ownership of one external tracing capture and its real stream.
+/// No writer or forwarding-latch policy is implemented by the backend closure.
+pub(super) struct VerificationLogSession {
+    log: SharedLog,
+    _tracing: super::tracing::TracingGuard,
+    forwarding: bool,
+    closed: bool,
+}
+
+impl VerificationLogSession {
+    pub(super) fn open(
+        file: File,
+        forwarded: &mut ForwardedDetlogPlan,
+        level: tracing::metadata::LevelFilter,
+        budget: Option<super::tracing::LogBudget>,
+    ) -> Result<Self, Error> {
+        let channel = forwarded.open_in_container()?;
+        hermit::proc_mount::warn_if_readonly_proc();
+        let (log, tracing) = verification_log_with_tracing(file, level, budget, Backend::Ptrace)?;
+        let forwarding = channel.is_some();
+        if let Some((sender, receiver)) = channel {
+            hermit::forward_in_guest_detlogs_to(sender);
+            detcore::detlog::set_forwarded_source(receiver, log.record_sink());
+        }
+        Ok(Self {
+            log,
+            _tracing: tracing,
+            forwarding,
+            closed: false,
+        })
+    }
+
+    pub(super) fn finish(&mut self) -> RunLatches {
+        if !self.closed {
+            if self.forwarding {
+                // Drop the coordinator's sender before the original ordered drain.
+                hermit::clear_in_guest_detlog_forwarding();
+                detcore::detlog::clear_forwarded_source();
+            }
+            let _ = self.log.clone().flush();
+            self.closed = true;
+        }
+        RunLatches {
+            determinism_loss: detcore::detlog::determinism_loss(),
+            log_sink_failure: self.log.failure(),
+        }
+    }
+}
+
+impl Drop for VerificationLogSession {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
 /// The `--print-verify-logs` echo of the first verification run's log.
 ///
 /// With --verify the first run's `--log` output was diverted to a temporary
@@ -7506,17 +7573,13 @@ impl RunOpts {
     /// A new executable does not inherit a ptrace-specific qualification just
     /// because the built-in default enum still exists in this compatibility
     /// step. Refuse unsupported core runtime switches before reading stdin.
-    fn refuse_unqualified_application_options(&self) -> Result<(), Error> {
+    fn refuse_unqualified_application_options(
+        &self,
+        cpu_profile_refusal: &'static str,
+    ) -> Result<(), Error> {
         let Some(name) = self.application_backend else {
             return Ok(());
         };
-        if self.verify_run.is_some() {
-            return Err(Error::new(PolicyRefusal).context(format!(
-                "--verify-run is not yet supported by executable-selected backend `{name}`: \
-                 its saved-record and offline-comparison bridge is not implemented; \
-                 use live --verify instead"
-            )));
-        }
         let config = &self.det_opts.det_config;
         let options = [
             (self.namespace_only, "--namespace-only"),
@@ -7539,8 +7602,6 @@ impl RunOpts {
                 config.network_trace.mode != NetworkTraceMode::Off,
                 "network tracing",
             ),
-            (!config.cpu_profile.is_default(), "--cpu-profile"),
-            (config.virtual_cpus.is_some(), "--virtual-cpus"),
         ];
         for (requested, option) in options {
             if requested {
@@ -7548,6 +7609,19 @@ impl RunOpts {
                     "{option} is not qualified for executable-selected backend `{name}`"
                 )));
             }
+        }
+        if !config.cpu_profile.is_default() {
+            return Err(Error::new(PolicyRefusal).context(
+                hermit::cpu_profile_admission::CpuProfileRefusal::new(
+                    config.cpu_profile,
+                    format!("--backend={name}: {cpu_profile_refusal}"),
+                ),
+            ));
+        }
+        if config.virtual_cpus.is_some() {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "--virtual-cpus is not qualified for executable-selected backend `{name}`"
+            )));
         }
         #[cfg(feature = "native-exec")]
         anyhow::ensure!(
@@ -7650,6 +7724,23 @@ impl RunOpts {
         Ok(ForwardedDetlogPlan::Socket { opened: false })
     }
 
+    fn forwarded_detlog_plan_for_transport(
+        &self,
+        transport: Option<super::backend_hook::VerificationLogTransport>,
+    ) -> Result<ForwardedDetlogPlan, Error> {
+        use super::backend_hook::VerificationLogTransport;
+        match transport {
+            Some(VerificationLogTransport::InGuestSocket) => {
+                Ok(ForwardedDetlogPlan::Socket { opened: false })
+            }
+            Some(
+                VerificationLogTransport::CoordinatorTracing
+                | VerificationLogTransport::NativeEvidence,
+            ) => Ok(ForwardedDetlogPlan::None),
+            None => self.forwarded_detlog_plan(),
+        }
+    }
+
     /// A Unix `SOCK_SEQPACKET` pair for one verification run's forwarded
     /// DETLOG records, when the run hosts Detcore inside the guest (in-guest
     /// LiteInst or SaBRe): the guest's runtime sends each record as one message
@@ -7709,7 +7800,22 @@ impl RunOpts {
         stderr: &mut Vec<u8>,
         socket: bool,
     ) -> Result<Option<usize>, Error> {
-        if !self.forwards_in_guest_detlogs() {
+        self.take_forwarded_detlogs_for_transport(log, stderr, socket, None)
+    }
+
+    fn take_forwarded_detlogs_for_transport(
+        &self,
+        log: &Path,
+        stderr: &mut Vec<u8>,
+        socket: bool,
+        transport: Option<super::backend_hook::VerificationLogTransport>,
+    ) -> Result<Option<usize>, Error> {
+        use super::backend_hook::VerificationLogTransport;
+        let forwards = transport.map_or_else(
+            || self.forwards_in_guest_detlogs(),
+            |source| source == VerificationLogTransport::InGuestSocket,
+        );
+        if !forwards {
             return Ok(None);
         }
         if socket {
@@ -7769,8 +7875,8 @@ impl RunOpts {
         }
         let backend = self.selected_backend();
         let request = hermit::cpu_profile_admission::AdmissionRequest {
-            backend: backend.as_str(),
-            ptrace: backend == Backend::Ptrace,
+            backend: self.execution_backend_name(),
+            ptrace: self.application_backend.is_none() && backend == Backend::Ptrace,
             virtualize_cpuid: config.virtualize_cpuid,
             virtualize_time: config.virtualize_time,
             strace_only: self.strace_only,
@@ -8072,7 +8178,7 @@ impl RunOpts {
     /// `--verify-verbose` historically implied a bitwise compare (it flipped
     /// `strip_lines` off and `FullTrace` on); that is preserved, and
     /// `--verify-strict` selects the same comparison quietly.
-    fn verification_strictness(&self) -> LogCompareStrictness {
+    pub(super) fn verification_strictness(&self) -> LogCompareStrictness {
         if self.verify_verbose || self.verify_strict {
             LogCompareStrictness::Canonical
         } else {
@@ -8215,10 +8321,19 @@ impl RunOpts {
         adapter: &A,
         adapter_options: A::Options,
     ) -> Result<ExitStatus, Error> {
+        if self.application_backend.is_some() {
+            adapter.validate_mode(if self.verify_run.is_some() {
+                super::backend_hook::Mode::SavedVerification
+            } else if self.verify {
+                super::backend_hook::Mode::VerificationPair
+            } else {
+                super::backend_hook::Mode::Ordinary
+            })?;
+        }
         // An executable-selected adapter has no DAP/namespace-only dispatch.
         // Refuse those switches before the built-in dispatcher can launch a
         // supervisor, lower a shorthand or read any input.
-        self.refuse_unqualified_application_options()?;
+        self.refuse_unqualified_application_options(A::NONDEFAULT_CPU_PROFILE_REFUSAL)?;
         // Admission must see the actual global backend before any launch.
         match self
             .dispatch_before_validation(global.backend, std::env::var_os(DAP_LISTEN_INNER_ENV))?
@@ -8303,7 +8418,7 @@ impl RunOpts {
         // The backend is a global option (`hermit --backend X run ...`), the only
         // place it can be given.
         self.set_backend(global.backend);
-        self.refuse_unqualified_application_options()?;
+        self.refuse_unqualified_application_options(A::NONDEFAULT_CPU_PROFILE_REFUSAL)?;
         // Static native-option policy belongs before stdin reservation,
         // availability probes, or backend-specific preprocessing/dispatch.
         #[cfg(feature = "native-exec")]
@@ -8570,6 +8685,19 @@ impl RunOpts {
 
         // Ordinary and saved operations retain the existing physical launcher's
         // preparation/writer order. Live pairs join the one common verifier.
+        if self.application_backend.is_some()
+            && !self.verify
+            && let Some(directory) = &self.verify_run
+        {
+            self.warn_no_namespace();
+            return self.verify_run_with_adapter(
+                directory,
+                global,
+                dbt_verification_stdin,
+                adapter,
+                adapter_options,
+            );
+        }
         if (backend == Backend::Dbt || self.application_backend.is_some()) && !self.verify {
             self.warn_no_namespace();
             let mode = if self.verify_run.is_some() {
@@ -10119,6 +10247,43 @@ impl RunOpts {
         Ok(())
     }
 
+    pub(super) fn adapter_executable_overlay_plan(
+        &self,
+    ) -> Result<super::backend_hook::ExecutableOverlay, Error> {
+        let (guest, host) = self.resolve_guest_and_host_program()?;
+        let target = self.resolve_e9patch_overlay_target(&guest, &host)?;
+        Ok(super::backend_hook::ExecutableOverlay {
+            guest,
+            host,
+            target,
+        })
+    }
+
+    pub(super) fn adapter_with_executable_overlay(
+        &self,
+        plan: &super::backend_hook::ExecutableOverlay,
+        source: Option<&Path>,
+    ) -> Result<Self, Error> {
+        anyhow::ensure!(
+            self.adapter_executable_overlay_plan()? == *plan,
+            "executable overlay no longer matches the admitted guest/mount resolution"
+        );
+        let overlay = if let Some(source) = source {
+            self.validate_e9patch_mount_targets()?;
+            self.validate_e9patch_source_visibility(source)?;
+            Some(E9patchOverlay {
+                source: source.to_owned(),
+                target: plan.target.clone(),
+            })
+        } else {
+            None
+        };
+        let mut options = self.clone();
+        options.e9patch_program = Some(plan.guest.clone());
+        options.e9patch_overlay = overlay;
+        Ok(options)
+    }
+
     fn prepare_e9patch_program(&mut self) -> Result<(), Error> {
         let (guest, host) = self.resolve_guest_and_host_program()?;
         self.e9patch_program = Some(guest.clone());
@@ -10590,6 +10755,56 @@ impl RunOpts {
     // written to DIR instead of compared. `hermit log-diff --verify-json`
     // compares two such directories (`verify_run::compare`).
     fn verify_run(&self, directory: &Path, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.verify_run_with_execution(
+            directory,
+            None,
+            false,
+            |options, log, path, forwarded| {
+                let VerificationRunOutput {
+                    output,
+                    skid_overshoots,
+                    latches,
+                    #[cfg(feature = "dbt")]
+                        dbt: _,
+                } = options.run_verify(
+                    log,
+                    path,
+                    forwarded,
+                    global,
+                    VerificationRun::Run1,
+                    #[cfg(feature = "dbt")]
+                    None,
+                )?;
+                Ok(super::backend_hook::PhysicalRun {
+                    output,
+                    skid_overshoots,
+                    latches,
+                    pending: (),
+                })
+            },
+            |(), _| Ok(None),
+        )
+    }
+
+    /// The existing saved-run writer and publication owner. Physical callbacks
+    /// return observations only; this function retains latches, forwarded-log
+    /// checks, summary/host-input files and the synchronized record-last commit.
+    fn verify_run_with_execution<P>(
+        &self,
+        directory: &Path,
+        transport: Option<super::backend_hook::VerificationLogTransport>,
+        native: bool,
+        mut execute: impl FnMut(
+            &Self,
+            fs::File,
+            &Path,
+            ForwardedDetlogPlan,
+        ) -> Result<super::backend_hook::PhysicalRun<P>, Error>,
+        finish: impl FnOnce(
+            P,
+            &Output,
+        ) -> Result<Option<super::backend_hook::SavedNativeEvidence>, Error>,
+    ) -> Result<ExitStatus, Error> {
         let writer = verify_run::VerifyRunWriter::create(directory)?;
         let log_path = writer.path(verify_run::LOG);
         let log_file = fs::OpenOptions::new()
@@ -10597,73 +10812,175 @@ impl RunOpts {
             .create_new(true)
             .open(&log_path)
             .with_context(|| format!("creating the verification log {}", log_path.display()))?;
-        let forwarded = self.forwarded_detlog_plan()?;
+        let forwarded = self.forwarded_detlog_plan_for_transport(transport)?;
         let socket = forwarded.requires_socket();
         // Both reached through the controller's descriptors, as `verify`
         // reaches its own (see private_summary_descriptor_path).
-        let summary_file = private_verify_summary()?;
-        let summary_path = private_summary_descriptor_path(&summary_file);
-        let host_inputs_file = tempfile::tempfile().context("creating the host-input record")?;
-        let host_inputs_path = descriptor_path(&host_inputs_file);
+        let summary_file = (!native).then(private_verify_summary).transpose()?;
+        let summary_path = summary_file.as_ref().map(private_summary_descriptor_path);
+        let host_inputs_file = if native {
+            None
+        } else {
+            Some(tempfile::tempfile().context("creating the host-input record")?)
+        };
+        let host_inputs_path = host_inputs_file.as_ref().map(descriptor_path);
         let mut options = self.clone();
-        options.summary_json = Some(summary_path.clone());
-        options.host_input_log = Some(host_inputs_path.clone());
+        if let Some(path) = &summary_path {
+            options.summary_json = Some(path.clone());
+        }
+        if let Some(path) = &host_inputs_path {
+            options.host_input_log = Some(path.clone());
+        }
         options.fatal_core_run_label = Some("run");
-        let comparison = verify_run::recorded_comparison(&self.verification_comparison_options());
-        let exact_branch_counter = self
-            .arms_reverie_ptrace_pmu_timer()
-            .then(branch_counter_verdict);
+        let mut comparison =
+            verify_run::recorded_comparison(&self.verification_comparison_options());
+        if native {
+            comparison.strictness = LogCompareStrictness::Canonical;
+        }
+        let exact_branch_counter =
+            (!native && self.arms_reverie_ptrace_pmu_timer()).then(branch_counter_verdict);
 
-        let completed = options
-            .run_verify(
-                log_file,
+        let completed = execute(&options, log_file, &log_path, forwarded).and_then(|completed| {
+            let super::backend_hook::PhysicalRun {
+                mut output,
+                skid_overshoots,
+                latches,
+                pending,
+            } = completed;
+            latches.refuse_comparison("run")?;
+            let forwarded_syscalls = self.take_forwarded_detlogs_for_transport(
                 &log_path,
-                forwarded,
-                global,
-                VerificationRun::Run1,
-                #[cfg(feature = "dbt")]
-                None,
-            )
-            .and_then(|completed| {
-                let VerificationRunOutput {
-                    mut output,
-                    skid_overshoots,
-                    latches,
-                    #[cfg(feature = "dbt")]
-                        dbt: _,
-                } = completed;
-                latches.refuse_comparison("run")?;
-                let forwarded_syscalls =
-                    self.take_forwarded_detlogs(&log_path, &mut output.stderr, socket)?;
-                Ok((output, skid_overshoots, forwarded_syscalls))
-            });
-        let (outcome, result) = match completed {
-            Ok((output, skid_overshoots, forwarded_syscalls)) => {
+                &mut output.stderr,
+                socket,
+                transport,
+            )?;
+            let evidence = finish(pending, &output)?;
+            anyhow::ensure!(
+                evidence.is_some() == native,
+                Error::new(hermit::BackendRunFailure).context(
+                    "backend omitted or changed its predeclared saved verification evidence"
+                )
+            );
+            Ok((output, skid_overshoots, forwarded_syscalls, evidence))
+        });
+        let (outcome, native_record, result) = match completed {
+            Ok((output, skid_overshoots, forwarded_syscalls, evidence)) => {
                 writer.write(verify_run::STDOUT, &output.stdout)?;
                 writer.write(verify_run::STDERR, &output.stderr)?;
+                let native_record = evidence
+                    .map(|evidence| {
+                        writer.write_native_evidence(&evidence)?;
+                        Ok::<_, Error>(verify_run::DbtRunRecord {
+                            initialization_records: evidence.initialization_records(),
+                        })
+                    })
+                    .transpose()?;
                 (
                     verify_run::VerifyRunOutcome::Completed {
                         status: verify_run::recorded_status(output.status),
                         skid_overshoots,
                         forwarded_syscalls: forwarded_syscalls.map(|count| count as u64),
                     },
+                    native_record,
                     Ok(output.status),
                 )
             }
-            Err(error) => (verify_run_outcome_of(&error), Err(error)),
+            Err(error) => (verify_run_outcome_of(&error), None, Err(error)),
         };
-        let summary = fs::read(&summary_path).unwrap_or_default();
-        if !summary.is_empty() {
-            writer.write(verify_run::SUMMARY, &summary)?;
-            if let Some(public) = &self.summary_json {
-                fs::write(public, &summary)
-                    .with_context(|| format!("writing the run summary {}", public.display()))?;
+        if let Some(summary_path) = &summary_path {
+            let summary = fs::read(summary_path).unwrap_or_default();
+            if !summary.is_empty() {
+                writer.write(verify_run::SUMMARY, &summary)?;
+                if let Some(public) = &self.summary_json {
+                    fs::write(public, &summary)
+                        .with_context(|| format!("writing the run summary {}", public.display()))?;
+                }
             }
         }
-        let host_inputs = fs::read(&host_inputs_path).context("reading the host-input record")?;
-        writer.write(verify_run::HOST_INPUTS, &host_inputs)?;
-        writer.commit(&self.verify_run_record(comparison, exact_branch_counter, outcome, None))?;
+        if let Some(host_inputs_path) = &host_inputs_path {
+            let host_inputs =
+                fs::read(host_inputs_path).context("reading the host-input record")?;
+            writer.write(verify_run::HOST_INPUTS, &host_inputs)?;
+        }
+        writer.commit(&self.verify_run_record(
+            comparison,
+            exact_branch_counter,
+            outcome,
+            native_record,
+        ))?;
         result
+    }
+
+    /// Prepare the executable's static adapter, then use the same core-owned
+    /// saved writer. Native evidence keeps its raw payload and original wire
+    /// metadata; Common runs cannot omit or acquire native evidence.
+    fn verify_run_with_adapter<A: super::backend_hook::BackendAdapter>(
+        &self,
+        directory: &Path,
+        global: &GlobalOpts,
+        stdin: Option<fs::File>,
+        adapter: &A,
+        adapter_options: A::Options,
+    ) -> Result<ExitStatus, Error> {
+        use super::backend_hook::EvidenceRequirement;
+        use super::backend_hook::Mode;
+        anyhow::ensure!(
+            self.application_backend == Some(A::NAME),
+            "saved application execution requires its exact static adapter identity"
+        );
+        A::LOG_TRANSPORT.validate(A::EVIDENCE)?;
+        let physical = super::backend_hook::PreparedPhysical::new(self, A::CAPABILITIES);
+        let mut session = adapter.prepare(
+            adapter_options,
+            super::backend_hook::Prepare {
+                options: self,
+                global,
+                mode: Mode::SavedVerification,
+                stdin,
+                physical: Some(&physical),
+            },
+        )?;
+        self.verify_run_with_execution(
+            directory,
+            Some(A::LOG_TRANSPORT),
+            A::EVIDENCE == EvidenceRequirement::NativeCounters,
+            |options, log, path, forwarded| {
+                adapter
+                    .execute(
+                        &mut session,
+                        super::backend_hook::Execute {
+                            mode: Mode::SavedVerification,
+                            verification: Some(super::backend_hook::VerificationCapture {
+                                log,
+                                path,
+                                run: VerificationRun::Run1,
+                                options,
+                                physical: Some(&physical),
+                                requested_log: global.log,
+                                log_budget: global.log_budget(),
+                                log_transport: A::LOG_TRANSPORT,
+                                forwarded_detlogs: forwarded,
+                            }),
+                        },
+                    )?
+                    .verification()
+            },
+            |pending, output| {
+                let facts = adapter.finish(
+                    pending,
+                    super::backend_hook::Observation {
+                        output,
+                        run: VerificationRun::Run1,
+                    },
+                )?;
+                match A::EVIDENCE {
+                    EvidenceRequirement::Common => Ok(None),
+                    EvidenceRequirement::NativeCounters => {
+                        adapter.save_native_evidence(&facts).map(Some)
+                    }
+                }
+            },
+        )
     }
 
     /// The record a `--verify-run` execution of these options commits.
@@ -10723,6 +11040,10 @@ impl RunOpts {
         } else {
             EvidenceRequirement::Common
         };
+        if selected {
+            A::LOG_TRANSPORT.validate(A::EVIDENCE)?;
+        }
+        let transport = selected.then_some(A::LOG_TRANSPORT);
         let physical = self
             .application_backend
             .map(|_| super::backend_hook::PreparedPhysical::new(self, A::CAPABILITIES));
@@ -10743,6 +11064,8 @@ impl RunOpts {
         self.verify_with_evidence(
             requirement,
             !(selected && requirement == EvidenceRequirement::NativeCounters),
+            transport,
+            selected.then_some(A::NATIVE_IDENTITY_DIAGNOSTIC).flatten(),
             |options, log, path, forwarded, run| {
                 if let Some(session) = &mut session {
                     let captured = adapter
@@ -10757,6 +11080,9 @@ impl RunOpts {
                                     options,
                                     physical: physical.as_ref(),
                                     requested_log: global.log,
+                                    log_budget: global.log_budget(),
+                                    log_transport: A::LOG_TRANSPORT,
+                                    forwarded_detlogs: forwarded,
                                 }),
                             },
                         )?
@@ -10825,6 +11151,8 @@ impl RunOpts {
                 EvidenceRequirement::Common
             },
             !native,
+            None,
+            None,
             |options, log, path, forwarded, run| {
                 execute(options, log, path, forwarded, run)
                     .map(VerificationRunOutput::into_physical)
@@ -10843,6 +11171,8 @@ impl RunOpts {
         &self,
         requirement: super::backend_hook::EvidenceRequirement,
         records_run_metadata: bool,
+        transport: Option<super::backend_hook::VerificationLogTransport>,
+        native_identity_diagnostic: Option<&'static str>,
         mut execute: impl FnMut(
             &Self,
             fs::File,
@@ -10860,8 +11190,8 @@ impl RunOpts {
 
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
-        let forwarded1_for_run = self.forwarded_detlog_plan()?;
-        let forwarded2_for_run = self.forwarded_detlog_plan()?;
+        let forwarded1_for_run = self.forwarded_detlog_plan_for_transport(transport)?;
+        let forwarded2_for_run = self.forwarded_detlog_plan_for_transport(transport)?;
         let (forwarded1, forwarded2) = (
             forwarded1_for_run.requires_socket(),
             forwarded2_for_run.requires_socket(),
@@ -11005,16 +11335,20 @@ impl RunOpts {
             }
             return Err(error);
         }
-        let forwarded_syscalls1 =
-            match self.take_forwarded_detlogs(&log1_path, &mut out1.stderr, forwarded1) {
-                Ok(count) => count,
-                Err(error) => {
-                    if self.keep_logs {
-                        retain_verification_logs([("run 1", log1_path)])?;
-                    }
-                    return Err(error);
+        let forwarded_syscalls1 = match self.take_forwarded_detlogs_for_transport(
+            &log1_path,
+            &mut out1.stderr,
+            forwarded1,
+            transport,
+        ) {
+            Ok(count) => count,
+            Err(error) => {
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path)])?;
                 }
-            };
+                return Err(error);
+            }
+        };
         // Prepared now, with the forwarded records in place: the comparison
         // consumes the log. Written if the verification ends unverified.
         if records_run_metadata {
@@ -11181,7 +11515,12 @@ impl RunOpts {
                 "LiteInst"
             };
             let forwarded_syscalls2 = match self
-                .take_forwarded_detlogs(&log2_path, &mut out2.stderr, forwarded2)
+                .take_forwarded_detlogs_for_transport(
+                    &log2_path,
+                    &mut out2.stderr,
+                    forwarded2,
+                    transport,
+                )
                 .and_then(|count| {
                     count.context("run 2 forwarded no DETLOG records where run 1 did")
                 }) {
@@ -11254,6 +11593,7 @@ impl RunOpts {
                 verify_json: self.verify_json.as_deref(),
                 comparison_options: self.verification_comparison_options(),
                 evidence,
+                native_identity_diagnostic,
                 backend: self.selected_backend(),
                 application_backend: self.application_backend,
                 passthru_opt: self.det_opts.det_config.passthru_opt,
@@ -11556,6 +11896,13 @@ impl RunOpts {
         let mut options = self.clone();
         options.adapter_capabilities = Some(capabilities);
         options
+    }
+
+    /// Apply only the common owner's per-run provenance sink. This does not
+    /// reobserve the terminal or change the prepared physical capabilities.
+    pub(super) fn apply_run_metadata(&self, config: &mut DetConfig) {
+        config.record_host_inputs = self.host_input_log.is_some();
+        config.host_input_log = self.host_input_log.clone();
     }
 
     pub(super) fn mounts_directory_placeholder(&self) -> bool {
@@ -12332,8 +12679,7 @@ impl RunOpts {
         // this is in-process only; it reaches the ptrace backend directly and is not
         // carried through the DBT JSON config or `--save-config`.
         config.happens_before = self.resolved_happens_before.clone();
-        config.record_host_inputs = self.host_input_log.is_some();
-        config.host_input_log = self.host_input_log.clone();
+        self.apply_run_metadata(&mut config);
         config.untraced_code_range = self
             .application_backend
             .is_none()
@@ -12777,7 +13123,6 @@ impl RunOpts {
         // was measured on exactly these `--verify` comparison logs would not
         // apply to the path that produces them: a livelocked run here could
         // still fill the disk.
-        let limit = log_max_bytes().map_err(Error::msg)?;
         // SYNCHRONOUS, so a fatal diagnostic in the tail survives the run that
         // emitted it. The non-blocking appender loses whatever has not drained
         // when a fail-closed guest dies, which is precisely the line naming the
@@ -12789,8 +13134,12 @@ impl RunOpts {
         // `--max-log-bytes` counts these logs too, forwarded records as well
         // as tracing events, and its counter is shared across the verify runs,
         // so the cap is a total for the invocation.
-        let log = verification_log(log_file, limit, global.log_budget());
-        let _guard = init_sync_file_tracing(Some(level), log.clone(), self.runtime_backend());
+        let (log, _guard) = verification_log_with_tracing(
+            log_file,
+            level,
+            global.log_budget(),
+            self.runtime_backend(),
+        )?;
 
         let command = self.guest_command()?;
 
@@ -12965,6 +13314,8 @@ pub(super) struct VerificationConclusion<'a> {
     pub(super) comparison_options: ComparisonOptions,
     /// Completed backend facts supplement the common comparison.
     pub(super) evidence: Option<super::verify::NativeEvidenceComparison>,
+    /// Static identity text, admitted only with completed native evidence.
+    pub(super) native_identity_diagnostic: Option<&'static str>,
     /// The built-in backend, when no executable-selected adapter is present.
     pub(super) backend: Backend,
     pub(super) application_backend: Option<&'a str>,
@@ -12987,6 +13338,7 @@ pub(super) fn conclude_verification(
         verify_json,
         mut comparison_options,
         evidence,
+        native_identity_diagnostic,
         backend,
         application_backend,
         passthru_opt,
@@ -13125,6 +13477,9 @@ pub(super) fn conclude_verification(
         }
         if application_backend.is_none() && backend == Backend::Dbt {
             eprintln!(":: DBT path confirmed: DynamoRIO client reported tool=Detcore");
+        }
+        if let Some(diagnostic) = native_identity_diagnostic {
+            eprintln!(":: {diagnostic}");
         }
     }
     announce_verification_outcome(&outcome, SecondRun::Rerun, success_message, failure_message);
@@ -13329,6 +13684,377 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    /// Exercise the actual saved writer and its per-run descriptor metadata.
+    /// The physical observations below are synthetic, not a guest qualification.
+    #[test]
+    fn saved_capture_keeps_private_metadata_transport_and_record_last_commit() {
+        use super::super::backend_hook::PhysicalRun;
+        use super::super::backend_hook::PreparedPhysical;
+        use super::super::backend_hook::VerificationCapture;
+        use super::super::backend_hook::VerificationLogTransport;
+
+        for transport in [
+            VerificationLogTransport::CoordinatorTracing,
+            VerificationLogTransport::InGuestSocket,
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let directory = parent.path().join("saved");
+            let mut options = run_opts_for(&["hermit", "run", "--", "/bin/true"]);
+            options.select_application_backend("saved-control").unwrap();
+            let physical =
+                PreparedPhysical::new(&options, hermit::backend_capabilities(Backend::Ptrace));
+            assert!(!physical.config.record_host_inputs);
+            assert!(physical.config.host_input_log.is_none());
+            let summary = b"{\"saved_owner_control\":true}\n";
+            let host_inputs = b"{\"records\":0}\n";
+            let finished = std::cell::Cell::new(false);
+            let result = options.verify_run_with_execution(
+                &directory,
+                Some(transport),
+                false,
+                |working, log, path, forwarded| {
+                    assert!(!directory.join(verify_run::RECORD).exists());
+                    assert_eq!(forwarded.requires_socket(),
+                        transport == VerificationLogTransport::InGuestSocket);
+                    let summary_path = working.summary_json.as_ref().unwrap();
+                    let host_inputs_path = working.host_input_log.as_ref().unwrap();
+                    assert_ne!(summary_path, &directory.join(verify_run::SUMMARY));
+                    assert_ne!(host_inputs_path, &directory.join(verify_run::HOST_INPUTS));
+                    fs::write(summary_path, summary)?;
+                    fs::write(host_inputs_path, host_inputs)?;
+                    let mut capture = VerificationCapture {
+                        log,
+                        path,
+                        run: VerificationRun::Run1,
+                        options: working,
+                        physical: Some(&physical),
+                        requested_log: None,
+                        log_budget: None,
+                        log_transport: transport,
+                        forwarded_detlogs: forwarded,
+                    };
+                    let actual = capture.config();
+                    assert!(actual.record_host_inputs);
+                    assert_eq!(actual.host_input_log.as_ref(), Some(host_inputs_path));
+                    assert_eq!(actual.backend, physical.config.backend);
+                    let line = if transport == VerificationLogTransport::InGuestSocket {
+                        format!("{NORMALIZED_FORWARDED_DETLOG_TIMESTAMP} INFO detcore: DETLOG [syscall] saved control\n")
+                    } else {
+                        "1970-01-01T00:00:00.000000Z INFO detcore: saved control\n".to_owned()
+                    };
+                    std::io::Write::write_all(&mut capture.log, line.as_bytes())?;
+                    Ok(PhysicalRun {
+                        output: Output {
+                            status: ExitStatus::Exited(0),
+                            stdout: b"saved stdout".to_vec(),
+                            stderr: b"saved stderr".to_vec(),
+                        },
+                        skid_overshoots: 0,
+                        latches: RunLatches::default(),
+                        pending: (),
+                    })
+                },
+                |(), _| {
+                    assert!(!directory.join(verify_run::RECORD).exists());
+                    finished.set(true);
+                    Ok(None)
+                },
+            );
+            assert_eq!(result.unwrap(), ExitStatus::Exited(0));
+            assert!(finished.get());
+            let record = verify_run::VerifyRunRecord::read(&directory).unwrap();
+            assert_eq!(record.backend, "saved-control");
+            assert_eq!(record.role, verify_run::RunRole::Run);
+            assert!(record.dbt.is_none());
+            assert_eq!(
+                record.outcome,
+                verify_run::VerifyRunOutcome::Completed {
+                    status: verify_run::RecordedStatus::Exited { code: 0 },
+                    skid_overshoots: 0,
+                    forwarded_syscalls: (transport == VerificationLogTransport::InGuestSocket)
+                        .then_some(1),
+                }
+            );
+            assert_eq!(
+                fs::read(directory.join(verify_run::STDOUT)).unwrap(),
+                b"saved stdout"
+            );
+            assert_eq!(
+                fs::read(directory.join(verify_run::STDERR)).unwrap(),
+                b"saved stderr"
+            );
+            assert_eq!(
+                fs::read(directory.join(verify_run::SUMMARY)).unwrap(),
+                summary
+            );
+            assert_eq!(
+                fs::read(directory.join(verify_run::HOST_INPUTS)).unwrap(),
+                host_inputs
+            );
+            assert!(!directory.join(verify_run::DBT_STATS).exists());
+        }
+    }
+
+    #[test]
+    fn saved_capture_preserves_latch_finish_and_payload_failure_order() {
+        use super::super::backend_hook::PhysicalRun;
+        use super::super::backend_hook::SavedNativeEvidence;
+        use super::super::backend_hook::VerificationLogTransport;
+
+        for failure in [None, Some("latch"), Some("finish"), Some("payload")] {
+            let parent = tempfile::tempdir().unwrap();
+            let directory = parent.path().join("saved");
+            let mut options = run_opts_for(&["hermit", "run", "--", "/bin/true"]);
+            options.select_application_backend("saved-control").unwrap();
+            let finished = std::cell::Cell::new(false);
+            let raw = b"synthetic writer payload; not native-runtime qualification";
+            let result = options.verify_run_with_execution(
+                &directory,
+                Some(VerificationLogTransport::NativeEvidence),
+                true,
+                |working, mut log, _, forwarded| {
+                    assert!(working.summary_json.is_none());
+                    assert!(working.host_input_log.is_none());
+                    assert!(!forwarded.requires_socket());
+                    assert!(!directory.join(verify_run::RECORD).exists());
+                    std::io::Write::write_all(&mut log, b"synthetic saved log\n")?;
+                    if failure == Some("payload") {
+                        fs::write(directory.join(verify_run::STDOUT), b"existing payload")?;
+                    }
+                    Ok(PhysicalRun {
+                        output: Output {
+                            status: ExitStatus::Exited(0),
+                            stdout: b"out".to_vec(),
+                            stderr: b"err".to_vec(),
+                        },
+                        skid_overshoots: 0,
+                        latches: RunLatches {
+                            determinism_loss: (failure == Some("latch"))
+                                .then(|| "saved control loss".to_owned()),
+                            log_sink_failure: None,
+                        },
+                        pending: (),
+                    })
+                },
+                |(), _| {
+                    assert!(!directory.join(verify_run::RECORD).exists());
+                    finished.set(true);
+                    if failure == Some("finish") {
+                        return Err(Error::new(hermit::BackendRunFailure)
+                            .context("saved control deferred failure"));
+                    }
+                    Ok(Some(SavedNativeEvidence::new(raw.to_vec(), 3)))
+                },
+            );
+            assert_eq!(result.is_ok(), failure.is_none());
+            assert_eq!(finished.get(), failure != Some("latch"));
+            if failure == Some("payload") {
+                assert!(
+                    !directory.join(verify_run::RECORD).exists(),
+                    "a failed create-new payload write must never publish the record"
+                );
+                assert_eq!(
+                    fs::read(directory.join(verify_run::STDOUT)).unwrap(),
+                    b"existing payload"
+                );
+                assert!(!directory.join(verify_run::DBT_STATS).exists());
+                continue;
+            }
+            let record = verify_run::VerifyRunRecord::read(&directory).unwrap();
+            assert_eq!(record.backend, "saved-control");
+            assert_eq!(
+                record.comparison.strictness,
+                LogCompareStrictness::Canonical
+            );
+            match failure {
+                None => {
+                    assert!(matches!(
+                        record.outcome,
+                        verify_run::VerifyRunOutcome::Completed { .. }
+                    ));
+                    assert_eq!(record.dbt.unwrap().initialization_records, 3);
+                    assert_eq!(
+                        fs::read(directory.join(verify_run::DBT_STATS)).unwrap(),
+                        raw
+                    );
+                    assert_eq!(
+                        fs::read(directory.join(verify_run::STDOUT)).unwrap(),
+                        b"out"
+                    );
+                }
+                Some("latch") => {
+                    assert!(matches!(
+                        record.outcome,
+                        verify_run::VerifyRunOutcome::RunFailed {
+                            failure: RunFailure::DeterminismLoss,
+                            ..
+                        }
+                    ));
+                    assert!(record.dbt.is_none());
+                    assert!(!directory.join(verify_run::DBT_STATS).exists());
+                }
+                Some("finish") => {
+                    assert!(matches!(
+                        record.outcome,
+                        verify_run::VerifyRunOutcome::RunFailed {
+                            failure: RunFailure::BackendFailure,
+                            ..
+                        }
+                    ));
+                    assert!(record.dbt.is_none());
+                    assert!(!directory.join(verify_run::DBT_STATS).exists());
+                }
+                _ => unreachable!(),
+            }
+            assert!(!directory.join(verify_run::SUMMARY).exists());
+            assert!(!directory.join(verify_run::HOST_INPUTS).exists());
+        }
+    }
+
+    /// Exercise the actual common socket/capture owner without starting a guest
+    /// or supplying a comparator verdict. A plain container child isolates its
+    /// real tracing subscriber and forwarded-source lifetime from the test host.
+    fn socket_capture_control(
+        file: &tempfile::NamedTempFile,
+        budget: Option<super::super::tracing::LogBudget>,
+        records: Vec<Vec<u8>>,
+        fail: bool,
+    ) -> Result<super::super::backend_hook::PhysicalRun<()>, Error> {
+        use super::super::backend_hook::CapturedOutput;
+        use super::super::backend_hook::PreparedPhysical;
+        use super::super::backend_hook::VerificationCapture;
+        use super::super::backend_hook::VerificationLogTransport;
+
+        let options = run_opts_for(&[
+            "hermit",
+            "run",
+            "--no-namespace",
+            "--timeout=5",
+            "--",
+            "/bin/true",
+        ]);
+        let capabilities = hermit::backend_capabilities(Backend::Ptrace);
+        let physical = PreparedPhysical::new(&options, capabilities);
+        let capture = VerificationCapture {
+            log: file.reopen()?,
+            path: file.path(),
+            run: VerificationRun::Run1,
+            options: &options,
+            physical: Some(&physical),
+            requested_log: Some(tracing::metadata::LevelFilter::INFO),
+            log_budget: budget,
+            log_transport: VerificationLogTransport::InGuestSocket,
+            forwarded_detlogs: ForwardedDetlogPlan::Socket { opened: false },
+        };
+        let (captured, ()) = capture.run_in_container(
+            (),
+            "actual common-capture socket control; no guest",
+            move |_, request| {
+                assert_eq!(request.config.backend, capabilities);
+                let sender = hermit::inheritable_in_guest_detlog_socket()?
+                    .expect("the declared transport opened its actual source");
+                for (index, record) in records.iter().enumerate() {
+                    let message = detcore::detlog::tagged_forwarded_message(
+                        unsafe { libc::syscall(libc::SYS_gettid) as i32 },
+                        (index + 1) as u64,
+                        record,
+                    );
+                    let sent = unsafe {
+                        libc::send(
+                            sender.as_raw_fd(),
+                            message.as_ptr().cast(),
+                            message.len(),
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        )
+                    };
+                    assert_eq!(sent, message.len() as isize, "send complete actual record");
+                }
+                // Just as the physical adapter must do after real teardown,
+                // retire the inherited source before the common ordered drain.
+                drop(sender);
+                anyhow::ensure!(!fail, "injected physical callback failure");
+                Ok(CapturedOutput {
+                    output: Output {
+                        status: ExitStatus::Exited(0),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    skid_overshoots: 0,
+                    pending: (),
+                })
+            },
+        )?;
+        Ok(captured)
+    }
+
+    #[test]
+    fn common_capture_drains_actual_socket_before_success_or_error_returns() {
+        for fail in [false, true] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let first = b"INFO detcore: DETLOG [syscall] capture first\n";
+            let second = b"INFO detcore: DETLOG [syscall] capture second\n";
+            let result =
+                socket_capture_control(&file, None, vec![first.to_vec(), second.to_vec()], fail);
+            if fail {
+                assert!(
+                    format!("{:#}", result.err().expect("physical error must propagate"))
+                        .contains("injected physical callback failure")
+                );
+            } else {
+                let captured = result.unwrap();
+                assert_eq!(captured.output.status, ExitStatus::Exited(0));
+                captured
+                    .latches
+                    .refuse_comparison("capture control")
+                    .unwrap();
+            }
+            let text = fs::read_to_string(file.path()).unwrap();
+            let first_at = text
+                .find("capture first")
+                .expect("first real source record drained");
+            let second_at = text
+                .find("capture second")
+                .expect("second real source record drained");
+            assert!(first_at < second_at, "{text}");
+            assert!(!text.contains(FORWARDING_REFUSED_MARKER), "{text}");
+        }
+        let invalid = tempfile::NamedTempFile::new().unwrap();
+        let captured =
+            socket_capture_control(&invalid, None, vec![b"HINFO".to_vec()], false).unwrap();
+        let error = captured
+            .latches
+            .refuse_comparison("actual malformed source")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("determinism loss"));
+        assert!(
+            fs::read_to_string(invalid.path())
+                .unwrap()
+                .contains(FORWARDING_REFUSED_MARKER)
+        );
+    }
+
+    #[test]
+    fn common_capture_charges_one_invocation_budget_across_actual_runs() {
+        let first = tempfile::NamedTempFile::new().unwrap();
+        let second = tempfile::NamedTempFile::new().unwrap();
+        let record = b"INFO detcore: DETLOG [syscall] shared capture budget\n";
+        let line_bytes = NORMALIZED_FORWARDED_DETLOG_TIMESTAMP.len() + 1 + record.len();
+        let budget = super::super::tracing::LogBudget::new((2 * line_bytes - 1) as u64).unwrap();
+        let captured =
+            socket_capture_control(&first, Some(budget.clone()), vec![record.to_vec()], false)
+                .unwrap();
+        captured.latches.refuse_comparison("first capture").unwrap();
+        assert_eq!(fs::metadata(first.path()).unwrap().len(), line_bytes as u64);
+        let error = socket_capture_control(&second, Some(budget), vec![record.to_vec()], false)
+            .err()
+            .expect("the second actual record must cross the shared invocation cap");
+        assert!(
+            error.downcast_ref::<LogCapExceeded>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(fs::metadata(first.path()).unwrap().len(), line_bytes as u64);
+    }
 
     fn forwarding_plan_options(forwarded: bool) -> RunOpts {
         let backend = if forwarded { "in-guest-trap" } else { "ptrace" };

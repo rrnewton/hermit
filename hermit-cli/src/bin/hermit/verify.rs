@@ -2583,6 +2583,56 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn native_summary_compares_every_non_branch_observation() {
+        use super::super::backend_hook::NativeFacts;
+
+        let native_stats = |counted_branches, intercepted_syscalls, rewritten_syscalls, stdin_reads, memory_hash_fold| NativeFacts {
+            counted_branches,
+            intercepted_syscalls,
+            rewritten_syscalls,
+            stdin_reads,
+            memory_hash_fold,
+            initialization_records: 0,
+            statistics_diagnostic: "synthetic common comparison observations".to_owned(),
+        };
+        let expected = native_stats(100, 169, 168, 0, 0x4b5e0e70f3050157);
+
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 170, 168, 0, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 169, 167, 0, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 169, 168, 1, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 169, 168, 0, 0)
+        ));
+
+        let different_branch_clock = native_stats(101, 169, 168, 0, 0x4b5e0e70f3050157);
+        assert!(
+            same_native_observable_behavior(&expected, &different_branch_clock),
+            "the counted-branch clock has its own typed comparison and must not be folded into \
+             the opaque summary mismatch"
+        );
+        assert!(native_branch_clock_mismatch(
+            "common-control",
+            expected.counted_branches,
+            different_branch_clock.counted_branches,
+        ).is_some());
+        assert!(native_branch_clock_mismatch(
+            "common-control",
+            expected.counted_branches,
+            expected.counted_branches,
+        ).is_none());
+    }
+
     /// A report larger than a page reaches a one-page pipe that has room for
     /// its first lines. Written as one write it put nothing there: 3600 bytes
     /// waiting plus the 1004 bytes past the report's whole page do not fit in
@@ -5731,5 +5781,149 @@ mod tests {
         assert!(default.ignore_lines.is_empty());
         assert!(!default.skip_commit);
         assert!(!default.skip_detlog);
+    }
+}
+
+// Generic typed branch-clock verdict policy remains owned by the common verifier.
+#[cfg(test)]
+pub(super) mod native_branch_policy_tests {
+    use super::*;
+
+    fn record_branch_clock_comparison(
+        outcome: &mut VerificationOutcome,
+        comparison: DbtCountedBranchComparison,
+    ) -> Option<String> {
+        super::record_native_branch_clock_comparison("DBT", outcome, comparison)
+    }
+
+    pub(crate) fn typed_outcome(verdict: Verdict, guest_exit: i32) -> VerificationOutcome {
+        use super::ComparedLogCounts;
+        use super::ComparisonSpec;
+
+        VerificationOutcome {
+            verdict,
+            no_result_reason: (verdict == Verdict::NoResult).then(|| {
+                super::NoResultReason::ComparisonRefused {
+                    detail: "fixture comparator refusal".into(),
+                }
+            }),
+            refused_log_comparison: (verdict == Verdict::NoResult)
+                .then(|| "fixture comparator refusal".into()),
+            guest_status: ExitStatus::Exited(guest_exit),
+            comparison: ComparisonSpec::new(
+                LogCompareStrictness::Canonical,
+                true,
+                false,
+                true,
+                RecordEnvelope::all_records_v1().policy(),
+                true,
+            ),
+            compared_log_messages: Some(ComparedLogCounts { left: 4, right: 4 }),
+            compared_outputs: {
+                let output = hermit::canonical_verdict::ComparedOutput {
+                    exit_code: Some(guest_exit),
+                    signal: None,
+                    stdout_sha256: "a".repeat(64),
+                    stdout_bytes: 0,
+                    stderr_sha256: "b".repeat(64),
+                    stderr_bytes: 0,
+                };
+                hermit::canonical_verdict::ComparedOutputs {
+                    left: output.clone(),
+                    right: output,
+                }
+            },
+            dbt_counted_branches: None,
+            runtime: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_record_positions: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+            first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
+        }
+    }
+
+    #[test]
+    fn equal_branch_clocks_do_not_authorize_a_no_result() {
+        let outcome = typed_outcome(Verdict::NoResult, 23);
+        let comparison = DbtCountedBranchComparison {
+            left: 563_145,
+            right: 563_145,
+        };
+        let verdict_file = tempfile::NamedTempFile::new().unwrap();
+
+        let mut outcome = outcome;
+        let failure = record_branch_clock_comparison(&mut outcome, comparison);
+        write_verification_json(verdict_file.path(), &outcome).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
+
+        assert!(failure.is_none());
+        assert_eq!(outcome.verdict, Verdict::NoResult);
+        assert!(outcome.dbt_counted_branches.is_none());
+        assert_eq!(json["verdict"], "no_result");
+        assert_eq!(json["verified"], false);
+        assert!(json.get("dbt_counted_branches").is_none());
+        let error = outcome.into_exit_status().unwrap_err().to_string();
+        assert!(error.contains("did not reach a verdict"), "{error}");
+    }
+
+    #[test]
+    fn branch_clock_divergence_is_retained_in_the_serialized_typed_verdict() {
+        use super::ComparedLogCounts;
+
+        for initial_verdict in [Verdict::Matched, Verdict::NoResult] {
+            let outcome = typed_outcome(initial_verdict, 0);
+            let comparison = DbtCountedBranchComparison {
+                left: 563_145,
+                right: 563_103,
+            };
+            let verdict_file = tempfile::NamedTempFile::new().unwrap();
+            let mut outcome = outcome;
+            let message = record_branch_clock_comparison(&mut outcome, comparison);
+            write_verification_json(verdict_file.path(), &outcome).unwrap();
+            let message = message.unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
+
+            assert!(message.contains("563145 != 563103"), "{message}");
+            assert_eq!(outcome.verdict, Verdict::Diverged);
+            assert_eq!(outcome.dbt_counted_branches, Some(comparison));
+            assert_eq!(json["verdict"], "diverged");
+            assert_eq!(json["verified"], false);
+            assert_eq!(json["bitwise_parity"], false);
+            assert_eq!(json["dbt_counted_branches"]["left"], 563_145);
+            assert_eq!(json["dbt_counted_branches"]["right"], 563_103);
+            assert_eq!(
+                outcome.compared_log_messages,
+                Some(ComparedLogCounts { left: 4, right: 4 })
+            );
+            assert_eq!(
+                outcome.into_exit_status().unwrap(),
+                ExitStatus::Exited(hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT)
+            );
+        }
+    }
+
+    #[test]
+    fn equal_branch_clocks_preserve_match_and_nonzero_guest_status() {
+        let outcome = typed_outcome(Verdict::Matched, 23);
+        let comparison = DbtCountedBranchComparison {
+            left: 563_145,
+            right: 563_145,
+        };
+
+        let mut outcome = outcome;
+        let failure = record_branch_clock_comparison(&mut outcome, comparison);
+        assert!(failure.is_none());
+        let report = super::verification_report(&outcome);
+
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert_eq!(report.dbt_counted_branches, Some(comparison));
+        assert!(report.verified);
+        assert!(report.bitwise_parity);
+        assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(23));
     }
 }

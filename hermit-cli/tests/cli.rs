@@ -11351,111 +11351,9 @@ fn run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs() {
     assert_eq!(report["comparison"]["compare_io_buffers"], true);
 }
 
-#[test]
-#[cfg(feature = "dbt")]
-fn run_dbt_private_placement_preserves_cli_echo() {
-    assert!(!dbt_unavailable(
-        "run_dbt_private_placement_preserves_cli_echo"
-    ));
-    let _guard = hermit_run_guard();
-    let probe = dbt_placement_probe::Probe::new(true);
-    let (install, bind) = probe.launch();
-    let bind = bind.expect("CLI observation needs its explicit writable bind");
-    let args = [
-        "--backend=dbt",
-        "run",
-        bind.as_str(),
-        "--",
-        "/bin/echo",
-        "hello",
-    ];
-    let mut command = hermit_command(&args);
-    command
-        .env("HERMIT_INSTALL_DIR", install)
-        .env("HERMIT_REQUIRE_DBT", "1");
-    let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
-    assert_success(&output, &args);
-    assert_eq!(output.stdout, b"hello\n");
-    probe.assert_zero(1, false);
-}
 
-#[test]
-#[cfg(feature = "dbt")]
-fn run_dbt_private_placement_preserves_stdin_verification() {
-    assert!(!dbt_unavailable(
-        "run_dbt_private_placement_preserves_stdin_verification"
-    ));
-    let _guard = hermit_run_guard();
-    let probe = dbt_placement_probe::Probe::new(true);
-    let (install, bind) = probe.launch();
-    let bind = bind.expect("CLI observation needs its explicit writable bind");
-    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let report_path = root.path().join("verdict.json");
-    let args = [
-        "--backend=dbt",
-        "run",
-        bind.as_str(),
-        "--strict",
-        "--verify",
-        "--verify-strict",
-        "--verify-json",
-        report_path.to_str().unwrap(),
-        "--",
-        "/bin/cat",
-    ];
-    // The existing pipe helper closes its writer after these bytes. Cat must
-    // read that EOF in both executions; output must be emitted only once.
-    let input = b"first\0line\nlast-without-newline\xff";
-    // Same pipe/EOF ownership as hermit_with_stdin, with only child-local staging.
-    let output = hermit_test::hermit_output_with(&format!("hermit {args:?}"), || {
-        let mut command = hermit_command(&args);
-        let mut child = command
-            .env("HERMIT_INSTALL_DIR", install)
-            .env("HERMIT_REQUIRE_DBT", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
-        child
-            .stdin
-            .take()
-            .expect("hermit stdin should be piped")
-            .write_all(input)
-            .expect("failed to write hermit stdin");
-        let output = child
-            .wait_with_output()
-            .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"));
-        (output, ())
-    })
-    .0;
-    assert_success(&output, &args);
-    assert_eq!(output.stdout, input);
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
-    assert_eq!(report["verdict"], "matched", "{report}");
-    assert_eq!(report["bitwise_parity"], true, "{report}");
-    assert_eq!(report["comparison"]["strictness"], "canonical");
-    assert_eq!(report["comparison"]["compare_io_buffers"], true);
-    for side in ["left", "right"] {
-        assert_eq!(report["compared_outputs"][side]["exit_code"], 0, "{report}");
-        assert_eq!(
-            report["compared_outputs"][side]["stdout_bytes"],
-            input.len(),
-            "{report}"
-        );
-        assert_eq!(
-            report["compared_outputs"][side]["stdout_sha256"],
-            detcore::Digest::new(input).to_string(),
-            "{report}"
-        );
-        assert!(
-            report["compared_log_messages"][side].as_u64().unwrap() > 0,
-            "{report}"
-        );
-    }
-    probe.assert_zero(2, true);
-}
+
+
 
 #[test]
 fn run_dbt_verify_replays_stdin_bytes_and_eof() {
@@ -31147,24 +31045,7 @@ fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
 /// Detcore's virtual clock. Before, the DBT client answered every read from its
 /// own fixed-stride counter, so DBT's run 1 log of `/bin/true` held none of the
 /// 10 rdtsc records ptrace's does.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_rdtsc_is_answered_by_detcore_as_under_ptrace() {
-    let _lock = hermit_run_guard();
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (ptrace_dir, dbt_dir) = (dir.path().join("ptrace"), dir.path().join("dbt"));
-    fs::create_dir_all(&ptrace_dir).unwrap();
-    fs::create_dir_all(&dbt_dir).unwrap();
-    let ptrace = fs::read_to_string(verify_log_of_true("ptrace", &ptrace_dir)).unwrap();
-    let dbt = fs::read_to_string(verify_log_of_true("dbt", &dbt_dir)).unwrap();
-    let reads = ptrace.matches("inbound rdtsc").count();
-    assert!(reads > 0, "ptrace logged no rdtsc:\n{ptrace}");
-    assert_eq!(
-        dbt.matches("inbound rdtsc").count(),
-        reads,
-        "ptrace:\n{ptrace}\ndbt:\n{dbt}"
-    );
-}
+
 
 /// Detcore's syscall outputs respect page protection, as the kernel's own
 /// writes do (https://github.com/rrnewton/reverie/issues/1064, F1):
@@ -31330,36 +31211,7 @@ fn a_datagram_receive_ends_when_its_read_side_is_shut_down() {
 /// when CPUID does. Before, the DBT client answered from its own copy of the
 /// table: leaf 7 EBX was 0x001807a9 (HLE and RTM cleared) where ptrace's is
 /// 0x00180fb9, and DBT's `/proc/cpuinfo` was the host's.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_cpuid_rows_match_ptrace() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&CPUID_TABLE_DUMP_GUEST, "cpuid_table_dump")
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let run = |backend: &str| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-            guest.as_str(),
-        ];
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        stdout(&output)
-    };
-    let ptrace = run("ptrace");
-    assert!(
-        ptrace.contains("00000007.0: 00000000 00180fb9 00000000 00000000\n"),
-        "{ptrace}"
-    );
-    assert!(!ptrace.contains("MISMATCH"), "{ptrace}");
-    assert_eq!(run("dbt"), ptrace);
-}
+
 
 /// Under DBT, resource limits and clock resolutions are Detcore's, as under
 /// ptrace, so the two print the same bytes: getrlimit and prlimit64 for every
@@ -31367,499 +31219,40 @@ fn dbt_cpuid_rows_match_ptrace() {
 /// lowered soft limit read back, and clock_getres and the invalid-clock error
 /// for each clock. The DBT client no longer keeps a limit or clock table of
 /// its own (A8 step 2), so nothing but Detcore can answer these.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_rlimit_and_clock_answers_match_ptrace() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&CLOCK_RLIMIT_PARITY_GUEST, "clock_rlimit_parity")
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let run = |backend: &str| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-            guest.as_str(),
-            "limits",
-        ];
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        stdout(&output)
-    };
-    let ptrace = run("ptrace");
-    assert!(ptrace.contains("rlimit lowered: 0 40 "), "{ptrace}");
-    assert!(
-        ptrace.contains("clock_gettime invalid: -1 EINVAL\n"),
-        "{ptrace}"
-    );
-    assert_eq!(run("dbt"), ptrace);
-}
+
 
 /// A vfork child's clock read is refused by name under DBT. Ptrace's Detcore
 /// answers it, but a copied DBT child cannot enter Detcore, and the client no
 /// longer answers from a clock of its own (A8 step 2), so strict execution
 /// stops the run rather than let the child read the host's clock. Before, the
 /// client's own counter answered, a second clock beside Detcore's.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_clock_read_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&CLOCK_RLIMIT_PARITY_GUEST, "clock_rlimit_parity")
-        .to_str()
-        .unwrap()
-        .to_owned();
-    let args = |backend| {
-        [
-            "--backend",
-            backend,
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-            guest.as_str(),
-            "vfork-clock",
-        ]
-        .map(str::to_owned)
-    };
-    let ptrace_args = args("ptrace");
-    let ptrace_args: Vec<&str> = ptrace_args.iter().map(String::as_str).collect();
-    let ptrace = hermit(&ptrace_args);
-    assert_success(&ptrace, &ptrace_args);
-    assert_eq!(stdout(&ptrace), "vfork child clock_gettime: ok, exit 0\n");
 
-    let dbt_args = args("dbt");
-    let dbt_args: Vec<&str> = dbt_args.iter().map(String::as_str).collect();
-    let dbt = hermit(&dbt_args);
-    assert!(!dbt.status.success(), "{}", stderr(&dbt));
-    assert!(
-        stderr(&dbt).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_clock_gettime
-        )),
-        "{}",
-        stderr(&dbt)
-    );
-}
 
 /// A copied DBT child must refuse a scheduling-policy query in strict mode.
 /// Its non-strict native path and the ordinary shared Detcore answer are distinct.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_scheduler_policy_query_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&COPIED_SCHEDULER_QUERY_GUEST, "copied_scheduler_query")
-        .to_str()
-        .unwrap();
-    let batch = |mut command: Command| {
-        // SAFETY: the raw syscall only changes this child before exec; it does
-        // not allocate, acquire locks, or alter the test process's policy.
-        unsafe {
-            command.pre_exec(|| {
-                let parameter = libc::sched_param { sched_priority: 0 };
-                if libc::syscall(
-                    libc::SYS_sched_setscheduler,
-                    0,
-                    libc::SCHED_BATCH,
-                    &parameter,
-                ) == -1
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command
-    };
-    let mut native = Command::new(guest);
-    native.arg("vfork");
-    let native = batch(native)
-        .output()
-        .expect("native SCHED_BATCH vfork control");
-    assert!(native.status.success(), "{native:?}");
-    assert_eq!(
-        stdout(&native),
-        "after sched_getscheduler\nvfork sched_getscheduler: policy=3 errno=0 exit=0\n"
-    );
-    let run = |backend, strictness, mode| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            strictness,
-            "--base-env=minimal",
-            "--",
-            guest,
-            mode,
-        ];
-        hermit_test::hermit_output("scheduler policy query", &mut batch(hermit_command(&args)))
-    };
-    // The ordinary shared Tool retains its existing SCHED_OTHER policy even
-    // though the launcher and the native control inherit SCHED_BATCH.
-    for backend in ["dbt", "ptrace"] {
-        let output = run(backend, "--strict", "ordinary");
-        assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(
-            stdout(&output),
-            "ordinary sched_getscheduler: policy=0 errno=0\n"
-        );
-    }
-    let ptrace = run("ptrace", "--strict", "vfork");
-    assert!(ptrace.status.success(), "{ptrace:?}");
-    assert_eq!(
-        stdout(&ptrace),
-        "after sched_getscheduler\nvfork sched_getscheduler: policy=0 errno=0 exit=0\n"
-    );
-    // This full transcript proves actual native policy inheritance; do not
-    // assume that the guest kept the launcher's policy or accept a fixed zero.
-    let passthrough = run("dbt", "--allow-unsupported-syscalls", "vfork");
-    assert!(passthrough.status.success(), "{passthrough:?}");
-    assert_eq!(passthrough.stdout, native.stdout);
 
-    let refused = run("dbt", "--strict", "vfork");
-    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
-    assert!(
-        stderr(&refused).contains("unsupported syscall sched_getscheduler (145) in copied child"),
-        "{refused:?}"
-    );
-    assert!(
-        stderr(&refused).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_sched_getscheduler
-        )),
-        "{refused:?}"
-    );
-    assert!(
-        !stdout(&refused).contains("after sched_getscheduler"),
-        "{refused:?}"
-    );
-}
 
 /// A copied child has no shared Tool memory writer for scheduler parameters.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_scheduler_parameter_query_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&COPIED_SCHEDULER_QUERY_GUEST, "copied_scheduler_query")
-        .to_str()
-        .unwrap();
-    let native = Command::new(guest)
-        .arg("param-vfork")
-        .output()
-        .expect("native sched_getparam vfork control");
-    assert!(native.status.success(), "{native:?}");
-    let vfork_output = "after sched_getparam\n\
-        vfork sched_getparam: result=0 errno=0 priority=0 canaries=1 exit=0\n";
-    assert_eq!(stdout(&native), vfork_output);
-    let run = |backend, strictness, mode| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            strictness,
-            "--base-env=minimal",
-            "--",
-            guest,
-            mode,
-        ];
-        hermit_test::hermit_output("scheduler parameter query", &mut hermit_command(&args))
-    };
-    // A zero priority alone does not prove Tool mediation. These complete
-    // target/null transcripts characterize the shared handler's existing
-    // PID-existence and null-pointer limitations, not native Linux semantics.
-    for backend in ["dbt", "ptrace"] {
-        let output = run(backend, "--strict", "param-ordinary");
-        assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(
-            stdout(&output),
-            "ordinary sched_getparam: result=0 errno=0 priority=0 canaries=1\n"
-        );
-        let targets = run(backend, "--strict", "param-targets");
-        assert!(targets.status.success(), "{backend}: {targets:?}");
-        assert_eq!(
-            stdout(&targets),
-            "parameter identities: child=1 parent=1\n\
-             sched_getparam zero: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam self: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam live: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam absent: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam negative: result=0 errno=0 priority=0 canaries=1\n\
-             sched_getparam null: result=0 errno=0 priority=324508639 canaries=1\n\
-             sched_getparam bad: result=-1 errno=14 priority=324508639 canaries=1\n\
-             parameter wait: exit=37\nsched-getparam-targets=ok\n"
-        );
-    }
-    let ptrace = run("ptrace", "--strict", "param-vfork");
-    assert!(ptrace.status.success(), "{ptrace:?}");
-    assert_eq!(stdout(&ptrace), vfork_output);
-    let passthrough = run("dbt", "--allow-unsupported-syscalls", "param-vfork");
-    assert!(passthrough.status.success(), "{passthrough:?}");
-    assert_eq!(passthrough.stdout, native.stdout);
 
-    let refused = run("dbt", "--strict", "param-vfork");
-    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
-    assert!(
-        stderr(&refused).contains("unsupported syscall sched_getparam (143) in copied child"),
-        "{refused:?}"
-    );
-    assert!(
-        stderr(&refused).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_sched_getparam
-        )),
-        "{refused:?}"
-    );
-    assert!(
-        !stdout(&refused).contains("after sched_getparam"),
-        "{refused:?}"
-    );
-}
 
 /// A copied child must not expose the host affinity mask in strict mode.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_affinity_query_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&COPIED_SCHEDULER_QUERY_GUEST, "copied_scheduler_query")
-        .to_str()
-        .unwrap();
-    use nix::sched::CpuSet;
-    use nix::sched::sched_getaffinity;
-    use nix::sched::sched_setaffinity;
-    use nix::unistd::Pid;
 
-    // Hermit chooses one CPU from its inherited mask. Give both command
-    // children the same measured singleton so the full native mask is an
-    // independent oracle under identical launch affinity; the test parent
-    // and all guest syscall policies remain unchanged.
-    let inherited = sched_getaffinity(Pid::from_raw(0)).expect("read allowed CPU mask");
-    let cpu = (0..CpuSet::count())
-        .find(|&cpu| inherited.is_set(cpu).unwrap_or(false))
-        .expect("nonempty allowed CPU mask");
-    let mut singleton = CpuSet::new();
-    singleton.set(cpu).expect("allowed CPU fits CpuSet");
-    let same_cpu = |mut command: Command| {
-        // SAFETY: one async-signal-safe syscall with a mask built before fork;
-        // no allocation or mutation of the parent process.
-        unsafe {
-            command.pre_exec(move || {
-                sched_setaffinity(Pid::from_raw(0), &singleton).map_err(std::io::Error::from)
-            });
-        }
-        command
-    };
-    let mut native_command = Command::new(guest);
-    native_command.arg("affinity-vfork");
-    let native = same_cpu(native_command)
-        .output()
-        .expect("native sched_getaffinity vfork control");
-    assert!(native.status.success(), "{native:?}");
-    assert!(
-        stdout(&native).starts_with("after sched_getaffinity\nvfork sched_getaffinity: result="),
-        "{native:?}"
-    );
-    let run = |backend, strictness, mode| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            strictness,
-            "--base-env=minimal",
-            "--",
-            guest,
-            mode,
-        ];
-        hermit_test::hermit_output(
-            "scheduler affinity query",
-            &mut same_cpu(hermit_command(&args)),
-        )
-    };
-    // This is the existing shared CPU0 policy, not the native Linux mask.
-    // Its ignored target-existence semantics are unchanged by this guard cut.
-    let mask = format!("01{}{}", "00".repeat(15), "7f".repeat(112));
-    let ordinary_output =
-        format!("ordinary sched_getaffinity: result=16 errno=0 mask={mask} canaries=1\n");
-    for backend in ["dbt", "ptrace"] {
-        let output = run(backend, "--strict", "affinity-ordinary");
-        assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(stdout(&output), ordinary_output);
-    }
-    let ptrace = run("ptrace", "--strict", "affinity-vfork");
-    assert!(ptrace.status.success(), "{ptrace:?}");
-    assert_eq!(
-        stdout(&ptrace),
-        format!(
-            "after sched_getaffinity\nvfork sched_getaffinity: result=16 errno=0 mask={mask} canaries=1\n"
-        )
-    );
-    // The complete measured native transcript includes the raw positive byte
-    // count, all 128 mask/suffix bytes and both canaries; do not hardcode CPU0.
-    let passthrough = run("dbt", "--allow-unsupported-syscalls", "affinity-vfork");
-    assert!(passthrough.status.success(), "{passthrough:?}");
-    assert_eq!(passthrough.stdout, native.stdout);
-
-    let refused = run("dbt", "--strict", "affinity-vfork");
-    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
-    assert!(
-        stderr(&refused).contains("unsupported syscall sched_getaffinity (204) in copied child"),
-        "{refused:?}"
-    );
-    assert!(
-        stderr(&refused).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_sched_getaffinity
-        )),
-        "{refused:?}"
-    );
-    assert!(
-        !stdout(&refused).contains("after sched_getaffinity"),
-        "{refused:?}"
-    );
-}
 
 /// A copied DBT child must refuse a priority query in strict mode.
 /// Its non-strict native path and the ordinary shared Detcore answer are distinct.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_a_vfork_childs_priority_query_by_name() {
-    let _lock = hermit_run_guard();
-    let guest = futex_c_guest(&COPIED_PRIORITY_QUERY_GUEST, "copied_priority_query")
-        .to_str()
-        .unwrap();
-    let nice19 = |mut command: Command| {
-        // SAFETY: the raw syscall only changes this child before exec; it does
-        // not allocate, acquire locks, or alter the test process's policy.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::syscall(libc::SYS_setpriority, libc::PRIO_PROCESS, 0, 19) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command
-    };
-    let mut native = Command::new(guest);
-    native.arg("vfork");
-    let native = nice19(native)
-        .output()
-        .expect("native nice19 vfork control");
-    assert!(native.status.success(), "{native:?}");
-    assert_eq!(
-        stdout(&native),
-        "after getpriority\nvfork getpriority: raw=1 errno=0 exit=0\n"
-    );
-    let run = |backend, strictness, mode| {
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            strictness,
-            "--base-env=minimal",
-            "--",
-            guest,
-            mode,
-        ];
-        hermit_test::hermit_output("priority query", &mut nice19(hermit_command(&args)))
-    };
-    // The ordinary shared Tool retains raw20 even when native nice19 returns1.
-    for backend in ["dbt", "ptrace"] {
-        let output = run(backend, "--strict", "ordinary");
-        assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(stdout(&output), "ordinary getpriority: raw=20 errno=0\n");
-        let targets = run(backend, "--strict", "ordinary-targets");
-        assert!(targets.status.success(), "{backend}: {targets:?}");
-        assert_eq!(
-            stdout(&targets),
-            "targets identities: child=1 parent=1\n\
-             getpriority zero: raw=20 errno=0\n\
-             getpriority self: raw=20 errno=0\n\
-             getpriority live: raw=20 errno=0\n\
-             getpriority absent: raw=20 errno=0\n\
-             getpriority negative: raw=20 errno=0\n\
-             getpriority invalid-negative: raw=-1 errno=22\n\
-             getpriority invalid-live: raw=-1 errno=22\n\
-             getpriority invalid-absent: raw=-1 errno=22\n\
-             targets wait: exit=37\ngetpriority-targets=ok\n"
-        );
-    }
-    let ptrace = run("ptrace", "--strict", "vfork");
-    assert!(ptrace.status.success(), "{ptrace:?}");
-    assert_eq!(
-        stdout(&ptrace),
-        "after getpriority\nvfork getpriority: raw=20 errno=0 exit=0\n"
-    );
-    // This full transcript proves the copied child actually inherited nice19;
-    // do not assume that launch configuration alone establishes its raw value.
-    let passthrough = run("dbt", "--allow-unsupported-syscalls", "vfork");
-    assert!(passthrough.status.success(), "{passthrough:?}");
-    assert_eq!(passthrough.stdout, native.stdout);
 
-    let refused = run("dbt", "--strict", "vfork");
-    assert_eq!(refused.status.code(), Some(101), "{refused:?}");
-    assert!(
-        stderr(&refused).contains("unsupported syscall getpriority (140) in copied child"),
-        "{refused:?}"
-    );
-    assert!(
-        stderr(&refused).contains(&format!(
-            "detcore-dbt: unsupported syscall {} in copied child",
-            libc::SYS_getpriority
-        )),
-        "{refused:?}"
-    );
-    assert!(
-        !stdout(&refused).contains("after getpriority"),
-        "{refused:?}"
-    );
-}
 
 /// [`cpuinfo_matches_cpuid`] on the DBT backend, whose `/proc/cpuinfo` Detcore
 /// now renders from the table it answers DBT's CPUID from. Before, DBT's guest
 /// did not report CPUID interception, so Detcore left the host's
 /// `/proc/cpuinfo` in place: on an AMD host it read AuthenticAMD while CPUID
 /// read GenuineIntel.
-#[test]
-#[cfg(feature = "dbt")]
-fn run_dbt_cpuinfo_matches_cpuid() {
-    assert_cpuinfo_matches_cpuid(&["--backend=dbt"]);
-}
+
 
 /// DBT refuses `--cpu-profile x86-64-v3` by name: Detcore answers its CPUID,
 /// but the DBT runtime's configuration carries no CPU profile, so a v3 run
 /// would see the v2 table.
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_refuses_cpu_profile_v3_by_name() {
-    let _lock = hermit_run_guard();
-    let args = [
-        "--backend",
-        "dbt",
-        "run",
-        "--cpu-profile",
-        "x86-64-v3",
-        "--",
-        "/bin/true",
-    ];
-    let output = hermit(&args);
-    assert_eq!(
-        output.status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "{}",
-        stderr(&output)
-    );
-    assert!(
-        stderr(&output).contains(
-            "--cpu-profile x86-64-v3 refused: --backend=dbt: Detcore answers DBT's CPUID, but \
-             the DBT runtime's configuration carries no CPU profile"
-        ),
-        "{}",
-        stderr(&output)
-    );
-}
+
 
 /// The coordinator writes the records the in-guest Tool forwards into the log
 /// as it handles the guest's requests, so backend parity's own comparison
@@ -43978,12 +43371,7 @@ fn a_procfs_directory_keeps_its_size() {
 /// procfs entries and keeps the host's values for a directory with procfs's
 /// stat fields (`procfs_inode::unprovable_procfs_signature`; Codex and Claude
 /// re-checks of https://github.com/rrnewton/hermit/pull/4369).
-#[test]
-#[cfg(feature = "dbt")]
-fn dbt_a_procfs_directory_keeps_its_size() {
-    let _guard = hermit_run_guard();
-    assert_procfs_directory_keeps_its_size("dbt");
-}
+
 
 /// [`assert_procfs_directory_keeps_its_size`] on KVM.
 #[test]

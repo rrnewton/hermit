@@ -36,16 +36,10 @@ release_unstamped = read_root_config("hermit_release", "unstamped", "false") == 
 # whole list because scripts/check-buck-reindeer-features.rs reads only literal
 # `features` lists, never a variable or a concatenation.
 release_features = {"features": [
-    "dbt",
-    "e9patch",
     "liteinst",
-    "sabre",
 ]} if release_unstamped else {"features": [
     "buck-release-provenance",
-    "dbt",
-    "e9patch",
     "liteinst",
-    "sabre",
 ]}
 release_build_env = hermit_build_env if release_unstamped else {
     "CARGO_PKG_VERSION": read_root_config("hermit_release", "version", ""),
@@ -89,11 +83,9 @@ rust_library(
             },
             "dependencies_override": {
                 "dependencies": {
-                    "hermit-test-workdir": {"optional": True},
                     "reverie-inguest": {"default-features": False, "optional": True},
                     "sha2": {"optional": True},
                     "reverie-rpc-transport": {"optional": True},
-                    "reverie-sabre-stats": {"optional": True},
                 },
                 "build-dependencies": {
                     "libc": {"version": "0.2.186"},
@@ -112,12 +104,8 @@ rust_library(
                 "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
                 "default": [],
                 "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
-                "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
-                "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
-                "e9patch": [],
                 "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
                 "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
-                "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
                 "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
@@ -185,7 +173,6 @@ rust_library(
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
-        "//hermetic_infra/reverie:reverie-sabre-stats",
         "//hermetic_infra/reverie:safeptrace",
         "fbsource//third-party/rust:colored",
         "fbsource//third-party/rust:diff",
@@ -197,7 +184,6 @@ rust_library(
         "fbsource//third-party/rust:shell-words",
         "fbsource//third-party/rust:tracing-appender",
         "//common/rust/build_info:build_info",
-        "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
     ],
 )
 
@@ -226,11 +212,9 @@ rust_binary(
             },
             "dependencies_override": {
                 "dependencies": {
-                    "hermit-test-workdir": {"optional": True},
                     "reverie-inguest": {"default-features": False, "optional": True},
                     "sha2": {"optional": True},
                     "reverie-rpc-transport": {"optional": True},
-                    "reverie-sabre-stats": {"optional": True},
                 },
                 "build-dependencies": {
                     "toml": {"version": "0.8.23"},
@@ -244,12 +228,8 @@ rust_binary(
                 "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
                 "default": [],
                 "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
-                "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
-                "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
-                "e9patch": [],
                 "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
                 "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
-                "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
                 "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
@@ -304,7 +284,6 @@ rust_library(
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:object",
         "fbsource//third-party/rust:rand_pcg",
-        "fbsource//third-party/rust:reverie-dbt",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tempfile",
@@ -314,7 +293,6 @@ rust_library(
         "fbsource//third-party/rust:tracing-subscriber",
         "fbsource//third-party/rust:uuid",
         "//hermetic_infra/hermit/detcore:detcore",
-        "//hermetic_infra/hermit/detcore-dbt:detcore-dbt",
         "//hermetic_infra/hermit/detcore-model:detcore-model",
         "//hermetic_infra/hermit/hermit-record:hermit-record",
         "//hermetic_infra/hermit/hermit-record-format:hermit-record-format",
@@ -327,7 +305,6 @@ rust_library(
         "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
-        "//hermetic_infra/reverie:reverie-sabre-stats",
         "//hermetic_infra/reverie:safeptrace",
         "fbsource//third-party/rust:colored",
         "fbsource//third-party/rust:diff",
@@ -339,7 +316,6 @@ rust_library(
         "fbsource//third-party/rust:shell-words",
         "fbsource//third-party/rust:tracing-appender",
         "//common/rust/build_info:build_info",
-        "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
     ],
     **release_features
 )

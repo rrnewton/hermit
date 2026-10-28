@@ -35,6 +35,10 @@ use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
 pub use super::run::RunLatches;
+/// Stamp only the common invocation-bound pending NO-RESULT report. This is
+/// the same fixed operation used by the shared application and saved comparison;
+/// terminal verdicts and their publication remain owned by the common driver.
+pub use super::verify::write_pending_verification_json;
 /// A parsed mount specification retained exactly for command reconstruction.
 pub use super::run::MountArg;
 
@@ -55,6 +59,30 @@ pub enum EvidenceRequirement {
     NativeCounters,
 }
 
+/// The real source of this adapter's verification records. This is declared
+/// before preparation; no empty/default transport can omit a required source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerificationLogTransport {
+    /// Detcore emits through the coordinator's synchronous bounded subscriber.
+    CoordinatorTracing,
+    /// Detcore in the guest sends typed records through the core-owned socket.
+    InGuestSocket,
+    /// The maintained native collector supplies records and all native facts.
+    NativeEvidence,
+}
+
+impl VerificationLogTransport {
+    pub(super) fn validate(self, evidence: EvidenceRequirement) -> Result<(), Error> {
+        match (self, evidence) {
+            (Self::CoordinatorTracing | Self::InGuestSocket, EvidenceRequirement::Common)
+            | (Self::NativeEvidence, EvidenceRequirement::NativeCounters) => Ok(()),
+            _ => Err(Error::msg(
+                "adapter log transport does not match its required verification evidence",
+            )),
+        }
+    }
+}
+
 /// One statically linked physical adapter, never a registry or a verdict owner.
 ///
 /// The selected executable supplies its own concrete options and state. None
@@ -64,6 +92,17 @@ pub trait BackendAdapter {
     const EVIDENCE: EvidenceRequirement;
     /// The actual physical runtime's facts, not an assurance or test verdict.
     const CAPABILITIES: reverie::BackendCapabilities;
+    /// Required physical record transport; independent of descriptor sharing.
+    const LOG_TRANSPORT: VerificationLogTransport;
+    /// An immutable identity diagnostic, emitted only after both native decoders
+    /// and their complete pair evidence succeeded. It cannot affect a verdict.
+    /// Common comparison publishes JSON and every native comparison message
+    /// before this diagnostic, including when the completed runs diverged.
+    const NATIVE_IDENTITY_DIAGNOSTIC: Option<&'static str> = None;
+    /// Reason text for the core's mandatory early refusal of a nondefault CPU
+    /// profile. An adapter cannot admit a profile through this declaration.
+    const NONDEFAULT_CPU_PROFILE_REFUSAL: &'static str =
+        "only the ptrace backend is qualified";
 
     type Options;
     type Session;
@@ -75,6 +114,22 @@ pub trait BackendAdapter {
     }
 
     fn parse(&self, matches: &ArgMatches) -> Result<Self::Options, clap::Error>;
+
+    /// Static operation support, checked before input/resource/writer work.
+    /// This must not probe a runtime or create resources. Saved execution is
+    /// opt-in only after the adapter uses the real core capture and, for native
+    /// evidence, implements the raw save/restore owner callbacks below.
+    fn validate_mode(&self, mode: Mode) -> Result<(), Error> {
+        match mode {
+            Mode::Ordinary | Mode::VerificationPair => Ok(()),
+            Mode::SavedVerification => Err(Error::new(hermit::PolicyRefusal).context(format!(
+                "--verify-run is not yet supported by executable-selected backend `{}`: \
+                 this adapter has not admitted the saved-record operation; \
+                 use live --verify instead",
+                Self::NAME
+            ))),
+        }
+    }
 
     fn prepare(&self, options: Self::Options, request: Prepare<'_>)
     -> Result<Self::Session, Error>;
@@ -98,6 +153,106 @@ pub trait BackendAdapter {
         first: &Self::Facts,
         second: &Self::Facts,
     ) -> Result<PairEvidence, Error>;
+
+    /// Preserve the backend's validated raw native records for the core-owned
+    /// saved-run writer. This is not a serialization of comparison summaries.
+    fn save_native_evidence(&self, _facts: &Self::Facts) -> Result<SavedNativeEvidence, Error> {
+        Err(Error::new(hermit::BackendRunFailure)
+            .context("backend does not implement validated raw native saved evidence"))
+    }
+
+    /// Restore through the same native decoder and refusal policy as a live
+    /// run. The core still compares the complete `pair_evidence` dimensions.
+    fn restore_native_evidence(
+        &self,
+        _evidence: SavedNativeEvidenceRef<'_>,
+    ) -> Result<Self::Facts, Error> {
+        Err(Error::new(hermit::BackendRunFailure)
+            .context("backend does not implement validated raw native saved evidence restoration"))
+    }
+}
+
+/// Backend-owned, already validated native record bytes. The core owns their
+/// filename, create-new writes, synchronization, record metadata and publication
+/// order. The backend owns their existing decoder, never the comparison verdict.
+pub struct SavedNativeEvidence {
+    raw: Vec<u8>,
+    initialization_records: u64,
+}
+
+impl SavedNativeEvidence {
+    pub fn new(raw: Vec<u8>, initialization_records: u64) -> Self {
+        Self {
+            raw,
+            initialization_records,
+        }
+    }
+
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    pub fn initialization_records(&self) -> u64 {
+        self.initialization_records
+    }
+
+    /// Store only this exact payload in a new, uncommitted artifact directory.
+    /// This uses the same core writer as the admitted saved-run operation. No
+    /// record, outcome or comparison is published; only the saved-run driver
+    /// can commit a complete run after its existing policy checks.
+    pub fn create_uncommitted_artifact(
+        &self,
+        directory: &Path,
+    ) -> Result<SavedNativeArtifact, Error> {
+        super::verify_run::VerifyRunWriter::create(directory)?.write_native_evidence(self)
+    }
+
+    pub fn as_ref(&self) -> SavedNativeEvidenceRef<'_> {
+        SavedNativeEvidenceRef {
+            raw: Ok(&self.raw),
+            initialization_records: self.initialization_records,
+        }
+    }
+}
+
+/// Immutable locator for the exact native payload written by the core owner.
+/// Possessing this artifact does not publish or admit a saved verification run.
+pub struct SavedNativeArtifact {
+    pub(super) path: PathBuf,
+    pub(super) initialization_records: u64,
+}
+
+impl SavedNativeArtifact {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn read(&self) -> Result<SavedNativeEvidence, Error> {
+        Ok(SavedNativeEvidence::new(
+            std::fs::read(&self.path)?,
+            self.initialization_records,
+        ))
+    }
+}
+
+/// The actual raw payload and recorded initialization count read by the core.
+/// A static adapter must decode them before returning its complete typed facts.
+#[derive(Clone, Copy)]
+pub struct SavedNativeEvidenceRef<'a> {
+    pub(super) raw: Result<&'a [u8], &'a std::io::Error>,
+    pub(super) initialization_records: u64,
+}
+
+impl<'a> SavedNativeEvidenceRef<'a> {
+    /// Preserve the actual saved-payload read result, including missing and
+    /// unreadable files, for the backend's unchanged native refusal policy.
+    pub fn raw(self) -> Result<&'a [u8], &'a std::io::Error> {
+        self.raw
+    }
+
+    pub fn initialization_records(self) -> u64 {
+        self.initialization_records
+    }
 }
 
 /// A new option. Its value parser is arbitrary; its relations are confined to
@@ -435,6 +590,14 @@ impl PreparedPhysical {
             ),
         }
     }
+
+    fn for_run(&self, options: &super::run::RunOpts) -> Self {
+        let mut physical = self.clone();
+        // Terminal/capability/signal preparation is invocation-owned. Only the
+        // common verifier's private per-run provenance descriptor varies.
+        options.apply_run_metadata(&mut physical.config);
+        physical
+    }
 }
 
 /// Common inputs already admitted by the application. The stdin owner moves
@@ -464,6 +627,31 @@ impl Prepare<'_> {
         self.options.adapter_arguments()
     }
 
+    /// The actual command with common image/environment/argv0 policy applied.
+    pub fn command(&self) -> Result<reverie::process::Command, Error> {
+        self.options.guest_command()
+    }
+
+    pub fn summary_json(&self) -> Option<&Path> {
+        self.options.summary_json.as_deref()
+    }
+
+    /// Resolve through the maintained guest mount/symlink visibility rules.
+    pub fn executable_overlay_plan(&self) -> Result<ExecutableOverlay, Error> {
+        self.options.adapter_executable_overlay_plan()
+    }
+
+    /// Bind both the actual command and its readonly overlay to one plan.
+    pub fn command_with_executable_overlay(
+        &self,
+        plan: &ExecutableOverlay,
+        source: Option<&Path>,
+    ) -> Result<(reverie::process::Command, ContainerScope), Error> {
+        let options = self.options.adapter_with_executable_overlay(plan, source)?;
+        let command = options.guest_command()?;
+        Ok((command, ContainerScope::prepared(&options, self.physical)))
+    }
+
     pub fn environment(&self) -> Result<BTreeMap<OsString, OsString>, Error> {
         Ok(self.options.guest_command()?.get_captured_envs())
     }
@@ -474,7 +662,7 @@ impl Prepare<'_> {
 
     pub fn config(&self) -> DetConfig {
         match self.physical {
-            Some(physical) => physical.config.clone(),
+            Some(physical) => physical.for_run(self.options).config,
             None => self.options.effective_det_config(),
         }
     }
@@ -535,6 +723,26 @@ impl Prepare<'_> {
     }
 }
 
+/// A preprocessor's resolved executable paths, constructed only by the
+/// maintained common resolver. Installing it rechecks the complete plan
+/// against the receiving invocation, then applies the existing readonly
+/// overlay ordering, mount-target and source-visibility rules.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableOverlay {
+    pub(super) guest: PathBuf,
+    pub(super) host: PathBuf,
+    pub(super) target: PathBuf,
+}
+
+impl ExecutableOverlay {
+    pub fn guest_program(&self) -> &Path {
+        &self.guest
+    }
+    pub fn host_program(&self) -> &Path {
+        &self.host
+    }
+}
+
 /// A controlled physical launch with the application's mounts and bounds.
 #[derive(Clone)]
 pub struct ContainerScope {
@@ -549,7 +757,7 @@ impl ContainerScope {
                 Some(physical) => options.with_adapter_capabilities(physical.capabilities),
                 None => options.clone(),
             },
-            physical: physical.cloned(),
+            physical: physical.map(|physical| physical.for_run(options)),
         }
     }
 
@@ -585,10 +793,74 @@ impl ContainerScope {
 
     /// Use the one prepared physical declaration for both the container's
     /// procfs policy and the Detcore configuration, without assuming ptrace.
-    pub fn run<G, F, T>(&self, guards: G, resources: &str, mut work: F) -> Result<(T, G), Error>
+    pub fn run<G, F, T>(&self, guards: G, resources: &str, work: F) -> Result<(T, G), Error>
     where
         G: 'static,
         F: FnMut(&mut G, DetConfig) -> Result<T, Error> + 'static,
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        self.run_inner(guards, resources, None, work)
+    }
+
+    /// Initialize coordinator tracing inside the same owned container. Tracing
+    /// owns the PID-slot reservation on this path, and its guard remains alive
+    /// through configuration and the complete physical operation.
+    pub fn run_with_tracing<G, F, T>(
+        &self,
+        guards: G,
+        resources: &str,
+        tracing: CoordinatorTracing,
+        work: F,
+    ) -> Result<(T, G), Error>
+    where
+        G: 'static,
+        F: FnMut(&mut G, DetConfig) -> Result<T, Error> + 'static,
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        self.run_inner(guards, resources, Some(tracing), work)
+    }
+
+    fn run_inner<G, F, T>(
+        &self,
+        guards: G,
+        resources: &str,
+        tracing: Option<CoordinatorTracing>,
+        mut work: F,
+    ) -> Result<(T, G), Error>
+    where
+        G: 'static,
+        F: FnMut(&mut G, DetConfig) -> Result<T, Error> + 'static,
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        self.run_with_setup(
+            guards,
+            resources,
+            move || {
+                // Each real setup path owns exactly one PID-slot reservation.
+                Ok(match &tracing {
+                    Some(tracing) => Some(tracing.clone().enter()),
+                    None => {
+                        super::tracing::align_namespace_pid_baseline();
+                        None
+                    }
+                })
+            },
+            move |guards, config, _tracing| work(guards, config),
+        )
+    }
+
+    fn run_with_setup<G, S, Setup, F, T>(
+        &self,
+        guards: G,
+        resources: &str,
+        mut setup: Setup,
+        mut work: F,
+    ) -> Result<(T, G), Error>
+    where
+        G: 'static,
+        S: 'static,
+        Setup: FnMut() -> Result<S, Error> + 'static,
+        F: FnMut(&mut G, DetConfig, S) -> Result<T, Error> + 'static,
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         let physical = self.physical.as_ref().ok_or_else(|| {
@@ -607,13 +879,13 @@ impl ContainerScope {
                     "an external physical adapter cannot consume a native exec enrollment"
                 );
                 super::container::exit_init_after_publication();
-                super::tracing::align_namespace_pid_baseline();
+                let setup = setup()?;
                 let config = super::run::complete_container_config(
                     config.clone(),
                     identity,
                     cwd.as_deref(),
                 )?;
-                work(guards, config)
+                work(guards, config, setup)
             },
         )
     }
@@ -669,12 +941,15 @@ pub struct VerificationCapture<'a> {
     pub(super) options: &'a super::run::RunOpts,
     pub(super) physical: Option<&'a PreparedPhysical>,
     pub(super) requested_log: Option<LevelFilter>,
+    pub(super) log_budget: Option<super::tracing::LogBudget>,
+    pub(super) log_transport: VerificationLogTransport,
+    pub(super) forwarded_detlogs: super::run::ForwardedDetlogPlan,
 }
 
 impl VerificationCapture<'_> {
     pub fn config(&self) -> DetConfig {
         match self.physical {
-            Some(physical) => physical.config.clone(),
+            Some(physical) => physical.for_run(self.options).config,
             None => self.options.effective_det_config(),
         }
     }
@@ -694,6 +969,121 @@ impl VerificationCapture<'_> {
         .max(LevelFilter::INFO)
     }
 
+    /// Consume this capture through the existing container/resource owner.
+    /// The closure performs only physical work. Writer policy, forwarding,
+    /// drain/flush, loss latches and comparison remain in the common library.
+    pub fn run_in_container<G, F, P>(
+        self,
+        guards: G,
+        resources: &str,
+        work: F,
+    ) -> Result<(PhysicalRun<P>, G), Error>
+    where
+        G: 'static,
+        F: FnMut(&mut G, VerificationCommand) -> Result<CapturedOutput<P>, Error> + 'static,
+        P: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        let options = self.options.clone();
+        self.run_with_options(options, guards, resources, work)
+    }
+
+    /// Same common capture, with the preprocessor's validated readonly
+    /// executable plan also applied to this physical run's own container.
+    pub fn run_in_container_with_executable_overlay<G, F, P>(
+        self,
+        plan: &ExecutableOverlay,
+        source: Option<&Path>,
+        guards: G,
+        resources: &str,
+        work: F,
+    ) -> Result<(PhysicalRun<P>, G), Error>
+    where
+        G: 'static,
+        F: FnMut(&mut G, VerificationCommand) -> Result<CapturedOutput<P>, Error> + 'static,
+        P: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        let options = self.options.adapter_with_executable_overlay(plan, source)?;
+        self.run_with_options(options, guards, resources, work)
+    }
+
+    fn run_with_options<G, F, P>(
+        self,
+        options: super::run::RunOpts,
+        guards: G,
+        resources: &str,
+        mut work: F,
+    ) -> Result<(PhysicalRun<P>, G), Error>
+    where
+        G: 'static,
+        F: FnMut(&mut G, VerificationCommand) -> Result<CapturedOutput<P>, Error> + 'static,
+        P: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        anyhow::ensure!(
+            self.log_transport != VerificationLogTransport::NativeEvidence,
+            "native evidence must use its maintained typed capture, not the common tracing capture"
+        );
+        let container = ContainerScope::prepared(&options, self.physical);
+        let level = super::verify::verification_log_level(
+            self.requested_log,
+            options.verification_strictness(),
+            options.adapter_verbose_verification(),
+        );
+        let mut file = Some(self.log);
+        let mut forwarded = self.forwarded_detlogs;
+        let budget = self.log_budget;
+        let run = self.run;
+        let verification_json = options.adapter_verification_json().map(Path::to_owned);
+        let ((output, skid_overshoots, latches, pending), guards) = container.run_with_setup(
+            guards,
+            resources,
+            move || {
+                let file = file
+                    .take()
+                    .ok_or_else(|| Error::msg("verification capture log was already consumed"))?;
+                super::run::VerificationLogSession::open(
+                    file,
+                    &mut forwarded,
+                    level,
+                    budget.clone(),
+                )
+            },
+            move |guards, config, mut log| {
+                let _deadlock =
+                    super::verify::record_terminal_deadlock(verification_json.as_deref(), run);
+                let result = (|| {
+                    let command = options.guest_command()?;
+                    work(
+                        guards,
+                        VerificationCommand {
+                            command,
+                            config,
+                            print_summary: options.summary,
+                            summary_json: options.summary_json.clone(),
+                        },
+                    )
+                })();
+                // Drain/clear and flush before propagating a physical error too.
+                let latches = log.finish();
+                let captured = result?;
+                Ok((
+                    captured.output,
+                    captured.skid_overshoots,
+                    latches,
+                    captured.pending,
+                ))
+            },
+        )?;
+        Ok((
+            PhysicalRun {
+                output,
+                skid_overshoots,
+                latches,
+                pending,
+            },
+            guards,
+        ))
+    }
+
     /// Install the common terminal-deadlock report only for this capture's
     /// actual run and report path. Keep the returned affine guard in scope
     /// until the physical run and its failure handling have completed.
@@ -711,6 +1101,21 @@ impl VerificationCapture<'_> {
 /// Affine ownership of the common scheduler's temporary deadlock report hook.
 pub struct TerminalDeadlockGuard {
     _guard: Option<super::verify::TerminalDeadlockRecording>,
+}
+
+/// Admitted physical inputs. These carry no comparator or verdict authority.
+pub struct VerificationCommand {
+    pub command: reverie::process::Command,
+    pub config: DetConfig,
+    pub print_summary: bool,
+    pub summary_json: Option<PathBuf>,
+}
+
+/// What the physical callback actually observed, before common latch checks.
+pub struct CapturedOutput<P> {
+    pub output: Output,
+    pub skid_overshoots: u64,
+    pub pending: P,
 }
 
 /// Exact physical output plus deferred state, without a verdict.
@@ -840,6 +1245,7 @@ mod tests {
         const NAME: &'static str = "dynamorio";
         const EVIDENCE: EvidenceRequirement = EvidenceRequirement::NativeCounters;
         const CAPABILITIES: reverie::BackendCapabilities = reverie::BackendCapabilities::DBT;
+        const LOG_TRANSPORT: VerificationLogTransport = VerificationLogTransport::NativeEvidence;
 
         type Options = u64;
         type Session = Session;
@@ -993,6 +1399,97 @@ mod tests {
 
     fn report(directory: &Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(directory.join("report.json")).unwrap()).unwrap()
+    }
+
+    struct WrongTransport(StaticAdapter);
+
+    impl BackendAdapter for WrongTransport {
+        const NAME: &'static str = StaticAdapter::NAME;
+        const EVIDENCE: EvidenceRequirement = StaticAdapter::EVIDENCE;
+        const CAPABILITIES: reverie::BackendCapabilities = StaticAdapter::CAPABILITIES;
+        const LOG_TRANSPORT: VerificationLogTransport = VerificationLogTransport::InGuestSocket;
+
+        type Options = <StaticAdapter as BackendAdapter>::Options;
+        type Session = <StaticAdapter as BackendAdapter>::Session;
+        type Pending = <StaticAdapter as BackendAdapter>::Pending;
+        type Facts = <StaticAdapter as BackendAdapter>::Facts;
+
+        fn parse(&self, matches: &ArgMatches) -> Result<Self::Options, clap::Error> {
+            self.0.parse(matches)
+        }
+
+        fn prepare(
+            &self,
+            options: Self::Options,
+            request: Prepare<'_>,
+        ) -> Result<Self::Session, Error> {
+            self.0.prepare(options, request)
+        }
+
+        fn execute(
+            &self,
+            session: &mut Self::Session,
+            request: Execute<'_>,
+        ) -> Result<Execution<Self::Pending>, Error> {
+            self.0.execute(session, request)
+        }
+
+        fn finish(
+            &self,
+            pending: Self::Pending,
+            observation: Observation<'_>,
+        ) -> Result<Self::Facts, Error> {
+            self.0.finish(pending, observation)
+        }
+
+        fn pair_evidence(
+            &self,
+            first: &Self::Facts,
+            second: &Self::Facts,
+        ) -> Result<PairEvidence, Error> {
+            self.0.pair_evidence(first, second)
+        }
+    }
+
+    #[test]
+    fn verification_transport_mismatch_refuses_before_prepare_or_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let adapter = WrongTransport(StaticAdapter::default());
+        let options = options(directory.path());
+        super::super::verify::write_pending_verification_json(
+            &directory.path().join("report.json"),
+        )
+        .unwrap();
+        let error = options
+            .verify_sharing_ld_so_cache(
+                &super::super::global_opts::GlobalOpts::parse_from(["hermit"]),
+                None,
+                &adapter,
+                7,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("log transport does not match"));
+        assert!(adapter.0.events.borrow().is_empty());
+        assert!(!directory.path().join("logs").exists());
+        let report = report(directory.path());
+        assert_eq!(report["verdict"], "no_result");
+        assert_eq!(report["verified"], false);
+        for transport in [
+            VerificationLogTransport::CoordinatorTracing,
+            VerificationLogTransport::InGuestSocket,
+        ] {
+            assert!(transport.validate(EvidenceRequirement::Common).is_ok());
+            assert!(
+                transport
+                    .validate(EvidenceRequirement::NativeCounters)
+                    .is_err()
+            );
+        }
+        assert!(
+            VerificationLogTransport::NativeEvidence
+                .validate(EvidenceRequirement::Common)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1201,6 +1698,9 @@ mod tests {
                 options: &options,
                 physical: Some(&physical),
                 requested_log,
+                log_budget: None,
+                log_transport: VerificationLogTransport::NativeEvidence,
+                forwarded_detlogs: super::super::run::ForwardedDetlogPlan::None,
             };
             assert_eq!(capture.evidence_log_level(), expected);
             assert_eq!(
@@ -1536,4 +2036,11 @@ mod tests {
             );
         }
     }
+}
+
+/// The common nonwaiting diagnostic channel for a physical adapter's existing
+/// preparation banner. This does not select a log filter, writer or verdict.
+/// The original macro keeps the current invocation's log-cap policy.
+pub fn controller_diagnostic(message: std::fmt::Arguments<'_>) {
+    super::tracing::diagnostic_eprintln!("{message}");
 }
