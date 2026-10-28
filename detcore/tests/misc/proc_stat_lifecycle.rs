@@ -52,6 +52,36 @@ fn under_detcore(guest: impl FnOnce() + Send) {
     );
 }
 
+/// Run the calling test in a child process of its own, before any native
+/// execution or setup in it. The native halves of these scenarios fork
+/// this process, and the Detcore halves trace its threads: in the shared
+/// libtest binary a sibling test's fork can inherit a session in flight
+/// (or leave one for this test's fork to inherit) and wedge both. Each
+/// test therefore runs in a child process of its own, as nextest already
+/// runs it; the native and Detcore halves both run again there. Returns
+/// true in the parent once the child has passed, and false in the child.
+fn run_in_child_process() -> bool {
+    const CHILD: &str = "HERMIT_PROC_STAT_LIFECYCLE_CHILD";
+    let case = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string();
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(&case)) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &case)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "{output:?}"
+    );
+    true
+}
+
 fn open_stat(path: &str) -> RawFd {
     let path = std::ffi::CString::new(path).unwrap();
     // SAFETY: a NUL-terminated path.
@@ -348,6 +378,9 @@ fn reap_passing(pid: libc::pid_t) {
 /// parent its getppid answers, by every spelling of its own process.
 #[test]
 fn a_rendered_stat_has_52_fields_and_the_callers_identity() {
+    if run_in_child_process() {
+        return;
+    }
     under_detcore(|| {
         // SAFETY: plain identity calls.
         let (pid, tid, ppid) = unsafe { (libc::getpid(), libc::gettid(), libc::getppid()) };
@@ -376,6 +409,9 @@ fn a_rendered_stat_has_52_fields_and_the_callers_identity() {
 /// tells the renderings apart.
 #[test]
 fn a_started_stat_read_keeps_its_record_and_pread_or_seek_renders_again() {
+    if run_in_child_process() {
+        return;
+    }
     under_detcore(|| {
         let fd = open_stat("/proc/self/stat");
         let head = read_some(fd, 5);
@@ -416,6 +452,9 @@ fn a_started_stat_read_keeps_its_record_and_pread_or_seek_renders_again() {
 /// parent at its first read, as Linux's `show` runs at the read.
 #[test]
 fn a_stat_opened_before_reparenting_shows_the_new_parent() {
+    if run_in_child_process() {
+        return;
+    }
     under_detcore(|| {
         let mut ready = [0; 2];
         let mut verdict = [0; 2];
@@ -462,6 +501,9 @@ fn a_stat_opened_before_reparenting_shows_the_new_parent() {
 /// opened its stat.
 #[test]
 fn an_inherited_stat_descriptor_shows_the_openers_parent() {
+    if run_in_child_process() {
+        return;
+    }
     under_detcore(|| {
         // SAFETY: plain identity calls, a pipe and a fork this guest owns.
         unsafe {
@@ -542,6 +584,9 @@ fn backing_answers() -> (i32, i32, i32, i32, u32, i64) {
 /// `fstat` as the kernel's own file does natively.
 #[test]
 fn a_rendered_stat_answers_mode_changes_syncfs_and_mappings_as_the_kernel() {
+    if run_in_child_process() {
+        return;
+    }
     let native = backing_answers();
     under_detcore(move || {
         assert_eq!(backing_answers(), native);
@@ -553,6 +598,9 @@ fn a_rendered_stat_answers_mode_changes_syncfs_and_mappings_as_the_kernel() {
 /// and the read does not reach the bytes the read returns.
 #[test]
 fn a_seek_renders_the_record_at_the_seek() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         let before = own_thread_count();
         let fd = open_stat("/proc/self/stat");
@@ -577,6 +625,9 @@ fn a_seek_renders_the_record_at_the_seek() {
 /// Linux's `seq_read_iter` sets the sequence before it copies.
 #[test]
 fn a_read_that_faults_keeps_the_record_its_traversal_rendered() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         let before = own_thread_count();
         let fd = open_stat("/proc/self/stat");
@@ -615,6 +666,9 @@ fn a_read_that_faults_keeps_the_record_its_traversal_rendered() {
 /// (one thread), as Linux's one `seq_file` per open file does.
 #[test]
 fn a_stat_descriptor_sent_to_another_process_continues_the_senders_record() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         let pair = socket_pair();
         let (ack, go) = (pipe(), pipe());
@@ -662,6 +716,9 @@ fn a_stat_descriptor_sent_to_another_process_continues_the_senders_record() {
 /// continues the sender's record (one thread).
 #[test]
 fn a_queued_stat_descriptor_whose_sender_closed_it_renders_again_under_detcore() {
+    if run_in_child_process() {
+        return;
+    }
     let check = |buffered: bool| {
         move || {
             let pair = socket_pair();
@@ -697,6 +754,9 @@ fn a_queued_stat_descriptor_whose_sender_closed_it_renders_again_under_detcore()
 /// file: the tool reads the described task's own `comm`, not the reader's.
 #[test]
 fn an_inherited_stat_descriptor_shows_the_name_its_task_wrote_to_its_comm_file() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         let comm = std::ffi::CString::new("/proc/self/comm").unwrap();
         // SAFETY: a NUL-terminated path, and a buffer this guest owns.
@@ -724,6 +784,9 @@ fn an_inherited_stat_descriptor_shows_the_name_its_task_wrote_to_its_comm_file()
 /// answers, not 0.
 #[test]
 fn a_clone_parent_childs_stat_read_by_its_child_shows_its_outside_parent() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         let verdict = pipe();
         // SAFETY: a raw clone with no new stack forks this process; the
@@ -770,6 +833,9 @@ fn a_clone_parent_childs_stat_read_by_its_child_shows_its_outside_parent() {
 /// change to `RLIMIT_RSS` with EPERM, so there both are `RLIM_INFINITY`.)
 #[test]
 fn an_inherited_stat_descriptor_shows_its_processes_rss_limit() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         let fd = open_stat("/proc/self/stat");
         let go = pipe();
@@ -976,6 +1042,9 @@ fn transfer_answers() -> Vec<(&'static str, i64)> {
 /// the kernel's own file does natively.
 #[test]
 fn a_moved_stat_descriptor_answers_as_the_kernels_file() {
+    if run_in_child_process() {
+        return;
+    }
     let native = natively_answering(|| format!("{:?}", transfer_answers()));
     assert!(native.contains("syncfs after an exec"), "{native}");
     println!("native answers: {native}");
@@ -989,6 +1058,9 @@ fn a_moved_stat_descriptor_answers_as_the_kernels_file() {
 /// `splice_read` (fs/proc/base.c:823-828 in 6.17).
 #[test]
 fn a_rendered_stat_is_refused_as_a_sendfile_source() {
+    if run_in_child_process() {
+        return;
+    }
     let check = |expected: i32| {
         move || {
             let fd = open_stat("/proc/self/stat");
@@ -1010,6 +1082,9 @@ fn a_rendered_stat_is_refused_as_a_sendfile_source() {
 /// (`seq_lseek`).
 #[test]
 fn a_failed_rendering_resets_the_sequence_and_a_seek_fails_again() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         let (to_worker, worker_waits) = std::sync::mpsc::channel::<()>();
         let (tid_sender, tid) = std::sync::mpsc::channel::<libc::pid_t>();
@@ -1067,6 +1142,9 @@ fn a_failed_rendering_resets_the_sequence_and_a_seek_fails_again() {
 /// read rendered.
 #[test]
 fn a_refused_read_leaves_the_buffered_record() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         let before = own_thread_count();
         let fd = open_stat("/proc/self/stat");
@@ -1148,6 +1226,9 @@ fn in_a_cloned_child(flags: libc::c_int, child: impl FnOnce()) {
 /// task's own name.
 #[test]
 fn a_stat_read_after_chroot_to_the_root_shows_the_kernels_name() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         in_a_cloned_child(libc::CLONE_NEWUSER, || {
             let fd = open_stat("/proc/self/stat");
@@ -1170,6 +1251,9 @@ fn a_stat_read_after_chroot_to_the_root_shows_the_kernels_name() {
 /// (the unit test `a_comm_is_not_read_through_a_changed_root_the_tool_shares`).
 #[test]
 fn a_stat_read_after_chroot_into_a_forged_proc_shows_the_kernels_name() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         // SAFETY: a plain identity call.
         let pid = unsafe { libc::getpid() };
@@ -1217,6 +1301,9 @@ fn a_stat_read_after_chroot_into_a_forged_proc_shows_the_kernels_name() {
 /// getppid answer, as the procfs the parent opened it in numbers them.
 #[test]
 fn a_pid_namespace_child_reads_its_parents_inherited_stat() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         // SAFETY: plain identity calls.
         let (pid, ppid) = unsafe { (libc::getpid(), libc::getppid()) };
@@ -1240,6 +1327,9 @@ fn a_pid_namespace_child_reads_its_parents_inherited_stat() {
 /// of Detcore's per-process numbers (bit 63 set).
 #[test]
 fn every_comm_spelling_stays_the_kernels_under_a_tracer() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         // SAFETY: plain identity calls.
         let (pid, tid) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
@@ -1301,6 +1391,9 @@ fn every_comm_spelling_stays_the_kernels_under_a_tracer() {
 /// files stay the kernel's under a tracer).
 #[test]
 fn vectored_reads_of_stat_cgroup_and_comm_take_only_rwf_hipri() {
+    if run_in_child_process() {
+        return;
+    }
     natively_and_under_detcore(|| {
         for path in [
             "/proc/self/stat",

@@ -59,6 +59,39 @@ pub use detcore::nonwaiting_write;
 pub mod physical_exit_watch;
 pub mod preemption_admission;
 pub mod proc_mount;
+
+/// Re-runs the named test alone in a fresh process of this test binary and
+/// requires it to pass; returns false in that fresh process so the caller
+/// runs its body there. Used by tests that fork, clone or spawn children:
+/// under the threaded harness a child forked from this process can inherit
+/// a malloc arena whose lock another harness thread held at the fork, and
+/// then wait on that lock forever (seen as `__malloc_fork_lock_parent` in
+/// `__fork`). A fresh process has no other allocating threads, so its
+/// children cannot inherit a held arena lock. The fresh process still runs
+/// under libtest with one test thread, so no assertion changes.
+#[cfg(test)]
+pub(crate) fn run_in_fresh_process(name: &str) -> bool {
+    const INNER: &str = "HERMIT_LIB_TEST_FRESH_PROCESS";
+    if std::env::var_os(INNER).is_some_and(|value| value == name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(INNER, name)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "inner run of {name} failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "inner run of {name} did not execute the test:\n{stdout}\n{stderr}"
+    );
+    true
+}
 mod ptrace_completion;
 
 pub use canonical_verdict::Verdict;
@@ -10137,6 +10170,20 @@ mod tests {
 
     #[test]
     fn kvm_runs_dynamic_echo_through_detcore() {
+        // The KVM backend runs its session on the calling thread (see
+        // `run`), and a debug session overflows the test thread's default
+        // 2 MiB stack under plain `cargo test`, so run the body on a
+        // thread with an explicit stack.
+        std::thread::Builder::new()
+            .name("kvm_runs_dynamic_echo_through_detcore".to_owned())
+            .stack_size(16 << 20)
+            .spawn(kvm_runs_dynamic_echo_through_detcore_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn kvm_runs_dynamic_echo_through_detcore_body() {
         use clap::Parser;
 
         if kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_some() {

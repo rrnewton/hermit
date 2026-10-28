@@ -2083,6 +2083,32 @@ mod file_metadata_tests {
     use crate::pipe_wake::ChannelEnd;
     use crate::pipe_wake::ChannelId;
 
+    /// Run the test named `case` in an isolated child process, returning
+    /// true when this invocation is the parent and the caller must return
+    /// at once. Tests here key model tables by this process's real
+    /// descriptor numbers; under plain `cargo test` a sibling thread can
+    /// be handed a number this test is using as a model-only alias, or
+    /// reuse a number this test just closed, so the model observes a
+    /// descriptor that is not its own. A child process has no sibling
+    /// threads allocating descriptors.
+    fn isolated_child(case: &str) -> bool {
+        const CHILD: &str = "HERMIT_FILE_METADATA_CHILD";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(case)) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case, "--nocapture", "--test-threads=1"])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        true
+    }
+
     #[test]
     fn maps_exec_survivors_keep_opened_target_aliases_and_cursor() {
         use crate::procfs::BoundTask;
@@ -2676,6 +2702,11 @@ mod file_metadata_tests {
 
     #[test]
     fn a_pipe_channel_follows_its_description_through_dup_and_fork() {
+        if isolated_child(
+            "tool_local::file_metadata_tests::a_pipe_channel_follows_its_description_through_dup_and_fork",
+        ) {
+            return;
+        }
         let owner = DetTid::from_raw(9018);
         let mut parent = FileMetadata::new(owner);
         let (reader, _writer) = nix::unistd::pipe2(OFlag::empty()).unwrap();
