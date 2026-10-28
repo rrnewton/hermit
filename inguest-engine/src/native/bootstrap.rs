@@ -5,24 +5,40 @@
 use std::ffi::OsStr;
 use std::future::Future;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::pin::pin;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
-use detcore::{Config, Detcore, GlobalState};
-use reverie::{Pid, Tool};
+use detcore::Config;
+use detcore::Detcore;
+use detcore::GlobalState;
+use reverie::Pid;
+use reverie::Tool;
 use reverie_inguest::guest::host::HostRuntime;
 use reverie_inguest::guest::native_rpc::NativeRpc;
 use reverie_inguest::guest::rpc::CoordinatorRpc;
 
-use super::abi::{Callback, VERSION};
-use super::config::{self, Mode, Source};
-use super::diagnostics::{self, Emitter};
-use super::{image, owner};
+use super::abi::Callback;
+use super::abi::VERSION;
+use super::config::Mode;
+use super::config::Source;
+use super::config::{self};
+use super::diagnostics::Emitter;
+use super::diagnostics::{self};
+use super::image;
+use super::owner;
 use crate::runtime::EngineRuntime;
 
 type Idler = unsafe extern "C" fn();
@@ -73,11 +89,17 @@ struct Bootstrap {
 static BOOTSTRAP: OnceLock<Bootstrap> = OnceLock::new();
 static ROOT_INSTALLATION: AtomicU8 = AtomicU8::new(0);
 
-unsafe fn borrowed<'a>(pointer: *const u8, length: usize, limit: usize) -> io::Result<Option<&'a [u8]>> {
+unsafe fn borrowed<'a>(
+    pointer: *const u8,
+    length: usize,
+    limit: usize,
+) -> io::Result<Option<&'a [u8]>> {
     if length > limit || (pointer.is_null() && length != 0) {
         return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
-    if pointer.is_null() { return Ok(None); }
+    if pointer.is_null() {
+        return Ok(None);
+    }
     Ok(Some(unsafe { std::slice::from_raw_parts(pointer, length) }))
 }
 
@@ -89,16 +111,23 @@ fn current_physical_pid() -> i32 {
 /// A shared-VM child must not enter the inherited host/Tool/RPC locks or clone
 /// an owning handle. BOOTSTRAP was completely published before native READY.
 pub(super) fn copied_policy(image: u64, physical_pid: i32) -> io::Result<(bool, i32)> {
-    let boot = BOOTSTRAP.get().ok_or_else(|| io::Error::from_raw_os_error(libc::EAGAIN))?;
+    let boot = BOOTSTRAP
+        .get()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EAGAIN))?;
     if crate::INSTALLATION.load(Ordering::Acquire) != 5
-        || physical_pid <= 0 || physical_pid != current_physical_pid()
+        || physical_pid <= 0
+        || physical_pid != current_physical_pid()
         || physical_pid == boot.physical_owner
-        || image == 0 || image != boot.image || image != super::image::generation()
+        || image == 0
+        || image != boot.image
+        || image != super::image::generation()
     {
         return Err(io::Error::from_raw_os_error(libc::ESTALE));
     }
-    Ok((boot.config.panic_on_unsupported_syscalls,
-        boot._copied_report.as_ref().map_or(-1, AsRawFd::as_raw_fd)))
+    Ok((
+        boot.config.panic_on_unsupported_syscalls,
+        boot._copied_report.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+    ))
 }
 
 /// # Safety
@@ -119,11 +148,15 @@ pub unsafe extern "C" fn hermit_engine_native_background_v1(startup: *const Star
 }
 
 unsafe fn start(startup: *const Startup) -> io::Result<()> {
-    if startup.is_null() { return Err(io::Error::from_raw_os_error(libc::EINVAL)); }
+    if startup.is_null() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
     let startup = unsafe { &*startup };
-    if startup.version != VERSION || startup.size as usize != size_of::<Startup>()
+    if startup.version != VERSION
+        || startup.size as usize != size_of::<Startup>()
         || crate::INSTALLATION.load(Ordering::Acquire) != 5
-        || startup.image == 0 || startup.image != image::generation()
+        || startup.image == 0
+        || startup.image != image::generation()
         || startup.physical_owner <= 0
         || startup.background_pid != current_physical_pid()
         || startup.reserved != 0
@@ -132,18 +165,40 @@ unsafe fn start(startup: *const Startup) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(libc::ESTALE));
     }
     let mode = match startup.mode {
-        1 => Mode::Standalone, 2 => Mode::Coordinated,
+        1 => Mode::Standalone,
+        2 => Mode::Coordinated,
         _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
     };
-    let diagnostic = startup.diagnostic.ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
-    let evidence = startup.evidence.ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
-    let idle = startup.idle.ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let diagnostic = startup
+        .diagnostic
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let evidence = startup
+        .evidence
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let idle = startup
+        .idle
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
     let control = unsafe { borrowed(startup.control, startup.control_len, 107)? };
     let fingerprint = unsafe { borrowed(startup.fingerprint, startup.fingerprint_len, 256)? };
-    let json = unsafe { borrowed(startup.standalone_json, startup.standalone_json_len, CONFIG_LIMIT)? };
-    let tracing_active = diagnostics::install(diagnostic, evidence, startup.evidence_level, control.is_some())?;
-    let selected = config::select(mode, control.map(OsStr::from_bytes),
-        fingerprint.map(OsStr::from_bytes), json.and_then(|bytes| std::str::from_utf8(bytes).ok()))?;
+    let json = unsafe {
+        borrowed(
+            startup.standalone_json,
+            startup.standalone_json_len,
+            CONFIG_LIMIT,
+        )?
+    };
+    let tracing_active = diagnostics::install(
+        diagnostic,
+        evidence,
+        startup.evidence_level,
+        control.is_some(),
+    )?;
+    let selected = config::select(
+        mode,
+        control.map(OsStr::from_bytes),
+        fingerprint.map(OsStr::from_bytes),
+        json.and_then(|bytes| std::str::from_utf8(bytes).ok()),
+    )?;
     let mut config = selected.config;
     config.panic_on_unsupported_syscalls = startup.panic_on_unsupported != 0;
     // Preserve the native runtime's existing exit+protected-report path. A
@@ -151,15 +206,24 @@ unsafe fn start(startup: *const Startup) -> io::Result<()> {
     config.exit_on_unsupported_syscall = true;
     config.shutdown_on_unsupported_syscall = false;
     config.unsupported_syscall_report_fd =
-        (unsafe { libc::fcntl(UNSUPPORTED_REPORT_FD, libc::F_GETFD) } >= 0).then_some(UNSUPPORTED_REPORT_FD);
-    let duplicate = unsafe { libc::fcntl(UNSUPPORTED_REPORT_FD, libc::F_DUPFD_CLOEXEC, UNSUPPORTED_REPORT_FD + 1) };
+        (unsafe { libc::fcntl(UNSUPPORTED_REPORT_FD, libc::F_GETFD) } >= 0)
+            .then_some(UNSUPPORTED_REPORT_FD);
+    let duplicate = unsafe {
+        libc::fcntl(
+            UNSUPPORTED_REPORT_FD,
+            libc::F_DUPFD_CLOEXEC,
+            UNSUPPORTED_REPORT_FD + 1,
+        )
+    };
     let copied_report = (duplicate >= 0).then(|| unsafe { OwnedFd::from_raw_fd(duplicate) });
     config.validate();
     if diagnostics::info_enabled() {
         let source: &[u8] = match selected.source {
             Source::Coordinator => b"native engine: using coordinator-provided Detcore Config\n",
             Source::StandaloneJson => b"native engine: using standalone Detcore Config\n",
-            Source::StandaloneParseFallback => b"native engine: using strict default after standalone parse failure\n",
+            Source::StandaloneParseFallback => {
+                b"native engine: using strict default after standalone parse failure\n"
+            }
             Source::StandaloneDefault => b"native engine: using strict default Detcore Config\n",
         };
         diagnostics::emit(source);
@@ -169,15 +233,21 @@ unsafe fn start(startup: *const Startup) -> io::Result<()> {
     }
     let config = Arc::new(config);
     let global = Arc::new(GlobalState::init_for_external_scheduler(&config));
-    BOOTSTRAP.set(Bootstrap {
-        config, global: Arc::clone(&global), coordinator: selected.coordinator,
-        physical_owner: startup.physical_owner,
-        pause_owner: unsafe { libc::getpid() },
-        image: startup.image, _copied_report: copied_report,
-    }).map_err(|_| io::Error::from_raw_os_error(libc::EALREADY))?;
-    detcore::install_shared_open_file_channel(Box::new(
-        detcore::ChunkedOpenFileChannel::new(OpenFiles)))
-        .map_err(|_| io::Error::other("native open-file channel already installed"))?;
+    BOOTSTRAP
+        .set(Bootstrap {
+            config,
+            global: Arc::clone(&global),
+            coordinator: selected.coordinator,
+            physical_owner: startup.physical_owner,
+            pause_owner: unsafe { libc::getpid() },
+            image: startup.image,
+            _copied_report: copied_report,
+        })
+        .map_err(|_| io::Error::from_raw_os_error(libc::EALREADY))?;
+    detcore::install_shared_open_file_channel(Box::new(detcore::ChunkedOpenFileChannel::new(
+        OpenFiles,
+    )))
+    .map_err(|_| io::Error::other("native open-file channel already installed"))?;
     let log_scheduler = diagnostics::info_enabled() && !tracing_active;
     let observer = Arc::new(move |event: &'static str| {
         if log_scheduler {
@@ -196,18 +266,26 @@ fn cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     let mut future = pin!(future);
     let mut context = Context::from_waker(Waker::noop());
     loop {
-        if image::SHUTDOWN.load(Ordering::Acquire) { return; }
+        if image::SHUTDOWN.load(Ordering::Acquire) {
+            return;
+        }
         if image::PAUSE_REQUESTED.load(Ordering::Acquire) {
             image::PAUSED.store(true, Ordering::Release);
-            while image::PAUSE_REQUESTED.load(Ordering::Acquire) && !image::SHUTDOWN.load(Ordering::Acquire) {
-                unsafe { idle(); }
+            while image::PAUSE_REQUESTED.load(Ordering::Acquire)
+                && !image::SHUTDOWN.load(Ordering::Acquire)
+            {
+                unsafe {
+                    idle();
+                }
             }
             image::PAUSED.store(false, Ordering::Release);
             continue;
         }
         match future.as_mut().poll(&mut context) {
             Poll::Ready(()) => return,
-            Poll::Pending => unsafe { idle(); },
+            Poll::Pending => unsafe {
+                idle();
+            },
         }
     }
 }
@@ -220,17 +298,24 @@ pub(super) fn install_root(callback: &Callback) -> io::Result<&'static owner::En
     // A genuine copied process has already installed its fresh owner through
     // the real child post-event. It reuses the original authenticated config,
     // never another background/GlobalState or a second Detcore::new call.
-    if let Ok(engine) = owner::installed() { return Ok(engine); }
-    let boot = BOOTSTRAP.get().ok_or_else(|| io::Error::from_raw_os_error(libc::EAGAIN))?;
-    if boot.physical_owner != current_physical_pid() || boot.physical_owner != identity.physical_pid
-        || boot.image != identity.image || boot.image != image::generation()
+    if let Ok(engine) = owner::installed() {
+        return Ok(engine);
+    }
+    let boot = BOOTSTRAP
+        .get()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EAGAIN))?;
+    if boot.physical_owner != current_physical_pid()
+        || boot.physical_owner != identity.physical_pid
+        || boot.image != identity.image
+        || boot.image != image::generation()
     {
         return Err(io::Error::from_raw_os_error(libc::ESTALE));
     }
     if identity.physical_tid != identity.physical_pid {
         return Err(io::Error::from_raw_os_error(libc::EAGAIN));
     }
-    ROOT_INSTALLATION.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+    ROOT_INSTALLATION
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         .map_err(|_| io::Error::from_raw_os_error(libc::EBUSY))?;
     // No process lock is held while constructing the original Tool. Failure
     // poisons this image's one-shot installation rather than creating another.
@@ -247,13 +332,25 @@ pub(super) fn install_root(callback: &Callback) -> io::Result<&'static owner::En
             ),
         };
         let root = Pid::from_raw(identity.tool_pid);
-        let subscriptions = Detcore::subscriptions(&config);
+        let subscriptions = <Detcore as Tool>::subscriptions(&config);
         let tool = Detcore::new(root, &config);
-        let host = unsafe { owner::Host::new_native(tool, cached, root,
-            subscriptions.iter_syscalls().collect(), subscriptions.has_cpuid(),
-            fresh_runtime()) };
+        let host = unsafe {
+            owner::Host::new_native(
+                tool,
+                cached,
+                root,
+                subscriptions.iter_syscalls().collect(),
+                subscriptions.has_cpuid(),
+                fresh_runtime(),
+            )
+        };
         owner::publish(owner::Engine {
-            host, rpc, config, root, physical_owner: boot.physical_owner, image: boot.image,
+            host,
+            rpc,
+            config,
+            root,
+            physical_owner: boot.physical_owner,
+            image: boot.image,
             pending_parents: Mutex::new(std::collections::HashMap::new()),
             next_child_ordinal: AtomicU64::new(1),
         })
@@ -264,23 +361,35 @@ pub(super) fn install_root(callback: &Callback) -> io::Result<&'static owner::En
 
 /// Immutable real launch choice. The admitted Engine owns all mutable work.
 pub(super) fn coordinated() -> bool {
-    BOOTSTRAP.get().is_some_and(|boot| boot.coordinator.is_some())
+    BOOTSTRAP
+        .get()
+        .is_some_and(|boot| boot.coordinator.is_some())
 }
 
 /// Preserve the maintained background's observed libc PID pause predicate.
 /// The application owner is separate; a COW child's Engine cannot replace
 /// this observation or fabricate an additional scheduler background.
 pub(super) fn owns_background(physical_pid: i32) -> bool {
-    BOOTSTRAP.get().is_some_and(|boot| boot.pause_owner == physical_pid
-        && physical_pid == current_physical_pid() && boot.image == image::generation())
+    BOOTSTRAP.get().is_some_and(|boot| {
+        boot.pause_owner == physical_pid
+            && physical_pid == current_physical_pid()
+            && boot.image == image::generation()
+    })
 }
 
 struct OpenFiles;
 impl detcore::OpenFileControlTransport for OpenFiles {
-    fn call(&self, request: detcore::OpenFileControl) -> Result<detcore::OpenFileControlReply, detcore::SharedOpenFileError> {
-        let boot = BOOTSTRAP.get().ok_or_else(|| detcore::SharedOpenFileError("native configuration is not installed".into()))?;
+    fn call(
+        &self,
+        request: detcore::OpenFileControl,
+    ) -> Result<detcore::OpenFileControlReply, detcore::SharedOpenFileError> {
+        let boot = BOOTSTRAP.get().ok_or_else(|| {
+            detcore::SharedOpenFileError("native configuration is not installed".into())
+        })?;
         if boot.coordinator.is_none() {
-            return Err(detcore::SharedOpenFileError("shared OFDs require the external coordinator".into()));
+            return Err(detcore::SharedOpenFileError(
+                "shared OFDs require the external coordinator".into(),
+            ));
         }
         let response = diagnostics::global_call(detcore::shared_open_file_request(request))
             .map_err(|error| detcore::SharedOpenFileError(error.to_string()))?;
@@ -295,20 +404,34 @@ pub(super) fn fresh_runtime() -> EngineRuntime {
     EngineRuntime::new(Box::new(NativeRuntime))
 }
 impl HostRuntime for NativeRuntime {
-    fn fork_child_rebind(&self) { panic!("native fork requires its original native lifecycle owner"); }
-    fn emit_stage(&self, stage: &[u8]) { diagnostics::emit(stage); }
+    fn fork_child_rebind(&self) {
+        panic!("native fork requires its original native lifecycle owner");
+    }
+    fn emit_stage(&self, stage: &[u8]) {
+        diagnostics::emit(stage);
+    }
     fn fork_child_reset(&self, _event: &reverie_inguest::guest::event::SyscallEvent) {
         panic!("native fork cannot use the local runtime reset");
     }
-    fn cpuid_interception_enabled(&self) -> bool { true }
+    fn cpuid_interception_enabled(&self) -> bool {
+        true
+    }
     fn exit_process_stats(&self, _tid: Pid) -> io::Result<()> {
-        Err(io::Error::other("native statistics retain their native finalization owner"))
+        Err(io::Error::other(
+            "native statistics retain their native finalization owner",
+        ))
     }
     fn read_clock(&self) -> io::Result<u64> {
-        Err(io::Error::other("native clock requires the actual callback branch fact"))
+        Err(io::Error::other(
+            "native clock requires the actual callback branch fact",
+        ))
     }
-    fn signal_action_supported(&self, _number: i64, _args: [u64; 6]) -> bool { false }
-    fn reserved_signal_mask(&self) -> u64 { 0 }
+    fn signal_action_supported(&self, _number: i64, _args: [u64; 6]) -> bool {
+        false
+    }
+    fn reserved_signal_mask(&self) -> u64 {
+        0
+    }
 }
 
-const _: () = assert!(size_of::<Startup>() == 104);
+const _: () = assert!(size_of::<Startup>() == 112);
