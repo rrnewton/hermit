@@ -4,9 +4,9 @@ This producer is separate from the ordinary GNU LiteInst DSO finalizer. It
 builds the private musl image used only by Hermit compiled with
 `exec-stop-launcher,liteinst` and launched with `--in-guest-exec-stop` on
 `in-guest-trap`. The flag is off by default. Its first domain is a direct run
-with a real log file, without the verify, debugger, namespace-only or network
-trace routes. Other admission checks, including disabled timer/RCB-time
-requirements, remain in their existing owners.
+with a real log file, or an explicit singleton verification run. Debugger,
+namespace-only and network trace routes remain refused. Other admission checks,
+including disabled timer/RCB-time requirements, remain in their existing owners.
 
 `owned/pipeline.py prepare` requires an explicit config and its SHA256, the
 exact producer-source manifest SHA256, a fresh evidence name and a fresh
@@ -49,3 +49,38 @@ python3 -m unittest discover -s hermit-install/private-static/owned -p 'test_*.p
 
 These controls are not a replacement for the actual fresh source-owned build,
 link, emitted-code inspection and physical guest/cancellation checks.
+
+## Explicit singleton verification
+
+With `exec-stop-launcher,liteinst` compiled, `--in-guest-exec-stop` on
+`in-guest-trap` also admits `--verify` and `--verify-strict`. Both use the
+existing verification owner and comparator. Complete stdout, stderr and exit
+status are captured; INFO uses the existing bounded sink and sticky loss
+latches. There is no success from an incomplete output or failed final flush.
+The finite initializer/restoration bounds remain; detached guest execution
+uses the verifier's ordinary execution lifetime.
+
+A live pair opens the qualified runtime package once and retains it through
+both runs. The existing `verify-inputs` owner also accepts
+`--in-guest-exec-stop`; it retains the original image and descriptor files for
+both saved `--verify-run` processes. Those runs require a shared manifest and
+one explicit epoch. The official pair runner selects this route only when the
+run itself explicitly supplies the loader flag. Package identities and bytes
+are rechecked at adoption, launch and finalization. Missing, changed, stale or
+partial input refuses without substituting another package or launch path.
+
+Omitting the loader flag preserves the selected backend's existing launch path,
+selection message and host-admission order. Ptrace remains the default backend;
+ordinary in-guest startup continues to use the preload, with the separate native
+exec opt-in unchanged. This change does not alter
+Detcore, its RPC layout or accounting, ptrace's injected signal-mask
+transaction, or the ordinary producer and warm Buck stage. The RCB observer's
+feature dependencies are unchanged. Runtime production remains the explicit
+pipeline documented above; this is not automatic package provisioning.
+
+Fork-family verification, native successor verification, the library custody
+prerequisite, and the eventual default switch are separate changes. Existing
+runtime refusals remain; this singleton slice does not establish support for
+those domains or change any selected corpus cell. Public `Command` behavior for
+working directories, stdio and `pre_exec` remains unchanged, as do `try_into_std`
+refusals for configuration that cannot be represented by a standard command.

@@ -4871,17 +4871,39 @@ fn verify_attempt_invocation_error<'a>(
     comparator: Comparator,
 ) -> Result<Option<&'a str>, String> {
     // The paired program ([`VERIFY_PAIR_SCRIPT`]): the comparison, then the
-    // run command -- under `hermit verify-inputs` when the attempt shares the
-    // host's dynamic-linker cache ([`shared_inputs_argv`]), and alone in rows
-    // recorded before that or on a host without one.
-    let shared = attempt
+    // run command, optionally below the original single sealed-input owner.
+    // A mapped image and the host linker cache share that same manifest.
+    let mapped_holder = attempt
         .argv
-        .get(1..=SHARED_INPUTS_PREFIX.len())
-        .is_some_and(|words| words.iter().map(String::as_str).eq(SHARED_INPUTS_PREFIX));
-    let paired = if shared {
-        &attempt.argv[1 + SHARED_INPUTS_PREFIX.len()..]
+        .get(1..=MAPPED_INPUTS_PREFIX.len())
+        .is_some_and(|words| words.iter().map(String::as_str).eq(MAPPED_INPUTS_PREFIX));
+    let (paired, shared) = if mapped_holder {
+        let rest = &attempt.argv[1 + MAPPED_INPUTS_PREFIX.len()..];
+        let cache = rest.get(..2).is_some_and(|words| {
+            words
+                .iter()
+                .map(String::as_str)
+                .eq(["--input", LD_SO_CACHE_INPUT])
+        });
+        (&rest[if cache { 2 } else { 0 }..], cache)
     } else {
-        &attempt.argv[..]
+        let shared = attempt
+            .argv
+            .get(1..=SHARED_INPUTS_PREFIX.len())
+            .is_some_and(|words| words.iter().map(String::as_str).eq(SHARED_INPUTS_PREFIX));
+        if attempt.argv.get(1).map(String::as_str) == Some("verify-inputs") && !shared {
+            return Err(
+                "does not use the original input holder with its exact manifest descriptor".into(),
+            );
+        }
+        (
+            &attempt.argv[if shared {
+                1 + SHARED_INPUTS_PREFIX.len()
+            } else {
+                0
+            }..],
+            shared,
+        )
     };
     let program = ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME];
     if paired
@@ -4900,6 +4922,9 @@ fn verify_attempt_invocation_error<'a>(
         .map(|offset| offset + 1)
         .ok_or("has no run command after its comparison")?;
     let (comparison, argv) = commands.split_at(run_start);
+    if mapped_holder && (attempt.argv.first() != argv.first() || backend != "in-guest-trap") {
+        return Err("mapped-input holder differs from the run's executable or backend".into());
+    }
     if shared && attempt.argv.first() != argv.first() {
         return Err("seals its shared inputs with a Hermit other than the run's".into());
     }
@@ -4965,9 +4990,14 @@ fn verify_attempt_invocation_error<'a>(
             "lacks `--verify-run {VERIFY_RUN_DIR_PLACEHOLDER}` where the executor writes it"
         ));
     }
-    if tokens.flag(SHARED_INPUTS_FLAG) != shared {
-        return Err(if shared {
+    let cache_only_holder = shared && !mapped_holder;
+    if tokens.flag(SHARED_INPUTS_FLAG) != cache_only_holder {
+        return Err(if cache_only_holder {
             format!("seals shared inputs but its run lacks `{SHARED_INPUTS_FLAG}`")
+        } else if mapped_holder {
+            format!(
+                "carries `{SHARED_INPUTS_FLAG}` although the mapped-input holder uses only fd 197"
+            )
         } else {
             format!("carries `{SHARED_INPUTS_FLAG}` without the `hermit verify-inputs` holder")
         });
@@ -4999,6 +5029,10 @@ fn verify_attempt_invocation_error<'a>(
                 "gives `--env` the value {assignment:?}, which assigns nothing"
             ));
         }
+    }
+    if mapped_holder {
+        tokens.require("--in-guest-exec-stop")?;
+        tokens.require("--native-exec-shared-inputs=197")?;
     }
     match tokens.0.first() {
         Some(token) => Err(format!(
@@ -5820,6 +5854,13 @@ const LD_SO_CACHE_INPUT: &str = "ld-so-cache:/etc/ld.so.cache";
 /// the first `--` of the recorded command line is still the run's guest
 /// separator, where its readers ([`ParityGuestInputs`](crate::parity), the
 /// SaBRe selection, the scorecard) find the end of Hermit's options.
+const MAPPED_INPUTS_PREFIX: [&str; 4] = [
+    "verify-inputs",
+    "--in-guest-exec-stop",
+    "--manifest-fd",
+    "197",
+];
+
 const SHARED_INPUTS_PREFIX: [&str; 5] = [
     "verify-inputs",
     "--manifest-fd",
@@ -5837,7 +5878,19 @@ const SHARED_INPUTS_PREFIX: [&str; 5] = [
 /// loader's `fstat` of it differed, and the comparison reported a
 /// divergence that no host-input check could name
 /// (https://github.com/rrnewton/hermit/issues/4693).
-fn shared_inputs_argv(hermit: &str, paired: Vec<String>) -> Vec<String> {
+fn shared_inputs_argv(hermit: &str, mut paired: Vec<String>) -> Vec<String> {
+    if paired
+        .get(1..=MAPPED_INPUTS_PREFIX.len())
+        .is_some_and(|words| words.iter().map(String::as_str).eq(MAPPED_INPUTS_PREFIX))
+    {
+        // Reuse the mapped holder, rather than nesting a second process whose
+        // manifest would replace the first owner at CLI entry.
+        paired.splice(
+            1 + MAPPED_INPUTS_PREFIX.len()..1 + MAPPED_INPUTS_PREFIX.len(),
+            ["--input".into(), LD_SO_CACHE_INPUT.into()],
+        );
+        return paired;
+    }
     let mut argv = vec![hermit.to_owned()];
     argv.extend(SHARED_INPUTS_PREFIX.map(String::from));
     argv.extend(paired);
@@ -6011,7 +6064,26 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
 /// command with the `comparison` command, as the executor runs every
 /// verified attempt. `run` carries `--verify-run @VERIFY_RUN_DIR@`; the last
 /// two words of `comparison` are the attempt's run1 and run2 directories.
-pub fn paired_verification_argv(comparison: Vec<String>, run: Vec<String>) -> Vec<String> {
+pub fn paired_verification_argv(comparison: Vec<String>, mut run: Vec<String>) -> Vec<String> {
+    // Reuse the existing holder and pair script: only the retained runtime
+    // transport changes. Both runs keep one command line and independent
+    // open descriptions of the holder's frozen stdin.
+    let separator = run.iter().position(|word| word == "--");
+    let mapped =
+        separator.is_some_and(|end| run[..end].iter().any(|word| word == "--in-guest-exec-stop"));
+    let holder = mapped.then(|| run[0].clone());
+    if mapped {
+        // The original cache-sharing command used fd 9. Both resources now
+        // travel in the mapped owner's fd 197; keep exactly one run option.
+        if let Some(index) = run[..separator.unwrap()]
+            .iter()
+            .position(|arg| arg == SHARED_INPUTS_FLAG)
+        {
+            run.remove(index);
+        }
+        let separator = run.iter().position(|word| word == "--").unwrap();
+        run.insert(separator, "--native-exec-shared-inputs=197".into());
+    }
     let mut paired = vec![
         "bash".into(),
         "-c".into(),
@@ -6020,7 +6092,14 @@ pub fn paired_verification_argv(comparison: Vec<String>, run: Vec<String>) -> Ve
     ];
     paired.extend(comparison);
     paired.extend(run);
-    paired
+    if let Some(hermit) = holder {
+        let mut owned = vec![hermit];
+        owned.extend(MAPPED_INPUTS_PREFIX.map(String::from));
+        owned.extend(paired);
+        owned
+    } else {
+        paired
+    }
 }
 
 fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
@@ -12046,10 +12125,139 @@ corpus:
         assert_eq!(error, "--label super names no test in any manifest");
     }
 
+    #[test]
+    fn explicit_mapped_pair_uses_original_holder_and_guest_literals_do_not_select_it() {
+        for (backend, is_run, explicit, mapped) in [
+            ("in-guest-trap", true, false, false),
+            ("in-guest-trap", true, true, true),
+            ("ptrace", true, false, false),
+            ("liteinst", true, false, false),
+            ("in-guest-trap", false, false, false),
+        ] {
+            let mut run = vec![
+                "hermit".into(),
+                "--backend".into(),
+                backend.into(),
+                if is_run {
+                    "run".into()
+                } else {
+                    "record".into()
+                },
+                "--verify-run".into(),
+                VERIFY_RUN_DIR_PLACEHOLDER.into(),
+            ];
+            if explicit {
+                run.push("--in-guest-exec-stop".into());
+            }
+            assert_eq!(
+                run.iter()
+                    .filter(|word| *word == "--in-guest-exec-stop")
+                    .count(),
+                usize::from(mapped)
+            );
+            run.extend(["--".into(), "guest".into(), "--in-guest-exec-stop".into()]);
+            let comparison = vec![
+                "hermit".into(),
+                "log-diff".into(),
+                "report".into(),
+                "run1".into(),
+                "run2".into(),
+            ];
+            let paired = paired_verification_argv(comparison, run);
+            assert_eq!(
+                paired.get(1).map(String::as_str) == Some("verify-inputs"),
+                mapped
+            );
+            let inner = without_mapped_input_holder(&paired);
+            assert_eq!(
+                &inner[..4],
+                ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+            );
+            assert_eq!(
+                paired
+                    .iter()
+                    .filter(|word| *word == "--native-exec-shared-inputs=197")
+                    .count(),
+                usize::from(mapped)
+            );
+            assert_eq!(
+                &paired[paired.len() - 3..],
+                ["--", "guest", "--in-guest-exec-stop"]
+            );
+        }
+    }
+
     fn relaxed_host() -> HostLevel {
         HostLevel {
             level: StrictnessLevel::Relaxed,
             reason: Some("this host has no exact branch counter (fixture)".into()),
+        }
+    }
+
+    /// Inspect the same paired command behind its one exact input holder.
+    fn without_mapped_input_holder(argv: &[String]) -> &[String] {
+        if argv.get(1).map(String::as_str) == Some("verify-inputs") {
+            assert_eq!(&argv[1..5], MAPPED_INPUTS_PREFIX);
+            let mut rest = &argv[5..];
+            if rest.first().map(String::as_str) == Some("--input") {
+                assert_eq!(&rest[..2], ["--input", LD_SO_CACHE_INPUT]);
+                rest = &rest[2..];
+            }
+            assert_eq!(
+                &rest[..4],
+                ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+            );
+            rest
+        } else {
+            argv
+        }
+    }
+
+    /// An explicit pair API caller's inputs, taken from an ordinary cell's
+    /// comparison and run. Manifest enrollment still selects no loader: the
+    /// caller adds its option before the run's first guest separator, then
+    /// uses the public pair builder and the existing single cache owner.
+    fn explicit_mapped_pair_argv(ordinary: Vec<String>) -> Vec<String> {
+        let shared = ordinary.get(1).map(String::as_str) == Some("verify-inputs");
+        let paired = if shared {
+            assert_eq!(
+                &ordinary[1..=SHARED_INPUTS_PREFIX.len()],
+                SHARED_INPUTS_PREFIX
+            );
+            &ordinary[1 + SHARED_INPUTS_PREFIX.len()..]
+        } else {
+            ordinary.as_slice()
+        };
+        assert_eq!(
+            &paired[..4],
+            ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+        );
+        let commands = &paired[4..];
+        let run_start = commands
+            .iter()
+            .skip(1)
+            .position(|word| word == &commands[0])
+            .map(|offset| offset + 1)
+            .unwrap();
+        let comparison = commands[..run_start].to_vec();
+        let mut run = commands[run_start..].to_vec();
+        assert_eq!(
+            &run[1..6],
+            ["--log", "info", "--backend", "in-guest-trap", "run"]
+        );
+        let separator = run.iter().position(|word| word == "--").unwrap();
+        assert!(
+            !run[..separator]
+                .iter()
+                .any(|word| word == "--in-guest-exec-stop")
+        );
+        run.insert(separator, "--in-guest-exec-stop".into());
+        let hermit = run[0].clone();
+        let mapped = paired_verification_argv(comparison, run);
+        if shared {
+            shared_inputs_argv(&hermit, mapped)
+        } else {
+            mapped
         }
     }
 
@@ -12480,6 +12688,60 @@ corpus:
         }
     }
 
+    #[test]
+    fn explicit_pair_api_uses_the_existing_holder_for_an_ordinary_trap_cell() {
+        let mut spec = verify_spec("in-guest-trap", true, BTreeMap::new(), None);
+        spec.argv = explicit_mapped_pair_argv(spec.argv);
+        assert_eq!(
+            &spec.argv[1..6],
+            [
+                "verify-inputs",
+                "--in-guest-exec-stop",
+                "--manifest-fd",
+                "197",
+                "bash"
+            ]
+        );
+        let paired = without_mapped_input_holder(&spec.argv);
+        assert_eq!(
+            &paired[..4],
+            ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+        );
+        assert_eq!(
+            paired
+                .iter()
+                .filter(|word| *word == "--native-exec-shared-inputs=197")
+                .count(),
+            1
+        );
+        assert_eq!(
+            paired
+                .iter()
+                .filter(|word| *word == "--in-guest-exec-stop")
+                .count(),
+            1
+        );
+        for backend in ["ptrace", "liteinst", "in-guest-trap"] {
+            let ordinary = verify_spec(backend, true, BTreeMap::new(), None);
+            assert_ne!(
+                ordinary.argv.get(1).map(String::as_str),
+                Some("verify-inputs")
+            );
+            assert!(
+                !ordinary
+                    .argv
+                    .iter()
+                    .any(|word| word == "--native-exec-shared-inputs=197")
+            );
+            assert!(
+                !ordinary
+                    .argv
+                    .iter()
+                    .any(|word| word == "--in-guest-exec-stop")
+            );
+        }
+    }
+
     fn verify_spec_of(cell: SelectedCell) -> CellRunSpec {
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -12527,8 +12789,9 @@ corpus:
     #[test]
     fn a_probed_in_guest_cell_runs_without_a_preemption_timer() {
         let timeslices = |spec: &CellRunSpec| {
-            let separator = spec.argv.iter().position(|a| a == "--").unwrap();
-            spec.argv[..separator]
+            let argv = without_mapped_input_holder(&spec.argv);
+            let separator = argv.iter().position(|a| a == "--").unwrap();
+            argv[..separator]
                 .iter()
                 .filter(|a| a.starts_with("--max-timeslice"))
                 .cloned()
@@ -12577,6 +12840,277 @@ corpus:
         assert_eq!(probe_relaxation(&sabre, "sabre"), None);
     }
 
+    /// Physical package qualification, deliberately outside ordinary manifest
+    /// enrollment. The tracked opt-in script supplies the actual successful
+    /// inline run's CLI, cat, package and complete report, then selects this
+    /// ignored test exactly. Missing inputs fail instead of skipping.
+    #[test]
+    #[ignore = "requires ci/qualify-loader-verification.sh and a genuine qualified private package"]
+    fn mapped_saved_pair_uses_actual_holder_and_matches_inline_verification() {
+        use crate::verify_run_record::RecordedStatus;
+        use crate::verify_run_record::VerifyRunOutcome;
+        use crate::verify_run_record::VerifyRunRecord;
+
+        const INPUT: &[u8] = b"first\0line\nlast-without-newline\xff";
+        let required_path = |name: &str| {
+            let value = std::env::var_os(name)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| panic!("{name} is required by the package qualification"));
+            fs::canonicalize(value).unwrap_or_else(|error| panic!("{name}: {error}"))
+        };
+        let record_path = required_path("HERMIT_LOADER_QUALIFICATION_RECORD");
+        let record: JsonValue = serde_json::from_slice(&fs::read(record_path).unwrap()).unwrap();
+        assert_eq!(record["schema"], 1);
+        assert_eq!(record["stdin_sha256"], hex_digest(INPUT));
+        let install = required_path("HERMIT_INSTALL_DIR");
+        assert_eq!(record["install"], install.to_str().unwrap());
+        let check_inputs = || {
+            for role in ["hermit", "cat", "image", "descriptor"] {
+                let path = Path::new(record[role]["path"].as_str().unwrap());
+                assert!(path.is_file(), "missing actual {role}: {}", path.display());
+                assert_eq!(
+                    file_digest(path).as_deref(),
+                    Some(record[role]["sha256"].as_str().unwrap()),
+                    "the actual {role} changed between qualification consumers"
+                );
+            }
+            assert_eq!(
+                fs::canonicalize(install.join("rsrcs/detcore_private_runtime.elf")).unwrap(),
+                Path::new(record["image"]["path"].as_str().unwrap())
+            );
+            assert_eq!(
+                fs::canonicalize(install.join("rsrcs/detcore_private_runtime.package.json"))
+                    .unwrap(),
+                Path::new(record["descriptor"]["path"].as_str().unwrap())
+            );
+        };
+        check_inputs();
+        let root = required_path("HERMIT_LOADER_QUALIFICATION_OUTPUT").join("saved-pair");
+        fs::create_dir(&root).expect("new saved-pair output; never reuse a prior attempt");
+        let directories = verify_run_directories(&root);
+        let report_path = root.join("report.json");
+        let manifest_path = root.join("holder-manifest.json");
+        let mut run: Vec<String> = serde_json::from_value(record["inline_argv"].clone()).unwrap();
+        assert_eq!(
+            fs::canonicalize(&run[0]).unwrap(),
+            Path::new(record["hermit"]["path"].as_str().unwrap())
+        );
+        let hermit = run[0].clone();
+        let guest = run.iter().position(|word| word == "--").unwrap();
+        for flag in [
+            "--in-guest-exec-stop",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+        ] {
+            assert_eq!(run[..guest].iter().filter(|word| *word == flag).count(), 1);
+        }
+        assert_eq!(run[guest + 1..].len(), 1);
+        assert_eq!(
+            fs::canonicalize(&run[guest + 1]).unwrap(),
+            Path::new(record["cat"]["path"].as_str().unwrap())
+        );
+        // Change only the public run mode and its output location. Preserve
+        // the inline invocation's exact epoch, seeds, guest and root flags.
+        let verify = run[..guest]
+            .iter()
+            .position(|word| word == "--verify")
+            .unwrap();
+        run.remove(verify);
+        let output = run.iter().position(|word| word == "--verify-json").unwrap();
+        run[output] = "--verify-run".into();
+        run[output + 1] = VERIFY_RUN_DIR_PLACEHOLDER.into();
+        let comparison = vec![
+            hermit.clone(),
+            "log-diff".into(),
+            "--verify-json".into(),
+            report_path.to_str().unwrap().into(),
+            "--verify-allow=success".into(),
+            directories[0].to_str().unwrap().into(),
+            directories[1].to_str().unwrap().into(),
+        ];
+        // Match the production RunContext: a root without a linker cache
+        // still uses the mapped holder, but has no cache input to seal.
+        let shares_ld_so_cache = Path::new(LD_SO_CACHE_PATH)
+            .try_exists()
+            .expect("observe the qualification root's linker cache");
+        let paired = paired_verification_argv(comparison, run);
+        let mut argv = if shares_ld_so_cache {
+            shared_inputs_argv(&hermit, paired)
+        } else {
+            paired
+        };
+        assert_eq!(&argv[1..5], MAPPED_INPUTS_PREFIX);
+        let program_index = if shares_ld_so_cache {
+            assert_eq!(&argv[5..7], ["--input", LD_SO_CACHE_INPUT]);
+            7
+        } else {
+            5
+        };
+        assert_eq!(
+            &argv[program_index..program_index + 4],
+            ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME]
+        );
+        // Observe the actual holder's wire record, then exec the unchanged
+        // maintained pair program. This adds no second holder or comparator
+        // and reopening fd 197 leaves its inherited open-description offset.
+        argv.splice(
+            program_index..program_index,
+            [
+                "bash".into(),
+                "-c".into(),
+                "set -eu; cat /proc/self/fd/197 > \"$1\"; shift; exec \"$@\"".into(),
+                "loader-package-manifest-observer".into(),
+                manifest_path.to_str().unwrap().into(),
+            ],
+        );
+        fs::write(
+            root.join("argv.json"),
+            serde_json::to_vec_pretty(&argv).unwrap(),
+        )
+        .unwrap();
+        let stdin_path = root.join("stdin");
+        fs::write(&stdin_path, INPUT).unwrap();
+        // This test runs only through the official counted Nextest CPU/wall
+        // owner in the qualification script. It makes one actual pair, with
+        // no internal retry or alternate execution route.
+        let output = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(File::open(&stdin_path).unwrap())
+            .env("HERMIT_EPOCH", CANONICAL_TEST_EPOCH)
+            .output()
+            .expect("start the actual mapped saved pair");
+        fs::write(root.join("controller.stdout"), &output.stdout).unwrap();
+        fs::write(root.join("controller.stderr"), &output.stderr).unwrap();
+        fs::write(
+            root.join("controller.status"),
+            format!("{:?}\n", output.status),
+        )
+        .unwrap();
+        check_inputs();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.stdout, INPUT,
+            "the public saved pair must emit the guest output once"
+        );
+
+        let manifest: JsonValue =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["schema"], 3, "{manifest}");
+        assert_eq!(manifest["sealed"]["producer"], "hermit-sealed-files");
+        assert_eq!(
+            manifest["package"]["image"]["sha256"],
+            record["image"]["sha256"]
+        );
+        assert_eq!(
+            manifest["package"]["descriptor"]["sha256"],
+            record["descriptor"]["sha256"]
+        );
+        assert_ne!(manifest["image_fd"], manifest["descriptor_fd"]);
+        let roles = manifest["sealed"]["objects"].as_array().unwrap();
+        assert_eq!(roles.len(), usize::from(shares_ld_so_cache), "{manifest}");
+        if shares_ld_so_cache {
+            assert_eq!(roles[0]["role"], "ld-so-cache");
+        }
+        assert_eq!(
+            Path::new(LD_SO_CACHE_PATH).try_exists().unwrap(),
+            shares_ld_so_cache,
+            "the qualification root's cache presence changed during the pair"
+        );
+        for directory in &directories {
+            let actual = VerifyRunRecord::read(directory).unwrap();
+            assert_eq!(actual.backend, "in-guest-trap");
+            // The saved record uses DateTime::to_rfc3339(), which spells
+            // the requested canonical UTC epoch with an explicit offset.
+            assert_eq!(actual.epoch, "2026-01-01T00:00:00+00:00");
+            assert!(
+                matches!(
+                    &actual.outcome,
+                    VerifyRunOutcome::Completed {
+                        status: RecordedStatus::Exited { code: 0 },
+                        skid_overshoots: 0,
+                        ..
+                    }
+                ),
+                "{actual:?}"
+            );
+            assert_eq!(fs::read(directory.join("stdout")).unwrap(), INPUT);
+            assert_eq!(fs::read(directory.join("stderr")).unwrap(), b"");
+            assert!(!fs::read(directory.join("run.log")).unwrap().is_empty());
+        }
+        let bytes = fs::read(&report_path).unwrap();
+        current_verification_report(&bytes).expect("complete current producer report");
+        let verdict: JsonValue = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            verdict, record["inline_report"],
+            "saved and inline reports must match in full"
+        );
+        assert_eq!(verdict["verdict"], "matched");
+        assert_eq!(verdict["verified"], true);
+        assert_eq!(verdict["bitwise_parity"], true);
+        let policy = &verdict["comparison"];
+        assert_eq!(policy["strictness"], "canonical");
+        assert_eq!(policy["record_envelope"], "all_records_v1");
+        assert_eq!(policy["log_scope"], "info");
+        for field in [
+            "compare_logs",
+            "compare_io_buffers",
+            "full_trace",
+            "exact_remainder",
+        ] {
+            assert_eq!(policy[field], true, "{field}: {verdict}");
+        }
+        for field in ["strip_lines", "ignore_lines", "skip_commit", "skip_detlog"] {
+            assert_eq!(policy[field], false, "{field}: {verdict}");
+        }
+        let compared = &verdict["compared_log_messages"];
+        assert!(compared["left"].as_u64().is_some_and(|count| count > 0));
+        assert_eq!(compared["left"], compared["right"]);
+        for side in ["left", "right"] {
+            let actual = &verdict["compared_outputs"][side];
+            assert_eq!(actual["exit_code"], 0);
+            assert!(actual["signal"].is_null());
+            assert_eq!(actual["stdout_bytes"], INPUT.len());
+            assert_eq!(actual["stdout_sha256"], hex_digest(INPUT));
+            assert_eq!(actual["stderr_bytes"], 0);
+            assert_eq!(actual["stderr_sha256"], hex_digest(b""));
+        }
+
+        // A changed retained output must be rejected by the SAME production
+        // log-diff. Preserve the original bytes beside the negative record.
+        let changed = directories[1].join("stdout");
+        fs::copy(&changed, root.join("run2.stdout.original")).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&changed)
+            .unwrap()
+            .write_all(b"!")
+            .unwrap();
+        let refused_path = root.join("changed-output.json");
+        let refused = Command::new(&hermit)
+            .args(["log-diff", "--verify-json"])
+            .arg(&refused_path)
+            .args(&directories)
+            .output()
+            .unwrap();
+        fs::write(root.join("changed-output.stdout"), &refused.stdout).unwrap();
+        fs::write(root.join("changed-output.stderr"), &refused.stderr).unwrap();
+        fs::write(
+            root.join("changed-output.status"),
+            format!("{:?}\n", refused.status),
+        )
+        .unwrap();
+        assert!(!refused.status.success());
+        let refused = current_verification_report(&fs::read(refused_path).unwrap()).unwrap();
+        assert_eq!(refused.verdict, Verdict::Diverged);
+        assert!(!refused.verified && !refused.bitwise_parity);
+        check_inputs();
+    }
     /// [`VERIFY_PAIR_SCRIPT`] follows `run --verify`: run 2 starts only when
     /// run 1 left a record with a status `--verify-allow` admits; a run that
     /// leaves no record ends the attempt with its own status and output, its
@@ -13404,6 +13938,7 @@ esac
     /// The guest of an equalized verify cell names only guest paths, and each
     /// of the cell's input directories is bound at the path it names.
     fn assert_equalized_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
+        let argv = without_mapped_input_holder(argv);
         assert_minimal_base_env(argv);
         assert_eq!(
             guest_env_args(argv),
@@ -20060,13 +20595,15 @@ backends_disabled:
                 (host, spec)
             };
             let after_separator = |spec: &CellRunSpec| {
-                let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
-                spec.argv[separator + 1..].to_vec()
+                let argv = without_mapped_input_holder(&spec.argv);
+                let separator = argv.iter().position(|arg| arg == "--").unwrap();
+                argv[separator + 1..].to_vec()
             };
             // What the guest can see: argv, environment and each bind target.
             let guest_view = |spec: &CellRunSpec| {
-                let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
-                let before = &spec.argv[..separator];
+                let argv = without_mapped_input_holder(&spec.argv);
+                let separator = argv.iter().position(|arg| arg == "--").unwrap();
+                let before = &argv[..separator];
                 let targets = before
                     .iter()
                     .filter_map(|arg| arg.strip_prefix("--bind="))
@@ -22200,13 +22737,25 @@ exit "$(cat "$PWD/exit-status")"
     /// does not record (a workdir, a guest environment) or a context with
     /// another execution root or log retention.
     fn with_executor_invocation_for(
-        mut row: CellResult,
+        row: CellResult,
         context: &RunContext,
         cell: &SelectedCell,
     ) -> CellResult {
+        with_executor_invocation_argv_for(row, context, cell, |argv| argv)
+    }
+
+    /// Build the pair before recording any command fields. Explicit pair
+    /// callers use the same cell's comparison/run inputs through the public
+    /// pair API; ordinary manifest rows keep `build_spec`'s argv unchanged.
+    fn with_executor_invocation_argv_for(
+        mut row: CellResult,
+        context: &RunContext,
+        cell: &SelectedCell,
+        build_pair: impl Fn(Vec<String>) -> Vec<String>,
+    ) -> CellResult {
         let dir = context.root.join("results/cell");
         for (position, attempt) in row.attempts.iter_mut().enumerate() {
-            let spec = build_spec(
+            let mut spec = build_spec(
                 context,
                 cell,
                 dir.clone(),
@@ -22216,6 +22765,7 @@ exit "$(cat "$PWD/exit-status")"
                 3,
             )
             .unwrap();
+            spec.argv = build_pair(spec.argv);
             attempt.cwd = spec.cwd.to_string_lossy().into_owned();
             attempt.shell_command = shell_command(&attempt.cwd, &spec.env, &spec.argv);
             attempt.argv = spec.argv;
@@ -22593,6 +23143,167 @@ exit "$(cat "$PWD/exit-status")"
             cell.test.proc = None;
             assert!(proc_level_mismatch(&row, &cell).is_some(), "{mode}");
         }
+
+        // A mapped pair is the same script and comparator, beneath one exact
+        // retained-input holder. Each malformed transport still fails this
+        // retained-row proof; metadata never stands in for a guest result.
+        let mut mapped = base.clone();
+        mapped.backend = Some("in-guest-trap".into());
+        let explicit_pair = |row: &CellResult, context: &RunContext| {
+            let cell = cell_recorded_by(row);
+            with_executor_invocation_argv_for(
+                row.clone(),
+                context,
+                &cell,
+                explicit_mapped_pair_argv,
+            )
+        };
+        let mapped = explicit_pair(&mapped, &context(&|_| {}));
+        // Exercise the public pair API with a caller's explicit selector,
+        // before recording the command fields checked by the retained proof.
+        assert!(mapped.argv.iter().any(|arg| arg == "--in-guest-exec-stop"));
+        assert_eq!(
+            mapped.argv[0],
+            root.join("hermit").to_string_lossy().into_owned()
+        );
+        accepted("mapped pair with its original shared-input holder", &mapped);
+        assert_eq!(mapped.argv[1], "verify-inputs");
+        refused(
+            "mapped holder with another manifest descriptor",
+            &with_argv(&mapped, replace_after("--manifest-fd", "196")),
+            "exact manifest descriptor",
+        );
+        refused(
+            "mapped run without its inherited manifest",
+            &with_argv(&mapped, without("--native-exec-shared-inputs=197", 0)),
+            "lacks `--native-exec-shared-inputs=197`",
+        );
+        refused(
+            "mapped holder and run executable differ",
+            &with_argv(&mapped, |argv| argv[0] = "different-hermit".into()),
+            "differs from the run's executable or backend",
+        );
+        refused(
+            "mapped selection missing from run",
+            &with_argv(&mapped, |argv| {
+                let index = argv
+                    .iter()
+                    .rposition(|x| x == "--in-guest-exec-stop")
+                    .unwrap();
+                argv.remove(index);
+            }),
+            "lacks `--in-guest-exec-stop`",
+        );
+
+        // The mapped image/stdin and linker cache belong to one holder and
+        // one inherited manifest. Removing the cache itself is a valid shape
+        // on hosts without it; malformed roles and transport remain refused.
+        let mapped_shared = explicit_pair(
+            &mapped,
+            &context(&|context| context.shares_ld_so_cache = true),
+        );
+        accepted(
+            "mapped pair sharing its holder with the linker cache",
+            &mapped_shared,
+        );
+        assert_eq!(
+            &mapped_shared.argv[1..7],
+            [
+                "verify-inputs",
+                "--in-guest-exec-stop",
+                "--manifest-fd",
+                "197",
+                "--input",
+                LD_SO_CACHE_INPUT
+            ]
+        );
+        assert_eq!(
+            without_mapped_input_holder(&mapped_shared.argv),
+            without_mapped_input_holder(&mapped.argv)
+        );
+        for (token, count) in [
+            ("verify-inputs", 1),
+            ("--native-exec-shared-inputs=197", 1),
+            (SHARED_INPUTS_FLAG, 0),
+            (VERIFY_PAIR_SCRIPT, 1),
+            ("log-diff", 1),
+        ] {
+            assert_eq!(
+                mapped_shared
+                    .argv
+                    .iter()
+                    .filter(|arg| *arg == token)
+                    .count(),
+                count
+            );
+        }
+        let encoded = serde_json::to_vec(&mapped_shared).unwrap();
+        let reread: CellResult = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(reread.argv, mapped_shared.argv);
+        accepted(
+            "mapped cache holder after retained-row JSON roundtrip",
+            &reread,
+        );
+        refused(
+            "mapped cache holder with a different cache role",
+            &with_argv(
+                &mapped_shared,
+                replace_after("--input", "ld-so-cache:/tmp/other"),
+            ),
+            "not the paired verification program",
+        );
+        refused(
+            "mapped cache holder with a duplicate cache input",
+            &with_argv(
+                &mapped_shared,
+                insert_before("bash", &["--input", LD_SO_CACHE_INPUT]),
+            ),
+            "not the paired verification program",
+        );
+        refused(
+            "mapped cache holder with a missing input flag",
+            &with_argv(&mapped_shared, without("--input", 0)),
+            "not the paired verification program",
+        );
+        refused(
+            "mapped cache holder using the cache-only descriptor",
+            &with_argv(
+                &mapped_shared,
+                replace_after("--manifest-fd", SHARED_INPUTS_FD),
+            ),
+            "exact manifest descriptor",
+        );
+        refused(
+            "mapped cache run with a second manifest adoption flag",
+            &with_argv(&mapped_shared, |argv| {
+                let index = at(argv, VERIFY_RUN_DIR_PLACEHOLDER) + 1;
+                argv.insert(index, SHARED_INPUTS_FLAG.into());
+            }),
+            "carries `--native-exec-shared-inputs=9`",
+        );
+        refused(
+            "mapped cache run with duplicate inherited mapped descriptors",
+            &with_argv(
+                &mapped_shared,
+                insert_before("--", &["--native-exec-shared-inputs=197"]),
+            ),
+            "carries `--native-exec-shared-inputs=197` where the executor writes nothing",
+        );
+        refused(
+            "nested cache owner around the mapped owner",
+            &with_argv(&mapped_shared, |argv| {
+                let mut nested = vec![argv[0].clone()];
+                nested.extend(SHARED_INPUTS_PREFIX.map(String::from));
+                nested.extend(argv.iter().cloned());
+                *argv = nested;
+            }),
+            "not the paired verification program",
+        );
+        refused(
+            "mapped holder with a separator before the pair script",
+            &with_argv(&mapped_shared, insert_before("bash", &["--"])),
+            "not the paired verification program",
+        );
 
         // The backend.
         refused(
@@ -25605,41 +26316,148 @@ cp "{}" "$verdict"
             .unwrap()
         };
         let hermit = context.hermit_bin.to_string_lossy().into_owned();
+        for backend in ["ptrace", "liteinst", "in-guest-trap"] {
+            for mode in ["verify", "chaos"] {
+                let mut cell = ptrace_cell(mode);
+                cell.id.backend = Some(backend.into());
+                let spec = spec_of(&context, &cell);
+                assert_eq!(spec.argv[0], hermit, "{backend}/{mode}: {:?}", spec.argv);
+                assert_eq!(
+                    spec.argv[1..=SHARED_INPUTS_PREFIX.len()],
+                    SHARED_INPUTS_PREFIX.map(String::from),
+                    "{backend}/{mode}: {:?}",
+                    spec.argv
+                );
+                assert_eq!(
+                    spec.argv[1 + SHARED_INPUTS_PREFIX.len()..][..3],
+                    ["bash", "-c", VERIFY_PAIR_SCRIPT],
+                    "{backend}/{mode}"
+                );
+                assert!(
+                    spec.argv.windows(3).any(|window| window
+                        == [
+                            "--verify-run",
+                            VERIFY_RUN_DIR_PLACEHOLDER,
+                            SHARED_INPUTS_FLAG
+                        ]),
+                    "{backend}/{mode}: {:?}",
+                    spec.argv
+                );
+                for (token, count) in [
+                    ("verify-inputs", 1),
+                    (SHARED_INPUTS_FLAG, 1),
+                    ("--in-guest-exec-stop", 0),
+                    ("--native-exec-shared-inputs=197", 0),
+                    (VERIFY_PAIR_SCRIPT, 1),
+                    ("log-diff", 1),
+                ] {
+                    assert_eq!(
+                        spec.argv.iter().filter(|arg| *arg == token).count(),
+                        count,
+                        "{backend}/{mode}: {token}"
+                    );
+                }
+
+                // Without the cache ordinary cells acquire no input holder.
+                let mut plain_context = context.clone();
+                plain_context.shares_ld_so_cache = false;
+                let plain = spec_of(&plain_context, &cell);
+                assert_eq!(plain.argv[..3], ["bash", "-c", VERIFY_PAIR_SCRIPT]);
+                for token in [
+                    "verify-inputs",
+                    SHARED_INPUTS_FLAG,
+                    "--in-guest-exec-stop",
+                    "--native-exec-shared-inputs=197",
+                ] {
+                    assert!(
+                        !plain.argv.iter().any(|arg| arg == token),
+                        "{backend}/{mode}: {token}"
+                    );
+                }
+            }
+            let base = ptrace_cell("verify").test.modes["verify"].clone();
+            let mut cell = replay_cell_with_verify(base.clone(), base);
+            cell.id.backend = Some(backend.into());
+            let replay = spec_of(&context, &cell);
+            assert_eq!(replay.argv[..3], ["bash", "-c", VERIFY_PAIR_SCRIPT]);
+            for token in [
+                "verify-inputs",
+                SHARED_INPUTS_FLAG,
+                "--in-guest-exec-stop",
+                "--native-exec-shared-inputs=197",
+            ] {
+                assert!(
+                    !replay.argv.iter().any(|arg| arg == token),
+                    "{backend}/replay: {token}"
+                );
+            }
+        }
+    }
+
+    /// Explicit pair API callers seal the image, stdin and optional loader
+    /// cache through one manifest. The cache changes no inner pair command;
+    /// ordinary verify/chaos manifest cells do not enroll in the loader.
+    #[test]
+    fn explicit_mapped_verify_and_chaos_pairs_share_one_manifest_with_the_loader_cache() {
+        let guest: Vec<String> = ["/bin/true", "--", "--in-guest-exec-stop"]
+            .map(String::from)
+            .into();
         for mode in ["verify", "chaos"] {
-            let spec = spec_of(&context, &ptrace_cell(mode));
-            assert_eq!(spec.argv[0], hermit, "{mode}: {:?}", spec.argv);
+            let mut cell = ptrace_cell(mode);
+            cell.id.backend = Some("in-guest-trap".into());
+            let spec_of = |shares_ld_so_cache| {
+                let mut context = run_context(Path::new("/repo"));
+                context.run_verify_strict = true;
+                context.shares_ld_so_cache = shares_ld_so_cache;
+                let mut spec = build_spec(
+                    &context,
+                    &cell,
+                    PathBuf::from("/repo/results/mapped-shared-cell"),
+                    guest.clone(),
+                    "1",
+                    (mode == "chaos").then_some(7),
+                    15,
+                )
+                .unwrap();
+                spec.argv = explicit_mapped_pair_argv(spec.argv);
+                spec
+            };
+            let plain = spec_of(false);
+            let cached = spec_of(true);
+            for spec in [&plain, &cached] {
+                assert_eq!(&spec.argv[1..5], MAPPED_INPUTS_PREFIX, "{mode}");
+                for (token, count) in [
+                    ("verify-inputs", 1),
+                    ("--native-exec-shared-inputs=197", 1),
+                    (SHARED_INPUTS_FLAG, 0),
+                    (VERIFY_PAIR_SCRIPT, 1),
+                    ("log-diff", 1),
+                ] {
+                    assert_eq!(
+                        spec.argv.iter().filter(|arg| *arg == token).count(),
+                        count,
+                        "{mode}: {token}: {:?}",
+                        spec.argv
+                    );
+                }
+                let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
+                assert_eq!(&spec.argv[separator + 1..], guest.as_slice(), "{mode}");
+                assert_eq!(
+                    spec.argv[..separator]
+                        .iter()
+                        .filter(|arg| *arg == "--in-guest-exec-stop")
+                        .count(),
+                    2,
+                    "{mode}: one holder selector and one run selector"
+                );
+            }
+            assert_eq!(&cached.argv[5..7], ["--input", LD_SO_CACHE_INPUT], "{mode}");
             assert_eq!(
-                spec.argv[1..=SHARED_INPUTS_PREFIX.len()],
-                SHARED_INPUTS_PREFIX.map(String::from),
-                "{mode}: {:?}",
-                spec.argv
-            );
-            assert_eq!(
-                spec.argv[1 + SHARED_INPUTS_PREFIX.len()..][..3],
-                ["bash", "-c", VERIFY_PAIR_SCRIPT],
-                "{mode}"
-            );
-            assert!(
-                spec.argv.windows(3).any(|window| window
-                    == [
-                        "--verify-run",
-                        VERIFY_RUN_DIR_PLACEHOLDER,
-                        SHARED_INPUTS_FLAG
-                    ]),
-                "{mode}: {:?}",
-                spec.argv
+                without_mapped_input_holder(&plain.argv),
+                without_mapped_input_holder(&cached.argv),
+                "{mode}: adding the cache must preserve the pair script, comparison and run"
             );
         }
-        let base = ptrace_cell("verify").test.modes["verify"].clone();
-        let replay = spec_of(&context, &replay_cell_with_verify(base.clone(), base));
-        assert_eq!(replay.argv[..3], ["bash", "-c", VERIFY_PAIR_SCRIPT]);
-        assert!(!replay.argv.iter().any(|arg| arg == SHARED_INPUTS_FLAG));
-
-        // Without the cache nothing changes.
-        context.shares_ld_so_cache = false;
-        let plain = spec_of(&context, &ptrace_cell("verify"));
-        assert_eq!(plain.argv[..3], ["bash", "-c", VERIFY_PAIR_SCRIPT]);
-        assert!(!plain.argv.iter().any(|arg| arg == SHARED_INPUTS_FLAG));
     }
 
     /// A canonical matched report whose two runs printed `first` and

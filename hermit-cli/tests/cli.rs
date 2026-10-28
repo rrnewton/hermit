@@ -12114,6 +12114,211 @@ fn piped_stdin_verifies_at_bitwise_parity_on_every_backend() {
     }
 }
 
+/// The public first-image loader must replay nonempty stdin in both strict
+/// verification runs. This needs the qualified private runtime package staged
+/// for this CLI; a missing package must fail, rather than skip the assertion.
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[test]
+fn loader_public_verify_replays_stdin_bytes_and_eof_at_bitwise_parity() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("loader.json");
+    let report_arg = report.to_str().expect("report path is UTF-8");
+    let input = b"first\0line\nlast-without-newline\xff";
+    let cat = &piped_stdin_guests().0;
+    let args = [
+        "--backend=in-guest-trap",
+        "--log=info",
+        "run",
+        "--in-guest-exec-stop",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        "--seed=0",
+        "--sched-seed=0",
+        "--rng-seed=0",
+        "--max-timeslice=disabled",
+        "--no-rcb-time",
+        "--base-env=empty",
+        "--verify-json",
+        report_arg,
+        "--",
+        cat.as_str(),
+    ];
+    let output = hermit_with_stdin(&args, input);
+    assert_success(&output, &args);
+    assert_eq!(output.stdout, input, "{}", stderr(&output));
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["verdict"], "matched", "{verdict}");
+    assert_eq!(verdict["verified"], true, "{verdict}");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    assert_eq!(
+        verdict["comparison"]["strictness"], "canonical",
+        "{verdict}"
+    );
+    assert_eq!(
+        verdict["comparison"]["compare_io_buffers"], true,
+        "{verdict}"
+    );
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "loader compared no INFO messages: {verdict}"
+    );
+    for side in ["left", "right"] {
+        let actual = &verdict["compared_outputs"][side];
+        assert_eq!(actual["exit_code"], 0, "{side}: {verdict}");
+        assert!(actual["signal"].is_null(), "{side}: {verdict}");
+        assert_eq!(actual["stdout_bytes"], input.len(), "{side}: {verdict}");
+        assert_eq!(
+            actual["stdout_sha256"],
+            detcore::Digest::new(input).to_string(),
+            "{side}: {verdict}"
+        );
+        assert_eq!(actual["stderr_bytes"], 0, "{side}: {verdict}");
+        assert_eq!(
+            actual["stderr_sha256"],
+            detcore::Digest::new(b"").to_string(),
+            "{side}: {verdict}"
+        );
+    }
+    // The opt-in package qualification keeps this real fixture and the entire
+    // successful report for the saved-pair test. Ordinary CLI selection has
+    // no extra output or package requirement; all assertions above still run.
+    if let Some(record_path) = std::env::var_os("HERMIT_LOADER_QUALIFICATION_RECORD") {
+        assert!(
+            !record_path.is_empty(),
+            "qualification record path is empty"
+        );
+        let install = std::env::var_os("HERMIT_INSTALL_DIR")
+            .filter(|path| !path.is_empty())
+            .expect("package qualification requires HERMIT_INSTALL_DIR");
+        let install = fs::canonicalize(install).expect("canonical package installation");
+        let identity = |path: &Path| {
+            use sha2::Digest as _;
+
+            let path = fs::canonicalize(path).expect("canonical qualification input");
+            assert!(path.is_file(), "qualification input is not a regular file");
+            let mut digest = sha2::Sha256::new();
+            std::io::copy(&mut fs::File::open(&path).unwrap(), &mut digest).unwrap();
+            serde_json::json!({
+                "path": path,
+                "sha256": format!("{:x}", digest.finalize()),
+            })
+        };
+        let command = hermit_command(&args);
+        let argv = std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|word| {
+                word.to_str()
+                    .expect("qualification argv is UTF-8")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let record = serde_json::json!({
+            "schema": 1,
+            "hermit": identity(Path::new(env!("CARGO_BIN_EXE_hermit"))),
+            "cat": identity(Path::new(cat)),
+            "image": identity(&install.join("rsrcs/detcore_private_runtime.elf")),
+            "descriptor": identity(&install.join("rsrcs/detcore_private_runtime.package.json")),
+            "install": install,
+            "inline_argv": argv,
+            "stdin_sha256": detcore::Digest::new(input).to_string(),
+            "inline_report": verdict,
+        });
+        let mut record_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(record_path)
+            .expect("claim a new qualification record; never reuse an earlier run");
+        serde_json::to_writer_pretty(&mut record_file, &record).unwrap();
+        record_file.write_all(b"\n").unwrap();
+        record_file.sync_all().unwrap();
+    }
+}
+
+/// Omitting the loader opt-in retains strict stdin verification on the
+/// existing in-guest startup path, even in a build that contains the loader.
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[test]
+fn in_guest_trap_without_loader_opt_in_keeps_strict_stdin_verification() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("loader.json");
+    let report_arg = report.to_str().expect("report path is UTF-8");
+    let input = b"first\0line\nlast-without-newline\xff";
+    let cat = &piped_stdin_guests().0;
+    let args = [
+        "--backend=in-guest-trap",
+        "--log=info",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        "--seed=0",
+        "--sched-seed=0",
+        "--rng-seed=0",
+        "--max-timeslice=disabled",
+        "--no-rcb-time",
+        "--base-env=empty",
+        "--verify-json",
+        report_arg,
+        "--",
+        cat.as_str(),
+    ];
+    let output = hermit_with_stdin(&args, input);
+    assert_success(&output, &args);
+    assert!(
+        stderr(&output).lines().any(|line| line ==
+            "hermit: [in-guest-trap] selected: the guest preload is to host the Detcore Tool, with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)"),
+        "omitted loader flag must preserve the preload selection output: {}",
+        stderr(&output)
+    );
+    assert_eq!(output.stdout, input, "{}", stderr(&output));
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["verdict"], "matched", "{verdict}");
+    assert_eq!(verdict["verified"], true, "{verdict}");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    assert_eq!(
+        verdict["comparison"]["strictness"], "canonical",
+        "{verdict}"
+    );
+    assert_eq!(
+        verdict["comparison"]["compare_io_buffers"], true,
+        "{verdict}"
+    );
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "loader compared no INFO messages: {verdict}"
+    );
+    for side in ["left", "right"] {
+        let actual = &verdict["compared_outputs"][side];
+        assert_eq!(actual["exit_code"], 0, "{side}: {verdict}");
+        assert!(actual["signal"].is_null(), "{side}: {verdict}");
+        assert_eq!(actual["stdout_bytes"], input.len(), "{side}: {verdict}");
+        assert_eq!(
+            actual["stdout_sha256"],
+            detcore::Digest::new(input).to_string(),
+            "{side}: {verdict}"
+        );
+        assert_eq!(actual["stderr_bytes"], 0, "{side}: {verdict}");
+        assert_eq!(
+            actual["stderr_sha256"],
+            detcore::Digest::new(b"").to_string(),
+            "{side}: {verdict}"
+        );
+    }
+}
+
 /// A guest that reads one byte of its piped stdin leaves the rest in the pipe
 /// for the next reader, on every backend, as natively: neither the backend nor
 /// Hermit reads ahead of the guest. The guest reads exactly one byte

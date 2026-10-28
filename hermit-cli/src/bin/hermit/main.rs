@@ -643,6 +643,7 @@ impl Subcommand {
         match self {
             Subcommand::Run(run) => {
                 run.set_backend(global.backend);
+                run.prepare_mapped_verification_inputs()?;
                 run.refuse_unready_exec_stop()?;
             }
             Subcommand::Oci(oci) => oci.refuse_unready_exec_stop()?,
