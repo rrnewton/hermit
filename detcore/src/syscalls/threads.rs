@@ -4588,9 +4588,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         ) {
             return None;
         }
-        memory
-            .read_values(Addr::<libc::pid_t>::from_raw(set_tid as usize)?, &mut tids)
-            .ok()?;
+        super::chosen_ids::read_pid_array(&memory, set_tid as usize, &mut tids)?;
         // With CLONE_NEWPID the first entry is the pid in the new namespace,
         // which must be 1 since that namespace has no init yet (EINVAL).
         let newpid = flags & libc::CLONE_NEWPID as u64 != 0;
@@ -8954,10 +8952,13 @@ fn clone3_field<M: MemoryAccess>(
     if clone.size() < CLONE_ARGS_SIZE_VER0 || offset + 8 > clone.size() {
         return None;
     }
-    let base = clone.args()?.as_raw();
-    memory
-        .read_value(Addr::<u64>::from_raw(base + offset)?)
-        .ok()
+    let field = clone.args()?.as_raw().checked_add(offset)?;
+    // Past user memory there is nothing to read, and a read's address
+    // arithmetic near the top of the address space would overflow.
+    if !super::chosen_ids::within_user_memory(field, std::mem::size_of::<u64>()) {
+        return None;
+    }
+    memory.read_value(Addr::<u64>::from_raw(field)?).ok()
 }
 
 /// Where a `CLONE_PIDFD` clone writes the new process's pidfd (`clone`'s
