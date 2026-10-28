@@ -9079,7 +9079,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_fd(call.fd())
                 .with_iov(call.iov())
                 .with_len(call.iov_len() as usize);
-            return self.handle_writev(guest, writev).await;
+            // Boxed: `writev`'s future is the largest of the arms
+            // `handle_syscall_event` keeps inline, and held here as well it
+            // would make this handler's larger still, and so every syscall's
+            // (`hot_path_futures_stay_small`). Only this rare form pays the
+            // allocation. `readv`'s future, smaller than `writev`'s, stays
+            // inline in `preadv2` above.
+            return Box::pin(self.handle_writev(guest, writev)).await;
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
