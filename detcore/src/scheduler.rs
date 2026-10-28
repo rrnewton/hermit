@@ -5289,12 +5289,39 @@ impl Scheduler {
     ///
     /// The index is the traced count when recording, and the schedule position
     /// (`Replayer::stacktrace_position`) under `--replay-schedule-from`.
+    ///
+    /// A replay can pass a requested position without running it: a
+    /// fast-forward drops recorded events to resync (`check_fast_forward`).
+    /// Every requested index below `current_ix` is then reported as missed and
+    /// discarded, so it neither disappears silently nor stays at the head of
+    /// the list and blocks every later index.
     fn try_pop_stacktrace_event(
         &mut self,
         current_ix: u64,
         observed: &SchedEvent,
     ) -> MaybePrintStack {
         let mut result = None;
+        if let Some(iter) = &mut self.stacktrace_events {
+            while let Some((missed, _, m_path)) = iter.next_if(|(ix, _, _)| *ix < current_ix) {
+                let destination = m_path
+                    .as_ref()
+                    .map_or_else(|| "stderr".to_string(), |p| p.display().to_string());
+                tracing::warn!(
+                    "No stack trace for scheduled event #{} (requested for {}): the run passed that position without running it, and reached #{} = {}",
+                    missed,
+                    destination,
+                    current_ix,
+                    observed,
+                );
+                crate::util::capped_eprintln!(
+                    "\nMissed stack trace for scheduled event #{} (requested for {}): the run passed that position without running it, and reached #{} = {}",
+                    missed,
+                    destination,
+                    current_ix,
+                    observed,
+                );
+            }
+        }
         if let Some(iter) = &mut self.stacktrace_events
             && let Some((next_ix, _, m_path)) = iter.peek()
             && *next_ix == current_ix
@@ -8431,24 +8458,26 @@ impl Scheduler {
         if std::mem::take(&mut self.fast_forward_for_alone_poller) {
             self.fast_forward_to_next_finite_deadline(global_time);
         }
-        if self.replay_fast_forward_to_recorded_wake(global_time) {
-            // No thread runs until the replayed thread wakes: committed time
-            // catches up in the next pass's step 1 (a replay with callback
-            // checkpoints holds only once the wake is due), and each pass
-            // then pops one due timed event, the replayed thread's last if
-            // others pop ahead of it.
-            self.step2b_process_timed(global_time);
-            return Err(SkipTurn);
-        }
+        // No thread runs until the replayed thread wakes: committed time
+        // catches up in the next pass's step 1 (a replay with callback
+        // checkpoints holds only once the wake is due), and each pass then
+        // pops one due timed event, the replayed thread's last if others pop
+        // ahead of it.
+        let held_for_replayed_wake = self.replay_fast_forward_to_recorded_wake(global_time);
         self.step2b_process_timed(global_time);
-        self.step2b_restore_due_pollers();
-        self.upgrade_pollers_on_time();
+        if !held_for_replayed_wake {
+            self.step2b_restore_due_pollers();
+            self.upgrade_pollers_on_time();
+        }
         // A timed signal that just armed a background thread is followed by an
         // empty pass, so the barrier above requeues it at the top of the next
-        // one whether or not its continuation is already posted.
+        // one whether or not its continuation is already posted. A held pass
+        // ends here too, after the same backend-failure and control-barrier
+        // checks as any other.
         if self.backend_failed()
             || self.control_barrier()
             || !self.blocked.signaled_background.is_empty()
+            || held_for_replayed_wake
         {
             return Err(SkipTurn);
         }
@@ -14335,12 +14364,19 @@ impl Scheduler {
             // poll whose data arrives a few attempts later): backing it off
             // would run another thread, an event the recording does not have
             // there. The first retry keeps the turn, since the grant before it
-            // may have finished other calls, which counts as progress.
-            let keeps_turn = self.replayer.as_ref().is_some_and(|replayer| {
+            // may have finished other calls, which counts as progress. The
+            // recorded event must name the syscall the thread has in flight,
+            // and a thread keeps at most `REPLAY_KEPT_RETRY_LIMIT` turns in a
+            // row while the schedule does not advance: a replay that has
+            // drifted can wait on a poll nothing in the run will satisfy (an
+            // epoll or a socket the host can change, whose peer's write the
+            // drift skipped), and only the backoff lets another thread run.
+            let keeps_turn = self.replayer.as_mut().is_some_and(|replayer| {
                 replayer.next_is_retry_by(dettid)
                     && (replayer.next_is_failed_attempt_by(dettid)
                         || !(rs.polls_guest_state_only
                             && Self::retries_its_call_without_progress(rs)))
+                    && replayer.keep_retry_turn(dettid)
             });
             if keeps_turn {
                 self.run_queue.push_back(dettid, priority);
@@ -19544,6 +19580,43 @@ mod test {
         assert_eq!(sched.consume_schedevent(&second).print_stack, Some(None));
     }
 
+    /// A replay that fast-forwards past a requested schedule position (it
+    /// drops recorded events to resync) reports that index as missed instead
+    /// of leaving it at the head of the list, so the next requested index
+    /// still prints at its own position.
+    #[test]
+    fn a_skipped_stacktrace_position_is_reported_and_the_next_one_prints() {
+        let mut sched = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(3);
+        let at = LogicalTime::from_nanos;
+        let schedule: Vec<SchedEvent> =
+            [Sysno::getpid, Sysno::getppid, Sysno::getuid, Sysno::getgid]
+                .into_iter()
+                .zip(1..)
+                .map(|(sysno, n)| {
+                    SchedEvent::syscall(tid, sysno, SyscallPhase::Prehook).with_time(at(n * 10_000))
+                })
+                .collect();
+        sched.replayer = Some(Replayer::new(schedule.clone()));
+        sched.stacktrace_events = Some(
+            vec![(1, None, None), (2, None, None)]
+                .into_iter()
+                .peekable(),
+        );
+        assert_eq!(sched.consume_schedevent(&schedule[0]).print_stack, None);
+        // The replay runs recorded event #2 next, skipping #1.
+        assert_eq!(
+            sched.consume_schedevent(&schedule[2]).print_stack,
+            Some(None),
+            "recorded event #2 prints although #1 was skipped"
+        );
+        assert!(
+            sched.stacktrace_events.as_mut().unwrap().peek().is_none(),
+            "the skipped index #1 was reported and discarded"
+        );
+        assert_eq!(sched.consume_schedevent(&schedule[3]).print_stack, None);
+    }
+
     /// A thread queued at the deferred replay priority when the recording
     /// runs out does not stay behind the foreground thread: consuming the
     /// last recorded event gives every thread the default priority
@@ -24354,11 +24427,56 @@ mod test {
         (global_time, deadline)
     }
 
+    /// A scheduler replaying a schedule whose next event is `next`'s `phase`
+    /// of `recorded`, with dtid 3 polling a `recvfrom` it entered (its
+    /// prehook is the schedule's first event, already observed).
+    fn replaying_a_recvfrom_retry(
+        next: DetTid,
+        recorded: Sysno,
+        phase: SyscallPhase,
+    ) -> (Scheduler, DetTid) {
+        let poller = DetTid::from_raw(3);
+        let mut scheduler = Scheduler::new(&Config::default());
+        register_known_thread(&mut scheduler, poller);
+        scheduler
+            .priorities
+            .insert(poller, runqueue::FIRST_PRIORITY + 2);
+        scheduler.runqueue_push_back(poller);
+        let entered = SchedEvent::syscall(poller, Sysno::recvfrom, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let mut replayer = replayer::Replayer::new(vec![
+            entered.clone(),
+            SchedEvent::syscall(next, recorded, phase).with_time(LogicalTime::from_nanos(20_000)),
+        ]);
+        let _ = replayer.observe_event(&entered);
+        scheduler.replayer = Some(replayer);
+        (scheduler, poller)
+    }
+
+    /// Run `poller`'s retry `request` through `step4_resource_block` and say
+    /// whether it was backed off as a poller (rather than kept runnable).
+    fn retry_is_backed_off(scheduler: &mut Scheduler, poller: DetTid, request: &Resources) -> bool {
+        let turn = scheduler.next_turns.get(&poller).unwrap();
+        if turn.req.try_read().is_none() {
+            turn.req.put(Ok(request.clone()));
+        }
+        let response = turn.resp.clone();
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
+        assert!(
+            scheduler
+                .step4_resource_block(poller, request, &response)
+                .is_err(),
+            "a retry that has not been remade runnable grants no turn"
+        );
+        !scheduler.run_queue.contains_non_polling_tid(poller)
+    }
+
     /// A polling thread's retry keeps its turn when the replayed schedule's
     /// next event is that retry: it is queued as an ordinary runnable thread
     /// rather than backed off as a poller, which would hand another thread the
     /// turn the recording gave it. It is backed off as before when the
-    /// schedule names another thread next, or names the retry's completion
+    /// schedule names another thread next, or another syscall than the one
+    /// the thread has in flight, or names the retry's completion
     /// while the retry is a second one after an attempt that moved nothing on
     /// guest state alone (only another thread can make it succeed). A retry
     /// whose outcome the host can change keeps the turn, and so does a
@@ -24368,46 +24486,61 @@ mod test {
         let poller = DetTid::from_raw(3);
         let other = DetTid::from_raw(5);
         let (completion, attempt) = (SyscallPhase::Posthook, SyscallPhase::Polling);
-        for (next, phase, retry, made_progress, guest_state_only, backed_off) in [
-            (poller, completion, 1, false, true, false),
-            (other, completion, 1, false, true, true),
-            (poller, completion, 2, false, true, true),
-            (poller, completion, 2, false, false, false),
-            (poller, completion, 2, true, true, false),
-            (poller, attempt, 2, false, true, false),
+        let (same, different) = (Sysno::recvfrom, Sysno::read);
+        for (next, recorded, phase, retry, made_progress, guest_state_only, backed_off) in [
+            (poller, same, completion, 1, false, true, false),
+            (other, same, completion, 1, false, true, true),
+            (poller, same, completion, 2, false, true, true),
+            (poller, same, completion, 2, false, false, false),
+            (poller, same, completion, 2, true, true, false),
+            (poller, same, attempt, 2, false, true, false),
+            (poller, different, completion, 1, false, true, true),
+            (poller, different, completion, 2, false, false, true),
+            (poller, different, attempt, 2, false, true, true),
         ] {
-            let mut scheduler = Scheduler::new(&Config::default());
-            register_known_thread(&mut scheduler, poller);
-            scheduler
-                .priorities
-                .insert(poller, runqueue::FIRST_PRIORITY + 2);
-            scheduler.runqueue_push_back(poller);
-            scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
-                next,
-                Sysno::recvfrom,
-                phase,
-            )]));
+            let (mut scheduler, poller) = replaying_a_recvfrom_retry(next, recorded, phase);
             let mut request = Resources::new(poller);
             request.insert(ResourceID::InternalIOPolling, Permission::W);
             request.poll_attempt = retry;
             request.previous_attempt_made_progress = made_progress;
             request.polls_guest_state_only = guest_state_only;
-            let turn = scheduler.next_turns.get(&poller).unwrap();
-            turn.req.put(Ok(request.clone()));
-            let response = turn.resp.clone();
-            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
-            assert!(
-                scheduler
-                    .step4_resource_block(poller, &request, &response)
-                    .is_err(),
-                "a retry that has not been remade runnable grants no turn"
-            );
             assert_eq!(
-                !scheduler.run_queue.contains_non_polling_tid(poller),
+                retry_is_backed_off(&mut scheduler, poller, &request),
                 backed_off,
-                "the schedule's next event is dtid {next}'s {phase:?}, retry {retry}, \
+                "the schedule's next event is dtid {next}'s {recorded} {phase:?}, retry {retry}, \
                  progress {made_progress}, guest state only {guest_state_only}"
             );
+        }
+    }
+
+    /// A retry whose outcome the host can change keeps its turn for at most
+    /// `REPLAY_KEPT_RETRY_LIMIT` retries in a row while the replayed schedule
+    /// does not advance, then backs off as a poller, so a drifted replay
+    /// cannot spin forever on a poll nothing in the run will satisfy.
+    #[test]
+    fn a_replayed_retry_backs_off_once_it_has_kept_the_turn_too_often() {
+        let poller = DetTid::from_raw(3);
+        let (mut scheduler, poller) =
+            replaying_a_recvfrom_retry(poller, Sysno::recvfrom, SyscallPhase::Posthook);
+        let mut request = Resources::new(poller);
+        request.insert(ResourceID::InternalIOPolling, Permission::W);
+        request.polls_guest_state_only = false;
+        for retry in 1..=replayer::REPLAY_KEPT_RETRY_LIMIT {
+            request.poll_attempt = retry;
+            assert!(
+                !retry_is_backed_off(&mut scheduler, poller, &request),
+                "retry {retry} keeps the turn"
+            );
+        }
+        for retry in replayer::REPLAY_KEPT_RETRY_LIMIT + 1..=replayer::REPLAY_KEPT_RETRY_LIMIT + 3 {
+            request.poll_attempt = retry;
+            assert!(
+                retry_is_backed_off(&mut scheduler, poller, &request),
+                "retry {retry} is past the cap"
+            );
+            // Back in the queue as a poller for the next retry.
+            scheduler.run_queue.remove_tid(poller);
+            scheduler.runqueue_push_back(poller);
         }
     }
 
@@ -24526,6 +24659,69 @@ mod test {
             "the replayed wake pops next, so the pass runs"
         );
         assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+    }
+
+    /// A scheduler pass under a schedule replay whose next recorded event
+    /// resumes a thread asleep in virtual time holds for that thread's wake:
+    /// it moves global time to the sleeper's deadline and ends without a
+    /// turn although another thread is runnable, popping one due timed event
+    /// per pass. Once committed time reaches the
+    /// deadline, the ordinary pass wakes the sleeper and goes on to a turn.
+    #[test]
+    fn a_replay_pass_holds_for_the_recorded_wake_of_a_sleeper() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(5);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        let now = global_time.lock().unwrap().as_nanos();
+        let early = [DetTid::from_raw(9), DetTid::from_raw(11)];
+        for (tid, offset) in early.iter().zip([1, 2]) {
+            register_known_thread(&mut scheduler, *tid);
+            scheduler
+                .blocked
+                .timed_waiters
+                .insert(now + LogicalTime::from_nanos(offset), *tid);
+        }
+        let worker = DetTid::from_raw(7);
+        queue_worker(&mut scheduler, worker);
+        scheduler.committed_time = now + LogicalTime::from_nanos(5);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
+            sleeper,
+            Sysno::clock_nanosleep,
+            SyscallPhase::Posthook,
+        )]));
+        let woken = |scheduler: &Scheduler, tids: &[DetTid]| {
+            tids.iter()
+                .filter(|tid| scheduler.run_queue.contains_tid(**tid))
+                .count()
+        };
+
+        for pass in 1..=2 {
+            assert!(
+                scheduler.step2_process_blocked(&global_time).is_err(),
+                "pass {pass} holds for the replayed wake although dtid {worker} is runnable"
+            );
+            assert_eq!(
+                global_time.lock().unwrap().as_nanos(),
+                deadline,
+                "global time moved to the sleeper's deadline"
+            );
+            assert_eq!(woken(&scheduler, &early), pass, "one due event per pass");
+            assert!(!scheduler.run_queue.contains_tid(sleeper));
+        }
+        assert!(
+            scheduler.step2_process_blocked(&global_time).is_err(),
+            "committed time is still short of the deadline"
+        );
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+
+        // Step 1 of the next pass brings committed time up to global time.
+        scheduler.committed_time = deadline;
+        assert!(
+            scheduler.step2_process_blocked(&global_time).is_ok(),
+            "the wake is due, so the pass goes on to a turn"
+        );
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
     }
 
     /// With a backgrounded call unfinished and nothing queued, record wakes a
