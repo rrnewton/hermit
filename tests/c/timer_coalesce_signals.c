@@ -908,7 +908,9 @@ static void nonleader_exec_child(void) {
 }
 
 /* The J construction with a process-directed SI_QUEUE send in a process with
- * two live threads. */
+ * two live threads. The sender blocks SIGUSR1, so Linux's complete_signal
+ * gives the copy to the worker, which discards it (SIG_IGN): a handler the
+ * main thread installs and unblocks after the join finds nothing pending. */
 static void forged_shared(void) {
   install(SIGUSR1, 1);
   pthread_t th;
@@ -923,6 +925,44 @@ static void forged_shared(void) {
   int r = (int)syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, &si);
   printf("forged_shared queue=%d\n", r);
   pthread_join(th, 0);
+  install(SIGUSR1, 0);
+  mask(SIG_UNBLOCK, SIGUSR1);
+  print_handled("forged_shared");
+}
+
+/* forged_shared with SIGUSR1 caught: the copy goes to the worker, the one
+ * thread that leaves it unblocked, and its handler ends the worker's timed
+ * futex wait (EINTR: no SA_RESTART). A copy no thread were woken for would
+ * leave the wait to its 5 s timeout (ETIMEDOUT). */
+static volatile int forged_wait_errno = -1;
+static void *forged_worker(void *a) {
+  (void)a;
+  struct timespec ts = {5, 0};
+  wtid = gettid_();
+  long r = syscall(SYS_futex, &futex_word, 128 /* FUTEX_WAIT_PRIVATE */, 0, &ts, 0, 0);
+  forged_wait_errno = r < 0 ? errno : 0;
+  return 0;
+}
+static void forged_shared_caught(void) {
+  install(SIGUSR1, 0);
+  pthread_t th;
+  pthread_create(&th, 0, forged_worker, 0);
+  mask(SIG_BLOCK, SIGUSR1);
+  while (!wtid) sleep_us(1000);
+  sleep_us(50000);
+  siginfo_t si;
+  memset(&si, 0, sizeof si);
+  si.si_signo = SIGUSR1;
+  si.si_code = SI_QUEUE;
+  si.si_value.sival_ptr = (void *)(uintptr_t)VALUE;
+  int r = (int)syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, &si);
+  pthread_join(th, 0);
+  printf("forged_shared_caught queue=%d wait=%s on_worker=%d\n", r,
+         forged_wait_errno == EINTR       ? "EINTR"
+         : forged_wait_errno == ETIMEDOUT ? "ETIMEDOUT"
+                                          : "other",
+         n > 0 && rthread[0] == wtid);
+  print_handled("forged_shared_caught");
 }
 
 /* The Codex review of https://github.com/rrnewton/hermit/pull/4491. */
@@ -1140,6 +1180,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(m, "nonleader_exec")) nonleader_exec();
   else if (!strcmp(m, "nonleader_exec_child")) nonleader_exec_child();
   else if (!strcmp(m, "forged_shared")) forged_shared();
+  else if (!strcmp(m, "forged_shared_caught")) forged_shared_caught();
   else if (!strcmp(m, "sigwait_bg")) sigwait_bg();
   else if (!strcmp(m, "spawn_tick")) spawn_tick();
   else if (!strcmp(m, "sfd_stale_single")) sfd_stale_room(0);

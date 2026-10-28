@@ -41937,6 +41937,18 @@ fn posix_timer_entries_hermit_refuses_or_diverges_on_are_named() {
 ///   siblings spin, so a delivery's turn may wait behind theirs; the expiries
 ///   each delivery accounts for must not exceed the grid points up to the
 ///   handler's own clock read.
+///
+/// From the lander review of https://github.com/rrnewton/hermit/pull/4625
+/// (5 native runs each, identical, 2026-10-28), the process-directed SI_QUEUE
+/// send to a process with two live threads, which Hermit refused by name
+/// before Detcore chose the receiving thread
+/// (https://github.com/rrnewton/hermit/issues/4034). The sender blocks
+/// SIGUSR1, so Linux's `complete_signal` gives the copy to the worker:
+/// - `forged_shared` (SIG_IGN): the worker discards it, so the handler the
+///   main thread installs and unblocks after the join finds nothing;
+/// - `forged_shared_caught`: the worker's handler runs with the sent siginfo
+///   and ends its timed futex wait (EINTR), where a copy no thread was woken
+///   for would leave the wait to its timeout (ETIMEDOUT).
 #[test]
 fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
     let guest = timer_coalesce_signals_guest().to_str().unwrap().to_owned();
@@ -41967,6 +41979,14 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
         (
             "delivery_turn",
             "delivery_turn deliveries_positive=1 all_si_timer=1 accounting_ok=1\n",
+        ),
+        (
+            "forged_shared",
+            "forged_shared queue=0\nforged_shared deliveries=0\n",
+        ),
+        (
+            "forged_shared_caught",
+            "forged_shared_caught queue=0 wait=EINTR on_worker=1\nforged_shared_caught deliveries=1\n  0 sig=10 code=-1 own_pid=0 value=0x1122334455667788\n",
         ),
         // The Codex review of https://github.com/rrnewton/hermit/pull/4491
         // (native 5 runs each, 2026-10-16): a stale entry between two returned
@@ -42123,9 +42143,8 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
 ///
 /// `forged_shared`, the shared-queue form of the forged row, was refused by
 /// the https://github.com/rrnewton/hermit/issues/4034 rule and is now
-/// delivered: the sender blocks SIGUSR1, so Linux gives the copy to the parked
-/// worker, which is what Detcore chooses. It prints `forged_shared queue=0`,
-/// as natively (3 of 3 runs).
+/// delivered to the thread Linux chooses
+/// (`posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity`).
 ///
 /// Known divergences, with Linux's answer beside Hermit's:
 /// - `fallback_pipe`, `fallback_cont` and `fallback_alrm`: SIGPIPE and SIGCONT
