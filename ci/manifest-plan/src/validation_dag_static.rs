@@ -1193,7 +1193,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // virtual_cpus_parse_from_1_to_128: 1882.
     // The shared caller/ABI16 companion adds detcore-dbt's
     // capability_clear_image_readiness_preserves_legacy_conditions: 1883, listed.
-    ("test.regular_crates", 1891),
+    // And this change's detcore-model tests: 1894.
+    ("test.regular_crates", 1894),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3053,7 +3054,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And determinize_stat_reports_one_link_for_directories_only and
     // determinize_stat_nlink_pin_edges (directory st_nlink pinned to 1):
     // 2736 + 2 = 2738, listed.
-    ("test.detcore_unit", 2738),
+    // And this change's Detcore unit tests: 2753.
+    ("test.detcore_unit", 2753),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4336,7 +4338,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 632 + 2 = 634.
     // And in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors
     // (https://github.com/rrnewton/hermit/issues/4689): 645.
-    ("test.cli", 654),
+    // And this change's CLI test: 655.
+    ("test.cli", 655),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4868,7 +4871,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 551 + 2 = 553.
     // And the same in-guest dup2-onto-runtime-descriptors test, not excluded:
     // 564.
-    ("test.cli_on_host", 573),
+    // And the same test: 574.
+    ("test.cli_on_host", 574),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5334,7 +5338,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same protection-key subscription unit: 2692, listed.
     // And the same P2b deletion of the anchor device unit: 2694, listed.
     // And the same two directory st_nlink units: 2738, listed.
-    ("test.detcore_unit_on_host", 2738),
+    // And the same tests: 2753.
+    ("test.detcore_unit_on_host", 2753),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5910,7 +5915,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two --virtual-cpus config tests: 1868.
     // The same shared caller/ABI16 legacy-readiness test, with all fourteen
     // hosted exclusions unchanged: 1869, listed.
-    ("test.regular_crates_on_host", 1877),
+    // And the same tests: 1880.
+    ("test.regular_crates_on_host", 1880),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

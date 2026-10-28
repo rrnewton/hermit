@@ -6665,6 +6665,7 @@ impl<T> ThreadState<T> {
     /// With no PMU maximum it is the only way out of a busy-wait on the TSC,
     /// and it still ends the expired target. Replay of recorded preemptions or
     /// schedules keeps its recorded boundaries.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn instruction_trap_ends_timeslice(&self, cfg: &Config) -> bool {
         let replaying = self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
         match self.max_timeslice_end {

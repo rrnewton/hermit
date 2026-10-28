@@ -150,7 +150,7 @@ fn descriptor_exit_dependency_with(
     // Follows the descriptor to the file it refers to.
     let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
     let status = execute(
-        Sysno::newfstatat,
+        crate::arch::FSTATAT,
         [
             libc::AT_FDCWD as usize,
             link.as_ptr() as usize,
@@ -197,7 +197,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             return;
         }
         let (arrived, how): (Vec<RawFd>, &str) = match call {
-            Syscall::Open(_) | Syscall::Openat(_) => (vec![ret as RawFd], "opened"),
+            Syscall::Openat(_) => (vec![ret as RawFd], "opened"),
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Open(_) => (vec![ret as RawFd], "opened"),
             _ if call.number() == Sysno::openat2 => (vec![ret as RawFd], "opened"),
             _ if call.number() == Sysno::pidfd_getfd => {
                 (vec![ret as RawFd], "received through pidfd_getfd")

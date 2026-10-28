@@ -47,6 +47,7 @@ pub mod liteinst_bootstrap;
 mod liteinst_constructor;
 pub mod liteinst_record;
 mod metadata;
+#[cfg(target_arch = "x86_64")]
 pub mod xstate_probe;
 /// Diagnostic writes that never wait for a reader; they live in detcore, whose
 /// own stderr writer reads the same flag.
@@ -403,6 +404,7 @@ use std::sync::Mutex;
 #[cfg(feature = "sabre")]
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 use anyhow::anyhow;
@@ -472,7 +474,16 @@ use serde::Serialize;
 pub use tracer_thread::launch_on_calling_thread;
 
 enum KvmStdinReservation {
-    Open(fs::File),
+    Open(
+        #[cfg_attr(
+            not(target_arch = "x86_64"),
+            allow(
+                dead_code,
+                reason = "only the x86_64 KVM backend reads the reserved stdin"
+            )
+        )]
+        fs::File,
+    ),
     Closed,
 }
 
@@ -524,6 +535,7 @@ fn ensure_kvm_stdin_reserved() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
 fn reserved_kvm_stdin() -> Result<Option<fs::File>, Error> {
     ensure_kvm_stdin_reserved()?;
     let reservation = KVM_STDIN_RESERVATION
@@ -3462,10 +3474,12 @@ fn sabre_uninstrumented_guest_message(status: &ExitStatus) -> String {
 // still writes zeros over every page, and node calls it over its 512 MiB
 // reservation, so a node run peaks near 880 MB of host memory until that is
 // made lazy too (https://github.com/rrnewton/hermit/issues/4366).
+#[cfg(target_arch = "x86_64")]
 const KVM_GUEST_MEMORY_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 /// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
 /// `BINPRM_MAX_RECURSION` limit for chained script interpreters.
+#[cfg(target_arch = "x86_64")]
 const MAX_SHEBANG_DEPTH: usize = 4;
 
 /// Resolve `#!` interpreter scripts before the reverie-kvm ELF loader runs.
@@ -3480,6 +3494,7 @@ const MAX_SHEBANG_DEPTH: usize = 4;
 ///
 /// The interpreter line is parsed with hermit's shared [`Shebang`] so the KVM
 /// backend matches how the ptrace backend and recorder treat `#!`-scripts.
+#[cfg(target_arch = "x86_64")]
 fn resolve_kvm_shebang(
     resolved_program: &Path,
     mut argv: Vec<String>,
@@ -3535,6 +3550,7 @@ fn resolve_kvm_shebang(
 /// The container replaces this host directory with a private, empty tmpfs, so
 /// nothing beneath it is visible to the guest. Kept next to the diagnostic that
 /// depends on it; `run.rs` has its own `TMP_DIR` for the mount itself.
+#[cfg(target_arch = "x86_64")]
 const CONTAINER_REPLACED_TMP: &str = "/tmp";
 
 /// Explain why a working directory that plainly exists on the host could not be
@@ -3564,6 +3580,7 @@ const CONTAINER_REPLACED_TMP: &str = "/tmp";
 /// silently fall back to `/`: changing the guest's working directory out from
 /// under a caller who asked for a specific one would trade a loud, correct
 /// failure for a quiet, wrong success.
+#[cfg(target_arch = "x86_64")]
 fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Error {
     let under_replaced_tmp = requested_cwd.starts_with(CONTAINER_REPLACED_TMP)
         && requested_cwd != Path::new(CONTAINER_REPLACED_TMP);
@@ -3620,6 +3637,7 @@ fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Err
 /// (`complete_container_config`). Either way Detcore renders the guest's mount
 /// files from the container mount table. KVM does not permit guest namespace
 /// changes.
+#[cfg(target_arch = "x86_64")]
 fn prepare_kvm_mountinfo_config(
     config: &mut DetConfig,
     namespace: impl FnOnce() -> Result<detcore_model::config::MountNamespaceIdentity, Error>,
@@ -3717,11 +3735,28 @@ fn prepare_kvm_mountinfo_config(
 /// guest thread can read a host file's kernel timestamps before Detcore
 /// rewrites them: the backend reports them either way, and sequentialization
 /// alone closes that window.
+#[cfg(target_arch = "x86_64")]
 fn kvm_reports_stored_metadata_timestamps(config: &DetConfig) -> bool {
     config.virtualize_metadata && config.sequentialize_threads
 }
 
+/// Refuses the KVM backend: reverie-kvm is an x86-64 VMM.
+#[cfg(not(target_arch = "x86_64"))]
+async fn run_kvm(
+    _command: &Command,
+    _config: DetConfig,
+    _print_summary: bool,
+    _print_summary_to_json_file: &Option<PathBuf>,
+    _capture_output: bool,
+) -> Result<Output, Error> {
+    anyhow::bail!(
+        "the KVM backend runs only on x86-64 hosts, and this host is {}",
+        std::env::consts::ARCH
+    )
+}
+
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
+#[cfg(target_arch = "x86_64")]
 async fn run_kvm(
     command: &Command,
     mut config: DetConfig,
@@ -3940,6 +3975,7 @@ async fn run_kvm(
 
 // A runtime error still owns GlobalState. Finish its terminal daemon before
 // returning the typed cause to the CLI's error classifier.
+#[cfg(target_arch = "x86_64")]
 async fn finish_kvm_tool_completion(
     completion: reverie_kvm::ToolRunCompletion<detcore::GlobalState>,
     print_summary: bool,
@@ -3963,6 +3999,7 @@ async fn finish_kvm_tool_completion(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn kvm_execution_error(
     primary: reverie_kvm::Error,
     cleanup: Option<detcore::BackendFailureCleanup>,
@@ -3982,7 +4019,7 @@ fn kvm_execution_error(
     error.context(message)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod kvm_failure_tests;
 
 #[cfg(all(test, feature = "kvm-execution-tests"))]
@@ -4745,7 +4782,12 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
         Backend::Ptrace | Backend::E9patch => {
             <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
         }
+        #[cfg(target_arch = "x86_64")]
         Backend::Kvm => reverie_kvm::KvmBackend::capabilities(),
+        // reverie-kvm is an x86-64 VMM; elsewhere the backend's declared
+        // capabilities stand in, and `run_kvm` refuses the run.
+        #[cfg(not(target_arch = "x86_64"))]
+        Backend::Kvm => reverie::BackendCapabilities::KVM,
         // Site patching changes how a syscall reaches the Tool, not what the
         // Tool host can do, so in-guest-trap has in-guest LiteInst's capabilities.
         Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,

@@ -11,14 +11,17 @@ use reverie::Guest;
 use reverie::syscalls::Accept4;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollPwait;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Select;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::Syscall;
@@ -26,6 +29,7 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
+#[cfg(target_arch = "x86_64")]
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::SelectEvent;
@@ -77,6 +81,7 @@ fn replay_pollfds<M: MemoryAccess>(
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
 fn replay_poll_event<M: MemoryAccess>(
     memory: &mut M,
     fds_address: Option<AddrMut<'_, PollFd>>,
@@ -249,6 +254,7 @@ fn scm_rights_fds(control: &[u8]) -> Vec<i32> {
 }
 
 impl Replayer {
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -327,6 +333,7 @@ impl Replayer {
         Ok(event.updated as i64)
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -356,6 +363,7 @@ impl Replayer {
         )
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_select<G: Guest<Self>>(
         &self,
         guest: &mut G,

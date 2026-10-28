@@ -36,6 +36,7 @@
 #![deny(missing_docs)]
 #![allow(clippy::uninlined_format_args)]
 
+mod arch;
 mod config;
 mod consts;
 mod cpu_clock;
@@ -91,6 +92,7 @@ mod signal_state;
 pub mod slice_boundary;
 mod sock_diag;
 mod stat;
+mod store_exclusive;
 mod syscall_classification;
 mod syscall_histogram;
 #[cfg(test)]
@@ -162,7 +164,9 @@ pub use finalization::TerminalReplayRefusal;
 pub use finalization::combine_finalization;
 #[cfg(test)]
 use rand::RngExt as _;
+#[cfg(target_arch = "x86_64")]
 use raw_cpuid::CpuIdResult;
+#[cfg(target_arch = "x86_64")]
 use raw_cpuid::cpuid;
 pub use record_or_replay::RecordOrReplay;
 use reverie::Error;
@@ -170,7 +174,9 @@ use reverie::ExitStatus;
 use reverie::GlobalRPC;
 use reverie::Guest;
 use reverie::Pid;
+#[cfg(target_arch = "x86_64")]
 use reverie::Rdtsc;
+#[cfg(target_arch = "x86_64")]
 use reverie::RdtscResult;
 use reverie::RegDisplay;
 use reverie::Signal;
@@ -181,8 +187,10 @@ use reverie::Tool;
 pub use reverie::process::Namespace;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::EpollCreate1;
 use reverie::syscalls::Errno;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::InotifyInit1;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
@@ -406,6 +414,7 @@ use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscall_classification::is_zero_copy_pipe_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
+#[cfg(target_arch = "x86_64")]
 use crate::syscalls::time::guest_clock_time;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
@@ -471,24 +480,6 @@ fn choose_rcb_timer(
 struct PriorityCheckin<'a> {
     token: Option<&'a preemptions::callback_history::Token>,
     site: preemptions::callback_history::Site,
-}
-
-/// The registers a syscall's completion leaves, computed from `entry`, the
-/// context at its entry (`rip` at the `syscall` instruction): `rax` holds the
-/// result, `rip` follows the instruction, and the instruction's own clobbers
-/// hold `rcx` = that `rip` and `r11` = `rflags` (signal phase 1's completed
-/// projection, design section 4). Only read, never written back.
-fn completed_syscall_projection(
-    entry: libc::user_regs_struct,
-    result: i64,
-) -> libc::user_regs_struct {
-    const SYSCALL_INSTRUCTION_LENGTH: u64 = 2;
-    let mut completed = entry;
-    completed.rax = result as u64;
-    completed.rip = entry.rip.wrapping_add(SYSCALL_INSTRUCTION_LENGTH);
-    completed.rcx = completed.rip;
-    completed.r11 = entry.eflags;
-    completed
 }
 
 /// Why this configuration cannot keep the two-phase delivery protocol
@@ -579,7 +570,8 @@ enum CheckIn {
     /// A syscall, signal, timer, exec or thread start: any expired slice ends.
     Event,
     /// A trapped `rdtsc` or `cpuid` in the middle of user code: see
-    /// [`ThreadState::instruction_trap_ends_timeslice`].
+    /// [`ThreadState::instruction_trap_ends_timeslice`]. Only x86 traps them.
+    #[cfg(target_arch = "x86_64")]
     InstructionTrap,
 }
 
@@ -778,7 +770,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(result) = completed {
             let entry = guest.regs().await;
             guest.thread_state_mut().signal_register_projection =
-                Some(completed_syscall_projection(entry, result));
+                Some(arch::completed_syscall_projection(entry, result));
         }
         let pipeline = self.handle_signal_event(guest, Signal::SIGALRM).await;
         guest.thread_state_mut().signal_register_projection = None;
@@ -1225,7 +1217,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dettid: DetTid,
         panic_on_unsupported_syscalls: bool,
     ) -> Result<i64, Error> {
-        let rip = guest.regs().await.rip;
+        let rip = arch::instruction_pointer(&guest.regs().await);
         let Some(block) = restart_block.and_then(|block| block.resumed_at(rip)) else {
             trace!(
                 "[detcore, dtid {}] restart_syscall at {:#x} restarts no wait Detcore emulated ({:?})",
@@ -1240,6 +1232,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             dettid, block
         );
         match block.call {
+            #[cfg(target_arch = "x86_64")]
             syscalls::helpers::RestartCall::Poll(poll) => {
                 self.handle_internal_poll_until(guest, poll, block.deadline)
                     .await
@@ -1349,6 +1342,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
 
                 if delta_rcbs > 0 {
+                    // The store-exclusives this segment failed, each of which
+                    // added branches to it (aarch64, recording or replaying
+                    // preemptions). Taken only for a segment that is kept, so
+                    // none is lost to an empty one.
+                    #[cfg(target_arch = "aarch64")]
+                    let ev = SchedEvent {
+                        strex_fails: detcore_model::schedule::HostObserved(
+                            crate::store_exclusive::take_segment_failures(guest.tid().as_raw()),
+                        ),
+                        ..ev
+                    };
                     // We don't fill the end_rip here, because the current rip is NOT precisely the
                     // end of this block of branch events.  Other instructions may have occured
                     // since the last branch.
@@ -1370,6 +1374,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             start_rip: None,
                             end_rip: None,
                             end_time: None,
+                            strex_fails: Default::default(),
                         },
                     );
                     // Fill in end_rip because current rip represents the end of this event.
@@ -1637,6 +1642,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     start_rip: None,
                     end_rip: None,
                     end_time: Some(nanos),
+                    strex_fails: Default::default(),
                 },
                 true,
             )
@@ -1729,6 +1735,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     start_rip: None,
                     end_rip: None,
                     end_time: Some(nanos),
+                    strex_fails: Default::default(),
                 },
                 true,
             )
@@ -2102,6 +2109,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let ends = match boundary {
             CheckIn::Event => thread_state.timeslice_expired(),
+            #[cfg(target_arch = "x86_64")]
             CheckIn::InstructionTrap => thread_state.instruction_trap_ends_timeslice(&self.cfg),
         };
         if !ends {
@@ -2308,6 +2316,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         thread.end_of_timeslice.is_some()
             && match boundary {
                 CheckIn::Event => thread.timeslice_expired(),
+                #[cfg(target_arch = "x86_64")]
                 CheckIn::InstructionTrap => thread.instruction_trap_ends_timeslice(&self.cfg),
             }
     }
@@ -2844,6 +2853,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// * The segment selectors `cs`/`ss`/`ds`/`es`/`fs`/`gs` -- constant for a 64-bit userspace
     ///   guest, so they add no signal; the TLS BASES are what a guest actually observes and those
     ///   are hashed.
+    ///
+    /// That is the x86_64 list. On aarch64 the hash covers `x0`-`x30` except `x7`, then `sp`,
+    /// `pc` and `pstate`; `x7` holds the kernel's ptrace entry/exit marker at a syscall stop, not
+    /// guest state (`arch::detlog_register_words`).
     fn detlog_registers<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2880,28 +2893,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             format!("spot-1/{cadence}")
         };
-        let mut bytes = Vec::with_capacity(19 * 8);
-        for v in [
-            regs.rax,
-            regs.rbx,
-            regs.rdx,
-            regs.rsi,
-            regs.rdi,
-            regs.rbp,
-            regs.rsp,
-            regs.r8,
-            regs.r9,
-            regs.r10,
-            regs.r12,
-            regs.r13,
-            regs.r14,
-            regs.r15,
-            regs.rip,
-            regs.eflags,
-            regs.orig_rax,
-            regs.fs_base,
-            regs.gs_base,
-        ] {
+        let words = arch::detlog_register_words(regs);
+        let mut bytes = Vec::with_capacity(words.len() * 8);
+        for v in words {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         detlog!(
@@ -3176,15 +3170,14 @@ fn display_syscall_finished<'a, M: MemoryAccess>(
 /// `kernel/time/time.c` stores `tv` and then returns `-EFAULT` if copying
 /// `tz` faults, so its rendered output can be kernel-written on failure.
 fn failure_leaves_outputs_unwritten(syscall: &Syscall) -> bool {
-    matches!(
-        syscall,
-        Syscall::Stat(_)
-            | Syscall::Lstat(_)
-            | Syscall::Fstat(_)
-            | Syscall::Newfstatat(_)
-            | Syscall::Statx(_)
-            | Syscall::ClockGettime(_)
-    )
+    match syscall {
+        Syscall::Fstat(_) | Syscall::Statx(_) | Syscall::ClockGettime(_) => true,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Stat(_) | Syscall::Lstat(_) | Syscall::Newfstatat(_) => true,
+        #[cfg(target_arch = "aarch64")]
+        Syscall::Fstatat(_) => true,
+        _ => false,
+    }
 }
 
 /// Whether `result` is a failure that, for a syscall listed in
@@ -3416,13 +3409,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#683)
                 Sysno::pwrite64,
                 Sysno::openat,
-                Sysno::open,
-                Sysno::creat,
                 // Detcore answers access and extended-attribute requests on the
                 // procfs files it renders
                 // (https://github.com/rrnewton/hermit/issues/4213); a backend
                 // keeps no copy of them, so these must not bypass Detcore.
-                Sysno::access,
                 Sysno::faccessat,
                 Sysno::faccessat2,
                 Sysno::getxattr,
@@ -3443,7 +3433,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::munmap,
                 Sysno::mremap,
                 Sysno::fcntl,
-                Sysno::arch_prctl,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-2150): Timer-slack prctl state is
                 // virtual and must not bypass Detcore under passthru_opt.
@@ -3452,8 +3441,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::futex,
                 Sysno::clone,
                 Sysno::clone3,
-                Sysno::fork,
-                Sysno::vfork,
                 Sysno::wait4,
                 Sysno::waitid,
                 Sysno::setsid,
@@ -3471,27 +3458,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // waiters are never woken.
                 Sysno::set_robust_list,
                 Sysno::dup,
-                Sysno::dup2,
                 Sysno::dup3,
-                Sysno::pipe,
                 Sysno::pipe2,
                 Sysno::getrandom,
-                Sysno::utime,
-                Sysno::utimes,
                 Sysno::utimensat,
-                Sysno::futimesat,
                 Sysno::socket,
                 Sysno::socketpair,
-                Sysno::eventfd,
                 Sysno::eventfd2,
                 Sysno::sched_getaffinity,
                 Sysno::sched_setaffinity,
-                Sysno::signalfd,
                 Sysno::signalfd4,
                 Sysno::timerfd_create,
                 Sysno::timerfd_settime,
                 Sysno::timerfd_gettime,
-                Sysno::inotify_init,
                 Sysno::inotify_init1,
                 Sysno::inotify_add_watch,
                 Sysno::inotify_rm_watch,
@@ -3519,16 +3498,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::nanosleep,
                 Sysno::clock_nanosleep,
                 Sysno::sched_yield,
-                Sysno::poll,
                 Sysno::ppoll,
                 Sysno::prlimit64,
-                Sysno::epoll_create,
                 Sysno::epoll_create1,
                 Sysno::epoll_ctl,
                 Sysno::epoll_pwait,
-                Sysno::epoll_wait,
-                Sysno::epoll_wait_old,
-                Sysno::epoll_ctl_old,
                 Sysno::recvfrom,
                 Sysno::rt_sigsuspend,
                 Sysno::rt_sigtimedwait,
@@ -3548,25 +3522,49 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // `select` is included by the Determinized sweep below;
                 // T137258824 tracks improving its implementation.
             ]);
+            // The same calls under their x86_64-only legacy numbers.
+            #[cfg(target_arch = "x86_64")]
+            subscription.syscalls([
+                Sysno::open,
+                Sysno::creat,
+                Sysno::access,
+                Sysno::arch_prctl,
+                Sysno::fork,
+                Sysno::vfork,
+                Sysno::dup2,
+                Sysno::pipe,
+                Sysno::utime,
+                Sysno::utimes,
+                Sysno::futimesat,
+                Sysno::eventfd,
+                Sysno::signalfd,
+                Sysno::inotify_init,
+                Sysno::poll,
+                Sysno::epoll_create,
+                Sysno::epoll_wait,
+                Sysno::epoll_wait_old,
+                Sysno::epoll_ctl_old,
+            ]);
 
+            // TODO: some of the above could probably move to this bucket.
+            // aarch64 has neither `alarm` nor `pause`; its libc builds them
+            // from `setitimer` and `ppoll`, which are listed above.
+            #[cfg(target_arch = "x86_64")]
             if do_sched {
-                subscription.syscalls([
-                    // TODO: some of the above could probably move to this bucket.
-                    Sysno::alarm,
-                    Sysno::pause,
-                ]);
+                subscription.syscalls([Sysno::alarm, Sysno::pause]);
             }
 
             if config.virtualize_metadata {
+                subscription.syscalls([Sysno::getdents64, Sysno::fstat, Sysno::statx]);
+                #[cfg(target_arch = "x86_64")]
                 subscription.syscalls([
                     Sysno::getdents,
-                    Sysno::getdents64,
                     Sysno::stat,
                     Sysno::lstat,
-                    Sysno::fstat,
                     Sysno::newfstatat,
-                    Sysno::statx,
                 ]);
+                #[cfg(target_arch = "aarch64")]
+                subscription.syscall(Sysno::fstatat);
             }
 
             if true
@@ -3591,10 +3589,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 subscription.rdtsc();
                 subscription.syscalls([
                     Sysno::gettimeofday,
-                    Sysno::time,
                     Sysno::clock_gettime,
                     Sysno::clock_getres,
                 ]);
+                #[cfg(target_arch = "x86_64")]
+                subscription.syscall(Sysno::time);
             }
 
             if config.virtualize_cpuid {
@@ -3627,6 +3626,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_cpuid_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3663,6 +3663,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         start_rip: None,
                         end_rip: None,
                         end_time: Some(nanos),
+                        strex_fails: Default::default(),
                     },
                     true,
                 )
@@ -3700,6 +3701,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         Ok(res)
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_rdtsc_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3733,6 +3735,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         start_rip: None,
                         end_rip: None,
                         end_time: None,
+                        strex_fails: Default::default(),
                     },
                 );
                 trace_schedevent(guest, ev, true).await;
@@ -4531,6 +4534,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             detpid
         );
 
+        // A new thread counts the store-exclusives of its segments from its
+        // first instruction (aarch64, in a run that counts them).
+        #[cfg(target_arch = "aarch64")]
+        crate::store_exclusive::open_segment_counter(&self.cfg, guest.tid().as_raw());
+
         // Delayed initialization of thread_state for this new thread:
         let thread_state = guest.thread_state_mut();
         thread_state.detpid = Some(detpid);
@@ -4776,6 +4784,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // The new image's program-break model, checked against the kernel's
         // once its exec record is in place.
         self.check_brk_model(guest).await;
+        // The new image's exclusive pairs (store-exclusive retry loops).
+        // Boxed, so its scan does not grow the post-exec future either.
+        #[cfg(target_arch = "aarch64")]
+        Box::pin(store_exclusive::report_after_exec(guest)).await;
         // Linux discards every queued POSIX timer signal at exec
         // (`flush_itimer_signals`), and Hermit's are ordinary signals it sent:
         // take them back before the new image runs
@@ -4915,6 +4927,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         start_rip: None,
                         end_rip: None,
                         end_time: None,
+                        strex_fails: Default::default(),
                     },
                 );
                 let ev = with_guest_rip(guest, ev).await;
@@ -5725,7 +5738,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#547)
                 Syscall::Writev(w) => self.handle_writev(guest, w).await,
                 Syscall::Openat(o) => Box::pin(self.handle_openat(guest, o)).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Open(o) => Box::pin(self.handle_openat(guest, o.into())).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Creat(o) => Box::pin(self.handle_openat(guest, o.into())).await,
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
@@ -5772,13 +5787,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Mincore(s) => self.handle_mincore(guest, s).await,
                 Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
                 Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Lstat(s) => self.handle_stat_family(guest, s.into()).await,
                 Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
+                #[cfg(target_arch = "aarch64")]
+                Syscall::Fstatat(s) => self.handle_stat_family(guest, s.into()).await,
                 Syscall::Statx(s) => self.handle_statx(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#877)
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
@@ -5795,11 +5816,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
 
                 // Forward vfork as vfork (rather than rewriting to fork) so the
                 // kernel enforces the CLONE_VFORK parent-blocking contract while the
                 // child registers itself and runs to exec/exit.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
                 Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
@@ -5807,7 +5830,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Setpgid(s) => self.handle_setpgid(guest, s).await,
                 Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Getpgrp(_) | Syscall::Getpgid(_) | Syscall::Getsid(_) => {
+                #[cfg(target_arch = "x86_64")]
+                Syscall::Getpgrp(_) => self.handle_group_or_session_getter(guest, call).await,
+                Syscall::Getpgid(_) | Syscall::Getsid(_) => {
                     self.handle_group_or_session_getter(guest, call).await
                 }
                 // Without virtual time the guest reads the host clock. Each of these
@@ -5820,6 +5845,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         self.passthrough(guest, call).await
                     }
                 }
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Time(s) => {
                     if virtualize_time {
                         self.handle_time(guest, s).await
@@ -5883,6 +5909,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-857): Empty virtual kernel ring buffer.
                 Syscall::Syslog(s) => self.handle_syslog(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Seccomp(s) => self.handle_seccomp(guest, s).await,
@@ -5900,17 +5927,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Exit(s) => self.handle_exit(guest, s).await,
 
                 Syscall::Dup(w) => self.handle_dup(guest, w).await.map_err(Into::into),
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Dup2(w) => self.handle_dup2(guest, w).await,
                 Syscall::Dup3(w) => self.handle_dup3(guest, w).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await,
                 Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await,
                 Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Utime(s) => self.handle_utime(guest, s).await.map_err(Into::into),
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Utimes(s) => self.handle_utimes(guest, s).await.map_err(Into::into),
                 // NB: lutimes is a libc function not a syscall
                 Syscall::Utimensat(s) => self.handle_utimensat(guest, s).await.map_err(Into::into),
                 // NB: futimes/futimens are libc functions not a syscall,
                 // futimesat is obsolete, return -ENOSYS for simplicity.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Futimesat(_s) => Err(Error::Errno(Errno::ENOSYS)),
                 // io_uring completion and memory-sharing semantics are not deterministic.
                 Syscall::IoUringSetup(_)
@@ -5940,13 +5972,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // socket-family syscall; half-closes a tracked socket and
                 // forwards via record_or_replay (KVM ratchet round 12).
                 Syscall::Shutdown(s) => self.handle_shutdown(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
                 Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
                 Syscall::Signalfd4(s) => self.handle_signalfd4(guest, s).await,
                 Syscall::TimerfdCreate(s) => self.handle_timerfd_create(guest, s).await,
                 Syscall::TimerfdSettime(s) => self.handle_timerfd_settime(guest, s).await,
                 Syscall::TimerfdGettime(s) => self.handle_timerfd_gettime(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::InotifyInit(s) => {
                     self.handle_inotify_init1(guest, InotifyInit1::from(s))
                         .await
@@ -5972,18 +6007,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 // NB: getdents is not recommended, (g)libc should call getdents64 only
                 // see: sysdeps/unix/sysv/linux/getdents.c.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Getdents(s) => self.handle_getdents(guest, s).await,
                 Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
 
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Poll(s) => self.handle_poll(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
                 Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Select(s) => self.handle_select(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::EpollCreate(s) => {
                     self.handle_epoll_create1(guest, EpollCreate1::from(s))
                         .await
@@ -5991,7 +6030,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::EpollCreate1(s) => self.handle_epoll_create1(guest, s).await,
                 Syscall::EpollCtl(s) => self.handle_epoll_ctl(guest, s).await,
                 Syscall::EpollPwait(s) => self.handle_epoll_pwait(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::EpollWait(s) => self.handle_epoll_wait(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::EpollWaitOld(s) => panic!(
                     "Not handling deprecated syscall: {}",
                     s.display(&guest.memory())
@@ -5999,6 +6040,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#549)
                 // The obsolete x86_64 entry point is absent from modern Linux kernels.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::EpollCtlOld(_) => Err(Error::Errno(Errno::ENOSYS)),
 
                 Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
@@ -6202,7 +6244,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     }
                     result
                 }
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Pause(s) => self.handle_pause(guest, s).await,
 
                 Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
@@ -6374,6 +6418,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Ok(ret) = res {
             self.refuse_exit_dependencies(guest, &call, ret).await;
         }
+        // A new executable file mapping's exclusive pairs (store-exclusive
+        // retry loops). Boxed, so this rare path does not grow every
+        // syscall's future.
+        #[cfg(target_arch = "aarch64")]
+        if let Ok(ret) = res
+            && let Some(range) = store_exclusive::range_to_scan(guest, &call, ret)
+        {
+            Box::pin(store_exclusive::report_new_mapping(guest, range)).await;
+        }
 
         // The guest resumes with this result in its return register (A5 step
         // 3.2). An error that is not an errno names no register value.
@@ -6490,6 +6543,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         thread_state.delivery_counters.log(dettid);
         // Its kept /proc status file reads only ESRCH from now on.
         crate::syscalls::forget_thread_status(Pid::from_raw(tid.as_raw()));
+        // A later thread may reuse its ID; that one opens its own counter.
+        #[cfg(target_arch = "aarch64")]
+        crate::store_exclusive::close_segment_counter(tid.as_raw());
         // Cancellation can consume the backend's transferred state before the
         // successful-exec callback has rebound its logical identity.
         let current = DetTid::from_raw(tid.as_raw());
@@ -7365,34 +7421,6 @@ mod thread_exit_identity_tests {
             select_thread_exit_detpid(None, process_detpid),
             (process_detpid, true)
         );
-    }
-}
-
-#[cfg(test)]
-mod completed_syscall_projection_tests {
-    use super::*;
-
-    /// Signal phase 1: the signal pipeline at a syscall's completion reads
-    /// the result in rax, rip after the two-byte syscall instruction, and the
-    /// instruction's clobbers; every other register is the entry's.
-    #[test]
-    fn a_completed_syscall_shows_its_result_and_return_address() {
-        let mut entry: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        entry.rip = 0x40_1000;
-        entry.rax = libc::SYS_pause as u64;
-        entry.rcx = 0x1111;
-        entry.r11 = 0x2222;
-        entry.eflags = 0x246;
-        entry.rdi = 7;
-        entry.rsp = 0x7ffd_0000;
-        let completed = completed_syscall_projection(entry, -i64::from(libc::EINTR));
-        assert_eq!(completed.rax, (-i64::from(libc::EINTR)) as u64);
-        assert_eq!(completed.rip, 0x40_1002);
-        assert_eq!(completed.rcx, 0x40_1002);
-        assert_eq!(completed.r11, 0x246);
-        assert_eq!(completed.rdi, 7);
-        assert_eq!(completed.rsp, 0x7ffd_0000);
-        assert_eq!(completed.eflags, 0x246);
     }
 }
 
