@@ -29,6 +29,10 @@
 //           mapped writable but not readable, which the kernel reads
 //   wronlyargs a reaped child's pid, with the struct clone_args itself on
 //           such a page
+//   size73  a reaped child's pid, in a one-entry set_tid array, with a
+//           73-byte struct clone_args (the kernel zero-extends it)
+//   nonetail a reaped child's pid, with a struct clone_args whose last 48
+//           bytes lie on a PROT_NONE page (EFAULT)
 //   deep    a reaped child's pid, followed by a pid for the namespace holding
 //           the caller's (set_tid = {pid, 1})
 //   nocap   a reaped child's pid, asked for after dropping every effective
@@ -261,6 +265,19 @@ int main(int argc, char** argv) {
     args.set_tid_size = 2;
   }
   struct clone_args_v2* argp = &args;
+  size_t size = sizeof(args);
+  if (!strcmp(mode, "size73")) {
+    size = 73;
+  }
+  if (!strcmp(mode, "nonetail")) {
+    long page = sysconf(_SC_PAGESIZE);
+    char* pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pages == MAP_FAILED || mprotect(pages + page, page, PROT_NONE) != 0) {
+      return 1;
+    }
+    argp = (struct clone_args_v2*)(pages + page - 40);
+    memcpy(argp, &args, 40);
+  }
   if (!strcmp(mode, "wronlyargs")) {
     argp = mmap(NULL, sysconf(_SC_PAGESIZE), PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (argp == MAP_FAILED) {
@@ -268,7 +285,7 @@ int main(int argc, char** argv) {
     }
     *argp = args;
   }
-  pid_t child = (pid_t)syscall(SYS_clone3, argp, sizeof(args));
+  pid_t child = (pid_t)syscall(SYS_clone3, argp, size);
   if (child < 0) {
     perror("clone3");
     if (zombie > 0) {

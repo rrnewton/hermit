@@ -4439,16 +4439,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         clone: &syscalls::Clone3,
     ) -> Option<Result<i64, Error>> {
         // Refuse only a call the kernel would accept as far as `set_tid` goes:
-        // any other shape goes to the kernel, whose own error stands, so a
-        // refusal never replaces an E2BIG, EINVAL, EFAULT or EPERM Linux
-        // would give for these arguments. `struct clone_args` gained `set_tid`
-        // (offset 64) and `set_tid_size` (offset 72) with its second version,
-        // 80 bytes.
+        // any other shape goes to the kernel, whose own error stands. The
+        // exceptions are deliberate, on the conservative side: a struct or
+        // array Detcore cannot read although the kernel may is refused before
+        // the kernel's later checks are known (EFAULT under
+        // --allow-unsupported-syscalls), and so is CLONE_NEWTIME on a kernel
+        // before 6.3, which refuses it with EINVAL. `struct clone_args`
+        // carries `set_tid` at offset 64 and `set_tid_size` at offset 72.
+        // The kernel zero-extends a shorter struct, so one of 73 bytes or
+        // more can name a set_tid; a shorter one names none or is EINVAL.
+        const SET_TID_SIZE_OFFSET: usize = 72;
         // The kernel's limit on PID namespace nesting (MAX_PID_NS_LEVEL).
         const MAX_SET_TID: u64 = 32;
         let size = clone.size();
         let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        if size < CLONE_ARGS_SIZE_VER1 || size > page {
+        if size <= SET_TID_SIZE_OFFSET || size > page {
             return None;
         }
         // The kernel copies all `size` bytes first: a fault there is its
@@ -4461,7 +4466,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // read although the kernel may (a page mapped writable, not readable,
         // or a mapped page 0) cannot be checked, so it is refused below.
         let memory = guest.memory();
-        let raw = match super::chosen_ids::read_clone_args(&memory, guest.tid().as_raw(), clone) {
+        let mut raw = match super::chosen_ids::read_clone_args(&memory, guest.tid().as_raw(), clone)
+        {
             super::chosen_ids::Clone3Read::Bytes(bytes) => bytes,
             super::chosen_ids::Clone3Read::Refused => return None,
             super::chosen_ids::Clone3Read::Unreadable { .. } => {
@@ -4474,16 +4480,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
             }
         };
+        // Zero-extended, as the kernel extends a shorter struct.
+        if raw.len() < super::chosen_ids::CLONE_ARGS_SIZE_VER2 {
+            raw.resize(super::chosen_ids::CLONE_ARGS_SIZE_VER2, 0);
+        }
         let field = |offset: usize| u64::from_ne_bytes(raw[offset..offset + 8].try_into().unwrap());
         let flags = field(0);
         let exit_signal = field(32);
         let set_tid = field(64);
         let set_tid_size = field(72);
-        // An exit signal must be a signal number, with nothing in CSIGNAL but
-        // CLONE_NEWTIME, which clone3 accepts from Linux 6.3 (on an older
-        // kernel, which refuses it with EINVAL, a refusal below is the
-        // conservative side).
-        if exit_signal > 64 || flags & 0x7f != 0 {
+        if !clone3_signal_fields_valid(flags, exit_signal) {
             return None;
         }
         if set_tid_size == 0 || set_tid_size > MAX_SET_TID {
@@ -8923,6 +8929,33 @@ fn clone3_field<M: MemoryAccess>(
         return None;
     }
     memory.read_value(Addr::<u64>::from_raw(field)?).ok()
+}
+
+/// Whether a `clone3`'s exit signal and the low byte of its flags pass the
+/// kernel's checks: the exit signal is a signal number, and the flags hold
+/// nothing in `CSIGNAL` but `CLONE_NEWTIME`, which `clone3` accepts from
+/// Linux 6.3 (`clone3_args_valid`). On an older kernel, which refuses
+/// `CLONE_NEWTIME` with EINVAL, a refusal after this is the conservative
+/// side.
+fn clone3_signal_fields_valid(flags: u64, exit_signal: u64) -> bool {
+    const CSIGNAL: u64 = 0xff;
+    const CLONE_NEWTIME: u64 = 0x80;
+    exit_signal <= 64 && flags & CSIGNAL & !CLONE_NEWTIME == 0
+}
+
+#[cfg(test)]
+mod clone3_signal_fields_tests {
+    /// CLONE_NEWTIME is the one CSIGNAL bit clone3 accepts in its flags;
+    /// every other one, or an exit signal above 64, is the kernel's EINVAL.
+    #[test]
+    fn clone3_accepts_only_clone_newtime_among_the_csignal_bits() {
+        assert!(super::clone3_signal_fields_valid(0x80, 17));
+        assert!(super::clone3_signal_fields_valid(0, 64));
+        for bit in 0..7 {
+            assert!(!super::clone3_signal_fields_valid(1 << bit, 17), "{bit}");
+        }
+        assert!(!super::clone3_signal_fields_valid(0, 65));
+    }
 }
 
 /// Where a `CLONE_PIDFD` clone writes the new process's pidfd (`clone`'s
