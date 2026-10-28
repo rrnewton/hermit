@@ -6313,7 +6313,7 @@ fn abstract_bind_notice_is_on_only_for_a_host_network_run_on_ptrace() {
     // backends Detcore's stderr would be the guest's.
     assert!(!resolved(&["--backend", "kvm"], &["--network=host"]));
 
-    let mut application = RunOpts::parse_from(["fakehermit", "--network=host", "fakeprog"]);
+    let mut application = run_opts_for(&["hermit", "run", "--network=host", "fakeprog"]);
     application.select_application_backend("dynamorio").unwrap();
     application.validate_args_with_perf_support(true).unwrap();
     assert!(
