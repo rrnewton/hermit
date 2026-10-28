@@ -95,6 +95,9 @@ mod tests {
         (5, "5a4ad14e74501e11", "4e10b2de93d47d64"),
         // Adds `Resources.slice_expired` (#4653).
         (6, "5a4ad14e74501e11", "6a1b176897e67771"),
+        // Retypes `GlobalRequest::RecordHostInput`
+        // (https://github.com/rrnewton/hermit/pull/4611).
+        (7, "6b6c7521a6620f94", "6a1b176897e67771"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
