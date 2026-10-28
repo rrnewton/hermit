@@ -150,9 +150,9 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .as_array()
             .unwrap()
             .len(),
-        // The reviewed catalog binds 73 runtime/artifact inputs.
+        // The reviewed catalog binds 76 runtime/artifact inputs.
         // The separately bound qualifier source adds one input.
-        74
+        77
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");

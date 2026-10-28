@@ -3027,8 +3027,15 @@ fi
 # Four test files move without changing the 1038-file source inventory. The
 # source catalog remains 73 rows (74 with its qualifier); no Tool code changes.
 # H env-shebang preprocessing is a separate follow-up, not covered by this pin.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 39a18b9cb8462b8d31ab48f0af3ce34f3d92bf78 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 39a18b9cb8462b8d31ab48f0af3ce34f3d92bf78 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 15853dd658edffbb69d78b0aec01a0fcea4d1067: from 39a18b9cb8462b8d31ab48f0af3ce34f3d92bf78.
+# Shared sealed startup carrier and caller-only endpoint delivery change Rust
+# consumers; SDK build.rs/vendor and native sources remain object-identical.
+# Recipe 2047197043f8f22b7be0ad1ecfbf80876f9b5ab075f2d819c4b748093e45f410
+# carries unchanged with all numeric budgets. Fresh current-pin Rust/runtime
+# validation remains required; this is no claim of runtime receipt reuse.
+# Measured DBT source inventory is 1039; premise catalog 76 / standalone 77.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 15853dd658edffbb69d78b0aec01a0fcea4d1067 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 15853dd658edffbb69d78b0aec01a0fcea4d1067 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
