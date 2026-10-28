@@ -4455,24 +4455,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         // EFAULT. A nonzero tail beyond the fields this code knows is not
         // read as a reason to let the call through, since a newer kernel may
         // accept it.
-        // Past user memory there is nothing to read, and a read's address
-        // arithmetic near the top of the address space would overflow.
-        let address = clone.args()?.as_raw();
-        if !super::chosen_ids::within_user_memory(address, size) {
-            return None;
-        }
-        let mut raw = vec![0u8; size];
+        // Read as copy_from_user reads it, with the guest's own access
+        // (`chosen_ids::read_clone_args`). A struct every kernel refuses
+        // (proved to fault included) goes to the kernel. One Detcore cannot
+        // read although the kernel may (a page mapped writable, not readable,
+        // or a mapped page 0) cannot be checked, so it is refused below.
         let memory = guest.memory();
-        memory
-            .read_exact(Addr::<u8>::from_raw(address)?, &mut raw)
-            .ok()?;
+        let raw = match super::chosen_ids::read_clone_args(&memory, guest.tid().as_raw(), clone) {
+            super::chosen_ids::Clone3Read::Bytes(bytes) => bytes,
+            super::chosen_ids::Clone3Read::Refused => return None,
+            super::chosen_ids::Clone3Read::Unreadable { .. } => {
+                return Some(
+                    self.refuse_unchecked_set_tid(
+                        guest,
+                        "clone3's struct clone_args cannot be read with the guest's own access",
+                    )
+                    .await,
+                );
+            }
+        };
         let field = |offset: usize| u64::from_ne_bytes(raw[offset..offset + 8].try_into().unwrap());
         let flags = field(0);
         let exit_signal = field(32);
         let set_tid = field(64);
         let set_tid_size = field(72);
-        // An exit signal must be a signal number, with nothing in CSIGNAL.
-        if exit_signal > 64 || flags & 0xff != 0 {
+        // An exit signal must be a signal number, with nothing in CSIGNAL but
+        // CLONE_NEWTIME, which clone3 accepts from Linux 6.3 (on an older
+        // kernel, which refuses it with EINVAL, a refusal below is the
+        // conservative side).
+        if exit_signal > 64 || flags & 0x7f != 0 {
             return None;
         }
         if set_tid_size == 0 || set_tid_size > MAX_SET_TID {
@@ -4553,23 +4564,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             return None;
         }
         if !read {
-            let message = "hermit: clone3 set_tid's array cannot be read with the guest's own \
-                           access, so Detcore cannot check its ids against the run's earlier \
-                           tasks (https://github.com/rrnewton/hermit/issues/4370)";
-            tracing::error!(
-                "[detcore, dtid {}] {}",
-                guest.thread_state().dettid,
-                message
-            );
-            if guest.config().panic_on_unsupported_syscalls {
-                use std::io::Write as _;
-                let _ = writeln!(crate::util::RetryingStderr, "{message}");
-            }
             return Some(
-                self.refuse_unserviceable_operation(
+                self.refuse_unchecked_set_tid(
                     guest,
-                    reverie::syscalls::Sysno::clone3,
-                    Errno::EFAULT,
+                    "clone3 set_tid's array cannot be read with the guest's own access",
                 )
                 .await,
             );
@@ -4600,6 +4598,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await,
         )
+    }
+
+    /// Refuse a `clone3` whose `set_tid` Detcore cannot check against the
+    /// run's earlier tasks, because `what` cannot be read with the guest's own
+    /// access while the kernel may read it: the conservative side, since a
+    /// reused id would merge two tasks' state in Detcore. With
+    /// `--allow-unsupported-syscalls` the call fails with `EFAULT`.
+    async fn refuse_unchecked_set_tid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        what: &str,
+    ) -> Result<i64, Error> {
+        let message = format!(
+            "hermit: {what}, so Detcore cannot check its set_tid against the run's earlier tasks \
+             (https://github.com/rrnewton/hermit/issues/4370)"
+        );
+        tracing::error!(
+            "[detcore, dtid {}] {}",
+            guest.thread_state().dettid,
+            message
+        );
+        if guest.config().panic_on_unsupported_syscalls {
+            use std::io::Write as _;
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+        }
+        self.refuse_unserviceable_operation(guest, reverie::syscalls::Sysno::clone3, Errno::EFAULT)
+            .await
     }
 
     /// Refuse by name a call from a nested PID namespace whose pids Detcore

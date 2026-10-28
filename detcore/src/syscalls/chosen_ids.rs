@@ -1242,7 +1242,11 @@ fn is_restart(errno: Errno) -> bool {
 
 /// A `clone3` call's `struct clone_args`, all the bytes it passes, if they
 /// can be read and number at most a page, the kernel's limit (E2BIG).
-fn read_clone_args<M: MemoryAccess>(memory: &M, tid: i32, clone: &syscalls::Clone3) -> Clone3Read {
+pub(crate) fn read_clone_args<M: MemoryAccess>(
+    memory: &M,
+    tid: i32,
+    clone: &syscalls::Clone3,
+) -> Clone3Read {
     let Ok(page) = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) else {
         return Clone3Read::Unreadable { flags: None };
     };
@@ -1305,7 +1309,7 @@ fn clone3_read_decision(
 /// A guest `clone3`'s `struct clone_args`, as Detcore read it to plan the
 /// call.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Clone3Read {
+pub(crate) enum Clone3Read {
     /// Its bytes, read as `copy_from_user` reads them.
     Bytes(Vec<u8>),
     /// Every kernel refuses the call before creating a task: the struct is
