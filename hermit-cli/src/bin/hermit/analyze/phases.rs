@@ -505,6 +505,9 @@ impl AnalyzeOpts {
         println!(
             "\n------------------------------ hermit analyze report ------------------------------"
         );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
         println!("{}", header);
         Self::print_stack("stack1", &chosen);
         Self::print_stack("stack2", &instead);
@@ -522,6 +525,7 @@ impl AnalyzeOpts {
                 event_index: decision,
                 stack: instead,
             },
+            branch_counter_warning: self.branch_counter_warning.clone(),
         })
     }
 
