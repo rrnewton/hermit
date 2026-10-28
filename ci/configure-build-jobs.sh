@@ -3140,8 +3140,27 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 82482ba80a1638d36ebf50d9518dfdfc6bb91185 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 82482ba80a1638d36ebf50d9518dfdfc6bb91185 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO e9c54de934df30175dbbfff162b1a4fcfa7670e7 (2026-10-28): from
+# 82482ba80a1638d36ebf50d9518dfdfc6bb91185. Two commits, each replayed
+# with an identical patch-id: 85336d95 (kvm lane, timer slice T1b-2: the
+# dormant KVM timer delivers precise timer events by single-stepping, in
+# reverie-kvm, one function of reverie-kvm-core/src/bootstrap.rs and the
+# root Cargo.lock's reverie-kvm entry, which gains iced-x86; the capability
+# stays false), then e9c54de9 (dbt lane: native startup failure completes
+# through its application owner, in reverie-dbt/native/client.c,
+# reverie-dbt/src/tools.rs, the launcher's startup-failure tests, and the
+# evidence.rs and caller_native_source.rs source-contract tests). The new
+# test module raises the reverie-dbt inventory from 1037 to 1038. The SDK
+# inputs to the DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# while reverie-dbt/native moves 0e9ffd386dbf -> c1f267db81c8 (client.c
+# only), so native artifacts are rebuilt; rust-toolchain.toml and
+# third-party/ are unchanged. The calibrated SDK budget, job width and
+# limits carry unchanged from the 82482ba8 entry; this carries SDK cost
+# only, not native byte equivalence or a cold-build timing sample.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e9c54de934df30175dbbfff162b1a4fcfa7670e7 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e9c54de934df30175dbbfff162b1a4fcfa7670e7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
