@@ -25,8 +25,8 @@ use super::compatibility_graph::Unit;
 
 pub const CAPTURE_ENV: &str = "HERMIT_COMPATIBILITY_RUSTC_CAPTURE";
 pub const GATE_ENV: &str = "HERMIT_COMPATIBILITY_RUSTC_GATE";
-pub const CAPTURE_SCHEMA: &str = "hermit-actual-rustc-capture/v1";
-pub const NORMALIZATION: &str = "hermit-shared-rustc-semantics/v1";
+pub const CAPTURE_SCHEMA: &str = "hermit-actual-rustc-capture/v2";
+pub const NORMALIZATION: &str = "hermit-shared-rustc-semantics/v2";
 pub const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_COMMANDS: usize = 4096;
@@ -70,6 +70,76 @@ pub struct ResponseFile {
     pub sha256: String,
 }
 
+/// Actual compiler input, distinct from guest stdin. Old captures lacking
+/// these bytes are not promoted to this schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CompilerInput {
+    File {
+        argument: usize,
+        path: Vec<u8>,
+        canonical_path: Vec<u8>,
+        identity: FileIdentity,
+        bytes: Vec<u8>,
+        sha256: String,
+    },
+    Stdin {
+        argument: usize,
+        bytes: Vec<u8>,
+        sha256: String,
+    },
+}
+
+impl CompilerInput {
+    pub fn argument(&self) -> usize {
+        match self {
+            Self::File { argument, .. } | Self::Stdin { argument, .. } => *argument,
+        }
+    }
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::File { bytes, .. } | Self::Stdin { bytes, .. } => bytes,
+        }
+    }
+    pub fn sha256(&self) -> &str {
+        match self {
+            Self::File { sha256, .. } | Self::Stdin { sha256, .. } => sha256,
+        }
+    }
+    pub fn validate(&self, command: &Invocation) -> Result<(), String> {
+        let argument = command
+            .argv
+            .get(self.argument())
+            .ok_or_else(|| "captured compiler source has no actual argument".to_owned())?;
+        if self.bytes().len() > MAX_COMMAND_BYTES || digest(self.bytes()) != self.sha256() {
+            return Err("captured compiler source bytes/digest differ".to_owned());
+        }
+        match self {
+            Self::Stdin { .. } if argument == b"-" => Ok(()),
+            Self::File {
+                path: raw,
+                canonical_path,
+                identity,
+                bytes,
+                ..
+            } => {
+                if !argument.ends_with(b".rs")
+                    || argument.starts_with(b"-")
+                    || absolute(&path(&command.cwd)?, argument)? != path(raw)?
+                    || !path(canonical_path)?.is_absolute()
+                    || identity.bytes != bytes.len() as u64
+                {
+                    return Err(
+                        "captured compiler file is not its exact source argument".to_owned()
+                    );
+                }
+                Ok(())
+            }
+            _ => Err("captured compiler stdin is not its exact source argument".to_owned()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Invocation {
@@ -80,6 +150,7 @@ pub struct Invocation {
     pub argv: Vec<Vec<u8>>,
     pub context: Context,
     pub response_files: Vec<ResponseFile>,
+    pub source: Option<CompilerInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +262,11 @@ impl Bundle {
             }) {
                 return Err("captured compiler has no exact compiler commit".to_owned());
             }
+            if let Some(source) = &command.source {
+                source.validate(command)?;
+            } else if !compiler_probe(command) {
+                return Err("emitting compiler command has no actual captured source".to_owned());
+            }
             for response in &command.response_files {
                 if digest(&response.bytes) != response.sha256
                     || command
@@ -289,6 +365,7 @@ pub struct Semantics {
     version: String,
     source: String,
     source_file: Vec<u8>,
+    source_sha256: String,
     cargo_unit: Unit,
     compiler: Vec<u8>,
     compiler_sha256: String,
@@ -337,10 +414,12 @@ fn actual_features(command: &Invocation) -> Result<Vec<String>, String> {
     Ok(features.into_iter().collect())
 }
 
-fn compiler_probe(command: &Invocation) -> bool {
+pub fn compiler_probe(command: &Invocation) -> bool {
     // Cargo can issue queries while package context is present. Do not treat
     // an actual emitted unit as a query merely because --print also appears.
     command.argv == [b"-vV".to_vec()]
+        || command.argv == [b"--version".to_vec()]
+        || command.argv == [b"--version".to_vec(), b"--verbose".to_vec()]
         || (command
             .argv
             .iter()
@@ -351,6 +430,426 @@ fn compiler_probe(command: &Invocation) -> bool {
                     || argument.starts_with(b"--out-dir=")
                     || (argument.starts_with(b"-o") && !argument.starts_with(b"--"))
             }))
+}
+
+fn owner<'a>(graph: &'a Graph, command: &Invocation) -> Result<&'a Package, String> {
+    let directory = command
+        .context
+        .manifest_directory
+        .as_deref()
+        .ok_or_else(|| "actual rustc unit has no Cargo manifest context".to_owned())?;
+    let manifest =
+        super::compatibility_graph::canonical_source_file(&path(directory)?.join("Cargo.toml"))?;
+    let mut matches = graph
+        .packages
+        .values()
+        .filter(|package| package.manifest_path == manifest);
+    let package = matches
+        .next()
+        .ok_or_else(|| "rustc manifest context is not one actual Cargo package".to_owned())?;
+    if matches.next().is_some() {
+        return Err("rustc manifest context is not one actual Cargo package".to_owned());
+    }
+    if command.context.package.as_deref() != Some(package.name.as_str())
+        || command.context.version.as_deref() != Some(package.version.as_str())
+    {
+        return Err("rustc Cargo name/version differs from its actual manifest package".to_owned());
+    }
+    Ok(package)
+}
+
+/// Resolve only a captured source against actual artifact-unit locators. An
+/// unrelated unbuilt metadata target is never required to exist.
+fn actual_source_unit<'a>(
+    graph: &'a Graph,
+    package: &Package,
+    command: &Invocation,
+) -> Result<Option<(usize, PathBuf, &'a Unit)>, String> {
+    let source = command
+        .source
+        .as_ref()
+        .ok_or_else(|| "actual compiler source was not captured".to_owned())?;
+    source.validate(command)?;
+    let CompilerInput::File { canonical_path, .. } = source else {
+        return Ok(None);
+    };
+    let candidate = path(canonical_path)?;
+    let features = actual_features(command)?;
+    let mut found = None;
+    for unit in graph.units.get(&package.id).into_iter().flatten() {
+        if unit.features != features {
+            continue;
+        }
+        let locators = graph
+            .source_locators
+            .get(&(package.id.clone(), unit.key()?))
+            .ok_or_else(|| "actual Cargo unit has no source locator proof".to_owned())?;
+        let declared = super::compatibility_graph::canonical_source_file(&locators.declared)?;
+        let emitted = super::compatibility_graph::canonical_source_file(&locators.emitted)?;
+        if declared != emitted {
+            return Err(
+                "actual Cargo target source differs from its metadata declaration".to_owned(),
+            );
+        }
+        if candidate == declared && found.replace((source.argument(), declared, unit)).is_some() {
+            return Err("rustc source target is ambiguous in its original argv".to_owned());
+        }
+    }
+    Ok(found)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum AuxiliaryArgument {
+    Raw {
+        bytes: Vec<u8>,
+    },
+    FileSource {
+        relative: Vec<u8>,
+    },
+    StdinSource,
+    BuildOutput {
+        option: String,
+        relative: Vec<u8>,
+    },
+    AutocfgCrateName {
+        ordinal: String,
+        generator: Box<ArtifactIdentity>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auxiliary {
+    owner: ArtifactIdentity,
+    output_scope: Vec<u8>,
+    compiler: Vec<u8>,
+    compiler_sha256: String,
+    source_sha256: String,
+    arguments: Vec<AuxiliaryArgument>,
+}
+
+// autocfg 1.5.1 src/lib.rs:297–303 and620–641: its random namespace
+// prevents temporary probe collisions; the ordinal and every other input
+// remain exact. The actual compiled generator source must have these bytes.
+const AUTOCFG_SOURCE: &str = "772630d0e09d06f343fd72284c8330eacde87d2a4ee22f70af62a0e2119fbf05";
+
+fn autocfg_ordinal(name: &[u8]) -> Option<&[u8]> {
+    let rest = name.strip_prefix(b"autocfg_")?;
+    let (nonce, ordinal) = rest.split_at_checked(16)?;
+    let ordinal = ordinal.strip_prefix(b"_")?;
+    (nonce
+        .iter()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        && !ordinal.is_empty()
+        && ordinal.iter().all(u8::is_ascii_digit)
+        && (ordinal == b"0" || !ordinal.starts_with(b"0")))
+    .then_some(ordinal)
+}
+
+fn autocfg_generator(
+    graph: &Graph,
+    bundle: &Bundle,
+    package: &Package,
+    core_root: &Path,
+) -> Result<ArtifactIdentity, String> {
+    let closure = graph.closure(&package.id)?;
+    let generators: Vec<_> = graph
+        .packages
+        .values()
+        .filter(|candidate| {
+            closure.contains(&candidate.id)
+                && candidate.name == "autocfg"
+                && candidate.version == "1.5.1"
+                && candidate.source.as_deref()
+                    == Some("registry+https://github.com/rust-lang/crates.io-index")
+        })
+        .collect();
+    if generators.len() != 1 {
+        return Err("auxiliary random crate name has no exact measured generator".to_owned());
+    }
+    let generator = generators[0];
+    let units: Vec<_> = graph
+        .units
+        .get(&generator.id)
+        .into_iter()
+        .flatten()
+        .filter(|unit| unit.kind == ["lib"] && unit.target == "autocfg")
+        .collect();
+    if units.len() != 1 {
+        return Err("autocfg generator has no unique actual library unit".to_owned());
+    }
+    let mut matching = 0;
+    for captured in &bundle.commands {
+        let command = &captured.invocation;
+        if compiler_probe(command) {
+            continue;
+        }
+        if owner(graph, command)?.id != generator.id {
+            continue;
+        }
+        if actual_source_unit(graph, generator, command)?
+            .is_some_and(|(_, _, unit)| unit == units[0])
+        {
+            if command.source.as_ref().map(CompilerInput::sha256) != Some(AUTOCFG_SOURCE) {
+                return Err(
+                    "autocfg nonce policy does not recognize the actual generator source"
+                        .to_owned(),
+                );
+            }
+            matching += 1;
+        }
+    }
+    if matching != 1 {
+        return Err("autocfg nonce policy requires one real generator compiler capture".to_owned());
+    }
+    artifact_identity(graph, &generator.id, units[0], core_root)
+}
+
+/// `reference` is a complete actual cold population proving the generator,
+/// not a replacement for this invocation's newly captured input or outcome.
+pub fn auxiliary_for_invocation(
+    graph: &Graph,
+    bundle: &Bundle,
+    reference: &Bundle,
+    command: &Invocation,
+) -> Result<Option<Auxiliary>, String> {
+    if compiler_probe(command) {
+        return Ok(None);
+    }
+    let package = owner(graph, command)?;
+    if actual_source_unit(graph, package, command)?.is_some() {
+        return Ok(None);
+    }
+    if !command.response_files.is_empty() || command.argv.iter().any(|arg| arg.starts_with(b"@")) {
+        return Err(
+            "auxiliary response expansion is unsupported; compatibility is unavailable".to_owned(),
+        );
+    }
+    let core = graph.named("hermit-run")?;
+    let core_root = core
+        .manifest_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "core manifest has no source root".to_owned())?;
+    let owners: Vec<_> = graph
+        .units
+        .get(&package.id)
+        .into_iter()
+        .flatten()
+        .filter(|unit| unit.kind == ["custom-build"] && unit.crate_types == ["bin"])
+        .collect();
+    if owners.len() != 1 {
+        return Err("unmatched compiler has no unique actual build-script owner".to_owned());
+    }
+    let source = command
+        .source
+        .as_ref()
+        .expect("actual_source_unit checked captured source");
+    let cwd = path(&command.cwd)?;
+    if cwd.canonicalize().map_err(|error| error.to_string())?
+        != package.manifest_path.parent().expect("manifest parent")
+    {
+        return Err("auxiliary compiler cwd is not its actual package".to_owned());
+    }
+    let mut outputs = Vec::new();
+    for (index, argument) in command.argv.iter().enumerate() {
+        for name in [b"--out-dir".as_slice(), b"-o".as_slice()] {
+            if let Some((value, count)) = option(argument, name, command.argv.get(index + 1)) {
+                outputs.push((index, count, name, absolute(&cwd, value)?));
+            }
+        }
+    }
+    if outputs.len() != 1 {
+        return Err("auxiliary compiler has no unique bounded output".to_owned());
+    }
+    let (output_index, output_count, output_option, output) = &outputs[0];
+    let roots: Vec<_> = graph
+        .build_outputs
+        .get(&package.id)
+        .into_iter()
+        .flatten()
+        .filter(|root| root.starts_with(&bundle.target_directory) && output.starts_with(root))
+        .collect();
+    if roots.len() != 1 {
+        return Err(
+            "auxiliary compiler output is not its actual Cargo build-script out_dir".to_owned(),
+        );
+    }
+    let root = roots[0];
+    if [root.as_path(), output.as_path()].iter().any(|path| {
+        path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    }) {
+        return Err("auxiliary output has a noncanonical relative component".to_owned());
+    }
+    let scope = root
+        .strip_prefix(&bundle.target_directory)
+        .map_err(|error| error.to_string())?;
+    let components: Vec<_> = scope.components().collect();
+    let build = components
+        .iter()
+        .position(|component| component.as_os_str() == "build")
+        .ok_or_else(|| "auxiliary build output has no Cargo build scope".to_owned())?;
+    if !(1..=2).contains(&build)
+        || components.len() != build + 3
+        || components
+            .last()
+            .is_none_or(|component| component.as_os_str() != "out")
+    {
+        return Err("auxiliary build output has an unsupported Cargo layout".to_owned());
+    }
+    let mut output_scope = PathBuf::new();
+    for component in &components[..build] {
+        output_scope.push(component.as_os_str());
+    }
+    let mut arguments = Vec::new();
+    let mut index = 0;
+    while index < command.argv.len() {
+        let argument = &command.argv[index];
+        if index == source.argument() {
+            arguments.push(match source {
+                CompilerInput::File { canonical_path, .. } => {
+                    let source = path(canonical_path)?;
+                    let relative = source
+                        .strip_prefix(package.manifest_path.parent().expect("manifest parent"))
+                        .map_err(|_| "auxiliary source is outside its actual package".to_owned())?;
+                    AuxiliaryArgument::FileSource {
+                        relative: bytes(relative),
+                    }
+                }
+                CompilerInput::Stdin { .. } => AuxiliaryArgument::StdinSource,
+            });
+            index += 1;
+            continue;
+        }
+        if index == *output_index {
+            arguments.push(AuxiliaryArgument::BuildOutput {
+                option: text(output_option, "auxiliary output option")?,
+                relative: bytes(
+                    output
+                        .strip_prefix(root)
+                        .map_err(|error| error.to_string())?,
+                ),
+            });
+            index += *output_count;
+            continue;
+        }
+        if let Some((name, count)) = option(argument, b"--crate-name", command.argv.get(index + 1))
+        {
+            if let Some(ordinal) = autocfg_ordinal(name) {
+                let lib = command
+                    .argv
+                    .iter()
+                    .filter(|arg| arg.as_slice() == b"--crate-type=lib")
+                    .count()
+                    == 1;
+                let ir = command
+                    .argv
+                    .iter()
+                    .filter(|arg| arg.as_slice() == b"--emit=llvm-ir")
+                    .count()
+                    == 1;
+                if !matches!(source, CompilerInput::Stdin { .. })
+                    || !lib
+                    || !ir
+                    || *output_option != b"--out-dir"
+                {
+                    return Err(
+                        "autocfg nonce is outside the exact measured stdin/lib/llvm-ir form"
+                            .to_owned(),
+                    );
+                }
+                arguments.push(AuxiliaryArgument::AutocfgCrateName {
+                    ordinal: text(ordinal, "autocfg ordinal")?,
+                    generator: Box::new(autocfg_generator(graph, reference, package, core_root)?),
+                });
+                index += count;
+                continue;
+            }
+            if name.starts_with(b"autocfg_") {
+                return Err("unrecognized autocfg generated name".to_owned());
+            }
+        }
+        arguments.push(AuxiliaryArgument::Raw {
+            bytes: argument.clone(),
+        });
+        index += 1;
+    }
+    if !graph.closure(&core.id)?.contains(&package.id) {
+        // The extension's additional build-script units still require exact
+        // ownership/input/output proof, but are not the shared core cohort.
+        return Ok(None);
+    }
+    Ok(Some(Auxiliary {
+        owner: artifact_identity(graph, &package.id, owners[0], core_root)?,
+        output_scope: bytes(&output_scope),
+        compiler: command.compiler.verbose_version.clone(),
+        compiler_sha256: command.compiler.sha256.clone(),
+        source_sha256: source.sha256().to_owned(),
+        arguments,
+    }))
+}
+
+pub fn auxiliary(graph: &Graph, bundle: &Bundle) -> Result<BTreeMap<String, usize>, String> {
+    auxiliary_with_reference(graph, bundle, bundle)
+}
+
+pub fn auxiliary_with_reference(
+    graph: &Graph,
+    bundle: &Bundle,
+    reference: &Bundle,
+) -> Result<BTreeMap<String, usize>, String> {
+    let mut result = BTreeMap::new();
+    for captured in &bundle.commands {
+        // The original strict successful-command predicate is retained. A
+        // negative compiler probe is not silently reclassified as success.
+        if captured.completion.exit_code != Some(0) || captured.completion.signal.is_some() {
+            return Err(
+                "auxiliary compiler outcome differs from successful captured completion".to_owned(),
+            );
+        }
+        if let Some(actual) =
+            auxiliary_for_invocation(graph, bundle, reference, &captured.invocation)?
+        {
+            let key = serde_json::to_string(&(
+                actual,
+                captured.completion.exit_code,
+                captured.completion.signal,
+            ))
+            .map_err(|error| error.to_string())?;
+            *result.entry(key).or_insert(0) += 1;
+        }
+    }
+    Ok(result)
+}
+
+fn queries(bundle: &Bundle) -> Result<BTreeMap<String, usize>, String> {
+    let mut result = BTreeMap::new();
+    for captured in &bundle.commands {
+        let command = &captured.invocation;
+        if compiler_probe(command) {
+            if captured.completion.exit_code != Some(0) || captured.completion.signal.is_some() {
+                return Err("compiler query did not complete successfully".to_owned());
+            }
+            let key = serde_json::to_string(&(
+                &command.argv,
+                &command.context,
+                &command.source,
+                &command.compiler.verbose_version,
+                &command.compiler.sha256,
+                captured.completion.exit_code,
+                captured.completion.signal,
+            ))
+            .map_err(|error| error.to_string())?;
+            *result.entry(key).or_insert(0) += 1;
+        }
+    }
+    Ok(result)
 }
 
 /// Only the core CLI entry executable is absent from an extension's shared
@@ -374,10 +873,10 @@ fn core_entry_binary(core: &Package, package: &Package, unit: &Unit) -> bool {
             && target.kind == unit.kind
             && target.crate_types == unit.crate_types
     });
-    targets
-        .next()
-        .is_some_and(|target| target.src_path == crate_directory.join("src/bin/hermit/main.rs"))
-        && targets.next().is_none()
+    targets.next().is_some_and(|target| {
+        super::compatibility_graph::canonical_source_file(&target.src_path)
+            .is_ok_and(|source| source == crate_directory.join("src/bin/hermit/main.rs"))
+    }) && targets.next().is_none()
 }
 
 pub fn for_invocation(
@@ -385,37 +884,21 @@ pub fn for_invocation(
     bundle: &Bundle,
     command: &Invocation,
 ) -> Result<Option<Semantics>, String> {
+    for_invocation_with_reference(graph, bundle, bundle, command)
+}
+
+pub fn for_invocation_with_reference(
+    graph: &Graph,
+    bundle: &Bundle,
+    reference: &Bundle,
+    command: &Invocation,
+) -> Result<Option<Semantics>, String> {
     if compiler_probe(command) {
         return Ok(None);
     }
-    let manifest = command
-        .context
-        .manifest_directory
-        .as_deref()
-        .ok_or_else(|| "actual rustc unit has no Cargo manifest context".to_owned())?;
-    let manifest = path(manifest)?
-        .join("Cargo.toml")
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let matches: Vec<_> = graph
-        .packages
-        .values()
-        .filter(|package| package.manifest_path == manifest)
-        .collect();
-    if matches.len() != 1 {
-        return Err("rustc manifest context is not one actual Cargo package".to_owned());
-    }
-    let package = matches[0];
-    if command.context.package.as_deref() != Some(package.name.as_str())
-        || command.context.version.as_deref() != Some(package.version.as_str())
-    {
-        return Err("rustc Cargo name/version differs from its actual manifest package".to_owned());
-    }
+    let package = owner(graph, command)?;
     let core = graph.named("hermit-run")?;
     let closure = graph.closure(&core.id)?;
-    if !closure.contains(&package.id) {
-        return Ok(None);
-    }
     // The source/API producer supports only a full measured core checkout.
     let core_root = core
         .manifest_path
@@ -426,48 +909,18 @@ pub fn for_invocation(
         return Err("response-file bytes were captured, but verified rustc response expansion is not yet supported; compatibility is unavailable".to_owned());
     }
     let cwd = path(&command.cwd)?;
-    let mut source = None;
-    for (index, argument) in command.argv.iter().enumerate() {
-        if argument.starts_with(b"-") {
-            continue;
-        }
-        let candidate = absolute(&cwd, argument)?;
-        let Some(target) = package
-            .targets
-            .iter()
-            .find(|target| target.src_path == candidate)
-        else {
-            continue;
-        };
-        if source.replace((index, target)).is_some() {
-            return Err("rustc source target is ambiguous in its original argv".to_owned());
-        }
-    }
-    let (source_index, target) =
-        source.ok_or_else(|| "rustc argv has no actual Cargo source target".to_owned())?;
-    let relative = target
-        .src_path
-        .strip_prefix(package.manifest_path.parent().expect("manifest has parent"))
-        .map_err(|_| "rustc source is outside its actual package".to_owned())?;
-    let features = actual_features(command)?;
-    let actual_units: Vec<_> = graph
-        .units
-        .get(&package.id)
-        .into_iter()
-        .flatten()
-        .filter(|unit| {
-            unit.target == target.name
-                && unit.kind == target.kind
-                && unit.crate_types == target.crate_types
-                && unit.features == features
-        })
-        .collect();
-    if actual_units.len() != 1 {
-        return Err("actual rustc command is not one unique Cargo artifact unit".to_owned());
-    }
-    if core_entry_binary(core, package, actual_units[0]) {
+    let Some((source_index, source_path, actual_unit)) =
+        actual_source_unit(graph, package, command)?
+    else {
+        auxiliary_for_invocation(graph, bundle, reference, command)?;
+        return Ok(None);
+    };
+    if !closure.contains(&package.id) || core_entry_binary(core, package, actual_unit) {
         return Ok(None);
     }
+    let relative = source_path
+        .strip_prefix(package.manifest_path.parent().expect("manifest has parent"))
+        .map_err(|_| "rustc source is outside its actual package".to_owned())?;
     let mut output = None;
     for (index, argument) in command.argv.iter().enumerate() {
         let Some((value, _)) = option(argument, b"--out-dir", command.argv.get(index + 1)) else {
@@ -592,7 +1045,13 @@ pub fn for_invocation(
         version: package.version.clone(),
         source: package_source(package, core_root)?,
         source_file: bytes(relative),
-        cargo_unit: actual_units[0].clone(),
+        source_sha256: command
+            .source
+            .as_ref()
+            .expect("source checked")
+            .sha256()
+            .to_owned(),
+        cargo_unit: actual_unit.clone(),
         compiler: command.compiler.verbose_version.clone(),
         compiler_sha256: command.compiler.sha256.clone(),
         arguments,
@@ -606,6 +1065,9 @@ pub fn shared(graph: &Graph, bundle: &Bundle) -> Result<BTreeMap<String, Semanti
     let mut result = BTreeMap::new();
     let mut units = BTreeSet::new();
     for captured in &bundle.commands {
+        if captured.completion.exit_code != Some(0) || captured.completion.signal.is_some() {
+            return Err("actual shared compiler command did not succeed".to_owned());
+        }
         if let Some(semantics) = for_invocation(graph, bundle, &captured.invocation)? {
             let key = serde_json::to_string(&semantics).map_err(|error| error.to_string())?;
             units.insert((
@@ -683,10 +1145,20 @@ pub fn cohort(
             "the two actual builds have different shared rustc semantics/populations".to_owned(),
         );
     }
+    let auxiliary_first = auxiliary(first_graph, first)?;
+    let auxiliary_second = auxiliary(second_graph, second)?;
+    if auxiliary_first != auxiliary_second || queries(first)? != queries(second)? {
+        return Err(
+            "the two actual builds have different auxiliary compiler/query inputs or outcomes"
+                .to_owned(),
+        );
+    }
     let bytes = serde_json::to_vec(&expected).map_err(|error| error.to_string())?;
     Ok(
         serde_json::json!({"schema":CAPTURE_SCHEMA,"normalization":NORMALIZATION,
-        "shared_units":expected.len(),"shared_sha256":digest(&bytes)}),
+        "shared_units":expected.len(),"shared_sha256":digest(&bytes),
+        "auxiliary_commands":auxiliary_first.values().sum::<usize>(),
+        "auxiliary_sha256":digest(&serde_json::to_vec(&auxiliary_first).map_err(|error| error.to_string())?)}),
     )
 }
 
@@ -918,6 +1390,21 @@ mod tests {
                         manifest_directory: Some(bytes(&root.join(directory))),
                     },
                     response_files: vec![],
+                    source: Some(CompilerInput::File {
+                        argument: 2,
+                        path: bytes(&root.join(source)),
+                        canonical_path: bytes(&root.join(source)),
+                        identity: FileIdentity {
+                            device: 0,
+                            inode: 0,
+                            bytes: std::fs::read(root.join(source)).unwrap().len() as u64,
+                            mode: 0o100644,
+                            modified: (0, 0),
+                            changed: (0, 0),
+                        },
+                        bytes: std::fs::read(root.join(source)).unwrap(),
+                        sha256: digest(&std::fs::read(root.join(source)).unwrap()),
+                    }),
                 };
                 let completion = Completion {
                     schema: CAPTURE_SCHEMA.to_owned(),
@@ -977,5 +1464,213 @@ mod tests {
                 digest(&serde_json::to_vec(&changed.commands[index].invocation).unwrap());
             assert!(cohort(&core_graph, &with_entry, &extension_graph, &changed).is_err());
         }
+
+        // A real leased-home symlink is a locator, not a different package or
+        // source. Both the Cargo declaration and captured argv remain bound.
+        let alias = root.join("cargo-homes/slot-0");
+        std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let mut aliased = library_only.clone();
+        for captured in &mut aliased.commands {
+            let command = &mut captured.invocation;
+            let manifest = path(command.context.manifest_directory.as_ref().unwrap()).unwrap();
+            command.context.manifest_directory =
+                Some(bytes(&alias.join(manifest.strip_prefix(&root).unwrap())));
+            let Some(CompilerInput::File {
+                argument,
+                path: raw,
+                canonical_path,
+                ..
+            }) = &mut command.source
+            else {
+                panic!("file fixture");
+            };
+            let aliased_source =
+                alias.join(path(canonical_path).unwrap().strip_prefix(&root).unwrap());
+            command.argv[*argument] = bytes(&aliased_source);
+            *raw = bytes(&aliased_source);
+        }
+        assert_eq!(expected, shared(&extension_graph, &aliased).unwrap());
+        let mut mismatch_graph = graph_for(false);
+        let dep = &library_only.commands[2].invocation;
+        let key = mismatch_graph.units["dependency"][0].key().unwrap();
+        let unrelated = root.join("shared-dependency/unrelated.rs");
+        std::fs::write(&unrelated, b"// a real different file\n").unwrap();
+        mismatch_graph
+            .source_locators
+            .get_mut(&("dependency".to_owned(), key))
+            .unwrap()
+            .emitted = unrelated;
+        assert!(
+            for_invocation(&mismatch_graph, &library_only, dep).is_err(),
+            "real unrelated source must refuse"
+        );
+        let actual = root.join("shared-dependency/src/lib.rs");
+        let saved = std::fs::read(&actual).unwrap();
+        std::fs::remove_file(&actual).unwrap();
+        assert!(
+            for_invocation(&extension_graph, &library_only, dep).is_err(),
+            "missing actual unit source must refuse"
+        );
+        std::fs::write(actual, saved).unwrap();
+        let mut incomplete = library_only.clone();
+        incomplete.commands[0].invocation.source = None;
+        assert!(
+            shared(&extension_graph, &incomplete).is_err(),
+            "missing input cannot become a unit"
+        );
+
+        // Auxiliary emitter inputs/options/outcomes have a separate complete
+        // comparison. They never fill a missing actual Cargo artifact unit.
+        let mut aux_graph = graph_for(false);
+        let package = aux_graph.packages["dependency"].clone();
+        let custom = Unit {
+            package: package.name.clone(),
+            version: package.version.clone(),
+            target: "build-script-build".to_owned(),
+            kind: vec!["custom-build".to_owned()],
+            crate_types: vec!["bin".to_owned()],
+            features: vec![],
+            profile: profile.clone(),
+        };
+        let build_source = root.join("shared-dependency/build.rs");
+        std::fs::write(&build_source, b"fn main() {}\n").unwrap();
+        aux_graph.source_locators.insert(
+            (package.id.clone(), custom.key().unwrap()),
+            super::super::compatibility_graph::SourceLocators {
+                declared: build_source.clone(),
+                emitted: build_source,
+            },
+        );
+        aux_graph.units.get_mut(&package.id).unwrap().push(custom);
+        let out = target_directory.join("debug/build/shared-dependency-actual/out");
+        aux_graph
+            .build_outputs
+            .insert(package.id.clone(), [out.clone()].into_iter().collect());
+        let probe = root.join("shared-dependency/probe.rs");
+        let body = b"pub fn actual_probe() {}\n";
+        std::fs::write(&probe, body).unwrap();
+        let mut auxiliary_capture = library_only.commands[2].clone();
+        let command = &mut auxiliary_capture.invocation;
+        command.cwd = bytes(package.manifest_path.parent().unwrap());
+        command.argv[1] = b"probe".to_vec();
+        command.argv[2] = bytes(&probe);
+        command.argv[7] = bytes(&out);
+        command.source = Some(CompilerInput::File {
+            argument: 2,
+            path: bytes(&probe),
+            canonical_path: bytes(&probe),
+            identity: FileIdentity {
+                bytes: body.len() as u64,
+                ..compiler.identity.clone()
+            },
+            bytes: body.to_vec(),
+            sha256: digest(body),
+        });
+        let mut aux_bundle = library_only.clone();
+        aux_bundle.commands = vec![auxiliary_capture.clone()];
+        let measured = auxiliary(&aux_graph, &aux_bundle).unwrap();
+        assert_eq!(measured.values().sum::<usize>(), 1);
+        assert!(
+            for_invocation(&aux_graph, &aux_bundle, &auxiliary_capture.invocation)
+                .unwrap()
+                .is_none()
+        );
+        for alteration in 0..5 {
+            let mut changed = aux_bundle.clone();
+            let command = &mut changed.commands[0].invocation;
+            match alteration {
+                0 => command.argv.push(b"--cfg=changed_probe_semantics".to_vec()),
+                1 => {
+                    if let Some(CompilerInput::File {
+                        bytes,
+                        sha256,
+                        identity,
+                        ..
+                    }) = &mut command.source
+                    {
+                        bytes.push(b' ');
+                        *sha256 = digest(bytes);
+                        identity.bytes = bytes.len() as u64;
+                    }
+                }
+                2 => command.source = None,
+                3 => {
+                    command.argv[7] = bytes(&target_directory.join("debug/build/foreign-owner/out"))
+                }
+                _ => changed.commands[0].completion.exit_code = Some(101),
+            }
+            assert!(
+                !auxiliary(&aux_graph, &changed).is_ok_and(|actual| actual == measured),
+                "changed or incomplete auxiliary input/options/outcome must refuse equality"
+            );
+        }
+        let mut stdin = aux_bundle.clone();
+        stdin.commands[0].invocation.argv[2] = b"-".to_vec();
+        stdin.commands[0].invocation.source = Some(CompilerInput::Stdin {
+            argument: 2,
+            bytes: body.to_vec(),
+            sha256: digest(body),
+        });
+        assert_eq!(
+            auxiliary(&aux_graph, &stdin)
+                .unwrap()
+                .values()
+                .sum::<usize>(),
+            1
+        );
+        let mut missing = stdin.clone();
+        missing.commands[0].invocation.source = None;
+        assert!(
+            auxiliary(&aux_graph, &missing).is_err(),
+            "stdin bytes cannot be inferred from argv"
+        );
+        missing = stdin.clone();
+        if let Some(CompilerInput::Stdin { bytes, .. }) = &mut missing.commands[0].invocation.source
+        {
+            bytes.push(b' ');
+        }
+        assert!(
+            auxiliary(&aux_graph, &missing).is_err(),
+            "stdin digest must bind exact bytes"
+        );
+        for name in [
+            b"autocfg_0123456789abcdef_0".as_slice(),
+            b"autocfg_fedcba9876543210_0",
+        ] {
+            let mut unknown_generator = stdin.clone();
+            unknown_generator.commands[0].invocation.argv = vec![
+                b"--crate-name".to_vec(),
+                name.to_vec(),
+                b"-".to_vec(),
+                b"--crate-type=lib".to_vec(),
+                b"--emit=llvm-ir".to_vec(),
+                b"--out-dir".to_vec(),
+                bytes(&out),
+            ];
+            assert!(
+                auxiliary(&aux_graph, &unknown_generator)
+                    .unwrap_err()
+                    .contains("exact measured generator"),
+                "nonce form without actual exact generator must refuse"
+            );
+        }
+        assert_eq!(
+            autocfg_ordinal(b"autocfg_0123456789abcdef_17"),
+            Some(b"17".as_slice())
+        );
+        for invalid in [
+            b"arbitrary_0123456789abcdef_17".as_slice(),
+            b"autocfg_0123456789abcdeg_17",
+            b"autocfg_0123456789abcdef_017",
+        ] {
+            assert!(autocfg_ordinal(invalid).is_none());
+        }
+        // The schema cannot retrofit missing old stdin bytes.
+        let mut old = serde_json::to_value(&stdin).unwrap();
+        old["schema"] = "hermit-actual-rustc-capture/v1".into();
+        let old_path = root.join("old-incomplete-capture.json");
+        std::fs::write(&old_path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(Bundle::read(&input_file(&old_path)).is_err());
     }
 }

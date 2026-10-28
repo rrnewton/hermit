@@ -158,6 +158,50 @@ pub struct Target {
     pub src_path: PathBuf,
 }
 
+/// Raw Cargo locators are retained; only an actual matching compiler source
+/// resolves these paths. Unbuilt metadata targets need not exist on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLocators {
+    pub declared: PathBuf,
+    pub emitted: PathBuf,
+}
+
+pub fn canonical_source_file(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("actual Cargo source locator is not absolute".to_owned());
+    }
+    let resolved = path.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve actual Cargo source {}: {error}",
+            path.display()
+        )
+    })?;
+    if !resolved.is_file() {
+        return Err("actual Cargo source is not a regular file".to_owned());
+    }
+    Ok(resolved)
+}
+
+fn metadata_packages(packages: Vec<Package>) -> Result<BTreeMap<String, Package>, String> {
+    let mut result = BTreeMap::new();
+    let mut manifests = BTreeSet::new();
+    for mut package in packages {
+        package.manifest_path = canonical_source_file(&package.manifest_path)?;
+        if package
+            .manifest_path
+            .file_name()
+            .is_none_or(|name| name != "Cargo.toml")
+            || !manifests.insert(package.manifest_path.clone())
+        {
+            return Err("actual metadata has duplicate or noncanonical manifest owners".to_owned());
+        }
+        if result.insert(package.id.clone(), package).is_some() {
+            return Err("actual metadata repeats a package ID".to_owned());
+        }
+    }
+    Ok(result)
+}
+
 #[derive(Debug, Deserialize)]
 struct Artifact {
     package_id: String,
@@ -175,6 +219,8 @@ pub struct Graph {
     pub units: BTreeMap<String, Vec<Unit>>,
     pub executables: BTreeMap<(String, String), PathBuf>,
     pub artifacts: BTreeMap<PathBuf, (String, Unit)>,
+    pub source_locators: BTreeMap<(String, String), SourceLocators>,
+    pub build_outputs: BTreeMap<String, BTreeSet<PathBuf>>,
 }
 
 impl Graph {
@@ -198,12 +244,7 @@ impl Graph {
                     .to_owned(),
             );
         }
-        let mut packages = BTreeMap::new();
-        for package in metadata.packages {
-            if packages.insert(package.id.clone(), package).is_some() {
-                return Err("actual metadata repeats a package ID".to_owned());
-            }
-        }
+        let packages = metadata_packages(metadata.packages)?;
         let mut edges = BTreeMap::new();
         for node in metadata
             .resolve
@@ -230,6 +271,8 @@ impl Graph {
             units: BTreeMap::new(),
             executables: BTreeMap::new(),
             artifacts: BTreeMap::new(),
+            source_locators: BTreeMap::new(),
+            build_outputs: BTreeMap::new(),
         };
         graph.read_artifacts(&input.artifacts.read(MAX_GRAPH_BYTES)?)?;
         Ok(graph)
@@ -239,6 +282,8 @@ impl Graph {
         let mut units: BTreeMap<String, BTreeMap<String, Unit>> = BTreeMap::new();
         let mut executables = BTreeMap::new();
         let mut artifacts = BTreeMap::new();
+        let mut source_locators = BTreeMap::new();
+        let mut build_outputs: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
         let mut finished = false;
         for line in bytes
             .split(|byte| *byte == b'\n')
@@ -267,6 +312,24 @@ impl Graph {
                     let package = self.packages.get(&artifact.package_id).ok_or_else(|| {
                         "built package is absent from the actual metadata".to_owned()
                     })?;
+                    let declared: Vec<_> = package
+                        .targets
+                        .iter()
+                        .filter(|target| {
+                            target.name == artifact.target.name
+                                && target.kind == artifact.target.kind
+                                && target.crate_types == artifact.target.crate_types
+                        })
+                        .collect();
+                    if declared.len() != 1 {
+                        return Err(
+                            "actual Cargo artifact has no unique declared target".to_owned()
+                        );
+                    }
+                    let locators = SourceLocators {
+                        declared: declared[0].src_path.clone(),
+                        emitted: artifact.target.src_path.clone(),
+                    };
                     let unit = Unit {
                         package: package.name.clone(),
                         version: package.version.clone(),
@@ -283,6 +346,12 @@ impl Graph {
                         || !unit.profile.is_object()
                     {
                         return Err("Cargo unit has invalid features/profile".to_owned());
+                    }
+                    if source_locators
+                        .insert((package.id.clone(), unit.key()?), locators.clone())
+                        .is_some_and(|old| old != locators)
+                    {
+                        return Err("actual Cargo unit has conflicting source locators".to_owned());
                     }
                     let duplicate_executable = artifact
                         .executable
@@ -312,6 +381,32 @@ impl Graph {
                         .or_default()
                         .insert(unit.key()?, unit);
                 }
+                Some("build-script-executed") => {
+                    if finished {
+                        return Err(
+                            "Cargo emitted a build-script result after build-finished".to_owned()
+                        );
+                    }
+                    let owner = value
+                        .get("package_id")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "Cargo build-script result has no owner".to_owned())?;
+                    if !self.packages.contains_key(owner) {
+                        return Err("Cargo build-script owner is absent from metadata".to_owned());
+                    }
+                    let directory = value
+                        .get("out_dir")
+                        .and_then(serde_json::Value::as_str)
+                        .map(PathBuf::from)
+                        .filter(|path| path.is_absolute())
+                        .ok_or_else(|| {
+                            "Cargo build-script output is not an absolute locator".to_owned()
+                        })?;
+                    build_outputs
+                        .entry(owner.to_owned())
+                        .or_default()
+                        .insert(directory);
+                }
                 Some(_) => {}
                 None => return Err("Cargo output has no typed message reason".to_owned()),
             }
@@ -325,6 +420,8 @@ impl Graph {
             .collect();
         self.executables = executables;
         self.artifacts = artifacts;
+        self.source_locators = source_locators;
+        self.build_outputs = build_outputs;
         Ok(())
     }
 
@@ -357,5 +454,77 @@ impl Graph {
             }
         }
         Ok(found)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leased_manifest_alias_is_injective_and_unbuilt_targets_stay_declared() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-metadata-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let _owned = Owned(root.clone());
+        let leased = root.join("cargo-homes/validate-cargo-fixture");
+        let package = leased.join("registry/src/pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("Cargo.toml"),
+            b"[package]\nname='fixture'\nversion='1.0.0'\n",
+        )
+        .unwrap();
+        let alias = root.join("cargo-homes/slot-0");
+        std::os::unix::fs::symlink(&leased, &alias).unwrap();
+        let target = alias.join("registry/src/pkg/unbuilt-optional-test.rs");
+        let value = Package {
+            id: "fixture".to_owned(),
+            name: "fixture".to_owned(),
+            version: "1.0.0".to_owned(),
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+            manifest_path: alias.join("registry/src/pkg/Cargo.toml"),
+            targets: vec![Target {
+                name: "optional".to_owned(),
+                kind: vec!["test".to_owned()],
+                crate_types: vec!["bin".to_owned()],
+                src_path: target.clone(),
+            }],
+        };
+        let measured = metadata_packages(vec![value.clone()]).unwrap();
+        assert_eq!(
+            measured["fixture"].manifest_path,
+            package.join("Cargo.toml")
+        );
+        assert_eq!(measured["fixture"].targets[0].src_path, target);
+        assert!(!target.exists(), "unbuilt target must not be manufactured");
+        assert!(
+            canonical_source_file(&target).is_err(),
+            "an actual selected missing source still refuses"
+        );
+        let mut duplicate = value.clone();
+        duplicate.id = "different-id".to_owned();
+        duplicate.manifest_path = package.join("Cargo.toml");
+        assert!(
+            metadata_packages(vec![value.clone(), duplicate]).is_err(),
+            "canonical manifest ownership must be injective"
+        );
+        std::fs::remove_file(package.join("Cargo.toml")).unwrap();
+        assert!(
+            metadata_packages(vec![value]).is_err(),
+            "an actual manifest must exist"
+        );
     }
 }
