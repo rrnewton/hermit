@@ -1232,7 +1232,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and hermit-manifest-plan's copy of canonical_verdict::tests::
     // store_exclusive_retries_are_optional_and_strictly_typed (a verify
     // divergence names its store-exclusive retries): 1937.
-    ("test.regular_crates", 1937),
+    // And detcore-model's config::tests::
+    // rewrite_exclusives_overlay_never_enters_the_legacy_form: 1938.
+    ("test.regular_crates", 1938),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5110,8 +5112,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.cli_on_host", 666),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
-    // Kept equal to the second test.regular_crates_on_host entry below: 1923.
-    ("test.regular_crates_on_host", 1923),
+    // Kept equal to the second test.regular_crates_on_host entry below: 1924.
+    ("test.regular_crates_on_host", 1924),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6259,7 +6261,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same legacy-form unit: 1921.
     // Less #4740's tests, which main counts since train 10: 1920.
     // And the same three store-exclusive cause units: 1923.
-    ("test.regular_crates_on_host", 1923),
+    // And the same overlay legacy-form unit: 1924.
+    ("test.regular_crates_on_host", 1924),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
