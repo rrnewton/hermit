@@ -43,7 +43,9 @@ use super::compatibility_rustc::CAPTURE_SCHEMA;
 use super::compatibility_rustc::Captured;
 use super::compatibility_rustc::Compiler;
 use super::compatibility_rustc::CompilerInput;
+use super::compatibility_rustc::CompilerQuery;
 use super::compatibility_rustc::Completion;
+use super::compatibility_rustc::DirectoryIdentity;
 use super::compatibility_rustc::FileIdentity;
 use super::compatibility_rustc::GATE_ENV;
 use super::compatibility_rustc::Invocation;
@@ -51,6 +53,9 @@ use super::compatibility_rustc::MAX_CAPTURE_BYTES;
 use super::compatibility_rustc::MAX_COMMAND_BYTES;
 use super::compatibility_rustc::MAX_COMMANDS;
 use super::compatibility_rustc::ResponseFile;
+use super::compatibility_rustc::SysrootArtifact;
+use super::compatibility_rustc::SysrootExtern;
+use super::compatibility_rustc::SysrootSearch;
 
 const COMPLETION_ALLOWANCE: usize = 16 * 1024;
 const VERSION_BYTES: usize = 64 * 1024;
@@ -424,14 +429,14 @@ fn drain(pipe: &mut impl Read, bytes: &mut Vec<u8>) -> Result<bool> {
     Ok(false)
 }
 
-fn compiler_version(compiler: &Path) -> Result<Vec<u8>> {
+fn compiler_query(compiler: &Path, argv: &[&str]) -> Result<CompilerQuery> {
     let mut child = Command::new(compiler)
-        .arg("-vV")
+        .args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let result = (|| -> Result<Vec<u8>> {
+    let result = (|| -> Result<CompilerQuery> {
         let mut stdout = child
             .stdout
             .take()
@@ -461,7 +466,12 @@ fn compiler_version(compiler: &Path) -> Result<Vec<u8>> {
                     status.success() && err.is_empty(),
                     "compiler identity command failed or left incomplete output: {status}"
                 );
-                return Ok(out);
+                return Ok(CompilerQuery {
+                    argv: argv.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+                    stdout: out,
+                    stderr: err,
+                    exit_code: status.code().context("compiler query has no exit status")?,
+                });
             }
             ensure!(
                 start.elapsed() < Duration::from_secs(10),
@@ -491,6 +501,10 @@ fn compiler_version(compiler: &Path) -> Result<Vec<u8>> {
     result
 }
 
+fn compiler_version(compiler: &Path) -> Result<Vec<u8>> {
+    Ok(compiler_query(compiler, &["-vV"])?.stdout)
+}
+
 fn compiler(path: &Path) -> Result<Compiler> {
     ensure!(
         path.is_absolute(),
@@ -512,6 +526,202 @@ fn compiler(path: &Path) -> Result<Compiler> {
         sha256,
         verbose_version: version,
     })
+}
+
+fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = file.metadata()?;
+    ensure!(meta.is_dir(), "sysroot search is not a real directory");
+    Ok(DirectoryIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+        mode: meta.mode(),
+    })
+}
+
+fn proc_macro_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    for (count, entry) in std::fs::read_dir(directory)?.enumerate() {
+        ensure!(
+            count < MAX_COMMANDS,
+            "sysroot search inventory exceeds its finite bound"
+        );
+        let entry = entry?;
+        if compatibility_rustc::proc_macro_artifact_name(entry.file_name().as_bytes())
+            .map_err(anyhow::Error::msg)?
+            .is_some()
+        {
+            candidates.push(entry.path());
+        }
+    }
+    candidates.sort();
+    Ok(candidates)
+}
+
+fn sysroot_artifact(path: &Path, remaining: u64) -> Result<SysrootArtifact> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let before = identity(&file)?;
+    ensure!(
+        before.bytes > 0 && before.bytes <= remaining,
+        "sysroot artifact exceeds its finite byte bound"
+    );
+    let mut hash = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        count = count
+            .checked_add(read as u64)
+            .context("sysroot artifact byte overflow")?;
+        ensure!(
+            count <= remaining,
+            "sysroot artifact grew beyond its finite byte bound"
+        );
+        hash.update(&buffer[..read]);
+    }
+    let current = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    ensure!(
+        count == before.bytes
+            && identity(&file)? == before
+            && identity(&current)? == before
+            && path.canonicalize()? == path,
+        "sysroot artifact changed while captured"
+    );
+    Ok(SysrootArtifact {
+        path: path.as_os_str().as_bytes().to_vec(),
+        identity: before,
+        sha256: format!("{:x}", hash.finalize()),
+    })
+}
+
+/// The query is an actual bounded compiler metadata child in production.
+/// Keeping resolution separate lets the control use real tiny files without
+/// running a second compiler or inventing a sysroot for an old population.
+fn sysroot_resolution(
+    command: &Invocation,
+    target: &Path,
+    query: CompilerQuery,
+) -> Result<Vec<SysrootExtern>> {
+    let shape = compatibility_rustc::sysroot_extern_shape(command)
+        .map_err(anyhow::Error::msg)?
+        .context("sysroot resolution has no implicit extern")?;
+    let directory = query
+        .stdout
+        .strip_suffix(b"\n")
+        .filter(|value| !value.is_empty() && !value.contains(&b'\n') && !value.contains(&0))
+        .context("compiler target-libdir output is not one exact Unix path")?;
+    let directory = PathBuf::from(std::ffi::OsStr::from_bytes(directory));
+    ensure!(
+        directory.is_absolute(),
+        "compiler target-libdir is not absolute"
+    );
+    let canonical = directory.canonicalize()?;
+    let before = directory_identity(&canonical)?;
+    let candidates = proc_macro_candidates(&canonical)?;
+    ensure!(
+        candidates.len() == 2,
+        "compiler sysroot has no unique proc_macro artifact pair"
+    );
+    let mut remaining = MAX_CAPTURE_BYTES as u64;
+    let mut artifacts = Vec::new();
+    for candidate in &candidates {
+        let artifact = sysroot_artifact(candidate, remaining)?;
+        remaining -= artifact.identity.bytes;
+        artifacts.push(artifact);
+    }
+    ensure!(
+        directory.canonicalize()? == canonical
+            && directory_identity(&canonical)? == before
+            && proc_macro_candidates(&canonical)? == candidates,
+        "compiler sysroot directory or candidate set changed while captured"
+    );
+    let cwd = Path::new(std::ffi::OsStr::from_bytes(&command.cwd));
+    let mut searches = Vec::new();
+    for (argument, raw) in &shape.searches {
+        let name = Path::new(std::ffi::OsStr::from_bytes(raw));
+        let directory = if name.is_absolute() {
+            name.to_owned()
+        } else {
+            cwd.join(name)
+        };
+        let canonical = directory.canonicalize()?;
+        ensure!(
+            canonical.starts_with(target) && canonical != target,
+            "implicit proc_macro dependency search escapes the actual fresh target"
+        );
+        let identity = directory_identity(&canonical)?;
+        let candidates = proc_macro_candidates(&canonical)?;
+        ensure!(
+            candidates.is_empty(),
+            "dependency search contains a proc_macro shadow"
+        );
+        ensure!(
+            directory.canonicalize()? == canonical
+                && directory_identity(&canonical)? == identity
+                && proc_macro_candidates(&canonical)?.is_empty(),
+            "implicit proc_macro dependency search changed while captured"
+        );
+        searches.push(SysrootSearch {
+            argument: *argument,
+            directory: directory.as_os_str().as_bytes().to_vec(),
+            canonical_directory: canonical.as_os_str().as_bytes().to_vec(),
+            identity,
+            candidates: Vec::new(),
+        });
+    }
+    let captures = shape
+        .arguments
+        .iter()
+        .map(|argument| SysrootExtern {
+            argument: *argument,
+            name: b"proc_macro".to_vec(),
+            compiler: command.compiler.clone(),
+            host: shape.host.clone(),
+            query: query.clone(),
+            directory: directory.as_os_str().as_bytes().to_vec(),
+            canonical_directory: canonical.as_os_str().as_bytes().to_vec(),
+            identity: before.clone(),
+            artifacts: artifacts.clone(),
+            searches: searches.clone(),
+        })
+        .collect();
+    let mut checked = command.clone();
+    checked.sysroot_externs = captures;
+    compatibility_rustc::validate_sysroot_externs(&checked, target).map_err(anyhow::Error::msg)?;
+    Ok(checked.sysroot_externs)
+}
+
+fn sysroot_externs(command: &Invocation, target: &Path) -> Result<Vec<SysrootExtern>> {
+    if compatibility_rustc::sysroot_extern_shape(command)
+        .map_err(anyhow::Error::msg)?
+        .is_none()
+    {
+        return Ok(Vec::new());
+    }
+    let path = Path::new(std::ffi::OsStr::from_bytes(&command.compiler.path));
+    ensure!(
+        compiler(path)? == command.compiler,
+        "sysroot query compiler changed before resolution"
+    );
+    let query = compiler_query(path, &["--print", "target-libdir"])?;
+    let captured = sysroot_resolution(command, target, query)?;
+    ensure!(
+        compiler(path)? == command.compiler,
+        "sysroot query compiler changed after resolution"
+    );
+    Ok(captured)
 }
 
 fn response_files(argv: &[Vec<u8>], cwd: &Path) -> Result<Vec<ResponseFile>> {
@@ -615,7 +825,7 @@ fn invocation(
             .map(|path| path.as_os_str().as_bytes().to_vec()),
     };
     let (source, replay) = source_input(&argv, &cwd)?;
-    let command = Invocation {
+    let mut command = Invocation {
         schema: CAPTURE_SCHEMA.to_owned(),
         pid: std::process::id(),
         compiler: compiler(compiler_path)?,
@@ -624,7 +834,9 @@ fn invocation(
         argv,
         context,
         source,
+        sysroot_externs: Vec::new(),
     };
+    command.sysroot_externs = sysroot_externs(&command, &config.target_directory)?;
     if let Some(source) = &command.source {
         source.validate(&command).map_err(anyhow::Error::msg)?;
     } else {
@@ -668,7 +880,8 @@ fn run(config_path: &Path) -> Result<ExitCode> {
         Ok(
             response_files(&command.argv, &std::env::current_dir()?)? == command.response_files
                 && source_unchanged(&command, &mut replay)?
-                && self::compiler(Path::new(&compiler))? == command.compiler,
+                && self::compiler(Path::new(&compiler))? == command.compiler
+                && sysroot_externs(&command, &config.target_directory)? == command.sysroot_externs,
         )
     })();
     let (exit_code, signal, mut capture_error) = match &status {
@@ -860,6 +1073,162 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn implicit_proc_macro_capture_binds_one_host_sysroot_and_refuses_shadow_or_change() {
+        let fixture = QuotaFixture::new();
+        let libdir = fixture
+            .root
+            .join("toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib");
+        let deps = fixture.config.target_directory.join("debug/deps");
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+        let rlib = libdir.join("libproc_macro-0123456789abcdef.rlib");
+        let rmeta = libdir.join("libproc_macro-0123456789abcdef.rmeta");
+        std::fs::write(&rlib, b"real fixture rlib bytes").unwrap();
+        std::fs::write(&rmeta, b"real fixture rmeta bytes").unwrap();
+        let source = fixture.root.join("fixture.rs");
+        std::fs::write(&source, b"// real fixture source\n").unwrap();
+        let compiler_path = fixture.root.join("fixture-rustc");
+        std::fs::write(&compiler_path, b"fixture identity, never executed").unwrap();
+        let compiler = Compiler {
+            path: compiler_path.as_os_str().as_bytes().to_vec(),
+            identity: identity(&File::open(&compiler_path).unwrap()).unwrap(),
+            sha256: digest(&std::fs::read(&compiler_path).unwrap()),
+            verbose_version: format!(
+                "rustc fixture\ncommit-hash: {}\nhost: x86_64-unknown-linux-gnu\n",
+                "a".repeat(40)
+            )
+            .into_bytes(),
+        };
+        let command = Invocation {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            pid: 1,
+            compiler,
+            cwd: fixture.root.as_os_str().as_bytes().to_vec(),
+            argv: vec![
+                b"--crate-name".to_vec(),
+                b"fixture".to_vec(),
+                source.as_os_str().as_bytes().to_vec(),
+                b"--crate-type".to_vec(),
+                b"proc-macro".to_vec(),
+                b"--out-dir".to_vec(),
+                deps.as_os_str().as_bytes().to_vec(),
+                b"-L".to_vec(),
+                [b"dependency=".as_slice(), deps.as_os_str().as_bytes()].concat(),
+                b"--extern".to_vec(),
+                b"proc_macro".to_vec(),
+            ],
+            context: compatibility_rustc::Context {
+                package: None,
+                version: None,
+                manifest_directory: None,
+            },
+            response_files: Vec::new(),
+            source: None,
+            sysroot_externs: Vec::new(),
+        };
+        let query = CompilerQuery {
+            argv: vec![b"--print".to_vec(), b"target-libdir".to_vec()],
+            stdout: [libdir.as_os_str().as_bytes(), b"\n"].concat(),
+            stderr: Vec::new(),
+            exit_code: 0,
+        };
+        let resolve = |command: &Invocation| {
+            sysroot_resolution(command, &fixture.config.target_directory, query.clone())
+        };
+        let captured = resolve(&command).unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].argument, 9);
+        assert_eq!(captured[0].artifacts.len(), 2);
+        assert_eq!(captured[0].artifacts[0].identity.bytes, 23);
+        assert!(captured[0].searches[0].candidates.is_empty());
+        assert_eq!(resolve(&command).unwrap(), captured);
+
+        std::fs::write(
+            deps.join("libproc_macro2-0123456789abcdef.rlib"),
+            b"a different crate",
+        )
+        .unwrap();
+        assert_eq!(resolve(&command).unwrap(), captured);
+        std::fs::write(&rlib, b"changed actual fixture bytes").unwrap();
+        assert_ne!(
+            resolve(&command).unwrap(),
+            captured,
+            "post-run recapture must detect changed artifact bytes/identity"
+        );
+        std::fs::write(&rlib, b"real fixture rlib bytes").unwrap();
+
+        let shadow = deps.join("libproc_macro-0123456789abcdef.rlib");
+        std::fs::write(&shadow, b"real shadow").unwrap();
+        assert!(
+            resolve(&command).is_err(),
+            "a competing dependency artifact must refuse"
+        );
+        std::fs::remove_file(shadow).unwrap();
+        let other = fixture.root.join("other.rlib");
+        std::fs::write(&other, b"symlink target").unwrap();
+        std::fs::remove_file(&rlib).unwrap();
+        std::os::unix::fs::symlink(&other, &rlib).unwrap();
+        assert!(
+            resolve(&command).is_err(),
+            "a sysroot artifact symlink must refuse"
+        );
+        std::fs::remove_file(&rlib).unwrap();
+        std::fs::write(&rlib, b"real fixture rlib bytes").unwrap();
+        std::fs::remove_file(&rmeta).unwrap();
+        assert!(
+            resolve(&command).is_err(),
+            "both exact artifact kinds are required"
+        );
+        std::fs::write(&rmeta, b"real fixture rmeta bytes").unwrap();
+        let mismatched = libdir.join("libproc_macro-fedcba9876543210.rmeta");
+        std::fs::rename(&rmeta, &mismatched).unwrap();
+        assert!(
+            resolve(&command).is_err(),
+            "rlib and rmeta stems must be equal"
+        );
+        std::fs::rename(&mismatched, &rmeta).unwrap();
+        for suffix in ["rlib", "rmeta"] {
+            std::fs::write(
+                libdir.join(format!("libproc_macro-fedcba9876543210.{suffix}")),
+                b"another stem",
+            )
+            .unwrap();
+        }
+        assert!(
+            resolve(&command).is_err(),
+            "multiple matching stems must refuse"
+        );
+        for suffix in ["rlib", "rmeta"] {
+            std::fs::remove_file(libdir.join(format!("libproc_macro-fedcba9876543210.{suffix}")))
+                .unwrap();
+        }
+        let unknown = libdir.join("libproc_macro-0123456789abcdef.so");
+        std::fs::write(&unknown, b"unknown matching form").unwrap();
+        assert!(resolve(&command).is_err());
+        std::fs::remove_file(unknown).unwrap();
+        for extra in [
+            "--target=x86_64-unknown-linux-gnu",
+            "--sysroot=/other",
+            "-Lnative=/other",
+        ] {
+            let mut overridden = command.clone();
+            overridden.argv.push(extra.as_bytes().to_vec());
+            assert!(
+                resolve(&overridden).is_err(),
+                "unmeasured override {extra} must refuse"
+            );
+        }
+        let mut unknown = command.clone();
+        unknown.argv[10] = b"unknown_bare_crate".to_vec();
+        assert!(resolve(&unknown).is_err());
+        let mut wrong_query = query;
+        wrong_query.exit_code = 1;
+        assert!(
+            sysroot_resolution(&command, &fixture.config.target_directory, wrong_query).is_err()
+        );
     }
 
     #[test]
