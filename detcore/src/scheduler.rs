@@ -22096,8 +22096,9 @@ mod test {
     /// which its thread retired recorded events is charged one scheduler turn,
     /// as the recording charged the yield turn it stands for. One under which
     /// nothing retired is free, and every `TraceReplay` turn under an older
-    /// record is free, as before; either way the turn is its thread's
-    /// previous turn, as before.
+    /// record is free, as before. Either way the turn is not its thread's
+    /// previous turn: a schedule replay's own switch turns stay out of that
+    /// bookkeeping (`previous_turn_tid`).
     #[test]
     fn a_replayed_switch_in_is_charged_when_its_thread_ran_guest_code() {
         let config = Config::default();
@@ -22129,9 +22130,9 @@ mod test {
         let after_one_turn = time.lock().unwrap().as_nanos();
         assert!(after_one_turn > start);
 
-        assert_eq!(charge(true, 3), (after_one_turn, Some(thread)));
-        assert_eq!(charge(true, 0), (start, Some(thread)));
-        assert_eq!(charge(false, 3), (start, Some(thread)));
+        assert_eq!(charge(true, 3), (after_one_turn, None));
+        assert_eq!(charge(true, 0), (start, None));
+        assert_eq!(charge(false, 3), (start, None));
     }
 
     /// A format-3 record makes its replay charge replayed switch-ins, and the
