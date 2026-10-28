@@ -21,6 +21,7 @@ mod clean;
 mod cli_owned_lifecycle;
 mod container;
 mod dap_adapter;
+mod departure_note;
 #[cfg(test)]
 mod exec_stop_launch_tests;
 mod gdb_client;
@@ -69,6 +70,7 @@ mod podman_store;
 mod record;
 mod record_envelope;
 mod record_start;
+mod refusal_note;
 mod remove;
 mod replay;
 mod run;

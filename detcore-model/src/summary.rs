@@ -128,6 +128,20 @@ impl fmt::Display for PreemptionSummary {
     }
 }
 
+/// Where a schedule replay first ran another thread than its schedule names:
+/// the schedule asked for a thread the run could not run at that point (one
+/// blocked there, say, in a splice of two runs' orders that this execution
+/// cannot take), so what the run did from then on is not that schedule's.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduleDeparture {
+    /// The run's event, counted as the replayer counts them (from 0).
+    pub event: u64,
+    /// The thread the schedule names there.
+    pub expected: DetTid,
+    /// The thread that ran instead.
+    pub running: DetTid,
+}
+
 /// Statistics that summarize a hermit run.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct RunSummary {
@@ -143,6 +157,13 @@ pub struct RunSummary {
 
     /// A human-readable summary of the desyncs that occurred.
     pub desync_descrip: Option<String>,
+
+    /// **Trace replay:** the first event at which the run ran another thread
+    /// than the replayed schedule names there ([`ScheduleDeparture`]). Absent
+    /// when it never did, and in summaries from before it was recorded. Not
+    /// part of the human-readable summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_departure: Option<ScheduleDeparture>,
 
     /// A summary of when threads where preempted and reprioritized (for --chaos mode), e.g. --record-preemptions-to.
     pub reprio_descrip: Option<String>,
@@ -249,6 +270,7 @@ impl RunSummary {
             schedevent_recorded,
             schedevent_desynced,
             desync_descrip,
+            schedule_departure: _,
             reprio_descrip: _,
             num_processes,
             num_threads,

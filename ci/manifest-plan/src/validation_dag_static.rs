@@ -1844,7 +1844,105 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1121, listed (1114 on main plus seven).
     // And the fourteen pinned_cpu::tests units, which choose the CPU a run is
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
-    ("test.hermit_unit", 1169),
+    // And analyze's trial-input tests: phases::tests::{the_workspace_is_created_in_the_tmp_dir,
+    // a_same_thread_critical_pair_is_flagged_and_a_cross_thread_one_is_not},
+    // rundata::tests::{trials_bind_only_a_workspace_the_private_tmp_would_hide,
+    // every_trial_hands_the_guest_the_target_seed_inputs} and
+    // schedule_search::tests::{a_failing_schedule_with_extra_events_reduces_to_the_one_swap,
+    // replays_differing_only_by_branch_skid_are_one_interleaving}: 1175.
+    // And analyze --prefix-search: phases::tests::the_prefix_search_finds_the_deciding_event
+    // and schedule_search::tests::{a_failure_on_failing_only_events_ends_with_no_single_swap,
+    // an_unstable_control_schedule_is_an_error,
+    // two_agreeing_replays_classify_a_schedule_after_an_outlier}: 1179.
+    // And phases::tests::a_prefix_trial_keeps_the_target_checkpoints_within_its_prefix
+    // (a prefix trial keeps the callback checkpoints its events reach): 1180.
+    // (a prefix trial keeps the callback checkpoints of the slices its events
+    // end): 1106.
+    // And phases::tests::a_prefix_report_says_when_both_stacks_are_one_thread: 1181.
+    // And analyze's per-trial bound: rundata::tests::{the_trial_bound_derives_from_the_slowest_endpoint_run,
+    // runs_take_the_bound_and_the_target_run_does_not, a_run_the_trial_bound_ends_names_the_bound,
+    // a_trials_log_is_capped_by_the_largest_endpoint_log,
+    // a_trial_that_a_bound_ends_did_not_reach_the_target,
+    // an_unenforceable_trial_timeout_is_refused_and_auto_does_without} and
+    // global_opts::tests::a_runs_log_bound_only_tightens_the_environment_bound: 1188.
+    // And the prefix search's continuation timeslice: phases::tests::{auto_continuations_only_get_coarser,
+    // the_prefix_search_continues_at_the_first_usable_timeslice} and
+    // rundata::tests::a_continuation_timeslice_that_would_change_the_prefix_is_refused: 1191.
+    // And the report's stacks: phases::tests::{only_the_criteria_a_run_misses_are_reported,
+    // a_replay_leaves_its_schedule_at_the_first_other_event,
+    // each_racing_stack_comes_from_a_replay_that_reached_it,
+    // a_target_replay_with_another_failure_than_the_target_run_is_named,
+    // a_report_without_a_deciding_event_reads,
+    // a_timing_decision_names_the_thread_that_runs_next_in_each_continuation}: 1197.
+    // And phases::tests::slice_ends_are_reported_only_when_the_next_stacks_tell_nothing_apart: 1198.
+    // And --minimize's replay of its own record:
+    // rundata::tests::a_normalized_record_is_written_for_reading_and_not_replayed and
+    // phases::tests::the_baseline_knock_out_removes_a_real_intervention_until_none_is_left: 1200.
+    // And --minimize's baseline search and minimization: phases::tests::the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses and
+    // minimize::tests::a_failed_cut_of_a_threads_last_interventions_is_tested_again: 1202.
+    // And the confirmation of a boundary trial the bound stopped:
+    // phases::tests::{a_trial_a_bound_stopped_does_not_decide_the_boundary,
+    // a_confirmed_trial_keeps_the_boundary,
+    // a_refuted_boundary_resumes_above_the_last_finished_miss,
+    // an_empty_prefix_that_meets_the_target_given_longer_ends_the_search} and
+    // rundata::tests::a_confirmation_lengthens_the_trial_bound: 1133.
+    // And phases::tests::a_boundary_trial_still_stopped_is_reported_as_a_hang,
+    // the_longest_finished_prefix_below_the_boundary_is_named and
+    // a_confirmation_raises_the_bound_and_keeps_it_once_finished: 1210.
+    // And analyze's workspace cleanup: workspace::tests::{a_workspace_is_removed_when_dropped,
+    // a_kept_workspace_stays, a_workspace_that_cannot_be_removed_is_named,
+    // an_uncreatable_tmp_dir_is_named} and stop::tests::{the_parent_is_the_field_after_the_state,
+    // the_first_stop_signal_is_the_one_reported,
+    // a_stop_signal_reaches_the_children_and_only_them,
+    // the_handler_stops_what_analyze_started_and_nothing_else}: 1218.
+    // And analyze's budget and resume: five budget::tests, four
+    // checkpoint::tests, seven rundata::tests (journaled runs, budget bounds,
+    // a cut run, the key's input digest, the reproducer's own bound), nine
+    // phases::tests (budget-ended prefix search and its resume, bracket,
+    // partial reports, resume refusal, restart from a whole interval, the
+    // kept workspace, a resume through the journal) and two
+    // schedule_search::tests (a stopped search's closest pair and its resume,
+    // a search started from an observed interval): 1245.
+    // And phases::tests::a_budget_hit_after_the_decision_reports_it: 1246.
+    // And phases::tests::a_trial_budget_that_ends_at_the_stack_trace_runs_reports_the_decision: 1247.
+    // And a trial analyze's wall-clock bound stops is no outcome:
+    // phases::tests::{a_trial_the_backstop_stopped_runs_again_and_does_not_change_the_answer,
+    // a_trial_stopped_again_ends_the_search_with_a_partial_report,
+    // a_stop_by_the_run_arguments_timeout_still_counts_as_not_meeting_the_target,
+    // a_bisection_trial_the_backstop_stopped_runs_again_and_does_not_change_the_pair}
+    // and rundata::tests::{the_auto_bound_grows_with_the_slowest_finished_run,
+    // a_backstop_stop_is_not_journaled_and_the_key_ignores_the_bound}: 1188.
+    // Less #4649's five boundary-confirmation tests, removed with the
+    // confirmation (phases::tests::{a_confirmation_raises_the_bound_and_keeps_it_once_finished,
+    // a_trial_a_bound_stopped_does_not_decide_the_boundary, a_confirmed_trial_keeps_the_boundary,
+    // a_refuted_boundary_resumes_above_the_last_finished_miss,
+    // an_empty_prefix_that_meets_the_target_given_longer_ends_the_search}), plus
+    // phases::tests::{a_continuation_with_an_inconclusive_endpoint_trial_ends_the_search,
+    // a_baseline_run_the_backstop_stopped_runs_again}: 1250.
+    // And a spliced schedule the replay cannot follow never decides:
+    // schedule_search::tests::{the_candidates_lie_between_the_pair_midpoint_first,
+    // an_infeasible_schedule_never_decides, a_pass_without_a_feasible_schedule_ends_the_search,
+    // an_endpoint_the_replay_leaves_keeps_its_outcome},
+    // phases::tests::a_bisection_round_that_left_its_schedule_never_decides and
+    // rundata::tests::a_departure_from_the_schedule_is_read_journaled_and_answered: 1256.
+    // And splicing only runs whose threads agree:
+    // schedule_search::tests::{the_matching_keeps_each_threads_order_and_its_syscalls_whole,
+    // one_reordered_event_or_split_syscall_is_a_divergence} and
+    // phases::tests::a_prefix_search_after_divergent_traces_says_why: 1259.
+    // And phases::tests::{diverging_endpoints_go_to_the_prefix_search,
+    // a_round_that_left_its_schedule_and_then_stopped_never_decides} and
+    // departure_note::tests::a_departure_noted_by_a_killed_child_reaches_its_parent_once: 1262.
+    // And departure_note::tests::arming_installs_the_hook_that_writes_the_note: 1263.
+    // And phases::tests::{a_stopped_stack_trace_replay_leaves_its_stacks_missing_not_the_decision,
+    // only_finished_stack_trace_replays_contradict_the_search}: 1265.
+    // And a refused trial never being an outcome: refusal_note::tests::{
+    // arming_installs_the_hook_that_writes_the_note,
+    // a_refusal_reason_noted_by_an_exiting_child_reaches_its_parent_once} and
+    // phases::tests::{a_host_timed_refusal_runs_again_and_does_not_change_the_answer,
+    // a_refusal_refused_again_or_deterministic_ends_the_search_with_a_partial_report,
+    // a_refused_search_round_or_minimize_replay_is_never_an_end,
+    // a_refused_recheck_is_noted_in_the_report}: 1271.
+    ("test.hermit_unit", 1271),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3053,7 +3151,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And determinize_stat_reports_one_link_for_directories_only and
     // determinize_stat_nlink_pin_edges (directory st_nlink pinned to 1):
     // 2736 + 2 = 2738, listed.
-    ("test.detcore_unit", 2738),
+    // And preemptions::tests::a_schedule_prefix_keeps_the_checkpoints_its_events_reach
+    // (a replay of a schedule's first events keeps their callback
+    // checkpoints): 2739, listed.
+    // And preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities: 2740.
+    // And scheduler::replayer::tests::the_first_departure_from_the_schedule_is_kept
+    // (where a replay first ran another thread than its schedule names): 2741.
+    // And tool_global::tests::stopping_refusal_tests::
+    // the_first_refusal_reason_is_handed_to_the_hook_once: 2742.
+    ("test.detcore_unit", 2742),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5334,7 +5440,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same protection-key subscription unit: 2692, listed.
     // And the same P2b deletion of the anchor device unit: 2694, listed.
     // And the same two directory st_nlink units: 2738, listed.
-    ("test.detcore_unit_on_host", 2738),
+    // And the same schedule-prefix unit: 2739, listed.
+    // And the same normalize test: 2740.
+    // And the same schedule-departure unit: 2741.
+    // And the same refusal-hook unit: 2742.
+    ("test.detcore_unit_on_host", 2742),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5702,7 +5812,31 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
-    ("test.hermit_unit_on_host", 1163),
+    // And the same six analyze trial-input tests: 1169.
+    // And the same four analyze --prefix-search tests: 1173.
+    // And the same prefix-trial checkpoint test: 1174.
+    // And the same one-thread prefix report test: 1175.
+    // And the same seven analyze per-trial bound tests: 1182.
+    // And the same three continuation-timeslice tests: 1185.
+    // And the same six report-stack tests: 1191.
+    // And the same slice-end test: 1192.
+    // And the same two minimize tests: 1194.
+    // And the same two --minimize tests: 1196.
+    // And the same five boundary-confirmation tests: 1133.
+    // And the same three prefix-hang tests: 1204.
+    // And the same eight workspace-cleanup tests: 1212.
+    // And the same twenty-seven budget-and-resume tests: 1239.
+    // And the same decided-budget test: 1240.
+    // And the same cut-path decided-budget test: 1241.
+    // And the same six backstop tests: 1188.
+    // Less the same five confirmation tests, plus the same two backstop tests: 1244.
+    // And the same six infeasible-splice tests: 1250.
+    // And the same three divergence tests: 1253.
+    // And the same three dispatch, stopped-departure and note tests: 1256.
+    // And the same arming test: 1257.
+    // And the same two stack-trace tests: 1259.
+    // And the same six refusal tests: 1265.
+    ("test.hermit_unit_on_host", 1265),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

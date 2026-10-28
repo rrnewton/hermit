@@ -32,7 +32,7 @@ pub(crate) mod posix_timer_coalesce;
 mod posix_timer_coalesce_tests;
 pub(crate) mod real_timer;
 mod rejoin_log;
-mod replayer;
+pub(crate) mod replayer;
 pub mod runqueue;
 mod sigalrm;
 pub mod sigkill_retirement;
@@ -16955,6 +16955,7 @@ impl Scheduler {
                 schedevent_desynced: total_desyncs,
                 // schedevent_desynced_at_context_switch: total_desyncs.at_context_switch,
                 desync_descrip,
+                schedule_departure: self.replayer.as_ref().and_then(|r| r.first_departure),
                 reprio_descrip,
                 threads_descrip,
                 num_processes,

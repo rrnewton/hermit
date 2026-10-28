@@ -8,8 +8,12 @@
 
 //! A mode for analyzing a hermit run.
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use clap::Parser;
 use regex::Regex;
@@ -18,6 +22,20 @@ use reverie::process::ExitStatus;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::metadata::LevelFilter;
+
+use crate::analyze::budget::Budget;
+use crate::analyze::budget::BudgetKind;
+use crate::analyze::budget::TimeBudget;
+use crate::analyze::budget::TrialBudget;
+use crate::analyze::checkpoint::BisectInterval;
+use crate::analyze::checkpoint::Journal;
+use crate::analyze::checkpoint::Phase;
+use crate::analyze::checkpoint::PrefixBracket;
+use crate::analyze::checkpoint::Progress;
+use crate::analyze::checkpoint::ProgressHandle;
+use crate::analyze::rundata::TrialInconclusive;
+use crate::analyze::rundata::TrialRunner;
+use crate::schedule_search::NoFeasibleSchedule;
 
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///
@@ -74,9 +92,16 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub run_needleman: bool,
 
-    /// Given a passing/failing run pair, based on different chaos seeds, first minimize the
-    /// chaos-mode interventions necessary to flip between the two outcomes.  This may accelerate
-    /// the subsequent binary search.
+    /// Before searching, minimize the target run's chaos-mode interventions (its preemptions
+    /// and priority changes) to those it needs to meet the target criteria, by knocking them out
+    /// a batch at a time. This may accelerate the subsequent binary search.
+    ///
+    /// The baseline is then the minimized record with its latest intervention knocked out, and
+    /// knocked out again while the replay still meets the target; when no intervention is left,
+    /// or the knocked-out run does not finish, analyze searches within the target schedule
+    /// instead (as `--prefix-search` does). So `--minimize` finds its own baseline and does not
+    /// take `--run2-seed`, `--run2-preemptions` or `--run2-schedule`. To search between a given
+    /// pair of runs, omit `--minimize`.
     #[clap(
         long,
         conflicts_with = "run2_seed",
@@ -84,6 +109,47 @@ pub struct AnalyzeOpts {
         conflicts_with = "run2_schedule"
     )]
     pub minimize: bool,
+
+    /// Search within the target run's schedule instead of between it and a baseline run.
+    ///
+    /// Each trial replays the first K events of the target schedule and then lets the
+    /// scheduler continue without chaos. Replaying none of it gives the baseline outcome and
+    /// replaying all of it the target outcome; a binary search finds the K at which the
+    /// outcome flips. Event #K is the scheduling decision that commits the run to the target:
+    /// the report shows the stack of the thread the target schedule runs there and of the
+    /// thread the scheduler would run instead.
+    ///
+    /// Unlike the default search, it needs no baseline schedule, so events that only one of
+    /// two unrelated runs executed (timeslices that end at other points, iterations of a
+    /// polling loop) cannot stop it. It takes about log2(schedule length) trials, two more for
+    /// each continuation (`--continuation-timeslice`) it tries, and two to recheck the
+    /// boundary.
+    #[clap(
+        long,
+        conflicts_with = "minimize",
+        conflicts_with = "run2_seed",
+        conflicts_with = "run2_preemptions",
+        conflicts_with = "run2_schedule",
+        conflicts_with = "run_needleman"
+    )]
+    pub prefix_search: bool,
+
+    /// The timeslice, in virtual nanoseconds, with which `--prefix-search` trials continue
+    /// without chaos after their replayed prefix: `auto` (the default) or a number.
+    ///
+    /// A race found only at a short timeslice often shows without chaos at that timeslice too:
+    /// the scheduler alone, replaying none of the target schedule, already meets the target,
+    /// and the search has nothing to bisect against. With `auto` the search continues at the
+    /// run's own `--max-timeslice`, and when that cannot serve (the scheduler alone meets the
+    /// target, or replaying the whole schedule misses it) at hermit's default 200 ms. This also
+    /// applies to the prefix search the default search falls back to. The report names the
+    /// timeslice the search used.
+    ///
+    /// The value is the trials' `--max-timeslice`, which also ends the replayed prefix's
+    /// slices that its schedule does not end, so it may not be shorter than the run's own, and
+    /// a run whose arguments disable PMU timeslices takes none.
+    #[clap(long, value_name = "NANOS|auto", default_value = "auto")]
+    pub continuation_timeslice: ContinuationTimeslice,
 
     /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
     /// enabled.
@@ -163,6 +229,9 @@ pub struct AnalyzeOpts {
     pub analyze_seed: Option<u64>,
 
     /// Print quite a bit of extra information so that you can see exactly what is happening.
+    ///
+    /// Each run then writes its log into the workspace (see --tmp-dir), and analyze keeps the
+    /// workspace when it exits, as --keep-tmp does, so that the logs can be read.
     #[clap(long, short)]
     pub verbose: bool,
 
@@ -175,11 +244,116 @@ pub struct AnalyzeOpts {
     #[clap(long, short, value_name = "EVTCNT", default_value = "5")]
     pub execution_context: usize,
 
-    /// Where the analysis run will store its temporary artifacts.
+    /// Directory under which the analysis creates its workspace of temporary artifacts
+    /// (schedules, logs, reports of every run), created if missing.
     ///
-    /// By default this is a directory in `/tmp`
+    /// By default the workspace is created in the system's temporary directory: $TMPDIR, or
+    /// /tmp when TMPDIR is unset. Analyze removes the workspace when it exits, unless
+    /// --keep-tmp or --verbose; this directory itself stays.
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
+
+    /// Keep the workspace (see --tmp-dir) when analyze exits.
+    ///
+    /// The workspace holds every run's schedules, logs, output and reproducer command, and the
+    /// paths analyze prints name it. By default analyze removes it when it exits: after its
+    /// report, after an error, and when SIGTERM, SIGINT or SIGHUP stops it. A stop signal ends
+    /// the run in progress and starts no other; analyze then removes the workspace and dies of
+    /// that signal (a shell reports 128 plus its number, 143 for SIGTERM). --verbose keeps the
+    /// workspace too. The report file (--report-file) is never removed.
+    ///
+    /// Analyze cannot clean up after SIGKILL, nor after a stop signal it does not handle: one it
+    /// inherits as ignored stays ignored, and an analyze that is PID 1 of its PID namespace
+    /// (`docker run IMAGE hermit analyze ...` without --init) leaves the stop signals at their
+    /// default actions, which Linux discards for a namespace's init. Neither does it handle
+    /// them, so that they kill it at once as before, when /proc is not its own PID namespace's
+    /// (analyze started by another process inside `unshare -pf` without --mount-proc) or
+    /// when it inherited more than 64 children.
+    #[clap(long)]
+    pub keep_tmp: bool,
+
+    /// Wall-clock bound, in seconds, on each run after the target run: `auto` (the default), a
+    /// number of seconds, or `off`.
+    ///
+    /// A replayed or spliced schedule can leave the guest spinning, or waiting for an event that
+    /// never comes. The endpoint runs are measured: the target run (or, with `--run1-preemptions`,
+    /// the first replay of its record) and the baseline run (from `--run2-seed`,
+    /// `--run2-preemptions`, or the run without chaos). With `auto`, every run after the first
+    /// measured one is bounded at max(60 s, 10 times the slowest endpoint run so far, 4 times the
+    /// slowest run that finished so far), the baseline run included.
+    ///
+    /// The host's speed decides when this bound fires, so a trial it stops has no outcome when it
+    /// is a `--prefix-search` trial, a default-search (bisection) trial or the baseline run: it
+    /// runs again at once with 4 times the bound (within the run arguments' own `--timeout` and
+    /// the time budget left), and the rerun's outcome counts. A rerun stopped again ends the
+    /// analysis with a partial report (exit 120, `HERMIT_ANALYZE_PARTIAL class=trial-inconclusive`)
+    /// that names the trial and says how to give it more time; with `--continuation-timeslice=auto`
+    /// a continuation whose endpoint trial is stopped twice is skipped instead, when another one
+    /// serves. A trial that a `--timeout` in the run arguments ends counts as not meeting the
+    /// target, as that bound is the user's, though it is host-timed too. Elsewhere (`--search`
+    /// rounds, `--minimize`'s knock-outs, the stack-trace runs) a run this bound stops counts as
+    /// not meeting the target, as before. A baseline run that the run arguments' `--timeout` stops
+    /// gives no baseline, so analyze searches within the target schedule instead (as
+    /// `--prefix-search` does). A `--timeout` in the run arguments still bounds every run, and wins
+    /// where it is shorter. The bound needs a backend
+    /// on which `hermit run --timeout` is qualified; elsewhere `auto` gives none, and an explicit
+    /// number is refused.
+    ///
+    /// While trials are bounded, the log file a trial writes under `--verbose` or `--selfcheck`
+    /// is capped too, at max(64 MiB, 10 times the largest endpoint log) and within
+    /// HERMIT_LOG_MAX_BYTES (0 there lifts both caps); `off` lifts it as well.
+    #[clap(long, value_name = "SECONDS|auto|off", default_value = "auto")]
+    pub trial_timeout: TrialTimeout,
+
+    /// Wall-clock time this invocation may spend before it reports what it has found so far:
+    /// `off` (the default), or a whole number of seconds, minutes or hours (`1800`, `30m`,
+    /// `2h`).
+    ///
+    /// The budget is checked before every run, and each run's `--timeout` is shortened to the
+    /// time left. A run the budget cuts short is thrown away, not counted as not meeting the
+    /// target, so the budget decides only when analyze stops, never what it finds. When it runs
+    /// out, analyze reports its best answer so far and exits 120 (a partial result): the
+    /// default search's current pair of schedules, whose replays miss and meet the target, and
+    /// the first event at which they differ; or `--prefix-search`'s bracket, the longest prefix
+    /// known to miss the target and the shortest known to meet it. The report says that it is
+    /// partial, why, and which phase was running, after the stderr line
+    /// `HERMIT_ANALYZE_PARTIAL class=time-budget`. The workspace is then kept, even without
+    /// --keep-tmp, and the report gives the command that continues the analysis (--resume).
+    /// The default search's report replays its two schedules for their stacks only when two
+    /// such runs fit min(120 s, 5% of the budget) after it ran out; the report says when they
+    /// did not. A budget that runs out after the search decided, during its stack-trace runs,
+    /// still reports the decision: the deciding event or the critical pair, without stacks.
+    /// Computation between runs (the default search's schedule distances) is not
+    /// interrupted, so analyze may overrun the budget by that much; an outer kill bound should
+    /// sit above the budget plus that grace, so that analyze stops itself first.
+    #[clap(long, value_name = "DURATION|off", default_value = "off")]
+    pub time_budget: TimeBudget,
+
+    /// How many runs this invocation may start before it reports what it has found so far:
+    /// `off` (the default) or a number. Ends like --time-budget does
+    /// (`HERMIT_ANALYZE_PARTIAL class=trial-budget`, exit 120). Runs a resumed analysis
+    /// answers from its journal (--resume) do not count.
+    #[clap(long, value_name = "N|off", default_value = "off")]
+    pub trial_budget: TrialBudget,
+
+    /// Continue the analysis whose workspace this is, instead of starting a new one.
+    ///
+    /// Analyze writes, as it goes, every finished run's outcome into its workspace
+    /// (analyze-journal.jsonl), with what the analysis is of (analyze-checkpoint.json) and the
+    /// search's current interval or bracket (analyze-progress.json). A workspace a budget kept
+    /// (see --time-budget), or that --keep-tmp kept or a SIGKILL left, can be resumed: pass the
+    /// same arguments and --resume=WORKSPACE. The analysis then runs again from its start, and
+    /// every run the journal holds takes its recorded outcome instead of running; the default
+    /// search restarts at the pass whose interval the progress names, from that interval's two
+    /// schedules. So it makes the same decisions as before and goes on from where it stopped:
+    /// a resumed analysis reports what an uninterrupted one would. It refuses (exit 122) when
+    /// the hermit binary, the guest program, the run arguments, the target criteria, the search
+    /// options and --max-log-bytes, the record or schedule files given as runs, or
+    /// --analyze-seed differ from the recorded ones, and names each difference. --tmp-dir is
+    /// not used. The workspace is removed or kept as for any analysis once the resumed
+    /// analysis finishes; one that errors or is stopped keeps it.
+    #[clap(long, value_name = "WORKSPACE")]
+    pub resume: Option<PathBuf>,
 
     /// Specify that analyze itself should return a non-zero exit code on success.
     /// This is needed under esoteric invocation scenarios.
@@ -223,6 +397,169 @@ pub struct AnalyzeOpts {
     /// (`Report::branch_counter_warning`); `None` when it printed none.
     #[clap(skip)]
     pub branch_counter_warning: Option<String>,
+
+    /// What the endpoint runs measured so far; the trials' bounds derive
+    /// from it ([`AnalyzeOpts::trial_bound`]). Every `RunData` copies these
+    /// options when it is created, so a run takes the bound of the endpoints
+    /// measured before it.
+    #[clap(skip)]
+    pub endpoints: EndpointMeasurements,
+
+    /// The invocation's --time-budget and --trial-budget, counted from
+    /// `AnalyzeOpts::main`; shared by every copy of these options.
+    #[clap(skip)]
+    pub budget: Budget,
+
+    /// The journal of finished runs in the workspace (`checkpoint`); off
+    /// until `AnalyzeOpts::main` opens it, and for `hermit bisect`.
+    #[clap(skip)]
+    pub journal: Journal,
+
+    /// The phase running and the search's interval or bracket, written into
+    /// the workspace as they change.
+    #[clap(skip)]
+    pub progress: ProgressHandle,
+
+    /// Whether `--analyze-seed` was drawn from system randomness by this
+    /// analysis rather than given (its warnings still say so).
+    #[clap(skip)]
+    pub analyze_seed_drawn: bool,
+
+    /// Set once a partial report is written: the workspace is then kept.
+    #[clap(skip)]
+    pub partial_report_written: bool,
+
+    /// `--resume`: the progress the earlier invocation wrote, whose interval
+    /// the default search restarts from.
+    #[clap(skip)]
+    pub resumed_progress: Option<Progress>,
+
+    /// What runs each trial's guest; unset, `RunData::run_now` does. Tests
+    /// set it to drive the searches without a guest.
+    #[clap(skip)]
+    pub trial_runner: TrialRunner,
+
+    /// The slowest run that finished so far, which `--trial-timeout=auto`
+    /// bounds later runs by too ([`AnalyzeOpts::trial_bound`]); shared by
+    /// every copy of these options.
+    #[clap(skip)]
+    pub slowest_run: SlowestRun,
+}
+
+/// [`AnalyzeOpts::slowest_run`]. Cloning shares it.
+#[derive(Debug, Clone, Default)]
+pub struct SlowestRun(Arc<Mutex<Option<Duration>>>);
+
+impl SlowestRun {
+    /// The slowest run so far, if one finished.
+    pub fn get(&self) -> Option<Duration> {
+        *self.0.lock().unwrap()
+    }
+
+    /// Record a finished run that took `wall`. Returns true if it is the
+    /// slowest so far.
+    pub fn record(&self, wall: Duration) -> bool {
+        let mut slowest = self.0.lock().unwrap();
+        let slower = slowest.is_none_or(|slowest| wall > slowest);
+        if slower {
+            *slowest = Some(wall);
+        }
+        slower
+    }
+}
+
+/// `--continuation-timeslice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationTimeslice {
+    /// Short first, then coarser where the short one cannot serve.
+    Auto,
+    /// This many virtual nanoseconds.
+    Nanos(NonZeroU64),
+}
+
+impl FromStr for ContinuationTimeslice {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "auto" {
+            return Ok(ContinuationTimeslice::Auto);
+        }
+        match s.parse::<NonZeroU64>() {
+            Ok(nanos) if nanos.get() >= detcore_model::time::NANOS_PER_RCB as u64 => {
+                Ok(ContinuationTimeslice::Nanos(nanos))
+            }
+            _ => Err(format!(
+                "expected `auto` or a timeslice of at least one RCB ({} virtual nanoseconds), \
+                 got {s:?}",
+                detcore_model::time::NANOS_PER_RCB
+            )),
+        }
+    }
+}
+
+/// `--trial-timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialTimeout {
+    /// Derived from the endpoint runs' wall-clock time.
+    Auto,
+    /// No bound beyond the run arguments' own `--timeout`.
+    Off,
+    /// This many seconds.
+    Seconds(NonZeroU64),
+}
+
+impl FromStr for TrialTimeout {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(TrialTimeout::Auto),
+            "off" => Ok(TrialTimeout::Off),
+            _ => s.parse().map(TrialTimeout::Seconds).map_err(|_| {
+                format!("expected a positive number of seconds, `auto` or `off`, got {s:?}")
+            }),
+        }
+    }
+}
+
+/// The least wall-clock bound `--trial-timeout=auto` gives a trial.
+pub const TRIAL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
+/// How many times the slowest endpoint run `--trial-timeout=auto` gives a trial.
+pub const TRIAL_TIMEOUT_FACTOR: u32 = 10;
+/// How many times the slowest run that finished so far `--trial-timeout=auto`
+/// gives a trial.
+pub const SLOWEST_RUN_FACTOR: u32 = 4;
+/// How many times its usual `--trial-timeout` bound a search trial gets when
+/// it runs again because that bound stopped it (`decisive_trial` in
+/// phases.rs).
+pub const CONFIRM_BOUND_FACTOR: u32 = 4;
+/// The least cap on a trial's log file.
+pub const TRIAL_LOG_FLOOR: u64 = 64 << 20;
+/// How many times the largest endpoint log a trial's log file may grow to.
+pub const TRIAL_LOG_FACTOR: u64 = 10;
+
+/// The slowest wall-clock time and the largest log file of the endpoint runs
+/// measured so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointMeasurements {
+    /// The slowest endpoint run, if one has been measured.
+    pub slowest: Option<Duration>,
+    /// The largest endpoint log file, if an endpoint run wrote one.
+    pub largest_log: Option<u64>,
+}
+
+impl EndpointMeasurements {
+    /// Record one endpoint run. Returns true if it is the slowest so far.
+    pub fn record(&mut self, wall: Duration, log_bytes: Option<u64>) -> bool {
+        if let Some(bytes) = log_bytes {
+            self.largest_log = self.largest_log.max(Some(bytes));
+        }
+        let slowest = self.slowest.is_none_or(|slowest| wall > slowest);
+        if slowest {
+            self.slowest = Some(wall);
+        }
+        slowest
+    }
 }
 
 // TODO: introduce a new type to encapsulate the state of the search, and make it immutable.
@@ -295,6 +632,112 @@ pub struct Report {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_counter_warning: Option<String>,
+
+    /// `--prefix-search` only, when the deciding event is a timing decision
+    /// (both continuations run the same thread there, for different lengths):
+    /// that thread's stack at the deciding event. The two critical events are
+    /// then the threads that run next in each continuation, and their
+    /// `event_index` is a position in that continuation's recorded schedule
+    /// (the header names both files); where no other thread runs, it is that
+    /// schedule's length and the stack is empty.
+    ///
+    /// In a partial report (`partial` set) its presence does NOT mean a timing
+    /// decision: when a budget ends the stack-trace runs of a prefix search,
+    /// the deciding event and both critical events all name the decision,
+    /// because which shape the complete report takes is known only after
+    /// those runs. Read `partial` first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deciding_event: Option<ReportCriticalEvent>,
+
+    /// Set when a budget (--time-budget, --trial-budget) ended the analysis
+    /// before it found the critical events: what it found so far. Read it
+    /// before the event fields, whose shape differs in a partial report (see
+    /// `deciding_event` and [`PartialReport::decided`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<PartialReport>,
+}
+
+/// What a partial report adds: why the analysis stopped, where, its best
+/// answer so far, and how to continue it.
+#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+pub struct PartialReport {
+    /// Why the analysis stopped early: the budget that ran out, or a trial
+    /// that stayed inconclusive.
+    pub reason: PartialReason,
+    /// The phase that was running.
+    pub phase: Phase,
+    /// Wall-clock seconds this invocation ran, and its budget, if any.
+    pub elapsed_seconds: u64,
+    pub time_budget_seconds: Option<u64>,
+    /// Runs this invocation started, its budget, if any, and the runs it
+    /// answered from the journal of an earlier invocation.
+    pub runs_started: u64,
+    pub trial_budget: Option<u64>,
+    pub runs_from_journal: u64,
+    /// The run the time budget cut short, whose outcome was not counted.
+    pub cut_run: Option<String>,
+    /// The trial that analyze's wall-clock bound stopped twice, when that
+    /// ended the analysis (`reason` `trial-inconclusive`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive: Option<TrialInconclusive>,
+    /// The schedules between the default search's pair that it tried and
+    /// could not replay, when that ended the analysis (`reason`
+    /// `trial-inconclusive`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infeasible: Option<NoFeasibleSchedule>,
+    /// The default search's interval, if it got that far.
+    pub interval: Option<BisectInterval>,
+    /// `--prefix-search`'s bracket, if it got that far.
+    pub bracket: Option<PrefixBracket>,
+    /// The search's result, if it had one before the stack traces. The
+    /// report's event fields then carry it too, without stacks: for
+    /// `--prefix-search` the deciding event and both critical events name
+    /// the decision until the stack-trace runs place them, so
+    /// `deciding_event`'s presence does not mean a timing decision; for the
+    /// default search the critical events are the critical pair.
+    pub decided: Option<String>,
+    /// Whether the stack traces were taken, or why not.
+    pub stacks: String,
+    /// Commands that replay the runs the report rests on.
+    pub replay_commands: Vec<String>,
+    /// The kept workspace, and the command that continues the analysis.
+    pub workspace: PathBuf,
+    pub resume_command: String,
+}
+
+/// Why an analysis ended with a partial report ([`PartialReport::reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PartialReason {
+    /// `--time-budget` ran out.
+    TimeBudget,
+    /// `--trial-budget` ran out.
+    TrialBudget,
+    /// A search trial that analyze's wall-clock bound stopped was stopped
+    /// again when it ran once more with a longer bound
+    /// ([`TrialInconclusive`]), or every schedule the default search tried
+    /// between its pair could not be replayed ([`NoFeasibleSchedule`]).
+    TrialInconclusive,
+}
+
+impl PartialReason {
+    /// The `class=` value of the stderr class line.
+    pub fn class(self) -> &'static str {
+        match self {
+            PartialReason::TimeBudget => BudgetKind::TimeBudget.class(),
+            PartialReason::TrialBudget => BudgetKind::TrialBudget.class(),
+            PartialReason::TrialInconclusive => "trial-inconclusive",
+        }
+    }
+}
+
+impl From<BudgetKind> for PartialReason {
+    fn from(kind: BudgetKind) -> Self {
+        match kind {
+            BudgetKind::TimeBudget => PartialReason::TimeBudget,
+            BudgetKind::TrialBudget => PartialReason::TrialBudget,
+        }
+    }
 }
 
 /// Runtime context for a critical event included in the analyze report.

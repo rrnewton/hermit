@@ -3371,6 +3371,7 @@ mod tests {
             max_log_bytes: None,
             log_budget: None,
             log_file_handle: None,
+            log_file_limit: None,
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }
