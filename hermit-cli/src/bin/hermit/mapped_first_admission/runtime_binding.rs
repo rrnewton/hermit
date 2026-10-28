@@ -265,6 +265,17 @@ impl RetainedImage {
         let (image, descriptor) = package_paths()?;
         Self::open_paths(&image, &descriptor)
     }
+    /// Required, test-scoped paired resource input. This reuses the actual
+    /// retained package parser and OFDs without changing process-wide discovery.
+    /// The caller's package gate owns source/entry binding; these remain DATA.
+    #[cfg(test)]
+    pub(crate) fn open_test_install(install: &Path) -> io::Result<Self> {
+        let resources = install.join("rsrcs");
+        Self::open_paths(
+            &resources.join(ELF_RESOURCE),
+            &resources.join(DATA_RESOURCE),
+        )
+    }
     fn open_paths(image_path: &Path, descriptor_path: &Path) -> io::Result<Self> {
         let descriptor = RetainedFile::open(descriptor_path, MAX_DATA)?;
         let data = parse_data(&descriptor.bytes)?;

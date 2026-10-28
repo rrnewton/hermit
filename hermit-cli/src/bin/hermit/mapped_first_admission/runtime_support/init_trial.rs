@@ -173,13 +173,15 @@ impl Trial {
         });
         Ok(())
     }
-    /// Safety: the enclosing root fulfils the exact V11 bounded-entry contract;
-    /// source qualification for production/Guest release is explicitly absent.
+    /// Safety: the enclosing root fulfils the bounded valid-path entry contract
+    /// for this same retained image and its exact coordinates. Package DATA
+    /// supplies neither source qualification nor permission for Guest release.
     #[cfg(test)]
     pub(crate) async unsafe fn observe(
         &self,
         mapped: &mut PreparedMapping<'_>,
         config: &detcore::Config,
+        coordinates: BootstrapEntryCoordinates,
     ) -> io::Result<()> {
         let serving = self
             .serving
@@ -194,10 +196,6 @@ impl Trial {
         if subscriptions.has_cpuid() || subscriptions.has_rdtsc() {
             reserved_signals |= 1_u64 << (libc::SIGSEGV - 1);
         }
-        let coordinates = BootstrapEntryCoordinates {
-            entry: 0x6000e179aba0,
-            terminal_int3: 0x6000e16688d4,
-        };
         let result = tokio::select! {
             // SAFETY: owner and all leases stay in the outer synchronous root.
             observed = unsafe { mapped.observe_until_terminal(
