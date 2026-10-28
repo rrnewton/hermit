@@ -29374,9 +29374,12 @@ int main(void) {
         hermit_command(&["run", "--strict", "--proc=standard", "--"]).arg(&guest),
     );
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    // Two of the host's pages: 8192 on x86-64.
+    // SAFETY: sysconf has no preconditions.
+    let capacity = 2 * unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
 
     assert!(
-        stdout.contains("initial=8192"),
+        stdout.contains(&format!("initial={capacity}")),
         "the creation-time pin must still apply\nstdout:\n{stdout}"
     );
     // -1 is EPERM: exactly what Linux returns when the request exceeds the
@@ -29386,11 +29389,11 @@ int main(void) {
         "a guest must not be able to grow a pipe past the pinned capacity\nstdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("after=8192"),
+        stdout.contains(&format!("after={capacity}")),
         "the pinned capacity must survive the guest's own F_SETPIPE_SZ\nstdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("ceiling=8192"),
+        stdout.contains(&format!("ceiling={capacity}")),
         "the guest must read the enforced ceiling, not the host's\nstdout:\n{stdout}"
     );
 }
@@ -29447,8 +29450,11 @@ int main(void) {
         backends.push(Some("--backend=dbt"));
     }
     let _guard = hermit_run_guard();
+    // A default 16-page pipe and a two-page one (65536 and 8192 on x86-64).
+    // SAFETY: sysconf has no preconditions.
+    let page = i32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
     for backend in backends {
-        for host_capacity in [65536, 8192] {
+        for host_capacity in [16 * page, 2 * page] {
             let mut fds = [0; 2];
             // SAFETY: `fds` has room for both descriptors.
             assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
@@ -29463,7 +29469,7 @@ int main(void) {
             // here, and the 8192 case still runs.
             if set < 0
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                && host_capacity > 8192
+                && host_capacity > 2 * page
             {
                 eprintln!(
                     "SKIPPED {backend:?} {host_capacity}: this host refuses to grow a pipe \
@@ -29501,7 +29507,8 @@ int main(void) {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert_eq!(
-                stdout, "grow=-1 EPERM, capacity=8192\n",
+                stdout,
+                format!("grow=-1 EPERM, capacity={}\n", 2 * page),
                 "{backend:?}: a {host_capacity}-byte host pipe must read as the ceiling"
             );
         }

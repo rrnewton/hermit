@@ -3066,7 +3066,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // And the_pipe_capacity_is_two_host_pages (the pipe pin follows the host's
     // page size): 2738 + 1 = 2789, listed.
-    ("test.detcore_unit", 2789),
+    // And a_pipe_below_two_pages_is_trusted_only_with_a_two_page_pipe_max_size:
+    // 2790, listed.
+    ("test.detcore_unit", 2790),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5377,7 +5379,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // And the same pipe page-size unit: 2789, listed.
-    ("test.detcore_unit_on_host", 2789),
+    // And the same two-page pipe-max-size unit: 2790, listed.
+    ("test.detcore_unit_on_host", 2790),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

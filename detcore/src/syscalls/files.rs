@@ -450,6 +450,12 @@ pub(crate) fn read_guest_exact<M: MemoryAccess>(
 /// not be applied there: Linux gives the pipe one 64 KiB page, and the creation pin, which accepts
 /// only exactly the capacity it asked for, ends the run (`pipe_capacity_failure`).
 ///
+/// Two pages is attainable and independent of host load on Linux 5.14 and later (whose quota
+/// fallback is two pages, not one) when `pipe-max-size` is at least two pages (the default is
+/// 1 MiB; a host that hardens it to one 64 KiB page caps new pipes at one page). Otherwise the
+/// creation pin fails closed (`pipe_capacity_failure`), and a pipe Hermit did not create is
+/// refused when it reads below two pages (`pipe_capacity_floor_is_two_pages`).
+///
 /// This is also the ceiling the guest is allowed to raise a pipe to, and the
 /// value `/proc/sys/fs/pipe-max-size` reports. Those three must be ONE value:
 /// a pinned capacity, an advertised maximum and an enforced maximum that can
@@ -504,6 +510,31 @@ pub(crate) fn pipe_capacity_request_exceeds_ceiling(requested: i32) -> bool {
 /// the host still completes as far as its real capacity and that reader allow.
 pub(crate) fn reported_pipe_capacity(host: i64) -> i64 {
     host.min(i64::from(deterministic_pipe_capacity_bytes()))
+}
+
+/// Whether a pipe the host reports `host` bytes for has that capacity
+/// whatever the host's load, given the host's `pipe-max-size`
+/// (`host_pipe_max_size`, `None` when unreadable). At or above the ceiling it
+/// reads as the ceiling either way. Below it, it is a capacity its creator
+/// chose only when no pipe is created below two pages: Linux caps a new pipe
+/// at `pipe-max-size` and, under `pipe-user-pages-soft`, gives it two pages
+/// instead (fs/pipe.c `alloc_pipe_info`), so with a `pipe-max-size` below two
+/// pages host load decides between one page and two.
+pub(crate) fn pipe_capacity_floor_is_two_pages(host: i64, host_pipe_max_size: Option<i64>) -> bool {
+    let ceiling = i64::from(deterministic_pipe_capacity_bytes());
+    host >= ceiling || host_pipe_max_size.is_some_and(|max| max >= ceiling)
+}
+
+/// The host's `/proc/sys/fs/pipe-max-size`, read once.
+fn host_pipe_max_size() -> Option<i64> {
+    static MAX: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/fs/pipe-max-size")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    })
 }
 
 /// SIGIO and SIGURG, the signals Linux sends to a descriptor's owner when
@@ -10883,9 +10914,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A host-backed pipe's capacity is host state
             // (`reported_pipe_capacity`); the guest reads it no larger than
             // the ceiling it may raise a pipe to.
-            F_GETPIPE_SZ => Ok(reported_pipe_capacity(
-                self.record_or_replay(guest, call).await?,
-            )),
+            F_GETPIPE_SZ => {
+                let host = self.record_or_replay(guest, call).await?;
+                if !pipe_capacity_floor_is_two_pages(host, host_pipe_max_size()) {
+                    error!(
+                        "[detcore] fd {} is a pipe of {} bytes, below the deterministic {}, on a \
+                         host whose pipe-max-size ({:?}) is below two pages: host load decides \
+                         whether such a pipe has one page or two. Determinism is unavailable for \
+                         this run.",
+                        fd,
+                        host,
+                        deterministic_pipe_capacity_bytes(),
+                        host_pipe_max_size(),
+                    );
+                    unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await;
+                }
+                Ok(reported_pipe_capacity(host))
+            }
             F_SETPIPE_SZ(requested) if pipe_capacity_request_exceeds_ceiling(requested) => {
                 trace!(
                     "[detcore] refusing F_SETPIPE_SZ({}) above the deterministic pipe ceiling {}",
@@ -17001,16 +17046,32 @@ mod test {
     }
 
     /// A host pipe's capacity above the ceiling reads as the ceiling, so a
-    /// default 64-KiB pipe and one the host shrank to two pages under
+    /// default 16-page pipe and one the host shrank to two pages under
     /// `pipe-user-pages-soft` read the same. A capacity at or below the ceiling
-    /// (Hermit's pin, or a guest's own shrink) reads as it is.
+    /// (Hermit's pin, or a guest's own shrink to one page) reads as it is.
     #[test]
     fn a_host_pipe_capacity_reads_no_larger_than_the_ceiling() {
         let ceiling = i64::from(deterministic_pipe_capacity_bytes());
-        assert_eq!(super::reported_pipe_capacity(65536), ceiling);
-        assert_eq!(super::reported_pipe_capacity(1 << 20), ceiling);
+        let page = ceiling / 2;
+        assert_eq!(super::reported_pipe_capacity(16 * page), ceiling);
+        assert_eq!(super::reported_pipe_capacity(1 << 30), ceiling);
         assert_eq!(super::reported_pipe_capacity(ceiling), ceiling);
-        assert_eq!(super::reported_pipe_capacity(4096), 4096);
+        assert_eq!(super::reported_pipe_capacity(page), page);
+    }
+
+    /// A pipe below two pages is the creator's choice only where no pipe is
+    /// created below two pages; on a host whose `pipe-max-size` is one page,
+    /// host load decides between one page and two, so it is refused.
+    #[test]
+    fn a_pipe_below_two_pages_is_trusted_only_with_a_two_page_pipe_max_size() {
+        let ceiling = i64::from(deterministic_pipe_capacity_bytes());
+        let page = ceiling / 2;
+        assert!(super::pipe_capacity_floor_is_two_pages(ceiling, Some(page)));
+        assert!(super::pipe_capacity_floor_is_two_pages(16 * page, None));
+        assert!(super::pipe_capacity_floor_is_two_pages(page, Some(1 << 20)));
+        assert!(super::pipe_capacity_floor_is_two_pages(page, Some(ceiling)));
+        assert!(!super::pipe_capacity_floor_is_two_pages(page, Some(page)));
+        assert!(!super::pipe_capacity_floor_is_two_pages(page, None));
     }
 
     /// Shrinking stays legal. `tests/c/pipe_capacity.c`
@@ -17033,7 +17094,10 @@ mod test {
     /// it is.
     #[test]
     fn host_ceilings_are_refused_identically_on_any_host() {
-        for host_ceiling in [65536, 1048576] {
+        let ceiling = deterministic_pipe_capacity_bytes();
+        // Above the two-page ceiling at any page size: twice it, eight times
+        // it, and the default 1 MiB.
+        for host_ceiling in [2 * ceiling, 8 * ceiling, 1 << 20] {
             assert!(
                 pipe_capacity_request_exceeds_ceiling(host_ceiling),
                 "{host_ceiling} must be refused regardless of the host sysctl"
