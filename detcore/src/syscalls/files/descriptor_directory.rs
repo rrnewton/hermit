@@ -4262,6 +4262,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if Self::starts_at_a_recorded_link(guest, dirfd, relative) {
             return Ok(None);
         }
+        Self::prepare_guest_cwd(guest, dirfd, relative).await;
         let Some(observed) = Self::observed_path(guest, dirfd, relative)
             .ok()
             .filter(|observed| observed.is_absolute())

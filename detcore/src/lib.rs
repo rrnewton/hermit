@@ -4391,6 +4391,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     // A new thread has made no syscall yet.
                     restart_block: None,
+                    syscall_cwd: None,
                     // A fork child inherits its parent's signal dispositions.
                     sigalrm_handled: pts.1.sigalrm_handled,
                     signal_shadow: child_signal_shadow.clone(),
@@ -5029,6 +5030,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // so the record a wait kept for it lives only until then
         // (`handle_restart_syscall`).
         let restart_block = guest.thread_state_mut().restart_block.take();
+        // A working directory read for the previous syscall may be stale by
+        // now (`ThreadState::syscall_cwd`).
+        guest.thread_state_mut().syscall_cwd = None;
 
         let dettid = guest.thread_state().dettid;
 

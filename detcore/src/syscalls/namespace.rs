@@ -1523,6 +1523,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         (dirfd, path): (i32, Option<PathPtr<'_>>),
     ) -> Option<Vec<u8>> {
         const CAPACITY: usize = libc::PATH_MAX as usize;
+        // The working directory a relative spelling needs is read before
+        // the stack scratch is taken: the translation of the call below can
+        // reach `Detcore::prepare_guest_cwd`, whose reads take that scratch
+        // too, which KVM refuses with a panic while it is held.
+        if let Some(Ok(spelling)) = path.map(|path| path.read(&guest.memory())) {
+            let spelling: PathBuf = spelling;
+            Self::prepare_guest_cwd(guest, dirfd, &spelling).await;
+        }
         let mut stack = guest.stack().await;
         if stack.capacity() < CAPACITY {
             return None;
@@ -1980,9 +1988,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// so that the placeholder's own path never reaches the guest: an
     /// absolute path as it is; a name relative to a placeholder descriptor
     /// below its directory's spelling; a name relative to the working
-    /// directory where the backend's `/proc` is the kernel's (an `fchdir`
-    /// into a descriptor directory enters it there), from the guest's
-    /// working directory. `None` for any other.
+    /// directory, from the guest's working directory (`Detcore::observed_path`,
+    /// which the caller prepares, `Detcore::prepare_guest_cwd`: where the tool
+    /// cannot read it from host procfs, KVM, the guest's own `getcwd` names
+    /// it, <https://github.com/rrnewton/hermit/issues/4541>). `None` for any
+    /// other.
     fn placeholder_link_spelling<G: Guest<Self>>(
         &self,
         guest: &G,
@@ -1995,11 +2005,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(spelled) = Self::spelling_below_placeholder(guest, dirfd, path) {
             return Some(spelled);
         }
-        (dirfd == libc::AT_FDCWD
-            && !path.as_os_str().is_empty()
-            && crate::procfs_inode::tool_can_name_guest_descriptors(&guest.config().backend))
-        .then(|| crate::syscalls::files::resolved_at_fdcwd_path(guest.pid().as_raw(), path))
-        .flatten()
+        (dirfd == libc::AT_FDCWD && !path.as_os_str().is_empty())
+            .then(|| Self::observed_path(guest, dirfd, path).ok())
+            .flatten()
+            .filter(|observed| observed.is_absolute())
     }
 
     /// Answer a `readlink` of `path` from `dirfd` if it is a descriptor link
@@ -2015,6 +2024,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         buf: Option<reverie::syscalls::AddrMut<'_, libc::c_char>>,
         buf_len: usize,
     ) -> Option<Result<i64, Error>> {
+        Self::prepare_guest_cwd(guest, dirfd, path).await;
         let spelled = self.placeholder_link_spelling(guest, dirfd, path)?;
         self.answer_descriptor_directory_link(guest, &spelled, buf, buf_len)
             .await

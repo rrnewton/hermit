@@ -4537,6 +4537,20 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) restart_block: Option<crate::syscalls::helpers::RestartBlock>,
 
+    /// The calling thread's working directory in the guest's view, read for
+    /// the syscall it is running where the tool cannot read it from host
+    /// procfs (`procfs_inode::tool_can_read_guest_cwd`: KVM): its path where
+    /// an injected `getcwd` answered one, else, where `getcwd` rendered none
+    /// (a removed directory, or one whose path is longer than `PATH_MAX`),
+    /// the directories the syscall's spellings climb to out of it with `..`
+    /// (`syscalls::SyscallCwd`); `None` until it is read, at most
+    /// once per syscall (`Detcore::prepare_guest_cwd`). Each syscall starts
+    /// without it (`Detcore::handle_syscall_event`), so a later syscall never
+    /// decides by a directory read before it. Never carried across a fork or
+    /// a migration.
+    #[serde(skip)]
+    pub(crate) syscall_cwd: Option<crate::syscalls::SyscallCwd>,
+
     /// Whether this thread's process has a guest handler for SIGALRM, so that
     /// signal phase 1's table (`sigalrm_phase1`) gates its syscalls. Set by the
     /// runtime's handler admission (phase 1 step I3), in the same turn it
@@ -5551,6 +5565,7 @@ impl<T> ThreadState<T> {
             parent_process_cpu_time: None,
             parent_cpu_publication: None,
             restart_block: None,
+            syscall_cwd: None,
             sigalrm_handled: false,
             signal_shadow: None,
             signal_shadow_lost: false,

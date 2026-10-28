@@ -454,6 +454,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let numbers = self
             .parent_numbers(guest, &lookups, &values, &recovered_paths)
             .await;
+        // A spelling relative to the working directory is decided from the
+        // guest's working directory, which the tool may first have to read
+        // from the guest (`Detcore::prepare_guest_cwd`: KVM), here, before
+        // the decisions, which do not await.
+        if !crate::procfs_inode::tool_can_read_guest_cwd(&self.cfg.backend) {
+            for (dirfd, spelling) in Self::looked_up_spellings(guest, &lookups, &values) {
+                Self::prepare_guest_cwd(guest, dirfd, &spelling).await;
+            }
+        }
         // Whether a refusal for permission can only be the KVM executor's.
         let mut confined = true;
         let replacements = match lookups {
@@ -601,6 +610,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             .iter()
             .map(|path| (libc::AT_FDCWD, path.clone()))
             .collect::<Vec<_>>();
+        spellings.extend(Self::looked_up_spellings(guest, lookups, values));
+        let named = spellings
+            .iter()
+            .filter_map(|(dirfd, spelling)| Self::observed_path(guest, *dirfd, spelling).ok())
+            .flat_map(|path| crate::procfs::ids::named_ids(&path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if named.is_empty() {
+            return Some(BTreeMap::new());
+        }
+        let kernel = crate::tool_global::procfs_ids(guest, true, named.clone()).await;
+        Some(named.into_iter().zip(kernel).collect())
+    }
+
+    /// The spellings `lookups` names in a call's argument `values`, each with
+    /// the directory descriptor it is looked up from (`AT_FDCWD` for the
+    /// working directory): the path operands, or the pathname a socket
+    /// address names.
+    fn looked_up_spellings<G: Guest<Self>>(
+        guest: &G,
+        lookups: &Lookups,
+        values: &[usize; 6],
+    ) -> Vec<(i32, PathBuf)> {
+        let mut spellings = Vec::new();
         match lookups {
             Lookups::Paths(operands) => {
                 for (dirfd, path) in operands {
@@ -636,18 +670,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
-        let named = spellings
-            .iter()
-            .filter_map(|(dirfd, spelling)| Self::observed_path(guest, *dirfd, spelling).ok())
-            .flat_map(|path| crate::procfs::ids::named_ids(&path))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if named.is_empty() {
-            return Some(BTreeMap::new());
-        }
-        let kernel = crate::tool_global::procfs_ids(guest, true, named.clone()).await;
-        Some(named.into_iter().zip(kernel).collect())
+        spellings
     }
 
     /// What Detcore decides about `spelling`, relative to `dirfd` (`None`
@@ -1202,12 +1225,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let level = self.cfg.proc_level;
         let Some(resolved) = (match self.guest_root_in_view(guest) {
-            Some(None) => call
-                .path()
-                .and_then(|path| path.read(&guest.memory()).ok())
-                .and_then(|path| Self::observed_path(guest, call.dirfd(), &path).ok())
-                .filter(|observed| observed.is_absolute())
-                .and_then(|observed| resolve_links(&observed)),
+            Some(None) => {
+                let spelling: Option<PathBuf> =
+                    call.path().and_then(|path| path.read(&guest.memory()).ok());
+                match spelling {
+                    Some(path) => {
+                        Self::prepare_guest_cwd(guest, call.dirfd(), &path).await;
+                        Self::observed_path(guest, call.dirfd(), &path)
+                            .ok()
+                            .filter(|observed| observed.is_absolute())
+                            .and_then(|observed| resolve_links(&observed))
+                    }
+                    None => None,
+                }
+            }
             _ => None,
         }) else {
             return false;

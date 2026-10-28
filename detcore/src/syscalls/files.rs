@@ -1175,12 +1175,248 @@ fn descriptor_identity(tid: i32, fd: RawFd) -> Option<(PathBuf, bool)> {
 /// root. Stripping `/proc/<pid>/root` produces the same guest-absolute path in
 /// record and replay without depending on the opened descriptor (which is an
 /// eventfd placeholder during replay).
+///
+/// A working directory whose path is longer than the kernel renders into its
+/// link has none here (`ENAMETOOLONG`); for that case see
+/// [`climbed_out_of_unrendered_cwd`].
 pub(crate) fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     debug_assert!(!path.is_absolute());
     let root = std::fs::read_link(format!("/proc/{pid}/root")).ok()?;
-    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    let cwd = match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+        Ok(cwd) => cwd,
+        Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+            return climbed_out_of_unrendered_cwd(pid, &root, path);
+        }
+        Err(_) => return None,
+    };
     let guest_cwd = cwd.strip_prefix(root).ok()?;
     Some(Path::new("/").join(guest_cwd).join(path))
+}
+
+/// [`resolved_at_fdcwd_path`] where the kernel cannot render the working
+/// directory of process `pid` into its link because its path is longer than
+/// `PATH_MAX`, which Linux still walks `..` out of. A spelling whose leading
+/// `..` climb out of it is made absolute from the directory they reach, which
+/// the kernel's own walk names: an `O_PATH` open of `/proc/<pid>/cwd/..` (as
+/// many `..` as the spelling leads with), whose descriptor's link is that
+/// directory's path; the rest of the spelling follows byte for byte
+/// ([`split_leading_climb`]). `None`, resolving nothing, for any other
+/// spelling, and where the open or the link fails: the call's own walk then
+/// decides the spelling, with its own error
+/// (<https://github.com/rrnewton/hermit/issues/4541>). Both reads are raw
+/// syscalls ([`crate::util::RawFd`], [`crate::util::raw_read_link`]), as
+/// Detcore may run inside the guest.
+fn climbed_out_of_unrendered_cwd(pid: i32, root: &Path, path: &Path) -> Option<PathBuf> {
+    let (climbs, rest) = split_leading_climb(path);
+    if climbs == 0 {
+        return None;
+    }
+    let climbed = crate::util::RawFd::open(
+        Path::new(&format!("/proc/{pid}/cwd/{}", climb_spelling(climbs))),
+        libc::O_PATH | libc::O_DIRECTORY,
+    )
+    .ok()?;
+    let directory =
+        crate::util::raw_read_link(Path::new(&format!("/proc/self/fd/{}", climbed.raw()))).ok()?;
+    let guest_directory = directory.strip_prefix(root).ok()?;
+    Some(joined_verbatim(&Path::new("/").join(guest_directory), rest))
+}
+
+/// How many `..` the relative `path` climbs before its first other name,
+/// past any `.`, and the rest of the spelling after them, byte for byte, so
+/// that a trailing `/` or `/.` keeps its meaning for the walk of the rest:
+/// `../../proc/fs` climbs 2, to `proc/fs`; `./..//proc/uptime/` climbs 1, to
+/// `proc/uptime/`; `x/..` climbs none.
+pub(crate) fn split_leading_climb(path: &Path) -> (usize, &std::ffi::OsStr) {
+    use std::os::unix::ffi::OsStrExt;
+    let mut rest = path.as_os_str().as_bytes();
+    let mut climbs = 0;
+    while !rest.is_empty() {
+        let end = rest
+            .iter()
+            .position(|&byte| byte == b'/')
+            .unwrap_or(rest.len());
+        match &rest[..end] {
+            b".." => climbs += 1,
+            b"." => {}
+            _ => break,
+        }
+        let slashes = rest[end..].iter().take_while(|&&byte| byte == b'/').count();
+        rest = &rest[end + slashes..];
+    }
+    (climbs, std::ffi::OsStr::from_bytes(rest))
+}
+
+/// Whether `path` is `PATH_MAX` bytes long or more, which no name may be:
+/// Linux copies at most `PATH_MAX` bytes of a pathname, its NUL included,
+/// and refuses one whose NUL is not among them with `ENAMETOOLONG`, before
+/// any walk (`getname_flags`, fs/namei.c:206-210 at v6.17). Such a spelling
+/// is never resolved, so that the call's own lookup refuses it.
+pub(crate) fn names_past_path_max(path: &Path) -> bool {
+    path.as_os_str().len() >= libc::PATH_MAX as usize
+}
+
+/// `rest`, a relative spelling, below `directory`, byte for byte;
+/// `directory` itself where `rest` is empty.
+fn joined_verbatim(directory: &Path, rest: &std::ffi::OsStr) -> PathBuf {
+    if rest.is_empty() {
+        directory.to_path_buf()
+    } else {
+        directory.join(rest)
+    }
+}
+
+/// `..` `climbs` times: `..`, `../..`, and so on.
+fn climb_spelling(climbs: usize) -> String {
+    vec![".."; climbs].join("/")
+}
+
+/// The calling thread's working directory, read for the syscall it is
+/// running where the tool cannot read it from host procfs
+/// (`procfs_inode::tool_can_read_guest_cwd`: KVM), at most once per syscall
+/// (`ThreadState::syscall_cwd`, `Detcore::prepare_guest_cwd`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SyscallCwd {
+    /// Its path, as the thread's `getcwd` answered it.
+    Path(PathBuf),
+    /// No path: `getcwd` failed with `ENOENT`, for a removed directory, or
+    /// for one whose path is longer than `PATH_MAX` (`ENAMETOOLONG`,
+    /// `ERANGE`), which Linux still walks `..` from. By how many `..` a
+    /// spelling of the syscall climbs out of it, the path of the directory
+    /// it climbs to, read through a descriptor for it
+    /// (`Detcore::read_climbed_directory`), `None` where that failed.
+    Unrendered(BTreeMap<usize, Option<PathBuf>>),
+    /// No path otherwise (`getcwd` answered no path from the root, or failed
+    /// another way): its spellings are decided as given.
+    Unknown,
+}
+
+/// The directory a listing of a descriptor reads, for
+/// `Detcore::drop_absent_entries`. Where the tool's `/proc` entry for the
+/// caller is the caller's (`tool_sees_caller`,
+/// `procfs_inode::tool_can_name_guest_descriptors`): the kernel's path for
+/// the descriptor (`linked`, its link in that entry), or, where that link
+/// cannot be read (after a `chroot` into a root without `/proc`, where the
+/// tool runs inside the guest), the path the guest opened it by (`recorded`).
+/// Where the guest's threads are no host tasks (KVM), that entry names one of
+/// the supervisor's own tasks, whose descriptor of that number is no guest's,
+/// so its link is never read
+/// (<https://github.com/rrnewton/hermit/issues/4541>): the directory is the
+/// recorded path, with its `.` and `..` folded in by name, as the kernel's
+/// path has neither (`/sys/devices/system/cpu/.` is the directory the
+/// listing filters). `None` where the path is not absolute.
+fn listed_directory(
+    tool_sees_caller: bool,
+    linked: impl FnOnce() -> Option<PathBuf>,
+    recorded: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let directory = if tool_sees_caller {
+        linked().or_else(recorded)
+    } else {
+        recorded().map(|path| {
+            let mut folded = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        folded.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => folded.push(other),
+                }
+            }
+            folded
+        })
+    };
+    directory.filter(|path| path.is_absolute())
+}
+
+#[cfg(test)]
+mod leading_climb_tests {
+    use super::*;
+
+    /// A spelling climbs out of the working directory by the `..` before its
+    /// first other name, past any `.`; the rest is kept byte for byte, a
+    /// trailing `/` or `/.` included, for the walk below where they lead
+    /// (<https://github.com/rrnewton/hermit/issues/4541>).
+    #[test]
+    fn a_spelling_climbs_by_its_leading_dotdots() {
+        let climb = |path: &'static str| {
+            let (climbs, rest) = split_leading_climb(Path::new(path));
+            (climbs, rest.to_str().unwrap().to_owned())
+        };
+        let split = |climbs: usize, rest: &str| (climbs, rest.to_owned());
+        assert_eq!(climb("../../proc/fs"), split(2, "proc/fs"));
+        assert_eq!(climb("./../x"), split(1, "x"));
+        assert_eq!(climb("..//./..//proc/uptime/"), split(2, "proc/uptime/"));
+        assert_eq!(climb("../proc/."), split(1, "proc/."));
+        assert_eq!(climb(".."), split(1, ""));
+        assert_eq!(climb("../"), split(1, ""));
+        assert_eq!(climb("x/.."), split(0, "x/.."));
+        assert_eq!(climb("...x/../y"), split(0, "...x/../y"));
+        assert_eq!(climb("proc/fs"), split(0, "proc/fs"));
+        assert_eq!(climb(""), split(0, ""));
+        assert_eq!(
+            joined_verbatim(Path::new("/"), std::ffi::OsStr::new("proc/uptime/")),
+            PathBuf::from("/proc/uptime/")
+        );
+        assert_eq!(
+            joined_verbatim(Path::new("/tmp"), std::ffi::OsStr::new("")),
+            PathBuf::from("/tmp")
+        );
+        assert_eq!(climb_spelling(1), "..");
+        assert_eq!(climb_spelling(3), "../../..");
+    }
+}
+
+#[cfg(test)]
+mod listed_directory_tests {
+    use super::*;
+
+    /// Where the tool's `/proc` entry for the caller is not the caller's
+    /// (KVM), a listing's directory is the path the guest opened it by, its
+    /// `.` and `..` folded in, and the descriptor link of the entry is never
+    /// read; elsewhere the link is the directory, and the recorded path, as
+    /// it is, the fallback (<https://github.com/rrnewton/hermit/issues/4541>).
+    #[test]
+    fn a_listing_is_named_by_the_link_only_where_the_entry_is_the_callers() {
+        // Compared byte for byte: `Path`'s own comparison ignores a `.`.
+        let bytes = |path: Option<PathBuf>| path.map(PathBuf::into_os_string);
+        let cpu = || Some(PathBuf::from("/sys/devices/system/cpu"));
+        let unread = || -> Option<PathBuf> { panic!("the link of a host task was read") };
+        for recorded in [
+            "/sys/devices/system/cpu/.",
+            "/sys/devices/system/cpu/",
+            "/sys/devices/system/./cpu",
+            "/sys/devices/system/cpu/../cpu",
+        ] {
+            assert_eq!(
+                bytes(listed_directory(false, unread, || Some(PathBuf::from(
+                    recorded
+                )))),
+                bytes(cpu()),
+                "{recorded}"
+            );
+        }
+        assert_eq!(
+            listed_directory(false, unread, || Some(PathBuf::from("cpu"))),
+            None
+        );
+        assert_eq!(
+            bytes(listed_directory(true, cpu, || Some(PathBuf::from(
+                "/tmp/x"
+            )))),
+            bytes(cpu())
+        );
+        // Where the link cannot be read, the recorded path as it is.
+        assert_eq!(
+            bytes(listed_directory(
+                true,
+                || None,
+                || Some(PathBuf::from("/tmp/x/../y"))
+            )),
+            Some("/tmp/x/../y".into())
+        );
+    }
 }
 
 /// A name `call` removes, as `(dirfd, path)`.
@@ -3866,6 +4102,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(directory.join(path));
             }
         }
+        Self::prepare_guest_cwd(guest, dirfd, path).await;
         Self::observed_path(guest, dirfd, path)
     }
 
@@ -3975,17 +4212,236 @@ impl<T: RecordOrReplay> Detcore<T> {
         Some(directory)
     }
 
+    /// Whether a decision about `path`, looked up relative to `dirfd`, reads
+    /// the guest's working directory from the guest
+    /// ([`Self::prepare_guest_cwd`]): a nonempty spelling relative to the
+    /// working directory (`AT_FDCWD`), where the tool cannot read the working
+    /// directory from host procfs
+    /// ([`crate::procfs_inode::tool_can_read_guest_cwd`]: KVM). An absolute
+    /// spelling is bound already, and a directory descriptor supplies its own
+    /// recorded path. The empty spelling (`AT_EMPTY_PATH`) is the working
+    /// directory itself, which no decision classifies (`Detcore::decide`
+    /// takes it for no name), so it is kept as given
+    /// ([`Self::observed_path`]); so is a spelling `PATH_MAX` bytes long or
+    /// more, which Linux refuses before any walk ([`names_past_path_max`]).
+    fn reads_guest_cwd<G: Guest<Self>>(guest: &G, dirfd: i32, path: &Path) -> bool {
+        dirfd == libc::AT_FDCWD
+            && !path.is_absolute()
+            && !path.as_os_str().is_empty()
+            && !names_past_path_max(path)
+            && !crate::procfs_inode::tool_can_read_guest_cwd(&guest.config().backend)
+    }
+
+    /// Read what a decision about `path` needs of the calling thread's
+    /// working directory for the syscall it is running, where
+    /// [`Self::reads_guest_cwd`] says it reads it from the guest, before the
+    /// decision, which does not await ([`Self::observed_path`]): the
+    /// directory's path, once per syscall
+    /// ([`Self::read_guest_cwd_for_syscall`]); and where that has none (a
+    /// removed directory, or one whose path is longer than `PATH_MAX`), the
+    /// directory the spelling climbs to out of it with `..`, once per number
+    /// of `..` ([`Self::read_climbed_directory`]). Nothing happens elsewhere,
+    /// so no other spelling, and no backend whose tool reads the working
+    /// directory from host procfs, makes a call for it.
+    ///
+    /// The calls it injects stage their buffers in the guest stack scratch,
+    /// which KVM gives out once at a time and refuses with a panic while
+    /// taken (Reverie's `KvmStack`); so it must run before its caller takes
+    /// that scratch, never while the caller holds it. A caller that holds the
+    /// scratch across a call whose translation may reach it prepares the
+    /// spelling first (`Detcore::whole_link`), which leaves nothing for it to
+    /// read again.
+    pub(crate) async fn prepare_guest_cwd<G: Guest<Self>>(guest: &mut G, dirfd: i32, path: &Path) {
+        if !Self::reads_guest_cwd(guest, dirfd, path) {
+            return;
+        }
+        if guest.thread_state().syscall_cwd.is_none() {
+            Box::pin(Self::read_guest_cwd_for_syscall(guest)).await;
+        }
+        let (climbs, _) = split_leading_climb(path);
+        let unread = climbs > 0
+            && matches!(
+                &guest.thread_state().syscall_cwd,
+                Some(SyscallCwd::Unrendered(climbed)) if !climbed.contains_key(&climbs)
+            );
+        if unread {
+            let climbed = Box::pin(Self::read_climbed_directory(guest, climbs)).await;
+            if let Some(SyscallCwd::Unrendered(paths)) = &mut guest.thread_state_mut().syscall_cwd {
+                paths.insert(climbs, climbed);
+            }
+        }
+    }
+
+    /// The calling thread's working directory as its own `getcwd` answers
+    /// it, read once for the syscall it is running
+    /// ([`ThreadState::syscall_cwd`]): one `getcwd` injected in the thread,
+    /// its buffer staged by [`crate::syscalls::scratch::inject_with_scratch`]
+    /// (the guest stack scratch, whose bytes are put back after the call, or
+    /// a transient private page where that scratch cannot hold the buffer).
+    /// On KVM that scratch is not the guest's stack but the Tool's own page in
+    /// the boot-reserved layout, open to user access only while a Tool
+    /// callback runs (Reverie's `KvmStack`), and `PATH_MAX` bytes fill it
+    /// exactly, so no guest memory holds the buffer and no page is mapped
+    /// for it.
+    ///
+    /// A `getcwd` that fails with `ENOENT` (the directory was removed) or
+    /// with `ENAMETOOLONG` or `ERANGE` (its path is longer than `PATH_MAX`)
+    /// leaves the directory unrendered, as Linux leaves it walkable: a
+    /// spelling that climbs out of it with `..` is then decided from the
+    /// directory it climbs to ([`Self::prepare_guest_cwd`]). One that fails
+    /// otherwise, or that answers no path from the root (its "(unreachable)"
+    /// prefix), leaves every spelling to be decided as given, as a spelling
+    /// Detcore could not resolve always was. Called through
+    /// [`Self::prepare_guest_cwd`], boxed, so that its buffers do not grow
+    /// every system call's future.
+    async fn read_guest_cwd_for_syscall<G: Guest<Self>>(guest: &mut G) {
+        const PATH_MAX: usize = libc::PATH_MAX as usize;
+        let answered =
+            crate::syscalls::scratch::inject_with_scratch(guest, [0_u8; PATH_MAX], |buffer| {
+                Syscall::from(
+                    syscalls::Getcwd::new()
+                        .with_buf(Some(buffer.cast::<libc::c_char>()))
+                        .with_size(PATH_MAX),
+                )
+            })
+            .await;
+        let cwd = match answered {
+            // The length counts the NUL.
+            Ok((length, bytes)) => usize::try_from(length)
+                .ok()
+                .filter(|length| (1..=PATH_MAX).contains(length))
+                .map(|length| &bytes[..length - 1])
+                .filter(|path| path.starts_with(b"/"))
+                .map_or(SyscallCwd::Unknown, |path| {
+                    SyscallCwd::Path(PathBuf::from(
+                        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
+                    ))
+                }),
+            Err(Errno::ENOENT | Errno::ENAMETOOLONG | Errno::ERANGE) => {
+                SyscallCwd::Unrendered(BTreeMap::new())
+            }
+            Err(_) => SyscallCwd::Unknown,
+        };
+        guest.thread_state_mut().syscall_cwd = Some(cwd);
+    }
+
+    /// The path of the directory `climbs` `..` lead to from the calling
+    /// thread's working directory, where `getcwd` renders none for it (a
+    /// removed directory, or one whose path is longer than `PATH_MAX`), read
+    /// through a descriptor for that directory, three calls injected in the
+    /// thread: an `O_PATH` open of `..` (`climbs` of them), which the
+    /// executor walks from the working directory itself, as Linux's walk
+    /// leaves a removed directory for its parent; a `readlinkat` of that
+    /// descriptor's link (`/proc/thread-self/fd/<it>`, which the executor
+    /// answers from its own descriptor, as for
+    /// `Detcore::received_descriptor_link`); and the descriptor's `close`,
+    /// before the guest runs again, so the guest's next descriptor number
+    /// does not move. Each call's path and buffer are staged as
+    /// [`Self::read_guest_cwd_for_syscall`] stages `getcwd`'s. `None` where a
+    /// call fails, or where the link fills its buffer and may be cut.
+    async fn read_climbed_directory<G: Guest<Self>>(
+        guest: &mut G,
+        climbs: usize,
+    ) -> Option<PathBuf> {
+        const PATH_MAX: usize = libc::PATH_MAX as usize;
+        const LINK_PATH: usize = 64;
+        const LINK_TARGET: usize = PATH_MAX - LINK_PATH;
+        let climbed = climb_spelling(climbs);
+        if climbed.len() >= PATH_MAX {
+            return None;
+        }
+        let mut spelled = [0_u8; PATH_MAX];
+        spelled[..climbed.len()].copy_from_slice(climbed.as_bytes());
+        let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+        let (opened, _) = crate::syscalls::scratch::inject_with_scratch(guest, spelled, |base| {
+            syscalls::Openat::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                .with_flags(flags)
+                .with_mode(None)
+                .into()
+        })
+        .await
+        .ok()?;
+        let fd = RawFd::try_from(opened).ok()?;
+        let mut buffer = [0_u8; LINK_PATH + LINK_TARGET];
+        let link = format!("/proc/thread-self/fd/{fd}");
+        buffer[..link.len()].copy_from_slice(link.as_bytes());
+        let linked = crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
+            // SAFETY: the buffer holds LINK_PATH + LINK_TARGET bytes.
+            let target = unsafe { base.add(LINK_PATH) };
+            syscalls::Readlinkat::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                .with_buf(Some(target.cast::<libc::c_char>()))
+                .with_buf_len(LINK_TARGET)
+                .into()
+        })
+        .await;
+        let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+        let (length, bytes) = linked.ok()?;
+        let length = usize::try_from(length)
+            .ok()
+            .filter(|length| *length < LINK_TARGET)?;
+        let path = &bytes[LINK_PATH..LINK_PATH + length];
+        path.starts_with(b"/").then(|| {
+            PathBuf::from(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path))
+        })
+    }
+
     /// `path`, as a guest syscall named it relative to `dirfd`, made
     /// absolute in the guest's view. A relative spelling is not the object:
     /// absolute paths are already bound, a dirfd supplies its own prefix, and
     /// AT_FDCWD-relative spellings are resolved through the guest's root and
     /// cwd, so the result does not depend on Replayer's placeholder
     /// descriptor. A spelling that cannot be resolved is kept as given.
-    fn observed_path<G: Guest<Self>>(guest: &G, dirfd: i32, path: &Path) -> Result<PathBuf, Error> {
-        Ok(if path.is_absolute() {
+    ///
+    /// Where the tool cannot read the guest's working directory from host
+    /// procfs ([`crate::procfs_inode::tool_can_read_guest_cwd`]: KVM, whose
+    /// guest process IDs name the supervisor's own threads), the working
+    /// directory is the one the guest's `getcwd` answered for this syscall,
+    /// which an async caller reads first ([`Self::prepare_guest_cwd`]). Where
+    /// `getcwd` answered none (a removed directory, or one whose path is
+    /// longer than `PATH_MAX`), a spelling whose leading `..` climb out of it
+    /// is made absolute from the directory they reach, as the executor's own
+    /// walk named it ([`Self::read_climbed_directory`]), the rest of the
+    /// spelling following byte for byte ([`split_leading_climb`]). Any other
+    /// spelling, and one whose climb failed, is kept as given, so that the
+    /// call's own walk decides it, with its own error.
+    ///
+    /// A spelling relative to the working directory that is `PATH_MAX` bytes
+    /// long or more is kept as given before anything is read or reused for
+    /// it, on every backend: Linux refuses it with `ENAMETOOLONG` before any
+    /// walk ([`names_past_path_max`]), and a climb would shorten it into a
+    /// name Detcore serves.
+    pub(crate) fn observed_path<G: Guest<Self>>(
+        guest: &G,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<PathBuf, Error> {
+        // An absolute spelling is bound already; a relative one of PATH_MAX
+        // bytes or more names nothing, and the call refuses it.
+        let as_given = path.is_absolute() || (dirfd == libc::AT_FDCWD && names_past_path_max(path));
+        Ok(if as_given {
             path.to_path_buf()
         } else if dirfd == libc::AT_FDCWD {
-            resolved_at_fdcwd_path(guest.pid().as_raw(), path).unwrap_or_else(|| path.to_path_buf())
+            if crate::procfs_inode::tool_can_read_guest_cwd(&guest.config().backend) {
+                resolved_at_fdcwd_path(guest.pid().as_raw(), path)
+                    .unwrap_or_else(|| path.to_path_buf())
+            } else {
+                match &guest.thread_state().syscall_cwd {
+                    _ if path.as_os_str().is_empty() => path.to_path_buf(),
+                    Some(SyscallCwd::Path(cwd)) => cwd.join(path),
+                    Some(SyscallCwd::Unrendered(climbed)) => {
+                        let (climbs, rest) = split_leading_climb(path);
+                        match climbed.get(&climbs) {
+                            Some(Some(directory)) if climbs > 0 => joined_verbatim(directory, rest),
+                            _ => path.to_path_buf(),
+                        }
+                    }
+                    _ => path.to_path_buf(),
+                }
+            }
         } else {
             // A descriptor Detcore has no state for (one received over
             // `SCM_RIGHTS` and not recorded,
@@ -4045,6 +4501,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let observed = match path.map(|path| path.read(&guest.memory())) {
                 Some(Ok(path)) => {
                     let path: PathBuf = path;
+                    Self::prepare_guest_cwd(guest, dirfd, &path).await;
                     Self::observed_path(guest, dirfd, &path).ok()
                 }
                 _ => None,
@@ -4343,6 +4800,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // bound; a dirfd supplies its own prefix; AT_FDCWD-relative spellings
         // are resolved through the guest's root and cwd before the open so the
         // result does not depend on Replayer's placeholder descriptor.
+        Self::prepare_guest_cwd(guest, call.dirfd(), &path).await;
         let observed_path = Self::observed_path(guest, call.dirfd(), &path)?;
         // The spelling Detcore's own lookups of the files it renders see.
         let procfs_spelling = self.procfs_spelling_at(guest, call.dirfd(), &path).await?;
@@ -11379,6 +11837,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if let Some(pointer) = call.path() {
             let path: PathBuf = pointer.read(&guest.memory())?;
+            Self::prepare_guest_cwd(guest, libc::AT_FDCWD, &path).await;
             let observed = Self::observed_path(guest, libc::AT_FDCWD, &path)?;
             if self.rendered_procfs_at(guest, &observed).await?.is_some()
                 || Box::pin(Self::names_placeholder_directory(guest, &observed)).await
@@ -14439,19 +14898,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 !runtime_owned_descriptor_entry(&entry.name, |fd| guest.is_runtime_owned_fd(fd))
             });
         }
-        // The kernel's path for the descriptor; or, where the tool cannot
-        // read it (after a `chroot` into a root without `/proc`, where the
-        // tool runs inside the guest), the path the guest opened it by.
-        let directory = std::fs::read_link(&link)
-            .ok()
-            .or_else(|| {
+        let directory = listed_directory(
+            tool_sees_caller,
+            || std::fs::read_link(&link).ok(),
+            || {
                 guest
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.path())
                     .ok()
                     .flatten()
-            })
-            .filter(|path| path.is_absolute());
+            },
+        );
         // After a `chroot` into another root, the kernel names the directory
         // in the tool's view, below that root.
         let directory = match (directory, self.guest_root_in_view(guest)) {

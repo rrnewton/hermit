@@ -237,6 +237,8 @@ static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_CPUS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_CPUS_POOL_RACE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CWD_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RECEIVED_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -7479,6 +7481,435 @@ fn run_kvm_procfs_directories_are_served_only_in_a_container() {
         return;
     }
     serve_procfs_directories_in_a_container_only("kvm", "/proc/fs/nfsd");
+}
+
+/// A guest for <https://github.com/rrnewton/hermit/issues/4541>. In `$1`, a
+/// new directory holding `proc/fs`, it looks up names relative to its
+/// working directory whose first component is `proc`, which Detcore decides
+/// against the `--proc` level by the directory they are relative to: the
+/// shell's `[ -d ]`, an `ls` of the directory, and `mkdir -p`, relative and
+/// with an absolute path, whose components it makes relative to each
+/// directory it enters. With a second argument it then looks up `proc/fs`
+/// from `/`, where it is the `/proc/fs` the level omits: first in the shell
+/// itself, by a redirection, whose error it names (the same process looked
+/// `proc/fs` up from its old directory before, so this one is decided only
+/// by the working directory read again for this call); then by `ls`, with
+/// `/proc/fs` itself, each with the error it meets.
+const RELATIVE_PROCFS_NAMES: &str = r#"mkdir "$1" "$1/proc" "$1/proc/fs" || exit 9
+cd "$1" || exit 9
+if [ -d proc/fs ]; then echo '[ -d proc/fs ]: true'; else echo '[ -d proc/fs ]: false'; fi
+ls proc/fs; echo "ls proc/fs: $?"
+mkdir -p proc/fs/made; echo "mkdir -p proc/fs/made: $?"
+mkdir -p "$1/again/proc/fs"; echo "mkdir -p DIRECTORY/again/proc/fs: $?"
+ls proc/fs; echo "ls proc/fs: $?"
+ls again/proc; echo "ls again/proc: $?"
+[ "$#" -gt 1 ] || exit 0
+cd / || exit 9
+if { true < proc/fs; } 2>/tmp/e; then e=opened; else
+  read -r e < /tmp/e
+  case "$e" in *"No such file"*) e=ENOENT ;; *"Permission denied"*) e=EACCES ;; esac
+fi
+echo "from /, < proc/fs in the shell: $e"
+for name in proc/fs /proc/fs; do
+  echo "from /, ls -d $name: $(ls -d "$name" 2>&1 >/dev/null | sed 's/.*: //')"
+done
+"#;
+
+/// What [`RELATIVE_PROCFS_NAMES`] prints natively without its second
+/// argument: below its directory every name is an ordinary one.
+const RELATIVE_PROCFS_NAMES_NATIVELY: &str = "[ -d proc/fs ]: true\nls proc/fs: 0\n\
+                                              mkdir -p proc/fs/made: 0\n\
+                                              mkdir -p DIRECTORY/again/proc/fs: 0\nmade\n\
+                                              ls proc/fs: 0\nfs\nls again/proc: 0\n";
+
+/// On `backend`, Detcore decides a guest's names relative to its working
+/// directory by that directory, whichever directory Hermit was started in
+/// (<https://github.com/rrnewton/hermit/issues/4541>): in a directory holding
+/// `proc/fs`, the names [`RELATIVE_PROCFS_NAMES`] looks up get their native
+/// answers, and from `/`, `proc/fs` is omitted as `/proc/fs` is. Hermit is
+/// started in `/` and in a directory of its own, and both runs print the
+/// same. Before the fix, Detcore on KVM read the working directory of the
+/// host task the guest's process ID names, one of Hermit's own threads,
+/// which is in Hermit's starting directory: started in `/`, the names in the
+/// guest's directory were taken for `/proc`'s (`[ -d proc/fs ]` false,
+/// `mkdir -p` refused with `EACCES`); started elsewhere, `proc/fs` from `/`
+/// was not taken for `/proc/fs` and reached KVM's executor, which refuses it
+/// with `EACCES` rather than omitting it. The shell's own lookup from `/`
+/// needs the working directory read again for that call: one still saved
+/// from its earlier call in the old directory would take `proc/fs` for an
+/// ordinary name there, and KVM's executor would refuse it with `EACCES`.
+fn decide_relative_names_by_the_guests_working_directory(backend: &str) {
+    let native = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = Command::new("/bin/sh")
+        .args(["-c", RELATIVE_PROCFS_NAMES, "sh"])
+        .arg(native.path().join("r"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(output.status.success(), "natively: {output:?}");
+    assert_eq!(stdout(&output), RELATIVE_PROCFS_NAMES_NATIVELY, "natively");
+    let expected = format!(
+        "{RELATIVE_PROCFS_NAMES_NATIVELY}from /, < proc/fs in the shell: ENOENT\n\
+         from /, ls -d proc/fs: No such file or directory\n\
+         from /, ls -d /proc/fs: No such file or directory\n"
+    );
+    let elsewhere = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        RELATIVE_PROCFS_NAMES,
+        "sh",
+        "/tmp/r",
+        "from /",
+    ];
+    for started_in in [Path::new("/"), elsewhere.path()] {
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&args)
+                .current_dir(started_in)
+                .stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            expected,
+            "{backend}, Hermit started in {}; stderr:\n{}",
+            started_in.display(),
+            stderr(&output)
+        );
+    }
+}
+
+/// [`decide_relative_names_by_the_guests_working_directory`] on ptrace,
+/// whose tool reads the guest's working directory from host procfs: the
+/// control for KVM's run.
+#[test]
+fn relative_names_are_decided_by_the_guests_working_directory() {
+    decide_relative_names_by_the_guests_working_directory("ptrace");
+}
+
+/// [`decide_relative_names_by_the_guests_working_directory`] on KVM, whose
+/// tool reads the guest's working directory with a `getcwd` injected in the
+/// guest.
+#[test]
+fn run_kvm_relative_names_are_decided_by_the_guests_working_directory() {
+    let test = "run_kvm_relative_names_are_decided_by_the_guests_working_directory";
+    if kvm_unavailable(test) {
+        return;
+    }
+    decide_relative_names_by_the_guests_working_directory("kvm");
+}
+
+/// What `tests/c/cwd_dotdot_lookups.c` prints under Hermit, on every backend,
+/// as natively for every name the `--proc` level does not hide: from a
+/// removed working directory and from one whose path is longer than
+/// `PATH_MAX` (whose `getcwd` glibc answers with ERANGE, natively too, after
+/// the kernel's ENAMETOOLONG), names whose leading `..` reach `/proc/fs`,
+/// which Hermit hides at every `--proc` level, are absent; `/proc`,
+/// `/tmp/sibling` and its file are found; `/proc/uptime/`, a file spelled as a
+/// directory, is no directory; the long directory's own `proc/fs` is found,
+/// directly and through `x/..`; and a climb to `/proc/uptime` padded with
+/// separators resolves at 4095 bytes and is refused with ENAMETOOLONG at
+/// 4096 and 4097, as Linux refuses any name of `PATH_MAX` bytes or more.
+const CWD_DOTDOT_LOOKUPS: &str = "absolute /proc/fs: stat=ENOENT open=ENOENT\n\
+                                  live ../sibling: stat=0 open=0\n\
+                                  removed getcwd: ENOENT\n\
+                                  removed ../../proc/fs: open=ENOENT\n\
+                                  removed ../../proc: stat=0 open=0\n\
+                                  removed ../../proc/uptime/: stat=ENOTDIR open=ENOTDIR\n\
+                                  removed /proc/fs: stat=ENOENT open=ENOENT\n\
+                                  removed ../sibling: stat=0 open=0\n\
+                                  removed ../sibling/file: stat=0 open=0\n\
+                                  removed .: stat=0 open=0\n\
+                                  removed x: stat=ENOENT open=ENOENT\n\
+                                  removed (../ x2, 4095 bytes)proc/uptime: stat=0 open=0\n\
+                                  removed (../ x2, 4096 bytes)proc/uptime: \
+                                  stat=ENAMETOOLONG open=ENAMETOOLONG\n\
+                                  removed (../ x2, 4097 bytes)proc/uptime: \
+                                  stat=ENAMETOOLONG open=ENAMETOOLONG\n\
+                                  overlong getcwd: ERANGE\n\
+                                  overlong proc/fs: stat=0 open=0\n\
+                                  overlong x/../proc/fs: stat=0 open=0\n\
+                                  overlong (../ x20)proc/fs: stat=ENOENT open=ENOENT\n\
+                                  overlong (../ x20)proc: stat=0 open=0\n\
+                                  overlong (../ x20)proc/uptime/: stat=ENOTDIR open=ENOTDIR\n\
+                                  overlong (../ x19)sibling: stat=0 open=0\n\
+                                  overlong (../ x20, 4095 bytes)proc/uptime: stat=0 open=0\n\
+                                  overlong (../ x20, 4096 bytes)proc/uptime: \
+                                  stat=ENAMETOOLONG open=ENAMETOOLONG\n\
+                                  overlong (../ x20, 4097 bytes)proc/uptime: \
+                                  stat=ENAMETOOLONG open=ENAMETOOLONG\n\
+                                  next descriptor: 3\n";
+
+/// On `backend`, Detcore decides a name that climbs out of a working
+/// directory `getcwd` cannot name by where the climb leads, from Hermit
+/// started in `/` and in a directory of its own
+/// (<https://github.com/rrnewton/hermit/issues/4541>): Linux still walks `..`
+/// out of a removed working directory (`getcwd`: ENOENT) and out of one whose
+/// path is longer than `PATH_MAX` (ENAMETOOLONG), and
+/// `tests/c/cwd_dotdot_lookups.c` looks names up through their leading `..`
+/// from each, and other names below the long one. The answers are the ones
+/// [`CWD_DOTDOT_LOOKUPS`] lists, and the calls that read where a climb leads
+/// leave the guest's next descriptor where it was. A climb padded to
+/// `PATH_MAX` bytes or more is never shortened into a name Detcore serves.
+/// Before, KVM decided these
+/// names by the working directory of one of Hermit's own threads: started in
+/// `/`, the long directory's own `proc/fs` was taken for the hidden
+/// `/proc/fs`; started elsewhere, KVM's executor refused the climbs to `/proc`
+/// with EACCES. Without the climb, it refused them from both directories.
+/// On ptrace, the stat of a climb to `/proc/fs` out of the long directory
+/// succeeded, as no climb out of a directory the kernel cannot name in its
+/// link was resolved.
+fn decide_dotdot_names_by_where_they_lead(backend: &str) {
+    let guest = futex_c_guest(&CWD_DOTDOT_LOOKUPS_GUEST, "cwd_dotdot_lookups")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let elsewhere = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+    ];
+    for started_in in [Path::new("/"), elsewhere.path()] {
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&args)
+                .current_dir(started_in)
+                .stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            CWD_DOTDOT_LOOKUPS,
+            "{backend}, Hermit started in {}; stderr:\n{}",
+            started_in.display(),
+            stderr(&output)
+        );
+    }
+}
+
+/// [`decide_dotdot_names_by_where_they_lead`] on ptrace, whose tool reads the
+/// working directory from host procfs, and, for one whose path no link
+/// holds, the directory a climb leads to through the kernel's own walk.
+#[test]
+fn dotdot_names_are_decided_by_where_they_lead() {
+    decide_dotdot_names_by_where_they_lead("ptrace");
+}
+
+/// [`decide_dotdot_names_by_where_they_lead`] on KVM, whose tool reads the
+/// working directory with an injected `getcwd`, and, where that names none,
+/// the directory a climb leads to through an injected descriptor for it,
+/// opened by the executor's own walk.
+#[test]
+fn run_kvm_dotdot_names_are_decided_by_where_they_lead() {
+    let test = "run_kvm_dotdot_names_are_decided_by_where_they_lead";
+    if kvm_unavailable(test) {
+        return;
+    }
+    decide_dotdot_names_by_where_they_lead("kvm");
+}
+
+/// The `/sys` CPU directory lists only the virtual CPUs by every spelling of
+/// it, on `backend`: Detcore names a listing's directory by the descriptor's
+/// kernel path where its `/proc` entry for the caller is the caller's, and
+/// otherwise (KVM) by the path the guest opened it by, `.` and `..` folded in,
+/// never by the link of a host task the guest's thread number names
+/// (<https://github.com/rrnewton/hermit/issues/4541>). Before, KVM listed
+/// every host CPU through `.`, `./cpu`, `cpu/` and `../cpu`, and through
+/// every relative spelling before the guest's working directory was its own.
+fn list_the_virtual_cpus_by_every_spelling(backend: &str) {
+    let script = "cpus=$(nproc)\n\
+                  cd /sys/devices/system || exit 9\n\
+                  for name in cpu ./cpu cpu/ /sys/devices/system/cpu; do\n\
+                  \x20 echo \"$name: $(ls \"$name\" | grep -c '^cpu[0-9][0-9]*$') of $cpus\"\n\
+                  done\n\
+                  cd cpu || exit 9\n\
+                  for name in . ../cpu; do\n\
+                  \x20 echo \"$name: $(ls \"$name\" | grep -c '^cpu[0-9][0-9]*$') of $cpus\"\n\
+                  done\n";
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+    ];
+    let output =
+        hermit_test::hermit_output("hermit run", hermit_command(&args).stdin(Stdio::null()));
+    assert_success(&output, &args);
+    let listed = stdout(&output);
+    let cpus = listed
+        .lines()
+        .next()
+        .and_then(|line| line.rsplit_once(" of "))
+        .map(|(_, cpus)| cpus.to_owned())
+        .unwrap_or_default();
+    let expected = [
+        "cpu",
+        "./cpu",
+        "cpu/",
+        "/sys/devices/system/cpu",
+        ".",
+        "../cpu",
+    ]
+    .iter()
+    .map(|name| format!("{name}: {cpus} of {cpus}\n"))
+    .collect::<String>();
+    assert!(
+        !cpus.is_empty(),
+        "{backend}: {listed}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert_eq!(listed, expected, "{backend}; stderr:\n{}", stderr(&output));
+}
+
+/// [`list_the_virtual_cpus_by_every_spelling`] on ptrace.
+#[test]
+fn the_virtual_cpus_are_listed_by_every_spelling() {
+    list_the_virtual_cpus_by_every_spelling("ptrace");
+}
+
+/// [`list_the_virtual_cpus_by_every_spelling`] on KVM.
+#[test]
+fn run_kvm_the_virtual_cpus_are_listed_by_every_spelling() {
+    let test = "run_kvm_the_virtual_cpus_are_listed_by_every_spelling";
+    if kvm_unavailable(test) {
+        return;
+    }
+    list_the_virtual_cpus_by_every_spelling("kvm");
+}
+
+/// A `readlink` of the caller's descriptor link to `/proc/self/fd`, open on
+/// descriptor 7, names that directory, `/proc/<pid>/fd`, on `backend`, as
+/// natively: by its absolute spelling, and relative to the working directory
+/// `/` (<https://github.com/rrnewton/hermit/issues/4541>). Before, KVM refused
+/// the relative spelling with `EACCES`: Detcore read no working directory for
+/// it, and its executor refuses procfs. A spelling through `..` is not
+/// decided here (<https://github.com/rrnewton/hermit/issues/4901>).
+fn read_descriptor_directory_links_relative_to_the_working_directory(backend: &str) {
+    let script = "exec 7< /proc/self/fd || exit 9\n\
+                  link() { echo \"$1: $(readlink \"$2\" 2>&1 | sed 's#/proc/[0-9]*/#/proc/N/#')\"; }\n\
+                  cd / || exit 9\n\
+                  link abs /proc/self/fd/7\n\
+                  link rel proc/self/fd/7\n";
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+    ];
+    let output =
+        hermit_test::hermit_output("hermit run", hermit_command(&args).stdin(Stdio::null()));
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "abs: /proc/N/fd\nrel: /proc/N/fd\n",
+        "{backend}; stderr:\n{}",
+        stderr(&output)
+    );
+}
+
+/// [`read_descriptor_directory_links_relative_to_the_working_directory`] on ptrace.
+#[test]
+fn descriptor_directory_links_are_read_relative_to_the_working_directory() {
+    read_descriptor_directory_links_relative_to_the_working_directory("ptrace");
+}
+
+/// [`read_descriptor_directory_links_relative_to_the_working_directory`] on KVM.
+#[test]
+fn run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory() {
+    let test = "run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory";
+    if kvm_unavailable(test) {
+        return;
+    }
+    read_descriptor_directory_links_relative_to_the_working_directory("kvm");
+}
+
+/// What `tests/c/received_dotdot_lookups.c` prints under Hermit, on every
+/// backend, as natively: through `..` from a directory descriptor for
+/// `/tmp/d/sub`, opened or received over `SCM_RIGHTS`, the guest's own
+/// `/tmp/d/proc/uptime` is read and its own `/tmp/d/proc/fs` is found;
+/// `/proc/fs` itself is absent; and a lookup from a descriptor that is not
+/// open, and one whose walk meets a file before its `..`, fail as Linux fails
+/// them.
+const RECEIVED_DOTDOT_LOOKUPS: &str = "opened ../proc/uptime: read=\"the guest's own file\"\n\
+                                       received ../proc/uptime: read=\"the guest's own file\"\n\
+                                       opened ../proc/fs: stat=0 open=0\n\
+                                       received ../proc/fs: stat=0 open=0\n\
+                                       received ../../d/proc/fs: stat=0 open=0\n\
+                                       absolute /proc/fs: stat=ENOENT open=ENOENT\n\
+                                       not open ../proc/uptime: open=EBADF\n\
+                                       absolute /dev/null/../../proc/uptime: open=ENOTDIR\n";
+
+/// On `backend`, a name relative to a directory descriptor is looked up
+/// from that descriptor's directory, never from `/`
+/// (<https://github.com/rrnewton/hermit/issues/4541>): a descriptor received
+/// over `SCM_RIGHTS`, for which Detcore may keep no path, keeps its name
+/// relative, and the kernel's or the executor's walk from the descriptor
+/// decides it, as for the descriptor the guest opened itself. The answers
+/// are the ones [`RECEIVED_DOTDOT_LOOKUPS`] lists. A general resolution of
+/// `..` that walked such a name from `/` read Detcore's own
+/// `/proc/uptime` instead of the guest's file, hid the guest's `proc/fs`, and
+/// answered the lookups that fail with EBADF and ENOTDIR.
+fn look_up_dotdot_from_received_descriptors(backend: &str) {
+    let guest = futex_c_guest(&RECEIVED_DOTDOT_LOOKUPS_GUEST, "received_dotdot_lookups")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+    ];
+    let output =
+        hermit_test::hermit_output("hermit run", hermit_command(&args).stdin(Stdio::null()));
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        RECEIVED_DOTDOT_LOOKUPS,
+        "{backend}; stderr:\n{}",
+        stderr(&output)
+    );
+}
+
+/// [`look_up_dotdot_from_received_descriptors`] on ptrace.
+#[test]
+fn dotdot_from_a_received_descriptor_finds_the_guests_own_files() {
+    look_up_dotdot_from_received_descriptors("ptrace");
+}
+
+/// [`look_up_dotdot_from_received_descriptors`] on KVM.
+#[test]
+fn run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files() {
+    let test = "run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files";
+    if kvm_unavailable(test) {
+        return;
+    }
+    look_up_dotdot_from_received_descriptors("kvm");
 }
 
 /// The calls on and below a `/proc` directory Detcore serves that Detcore

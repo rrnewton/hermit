@@ -313,6 +313,12 @@
       "why": "tests/c/cpuinfo_matches_cpuid.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test cpuinfo_matches_cpuid compiles this guest, which compares /proc/cpuinfo's vendor, family, model, stepping, model name and 22 feature flags with what the CPUID instruction reports and prints only whether each matches, and requires every line to match at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4161: /proc/cpuinfo showed the host CPU while CPUID showed the virtual one); it remains a guest fixture because a generic manifest cannot assert this exact output."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/cwd_dotdot_lookups.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/cwd_dotdot_lookups.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests dotdot_names_are_decided_by_where_they_lead (ptrace) and run_kvm_dotdot_names_are_decided_by_where_they_lead (KVM) compile this guest, which looks names up through their leading `..` from a removed working directory, whose getcwd fails with ENOENT, and from one whose path is longer than PATH_MAX (ENAMETOOLONG), as Linux still walks `..` out of both, and other names below the long one, and require the same exact lines on both backends from Hermit started in / and elsewhere (https://github.com/rrnewton/hermit/issues/4541); it remains a guest fixture because a generic manifest cannot start Hermit from two working directories and compare."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/cwd_roundtrip.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -1985,6 +1991,12 @@
       "path": "tests/c/received_directory_swap.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/received_directory_swap.c is owned by hermit-cli/tests/cli.rs: the CLI test a_received_directory_replaced_during_an_open_is_what_the_open_returned runs it natively and then on ptrace with --no-sequentialize-threads and the procfs_spelling_resolved race probe, so that a second thread replaces a received /proc descriptor with an ordinary directory between Detcore naming it and the kernel's open, and requires the returned directory to behave as what it holds (marker found, mountinfo ENOENT), not as /proc/self (https://github.com/rrnewton/hermit/issues/4213, K3b). It stays a fixture because a generic manifest cannot set a race probe or assert which object the open returned."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/received_dotdot_lookups.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/received_dotdot_lookups.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests dotdot_from_a_received_descriptor_finds_the_guests_own_files (ptrace) and run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files (KVM) compile this guest, which looks names up through `..` from a directory descriptor it opened and from the same directory received over SCM_RIGHTS, and require the guest's own proc/uptime and proc/fs below that directory's parent, not /proc's, together with the EBADF and ENOTDIR of lookups Linux refuses (https://github.com/rrnewton/hermit/issues/4541); it remains a guest fixture because a generic manifest cannot compare the exact lines across backends."
     },
     {
       "disposition": "manifest-test",
