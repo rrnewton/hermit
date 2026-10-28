@@ -27782,6 +27782,38 @@ mod test {
         assert_eq!(scheduler.signal_curr_targets.get(&process), None);
     }
 
+    /// A signal whose default action ends the process, sent to a process
+    /// every thread of which blocks it, waits in the shared queue: no thread
+    /// takes it, and none is named, least of all a thread of the sending
+    /// process. With one thread leaving it unblocked, that thread is named.
+    #[test]
+    fn a_fatal_signal_every_thread_blocks_waits_in_the_shared_queue() {
+        let term = kernel_signal_bit(libc::SIGTERM);
+        let mut scheduler = gated_scheduler();
+        let leader = DetTid::from_raw(100);
+        let worker = DetTid::from_raw(101);
+        let sender = DetTid::from_raw(200);
+        let process = DetPid::from_raw(100);
+        signal_process(&mut scheduler, leader, &[(leader, term), (worker, term)], 0);
+        signal_process(&mut scheduler, sender, &[(sender, 0)], 0);
+        assert_eq!(
+            scheduler.process_signal_receiver(process, leader, sender, libc::SIGTERM),
+            process_signal_receiver::ProcessSignalReceiver::SharedQueue
+        );
+        scheduler
+            .test_kernel_signal_states
+            .get_mut(&worker)
+            .unwrap()
+            .blocked = 0;
+        assert_eq!(
+            scheduler.process_signal_receiver(process, leader, sender, libc::SIGTERM),
+            process_signal_receiver::ProcessSignalReceiver::Thread {
+                thread: worker,
+                sole: true
+            }
+        );
+    }
+
     /// The readmission that broke record/replay of make -jN (minibeads
     /// dh-ojrf): make (7), a SIGCHLD taker, is backgrounded in a `pselect6`
     /// and a child (173) in a `connect`. Both calls have finished by one

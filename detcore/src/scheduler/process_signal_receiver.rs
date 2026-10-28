@@ -268,10 +268,22 @@ impl Scheduler {
             .and_then(|(thread, _)| self.stopped_thread_signal_state(*thread).ok())
             .is_some_and(|state| state.default_action_ends_process(signo))
         {
-            let thread = threads
+            // Every thread blocks it: Linux leaves it in the shared queue, and
+            // no thread takes it until one unblocks it.
+            let Some(thread) = threads
                 .iter()
-                .find(|(thread, wants)| *wants != Wants::No || *thread == sender)
-                .map_or(sender, |(thread, _)| *thread);
+                .find(|(_, wants)| *wants != Wants::No)
+                .map(|(thread, _)| *thread)
+            else {
+                tracing::info!(
+                    "[scheduler] process-directed signal {} from {} to process {} would end its \
+                     thread group, but every thread blocks it: it waits in the shared queue",
+                    signo,
+                    sender,
+                    process,
+                );
+                return ProcessSignalReceiver::SharedQueue;
+            };
             tracing::info!(
                 "[scheduler] process-directed signal {} from {} to process {} ends its thread \
                  group whichever thread takes it; thread {} is named",

@@ -3069,7 +3069,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the pidfd sentinel spelling unit (lander review of #4625): 2797.
     // And the chosen-receiver selection unit (lander review of #4625): 2798.
     // And the curr_target commit unit (lander review of #4625): 2799.
-    ("test.detcore_unit", 2799),
+    // And the fatal all-blocked unit (lander review of #4625): 2800.
+    ("test.detcore_unit", 2800),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5397,7 +5398,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same pidfd sentinel spelling unit: 2797.
     // And the same chosen-receiver selection unit: 2798.
     // And the same curr_target commit unit: 2799.
-    ("test.detcore_unit_on_host", 2799),
+    // And the same fatal all-blocked unit: 2800.
+    ("test.detcore_unit_on_host", 2800),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
