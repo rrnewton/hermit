@@ -40,6 +40,11 @@
  *   [1] (the new namespace's ID only) or [1, first + 100] (also the ID in the
  *   guest's own namespace); the child checks it is 1 in its namespace;
  * - `unknown-flag`: `own-tid 1` with an unknown flag bit too (EINVAL);
+ * - `edge-tid`: `own-tid 1` with the array in the last four bytes of a page
+ *   that an unmapped page follows;
+ * - `wronly-args`, `wronly-vfork`: a clone3 (with CLONE_VFORK for the
+ *   second) whose struct clone_args is on a page mapped writable but not
+ *   readable, which the kernel reads all the same;
  * - `vfork-detached`: a raw clone with CLONE_VFORK, CLONE_PIDFD and
  *   CLONE_DETACHED, which every kernel refuses (EINVAL);
  * - `nested`: `own-tid 1` after unshare(CLONE_NEWPID), so that the array is
@@ -72,6 +77,7 @@
 #include <linux/seccomp.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -206,6 +212,7 @@ static int one_call(int argc, char** argv) {
   memset(&args, 0, sizeof args);
   args.exit_signal = SIGCHLD;
   args.set_tid = (uint64_t)(uintptr_t)tids;
+  struct clone_args* argp = &args;
   int nested_call = 0;
   if (strncmp(what, "newpid", 6) == 0) {
     args.flags = CLONE_NEWPID;
@@ -241,13 +248,39 @@ static int one_call(int argc, char** argv) {
     args.set_tid_size = 1;
   } else if (strcmp(what, "bad-size") == 0) {
     args.set_tid_size = 0;
+  } else if (strcmp(what, "edge-tid") == 0) {
+    long page = sysconf(_SC_PAGESIZE);
+    char* pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pages == MAP_FAILED || munmap(pages + page, page) != 0) {
+      printf("mmap: %s\n", strerror(errno));
+      return 1;
+    }
+    pid_t* edge = (pid_t*)(pages + page - sizeof(pid_t));
+    *edge = 1;
+    args.flags = CLONE_NEWPID;
+    args.set_tid = (uint64_t)(uintptr_t)edge;
+    args.set_tid_size = 1;
+  } else if (strcmp(what, "wronly-args") == 0 ||
+             strcmp(what, "wronly-vfork") == 0) {
+    args.set_tid = 0;
+    if (strcmp(what, "wronly-vfork") == 0) {
+      args.flags = CLONE_VFORK;
+    }
+    argp = mmap(NULL, sysconf(_SC_PAGESIZE), PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (argp == MAP_FAILED) {
+      printf("mmap: %s\n", strerror(errno));
+      return 1;
+    }
+    *argp = args;
   } else {
     printf("unknown call %s\n", what);
     return 2;
   }
-  long child = syscall(SYS_clone3, &args, sizeof args);
+  long child = syscall(SYS_clone3, argp, sizeof args);
   if (child == 0) {
-    if (args.set_tid == 0) {
+    if (args.set_tid == 0 && args.flags == CLONE_NEWPID) {
       printf("newpid child: own ID %ld\n", (long)getpid());
     }
     if (nested_call != 0) {
