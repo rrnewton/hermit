@@ -318,6 +318,11 @@ mod tests {
 
     #[test]
     fn the_relay_serves_one_client_once_the_gdbserver_listens() {
+        if crate::run_in_fresh_process(
+            "gdbserver::tests::the_relay_serves_one_client_once_the_gdbserver_listens",
+        ) {
+            return;
+        }
         let runtime = runtime();
         let port = GdbPort::bind(0).unwrap();
         let number = port.port();

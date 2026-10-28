@@ -1322,6 +1322,9 @@ mod tests {
 
     #[test]
     fn entry_descriptor_failure_can_stamp_no_result_without_running_a_guest() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         use std::os::fd::AsRawFd;
         use std::os::fd::FromRawFd;
         use std::os::fd::OwnedFd;
@@ -1753,6 +1756,9 @@ mod tests {
 
     #[test]
     fn run_epoch_environment_and_cli_precedence() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         const CHILD: &str = "HERMIT_EPOCH_PRECEDENCE_TEST_CHILD";
         const ENV_EPOCH: &str = "2000-12-31T23:59:59.123456789Z";
         if std::env::var_os(CHILD).is_none() {

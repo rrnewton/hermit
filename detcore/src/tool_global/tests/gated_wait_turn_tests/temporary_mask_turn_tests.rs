@@ -96,6 +96,11 @@ fn suspend_requests(guest: &TurnGuest) -> Vec<Resources> {
 /// (c)'s publication assertion fails.
 #[tokio::test]
 async fn under_the_gate_rt_sigsuspend_parks_and_decides_by_its_temporary_mask() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::under_the_gate_rt_sigsuspend_parks_and_decides_by_its_temporary_mask",
+    ) {
+        return;
+    }
     let term = bit(libc::SIGTERM);
     let quit = bit(libc::SIGQUIT);
     let call = Syscall::from(suspend(0));
@@ -247,6 +252,11 @@ async fn under_the_gate_a_caught_end_of_a_temporary_mask_wait_is_a_named_refusal
 /// keyed on anything but the gate": it files a request or reads `/proc`.
 #[tokio::test]
 async fn with_the_gate_off_rt_sigsuspend_keeps_its_kernel_run_path() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::with_the_gate_off_rt_sigsuspend_keeps_its_kernel_run_path",
+    ) {
+        return;
+    }
     let _seam = signal_state_read_seam::install(|_, _| panic!("a /proc read with the gate off"));
     let mut guest = turn_guest(false, Some(0));
     let tool = super::tool(&guest);
@@ -279,6 +289,11 @@ async fn with_the_gate_off_rt_sigsuspend_keeps_its_kernel_run_path() {
 /// check" (the third check removes).
 #[tokio::test]
 async fn a_parked_rt_sigsuspend_removes_the_ignored_signals_linux_would_not_hold() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::a_parked_rt_sigsuspend_removes_the_ignored_signals_linux_would_not_hold",
+    ) {
+        return;
+    }
     let urg = bit(libc::SIGURG);
     let winch = bit(libc::SIGWINCH);
     let chld = bit(libc::SIGCHLD);
@@ -381,6 +396,11 @@ fn a_sigchld_sent_before_its_block_was_granted_is_neither_kept_nor_shown() {
 /// "not keyed on a move away from ignored" (the SIG_IGN row removes).
 #[tokio::test]
 async fn an_rt_sigaction_that_unignores_removes_first_the_instances_linux_discarded() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::an_rt_sigaction_that_unignores_removes_first_the_instances_linux_discarded",
+    ) {
+        return;
+    }
     let term = bit(libc::SIGTERM);
     let action = |handler: usize| {
         let cell: &'static mut [u64; 4] = Box::leak(Box::new([handler as u64, 0, 0, 0]));
@@ -868,6 +888,11 @@ async fn under_the_gate_a_masked_pselect6_with_more_than_64_descriptors_that_wou
 /// a masked call" (the first row parks).
 #[tokio::test]
 async fn under_the_gate_each_select_form_ends_only_for_a_signal_its_mask_lets_in() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::under_the_gate_each_select_form_ends_only_for_a_signal_its_mask_lets_in",
+    ) {
+        return;
+    }
     let term = bit(libc::SIGTERM);
     let urg = bit(libc::SIGURG);
     #[derive(Clone, Copy, Debug)]
@@ -1299,6 +1324,11 @@ async fn under_the_gate_a_masked_epoll_pwait2_takes_the_same_path() {
 /// one of them changes.
 #[tokio::test]
 async fn with_the_gate_off_the_masked_forms_keep_today_s_paths() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::with_the_gate_off_the_masked_forms_keep_today_s_paths",
+    ) {
+        return;
+    }
     let _seam = signal_state_read_seam::install(|_, _| panic!("a /proc read with the gate off"));
     let memory = FormMemory::new(Some(1_000_000_000), 0);
     let mut guest = turn_guest(false, Some(0));
@@ -1521,6 +1551,11 @@ async fn the_base_rows_where_in_guest_matched_linux_keep_their_answers_under_the
 /// removes nothing).
 #[tokio::test]
 async fn ir7_rows_a_and_b_hold_for_pselect6_and_ppoll() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::ir7_rows_a_and_b_hold_for_pselect6_and_ppoll",
+    ) {
+        return;
+    }
     let urg = bit(libc::SIGURG);
     let urg_state = proc_state(urg, 0, 0);
     let none = proc_state(0, 0, 0);
@@ -1713,6 +1748,11 @@ async fn under_the_gate_an_invalid_masked_call_meets_d41_only_for_a_signal_its_o
 /// clear. Mutation "the guest's mask published as written".
 #[tokio::test]
 async fn under_the_gate_a_masked_wait_publishes_the_mask_linux_installs() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::under_the_gate_a_masked_wait_publishes_the_mask_linux_installs",
+    ) {
+        return;
+    }
     let term = bit(libc::SIGTERM);
     let installed = !term & !(bit(libc::SIGKILL) | bit(libc::SIGSTOP));
     for form in ["pselect6", "ppoll", "epoll_pwait"] {
@@ -1892,6 +1932,11 @@ async fn under_the_gate_a_masked_pselect6_reads_its_sets_before_refusing_more_th
 /// the yield" (0.6 s).
 #[tokio::test]
 async fn under_the_gate_a_masked_wait_ready_at_its_first_probe_still_yields_once() {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::under_the_gate_a_masked_wait_ready_at_its_first_probe_still_yields_once",
+    ) {
+        return;
+    }
     let term = bit(libc::SIGTERM);
     for form in ["pselect6", "pselect6 65", "ppoll", "epoll_pwait"] {
         for probe in [Ok(2), Err(Errno::EBADF)] {
@@ -2105,6 +2150,11 @@ fn arm_virtual_timerfd(guest: &mut TurnGuest) {
 #[tokio::test]
 async fn under_the_gate_a_signal_sent_during_a_hand_off_before_the_first_check_is_not_an_entry_instance()
  {
+    if super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::under_the_gate_a_signal_sent_during_a_hand_off_before_the_first_check_is_not_an_entry_instance",
+    ) {
+        return;
+    }
     let urg = bit(libc::SIGURG);
     for timerfd in [false, true] {
         let forms: &[&str] = if timerfd {

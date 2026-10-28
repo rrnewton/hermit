@@ -132,6 +132,21 @@ mod real_random {
     }
 
     pub(super) fn case(name: &str, fatal: bool, trace_diagnostics: bool, operation: Operation) {
+        // These cases drive a Detcore session on the calling thread, and
+        // a debug session overflows the test thread's default 2 MiB stack
+        // under plain `cargo test`, so run the case on a thread with an
+        // explicit stack.
+        let name = name.to_owned();
+        std::thread::Builder::new()
+            .name(name.clone())
+            .stack_size(16 << 20)
+            .spawn(move || case_body(&name, fatal, trace_diagnostics, operation))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn case_body(name: &str, fatal: bool, trace_diagnostics: bool, operation: Operation) {
         if std::env::var("HERMIT_OWNER_TEST_ROLE").as_deref() == Ok(name) {
             isolated(name, || exercise(fatal, trace_diagnostics, operation));
             return;

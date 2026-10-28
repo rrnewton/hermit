@@ -141,6 +141,11 @@ fn publications(guest: &TurnGuest) -> Vec<(u64, u64, u64)> {
 /// (the unarmed rows).
 #[tokio::test]
 async fn ir23_each_masked_site_publishes_its_temporary_mask_once_before_the_timerfd_rpc() {
+    if super::super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::publication_tests::ir23_each_masked_site_publishes_its_temporary_mask_once_before_the_timerfd_rpc",
+    ) {
+        return;
+    }
     let own = bit(libc::SIGUSR1);
     let temporary = bit(libc::SIGTERM) | bit(libc::SIGKILL);
     let installed = bit(libc::SIGTERM);
@@ -216,6 +221,11 @@ async fn ir23_each_masked_site_publishes_its_temporary_mask_once_before_the_time
 /// publication": the armed rows' deadline is 1.3 s.
 #[tokio::test]
 async fn ir23c_with_an_armed_timerfd_the_deadline_is_the_entrys() {
+    if super::super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::publication_tests::ir23c_with_an_armed_timerfd_the_deadline_is_the_entrys",
+    ) {
+        return;
+    }
     for armed in [true, false] {
         for site in [Site::InternalPselect6, Site::Ppoll, Site::Epoll] {
             let case = format!("{site:?}, armed {armed}");
@@ -427,6 +437,11 @@ async fn held_masks_and_r2_are_per_queue_in_both_orders() {
 /// the request).
 #[tokio::test]
 async fn r2_keeps_the_entry_instance_and_removes_the_arrival_before_the_yield() {
+    if super::super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::publication_tests::r2_keeps_the_entry_instance_and_removes_the_arrival_before_the_yield",
+    ) {
+        return;
+    }
     let urg = bit(libc::SIGURG);
     let winch = bit(libc::SIGWINCH);
     for site in [Site::Ppoll, Site::ZeroEpoll, Site::InternalPselect6] {
@@ -700,6 +715,11 @@ async fn ir23c_the_staged_pselect6_writes_back_from_the_entry_deadline() {
 /// nothing after their last request.
 #[tokio::test]
 async fn a_parked_masked_wait_puts_the_own_mask_back_unless_interrupted() {
+    if super::super::isolated_child(
+        "tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests::publication_tests::a_parked_masked_wait_puts_the_own_mask_back_unless_interrupted",
+    ) {
+        return;
+    }
     let term = bit(libc::SIGTERM);
     for armed in [true, false] {
         for site in [Site::InternalPselect6, Site::Ppoll, Site::Epoll] {

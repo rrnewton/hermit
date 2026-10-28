@@ -634,6 +634,149 @@ impl MakeWriter<'_> for BufWriter {
     }
 }
 
+/// Sessions trace threads of this same process, so two sessions from
+/// different tests running at once can stop each other's tracees and wedge
+/// both tracers. Within one test binary, sessions therefore run one test at
+/// a time: the serializer is keyed by the calling thread's test name, so
+/// the several sessions one test spawns for itself (cpuinfo_sessions runs
+/// two at once on purpose) still overlap, while another test's session
+/// waits for the current test's last session to end.
+struct SessionSerializer {
+    state: std::sync::Mutex<(Option<(u32, String)>, usize)>,
+    available: std::sync::Condvar,
+}
+
+fn new_session_serializer() -> SessionSerializer {
+    SessionSerializer {
+        state: std::sync::Mutex::new((None, 0)),
+        available: std::sync::Condvar::new(),
+    }
+}
+
+/// The live serializer for this process, and the pid that installed it.
+/// A forked child inherits its parent's serializer, whose mutex may have
+/// been locked at the fork by a thread that does not exist in the child;
+/// touching that mutex at all — even to discover that its recorded owner
+/// pid is stale — can therefore deadlock the child before any recovery
+/// runs. The child path must be safe before it touches inherited locks:
+/// it decides from these atomics alone, and on a pid mismatch installs a
+/// fresh serializer and leaks the inherited one untouched.
+static SESSION_SERIALIZER_PTR: std::sync::atomic::AtomicPtr<SessionSerializer> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static SESSION_SERIALIZER_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Install lock for [`session_serializer`], held as the installer's pid:
+/// every thread of one process shares that pid, while a child that
+/// inherits the lock held sees a pid that is not its own and can take the
+/// lock over from the thread that no longer exists.
+static SESSION_SERIALIZER_INSTALL: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+fn session_serializer() -> &'static SessionSerializer {
+    use std::sync::atomic::Ordering;
+    let pid = std::process::id();
+    let ptr = SESSION_SERIALIZER_PTR.load(Ordering::Acquire);
+    if !ptr.is_null() && SESSION_SERIALIZER_PID.load(Ordering::Acquire) == pid {
+        // SAFETY: installed above for this process and never mutated or freed.
+        return unsafe { &*ptr };
+    }
+    loop {
+        match SESSION_SERIALIZER_INSTALL.compare_exchange(
+            0,
+            pid,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            // A holder from another pid is a thread lost to a fork.
+            Err(holder) if holder != pid => {
+                if SESSION_SERIALIZER_INSTALL
+                    .compare_exchange(holder, pid, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            Err(_) => std::hint::spin_loop(),
+        }
+    }
+    let ptr = SESSION_SERIALIZER_PTR.load(Ordering::Acquire);
+    let live = if !ptr.is_null() && SESSION_SERIALIZER_PID.load(Ordering::Acquire) == pid {
+        ptr
+    } else {
+        let fresh = Box::into_raw(Box::new(new_session_serializer()));
+        SESSION_SERIALIZER_PTR.store(fresh, Ordering::Release);
+        SESSION_SERIALIZER_PID.store(pid, Ordering::Release);
+        fresh
+    };
+    SESSION_SERIALIZER_INSTALL.store(0, Ordering::Release);
+    // SAFETY: installed above for this process and never mutated or freed.
+    unsafe { &*live }
+}
+
+pub struct SessionGuard(());
+
+/// Hold the per-test session serializer for one in-process session; see
+/// [`SessionSerializer`]. Binaries whose tests drive sessions through their
+/// own wrappers (tests/time) hold this across the session instead.
+pub fn serialized_session() -> SessionGuard {
+    SessionGuard::acquire()
+}
+
+impl SessionGuard {
+    fn acquire() -> Self {
+        let case = std::thread::current()
+            .name()
+            .unwrap_or_default()
+            .to_string();
+        let pid = std::process::id();
+        let serializer = session_serializer();
+        let mut state = serializer
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.0.as_ref().is_some_and(|(_, holder)| holder != &case) {
+            state = serializer
+                .available
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.0 = Some((pid, case));
+        state.1 += 1;
+        SessionGuard(())
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        // `session_serializer` decides from atomics alone, so a guard
+        // inherited across a fork installs and touches only the child's
+        // fresh serializer, never the parent's possibly-locked one.
+        let serializer = session_serializer();
+        let mut state = serializer
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A guard inherited across a fork releases nothing in the child:
+        // its hold was recorded under the parent's pid, which the fresh
+        // serializer does not hold.
+        if state
+            .0
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner != std::process::id())
+        {
+            return;
+        }
+        if state.0.is_none() {
+            return;
+        }
+        state.1 = state.1.saturating_sub(1);
+        if state.1 == 0 {
+            state.0 = None;
+            serializer.available.notify_all();
+        }
+    }
+}
+
 /// Similar to Reverie's `test_fn_with_config` that captures and returns the tracer's
 /// logs as well.
 fn test_fn_with_logs<T, F>(
@@ -678,6 +821,8 @@ where
         f()
     };
 
+    let _session = SessionGuard::acquire();
+
     // Here we have to keep the collector tightly scoped to this test, because
     // we want to recapture the output of this test and no other.
     let run = move || {
@@ -695,11 +840,29 @@ where
             // thread returns. No external executor launches this tracee.
         })
     };
-    let (out, state) = if workdir.is_some() {
-        hermit_test_workdir::with_isolated_workdir(run)?
-    } else {
-        run()
-    }?;
+    // A debug Detcore session needs more than Rust's default 2 MiB
+    // spawned-thread stack (hermit-cli's docs measure about 2 MiB for the
+    // session alone in a debug build), so under plain `cargo test`, whose
+    // test threads get that default, a session here overflowed its stack,
+    // while under nextest it passed. Run the session on a thread with an
+    // explicit stack in this test harness — the allowance is scoped to
+    // these test sessions, not exported to every Cargo process.
+    let run_session = move || {
+        if workdir.is_some() {
+            hermit_test_workdir::with_isolated_workdir(run)?
+        } else {
+            run()
+        }
+    };
+    let (out, state) = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("detcore-test-session".to_owned())
+            .stack_size(16 << 20)
+            .spawn_scoped(scope, run_session)
+            .unwrap()
+            .join()
+            .unwrap()
+    })?;
     Ok((out, state, bufwriter.get_strings()))
 }
 
@@ -785,6 +948,12 @@ pub fn det_test_fn_with_config_repetitions<F, O>(
     O: Fn(&Output, <Detcore as Tool>::GlobalState),
 {
     assert!(repetitions > 0, "at least one test repetition is required");
+    // The driver below forks this process. Holding the session serializer
+    // across the fork and the child's whole run means the fork happens
+    // while no sibling test has a session (and thus no session lock) in
+    // flight for the child to inherit; the child's own sessions re-acquire
+    // under its new pid.
+    let _session = serialized_session();
     let config = prepare_ptrace_timer_config(config);
     // Borrow the caller's values: only child-created configs/runtime/state are
     // consumed in children, and the caller drops its originals after the wait.
@@ -1088,6 +1257,108 @@ mod tests {
     }
 
     #[test]
+    fn forked_child_acquires_the_session_serializer_while_a_sibling_holds_its_mutex() {
+        // Hold the serializer's state mutex on a sibling thread, as a
+        // waiter briefly does, then fork. In the child that thread does
+        // not exist, so acquiring the serializer there must not touch the
+        // inherited (still locked) mutex at all.
+        let (locked, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _state = super::session_serializer()
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locked.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        // SAFETY: the child only acquires and releases the serializer,
+        // then exits without returning into the test harness.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            let _guard = super::serialized_session();
+            // SAFETY: the forked child ends here.
+            unsafe { libc::_exit(0) };
+        }
+        // Bound the wait so a regression fails this test instead of
+        // hanging the suite: poll for the child, kill it past a deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut status = 0;
+        loop {
+            // SAFETY: waiting for the child forked above.
+            let waited = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+            if waited == child {
+                break;
+            }
+            assert!(waited == 0, "waitpid: {}", std::io::Error::last_os_error());
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: killing the child forked above.
+                unsafe { libc::kill(child, libc::SIGKILL) };
+                let _ = unsafe { libc::waitpid(child, &mut status, 0) };
+                release.send(()).unwrap();
+                holder.join().unwrap();
+                panic!("forked child deadlocked acquiring the session serializer");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "forked child failed: status {status:#x}"
+        );
+    }
+
+    #[test]
+    fn forked_child_takes_over_an_inherited_session_serializer_installation_lock() {
+        use std::sync::atomic::Ordering;
+        // Install the serializer in this process first, so the child
+        // inherits a live one owned by this pid.
+        let parent_pid = std::process::id();
+        let _ = super::session_serializer();
+        // SAFETY: the child only restores the inherited installation
+        // state, acquires the serializer, and exits without returning
+        // into the test harness.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            // Recreate the state a fork during installation leaves: the
+            // installation lock is held under the parent's pid, which is
+            // not this child's pid, by a thread that does not exist here.
+            super::SESSION_SERIALIZER_INSTALL.store(parent_pid, Ordering::Release);
+            super::SESSION_SERIALIZER_PID.store(parent_pid, Ordering::Release);
+            let _guard = super::serialized_session();
+            // SAFETY: the forked child ends here.
+            unsafe { libc::_exit(0) };
+        }
+        // Bound the wait, as above, so a regression (spinning on the
+        // taken-over lock's own pid) fails instead of hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut status = 0;
+        loop {
+            // SAFETY: waiting for the child forked above.
+            let waited = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+            if waited == child {
+                break;
+            }
+            assert!(waited == 0, "waitpid: {}", std::io::Error::last_os_error());
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: killing the child forked above.
+                unsafe { libc::kill(child, libc::SIGKILL) };
+                let _ = unsafe { libc::waitpid(child, &mut status, 0) };
+                panic!("forked child deadlocked taking over the installation lock");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "forked child failed: status {status:#x}"
+        );
+    }
+
+    #[test]
     fn function_driver_inherits_completed_subscriber_initialization() {
         super::run_function_test_driver(|| {
             // Inspect without forcing: child-side initialization or a force
@@ -1105,6 +1376,26 @@ mod tests {
 
     #[test]
     fn isolated_function_repetitions_compare_real_pid_and_procfs_output() {
+        const CHILD: &str = "HERMIT_TEST_FUNCTION_DRIVER_CHILD";
+        const CASE: &str =
+            "tests::isolated_function_repetitions_compare_real_pid_and_procfs_output";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+            // The oracle receipt below allows the forked driver one
+            // second to arrive. In the shared libtest binary the driver
+            // can sit behind every other test's session work past that
+            // second, so the test runs in an isolated child process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, CASE)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         let (receipts, oracle) = oracle_receipts();
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
@@ -1152,6 +1443,25 @@ mod tests {
 
     #[test]
     fn isolated_function_repetitions_propagate_nonzero_guest_exit() {
+        const CHILD: &str = "HERMIT_TEST_FUNCTION_DRIVER_CHILD";
+        const CASE: &str = "tests::isolated_function_repetitions_propagate_nonzero_guest_exit";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+            // The oracle receipt below allows the forked driver one
+            // second to arrive. In the shared libtest binary the driver
+            // can sit behind every other test's session work past that
+            // second, so the test runs in an isolated child process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, CASE)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         let (receipts, oracle) = oracle_receipts();
         let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::det_test_fn_with_config_repetitions(
@@ -1176,6 +1486,25 @@ mod tests {
 
     #[test]
     fn isolated_function_repetitions_propagate_reached_oracle_panic() {
+        const CHILD: &str = "HERMIT_TEST_FUNCTION_DRIVER_CHILD";
+        const CASE: &str = "tests::isolated_function_repetitions_propagate_reached_oracle_panic";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+            // The oracle receipt below allows the forked driver one
+            // second to arrive. In the shared libtest binary the driver
+            // can sit behind every other test's session work past that
+            // second, so the test runs in an isolated child process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, CASE)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         let (receipts, oracle) = oracle_receipts();
         let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             super::det_test_fn_with_config_repetitions(
@@ -1295,6 +1624,28 @@ mod tests {
 
     #[test]
     fn global_test_filter_applies_on_spawned_threads() {
+        const CHILD: &str = "HERMIT_TEST_GLOBAL_SUBSCRIBER_CHILD";
+        const CASE: &str = "tests::global_test_filter_applies_on_spawned_threads";
+        if std::env::var_os(CHILD).is_none() {
+            // Installing the global tracing subscriber succeeds once per
+            // process, and any other test in this binary may have installed
+            // it first (GLOBAL_TEST_SUBSCRIBER is forced by the shared test
+            // entry points), so the installation is asserted in an isolated
+            // child process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         let writer = BufWriter::new();
         assert!(install_global_test_subscriber(
             "reverie_ptrace::timer=off,detcore_testutils=trace",
