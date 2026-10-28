@@ -239,16 +239,22 @@ impl InterpolateOpts {
         let tmpdir_path = dir.keep();
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
         let sched_path = tmpdir_path.join(format!("interpolate_{}.events", self.interpolate));
-        next_sched.write_to_disk(&sched_path).unwrap();
+        next_sched
+            .write_to_disk(&sched_path)
+            .map_err(anyhow::Error::msg)?;
 
         Ok(true)
     }
 
+    /// The interpolated schedule, carrying the run settings both input
+    /// schedules were recorded under, which a replay of it must use; inputs
+    /// that disagree on one are refused.
     fn interpolated_record(&self) -> anyhow::Result<PreemptionRecord> {
         let guest_ids = Self::common_guest_ids(&self.file_a, &self.file_b)?;
         let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;
         let copy = Self::common_signal_state_copy(&self.file_a, &self.file_b)?;
         let charged_once = Self::common_expired_wait_charge(&self.file_a, &self.file_b)?;
+        let capped = Self::common_cap_preemption_charge(&self.file_a, &self.file_b)?;
         let first_record =
             Recording::read(&self.file_a)?.into_legacy("schedule diff/interpolation")?;
         let second_record =
@@ -279,6 +285,7 @@ impl InterpolateOpts {
                 .with_pipe_wake_latency(latency)
                 .with_signal_state_copy(copy)
                 .with_expired_wait_runs_charged_once(charged_once)
+                .with_cap_preemption_charge(capped)
         };
         reconciled(first_record)
             .interpolate_events(&reconciled(second_record), requested_schedule)
@@ -303,6 +310,34 @@ impl InterpolateOpts {
                  same guest ID mode and --pid-base.",
                 file_a.display(),
                 file_b.display(),
+            );
+        }
+        Ok(a)
+    }
+
+    /// Whether both schedules' runs capped preemption charges
+    /// (`--cap-preemption-charge`), which the interpolated schedule carries;
+    /// schedules recorded under different settings are refused, since their
+    /// clocks advanced by different charges and a replay of the result
+    /// refuses any setting but the one it stores.
+    fn common_cap_preemption_charge(
+        file_a: &std::path::Path,
+        file_b: &std::path::Path,
+    ) -> anyhow::Result<bool> {
+        let read = |path: &std::path::Path| {
+            detcore::preemptions::read_recorded_cap_preemption_charge(path)
+                .map_err(anyhow::Error::msg)
+        };
+        let (a, b) = (read(file_a)?, read(file_b)?);
+        if a != b {
+            let show = |on: bool| if on { "on" } else { "off" };
+            anyhow::bail!(
+                "{} and {} were recorded with --cap-preemption-charge {} and {}; no \
+                 interpolation of them can be replayed",
+                file_a.display(),
+                file_b.display(),
+                show(a),
+                show(b)
             );
         }
         Ok(a)
@@ -921,6 +956,85 @@ mod tests {
                 .contains("different --expired-wait-charge rules (each and once)"),
             "{error}"
         );
+    }
+
+    /// Two schedules recorded with different `--cap-preemption-charge`
+    /// settings cannot be interpolated; agreeing ones, on or off, give their
+    /// setting to the result.
+    #[test]
+    fn interpolate_refuses_schedules_recorded_under_different_cap_preemption_charges() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, on: bool| {
+            let path = dir.path().join(name);
+            let record =
+                PreemptionRecord::from_sched_events(Vec::new()).with_cap_preemption_charge(on);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            path
+        };
+        let off = write("off.json", false);
+        let on = write("on.json", true);
+        let common = InterpolateOpts::common_cap_preemption_charge;
+        assert!(!common(&off, &off).unwrap());
+        assert!(common(&on, &on).unwrap());
+        for (a, b, said) in [(&off, &on, "off and on"), (&on, &off, "on and off")] {
+            let error = common(a, b).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!(
+                    "with --cap-preemption-charge {said}; no interpolation of them can be \
+                         replayed"
+                )),
+                "{error}"
+            );
+        }
+    }
+
+    /// The schedule interpolation writes carries the settings its inputs
+    /// were recorded under: a replay of two capped schedules' interpolation
+    /// caps as they did, and one of two uncapped ones does not.
+    #[test]
+    fn an_interpolated_schedule_carries_its_inputs_cap_and_charge_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = |tid: i32| {
+            (0..3)
+                .map(|i| SchedEvent {
+                    dettid: DetTid::from_raw(tid + i % 2),
+                    op: detcore_model::schedule::Op::Branch,
+                    count: 10,
+                    start_rip: None,
+                    end_rip: None,
+                    end_time: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for (capped, once) in [(true, true), (true, false), (false, true), (false, false)] {
+            let write = |name: &str, tid: i32| {
+                let path = dir.path().join(format!("{name}-{capped}-{once}.json"));
+                PreemptionRecord::from_sched_events(events(tid))
+                    .with_cap_preemption_charge(capped)
+                    .with_expired_wait_runs_charged_once(once)
+                    .write_to_disk(&path)
+                    .unwrap();
+                path
+            };
+            let opts = InterpolateOpts {
+                interpolate: 50,
+                file_a: write("a", 3),
+                file_b: write("b", 4),
+            };
+            let out = dir.path().join(format!("out-{capped}-{once}.json"));
+            opts.interpolated_record()
+                .unwrap()
+                .write_to_disk(&out)
+                .unwrap();
+            assert_eq!(
+                detcore::preemptions::read_recorded_cap_preemption_charge(&out).unwrap(),
+                capped
+            );
+            assert_eq!(
+                detcore::preemptions::read_recorded_expired_wait_runs_charged_once(&out).unwrap(),
+                once
+            );
+        }
     }
 
     /// Two schedules recorded under different `--pipe-wake-latency` values,
