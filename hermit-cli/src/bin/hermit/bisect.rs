@@ -775,7 +775,7 @@ mod tests {
 
         // Schedules without a seed change nothing.
         let unseeded = trials(None, None, &[]).unwrap();
-        assert!(unseeded.run_arg.is_empty(), "{:?}", unseeded.run_arg);
+        assert_eq!(unseeded.run_arg, ["--expired-wait-charge=each"]);
 
         // The recorded seed, from either schedule or both, also over the run
         // arguments' --seed, which seeds the scheduler.
@@ -796,7 +796,7 @@ mod tests {
         // An equal explicit --rng-seed adds no second one; a different one is
         // refused, naming the remedy.
         let explicit = trials(Some(7), Some(7), &["--rng-seed=7"]).unwrap();
-        assert!(explicit.run_arg.is_empty(), "{:?}", explicit.run_arg);
+        assert_eq!(explicit.run_arg, ["--expired-wait-charge=each"]);
         let error = trials(Some(7), Some(7), &["--rng-seed=3"]).unwrap_err();
         assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
         assert!(error.to_string().contains("pass --rng-seed=7"), "{error:#}");
