@@ -4376,6 +4376,26 @@ mod tests {
 
     #[test]
     fn forwarded_receiver_retires_after_real_eof_without_rearming() {
+        const CHILD: &str = "HERMIT_TEST_FORWARDED_RECEIVER_CHILD";
+        const CASE: &str =
+            "detlog::tests::forwarded_receiver_retires_after_real_eof_without_rearming";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+            // The forwarded source, its generations, and its stop owner are
+            // process-global, and a receiver task spawned by another test in
+            // this binary can still be running against them, so the scenario
+            // runs in an isolated child process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, CASE)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         use std::os::fd::AsRawFd;
         let _guard = global_source_test();
         let _cleanup = ForwardedReceiverSourceCleanup;
@@ -4456,6 +4476,24 @@ mod tests {
 
     #[test]
     fn forwarded_receiver_replacement_preserves_new_generation() {
+        const CHILD: &str = "HERMIT_TEST_FORWARDED_RECEIVER_CHILD";
+        const CASE: &str = "detlog::tests::forwarded_receiver_replacement_preserves_new_generation";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+            // Isolated in a child process for the same reason as the
+            // real-EOF retirement test above: the forwarded source and its
+            // generations are process-global.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, CASE)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         let _guard = global_source_test();
         let _cleanup = ForwardedReceiverSourceCleanup;
         let ReceiverSource {
@@ -4524,6 +4562,25 @@ mod tests {
 
     #[test]
     fn forwarded_receiver_retirement_preserves_uncredited_tail_refusal() {
+        const CHILD: &str = "HERMIT_TEST_FORWARDED_RECEIVER_CHILD";
+        const CASE: &str =
+            "detlog::tests::forwarded_receiver_retirement_preserves_uncredited_tail_refusal";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+            // Isolated in a child process for the same reason as the other
+            // forwarded-receiver tests: the forwarded source and its
+            // generations are process-global.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, CASE)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         use std::os::fd::AsRawFd;
 
         use super::CoordinatorForwardingCutError as Error;

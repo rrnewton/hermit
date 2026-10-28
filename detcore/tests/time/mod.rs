@@ -37,6 +37,9 @@ where
     T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
     F: FnOnce(),
 {
+    // In-process sessions from different tests wedge each other's tracers;
+    // hold the shared per-test serializer for the session (see testutils).
+    let _session = detcore_testutils::serialized_session();
     reverie_ptrace::testing::test_fn_with_config::<T, F>(
         f,
         detcore_testutils::prepare_ptrace_timer_config(config),
@@ -50,6 +53,7 @@ where
     T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
     F: FnOnce(),
 {
+    let _session = detcore_testutils::serialized_session();
     reverie_ptrace::testing::check_fn_with_config::<T, F>(
         f,
         detcore_testutils::prepare_ptrace_timer_config(config),
