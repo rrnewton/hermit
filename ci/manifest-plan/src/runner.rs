@@ -16947,6 +16947,30 @@ fi
 
     #[test]
     fn a_run_without_cgroups_measures_with_the_process_group_scan_under_its_own_source_name() {
+        const CHILD: &str = "HERMIT_TEST_PROCESS_GROUP_SCAN_ROW_CHILD";
+        const CASE: &str = "runner::tests::a_run_without_cgroups_measures_with_the_process_group_scan_under_its_own_source_name";
+        if std::env::var_os(CHILD).is_none() {
+            // The assertion below is that a budgeted command that lives long
+            // enough is polled at least once. In the parallel libtest process
+            // every other test's monitor queues on the same process-global CPU
+            // registry and session census, and a monitor can be delayed past
+            // its command's whole life, so the measurement is made in an
+            // isolated child process, as the descriptor-reserve test above
+            // isolates its process-wide rlimit.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         // With the marker set and no cgroup available, the agent-utils scan
         // measures the command, and every row says so: no row of such a run
         // carries the cgroup source, so no reader can count it as one.
@@ -17010,6 +17034,27 @@ fi
 
     #[test]
     fn a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source() {
+        const CHILD: &str = "HERMIT_TEST_INVOCATION_CGROUP_ROW_CHILD";
+        const CASE: &str =
+            "runner::tests::a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolated in a child process for the same reason as the
+            // process-group scan row above: the live-CPU poll must not queue
+            // behind every other test's monitor in this process.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         let test = "a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source";
         let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
         else {
@@ -18226,6 +18271,32 @@ fi
 
     #[test]
     fn failed_later_launch_retains_prior_attempt_and_cpu_observations() {
+        const CHILD: &str = "HERMIT_TEST_PRIOR_WORK_BEFORE_SPAWN_FAILURE_CHILD";
+        const CASE: &str =
+            "runner::tests::failed_later_launch_retains_prior_attempt_and_cpu_observations";
+        if std::env::var_os(CHILD).is_none() {
+            // The first attempt must finish well inside the cell's wall
+            // backstop so the second attempt reaches its spawn and fails
+            // there. In the parallel libtest process a trivial first command
+            // can sit unscheduled for seconds behind every other test's
+            // children, and the second attempt then reports the backstop
+            // instead of the spawn failure, so the cell runs in an isolated
+            // child process, as the descriptor-reserve test isolates its
+            // process-wide rlimit.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         let root = cpu_reader_test_root("prior-work-before-spawn-failure");
         let context = run_context(&root);
         let program = root.join("remove-self");
@@ -18274,6 +18345,31 @@ fi
 
     #[test]
     fn native_zombie_then_reaped_child_has_no_double_cpu_charge() {
+        const CHILD: &str = "HERMIT_TEST_ZOMBIE_REAP_CPU_CHILD";
+        const CASE: &str =
+            "runner::tests::native_zombie_then_reaped_child_has_no_double_cpu_charge";
+        if std::env::var_os(CHILD).is_none() {
+            // The phase handshake below advances on the monitor's poll
+            // samples inside a five-second deadline. In the parallel libtest
+            // process those samples queue on the same process-global CPU
+            // registry as every other test's monitor, and a delayed sample
+            // lets the deadline stop the fixture mid-handshake, so the
+            // measurement is made in an isolated child process, as the
+            // descriptor-reserve test isolates its process-wide rlimit.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         use std::io::Read;
         use std::os::unix::net::UnixListener;
 
