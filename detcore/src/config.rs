@@ -101,6 +101,9 @@ mod tests {
         // Adds `Resources.zero_length_sleep`
         // (https://github.com/rrnewton/hermit/pull/4658).
         (8, "6b6c7521a6620f94", "dafaa96d8b8cb3ad"),
+        // Adds `GlobalResponse::WithLoneGrant`
+        // (https://github.com/rrnewton/hermit/pull/4662).
+        (9, "ebfd2b59a97e1d7a", "dafaa96d8b8cb3ad"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
