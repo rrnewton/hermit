@@ -1142,11 +1142,10 @@ fn read_guest_set_tid<M: MemoryAccess>(
 }
 
 /// Read the guest's `pid_t` array at `address` into `tids` exactly, as
-/// `copy_from_user` reads it: with the guest's own access, or, where that
-/// fails (a page mapped writable, not readable), entry by entry through the
-/// eight-byte-aligned word holding each four-aligned entry, which never
-/// reaches into the next page as a debugger read of a four-byte value at a
-/// page's end does. `None` if neither reads it.
+/// `copy_from_user` reads it, with the guest's own access: never a debugger
+/// read, which could reach past the array into the next page, or read a page
+/// the guest cannot. `None` if that read fails; the caller then decides by
+/// [`range_faults`] whether the kernel must fault too.
 pub(crate) fn read_pid_array<M: MemoryAccess>(
     memory: &M,
     address: usize,
@@ -1154,22 +1153,9 @@ pub(crate) fn read_pid_array<M: MemoryAccess>(
 ) -> Option<()> {
     const ENTRY: usize = std::mem::size_of::<libc::pid_t>();
     let mut bytes = vec![0u8; tids.len() * ENTRY];
-    let start = Addr::<u8>::from_raw(address)?;
-    if memory
-        .read_exact_with_user_access(start, &mut bytes)
-        .is_err()
-    {
-        if !address.is_multiple_of(ENTRY) {
-            return None;
-        }
-        for (index, chunk) in bytes.as_chunks_mut::<ENTRY>().0.iter_mut().enumerate() {
-            let entry = address.checked_add(index * ENTRY)?;
-            let word = entry & !(std::mem::size_of::<u64>() - 1);
-            let value: u64 = memory.read_value(Addr::<u64>::from_raw(word)?).ok()?;
-            let offset = entry - word;
-            chunk.copy_from_slice(&value.to_ne_bytes()[offset..offset + ENTRY]);
-        }
-    }
+    memory
+        .read_exact_with_user_access(Addr::<u8>::from_raw(address)?, &mut bytes)
+        .ok()?;
     for (tid, chunk) in tids.iter_mut().zip(bytes.as_chunks::<ENTRY>().0) {
         *tid = libc::pid_t::from_ne_bytes(*chunk);
     }
@@ -1352,7 +1338,7 @@ fn user_memory_end() -> Option<usize> {
 /// proved, as when the mappings cannot be read. Reading smaps walks the page
 /// tables of every mapping, which is why it is read only after a read with
 /// the guest's own access has failed, a rare event.
-fn range_faults(tid: i32, address: usize, len: usize) -> bool {
+pub(crate) fn range_faults(tid: i32, address: usize, len: usize) -> bool {
     let Some(limit) = user_memory_end() else {
         return false;
     };
