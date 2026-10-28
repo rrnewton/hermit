@@ -72,6 +72,8 @@ struct RustcInputs {
     normalization: String,
     shared_units: usize,
     shared_sha256: String,
+    auxiliary_commands: usize,
+    auxiliary_sha256: String,
 }
 
 /// Immutable complete comparison input measured by the core build producer.
@@ -210,10 +212,11 @@ impl CoreCompatibility {
         );
         validate_profile(&self.core_profile, "core library unit")?;
         ensure!(
-            self.rustc_inputs.schema == "hermit-actual-rustc-capture/v1"
-                && self.rustc_inputs.normalization == "hermit-shared-rustc-semantics/v1"
+            self.rustc_inputs.schema == "hermit-actual-rustc-capture/v3"
+                && self.rustc_inputs.normalization == "hermit-shared-rustc-semantics/v3"
                 && self.rustc_inputs.shared_units >= 2
-                && full_digest(&self.rustc_inputs.shared_sha256),
+                && full_digest(&self.rustc_inputs.shared_sha256)
+                && full_digest(&self.rustc_inputs.auxiliary_sha256),
             "core compatibility has no complete compared actual shared rustc inputs"
         );
         ensure!(
@@ -345,10 +348,12 @@ mod tests {
             core_profile: serde_json::json!({"opt_level":"3", "debuginfo":0,
                 "debug_assertions":false,"overflow_checks":false,"test":false}),
             rustc_inputs: RustcInputs {
-                schema: "hermit-actual-rustc-capture/v1".to_owned(),
-                normalization: "hermit-shared-rustc-semantics/v1".to_owned(),
+                schema: "hermit-actual-rustc-capture/v3".to_owned(),
+                normalization: "hermit-shared-rustc-semantics/v3".to_owned(),
                 shared_units: 2,
                 shared_sha256: "8".repeat(64),
+                auxiliary_commands: 1,
+                auxiliary_sha256: "b".repeat(64),
             },
             configuration,
         }
@@ -375,6 +380,8 @@ mod tests {
             |s| s.features.clear(),
             |s| s.core_profile["overflow_checks"] = true.into(),
             |s| s.rustc_inputs.shared_sha256 = "9".repeat(64),
+            |s| s.rustc_inputs.auxiliary_commands += 1,
+            |s| s.rustc_inputs.auxiliary_sha256 = "c".repeat(64),
             |s| s.configuration[0].value.push_str("other option"),
         ];
         for change in changes {
@@ -412,6 +419,472 @@ mod tests {
         let mut missing = serde_json::to_value(stamp()).unwrap();
         missing.as_object_mut().unwrap().remove("rustc_inputs");
         assert!(serde_json::from_value::<CoreCompatibility>(missing).is_err());
+    }
+
+    #[test]
+    fn compatibility_reads_actual_schema3_and_refuses_auxiliary_drift() {
+        // Verbatim core_stamp JSON from the actual source366 producer output.
+        // This is a reader-format fixture, never runtime compatibility evidence.
+        // completed-build.json SHA256: 22b3fbc42c64c7e66b111948bac20b6ce1d2ff896a4b673c5ccf6c516886749b
+        let actual: CoreCompatibility = serde_json::from_str(r#"{
+    "api": "hermit-cli-static-backend/v1",
+    "compiler": "rustc 1.99.0-nightly (be8e82435 2026-07-11)\nbinary: rustc\ncommit-hash: be8e82435eb04fbe75ed5286b52735366e160bed\ncommit-date: 2026-07-11\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 22.1.8",
+    "compiler_sha256": "81536ef88a773f0918ac57c79e4638699e3ffe0a203475e7d2e5168e5853bfee",
+    "configuration": [
+      {
+        "name": "CARGO_CFG_DEBUG_ASSERTIONS",
+        "value": ""
+      },
+      {
+        "name": "CARGO_CFG_FEATURE",
+        "value": "default"
+      },
+      {
+        "name": "CARGO_CFG_FMT_DEBUG",
+        "value": "full"
+      },
+      {
+        "name": "CARGO_CFG_OVERFLOW_CHECKS",
+        "value": ""
+      },
+      {
+        "name": "CARGO_CFG_PANIC",
+        "value": "unwind"
+      },
+      {
+        "name": "CARGO_CFG_RELOCATION_MODEL",
+        "value": "pic"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_ABI",
+        "value": ""
+      },
+      {
+        "name": "CARGO_CFG_TARGET_ARCH",
+        "value": "x86_64"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_ENDIAN",
+        "value": "little"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_ENV",
+        "value": "gnu"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_FAMILY",
+        "value": "unix"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_FEATURE",
+        "value": "fxsr,sse,sse2,x87"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_HAS_ATOMIC",
+        "value": "16,32,64,8,ptr"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_HAS_ATOMIC_LOAD_STORE",
+        "value": "16,32,64,8,ptr"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_HAS_ATOMIC_PRIMITIVE_ALIGNMENT",
+        "value": "16,32,64,8,ptr"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_HAS_RELIABLE_F128",
+        "value": ""
+      },
+      {
+        "name": "CARGO_CFG_TARGET_HAS_RELIABLE_F16",
+        "value": ""
+      },
+      {
+        "name": "CARGO_CFG_TARGET_HAS_RELIABLE_F16_MATH",
+        "value": ""
+      },
+      {
+        "name": "CARGO_CFG_TARGET_HAS_THREADS",
+        "value": ""
+      },
+      {
+        "name": "CARGO_CFG_TARGET_OBJECT_FORMAT",
+        "value": "elf"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_OS",
+        "value": "linux"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_POINTER_WIDTH",
+        "value": "64"
+      },
+      {
+        "name": "CARGO_CFG_TARGET_THREAD_LOCAL",
+        "value": ""
+      },
+      {
+        "name": "CARGO_CFG_TARGET_VENDOR",
+        "value": "unknown"
+      },
+      {
+        "name": "CARGO_CFG_UB_CHECKS",
+        "value": ""
+      },
+      {
+        "name": "CARGO_CFG_UNIX",
+        "value": ""
+      },
+      {
+        "name": "CARGO_ENCODED_RUSTFLAGS",
+        "value": ""
+      },
+      {
+        "name": "DEBUG",
+        "value": "true"
+      },
+      {
+        "name": "OPT_LEVEL",
+        "value": "0"
+      },
+      {
+        "name": "PROFILE",
+        "value": "debug"
+      },
+      {
+        "name": "RUSTC_WORKSPACE_WRAPPER",
+        "value": ""
+      },
+      {
+        "name": "RUSTC_WRAPPER",
+        "value": "hermit-actual-rustc-capture/v3"
+      },
+      {
+        "name": "RUSTFLAGS",
+        "value": ""
+      }
+    ],
+    "core_profile": {
+      "debug_assertions": true,
+      "debuginfo": 2,
+      "opt_level": "0",
+      "overflow_checks": true,
+      "test": false
+    },
+    "features": [
+      "CARGO_FEATURE_DEFAULT"
+    ],
+    "host": "x86_64-unknown-linux-gnu",
+    "release": "0.5.4",
+    "reverie": {
+      "commit": "882c91c02b981f56370a2912f0832b04fefc46ec",
+      "sha256": "f28f1a15c9c0ea1b09554bc7cd02d7b8eaadf377d1854c1770f567e524fe97bf",
+      "units": [
+        {
+          "crate_types": [
+            "lib"
+          ],
+          "features": [
+            "default"
+          ],
+          "kind": [
+            "lib"
+          ],
+          "package": "reverie-core",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "reverie",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "lib"
+          ],
+          "features": [
+            "default"
+          ],
+          "kind": [
+            "lib"
+          ],
+          "package": "reverie-kvm",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "reverie_kvm",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "lib"
+          ],
+          "features": [
+            "default"
+          ],
+          "kind": [
+            "lib"
+          ],
+          "package": "reverie-kvm-core",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "reverie_kvm_core",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "bin"
+          ],
+          "features": [
+            "default"
+          ],
+          "kind": [
+            "custom-build"
+          ],
+          "package": "reverie-linuxemu",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "build-script-build",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "lib"
+          ],
+          "features": [
+            "default"
+          ],
+          "kind": [
+            "lib"
+          ],
+          "package": "reverie-linuxemu",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "reverie_linuxemu",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "lib"
+          ],
+          "features": [],
+          "kind": [
+            "lib"
+          ],
+          "package": "reverie-memory",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "reverie_memory",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "lib"
+          ],
+          "features": [
+            "default"
+          ],
+          "kind": [
+            "lib"
+          ],
+          "package": "reverie-process",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "reverie_process",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "bin"
+          ],
+          "features": [
+            "default"
+          ],
+          "kind": [
+            "custom-build"
+          ],
+          "package": "reverie-ptrace",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "build-script-build",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "lib"
+          ],
+          "features": [
+            "default"
+          ],
+          "kind": [
+            "lib"
+          ],
+          "package": "reverie-ptrace",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "reverie_ptrace",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "lib"
+          ],
+          "features": [],
+          "kind": [
+            "lib"
+          ],
+          "package": "reverie-syscalls",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "reverie_syscalls",
+          "version": "0.5.4"
+        },
+        {
+          "crate_types": [
+            "lib"
+          ],
+          "features": [
+            "default",
+            "memory",
+            "notifier",
+            "reverie-memory"
+          ],
+          "kind": [
+            "lib"
+          ],
+          "package": "safeptrace",
+          "profile": {
+            "debug_assertions": true,
+            "debuginfo": 2,
+            "opt_level": "0",
+            "overflow_checks": true,
+            "test": false
+          },
+          "target": "safeptrace",
+          "version": "0.5.4"
+        }
+      ]
+    },
+    "rustc_inputs": {
+      "auxiliary_commands": 9,
+      "auxiliary_sha256": "6d34ed7b4c1e73b2b5d1a54aaa04103f55bd2d898a8cac685d44b795c0835db1",
+      "normalization": "hermit-shared-rustc-semantics/v3",
+      "schema": "hermit-actual-rustc-capture/v3",
+      "shared_sha256": "794a32fc7083160f524eb7fdf7a328986bc31bb7730253f9c1677a0b4a8c765e",
+      "shared_units": 282
+    },
+    "schema": "hermit-core-compatibility/v1",
+    "source": {
+      "commit": "36609459b88ad44904cfb91e90b025cbe07f18e6",
+      "kind": "git",
+      "sha256": "a34c1786a0d6d03a84a876edc71b5d3d39e1a03497b3b010ca5b80c10b754e86",
+      "tree": "e7d0f9b9bb10a5e74579e9c777d74a5993b4e37d"
+    },
+    "target": "x86_64-unknown-linux-gnu"
+  }"#).unwrap();
+        actual.validate().unwrap();
+        assert_eq!(actual.rustc_inputs.shared_units, 282);
+        assert_eq!(actual.rustc_inputs.auxiliary_commands, 9);
+        let bytes = Probe {
+            schema: PROBE_SCHEMA.to_owned(),
+            executable: ExecutableIdentity::Core,
+            core: actual.clone(),
+        }
+        .encode()
+        .unwrap();
+        Probe::require(&bytes, &ExecutableIdentity::Core, &actual).unwrap();
+
+        for field in ["auxiliary_commands", "auxiliary_sha256"] {
+            let mut missing = serde_json::to_value(&actual).unwrap();
+            missing["rustc_inputs"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                serde_json::from_value::<CoreCompatibility>(missing).is_err(),
+                "accepted missing {field}"
+            );
+        }
+        for version in ["v1", "v2"] {
+            let mut obsolete = actual.clone();
+            obsolete.rustc_inputs.schema = format!("hermit-actual-rustc-capture/{version}");
+            obsolete.rustc_inputs.normalization =
+                format!("hermit-shared-rustc-semantics/{version}");
+            assert!(
+                obsolete.validate().is_err(),
+                "accepted incomplete capture {version}"
+            );
+        }
+        let mut wrong_semantics = actual.clone();
+        wrong_semantics.rustc_inputs.normalization = "hermit-shared-rustc-semantics/v2".to_owned();
+        assert!(wrong_semantics.validate().is_err());
+        for malformed in ["", "unknown", "1234", &"A".repeat(64)] {
+            let mut invalid = actual.clone();
+            invalid.rustc_inputs.auxiliary_sha256 = malformed.to_owned();
+            assert!(
+                invalid.validate().is_err(),
+                "accepted malformed auxiliary digest"
+            );
+        }
+        let mut invalid_count = serde_json::to_value(&actual).unwrap();
+        invalid_count["rustc_inputs"]["auxiliary_commands"] = (-1).into();
+        assert!(serde_json::from_value::<CoreCompatibility>(invalid_count).is_err());
+
+        let mut changed_count = actual.clone();
+        changed_count.rustc_inputs.auxiliary_commands += 1;
+        changed_count.validate().unwrap();
+        assert!(actual.require_exact(&changed_count).is_err());
+        let mut changed_digest = actual.clone();
+        changed_digest.rustc_inputs.auxiliary_sha256 = "f".repeat(64);
+        changed_digest.validate().unwrap();
+        assert!(actual.require_exact(&changed_digest).is_err());
     }
 
     #[test]
