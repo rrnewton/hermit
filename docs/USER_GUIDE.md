@@ -742,6 +742,146 @@ Run `hermit analyze --help` before using this workflow. Search, minimization,
 and schedule replay can perform many guest executions and require a reliably
 reproducible target condition.
 
+Analyze keeps every run's schedules, logs, output and reproducer command in a
+workspace, a `hermit_analyze*` directory it creates in `--tmp-dir`, or else in
+`$TMPDIR` (`/tmp` when TMPDIR is unset); the paths it prints name that
+directory. Analyze removes the workspace when it exits: after its report,
+after an error, and when SIGTERM, SIGINT or SIGHUP stops it. A stop signal
+ends the run in progress and starts no other; analyze then removes the
+workspace and that run's own temporary directories, and dies of the signal,
+so a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
+keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
+too, since the per-run logs it adds are written there. The report file
+(`--report-file`) and the `--tmp-dir` directory itself are never removed.
+
+Analyze cannot clean up after SIGKILL, nor after a stop signal it does not
+handle: a signal it inherits as ignored stays ignored (SIGINT in a shell's
+background job, SIGHUP under `nohup`), and an analyze that is PID 1 of its PID
+namespace, as in `docker run IMAGE hermit analyze ...` without `--init`, keeps
+the default actions, which Linux discards for a namespace's init. Analyze also
+leaves the stop signals to kill it at once, as before, when `/proc` is not its
+own PID namespace's (analyze started by another process inside `unshare -pf`
+without `--mount-proc`) or when it inherited more than 64 children, since it
+could not then find the run to stop. `hermit
+bisect` keeps its workspace and names it when it exits.
+
+A replayed or spliced schedule can leave the guest spinning or waiting for an
+event that never comes, so once the target run has been measured, every later
+run is bounded: by default at max(60 s, 10 times the slowest endpoint run),
+which analyze prints (`--trial-timeout=SECONDS|auto|off`). With
+`--run1-preemptions` there is no target run to measure, so pass an explicit
+`--trial-timeout`; on a backend that does not enforce `--timeout`, bound the
+whole analysis from outside. A trial that reaches the bound counts as not
+meeting the target, and a baseline run that reaches it makes analyze search
+within the target schedule instead, as `--prefix-search` does. A bound stops a
+trial at a time the host decides, so such a trial does not decide a
+`--prefix-search` boundary: when the search settles next to one, it runs that
+trial again with 4 times the bound (within the run arguments' own
+`--timeout`). If it then meets the target, the deciding event is an earlier
+one, and the search goes on below it. If it misses, the boundary stands on
+that finished trial. Once a confirmation finishes, whatever its outcome, every
+later run keeps the longer bound. If it is still stopped, or no longer bound
+can be given, the report calls that trial a hang, a third outcome rather than
+a run that misses (for example a deadlock while other threads keep polling),
+and notes that the boundary rests on a wall-clock bound. If the trial
+confirmed is the empty prefix's and it meets the target, the scheduler alone
+meets it, and analyze ends with an error that says so. A search whose baseline
+side never finishes thus runs one trial at 4 times the bound instead of
+rechecking it at the usual one, and one whose confirmation finishes runs the
+rest of its trials under the longer bound. A trial that Hermit refuses when
+its guest reaches an operation Hermit does not support (exit 122) counts as
+not meeting the target too, with a warning; a refused target run still ends
+the analysis.
+
+By default analyze bisects between the failing schedule and a passing one from
+another run. When the two runs differ in events only one of them executed (for
+example timeslices that end at other points, or extra iterations of a polling
+loop), no single swap may separate the outcomes. `--prefix-search` searches
+within the failing schedule instead: each trial replays its first K events and
+then schedules without chaos, and a binary search finds the event at which the
+outcome flips. The continuation runs at the run's own `--max-timeslice`; a race
+found only at a short timeslice often shows without chaos at that timeslice
+too, and then the search continues at 200 ms instead
+(`--continuation-timeslice`). The report shows the stack of the thread the
+failing schedule runs at that event and of the thread that runs there
+otherwise. When both continuations run the same thread there, the decision is
+how long that thread runs: the report then shows its stack, and the stacks of
+the threads that run after it with and without the event:
+
+```bash
+hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
+  --target-exit-code=any --report-file=analysis.json -- --chaos -- PROGRAM
+```
+
+#### Racing accesses
+
+The report ends with a "Racing accesses" section (`racing_accesses` in a
+`--report-file`; `--no-racing-accesses` leaves it out). The final replays on
+each side of the deciding event record an access trace, and analyze compares
+the two from that event on. Its `status` says how far the evidence goes:
+
+| Status | Meaning |
+| --- | --- |
+| `found` | The evidence singles out one pair of conflicting syscalls on two threads whose order flips between the runs. |
+| `timing` | No conflicting pair; two timed calls whose return order flips. |
+| `candidates` | Up to three ranked candidates, none singled out; each says what differs between the runs. |
+| `found_by_intervention` | Exactly one candidate whose reversal changes the outcome while an unedited control does not. |
+| `none_found`, `unavailable` | Neither, with the reason. |
+
+A rank is not a verdict. Candidates are listed by kind of evidence: a thread's
+change of course that fed the outcome's input first, then waits in flight
+across the deciding event, then order flips the evidence supports, then the
+rest. Analyze checks each candidate by replaying one run with the candidate's
+turn order reversed, beside a control replay without the reversal, and the
+candidate's `Check:` line (`check` in the report file) says what that showed:
+`decides` (the reversal changed whether the run meets the target, and the
+control did not), `does not decide`, `not realized` (the replay could not
+follow the edited schedule; a timed sleep, for example, cannot return before
+its deadline) or `not checked`, with how many events the edit moved and which
+threads' events they crossed. A candidate whose check does not decide ends
+"not shown to decide", whatever its rank. Only `found_by_intervention` says an
+order decides the outcome. In a report file that sentence is not part of a
+candidate's `evidence`: read its `check.verdict`, which is `decides` only for
+a candidate shown to decide.
+
+When the checks ran and none decides, the report says so after the
+candidates, and keeps the cases apart. A reversal that ran as edited and left
+the outcome as it was clears its candidate, but only as far as one turn
+reversal in one run goes: when all of them did, the outcome probably does not
+turn on any one of these candidates' orders alone, and may turn on an order not
+ranked here, an order in memory that syscalls do not show, one outside the
+trace, or several together. A reversal that could not be replayed as edited
+(`not realized`), one never tried because its control did not reproduce the
+run, and a candidate not checked leave it untested, not cleared. Either way,
+nothing says the right pair is among the candidates. The report then lists what to try next: `--minimize`, so fewer
+chaos interventions surround the deciding event; a wider `--race-window` when a
+trace was cut short; and the unrealized checks' replays
+(`racing_candidate_N.repro`), which show where each left its edit. A report
+file carries the same information in the candidates' `check.verdict` values.
+
+For example, an RPC server's shutdown removes a client in memory just before
+the server's default handler looks the client up. No syscall shows that order,
+so the first candidate is the handler thread's change of course against the
+call the deciding event runs. The two run in the same order in both runs (in
+the baseline the order is measured at the handler's call of the same number,
+which there takes another course), and an edge Hermit observes orders them, so
+the candidate is listed for the change rather than for an order flip, and its
+check could not replay the reversal (stacks and part of the Check line left
+out):
+
+```text
+Racing accesses: thread 3's read(5, 0x7fffffffec48, 4) returns 4 in both runs but reaches different data; it takes its data from a thread whose calls change course after the deciding event, and no access Hermit sees changes order around that change.
+Candidates, ranked (each says what differs between the runs; a rank is not a verdict, and a candidate decides only where its check says so):
+  1. thread 3's read(5, 0x7fffffffec48, 4) returns 4 in both runs but reaches different data; it takes its data from thread 9's write (#716), and thread 9's calls change course at its call 5 (#704); the deciding event 668 runs thread 7's read; the two run in the same order in both runs (the changed call's counterpart enters at #703 in the baseline); ordered in the target by futex wake thread 7 #684 -> thread 9 #701; it is listed for that change, ahead of order flips, and no access Hermit sees changes order around it, so what decides may be an order in memory that syscalls do not show; thread 3's read is 24 events before the outcome and reaches it through program order; not shown to decide.
+     thread 7  #668  read(7, 0x7ffff73fde47, 1) = 1 (its return)
+     thread 9  #704  write(2, "server: client 3 not found, no handler", 39) = 39
+   Check: not realized: reversing this turn order (moving 8 events of thread 9 before thread 7's turn at #668, crossing thread 3 (1 event), thread 5 (3 events)) in the target run cannot be replayed as edited: the replay ran (...) at event #659, where the schedule has (...) (racing_candidate_1.repro).
+```
+
+Here thread 7 is the shutdown, thread 9 the default handler and thread 3 the
+client. The candidate names the right roles, but nothing in the two runs shows
+that their order decides the failure.
+
 ## Common Run Options
 
 ### Scheduling And Determinism

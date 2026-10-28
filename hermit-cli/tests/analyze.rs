@@ -27,13 +27,17 @@
 mod hermit_test;
 
 use std::fs;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
 
 static ANALYZE_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<AnalyzeWorkloads> = OnceLock::new();
@@ -49,6 +53,9 @@ struct AnalyzeWorkloads {
     hello_race: PathBuf,
     racewrite_nostdlib: PathBuf,
     nanosleep_nocrash: PathBuf,
+    fd_reuse_close_race: PathBuf,
+    race_then: PathBuf,
+    rpc_shutdown_removes_client: PathBuf,
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
@@ -92,6 +99,31 @@ fn repository() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository")
+}
+
+/// The `--tmp-dir` a test's analysis creates its workspace in, beside its
+/// report. Analyze removes the workspace when it exits, unless `--keep-tmp`.
+fn tmp_dir_in(report_dir: &Path) -> PathBuf {
+    report_dir.join("workspaces")
+}
+
+/// What an analysis left in its `--tmp-dir` (or any directory).
+fn left_in(dir: &Path) -> Vec<PathBuf> {
+    match fs::read_dir(dir) {
+        Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("cannot list {}: {error}", dir.display()),
+    }
+}
+
+/// An analysis that has exited left no workspace in `tmp_dir`, whatever its
+/// outcome.
+fn assert_no_workspace_left(label: &str, tmp_dir: &Path, combined: &str) {
+    let left = left_in(tmp_dir);
+    assert!(
+        left.is_empty(),
+        "{label}: analyze left {left:?} in its --tmp-dir\n{combined}"
+    );
 }
 
 fn compile_c_pthread(source: &Path, output: &Path) {
@@ -145,26 +177,53 @@ fn workloads() -> &'static AnalyzeWorkloads {
             &nanosleep_nocrash,
         );
 
+        let fd_reuse_close_race = build_root.join("fd_reuse_close_race");
+        compile_c_pthread(
+            &repository.join("tests/c/fd_reuse_close_race.c"),
+            &fd_reuse_close_race,
+        );
+
+        let race_then = build_root.join("analyze_race_then");
+        compile_c_pthread(
+            &repository.join("hermit-cli/tests/fixtures/analyze_race_then.c"),
+            &race_then,
+        );
+
+        let rpc_shutdown_removes_client = build_root.join("rpc_shutdown_removes_client");
+        compile_c_pthread(
+            &repository.join("tests/c/rpc_shutdown_removes_client.c"),
+            &rpc_shutdown_removes_client,
+        );
+
         AnalyzeWorkloads {
             hello_race,
             racewrite_nostdlib,
             nanosleep_nocrash,
+            fd_reuse_close_race,
+            race_then,
+            rpc_shutdown_removes_client,
         }
     })
 }
 
-/// Runs `hermit analyze --search` over `guest` and returns the combined
-/// stdout+stderr, asserting a successful exit and that at least one guest stack
-/// trace was printed. `expected_output`, when non-empty, must also appear (used
-/// to pin the blamed source line).
+/// Runs `hermit analyze --search` over `guest` and returns its report file,
+/// asserting a successful exit and that at least one guest stack trace was
+/// printed. `expected_output`, when non-empty, must also appear in the
+/// combined stdout+stderr (used to pin the blamed source line).
 ///
 /// Mirrors `tests/util/hermit_analyze_test.sh`: `--analyze-seed=0 --search`,
 /// then a chaotic run with a tight preemption timeout so the search has enough
 /// scheduling change points to expose the race.
-fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output: &str) {
+fn run_analyze(
+    label: &str,
+    guest: &Path,
+    analyze_opts: &[&str],
+    expected_output: &str,
+) -> serde_json::Value {
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(report_dir.path());
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.arg("analyze");
@@ -172,6 +231,7 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
     add_calibrated_skid_margin(&mut command, label);
     command
         .arg(format!("--report-file={}", report_file.display()))
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
         .args(["--analyze-seed=0", "--search", "--"])
         // Arguments forwarded to the underlying `hermit run` invocations:
         .args(["--chaos", "--summary", "--max-timeslice=400000", "--"])
@@ -187,6 +247,19 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
     assert!(
         combined.contains("Stack trace for thread"),
         "{label}: hermit analyze did not print a guest stack trace\n{combined}"
+    );
+    // The report is the user's; the workspace is analyze's.
+    assert!(report_file.is_file(), "{label}: no report\n{combined}");
+    assert_no_workspace_left(label, &tmp_dir, &combined);
+    // --trial-timeout=auto: the runs after the target run are bounded, at
+    // 60 s or 10 times the slowest endpoint run, whichever is longer.
+    let bound = combined
+        .split_once("Runs from here on are bounded at ")
+        .and_then(|(_, rest)| rest.split_once(" s of wall-clock time"))
+        .and_then(|(seconds, _)| seconds.parse::<u64>().ok());
+    assert!(
+        bound.is_some_and(|seconds| seconds >= 60),
+        "{label}: no trial bound of at least 60 s\n{combined}"
     );
     if !expected_output.is_empty() {
         assert!(
@@ -215,6 +288,10 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
         warnings.first().copied(),
         "{label}: {report}\n{combined}"
     );
+    let report = fs::read_to_string(&report_file)
+        .unwrap_or_else(|error| panic!("{label}: no report file: {error}\n{combined}"));
+    serde_json::from_str(&report)
+        .unwrap_or_else(|error| panic!("{label}: unreadable report file: {error}\n{report}"))
 }
 
 /// Exercises analyze's fail-closed endpoint check for a workload whose target
@@ -223,6 +300,7 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(report_dir.path());
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.arg("analyze");
@@ -230,6 +308,7 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
     add_calibrated_skid_margin(&mut command, label);
     command
         .arg(format!("--report-file={}", report_file.display()))
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
         .args(["--analyze-seed=0", "--search", "--"])
         .args(["--chaos", "--summary", "--preemption-timeout=400000", "--"])
         .arg(guest);
@@ -250,6 +329,7 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
         combined.contains("baseline run matched target criteria when it should not"),
         "{label}: analyze did not reject indistinguishable endpoints\n{combined}"
     );
+    assert_no_workspace_left(label, &tmp_dir, &combined);
 }
 
 #[test]
@@ -282,6 +362,127 @@ fn analyze_racewrite_nostdlib() {
     );
 }
 
+/// `--prefix-search` finds the same race from the target schedule alone: the
+/// deciding event is the parent's return from fork, and the thread the
+/// scheduler would run there instead is the child at its racing write. The
+/// parent's slice ends right after that return in the target schedule, and a
+/// trial that stops there leaves that slice end to the scheduler; one that
+/// replayed it would name the parent's next event, one too late.
+#[test]
+#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_racewrite_nostdlib_prefix_search() {
+    let report = run_analyze(
+        "analyze racewrite_nostdlib --prefix-search",
+        &workloads().racewrite_nostdlib,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-exit-code=0",
+            "--target-stdout=foobar",
+        ],
+        "racewrite_nostdlib.c:35",
+    );
+    let header = report["header"].as_str().unwrap_or_default();
+    assert!(header.contains("Syscall(fork, Posthook)"), "{report}");
+    let thread = |event: &str| report[event]["stack"]["thread_id"].as_i64();
+    assert!(thread("critical_event1").is_some(), "{report}");
+    assert!(thread("critical_event2").is_some(), "{report}");
+    assert_ne!(
+        thread("critical_event1"),
+        thread("critical_event2"),
+        "{report}"
+    );
+}
+
+/// A shutdown that removes a client before the server looks it up
+/// (tests/c/rpc_shutdown_removes_client.c): the race is in memory, so the
+/// finder can only rank candidates, first the server's change of course
+/// against the deciding event. The report checks each candidate by
+/// intervention. Moving the server's turn before the shutdown's crosses the
+/// client and the poller, and the check says how many events of each; the
+/// server then cannot run as edited (it needs the request that now comes
+/// after it), so the check is not realized rather than a verdict. No
+/// poller nap decides.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_checks_the_race_candidates_and_says_what_each_edit_moved() {
+    let report = run_analyze(
+        "analyze rpc_shutdown_removes_client --prefix-search",
+        &workloads().rpc_shutdown_removes_client,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-stdout=call failed",
+        ],
+        "call failed",
+    );
+    let racing = &report["racing_accesses"];
+    assert_eq!(racing["status"], "candidates", "{report}");
+    let candidates = racing["candidates"].as_array().cloned().unwrap_or_default();
+    let calls = |c: &serde_json::Value| -> Vec<String> {
+        (0..2)
+            .map(|i| c["accesses"][i]["call"].as_str().unwrap_or("").to_owned())
+            .collect()
+    };
+    let change = candidates
+        .iter()
+        .find(|c| calls(c).iter().any(|call| call.contains("not found")))
+        .unwrap_or_else(|| panic!("no candidate names the server's change: {report}"));
+    let check = &change["check"];
+    assert_eq!(check["verdict"], "not_realized", "{report}");
+    assert!(
+        check["edit"].as_str().unwrap_or("").starts_with("moving ")
+            && check["moved"]["events"].as_u64().unwrap_or(0) > 0
+            && !check["moved"]["crossed"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .is_empty(),
+        "{report}"
+    );
+    for candidate in &candidates {
+        assert!(candidate["check"].is_object(), "{report}");
+        if calls(candidate)
+            .iter()
+            .any(|call| call.starts_with("nanosleep("))
+        {
+            assert_ne!(candidate["check"]["verdict"], "decides", "{report}");
+        }
+    }
+}
+
+/// A deferred second close of a descriptor number another thread reopened
+/// (tests/c/fd_reuse_close_race.c, the fdsan pattern): the report's
+/// "Racing accesses" section names the closer's close and the writer's lseek
+/// that fails with EBADF, on two threads, and no edge Hermit observes orders
+/// them.
+#[test]
+#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_names_the_close_racing_the_reused_descriptor() {
+    let report = run_analyze(
+        "analyze fd_reuse_close_race --prefix-search",
+        &workloads().fd_reuse_close_race,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-stderr=failed with EBADF",
+        ],
+        "unordered by the edges Hermit observes",
+    );
+    let racing = &report["racing_accesses"];
+    assert_eq!(racing["status"], "found", "{report}");
+    let access = |i: usize, field: &str| racing["accesses"][i][field].clone();
+    let call = |i: usize| access(i, "call").as_str().unwrap_or_default().to_owned();
+    assert!(call(0).starts_with("close("), "{report}");
+    assert!(call(1).starts_with("lseek("), "{report}");
+    assert_eq!(access(1, "result"), "-EBADF", "{report}");
+    assert_ne!(access(0, "thread"), access(1, "thread"), "{report}");
+    assert_eq!(
+        racing["happens_before"]["target"]["ordered"], false,
+        "{report}"
+    );
+}
+
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
@@ -289,5 +490,451 @@ fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
         "analyze nanosleep-threads baseline collision",
         &workloads().nanosleep_nocrash,
         &["--run-arg=--base-env=empty", "--target-exit-code=0"],
+    );
+}
+
+/// The first chaos seed under which `analyze_race_then THEN`, run with
+/// `run_args`, takes the order that finishes ("b-first", exit 0). A run in
+/// the other order may not end by itself, so each is bounded at 5 s.
+fn race_then_target_seed(then: &str, run_args: &[&str]) -> u64 {
+    let guest = &workloads().race_then;
+    (0..40)
+        .find(|seed| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+            command
+                .args(["run", "--chaos", "--timeout=5"])
+                .args(run_args)
+                .arg(format!("--seed={seed}"))
+                .arg("--")
+                .arg(guest)
+                .arg(then);
+            let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+            output.status.success() && output.stdout == b"b-first\n"
+        })
+        .expect("no chaos seed in 0..40 lets thread b win the race")
+}
+
+fn combined_output(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// `hermit analyze` over `analyze_race_then THEN` from a target seed, with
+/// `--trial-timeout=3` and more analyze options and run arguments: its
+/// output and report, if it wrote one.
+fn analyze_race_then_with(
+    then: &str,
+    analyze_opts: &[&str],
+    run_args: &[&str],
+) -> (Output, Option<serde_json::Value>) {
+    let seed = race_then_target_seed(then, run_args);
+    let _guard = analyze_lock();
+    let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
+    let report_file = report_dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(report_dir.path());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .arg("analyze")
+        .args([
+            "--target-stdout=b-first",
+            "--target-exit-code=0",
+            "--trial-timeout=3",
+        ])
+        .args(analyze_opts)
+        .arg(format!("--run1-seed={seed}"))
+        .arg(format!("--report-file={}", report_file.display()))
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
+        .args(["--", "--chaos"])
+        .args(run_args)
+        .arg("--")
+        .arg(&workloads().race_then)
+        .arg(then);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    assert_no_workspace_left(&format!("{command:?}"), &tmp_dir, &combined_output(&output));
+    let report = fs::read_to_string(&report_file).ok().map(|text| {
+        serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("unreadable report: {error}\n{}", combined_output(&output))
+        })
+    });
+    (output, report)
+}
+
+/// [`analyze_race_then_with`], asserting that analyze succeeded and wrote a
+/// report naming a critical event: the combined output and the report.
+fn analyze_race_then(
+    label: &str,
+    then: &str,
+    analyze_opts: &[&str],
+) -> (String, serde_json::Value) {
+    let (output, report) = analyze_race_then_with(then, analyze_opts, &[]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label} failed: {}\n{combined}",
+        output.status
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert!(
+        report["critical_event1"]["event_index"].is_u64(),
+        "{label}: {report}"
+    );
+    (combined, report)
+}
+
+const BOUND_REACHED: &str = "reached hermit analyze's bound of 3 s for this run \
+                             (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)); \
+                             counted as not meeting the target";
+
+/// Every prefix trial in which thread a wins the race spins for ever, the
+/// run without chaos (the prefix search's baseline) among them. Each is
+/// bounded by `--trial-timeout` and counts as not meeting the target, so
+/// the search still finds the deciding event. Before the bound, the first
+/// such trial never ended. The trial on the boundary's baseline side runs
+/// once more with 4 times the bound, does not finish then either, and the
+/// report says the boundary rests on that bound rather than on an outcome.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_bounds_trials_that_never_end() {
+    let label = "analyze --prefix-search analyze_race_then spin";
+    let (combined, report) = analyze_race_then(label, "spin", &["--prefix-search"]);
+    assert!(
+        combined.contains(BOUND_REACHED),
+        "{label}: no trial reached the bound\n{combined}"
+    );
+    assert!(
+        combined.contains("running it again with a bound of 12 s, so that a finished trial"),
+        "{label}: the boundary was not confirmed\n{combined}"
+    );
+    let header = report["header"].as_str().unwrap();
+    assert!(
+        header.contains("does not finish, which the search counts as not meeting")
+            && header.contains("this boundary rests on a wall-clock bound, not on an outcome"),
+        "{label}: {report}"
+    );
+}
+
+/// The default search's baseline is the run without chaos, which here spins
+/// for ever. The bound ends it too, and with no baseline schedule analyze
+/// searches within the target schedule instead. Before, the baseline run
+/// never ended, whatever --trial-timeout said.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_searches_the_target_schedule_when_the_baseline_never_ends() {
+    let label = "analyze analyze_race_then spin";
+    let (combined, _) = analyze_race_then(label, "spin", &[]);
+    assert!(
+        combined.contains(
+            "the baseline run (non-chaos (0 extra preemptions) run) did not finish, so it \
+             recorded no schedule to bisect against"
+        ) && combined.contains("Searching within the target schedule instead"),
+        "{label}: no fallback\n{combined}"
+    );
+}
+
+/// Every prefix trial in which thread a wins the race asks for something
+/// Hermit refuses at run time (exit 122), the run without chaos (the prefix
+/// search's baseline) among them. Each counts as not meeting the target, with
+/// a warning, and the report says how many were refused. Before, the first
+/// refused trial ended the whole analysis with exit 122. The refusal is
+/// Detcore's for a process-directed signal while several threads live
+/// (https://github.com/rrnewton/hermit/issues/4034); once that is supported,
+/// the fixture needs another refused operation.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_counts_a_refused_trial_as_the_baseline() {
+    let label = "analyze --prefix-search analyze_race_then refuse";
+    let (combined, report) = analyze_race_then(label, "refuse", &["--prefix-search"]);
+    assert!(
+        combined.contains(
+            "Hermit refused this trial when the guest reached an operation it does not support"
+        ),
+        "{label}: no trial was refused\n{combined}"
+    );
+    assert!(
+        report["header"]
+            .as_str()
+            .unwrap()
+            .contains("trial(s) were refused by Hermit (exit 122) and counted as not reaching"),
+        "{label}: {report}"
+    );
+}
+
+/// The target run itself is refused: it cannot be studied, so analyze ends
+/// with Hermit's refusal (exit 122) rather than counting it.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_ends_with_a_refused_target_run() {
+    let label = "analyze analyze_race_then refuse, target refused";
+    let guest = &workloads().race_then;
+    // The run without chaos takes the order Hermit refuses.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["analyze", "--prefix-search", "--target-stdout=a-first"])
+        .args(["--", "--timeout=30", "--"])
+        .arg(guest)
+        .arg("refuse");
+    let output = hermit_test::hermit_output(label, &mut command);
+    let combined = combined_output(&output);
+    assert_eq!(output.status.code(), Some(122), "{label}\n{combined}");
+    assert!(
+        combined.contains("HERMIT_POLICY_REFUSAL"),
+        "{label}\n{combined}"
+    );
+}
+
+/// A race found only at a short timeslice: at the run's own 100 us, thread a
+/// is preempted before it claims even without chaos, so the scheduler alone
+/// meets the target and gives the prefix search nothing to bisect against.
+/// The search says so and continues at hermit's default 200 ms, where it
+/// does not. Before, the analysis ended there with exit 125.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_continues_prefixes_at_a_coarser_timeslice() {
+    let label = "analyze --prefix-search analyze_race_then late-a --max-timeslice=100000";
+    let (output, report) =
+        analyze_race_then_with("late-a", &["--prefix-search"], &["--max-timeslice=100000"]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label}: {}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains(
+            "Continuing without chaos at a 100000 ns timeslice, the scheduler alone, replaying \
+             none of the target schedule, meets the target"
+        ),
+        "{label}\n{combined}"
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert!(
+        report["header"]
+            .as_str()
+            .unwrap()
+            .contains("scheduling without chaos at a 200000000 ns timeslice does not meet"),
+        "{label}: {report}"
+    );
+}
+
+/// The same race with `--continuation-timeslice=100000`: there is no other
+/// continuation to try, so analyze fails, saying that the outcome does not
+/// depend on a chaos decision and what to run or pass instead.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_explains_a_target_the_scheduler_meets_alone() {
+    let label = "analyze --prefix-search analyze_race_then late-a --continuation-timeslice=100000";
+    let (output, _) = analyze_race_then_with(
+        "late-a",
+        &["--prefix-search", "--continuation-timeslice=100000"],
+        &["--max-timeslice=100000"],
+    );
+    let combined = combined_output(&output);
+    assert!(!output.status.success(), "{label}\n{combined}");
+    for expected in [
+        "no event of the target schedule decides the outcome: without chaos, the scheduler alone \
+         already meets the target criteria at a 100000 ns timeslice",
+        "prefix_round_001.repro",
+        "pass --continuation-timeslice",
+        "--run2-seed",
+    ] {
+        assert!(
+            combined.contains(expected),
+            "{label}: no {expected:?}\n{combined}"
+        );
+    }
+}
+
+/// An analysis that ends with an error removes its workspace too, and with
+/// `--keep-tmp` keeps it: the target run here misses a target nothing prints,
+/// and without `--search` analyze ends there.
+#[test]
+#[ignore = "slow: runs a chaos trial; requires PMU branch counters and working mount namespaces"]
+fn analyze_removes_its_workspace_unless_kept() {
+    for keep in [false, true] {
+        let label = format!("analyze hello_race, target never met, keep: {keep}");
+        let _guard = analyze_lock();
+        let dir = tempfile::tempdir().expect("failed to create analyze directory");
+        let tmp_dir = tmp_dir_in(dir.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .arg("analyze")
+            .arg(format!("--tmp-dir={}", tmp_dir.display()))
+            .args(["--run-arg=--base-env=host", "--target-stdout=never printed"]);
+        if keep {
+            command.arg("--keep-tmp");
+        }
+        command
+            .args(["--", "--chaos", "--max-timeslice=400000", "--"])
+            .arg(&workloads().hello_race);
+        let output = hermit_test::hermit_output(&label, &mut command);
+        let combined = combined_output(&output);
+        assert!(
+            !output.status.success()
+                && combined.contains("The run did not match the target criteria"),
+            "{label}: {}\n{combined}",
+            output.status
+        );
+        let left = left_in(&tmp_dir);
+        if keep {
+            assert!(
+                left.len() == 1 && left[0].join("run1_target.repro").is_file(),
+                "{label}: {left:?}\n{combined}"
+            );
+            assert!(
+                combined.contains("Kept the workspace"),
+                "{label}\n{combined}"
+            );
+        } else {
+            assert_no_workspace_left(&label, &tmp_dir, &combined);
+            assert!(
+                combined.contains("Removed the workspace"),
+                "{label}\n{combined}"
+            );
+        }
+    }
+}
+
+/// Makes a container init wait before it arms its own stop handlers, under
+/// the thread name [`ARMING_STALL_COMM`]; both are copied from
+/// `stall_container_init_before_arming_if_asked` in `bin/hermit/container.rs`.
+const ARMING_STALL_ENV: &str = "HERMIT_INTERNAL_STALL_CONTAINER_INIT_BEFORE_ARMING";
+const ARMING_STALL_COMM: &str = "unarmed-init";
+
+/// The children of process `parent`, by the parent field of each
+/// `/proc/<pid>/stat`.
+fn children_of(parent: u32) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
+                    == Some(parent)
+            })
+        })
+        .collect()
+}
+
+/// Run `hermit analyze` over a target run that spins for ever, with `env`,
+/// send SIGTERM to analyze alone once `ready` says so, and check that it ends
+/// that run and the analysis: analyze removes its workspace and the run's own
+/// temporary directories (its private /tmp, in TMPDIR), leaves no process,
+/// and dies of the signal, as a shell reports with 143.
+fn analyze_stopped_by_sigterm(label: &str, env: &[(&str, &str)], ready: impl Fn(u32) -> bool) {
+    let _guard = analyze_lock();
+    let dir = tempfile::tempdir().expect("failed to create analyze directory");
+    let tmp_dir = tmp_dir_in(dir.path());
+    let run_tmp = dir.path().join("TMPDIR");
+    fs::create_dir(&run_tmp).unwrap();
+    let stderr = dir.path().join("stderr");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    hermit_test::pin_canonical_epoch(&mut command);
+    command
+        .arg("analyze")
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
+        .args(["--", "--chaos", "--max-timeslice=400000", "--"])
+        .args(["/bin/sh", "-c", "while :; do :; done"])
+        .env("TMPDIR", &run_tmp)
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr).unwrap());
+    let mut analyze = command.spawn().expect("failed to start hermit analyze");
+    let said = || fs::read_to_string(&stderr).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !ready(analyze.id()) {
+        assert!(
+            analyze.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "{label}: analyze did not get as far as the signal\n{}",
+            said()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let inits = children_of(analyze.id());
+    // SAFETY: kill(2) on this test's own child.
+    assert_eq!(
+        unsafe { libc::kill(analyze.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = analyze.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = analyze.kill();
+            let _ = analyze.wait();
+            panic!("{label}: analyze did not stop\n{}", said());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let said = said();
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "{label}: {status}\n{said}"
+    );
+    assert!(
+        said.contains("hermit analyze stopped on SIGTERM")
+            && said.contains("Removed the workspace"),
+        "{label}\n{said}"
+    );
+    assert_no_workspace_left(label, &tmp_dir, &said);
+    let run_left = left_in(&run_tmp);
+    assert!(
+        run_left.is_empty(),
+        "{label}: the run left {run_left:?} in TMPDIR\n{said}"
+    );
+    // Analyze reaped the run's container init before it exited.
+    let survivors: Vec<_> = inits
+        .iter()
+        .filter(|init| Path::new(&format!("/proc/{init}")).exists())
+        .collect();
+    assert!(
+        survivors.is_empty(),
+        "{label}: the run's init {survivors:?} outlived analyze\n{said}"
+    );
+}
+
+/// SIGTERM sent to analyze alone, 2 s into a target run that spins for ever,
+/// ends that run and the analysis, and analyze cleans up. Before, the
+/// workspace stayed behind whatever ended analyze, and a SIGTERM also left
+/// the run's directories.
+#[test]
+#[ignore = "slow: runs a chaos trial; requires PMU branch counters and working mount namespaces"]
+fn analyze_cleans_up_when_a_signal_stops_it() {
+    let started = std::cell::Cell::new(None);
+    analyze_stopped_by_sigterm("analyze of a guest that spins, SIGTERM", &[], |analyze| {
+        // The target run's container init is analyze's only child.
+        let at = started
+            .get()
+            .or((!children_of(analyze).is_empty()).then(Instant::now));
+        started.set(at);
+        at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+    });
+}
+
+/// SIGTERM sent to analyze while its run's container init is held before
+/// it arms its own stop handlers (Hermit's internal stall) reaches that init
+/// all the same: the handler it inherited from analyze ends it as its own
+/// would, and analyze cleans up.
+#[test]
+#[ignore = "slow: runs a chaos trial; requires PMU branch counters and working mount namespaces"]
+fn analyze_stops_a_run_whose_init_has_not_armed() {
+    analyze_stopped_by_sigterm(
+        "analyze, SIGTERM before the run's init arms",
+        &[(ARMING_STALL_ENV, "1")],
+        |analyze| {
+            children_of(analyze).iter().any(|init| {
+                fs::read_to_string(format!("/proc/{init}/comm"))
+                    .is_ok_and(|comm| comm.trim() == ARMING_STALL_COMM)
+            })
+        },
     );
 }

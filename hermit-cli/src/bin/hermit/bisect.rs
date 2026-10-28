@@ -104,6 +104,8 @@ impl BisectOpts {
             search: false,
             run_needleman: self.needleman,
             minimize: false,
+            prefix_search: false,
+            continuation_timeslice: crate::analyze::ContinuationTimeslice::Auto,
             imprecise_search: false,
             run1_seed: None,
             run1_preemptions: None,
@@ -112,11 +114,18 @@ impl BisectOpts {
             run2_preemptions: None,
             run2_schedule: None,
             report_file: self.report_file.clone(),
+            // The "Racing accesses" section is analyze's: bisect's report
+            // keeps its two stacks and runs no extra traced replay.
+            no_racing_accesses: true,
+            race_window: 0,
             analyze_seed: None,
             verbose: self.verbose,
             jitter_dist: self.jitter_dist,
             execution_context: self.execution_context,
             tmp_dir: None,
+            // Bisect keeps its workspace whatever this says
+            // (`bisect_schedule_pair`).
+            keep_tmp: false,
             success_exit_code: None,
             run_arg: Vec::new(),
             run_args: self.run_args.clone(),
@@ -128,6 +137,11 @@ impl BisectOpts {
             log_budget: global.log_budget(),
             inexact_branch_counter: self.inexact_branch_counter,
             branch_counter_warning: None,
+            // Bisect runs no endpoint to measure: its replays are bounded by
+            // the run arguments' --timeout alone.
+            trial_timeout: crate::analyze::TrialTimeout::Off,
+            endpoints: Default::default(),
+            trial_bound_factor: 1,
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.

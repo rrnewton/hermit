@@ -11,8 +11,14 @@
 mod consts;
 mod minimize;
 mod phases;
+mod race_report;
+mod races;
 mod rundata;
+mod stop;
 mod types;
+mod workspace;
 
 pub use types::AnalyzeOpts;
+pub use types::ContinuationTimeslice;
 pub use types::ExitStatusConstraint;
+pub use types::TrialTimeout;
