@@ -993,8 +993,74 @@ pub(crate) fn pidfd_signal_scope(flags: u32) -> Result<PidfdSignalScope, Errno> 
 
 /// `pidfd_send_signal`'s sentinel for the calling thread (Linux 6.15 and later).
 const PIDFD_SELF_THREAD: RawFd = -10000;
-/// `pidfd_send_signal`'s sentinel for the calling thread's thread group.
+/// `pidfd_send_signal`'s sentinel for the calling thread's thread group, as
+/// Linux 6.17 and later spell it (include/uapi/linux/fcntl.h:111 at v6.17),
+/// which is the ABI Hermit presents on every host
+/// (https://github.com/rrnewton/hermit/issues/4147).
 const PIDFD_SELF_THREAD_GROUP: RawFd = -10001;
+/// The same sentinel as Linux 6.15 and 6.16 spell it
+/// (include/uapi/linux/pidfd.h:58 at v6.16), before 6.17 moved it to
+/// [`PIDFD_SELF_THREAD_GROUP`]. A guest's -20000 is no sentinel to Hermit, as
+/// to Linux 6.17: an unknown descriptor, EBADF.
+const PIDFD_SELF_THREAD_GROUP_6_15: RawFd = -20000;
+
+/// The values a host kernel may give the sentinel Hermit presents as
+/// `sentinel`, newest first.
+fn pidfd_self_spellings(sentinel: RawFd) -> &'static [RawFd] {
+    match sentinel {
+        PIDFD_SELF_THREAD => &[PIDFD_SELF_THREAD],
+        PIDFD_SELF_THREAD_GROUP => &[PIDFD_SELF_THREAD_GROUP, PIDFD_SELF_THREAD_GROUP_6_15],
+        _ => &[],
+    }
+}
+
+/// The first value of `sentinel` (`pidfd_self_spellings`) that `accepts` says
+/// the host kernel takes as that sentinel; `None` when it knows none.
+fn pidfd_self_spelling(sentinel: RawFd, accepts: impl Fn(RawFd) -> bool) -> Option<RawFd> {
+    pidfd_self_spellings(sentinel)
+        .iter()
+        .copied()
+        .find(|&spelling| accepts(spelling))
+}
+
+/// How this host's kernel spells the sentinel Hermit presents as `sentinel`,
+/// probed once per sentinel: a signal 0 sent through a value from Hermit's
+/// own process succeeds only where the kernel takes that value as the
+/// sentinel (a signal-0 send checks only that the target exists, and any
+/// other negative descriptor is EBADF, kernel/signal.c:4090-4092 at v6.17).
+/// Detcore decides what a sentinel names itself and forwards a send in the
+/// host's spelling, so that what the guest sees does not depend on the host
+/// kernel's version.
+fn host_pidfd_self_spelling(sentinel: RawFd) -> Option<RawFd> {
+    static THREAD: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
+    static GROUP: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
+    let accepts = |spelling: RawFd| {
+        // SAFETY: a signal-0 pidfd_send_signal with no siginfo reads no
+        // memory and sends no signal.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                spelling,
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        rc == 0
+    };
+    match sentinel {
+        PIDFD_SELF_THREAD => *THREAD.get_or_init(|| pidfd_self_spelling(sentinel, accepts)),
+        PIDFD_SELF_THREAD_GROUP => *GROUP.get_or_init(|| pidfd_self_spelling(sentinel, accepts)),
+        _ => None,
+    }
+}
+
+/// `call`, a `pidfd_send_signal`, with `pidfd` as its descriptor.
+fn with_pidfd(call: Syscall, pidfd: RawFd) -> Syscall {
+    let (sysno, mut args) = call.into_parts();
+    args.arg0 = pidfd as usize;
+    Syscall::from_raw(sysno, args)
+}
 
 /// The task a `PIDFD_SELF_*` sentinel names, and the scope Linux gives it when
 /// no flag is set: the calling thread (thread-directed) or its thread group
@@ -13583,6 +13649,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         signal: i32,
         flags: u32,
     ) -> Result<i64, Error> {
+        let mut call = call;
         // Linux checks the flags before it looks at the descriptor.
         let mut scope = pidfd_signal_scope(flags)?;
         let info = AddrMut::<GuestSiginfo>::from_raw(call.into_parts().1.arg2);
@@ -13597,6 +13664,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         // or its thread group (`PIDFD_SELF_THREAD_GROUP`)
         // (https://github.com/rrnewton/hermit/issues/4147).
         let named = if let Some((target, default)) = pidfd_self_target(guest, pidfd) {
+            // Hermit presents Linux 6.17's sentinels whatever the host's
+            // version: what the call names is Detcore's decision, and a
+            // forwarded send carries the value this host's kernel takes for
+            // the same sentinel (`host_pidfd_self_spelling`). A host that
+            // knows none (before Linux 6.15) cannot carry it out.
+            let Some(spelling) = host_pidfd_self_spelling(pidfd) else {
+                tracing::error!(
+                    "[detcore, dtid {}] pidfd_send_signal through the sentinel {} is not \
+                     supported: this host's kernel does not know it \
+                     (https://github.com/rrnewton/hermit/issues/4147)",
+                    guest.thread_state().dettid,
+                    pidfd,
+                );
+                return self
+                    .refuse_unserviceable_operation(guest, Sysno::pidfd_send_signal, Errno::ENOSYS)
+                    .await;
+            };
+            if spelling != pidfd {
+                call = with_pidfd(call, spelling);
+            }
             if flags == 0 {
                 scope = default;
             }
@@ -19685,24 +19772,32 @@ mod rebound_path_tests {
 
 #[cfg(test)]
 mod untraced_code_tests {
+    use std::os::fd::RawFd;
     use std::path::Path;
     use std::path::PathBuf;
 
     use nix::fcntl::OFlag;
     use reverie::syscalls::Errno;
+    use reverie::syscalls::Syscall;
     use reverie::syscalls::SyscallArgs;
+    use reverie::syscalls::SyscallInfo;
     use reverie::syscalls::Sysno;
 
     use super::DescriptorFacts;
     use super::DetPid;
+    use super::PIDFD_SELF_THREAD;
+    use super::PIDFD_SELF_THREAD_GROUP;
     use super::PROC_ROOT_INO;
     use super::PidfdSignalScope;
     use super::ProcessDirectoryDescriptor;
     use super::classify_process_directory;
     use super::descriptor_identity;
+    use super::host_pidfd_self_spelling;
     use super::may_change_untraced_code;
     use super::may_write_process_memory;
+    use super::pidfd_self_spelling;
     use super::pidfd_signal_scope;
+    use super::with_pidfd;
 
     const PAGE: (u64, u64) = (0x7100_0000, 0x7100_1000);
 
@@ -19968,6 +20063,54 @@ mod untraced_code_tests {
         for flags in [3, 5, 6, 7, 8, 9, 1 << 31, u32::MAX] {
             assert_eq!(pidfd_signal_scope(flags), Err(Errno::EINVAL), "{flags:#x}");
         }
+    }
+
+    /// The thread-group sentinel Hermit presents is Linux 6.17's -10001 on
+    /// every host: a forwarded send carries the host kernel's own value for it,
+    /// -10001 from Linux 6.17 on and -20000 in 6.15 and 6.16, and none before
+    /// 6.15 (https://github.com/rrnewton/hermit/issues/4147). The probe takes
+    /// the newest value the host accepts. A send keeps every other argument.
+    #[test]
+    fn a_pidfd_self_sentinel_is_forwarded_in_the_hosts_spelling() {
+        let linux_6_17 = |fd: RawFd| fd == PIDFD_SELF_THREAD || fd == -10001;
+        let linux_6_16 = |fd: RawFd| fd == PIDFD_SELF_THREAD || fd == -20000;
+        let linux_6_14 = |_: RawFd| false;
+        assert_eq!(
+            pidfd_self_spelling(PIDFD_SELF_THREAD_GROUP, linux_6_17),
+            Some(-10001)
+        );
+        assert_eq!(
+            pidfd_self_spelling(PIDFD_SELF_THREAD_GROUP, linux_6_16),
+            Some(-20000)
+        );
+        assert_eq!(
+            pidfd_self_spelling(PIDFD_SELF_THREAD_GROUP, linux_6_14),
+            None
+        );
+        for host in [linux_6_17, linux_6_16] {
+            assert_eq!(
+                pidfd_self_spelling(PIDFD_SELF_THREAD, host),
+                Some(PIDFD_SELF_THREAD)
+            );
+        }
+        // -20000 is no sentinel Hermit presents: a guest's -20000 is an
+        // unknown descriptor, as on Linux 6.17.
+        assert_eq!(pidfd_self_spelling(-20000, linux_6_16), None);
+        // This host's own answer is one of the two values.
+        assert!(matches!(
+            host_pidfd_self_spelling(PIDFD_SELF_THREAD_GROUP),
+            Some(-10001 | -20000) | None
+        ));
+        let call = Syscall::from_raw(
+            Sysno::pidfd_send_signal,
+            SyscallArgs::new(PIDFD_SELF_THREAD_GROUP as usize, 10, 0x1000, 0, 0, 0),
+        );
+        let (sysno, args) = with_pidfd(call, -20000).into_parts();
+        assert_eq!(sysno, Sysno::pidfd_send_signal);
+        assert_eq!(
+            (args.arg0 as RawFd, args.arg1, args.arg2, args.arg3),
+            (-20000, 10, 0x1000, 0)
+        );
     }
 
     /// A descriptor names a process for `pidfd_send_signal` only when it is a

@@ -38943,8 +38943,11 @@ fn a_pidfd_signal_through_hermits_own_proc_directories_is_eperm() {
 /// returns ENOSYS. The two sends through `PIDFD_SELF_THREAD_GROUP` and
 /// through `PIDFD_SELF_THREAD` with `PIDFD_SIGNAL_THREAD_GROUP`, which name
 /// the same process (https://github.com/rrnewton/hermit/issues/4147), are
-/// answered as this host's kernel answers them natively (EBADF for the
-/// sentinel it does not know, and 0): before, both were refused.
+/// answered as Linux 6.17 and later answer them, whatever the host kernel's
+/// version: the sentinel is -10001 there (include/uapi/linux/fcntl.h:111 at
+/// v6.17), so the first send succeeds and its handler runs on the sender,
+/// though Linux 6.15 and 6.16 spell the sentinel -20000 and answer -10001
+/// with EBADF. Before, both were refused.
 #[test]
 fn a_pidfd_signal_through_a_siblings_proc_directory_names_the_process() {
     let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags")
@@ -39019,7 +39022,7 @@ fn a_pidfd_signal_through_a_siblings_proc_directory_names_the_process() {
         stdout,
         format!(
             "process {pid}\n/proc/<sibling tid> rc=-1 ENOSYS ran=0\n\
-             PIDFD_SELF_THREAD_GROUP rc=-1 EBADF ran=0\n\
+             PIDFD_SELF_THREAD_GROUP rc=0 - ran=1\n\
              worker, PIDFD_SELF_THREAD, thread group rc=0 - ran=0\n"
         ),
         "stderr:\n{log}"

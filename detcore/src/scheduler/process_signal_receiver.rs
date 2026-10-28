@@ -32,7 +32,8 @@
 //! `recalc_sigpending_tsk`, signal.c:2491-2496). So Detcore makes the choice, by
 //! the same rule over its own model, and then keeps the call itself: it
 //! forwards the guest's `kill`, `rt_sigqueueinfo` or `pidfd_send_signal`
-//! unchanged, so the copy is the kernel's own, in the shared queue, with
+//! unchanged (but for a `PIDFD_SELF_THREAD_GROUP` sentinel, which goes in
+//! the host kernel's spelling), so the copy is the kernel's own, in the shared queue, with
 //! Linux's siginfo, coalescing, retargeting and visibility; and it resumes
 //! the chosen thread before any other that could take it, until it does
 //! (`process_signal_takers`, `Scheduler::first_process_signal_taker`).
