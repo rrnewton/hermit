@@ -10346,8 +10346,9 @@ fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
 /// task has that ID. With one, Detcore adds the chosen ID for Hermit's
 /// namespace, in both kinds of run, also when the one entry is the last four
 /// bytes of a page that an unmapped page follows (Detcore reads exactly the
-/// array, as the kernel does). After the guest gives up its capabilities, `CLONE_NEWUSER` lets its own one-entry call through, but the
-/// added entry needs a capability over Hermit's namespace: an explicit base
+/// array, as the kernel does). After the guest gives up its capabilities,
+/// `CLONE_NEWUSER` lets its own one-entry call through, but the added entry
+/// needs a capability over Hermit's namespace: an explicit base
 /// refuses the call before the task exists, and a default run issues the
 /// guest's own call, whose task gets a host ID, with a warning and the
 /// summary's count.
@@ -41246,7 +41247,11 @@ fn a_namespace_only_run_on_a_terminal_keeps_its_terminal_behaviour() {
 /// followed by an entry for an outer namespace, a live task's id, or another
 /// process's zombie child's pid) is refused by name: the run ends with the
 /// policy exit 122, or, with --allow-unsupported-syscalls, the call fails with
-/// EEXIST. The pid of the caller's own zombie child, a `set_tid` array the
+/// EEXIST (also for a one-entry array at a page's end before an unmapped
+/// page, or at an unaligned address). An array on a page mapped writable but
+/// not readable, which Detcore cannot check, is refused by name, or fails
+/// with EFAULT under --allow-unsupported-syscalls. The pid of the caller's
+/// own zombie child, a `set_tid` array the
 /// kernel cannot read, one it rejects, and a caller without the capability to
 /// choose a pid get the kernel's own EEXIST, EFAULT, EINVAL and EPERM, as on
 /// Linux, and a fresh pid is given as on Linux, at L2 (ptrace).
@@ -41295,6 +41300,7 @@ fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
         "orphan",
         "deep",
         "edge",
+        "unaligned",
     ] {
         let (code, stdout, log, _) = run(&["--strict"], mode);
         assert_eq!(code, Some(122), "{mode}: {stdout}\n{log}");
@@ -41323,6 +41329,18 @@ fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
             "{mode}: the kernel answers and nothing is refused:\n{log}"
         );
     }
+    // An array on a page mapped writable but not readable, which the kernel
+    // reads but Detcore cannot check, is refused by name; with
+    // --allow-unsupported-syscalls the call fails with EFAULT.
+    let (code, stdout, log, _) = run(&["--strict"], "wronly");
+    assert_eq!(code, Some(122), "wronly: {stdout}\n{log}");
+    assert!(
+        log.contains("clone3 set_tid's array cannot be read with the guest's own access"),
+        "wronly: the refusal must say why:\n{log}"
+    );
+    let (code, stdout, log, _) = run(&["--allow-unsupported-syscalls"], "wronly");
+    assert_eq!(code, Some(1), "wronly: {stdout}\n{log}");
+    assert!(log.contains("clone3: Bad address"), "wronly: {log}");
     let (code, stdout, log, parity) = run(&["--strict", "--verify", "--verify-strict"], "fresh");
     assert_eq!(code, Some(0), "fresh: {stdout}\n{log}");
     assert_eq!(stdout, "got the requested pid: 1\n", "fresh: {log}");
