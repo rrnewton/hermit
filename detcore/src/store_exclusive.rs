@@ -169,6 +169,7 @@ mod decode {
             super::model::FileLoops {
                 pair_loads: self.pair_loads,
                 counter_reads: self.reads,
+                unverified: Vec::new(),
             }
         }
     }
@@ -190,24 +191,120 @@ mod decode {
             .then_some((offset, usize::from(count)))
     }
 
-    /// The file ranges (offset, size) of the sections that hold instructions
-    /// (`SHF_EXECINSTR`, with file contents) in an ELF64 little-endian
-    /// section header table. Only these are scanned, so read-only data that
-    /// shares the executable segment cannot pass for an exclusive pair.
-    pub(crate) fn executable_sections(table: &[u8]) -> Vec<(u64, u64)> {
+    /// A section that holds instructions, as an ELF64 section header gives
+    /// it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct ExecutableSection {
+        /// Its index in the section header table, which mapping symbols name.
+        pub(crate) index: usize,
+        /// Its file offset and size.
+        pub(crate) offset: u64,
+        pub(crate) size: u64,
+        /// Its address, which mapping symbols' values are.
+        pub(crate) address: u64,
+    }
+
+    /// The sections that hold instructions (`SHF_EXECINSTR`, with file
+    /// contents) in an ELF64 little-endian section header table. Only these
+    /// are scanned, so read-only data that shares the executable segment
+    /// cannot pass for an exclusive pair.
+    pub(crate) fn executable_sections(table: &[u8]) -> Vec<ExecutableSection> {
         const SHT_NOBITS: u32 = 8;
         const SHF_EXECINSTR: u64 = 0x4;
         table
             .as_chunks::<64>()
             .0
             .iter()
-            .filter_map(|entry| {
+            .enumerate()
+            .filter_map(|(index, entry)| {
                 let word = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
                 let kind = u32::from_le_bytes(entry[4..8].try_into().unwrap());
-                (kind != SHT_NOBITS && word(8) & SHF_EXECINSTR != 0 && word(32) != 0)
-                    .then(|| (word(24), word(32)))
+                (kind != SHT_NOBITS && word(8) & SHF_EXECINSTR != 0 && word(32) != 0).then(|| {
+                    ExecutableSection {
+                        index,
+                        offset: word(24),
+                        size: word(32),
+                        address: word(16),
+                    }
+                })
             })
             .collect()
+    }
+
+    /// The file ranges (start, end) of `sections` to scan, and of those the
+    /// ones scanned without evidence, each sorted and merged. A section's
+    /// code ([`CodeEvidence::classify`]) is scanned, and so is what is
+    /// neither known code nor marked data: bytes before its first mapping
+    /// symbol, bytes no FDE covers, or the whole section when nothing speaks
+    /// for it. Those are labelled unverified: the rewriter leaves them
+    /// alone, but this census only names where retries may come from, and
+    /// dropping them would hide a real loop. Only `$d` ranges, which say
+    /// they are data, are not scanned, so a constant table in `.text` cannot
+    /// pass for an exclusive pair.
+    ///
+    /// [`CodeEvidence::classify`]: crate::aarch64_lse::mapping::CodeEvidence::classify
+    ///
+    /// Under the unwind table alone, code is what control reaches from the
+    /// functions' entries, as the rewriter takes it
+    /// ([`reachable_code`]), when `words` returns the section's instruction
+    /// words; the FDEs' whole ranges when it does not.
+    ///
+    /// [`reachable_code`]: crate::aarch64_lse::mapping::reachable_code
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn code_file_ranges(
+        sections: &[ExecutableSection],
+        evidence: &crate::aarch64_lse::mapping::CodeEvidence,
+        mut words: impl FnMut(&ExecutableSection) -> Option<Vec<u32>>,
+    ) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
+        use crate::aarch64_lse::mapping;
+        let mut ranges = Vec::new();
+        let mut unverified = Vec::new();
+        for section in sections {
+            let mut held = evidence.classify(section.index, section.address, section.size);
+            if held.evidence == Some(mapping::Evidence::UnwindTable)
+                && let Some(words) = words(section)
+            {
+                let end = section.address.saturating_add(section.size);
+                held.code = mapping::reachable_code(
+                    &words,
+                    section.address,
+                    &held.code,
+                    &evidence.unwind_entries(section.address, section.size),
+                );
+                let mut gaps = Vec::new();
+                let mut at = section.address;
+                for (start, stop) in &held.code {
+                    if at < *start {
+                        gaps.push((at, *start));
+                    }
+                    at = at.max(*stop);
+                }
+                if at < end {
+                    gaps.push((at, end));
+                }
+                held.unknown = gaps;
+            }
+            let file = |(start, end): &(u64, u64)| {
+                (
+                    section.offset + (start - section.address),
+                    section.offset + (end - section.address),
+                )
+            };
+            ranges.extend(held.code.iter().chain(&held.unknown).map(file));
+            unverified.extend(held.unknown.iter().map(file));
+        }
+        let merged = |mut spans: Vec<(u64, u64)>| {
+            spans.sort_unstable();
+            let mut out: Vec<(u64, u64)> = Vec::new();
+            for (start, end) in spans {
+                match out.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => out.push((start, end)),
+                }
+            }
+            out
+        };
+        (merged(ranges), merged(unverified))
     }
 
     /// One pass over `words`.
@@ -335,6 +432,10 @@ mod model {
         /// EL0 generic-timer counter reads: time the guest sees that virtual
         /// time does not control.
         pub counter_reads: u64,
+        /// Of `pairs`, those in bytes not known to be code: neither marked
+        /// `$x` nor covered by an FDE, nor marked `$d`. They may be data.
+        #[serde(default)]
+        pub unverified_pairs: u64,
     }
 
     /// What a scan of one mapping found, with the mapping. It crosses to the
@@ -774,6 +875,9 @@ mod model {
         pub(crate) pair_loads: Vec<u64>,
         /// The file offset of each counter read.
         pub(crate) counter_reads: Vec<u64>,
+        /// The file ranges scanned whole because nothing told their code
+        /// from their data (`decode::code_file_ranges`).
+        pub(crate) unverified: Vec<(u64, u64)>,
     }
 
     impl FileLoops {
@@ -788,9 +892,20 @@ mod model {
                     .filter(|offset| start <= **offset && **offset < end)
                     .count() as u64
             };
+            let unverified: Vec<u64> = self
+                .pair_loads
+                .iter()
+                .copied()
+                .filter(|offset| {
+                    self.unverified
+                        .iter()
+                        .any(|(start, end)| start <= offset && offset < end)
+                })
+                .collect();
             Found {
                 pairs: inside(&self.pair_loads),
                 counter_reads: inside(&self.counter_reads),
+                unverified_pairs: inside(&unverified),
             }
         }
     }
@@ -1019,6 +1134,12 @@ mod model {
             self.per_path(|(found, _)| found.counter_reads)
         }
 
+        /// The pairs of each guest path that has any that nothing told from
+        /// data ([`Found::unverified_pairs`]).
+        pub(crate) fn unverified_pairs_per_path(&self) -> BTreeMap<String, u64> {
+            self.per_path(|(found, _)| found.unverified_pairs)
+        }
+
         /// The in-memory rewrite of each guest path it touched: the sums over
         /// the ranges of one address space, the one that left or could not
         /// write the most (then the one with the most loops), so that the
@@ -1130,6 +1251,7 @@ mod runtime {
     use tracing::warn;
 
     use super::decode::CodeScan;
+    use super::decode::code_file_ranges;
     use super::decode::elf_section_table;
     use super::decode::executable_sections;
     use super::model::ByteCache;
@@ -1350,6 +1472,7 @@ mod runtime {
         /// and the counts or why there are none (full report only).
         pub(crate) fn fill_summary(&mut self, summary: &mut RunSummary) {
             summary.exclusive_pairs = self.pairs.pairs_per_path();
+            summary.exclusive_pairs_unverified = self.pairs.unverified_pairs_per_path();
             summary.exclusive_rewrite_cache_peak = PLANS.lock().unwrap().peak() as u64;
             summary.counter_reads = self.pairs.counter_reads_per_path();
             summary.exclusive_rewrites = self
@@ -2275,7 +2398,7 @@ mod runtime {
     /// Scan the mapped range of a file of `size` bytes, in its executable
     /// ELF sections only, for what [`Found`] names.
     fn scan_file(file: &File, size: u64) -> std::io::Result<FileLoops> {
-        let ranges = code_ranges(file, size)?;
+        let (ranges, unverified) = code_ranges(file, size)?;
         // Bounded like a plan: the whole of a file's code is read, whatever
         // a process maps of it, so a huge file counts as not scanned.
         if ranges.iter().map(|(start, end)| end - start).sum::<u64>() > MAX_PLANNED_FILE {
@@ -2283,7 +2406,10 @@ mod runtime {
                 "its code is larger than the {MAX_PLANNED_FILE} bytes scanned"
             )));
         }
-        let mut loops = FileLoops::default();
+        let mut loops = FileLoops {
+            unverified,
+            ..FileLoops::default()
+        };
         for (start, end) in ranges {
             // A pair cannot span two sections.
             let mut section = CodeScan::at(start);
@@ -2295,10 +2421,12 @@ mod runtime {
         Ok(loops)
     }
 
-    /// The file ranges that hold instructions: the file's executable ELF
-    /// sections, or the whole file when it has no section headers. Scanned
-    /// whole, whatever a process maps of them.
-    fn code_ranges(file: &File, size: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    /// The file ranges that hold instructions, and of those the ones scanned
+    /// without evidence: the code of the file's executable ELF sections
+    /// ([`code_file_ranges`]), or the whole file, unverified, when it has no
+    /// section headers. Scanned whole, whatever a process maps of them.
+    #[allow(clippy::type_complexity)]
+    fn code_ranges(file: &File, size: u64) -> std::io::Result<(Vec<(u64, u64)>, Vec<(u64, u64)>)> {
         let mut header = [0u8; 64];
         let table = match file.read_exact_at(&mut header, 0) {
             Ok(()) => elf_section_table(&header),
@@ -2306,18 +2434,69 @@ mod runtime {
             Err(error) => return Err(error),
         };
         let Some((offset, count)) = table else {
-            return Ok(vec![(0, size)]);
+            return Ok((vec![(0, size)], vec![(0, size)]));
         };
         let mut table = vec![0u8; count * 64];
         file.read_exact_at(&mut table, offset)?;
-        Ok(merge_overlaps(
-            executable_sections(&table)
-                .into_iter()
-                .map(|(offset, length)| (offset, offset.saturating_add(length).min(size)))
-                .filter(|(start, end)| start < end)
-                .collect(),
-        ))
+        let shstrndx = usize::from(u16::from_le_bytes([header[0x3E], header[0x3F]]));
+        let e_type = u16::from_le_bytes([header[0x10], header[0x11]]);
+        // Each table the evidence needs, if it lies in the file and is not
+        // larger than the scan reads; one that is not read is evidence the
+        // file lacks, which leaves its sections scanned whole.
+        let mut budget = MAX_EVIDENCE_TABLES;
+        let evidence = crate::aarch64_lse::mapping::CodeEvidence::read(
+            &table,
+            shstrndx,
+            e_type,
+            |(offset, length)| {
+                let end = offset.checked_add(length)?;
+                if end > size || length > budget {
+                    return None;
+                }
+                budget -= length;
+                let mut bytes = vec![0u8; usize::try_from(length).ok()?];
+                file.read_exact_at(&mut bytes, offset).ok()?;
+                Some(bytes)
+            },
+        );
+        let clip = |ranges: Vec<(u64, u64)>| {
+            merge_overlaps(
+                ranges
+                    .into_iter()
+                    .map(|(start, end)| (start, end.min(size)))
+                    .filter(|(start, end)| start < end)
+                    .collect(),
+            )
+        };
+        let (ranges, unverified) =
+            code_file_ranges(&executable_sections(&table), &evidence, |section| {
+                // The section's words, for the reachability the rewriter
+                // also uses, within the same bound as the rest of the scan.
+                let length = usize::try_from(section.size).ok()?;
+                if section.offset.checked_add(section.size)? > size
+                    || section.size > MAX_PLANNED_FILE
+                    || !section.offset.is_multiple_of(4)
+                    || !section.address.is_multiple_of(4)
+                {
+                    return None;
+                }
+                let mut bytes = vec![0u8; length];
+                file.read_exact_at(&mut bytes, section.offset).ok()?;
+                Some(
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| u32::from_le_bytes(*word))
+                        .collect(),
+                )
+            });
+        Ok((clip(ranges), clip(unverified)))
     }
+
+    /// The most symbol, string and unwind table bytes read to tell a file's
+    /// code from its data. A large test binary's measured 13 MiB.
+    const MAX_EVIDENCE_TABLES: u64 = 256 << 20;
 
     /// Feed `counter` the words of `file` in `start..end`.
     fn read_words(
@@ -2468,6 +2647,16 @@ mod runtime {
                         .map(|(count, noun)| counted(count, noun))
                         .collect::<Vec<_>>()
                         .join(" and ");
+                        // Named only when there are any, so the line is
+                        // otherwise the one it always was.
+                        let what = if found.unverified_pairs == 0 {
+                            what
+                        } else {
+                            format!(
+                                "{what} ({} unverified: in bytes not known to be code)",
+                                found.unverified_pairs
+                            )
+                        };
                         info!(
                             "[detcore, dtid {}] {} in executable mapping {} (offset {:#x}, {:#x} \
                              bytes)",
@@ -2731,8 +2920,10 @@ mod runtime {
 mod tests {
     use super::decode::CodeScan;
     use super::decode::Exclusive;
+    use super::decode::ExecutableSection;
     use super::decode::PAIR_WINDOW;
     use super::decode::classify;
+    use super::decode::code_file_ranges;
     use super::decode::count_pairs;
     use super::decode::elf_section_table;
     use super::decode::executable_sections;
@@ -2740,6 +2931,7 @@ mod tests {
     use super::decode::scan_words;
     use super::model::ByteCache;
     use super::model::CpuPmu;
+    use super::model::FileLoops;
     use super::model::Found;
     use super::model::GuestCode;
     use super::model::LiveMapping;
@@ -2880,6 +3072,9 @@ mod tests {
         let mut entry = [0u8; 64];
         entry[4..8].copy_from_slice(&kind.to_le_bytes());
         entry[8..16].copy_from_slice(&flags.to_le_bytes());
+        // Mapped at its file offset plus 0x10000, as a shared object's text
+        // might be.
+        entry[16..24].copy_from_slice(&(offset + 0x10000).to_le_bytes());
         entry[24..32].copy_from_slice(&offset.to_le_bytes());
         entry[32..40].copy_from_slice(&size.to_le_bytes());
         entry
@@ -2918,10 +3113,138 @@ mod tests {
             section(PROGBITS, ALLOC | EXECINSTR, 0x1000, 0x20), // .plt
         ]
         .concat();
+        let at = |index, offset, size| ExecutableSection {
+            index,
+            offset,
+            size,
+            address: offset + 0x10000,
+        };
         assert_eq!(
             executable_sections(&table),
-            vec![(0x400, 0x800), (0x1000, 0x20)]
+            vec![at(2, 0x400, 0x800), at(5, 0x1000, 0x20)]
         );
+    }
+
+    /// A section the mapping symbols or the unwind table speak for is
+    /// scanned in its code only, so a constant table in `.text` whose words
+    /// form a loop is not counted; a section neither speaks for is scanned
+    /// whole, and labelled unverified.
+    #[test]
+    fn the_census_scans_the_code_the_evidence_marks() {
+        use crate::aarch64_lse::mapping::CodeEvidence;
+        use crate::aarch64_lse::mapping::MappingSymbol;
+        let text = ExecutableSection {
+            index: 2,
+            offset: 0x400,
+            size: 0x800,
+            address: 0x10400,
+        };
+        let plt = ExecutableSection {
+            index: 5,
+            offset: 0x1000,
+            size: 0x20,
+            address: 0x11000,
+        };
+        let mark = |address, code| MappingSymbol {
+            section: 2,
+            address,
+            code,
+        };
+        // .text: code, a table at 0x10600..0x10700, then code again; .plt
+        // unmarked, in a file without an unwind table.
+        let symbols = CodeEvidence {
+            symbols: vec![
+                mark(0x10400, true),
+                mark(0x10600, false),
+                mark(0x10700, true),
+            ],
+            unwind: None,
+        };
+        assert_eq!(
+            code_file_ranges(&[text, plt], &symbols, |_| None),
+            (
+                vec![(0x400, 0x600), (0x700, 0xC00), (0x1000, 0x1020)],
+                vec![(0x1000, 0x1020)]
+            )
+        );
+        // No mapping symbols, but FDEs cover two functions of .text.
+        let unwind = CodeEvidence {
+            symbols: Vec::new(),
+            unwind: Some(vec![(0x10400, 0x10600), (0x10700, 0x10800)]),
+        };
+        // What the FDEs leave of .text, and the whole of .plt, which no FDE
+        // covers, are scanned too, unverified.
+        assert_eq!(
+            code_file_ranges(&[text, plt], &unwind, |_| None),
+            (
+                vec![(0x400, 0xC00), (0x1000, 0x1020)],
+                vec![(0x600, 0x700), (0x800, 0xC00), (0x1000, 0x1020)]
+            )
+        );
+        // Given the words, the census takes what control reaches, as the
+        // rewriter does: .text's first function branches over a table
+        // (0x10500..0x105fc) inside its FDE, which joins the unverified
+        // bytes.
+        let mut words = vec![0xd503_201f_u32; 0x800 / 4]; // nops
+        words[0xfc / 4] = 0x1400_0040; // 0x104fc: b 0x105fc
+        words[0x1fc / 4] = 0xd65f_03c0; // 0x105fc: ret
+        words[0x3fc / 4] = 0xd65f_03c0; // 0x107fc: ret
+        assert_eq!(
+            code_file_ranges(&[text], &unwind, |_| Some(words.clone())),
+            (
+                vec![(0x400, 0xC00)],
+                vec![(0x500, 0x5fc), (0x600, 0x700), (0x800, 0xC00)]
+            )
+        );
+        // Nothing at all, as in a stripped file without an unwind table:
+        // whole sections, unverified.
+        let nothing = CodeEvidence::default();
+        let whole = vec![(0x400, 0xC00), (0x1000, 0x1020)];
+        assert_eq!(
+            code_file_ranges(&[text, plt], &nothing, |_| None),
+            (whole.clone(), whole)
+        );
+        // The scan over those ranges counts the code's loop and not the
+        // table's.
+        let image: Vec<u32> = [LDAXR_X0_X2, ADD_X1_X0_1, STLXR_W3_X1_X2, CBNZ_W3]
+            .into_iter()
+            .cycle()
+            .take(0x800 / 4)
+            .collect();
+        let pairs_in = |ranges: Vec<(u64, u64)>| -> u64 {
+            ranges
+                .into_iter()
+                .filter(|(start, _)| *start < 0xC00)
+                .map(|(start, end)| {
+                    let words =
+                        &image[((start - 0x400) / 4) as usize..((end - 0x400) / 4) as usize];
+                    count_pairs(words.iter().copied())
+                })
+                .sum()
+        };
+        assert_eq!(
+            pairs_in(code_file_ranges(&[text], &nothing, |_| None).0),
+            0x800 / 16
+        );
+        assert_eq!(
+            pairs_in(code_file_ranges(&[text], &symbols, |_| None).0),
+            (0x800 - 0x100) / 16
+        );
+    }
+
+    /// A pair is unverified when its load-exclusive lies in a range scanned
+    /// without evidence.
+    #[test]
+    fn unverified_pairs_are_those_in_unverified_ranges() {
+        let loops = FileLoops {
+            pair_loads: vec![0x400, 0x500, 0x1000],
+            counter_reads: Vec::new(),
+            unverified: vec![(0x1000, 0x1020)],
+        };
+        let found = loops.found_in(0, 0x2000);
+        assert_eq!((found.pairs, found.unverified_pairs), (3, 1));
+        let found = loops.found_in(0, 0x1000);
+        assert_eq!((found.pairs, found.unverified_pairs), (2, 0));
     }
 
     #[test]
@@ -3044,6 +3367,7 @@ mod tests {
             found: Found {
                 pairs,
                 counter_reads: 0,
+                unverified_pairs: 0,
             },
             rewrite: Rewrite::default(),
         }
@@ -3342,6 +3666,7 @@ mod tests {
             found: Found {
                 pairs: 0,
                 counter_reads: 1,
+                unverified_pairs: 0,
             },
             rewrite: Rewrite::default(),
         };

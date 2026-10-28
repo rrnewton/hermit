@@ -87,10 +87,11 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
-    /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
-    /// with its row. Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 28 for PR 4789, 29 for
+    /// PR 4884, 30 for PR 4728, 31 for PR 4867 and 32 for PR 4885, none of
+    /// which is on main yet. Remove an entry when its change lands, with
+    /// its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[28, 29, 30, 31, 32];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -223,6 +224,11 @@ mod tests {
         // image returns it (the release-05 pidfd pair, renumbered to 27 at
         // its rebase onto C2's 25 and 26; digest measured at this head).
         (27, "74ceb8dd663f2297", "f013e36743d8d9e6"),
+        // `Found::unverified_pairs` (#4908) and the StoreExclusive payload
+        // types (this change), appended as revision 33 on drain/4909
+        // (skipping reserved 28-32; payload unchanged; digest placeholder
+        // until measure).
+        (33, "0000000000000000", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -243,10 +249,12 @@ mod tests {
     /// The types `GlobalRequest::StoreExclusive` carries, declared in
     /// `store_exclusive.rs` inside its modules. Their fields cross the RPC in
     /// positional bincode as the enums' own do.
-    const STORE_EXCLUSIVE_PAYLOAD: [&str; 3] = [
+    const STORE_EXCLUSIVE_PAYLOAD: [&str; 5] = [
         "pub enum Report {",
         "pub struct ScannedMapping {",
         "pub struct Found {",
+        "pub struct Rewrite {",
+        "pub struct LiveMapping {",
     ];
 
     /// The lines of code, as [`definition`] gives them, of the type that
