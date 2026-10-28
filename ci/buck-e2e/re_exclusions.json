@@ -304,7 +304,7 @@
    "evidence": [
     {
      "cell": "compat/node/verify@dbt",
-     "local_run": "flip-measure-2 (test-harness run on devbig014, 2026-10-27): PASS, 16.219 CPU s, 27.415 wall s",
+     "local_run": "flip-measure-2 (test-harness run on the host named in docs/TESTING_ENVIRONMENTS.md under Named measurement hosts, 2026-10-27): PASS, 16.219 CPU s, 27.415 wall s",
      "re_error_kind": "infrastructure",
      "re_reason": "guest launch refused before execution: guest program not found (/bin/node absent on the RE worker image)",
      "re_runs": [

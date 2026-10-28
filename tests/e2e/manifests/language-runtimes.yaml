@@ -1247,7 +1247,7 @@ test:
         cpu_timeout_seconds:
           dbt: 33
         slow_reason:
-          dbt: "The full validation of 77635530182d stopped this DBT cell at the default 22 CPU s. A local single sample on devbig014 at the flip head (2026-10-27) measured 20.173 CPU s and 31.470 wall s; the configured CPU bound is ceil(1.5 x 22.0) = 33, the rule of DBT_2026_10_25_TIMEOUT_CALIBRATIONS. Wall stays at the 57 s default."
+          dbt: "The full validation of 77635530182d stopped this DBT cell at the default 22 CPU s. A local single sample on the host named in docs/TESTING_ENVIRONMENTS.md under Named measurement hosts, at the flip head (2026-10-27) measured 20.173 CPU s and 31.470 wall s; the configured CPU bound is ceil(1.5 x 22.0) = 33, the rule of DBT_2026_10_25_TIMEOUT_CALIBRATIONS. Wall stays at the 57 s default."
         ci: true
         backends_enabled:
           - ptrace
