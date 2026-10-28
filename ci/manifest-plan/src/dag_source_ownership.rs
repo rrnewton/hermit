@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use dagrun::model::ResultManifest;
 use serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -384,11 +383,9 @@ pub fn select_core(cfg: &mut dagrun::model::DagConfig) -> Result<(), String> {
         {
             return Err(format!("core command still owns an external recipe: {tag}"));
         }
-        for result in step.effective_result_manifests().iter() {
-            if let ResultManifest::ManifestCell(cell) = result {
-                if matches!(cell.backend.as_deref(), Some("dbt" | "sabre")) {
-                    return Err(format!("core source still claims external cell: {tag}"));
-                }
+        for cell in step.effective_result_manifests().iter() {
+            if matches!(cell.backend.as_deref(), Some("dbt" | "sabre")) {
+                return Err(format!("core source still claims external cell: {tag}"));
             }
         }
     }
