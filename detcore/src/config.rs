@@ -98,6 +98,8 @@ mod tests {
         // Retypes `GlobalRequest::RecordHostInput`
         // (https://github.com/rrnewton/hermit/pull/4611).
         (7, "6b6c7521a6620f94", "6a1b176897e67771"),
+        // Retypes `GlobalRequest::TraceSchedEvent` (#4741).
+        (8, "146d04bf8a68c107", "6a1b176897e67771"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
