@@ -16,8 +16,8 @@
 //! with a `set_tid` array whose entry for Hermit's PID namespace is the next
 //! ID (after 1 for a new PID namespace's first task, or after the guest's own
 //! entries), so the kernel itself hands out IDs that depend only on the base
-//! and the guest's own order of clone calls. Every call takes an ID, whether
-//! or not it creates a task, so a failed call leaves a gap. The kernel
+//! and the guest's own order of clone calls. A call Detcore takes an ID for
+//! keeps it whether or not it creates a task, so a failed one leaves a gap. The kernel
 //! then writes those IDs wherever it writes a task's ID: clone's return value
 //! and `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID` words, `getpid` and
 //! `gettid`, `/proc`, wait results and `si_pid`, PI-futex owner words and
@@ -55,7 +55,9 @@ use crate::Detcore;
 use crate::record_or_replay::RecordOrReplay;
 
 /// `struct clone_args` through `cgroup`: `CLONE_ARGS_SIZE_VER2`
-/// (include/uapi/linux/sched.h), the largest size Detcore rewrites.
+/// (include/uapi/linux/sched.h), the largest size Detcore rewrites. A
+/// longer struct with nonzero bytes past it is `E2BIG` only on kernels that
+/// know no later version, so it takes the host-ID path.
 pub(crate) const CLONE_ARGS_SIZE_VER2: usize = 88;
 /// Through `set_tid_size`, the first size that carries `set_tid`.
 const CLONE_ARGS_SIZE_VER1: usize = 80;
@@ -85,9 +87,11 @@ pub(crate) enum ChosenIdCall {
         args: [u8; CLONE_ARGS_SIZE_VER2],
         size: usize,
     },
-    /// Issue the call as the guest made it: the kernel refuses it before it
-    /// creates a task, so no ID is needed, and `clone3` could refuse it with
-    /// another error.
+    /// Issue the call as the guest made it: every kernel that can choose IDs
+    /// (5.5 and later, for `set_tid`) refuses it before it creates a task, by
+    /// the ABI (`CLONE_PIDFD` beside `CLONE_DETACHED`, a `clone3` struct
+    /// shorter than its first version), so no ID is needed, and `clone3`
+    /// could refuse it with another error.
     Unchanged,
     /// A guest `clone3` that passes `set_tid` itself, with its `struct
     /// clone_args` (the first 88 bytes, zero extended) and the size to pass:
@@ -159,7 +163,11 @@ pub(crate) fn clone3_form(
         },
         Sysno::clone => LegacyClone::of_clone(args, CloneArgOrder::NATIVE),
         Sysno::clone3 => return clone3_with_room_for_set_tid(clone3_args),
-        _ => return ChosenIdCall::Unchanged,
+        _ => {
+            return ChosenIdCall::Inexpressible(format!(
+                "{sysno} is not a clone-family call Detcore knows"
+            ));
+        }
     };
     fields.as_clone3()
 }
@@ -297,8 +305,13 @@ impl LegacyClone {
 /// is unset exactly when bytes 64 to 79 are zero: then Detcore fills it in.
 fn clone3_with_room_for_set_tid(bytes: Option<&[u8]>) -> ChosenIdCall {
     let Some(bytes) = bytes else {
-        // An unreadable struct is the kernel's EFAULT; one over a page, E2BIG.
-        return ChosenIdCall::Unchanged;
+        // Mapped, but not readable with the guest's access: the kernel may
+        // read it (`Clone3Read::Unreadable`).
+        return ChosenIdCall::Inexpressible(
+            "Detcore could not read its struct clone_args with the guest's own access, though \
+             it is mapped"
+                .to_owned(),
+        );
     };
     let size = bytes.len();
     if size < CLONE_ARGS_SIZE_VER0 {
@@ -310,8 +323,12 @@ fn clone3_with_room_for_set_tid(bytes: Option<&[u8]>) -> ChosenIdCall {
         .skip(CLONE_ARGS_SIZE_VER2)
         .any(|byte| *byte != 0)
     {
-        // copy_clone_args_from_user: E2BIG.
-        return ChosenIdCall::Unchanged;
+        // copy_clone_args_from_user refuses it with E2BIG only while the
+        // kernel knows no later struct version; a newer one may read it.
+        return ChosenIdCall::Inexpressible(format!(
+            "its struct clone_args has nonzero bytes past the {CLONE_ARGS_SIZE_VER2} Detcore \
+             knows, which a newer kernel may read"
+        ));
     }
     let mut args = [0u8; CLONE_ARGS_SIZE_VER2];
     let known = size.min(CLONE_ARGS_SIZE_VER2);
@@ -405,21 +422,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(ClonePlan::Kernel);
         };
         let (sysno, args) = call.into_parts();
-        let clone3_args = match call {
-            Syscall::Clone3(clone) => read_clone_args(&guest.memory(), clone),
+        let pid = guest.pid().as_raw();
+        let clone3_read = match call {
+            Syscall::Clone3(clone) => Some(read_clone_args(&guest.memory(), pid, clone)),
             _ => None,
         };
+        if clone3_read == Some(Clone3Read::Refused) {
+            return Ok(ClonePlan::KernelRefuses);
+        }
         // A task the tracer does not follow would run outside Detcore's
         // scheduler, so a call with CLONE_UNTRACED is issued only rewritten,
-        // without the flag; where it cannot be, the run ends.
-        let untraced = match sysno {
-            Sysno::clone => args.arg0 as u64,
-            _ => clone3_args
-                .as_deref()
-                .and_then(|bytes| bytes.get(..8))
+        // without the flag; where it cannot be, the run ends. A struct whose
+        // flags Detcore could not read at all counts as untraced.
+        let flags = match (&clone3_read, sysno) {
+            (_, Sysno::clone) => args.arg0 as u64,
+            (Some(Clone3Read::Bytes(bytes)), _) => bytes
+                .get(..8)
                 .map_or(0, |flags| u64::from_ne_bytes(flags.try_into().unwrap())),
-        } & libc::CLONE_UNTRACED as u64
-            != 0;
+            (Some(Clone3Read::Unreadable { flags }), _) => {
+                flags.unwrap_or(libc::CLONE_UNTRACED as u64)
+            }
+            _ => 0,
+        };
+        let untraced = flags & libc::CLONE_UNTRACED as u64 != 0;
+        let clone3_args = match clone3_read {
+            Some(Clone3Read::Bytes(bytes)) => Some(bytes),
+            _ => None,
+        };
         let form = clone3_form(sysno, &args, clone3_args.as_deref());
         // A restarted call's ID is for that call only: taken here whatever
         // the plan, so that no other call inherits it.
@@ -460,10 +489,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 (args, size, inner, false)
             }
             ChosenIdCall::GuestChosen { args, size } => {
-                // An array the kernel cannot read, or whose address and size
-                // disagree, goes to the kernel, whose error is the guest's.
-                let Some(tids) = read_guest_set_tid(&guest.memory(), &args) else {
-                    return Ok(ClonePlan::GuestChosen);
+                // An array every kernel refuses goes to the kernel, whose
+                // EINVAL or EFAULT is the guest's. One Detcore cannot read
+                // though it is mapped could still be read by the kernel, so
+                // it may create a task whose ID in Hermit's namespace the
+                // kernel picks.
+                let tids = match read_guest_set_tid(&guest.memory(), pid, &args) {
+                    Ok(tids) => tids,
+                    Err(SetTidUnread::Refused) => return Ok(ClonePlan::GuestChosen),
+                    Err(SetTidUnread::Unreadable) => {
+                        let why = "Detcore could not read its set_tid array with the guest's own \
+                                   access"
+                            .to_owned();
+                        return self
+                            .host_id_planned(guest, sysno, why, refuse_host_ids, untraced)
+                            .await;
+                    }
                 };
                 let flags = u64::from_ne_bytes(args[..8].try_into().unwrap());
                 // The array runs from the new task's PID namespace outwards.
@@ -743,8 +784,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             ClonePlan::KernelRefuses => {
                 let result = guest.inject(call).await;
                 if let Ok(child) = result {
-                    self.gave_host_id(guest, child, "Detcore expected the kernel to refuse it")
-                        .await;
+                    self.gave_host_id(
+                        guest,
+                        child,
+                        "unexpectedly, as Detcore expected every kernel to refuse it",
+                    )
+                    .await;
                 }
                 result
             }
@@ -1027,14 +1072,43 @@ const MAX_SET_TID: usize = 32;
 /// kernel.
 fn read_guest_set_tid<M: MemoryAccess>(
     memory: &M,
+    pid: i32,
     args: &[u8; CLONE_ARGS_SIZE_VER2],
-) -> Option<Vec<libc::pid_t>> {
-    let (address, size) = guest_set_tid_shape(args)?;
-    let mut tids = vec![0 as libc::pid_t; size];
-    memory
-        .read_values(Addr::<libc::pid_t>::from_raw(address as usize)?, &mut tids)
-        .ok()?;
-    Some(tids)
+) -> Result<Vec<libc::pid_t>, SetTidUnread> {
+    let (address, size) = guest_set_tid_shape(args).ok_or(SetTidUnread::Refused)?;
+    let mut bytes = vec![0u8; size * std::mem::size_of::<libc::pid_t>()];
+    // Exactly the array, with the guest's own access, as copy_from_user
+    // reads it: a debugger read could reach past it into an unmapped page.
+    let read = memory.read_exact_with_user_access(
+        Addr::<u8>::from_raw(address as usize).ok_or(SetTidUnread::Refused)?,
+        &mut bytes,
+    );
+    if read.is_err() {
+        return Err(if range_is_unmapped(pid, address as usize, bytes.len()) {
+            SetTidUnread::Refused
+        } else {
+            SetTidUnread::Unreadable
+        });
+    }
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| libc::pid_t::from_ne_bytes(*chunk))
+        .collect())
+}
+
+/// Why a guest `clone3`'s own `set_tid` array was not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetTidUnread {
+    /// Every kernel refuses the call before creating a task: the array's
+    /// address and size disagree, or it is longer than `MAX_PID_NS_LEVEL`
+    /// (`EINVAL`), or it is not all in the guest's mappings (`EFAULT`).
+    Refused,
+    /// It lies in the guest's mappings, but Detcore could not read it with
+    /// the guest's own access, while the kernel may (a page mapped writable,
+    /// not readable), so nothing is proved.
+    Unreadable,
 }
 
 /// The address and length of a guest `clone3`'s own `set_tid` array, unless
@@ -1103,16 +1177,94 @@ fn is_restart(errno: Errno) -> bool {
 
 /// A `clone3` call's `struct clone_args`, all the bytes it passes, if they
 /// can be read and number at most a page, the kernel's limit (E2BIG).
-fn read_clone_args<M: MemoryAccess>(memory: &M, clone: &syscalls::Clone3) -> Option<Vec<u8>> {
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+fn read_clone_args<M: MemoryAccess>(memory: &M, pid: i32, clone: &syscalls::Clone3) -> Clone3Read {
+    let Ok(page) = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) else {
+        return Clone3Read::Unreadable { flags: None };
+    };
+    // copy_clone_args_from_user: E2BIG over a page, before reading.
     if clone.size() > page {
-        return None;
+        return Clone3Read::Refused;
     }
+    let Some(address) = clone
+        .args()
+        .and_then(|args| Addr::<u8>::from_raw(args.as_raw()))
+    else {
+        return Clone3Read::Refused;
+    };
     let mut bytes = vec![0u8; clone.size()];
-    memory
-        .read_exact(Addr::<u8>::from_raw(clone.args()?.as_raw())?, &mut bytes)
-        .ok()?;
-    Some(bytes)
+    // Exactly the struct, with the guest's own access, as copy_from_user
+    // reads it.
+    if memory
+        .read_exact_with_user_access(address, &mut bytes)
+        .is_ok()
+    {
+        return Clone3Read::Bytes(bytes);
+    }
+    if range_is_unmapped(pid, address.as_raw(), bytes.len()) {
+        return Clone3Read::Refused;
+    }
+    // Mapped, but not readable with the guest's access (writable only):
+    // the kernel may read it. Its flags, read past the protection, still
+    // say whether the call is untraced.
+    let mut flags = [0u8; 8];
+    let flags = memory
+        .read_exact(address, &mut flags)
+        .ok()
+        .map(|()| u64::from_ne_bytes(flags));
+    Clone3Read::Unreadable { flags }
+}
+
+/// A guest `clone3`'s `struct clone_args`, as Detcore read it to plan the
+/// call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Clone3Read {
+    /// Its bytes, read as `copy_from_user` reads them.
+    Bytes(Vec<u8>),
+    /// Every kernel refuses the call before creating a task: the struct is
+    /// larger than a page (`E2BIG`), or not all in the guest's mappings
+    /// (`EFAULT`).
+    Refused,
+    /// It lies in the guest's mappings, but Detcore could not read it with
+    /// the guest's access, while the kernel may (a page mapped writable, not
+    /// readable); its flags if Detcore could read them otherwise.
+    Unreadable { flags: Option<u64> },
+}
+
+/// Whether some byte of the guest's `address..address + len` lies in none of
+/// its mappings (`/proc/<pid>/maps`), or beyond user memory, so that the
+/// kernel's `copy_from_user` of it fails with `EFAULT`. False when the maps
+/// cannot be read: then nothing is proved.
+fn range_is_unmapped(pid: i32, address: usize, len: usize) -> bool {
+    let Some(last) = address.checked_add(len.max(1) - 1) else {
+        return true;
+    };
+    if last > super::threads::user_ptr_max() {
+        return true;
+    }
+    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+        return false;
+    };
+    let ranges: Vec<(usize, usize)> = maps
+        .lines()
+        .filter_map(|line| {
+            let (start, end) = line.split_whitespace().next()?.split_once('-')?;
+            Some((
+                usize::from_str_radix(start, 16).ok()?,
+                usize::from_str_radix(end, 16).ok()?,
+            ))
+        })
+        .collect();
+    let mut at = address;
+    while at <= last {
+        match ranges
+            .iter()
+            .find(|(start, end)| (*start..*end).contains(&at))
+        {
+            Some(&(_, end)) => at = end,
+            None => return true,
+        }
+    }
+    false
 }
 
 /// End a run that needs every ID chosen (`GuestIds::Chosen::refuse_host_ids`:
@@ -1396,16 +1548,23 @@ mod tests {
             clone3_form(Sysno::clone3, &none, Some(&short)),
             ChosenIdCall::GuestChosen { .. }
         ));
-        for refused in [&[0u8; 32][..], &[[0u8; 96], [1u8; 96]].concat()[..]] {
-            assert_eq!(
-                clone3_form(Sysno::clone3, &none, Some(refused)),
-                ChosenIdCall::Unchanged
-            );
-        }
+        // Shorter than the first version: EINVAL from every kernel.
         assert_eq!(
-            clone3_form(Sysno::clone3, &none, None),
+            clone3_form(Sysno::clone3, &none, Some(&[0u8; 32])),
             ChosenIdCall::Unchanged
         );
+        // A nonzero tail a newer kernel may read, or a struct Detcore could
+        // not read, is not proved refused: it takes the host-ID path.
+        for unproven in [Some(&[[0u8; 96], [1u8; 96]].concat()[..]), None] {
+            assert!(matches!(
+                clone3_form(Sysno::clone3, &none, unproven),
+                ChosenIdCall::Inexpressible(_)
+            ));
+        }
+        assert!(matches!(
+            clone3_form(Sysno::getpid, &none, None),
+            ChosenIdCall::Inexpressible(_)
+        ));
         let mut long = [0u8; 96];
         long[..8].copy_from_slice(&(libc::CLONE_FILES as u64).to_ne_bytes());
         let (long_fields, size) = fields(&clone3_form(Sysno::clone3, &none, Some(&long)));
