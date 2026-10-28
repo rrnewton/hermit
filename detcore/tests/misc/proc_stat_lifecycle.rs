@@ -124,6 +124,43 @@ fn tail_field(tail: &[u8], number: usize) -> String {
         .to_owned()
 }
 
+/// Require that `tail`, read from byte `offset` (inside the pid) of a new
+/// rendering of the `stat` record `whole` was an earlier rendering of, is
+/// `whole` from `offset` on, except for the CPU time `show` reads afresh:
+/// utime and stime (fields 14 and 15, `do_task_stat`'s
+/// `thread_group_cputime_adjusted`, fs/proc/array.c:566 and 598-599 at
+/// v7.1.3) may have grown since `whole`, and never shrink (`cputime_adjust`
+/// keeps both monotonic, kernel/sched/cputime.c:599-613). Every other byte
+/// matches: the pid's remainder and the name exactly, the other fields one
+/// by one.
+fn assert_rendered_again_from(whole: &[u8], offset: usize, tail: &[u8]) {
+    let text = String::from_utf8_lossy(whole).into_owned();
+    let pid_end = text.find(' ').expect("no end of the pid");
+    assert!(offset < pid_end, "offset {offset} is not inside the pid");
+    let name_end = text.rfind(") ").expect("no end of the name") + 2;
+    let prefix = name_end - offset;
+    assert!(tail.len() > prefix, "short tail: {tail:?}");
+    assert_eq!(tail[..prefix], whole[offset..name_end], "{tail:?}");
+    let tail_text = String::from_utf8_lossy(&tail[prefix..]).into_owned();
+    assert!(tail_text.ends_with('\n'), "not a whole line: {tail_text:?}");
+    let later: Vec<&str> = tail_text.split_whitespace().collect();
+    let earlier = &fields(whole)[2..];
+    assert_eq!(later.len(), earlier.len(), "{tail_text:?}");
+    for (index, (later, earlier)) in later.iter().zip(earlier).enumerate() {
+        let number = index + 3;
+        if number == 14 || number == 15 {
+            let later: u64 = later.parse().expect("CPU time");
+            let earlier: u64 = earlier.parse().expect("CPU time");
+            assert!(
+                later >= earlier,
+                "field {number} went back: {earlier} -> {later}"
+            );
+        } else {
+            assert_eq!(later, earlier, "field {number}: {tail_text:?}");
+        }
+    }
+}
+
 /// Run `test` natively in a forked child of this process, which has one
 /// thread (this test process may have many) and exits 0 when `test` returns.
 fn natively(test: impl FnOnce()) {
@@ -361,10 +398,11 @@ fn a_started_stat_read_keeps_its_record_and_pread_or_seek_renders_again() {
         seek(fd, 0);
         let rewound = read_rest(fd);
         assert_eq!(field(&rewound, 20), "2", "{rewound:?}");
-        // A seek elsewhere renders it again, and reads on from there.
+        // A seek elsewhere renders it again, and reads on from there: the
+        // same record, but for the CPU time the new rendering takes again.
         seek(fd, 3);
         let tail = read_rest(fd);
-        assert_eq!(tail, rewound[3..].to_vec());
+        assert_rendered_again_from(&rewound, 3, &tail);
         keep.send(()).unwrap();
         thread.join().unwrap();
         // SAFETY: a descriptor this guest opened.
