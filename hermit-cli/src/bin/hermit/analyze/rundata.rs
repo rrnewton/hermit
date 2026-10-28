@@ -1936,7 +1936,7 @@ mod tests {
         options.tmp_dir = Some(PathBuf::from("/tmp/hermit_analyzeXYZ"));
         assert_eq!(binds(&options), ["/tmp/hermit_analyzeXYZ"]);
 
-        options.tmp_dir = Some(PathBuf::from("/home/someone/analyze-ws/hermit_analyzeXYZ"));
+        options.tmp_dir = Some(PathBuf::from("someone/analyze-ws/hermit_analyzeXYZ"));
         assert!(binds(&options).is_empty(), "visible as it is");
 
         // Where the workspace really is decides. A relative path to a
