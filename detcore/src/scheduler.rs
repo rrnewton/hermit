@@ -17675,7 +17675,7 @@ impl Scheduler {
     ///   (`Resources::polls_guest_state_only`), whatever its backoff, whose
     ///   request retries after an attempt that moved nothing
     ///   (`waits_after_a_failed_attempt`), made no earlier than the latest
-    ///   progress: its latest attempt (`last_attempt_at`) is at or after every
+    ///   progress: its latest attempt (`last_commit_at`) is at or after every
     ///   turn known to be progress (`last_progress`) and every other poller's
     ///   grant whose thread's request does not repeat that call without
     ///   progress (`retries_its_call_without_progress`);
@@ -17849,7 +17849,7 @@ impl Scheduler {
     /// actions (`Resources::polls_guest_state_only`), whatever its backoff,
     /// and whose request retries after an attempt that moved nothing
     /// (`waits_after_a_failed_attempt`), made no earlier than `progress`
-    /// (`latest_progress`): its latest attempt (`last_attempt_at`) is at or
+    /// (`latest_progress`): its latest attempt (`last_commit_at`) is at or
     /// after it.
     fn is_idle_guest_poller(&self, tid: DetTid, progress: u64) -> bool {
         self.run_queue.contains_tid(tid)
@@ -17865,9 +17865,9 @@ impl Scheduler {
             && Self::waits_after_a_failed_attempt(rs)
     }
 
-    /// Whether `tid`'s latest attempt (`last_attempt_at`) is at or after `progress`.
+    /// Whether `tid`'s latest attempt (`last_commit_at`) is at or after `progress`.
     fn attempted_since(&self, tid: DetTid, progress: u64) -> bool {
-        self.last_attempt_at
+        self.last_commit_at
             .get(&tid)
             .is_some_and(|&commit| commit >= progress)
     }
@@ -21024,7 +21024,7 @@ mod test {
         resources.polls_guest_state_only = guest_state_only;
         sched.next_turns[&tid].req.put(Ok(resources));
         sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
-        sched.last_attempt_at.insert(tid, sched.progress_epoch);
+        sched.last_commit_at.insert(tid, sched.progress_epoch);
         if guest_state_only {
             sched
                 .guest_state_polled_at
@@ -21447,7 +21447,7 @@ mod test {
         resources.previous_attempt_made_progress = true;
         sched.next_turns[&writer].req.put(Ok(resources));
         sched.run_queue.push_poller(writer, DEFAULT_PRIORITY, 2);
-        sched.last_attempt_at.insert(writer, sched.progress_epoch);
+        sched.last_commit_at.insert(writer, sched.progress_epoch);
         sched
             .guest_state_polled_at
             .insert(writer, sched.progress_epoch);
@@ -21754,7 +21754,7 @@ mod test {
                 _ => {
                     fifo_open_poll(&mut sched, poller);
                     sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 1);
-                    sched.last_attempt_at.insert(poller, sched.progress_epoch);
+                    sched.last_commit_at.insert(poller, sched.progress_epoch);
                 }
             }
             let writer = DetTid::from_raw(5);
