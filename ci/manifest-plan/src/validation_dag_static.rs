@@ -3089,7 +3089,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::parked_tests::{the_controlled_loop_refresh_registers_a_sleep_filed_during_maintenance,
     // the_controlled_loop_registers_a_sleep_its_drain_admits}
     // (https://github.com/rrnewton/hermit/pull/4682): 2826.
-    ("test.detcore_unit", 2826),
+    // Plus the send-time and any-backend deadline units
+    // scheduler::test::{a_timed_signal_due_before_a_parked_nanosleep_deadline_ends_it_whenever_it_pops,
+    // a_signal_after_a_parked_nanosleep_deadline_leaves_it_to_complete_on_any_backend} and
+    // scheduler::posix_timer_coalesce_tests::a_timer_send_is_made_at_its_due_time
+    // (https://github.com/rrnewton/hermit/pull/4682): 2829.
+    ("test.detcore_unit", 2829),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5408,7 +5413,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three queued-sleep registration units: 2820, listed.
     // And the same two registration-rule units: 2822.
     // And the same four sleep-registration units: 2826.
-    ("test.detcore_unit_on_host", 2826),
+    // And the same three send-time and any-backend deadline units: 2829.
+    ("test.detcore_unit_on_host", 2829),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
