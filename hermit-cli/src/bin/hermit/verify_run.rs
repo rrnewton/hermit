@@ -462,6 +462,8 @@ pub(crate) fn compare(
                 dbt: None,
                 backend,
                 passthru_opt: record1.passthru_opt,
+                // A `--verify-run` record does not say.
+                rewrite_exclusives: None,
             },
             CompletedVerificationRun {
                 output: &out1,

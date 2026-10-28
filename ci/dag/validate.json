@@ -30394,7 +30394,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1963",
+        "NEXTEST_EXPECTED_EXECUTED": "1966",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit-detcore-tests\",\"--exclude\",\"hermit-run\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -30443,7 +30443,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1332",
+        "NEXTEST_EXPECTED_EXECUTED": "1336",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -58799,7 +58799,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1949",
+        "NEXTEST_EXPECTED_EXECUTED": "1952",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit-detcore-tests\",\"--exclude\",\"hermit-run\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -58845,7 +58845,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1326",
+        "NEXTEST_EXPECTED_EXECUTED": "1330",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
