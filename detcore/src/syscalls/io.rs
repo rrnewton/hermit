@@ -1005,9 +1005,18 @@ fn kernel_poll_result(
 /// poll's `restart_syscall`, which finds the record, or the guest's own poll,
 /// which never ran and starts its timeout again (Linux's restart would keep
 /// the first end time; under `--no-sequentialize-threads` the end moves by
-/// the delivery's latency). A handler turns either code into `EINTR`. A signal that ends a poll that ran is not held: it reaches
-/// the guest at an ordinary delivery stop, which the backend reports. Any
-/// other result passes through.
+/// the delivery's latency). A handler turns either code into `EINTR`. A
+/// signal that ends a poll that ran is not held: it reaches the guest at an
+/// ordinary delivery stop, which the backend reports. Any other result passes
+/// through.
+///
+/// Unlike `held_signal_restart_errno`, this does not know which signal the
+/// backend holds, so a held `SIGSTOP` also gets `ERESTARTNOHAND`. That is
+/// harmless: after the stop the kernel runs the guest's call again, as for
+/// any other held signal above. A resumed poll's `restart_syscall` still finds
+/// its record; a poll that never ran starts its timeout again, which loses
+/// nothing under record and replay and, under `--no-sequentialize-threads`,
+/// drops the end time Detcore read for it as described above.
 #[cfg(target_arch = "x86_64")]
 fn kernel_poll_restart_code(kept: Result<i64, Error>, before_run: bool) -> Result<i64, Error> {
     match kept {

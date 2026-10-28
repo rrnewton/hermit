@@ -837,7 +837,16 @@ impl RecordVersion {
 // --chaos --seed=N`), and replay follows it. An older reader would replay a
 // chaos recording under the default schedule and fall out of step, so it is
 // refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
+// 0x187 -> 0x18c (provisional: 0x188-0x18b are reserved for #4592, #4593,
+// #4603 and #4623; the lander re-checks HIGHEST_SHIPPED + 1 at land): a poll
+// Detcore runs in the kernel that a signal stopped before it ran, which the
+// recorder stores as the backend's ERESTARTSYS, now returns ERESTARTNOHAND
+// (`kernel_poll_restart_code`); a handler turns it into EINTR, as it does
+// Linux's ERESTART_RESTARTBLOCK. An older build passed the recorded
+// ERESTARTSYS on, and an SA_RESTART handler ran the poll again; replaying such
+// a recording here ends that poll with EINTR and falls out of step, so it is
+// refused.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -862,7 +871,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x187;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -2303,6 +2312,14 @@ mod tests {
     #[test]
     fn record_version_rejects_path_classified_random_device_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x184)));
+    }
+
+    /// A 0x187 recording, main's version before this change, passed a kernel
+    /// poll's ERESTARTSYS on, which an SA_RESTART handler ran again; this
+    /// replayer ends that poll with EINTR, so the version gate must refuse it.
+    #[test]
+    fn record_version_rejects_restarted_kernel_poll_recordings() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
     }
 
     #[test]
