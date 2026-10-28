@@ -5211,13 +5211,7 @@ impl GlobalState {
                 {
                     return (SchedulerRpcResult::ThreadExited, None);
                 }
-                for tid in sched.thread_tree.my_thread_group(&dettid) {
-                    // We don't need to do anything extra for our own thread. That can use the
-                    // same mechanics as a normal exit:
-                    if tid != dettid {
-                        sched.logically_kill_thread(&tid, &process, mm);
-                    }
-                }
+                sched.logically_kill_exit_group_siblings(dettid, process, mm);
             }
         }
 
@@ -19011,6 +19005,85 @@ mod tests {
 
         let (response, ()) = tokio::join!(request, kill_after_request);
         assert_eq!(response, (SchedulerRpcResult::ThreadExited, None));
+    }
+
+    /// An `exit_group`'s granted response (`finish_resource_response`) takes
+    /// the turns of the caller's own process's other threads, as Linux's
+    /// `zap_other_threads` does: not those of another process's live thread
+    /// whose ID the thread tree still lists under the caller's process, and,
+    /// for a caller whose ID once led a reaped process, those of the process
+    /// it is a thread of now.
+    #[tokio::test]
+    async fn an_exit_group_grant_response_takes_only_the_callers_own_threads() {
+        let tid = DetTid::from_raw;
+        let exit_group = |caller: DetTid, process: DetPid| {
+            let mut rs = Resources::new(caller);
+            rs.insert(
+                ResourceID::Exit {
+                    group: true,
+                    process,
+                    mm: MmId::initial(process),
+                },
+                Permission::RW,
+            );
+            rs
+        };
+        let granted = || SchedResponse::Go(Some(SchedValue::Value(1)));
+
+        // 38's thread 39 exited, and Linux gave 39 to a thread of process 50.
+        let state = GlobalState::initialize(&Config::default(), false);
+        let (parent, process, reused, other) = (tid(37), tid(38), tid(39), tid(50));
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(parent, parent, true);
+            sched.thread_tree.add_child(parent, process, true);
+            sched.thread_tree.add_child(process, reused, false);
+            sched.thread_tree.add_child(parent, other, true);
+            sched.thread_tree.add_child(other, reused, false);
+        }
+        for thread in [parent, process, reused, other] {
+            install_test_registration(&state, thread, Ivar::new());
+        }
+        let (result, _) = state
+            .finish_resource_response(
+                reverie::Tid::from_raw(process.as_raw()),
+                process,
+                exit_group(process, process),
+                None,
+                granted(),
+            )
+            .await;
+        assert!(matches!(result, SchedulerRpcResult::Continue(_)));
+        assert!(state.sched.lock().unwrap().next_turns.contains_key(&reused));
+
+        // Process 38 was reaped and Linux gave 38 to a thread of process 50,
+        // beside 50's thread 51.
+        let state = GlobalState::initialize(&Config::default(), false);
+        let (parent, caller, other, sibling) = (tid(37), tid(38), tid(50), tid(51));
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(parent, parent, true);
+            sched.thread_tree.add_child(parent, caller, true);
+            sched.thread_tree.add_child(parent, other, true);
+            sched.thread_tree.add_child(other, caller, false);
+            sched.thread_tree.add_child(other, sibling, false);
+        }
+        for thread in [parent, caller, other, sibling] {
+            install_test_registration(&state, thread, Ivar::new());
+        }
+        let (result, _) = state
+            .finish_resource_response(
+                reverie::Tid::from_raw(caller.as_raw()),
+                other,
+                exit_group(caller, other),
+                None,
+                granted(),
+            )
+            .await;
+        assert!(matches!(result, SchedulerRpcResult::Continue(_)));
+        let sched = state.sched.lock().unwrap();
+        assert!(!sched.next_turns.contains_key(&sibling));
+        assert!(sched.next_turns.contains_key(&caller));
     }
 
     #[tokio::test]

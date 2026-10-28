@@ -3064,7 +3064,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit", 2788),
+    // And twenty-eight reused-thread-ID units for the exit and signal paths
+    // that still walked a process's group from the thread tree (the
+    // exit_group grant, its granted response and turn hold, targeted chaos
+    // and its draw order, both process-signal-control exit paths, exec,
+    // native exec preparation, leader retirement, signal takers, timer
+    // copies, parent death, reapers, /proc task listing and wait state, a
+    // stuck child, a SIGKILL victim's thread, the in-guest SIGALRM guards, a
+    // leader without a leader entry, duplicate and cyclic tree edges, a
+    // reused process ID's new incarnation with and without an old thread
+    // still registered, an exit_group's SIGALRM cleanup, the historical
+    // other-thread flag's lifecycle, appended threads and their order, and
+    // the walk's order without reuse): 2816, listed.
+    ("test.detcore_unit", 2816),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5374,7 +5386,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three working-directory units: 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit_on_host", 2788),
+    // And the same twenty-eight reused-thread-ID units: 2816, listed.
+    ("test.detcore_unit_on_host", 2816),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
