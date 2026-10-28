@@ -249,6 +249,15 @@ pub struct Config {
     #[serde(default)]
     pub rewrite_exclusives_in_memory: bool,
 
+    /// aarch64: count the store-exclusives the guest executes and fails, as
+    /// a run that records or replays preemptions does. Set by the CLI for
+    /// each run of `--verify` and `--verify-run`, so that a divergence a
+    /// retried load/store-exclusive loop explains can be named; never read
+    /// from a recording.
+    #[clap(skip)]
+    #[serde(default)]
+    pub count_store_exclusives: bool,
+
     /// The host facts a v3 guest's leaf 0xD and xstate answers come from, set
     /// by the CLI after the host qualifies; `None` under v2. Neither profile
     /// field enters the legacy form the DBT runtime reads (DBT refuses v3).
@@ -3612,7 +3621,10 @@ mod legacy_backend_json {
     /// rewrite of aarch64 exclusive loops is done by the ptrace backend's
     /// global state, and no backend that reads the legacy form does it, so it
     /// is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 46] = [
+    /// `count_store_exclusives` came after it as well: the run's global state
+    /// counts store-exclusives on aarch64 ptrace runs, not the runtime, so it
+    /// is never written and reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 47] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3659,6 +3671,7 @@ mod legacy_backend_json {
         "access_trace_max_bytes",
         "replay_continue_fairly",
         "rewrite_exclusives_in_memory",
+        "count_store_exclusives",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3806,7 +3819,8 @@ mod legacy_backend_json {
                     | "replay_edited_preemptions"
                     | "eager_lone_preemptions"
                     | "replay_continue_fairly"
-                    | "rewrite_exclusives_in_memory",
+                    | "rewrite_exclusives_in_memory"
+                    | "count_store_exclusives",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
                 Some("in_guest_reserved_signals" | "access_trace_from") => {
@@ -4158,7 +4172,8 @@ mod legacy_backend_json {
                 | "access_trace_from"
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
-                | "rewrite_exclusives_in_memory" => Ok(()),
+                | "rewrite_exclusives_in_memory"
+                | "count_store_exclusives" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -5065,7 +5080,8 @@ mod tests {
                 | "access_trace_from"
                 | "access_trace_max_records"
                 | "access_trace_max_bytes"
-                | "rewrite_exclusives_in_memory" => {}
+                | "rewrite_exclusives_in_memory"
+                | "count_store_exclusives" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -5101,11 +5117,11 @@ mod tests {
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes`, `replay_continue_fairly`,
-        // `rewrite_exclusives_in_memory` and
+        // `rewrite_exclusives_in_memory`, `count_store_exclusives` and
         // `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-five fewer, so thirty-one keys fewer than fields.
+        // forty-six fewer, so thirty-two keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 31);
+        assert_eq!(fields.len(), keys.len() + 32);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5658,6 +5674,39 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .rewrite_exclusives_in_memory
+        );
+    }
+
+    /// `count_store_exclusives` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads back as false
+    /// from both the object and the array form.
+    #[test]
+    fn count_store_exclusives_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            count_store_exclusives: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("count_store_exclusives"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .count_store_exclusives
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .count_store_exclusives
         );
     }
 

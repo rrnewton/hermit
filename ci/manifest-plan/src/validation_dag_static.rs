@@ -1226,7 +1226,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's config::tests::
     // rewrite_exclusives_in_memory_never_enters_the_legacy_form: 1935.
     // Less #4740's tests, which main counts since train 10: 1934.
-    ("test.regular_crates", 1934),
+    // And detcore-model's summary::tests::
+    // the_loops_left_are_the_pairs_less_what_the_in_memory_rewrite_made_atomic
+    // and config::tests::count_store_exclusives_never_enters_the_legacy_form,
+    // and hermit-manifest-plan's copy of canonical_verdict::tests::
+    // store_exclusive_retries_are_optional_and_strictly_typed (a verify
+    // divergence names its store-exclusive retries): 1937.
+    ("test.regular_crates", 1937),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1920,7 +1926,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-derived with the node's own selection at the head of the aarch64
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 1293, listed.
-    ("test.hermit_unit", 1293),
+    // And canonical_verdict::tests::store_exclusive_retries_are_optional_and_
+    // strictly_typed plus verify::tests' three store-exclusive cause units (a
+    // verify divergence names its store-exclusive retries): 1297.
+    ("test.hermit_unit", 1297),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5101,8 +5110,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.cli_on_host", 666),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
-    // Kept equal to the second test.regular_crates_on_host entry below: 1920.
-    ("test.regular_crates_on_host", 1920),
+    // Kept equal to the second test.regular_crates_on_host entry below: 1923.
+    ("test.regular_crates_on_host", 1923),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6015,7 +6024,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 1286, listed.
     // And the same unit tests as test.hermit_unit: 1287.
-    ("test.hermit_unit_on_host", 1287),
+    // And the same four store-exclusive cause units: 1291.
+    ("test.hermit_unit_on_host", 1291),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6248,7 +6258,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // moved from hermit-cli into Detcore and grew there: 1920, listed.
     // And the same legacy-form unit: 1921.
     // Less #4740's tests, which main counts since train 10: 1920.
-    ("test.regular_crates_on_host", 1920),
+    // And the same three store-exclusive cause units: 1923.
+    ("test.regular_crates_on_host", 1923),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

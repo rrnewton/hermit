@@ -2750,6 +2750,7 @@ mod tests {
             },
             dbt_counted_branches: None,
             runtime: None,
+            store_exclusive_retries: None,
             first_divergent_scheduler_turn: None,
             first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: None,
