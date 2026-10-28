@@ -3763,7 +3763,7 @@ fn non_elf_entrypoints_skip_e9patch_preprocessing() {
         mount_link.join("target").display()
     );
     let tmp = format!("--tmp={}", directory.path().display());
-    let mut ro = run_opts_for(&[
+    let ro = run_opts_for(&[
         "hermit",
         "--backend",
         "e9patch",
@@ -5041,9 +5041,9 @@ fn pipe_wake_latency_parses_round_trips_and_is_refused_where_inert() {
 /// `--cap-preemption-charge` parses, is rendered into the reproduce command
 /// and round-trips. It is refused where no turn ends an expired timeslice:
 /// without a timeslice (given or downgraded for a host without a PMU timer),
-/// without Detcore's sequentializing scheduler, and with the DBT backend,
-/// whose runtime reads a configuration form that cannot carry it. A logical
-/// `--target-timeslice` without the PMU maximum still ends slices.
+/// without Detcore's sequentializing scheduler. Executable-selected DBT is
+/// refused by application admission while this option remains unqualified.
+/// A logical `--target-timeslice` without the PMU maximum still ends slices.
 #[test]
 fn cap_preemption_charge_parses_round_trips_and_is_refused_where_inert() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--cap-preemption-charge", "fakeprog"]);
@@ -5085,7 +5085,10 @@ fn cap_preemption_charge_parses_round_trips_and_is_refused_where_inert() {
         RunOpts::parse_from(["fakehermit", "--cap-preemption-charge", "fakeprog"]);
     application.select_application_backend("dynamorio").unwrap();
     let error = application
-        .refuse_unqualified_application_options()
+        .refuse_unqualified_application_options(
+            <super::core_adapter::CoreApplicationAdapter as
+                super::backend_hook::BackendAdapter>::NONDEFAULT_CPU_PROFILE_REFUSAL,
+        )
         .unwrap_err();
     assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
     assert!(
@@ -5143,13 +5146,36 @@ fn cap_preemption_charge_parses_round_trips_and_is_refused_where_inert() {
                 "--cap-preemption-charge",
                 "fakeprog",
             ],
-            "the dbt backend cannot apply --cap-preemption-charge",
+            "--cap-preemption-charge is not qualified for executable-selected backend `dbt`",
         ),
     ] {
-        let error = run_opts_for(&argv)
-            .validate_args_with_perf_support(true)
-            .err()
-            .unwrap_or_else(|| panic!("{argv:?} was accepted"));
+        let mut opts = run_opts_for(&argv);
+        let error = if argv.contains(&"--backend=dbt") {
+            assert_eq!(opts.application_backend, Some("dbt"));
+            assert_eq!(
+                opts.adapter_capabilities,
+                Some(reverie::BackendCapabilities::DBT)
+            );
+            let error = opts
+                .refuse_unqualified_application_options(
+                    <super::core_adapter::CoreApplicationAdapter as
+                        super::backend_hook::BackendAdapter>::NONDEFAULT_CPU_PROFILE_REFUSAL,
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} was accepted"));
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            assert!(
+                error.to_string().contains("--cap-preemption-charge"),
+                "{error:#}"
+            );
+            assert!(error.to_string().contains("`dbt`"), "{error:#}");
+            assert_eq!(error.to_string(), expected, "{argv:?}: {error}");
+            error
+        } else {
+            opts.validate_args_with_perf_support(true)
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} was accepted"))
+        };
         assert!(error.to_string().contains(expected), "{argv:?}: {error}");
     }
 }
@@ -13809,8 +13835,8 @@ mod tests {
             options.select_application_backend("saved-control").unwrap();
             let physical =
                 PreparedPhysical::new(&options, hermit::backend_capabilities(Backend::Ptrace));
-            assert!(!physical.config.record_host_inputs);
-            assert!(physical.config.host_input_log.is_none());
+            assert!(!physical.config().record_host_inputs);
+            assert!(physical.config().host_input_log.is_none());
             let summary = b"{\"saved_owner_control\":true}\n";
             let host_inputs = b"{\"records\":0}\n";
             let finished = std::cell::Cell::new(false);
@@ -13842,7 +13868,7 @@ mod tests {
                     let actual = capture.config();
                     assert!(actual.record_host_inputs);
                     assert_eq!(actual.host_input_log.as_ref(), Some(host_inputs_path));
-                    assert_eq!(actual.backend, physical.config.backend);
+                    assert_eq!(actual.backend, physical.config().backend);
                     let line = if transport == VerificationLogTransport::InGuestSocket {
                         format!("{NORMALIZED_FORWARDED_DETLOG_TIMESTAMP} INFO detcore: DETLOG [syscall] saved control\n")
                     } else {
@@ -13903,6 +13929,8 @@ mod tests {
 
     #[test]
     fn saved_capture_preserves_latch_finish_and_payload_failure_order() {
+        use hermit::canonical_verdict::RunFailure;
+
         use super::super::backend_hook::PhysicalRun;
         use super::super::backend_hook::SavedNativeEvidence;
         use super::super::backend_hook::VerificationLogTransport;

@@ -613,6 +613,11 @@ impl PreparedPhysical {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn config(&self) -> &DetConfig {
+        &self.config
+    }
+
     fn for_run(&self, options: &super::run::RunOpts) -> Self {
         let mut physical = self.clone();
         // Terminal/capability/signal preparation is invocation-owned. Only the

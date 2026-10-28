@@ -1266,6 +1266,7 @@ mod native_exec_provider_connect_tests;
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use clap::FromArgMatches;
     use clap::Parser;
     use hermit::Backend;
     use hermit::BackendUnavailable;
@@ -2721,8 +2722,8 @@ mod tests {
     /// `main`'s per-backend preparation, so only backends whose trials really run
     /// on them through that path are in scope: ptrace and KVM. The rest must be
     /// refused rather than silently run as ptrace (e9patch without its rewrite)
-    /// or fail on analyze's workspace bind (DBT). A management subcommand stays
-    /// out of scope for every non-default backend.
+    /// or fail on analyze's workspace bind (DBT). Foreign core selectors remain
+    /// refused; static executables share commands that do not start a guest.
     #[test]
     fn analyze_and_bisect_scope_is_limited_to_backends_whose_trials_run() {
         for (backend, in_scope) in [
@@ -2758,7 +2759,6 @@ mod tests {
                         backend,
                         backend == "e9patch",
                         backend == "sabre",
-                        backend_hook::EvidenceRequirement::Common,
                     )
                 } else {
                     args.command.validate_backend_scope(args.global.backend)
@@ -2779,25 +2779,31 @@ mod tests {
             if backend != "ptrace" {
                 let argv = ["hermit", "--backend", backend, "record", "list"];
                 let external = matches!(backend, "dbt" | "sabre" | "e9patch");
-                let args = if external {
-                    application_args(backend, &argv)
-                } else {
-                    Args::try_parse_from(argv).unwrap()
-                };
                 let scope = if external {
-                    args.command.validate_application_backend_scope(
-                        backend,
-                        backend == "e9patch",
-                        backend == "sabre",
-                        backend_hook::EvidenceRequirement::Common,
-                    )
+                    // Removed core selectors still refuse this exact original argv.
+                    let error = Args::try_parse_from(argv)
+                        .expect_err("foreign selectors require their static executable");
+                    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+                    Err(Error::from(error))
                 } else {
+                    let args = Args::try_parse_from(argv).unwrap();
                     args.command.validate_backend_scope(args.global.backend)
                 };
                 assert!(
                     scope.is_err(),
                     "--backend {backend} record list must stay out of scope"
                 );
+                if external {
+                    // Static executables share this nonlaunch management command.
+                    let args = application_args(backend, &argv);
+                    args.command
+                        .validate_application_backend_scope(
+                            backend,
+                            backend == "e9patch",
+                            backend == "sabre",
+                        )
+                        .expect("shared record list does not launch a physical backend");
+                }
             }
         }
     }
@@ -2967,12 +2973,7 @@ mod tests {
         ] {
             let args = application_args("e9patch", &command);
             args.command
-                .validate_application_backend_scope(
-                    "e9patch",
-                    true,
-                    false,
-                    backend_hook::EvidenceRequirement::Common,
-                )
+                .validate_application_backend_scope("e9patch", true, false)
                 .unwrap();
         }
 
@@ -2987,16 +2988,21 @@ mod tests {
             ],
         ] {
             let args = application_args("e9patch", &command);
-            let error = args
-                .command
-                .validate_application_backend_scope(
-                    "e9patch",
-                    true,
-                    false,
-                    backend_hook::EvidenceRequirement::Common,
-                )
-                .unwrap_err();
-            assert!(error.to_string().contains("only through"));
+            if matches!(&args.command, Subcommand::Record(_)) {
+                // Keep the original core-selector refusal; the static list is shared.
+                let error = Args::try_parse_from(&command)
+                    .expect_err("foreign selectors require their static executable");
+                assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+                args.command
+                    .validate_application_backend_scope("e9patch", true, false)
+                    .expect("shared record list does not launch a physical backend");
+            } else {
+                let error = args
+                    .command
+                    .validate_application_backend_scope("e9patch", true, false)
+                    .unwrap_err();
+                assert!(error.to_string().contains("only through"));
+            }
         }
     }
 
@@ -3073,12 +3079,7 @@ mod tests {
             &["hermit", "--backend", "dbt", "run", "--", "/bin/true"],
         );
         run.command
-            .validate_application_backend_scope(
-                "dbt",
-                false,
-                false,
-                backend_hook::EvidenceRequirement::NativeCounters,
-            )
+            .validate_application_backend_scope("dbt", false, false)
             .expect("DBT run is the supported DBT execution path");
 
         let record = application_args(
@@ -3095,12 +3096,7 @@ mod tests {
         );
         let error = record
             .command
-            .validate_application_backend_scope(
-                "dbt",
-                false,
-                false,
-                backend_hook::EvidenceRequirement::NativeCounters,
-            )
+            .validate_application_backend_scope("dbt", false, false)
             .expect_err("DBT record must not silently execute through ptrace");
         assert!(error.to_string().contains("use the ptrace runtime"));
     }
@@ -3142,47 +3138,62 @@ mod tests {
             );
             assert_eq!(args.global.backend, None);
             args.command
-                .validate_application_backend_scope(
-                    "sabre",
-                    false,
-                    true,
-                    backend_hook::EvidenceRequirement::Common,
-                )
+                .validate_application_backend_scope("sabre", false, true)
                 .unwrap_or_else(|e| panic!("`--backend sabre {sub}` must be in scope: {e}"));
         }
 
-        // NEGATIVE: something outside the set is still refused. Without this the
-        // guard could admit everything and still pass the positives above.
-        let args = application_args(
+        // This original core-selector argv still refuses at its current parser owner.
+        let command = [
+            "hermit",
+            "--backend",
             "sabre",
-            &[
+            "log-diff",
+            "/dev/null",
+            "/dev/null",
+        ];
+        let error =
+            Args::try_parse_from(command).expect_err("`--backend sabre log-diff` must be rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        let args = application_args("sabre", &command);
+        args.command
+            .validate_application_backend_scope("sabre", false, true)
+            .expect("shared log-diff does not launch a physical backend");
+
+        // NEGATIVE: unsupported guest commands must still refuse; the guard
+        // cannot admit everything and pass only the run/strace positives.
+        for command in [
+            vec![
                 "hermit",
                 "--backend",
                 "sabre",
-                "log-diff",
-                "/dev/null",
-                "/dev/null",
+                "record",
+                "start",
+                "--",
+                "/bin/true",
             ],
-        );
-        let err = args
-            .command
-            .validate_application_backend_scope(
+            vec![
+                "hermit",
+                "--backend",
                 "sabre",
-                false,
-                true,
-                backend_hook::EvidenceRequirement::Common,
-            )
-            .expect_err("`--backend sabre log-diff` must be rejected");
+                "replay",
+                "0123456789abcdef0123456789abcdef",
+            ],
+        ] {
+            let args = application_args("sabre", &command);
+            let err = args
+                .command
+                .validate_application_backend_scope("sabre", false, true)
+                .expect_err("unsupported SaBRe guest commands must be rejected");
 
-        // And the refusal must NAME both supported forms. A message that omits
-        // `run` is the original defect: it sends a user away from a path that
-        // works.
-        let text = err.to_string();
-        assert!(text.contains("sabre run"), "message must name run: {text}");
-        assert!(
-            text.contains("sabre strace"),
-            "message must name strace: {text}"
-        );
+            // The refusal must NAME both supported forms. Omitting `run`
+            // sends a user away from a working physical execution path.
+            let text = err.to_string();
+            assert!(text.contains("sabre run"), "message must name run: {text}");
+            assert!(
+                text.contains("sabre strace"),
+                "message must name strace: {text}"
+            );
+        }
     }
 
     #[test]
