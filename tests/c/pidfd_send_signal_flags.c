@@ -57,10 +57,14 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef PIDFD_SELF_THREAD
+/* The sentinels as Linux 6.17 and later spell them
+ * (include/uapi/linux/fcntl.h:110-111 at v6.17), which Hermit presents on
+ * every host, whatever the build host's headers say: Linux 6.15 and 6.16
+ * spelled PIDFD_SELF_THREAD_GROUP -20000. */
+#undef PIDFD_SELF_THREAD
+#undef PIDFD_SELF_THREAD_GROUP
 #define PIDFD_SELF_THREAD -10000
 #define PIDFD_SELF_THREAD_GROUP -10001
-#endif
 #ifndef PIDFD_SIGNAL_THREAD
 #define PIDFD_SIGNAL_THREAD (1U << 0)
 #define PIDFD_SIGNAL_THREAD_GROUP (1U << 1)

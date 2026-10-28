@@ -1024,35 +1024,58 @@ fn pidfd_self_spelling(sentinel: RawFd, accepts: impl Fn(RawFd) -> bool) -> Opti
 }
 
 /// How this host's kernel spells the sentinel Hermit presents as `sentinel`,
-/// probed once per sentinel: a signal 0 sent through a value from Hermit's
-/// own process succeeds only where the kernel takes that value as the
-/// sentinel (a signal-0 send checks only that the target exists, and any
+/// probed once per sentinel: a signal 0 sent through a value from the
+/// process Detcore runs in succeeds only where the kernel takes that value as
+/// the sentinel (a signal-0 send checks only that the target exists, and any
 /// other negative descriptor is EBADF, kernel/signal.c:4090-4092 at v6.17).
 /// Detcore decides what a sentinel names itself and forwards a send in the
 /// host's spelling, so that what the guest sees does not depend on the host
 /// kernel's version.
+///
+/// The probe is deterministic and invisible to the guest. The kernel's
+/// answer depends only on its version, which a run cannot change, so every
+/// run and both runs of `--verify` take the same spelling. A signal-0 send
+/// queues no signal and changes no task's state, and the probe puts `errno`
+/// back as it found it, which matters where Detcore runs inside the guest's
+/// process (LiteInst, SaBRe, DBT). A `hermit replay` probes too: the replay
+/// tool compares each forwarded call's arguments with the recorded call
+/// before it returns the recorded result, and the recording carries the
+/// recording host's spelling, so a replay on a host whose kernel spells the
+/// sentinel differently stops with a named desynchronization rather than a
+/// different answer.
 fn host_pidfd_self_spelling(sentinel: RawFd) -> Option<RawFd> {
     static THREAD: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
     static GROUP: std::sync::OnceLock<Option<RawFd>> = std::sync::OnceLock::new();
-    let accepts = |spelling: RawFd| {
-        // SAFETY: a signal-0 pidfd_send_signal with no siginfo reads no
-        // memory and sends no signal.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                spelling,
-                0,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
-        rc == 0
+    let probe = || {
+        // SAFETY: `__errno_location` returns this thread's `errno`.
+        let errno = unsafe { libc::__errno_location() };
+        let saved = unsafe { *errno };
+        let spelling = pidfd_self_spelling(sentinel, accepts);
+        unsafe { *errno = saved };
+        spelling
     };
     match sentinel {
-        PIDFD_SELF_THREAD => *THREAD.get_or_init(|| pidfd_self_spelling(sentinel, accepts)),
-        PIDFD_SELF_THREAD_GROUP => *GROUP.get_or_init(|| pidfd_self_spelling(sentinel, accepts)),
+        PIDFD_SELF_THREAD => *THREAD.get_or_init(probe),
+        PIDFD_SELF_THREAD_GROUP => *GROUP.get_or_init(probe),
         _ => None,
     }
+}
+
+/// Whether the host kernel takes `spelling` as a `pidfd_send_signal` sentinel
+/// (`host_pidfd_self_spelling`).
+fn accepts(spelling: RawFd) -> bool {
+    // SAFETY: a signal-0 pidfd_send_signal with no siginfo reads no memory
+    // and sends no signal.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            spelling,
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    rc == 0
 }
 
 /// `call`, a `pidfd_send_signal`, with `pidfd` as its descriptor.
