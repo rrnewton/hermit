@@ -481,8 +481,15 @@ fn every_validation_derives_the_seeded_maximum_afresh() {
     assert_eq!(maximum(&run), Some(200_000_000));
     assert_eq!(run.seeded_chaos_timeslice(), None);
 
+    // Validation reads a replayed record for the timeslice its run drew, so
+    // the replay needs a readable record; this one states none.
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("preemptions.json");
+    detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+        .write_to_disk(&record)
+        .unwrap();
     run.det_opts.det_config.chaos = true;
-    run.det_opts.det_config.replay_preemptions_from = Some("unused-preemptions".into());
+    run.det_opts.det_config.replay_preemptions_from = Some(record);
     run.validate_args_with_perf_support(true).unwrap();
     assert_eq!(maximum(&run), Some(200_000_000));
     assert_eq!(run.seeded_chaos_timeslice(), None);
