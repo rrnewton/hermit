@@ -148,7 +148,7 @@ pub(crate) fn installed_skid_margin() -> u64 {
 /// has it), which only the container's mount table shows, so it is left to
 /// container setup. Checked before setup, a missing target is named; at
 /// setup it is only ENOENT from a mount, without the path.
-fn missing_mount_target(mounts: &[Mount], exists: impl Fn(&Path) -> bool) -> Option<&Path> {
+fn missing_mount_target(mounts: &[MountArg], exists: impl Fn(&Path) -> bool) -> Option<&Path> {
     mounts.iter().enumerate().find_map(|(index, mount)| {
         let target = mount.get_target();
         let under_an_earlier_mount = mounts[..index]
