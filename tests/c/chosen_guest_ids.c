@@ -50,7 +50,8 @@
  * - `leader-gone CALL`: CALL, by a second thread once the first has exited
  *   (`pthread_exit`), so that the thread group leader is a zombie;
  * - `vfork-detached`: a raw clone with CLONE_VFORK, CLONE_PIDFD and
- *   CLONE_DETACHED, which every kernel refuses (EINVAL);
+ *   CLONE_DETACHED, which every kernel refuses (EINVAL); `untraced-detached`
+ *   the same with CLONE_UNTRACED instead of CLONE_VFORK;
  * - `nested`: `own-tid 1` after unshare(CLONE_NEWPID), so that the array is
  *   two levels short of the guest's own namespace;
  * - `no-caps`: `own-tid 1` with CLONE_NEWUSER too, after the guest gives up
@@ -148,22 +149,24 @@ static pid_t hold(pid_t id) {
  * `bad-size` ask, and its outcome. */
 static int one_call(int argc, char** argv) {
   const char* what = argv[1];
-  if (strcmp(what, "vfork-detached") == 0) {
+  if (strcmp(what, "vfork-detached") == 0 ||
+      strcmp(what, "untraced-detached") == 0) {
 #ifndef CLONE_DETACHED
 #define CLONE_DETACHED 0x00400000
 #endif
     int pidfd = -1;
-    long child = syscall(SYS_clone,
-                         CLONE_VFORK | CLONE_PIDFD | CLONE_DETACHED | SIGCHLD,
-                         0, &pidfd, 0, 0);
+    unsigned long extra =
+        strcmp(what, "vfork-detached") == 0 ? CLONE_VFORK : CLONE_UNTRACED;
+    long child =
+        syscall(SYS_clone, extra | CLONE_PIDFD | CLONE_DETACHED | SIGCHLD, 0,
+                &pidfd, 0, 0);
     if (child == 0) {
       syscall(SYS_exit, 0);
     }
     if (child > 0) {
       waitpid((pid_t)child, NULL, __WALL);
     }
-    printf("clone vfork-detached: %s\n",
-           child < 0 ? strerror(errno) : "created");
+    printf("clone %s: %s\n", what, child < 0 ? strerror(errno) : "created");
     return 0;
   }
   if (strcmp(what, "sighand") == 0) {
