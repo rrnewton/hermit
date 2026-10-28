@@ -3159,8 +3159,29 @@ fi
 # third-party/ are unchanged. The calibrated SDK budget, job width and
 # limits carry unchanged from the 82482ba8 entry; this carries SDK cost
 # only, not native byte equivalence or a cold-build timing sample.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e9c54de934df30175dbbfff162b1a4fcfa7670e7 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e9c54de934df30175dbbfff162b1a4fcfa7670e7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# BUDGET TO a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b (2026-10-28): from
+# e9c54de934df30175dbbfff162b1a4fcfa7670e7. Four commits, each replayed with
+# an identical patch-id: f709c401 and e7847776 (kvm lane, timer slice T1c:
+# the dormant KVM timer delivers pending signals at timer boundaries, in
+# reverie-kvm only; the capability stays false), then 44f1f4f5 and a4a654ac
+# (dbt lane, authored as d7d871a3 and 39a18b9c: DBT executable selection
+# follows PATH, checks execute access before script rewriting, keeps
+# launch error ordering and refuses unreadable images). The explicit
+# executable frontend and attested drrun digest change the SDK inputs:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 2cc9d19b9a35
+#     reverie-dbt/build.rs          ff1eeb32b140 -> 3f2abba1b74a
+# while reverie-dbt/native stays c1f267db81c8; rust-toolchain.toml and
+# third-party/ are unchanged. These SDK inputs are object-identical to the
+# dbt lane's measured tree 39a18b9c, whose new SDK recipe
+# 2047197043f8f22b7be0ad1ecfbf80876f9b5ab075f2d819c4b748093e45f410 completed
+# its source build in 56.55 seconds at two jobs (113.10 job-seconds) in one
+# bounded local sample. That does not recalibrate hosted-runner budgets; the
+# numeric limits and job width stay. Four reverie-dbt test files move under
+# src/launcher/tests without changing the 1038-file inventory, and the
+# LiteInst source catalog stays 73 rows. This is not native byte
+# equivalence or proof of Hermit native behavior.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

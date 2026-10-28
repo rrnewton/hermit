@@ -3029,7 +3029,7 @@ mod tests {
         }
         let original = format!("{options:?}");
         let execution = DbtExecution::new(&options, false);
-        let runner = DbtRunner::new("/bin/true", "/bin/true").unwrap();
+        let runner = DbtRunner::new(reverie_dbt::bundled_drrun_path(), "/bin/true").unwrap();
         let first = execution.stats_capture().unwrap();
         let configured = execution.configure_stats(&first, runner.clone()).unwrap();
         let target = Path::new("/tmp/.hermit-dbt-stats-2");
@@ -3064,7 +3064,7 @@ mod tests {
             super::super::run::RunOpts::parse_from(["run", "--no-namespace", "--", "/bin/true"]);
         let execution = DbtExecution::new(&options, false);
         let capture = execution.stats_capture().unwrap();
-        let runner = DbtRunner::new("/bin/true", "/bin/true").unwrap();
+        let runner = DbtRunner::new(reverie_dbt::bundled_drrun_path(), "/bin/true").unwrap();
         let expected = capture.configure(runner.clone());
         let actual = execution.configure_stats(&capture, runner).unwrap();
         assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
@@ -3485,7 +3485,7 @@ mod tests {
     #[cfg(feature = "dbt")]
     fn configured_dbt_evidence_rejects_forged_records_during_collection() {
         let file = tempfile::tempfile().unwrap();
-        let runner = DbtRunner::new("/bin/true", "/bin/true").unwrap();
+        let runner = DbtRunner::new(reverie_dbt::bundled_drrun_path(), "/bin/true").unwrap();
         let configured = configure_dbt_run_evidence(
             &runner,
             Some(DbtRunEvidence {
