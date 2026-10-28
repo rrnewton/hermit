@@ -844,7 +844,12 @@ impl RecordVersion {
 // returns the first EAGAIN to the guest and falls out of step. One that
 // succeeded at once also took a polling turn that this build no longer
 // takes, so its schedule differs. Both are refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x188);
+// 0x188 -> 0x189 (renumbered at land time from the branch's 0x18e, the next
+// HIGHEST_SHIPPED + 1 in this train): the recorder stores a
+// poll's raw ERESTARTSYS, and this change maps a recorded ERESTARTSYS
+// to ERESTARTNOHAND instead of rerunning the poll, so an old recording
+// can replay a different result.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x189);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -869,7 +874,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x188);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x188;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x189;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
