@@ -401,7 +401,7 @@ mod tests {
             );
         }
         let mut scheduler = scheduler();
-        scheduler.thread_tree.thread_to_leader.remove(&POLLER);
+        scheduler.thread_tree.remove_test_thread_leader(POLLER);
         assert!(
             scheduler
                 .ready_channel(ACTOR, channel(), Wants::Data)

@@ -6212,3 +6212,89 @@ fn the_vfork_barrier_valve_is_thirty_seconds() {
         Scheduler::SIGNALED_BACKGROUND_VALVE
     );
 }
+
+/// Process 200 (created by 100) had thread 201, which exited, and Linux gave
+/// 201 to a thread of process 300, which lives. The thread tree keeps the
+/// edge from 200 to 201. Process signal control is installed, as on a
+/// sequentialized run of a backend that provides it.
+fn reused_member_family() -> (Scheduler, DetTid, MmId, DetTid) {
+    let (mut s, _) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.thread_tree.add_child(child, DetTid::from_raw(201), false);
+    let _ = add_process_child(&mut s, 100, 300);
+    let (reused, _, _) = add(&mut s, 300, 201);
+    assert!(
+        s.thread_tree.my_thread_group(&child).contains(&reused),
+        "the stale edge this test is about must exist"
+    );
+    (s, child, child_mm, reused)
+}
+
+fn terminated(permit: SignalDeliveryPermit, group: bool) -> SignalBoundaryReceipt {
+    SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group,
+            wait_status: 7 << 8,
+        },
+    }
+}
+
+/// Under process signal control, the raw `exit` of a process's last thread
+/// is its process's final exit: it reserves the child exit for the live
+/// parent, and its receipt records the final transition. A live thread of
+/// another process whose ID the tree lists under the exiting process is not
+/// a surviving sibling: Linux's `exit_notify` sees the thread group empty.
+#[test]
+fn a_controlled_raw_exit_of_a_last_thread_is_final_beside_a_reused_member_id() {
+    let (mut s, child, child_mm, reused) = reused_member_family();
+    assert_eq!(
+        s.reserve_exit_boundary(child, child, child_mm, false),
+        Ok(super::signal_control::ExitReserveMode::Controlled)
+    );
+    let child_key = ProcessGeneration::from_backend(task(200, 200).process);
+    assert!(
+        s.parked.child_exit_reservations.contains_key(&child_key),
+        "the last thread's raw exit must reserve its process's child exit"
+    );
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(terminated(permit, false))
+        .unwrap();
+    assert!(matches!(
+        s.parked.child_exit_reservations[&child_key].phase,
+        ChildExitReservationPhase::AwaitingPublication {
+            status: ExitStatus::Exited(7)
+        }
+    ));
+    assert!(!s.next_turns.contains_key(&child));
+    assert!(s.next_turns.contains_key(&reused));
+}
+
+/// Under process signal control, a group exit's receipt retires the
+/// exiting process's own live threads, as Linux's `zap_other_threads` kills
+/// its own thread group, and records its final transition. A live thread of
+/// another process whose ID the tree lists under it is neither retired nor
+/// a reason to refuse the receipt.
+#[test]
+fn a_controlled_group_exit_retires_only_its_own_threads_beside_a_reused_member_id() {
+    let (mut s, child, child_mm, reused) = reused_member_family();
+    let (sibling, _, _) = add(&mut s, 200, 202);
+    assert_eq!(
+        s.reserve_exit_boundary(child, child, child_mm, true),
+        Ok(super::signal_control::ExitReserveMode::Controlled)
+    );
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(terminated(permit, true))
+        .expect("a legitimate group exit's receipt");
+    assert!(!s.next_turns.contains_key(&child));
+    assert!(!s.next_turns.contains_key(&sibling));
+    assert!(s.next_turns.contains_key(&reused));
+    let child_key = ProcessGeneration::from_backend(task(200, 200).process);
+    assert!(matches!(
+        s.parked.child_exit_reservations[&child_key].phase,
+        ChildExitReservationPhase::AwaitingPublication {
+            status: ExitStatus::Exited(7)
+        }
+    ));
+}

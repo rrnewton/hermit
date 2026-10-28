@@ -2618,6 +2618,19 @@ pub struct ThreadTree {
     /// here. If, however, a thread is a group leader, this will map back to itself.
     thread_to_leader: HashMap<DetTid, DetPid>,
 
+    /// The current threads of each process, live or exited, in DetTid order:
+    /// the threads whose `thread_to_leader` entry names the process, added
+    /// since the process ID last started a process. An ID that Linux gives to
+    /// another process moves to that process's set (`set_thread_leader`), and
+    /// a pid reused for a new process starts an empty set, while its old
+    /// threads keep their `thread_to_leader` entries.
+    leader_threads: HashMap<DetPid, BTreeSet<DetTid>>,
+
+    /// The processes that have had a thread other than their leader since
+    /// their pid last started a process, live or exited, whatever became of
+    /// that thread's ID since (`has_had_other_threads`).
+    had_other_threads: HashSet<DetPid>,
+
     /// Reverse map from a process (group-leader `DetPid`) to its effective Linux
     /// wait parent, including `CLONE_PARENT`. Populated when a new group leader
     /// is registered; the root process has no entry. Entries survive logical
@@ -2829,6 +2842,12 @@ impl ThreadTree {
     /// thread groups using square brackets:
     ///
     ///   `[1 [2 [3] 4] (5 6 7)]`
+    ///
+    /// Each thread is expanded once, at its first visit; a later visit prints
+    /// `<again N>`. The tree keeps every edge it was ever given, so after
+    /// Linux reuses a thread ID a thread can be listed twice, or close a cycle
+    /// (`ThreadTree::my_thread_group`). Without a reused ID no thread is
+    /// reached twice and the output is unchanged.
     // TODO: it would also be nice to store a fixed prefix of the binary name and listing
     // that along with the thread ID.
     pub fn pretty_print(&self) -> String {
@@ -2836,22 +2855,24 @@ impl ThreadTree {
             tt: &'a HashMap<DetTid, Vec<DetTid>>,
             tgl: &HashSet<DetTid>,
             current: &DetTid,
+            visited: &mut HashSet<DetTid>,
         ) -> RcDoc<'a, ()> {
+            if !visited.insert(*current) {
+                return RcDoc::text("<again ")
+                    .append(RcDoc::as_string(current))
+                    .append(RcDoc::text(">"));
+            }
             if let Some(children) = tt.get(current) {
+                let children: Vec<RcDoc<'a, ()>> =
+                    children.iter().map(|x| walk(tt, tgl, x, visited)).collect();
                 if tgl.contains(current) {
                     RcDoc::text("[")
                         .append(RcDoc::as_string(current))
                         .append(if children.is_empty() {
                             RcDoc::text("")
                         } else {
-                            RcDoc::text(" ").append(
-                                RcDoc::intersperse(
-                                    children.iter().map(|x| walk(tt, tgl, x)),
-                                    Doc::line(),
-                                )
-                                .nest(1)
-                                .group(),
-                            )
+                            RcDoc::text(" ")
+                                .append(RcDoc::intersperse(children, Doc::line()).nest(1).group())
                         })
                         .append(RcDoc::text("]"))
                 } else if children.is_empty() {
@@ -2860,14 +2881,7 @@ impl ThreadTree {
                     RcDoc::text("(")
                         .append(RcDoc::as_string(current))
                         .append(RcDoc::text(" "))
-                        .append(
-                            RcDoc::intersperse(
-                                children.iter().map(|x| walk(tt, tgl, x)),
-                                Doc::line(),
-                            )
-                            .nest(1)
-                            .group(),
-                        )
+                        .append(RcDoc::intersperse(children, Doc::line()).nest(1).group())
                         .append(RcDoc::text(")"))
                 }
             } else {
@@ -2883,7 +2897,12 @@ impl ThreadTree {
             Some(root) => root,
         };
 
-        let doc = walk(&self.tree, &self.thread_group_leaders, &root);
+        let doc = walk(
+            &self.tree,
+            &self.thread_group_leaders,
+            &root,
+            &mut HashSet::new(),
+        );
         let width = 100;
         let mut vec = Vec::new();
         doc.render(width, &mut vec).unwrap();
@@ -2972,7 +2991,12 @@ impl ThreadTree {
             };
             self.external_parents.remove(&child_dettid);
             self.thread_group_leaders.insert(child_dettid);
-            self.thread_to_leader.insert(child_dettid, child_dettid);
+            // A reused pid starts a new process with none of the old one's
+            // threads: their `thread_to_leader` entries still name this pid,
+            // but they are no member of the new process (`leader_threads`).
+            self.leader_threads.remove(&child_dettid);
+            self.had_other_threads.remove(&child_dettid);
+            self.set_thread_leader(child_dettid, child_dettid);
             // A reused pid starts with neither Linux attribute: the flag is
             // not inherited, and the new process has its own live parent.
             self.child_subreapers.remove(&child_dettid);
@@ -3095,7 +3119,75 @@ impl ThreadTree {
                             panic!("recv_create_child_thread: parent {} of child dtid {} does not exist in thread_to_leader map!",
                                    parent_dettid, child_dettid);
                         });
-            self.thread_to_leader.insert(child_dettid, parent_leader);
+            self.set_thread_leader(child_dettid, parent_leader);
+            self.had_other_threads.insert(parent_leader);
+        }
+    }
+
+    /// Record that `thread`'s current process is `leader`, in
+    /// `thread_to_leader` and its reverse, `leader_threads`.
+    fn set_thread_leader(&mut self, thread: DetTid, leader: DetPid) {
+        if let Some(former) = self.thread_to_leader.insert(thread, leader)
+            && former != leader
+            && let Some(threads) = self.leader_threads.get_mut(&former)
+        {
+            threads.remove(&thread);
+        }
+        self.leader_threads
+            .entry(leader)
+            .or_default()
+            .insert(thread);
+    }
+
+    /// The current threads of `process` (`leader_threads`), live or exited,
+    /// in DetTid order.
+    pub(crate) fn threads_led_by(&self, process: DetPid) -> impl Iterator<Item = DetTid> + '_ {
+        self.leader_threads
+            .get(&process)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |tid| self.is_current_thread_of(*tid, process))
+    }
+
+    /// Whether `thread` is a current thread of `process`: its
+    /// `thread_to_leader` entry names `process`, and it was added since the
+    /// process ID last started a process.
+    pub(crate) fn is_current_thread_of(&self, thread: DetTid, process: DetPid) -> bool {
+        self.thread_to_leader.get(&thread) == Some(&process)
+            && self
+                .leader_threads
+                .get(&process)
+                .is_some_and(|threads| threads.contains(&thread))
+    }
+
+    /// Whether `process` has had a thread other than its leader since its pid
+    /// last started a process, even one that has exited, or whose ID Linux
+    /// has since given to another process. Without a reused ID this is
+    /// whether the tree's walk of the group lists more than the leader. An
+    /// exec, which leaves the process one thread, does not reset it, as the
+    /// walk keeps listing the exited threads.
+    pub(crate) fn has_had_other_threads(&self, process: DetPid) -> bool {
+        self.had_other_threads.contains(&process)
+    }
+
+    /// Set `thread`'s process through `set_thread_leader` (test setup).
+    #[cfg(test)]
+    pub(crate) fn set_test_thread_leader(&mut self, thread: DetTid, leader: DetPid) {
+        self.set_thread_leader(thread, leader);
+        if thread != leader {
+            self.had_other_threads.insert(leader);
+        }
+    }
+
+    /// Drop `thread`'s process from both maps (test setup of a state
+    /// production does not build).
+    #[cfg(test)]
+    pub(crate) fn remove_test_thread_leader(&mut self, thread: DetTid) {
+        if let Some(leader) = self.thread_to_leader.remove(&thread)
+            && let Some(threads) = self.leader_threads.get_mut(&leader)
+        {
+            threads.remove(&thread);
         }
     }
 
@@ -3451,7 +3543,13 @@ impl ThreadTree {
     /// Every thread the thread group of `me` has had, live or not, found by
     /// walking the tree from its leader. The tree keeps exited threads, so
     /// this costs every thread the group ever had; for the live ones use
-    /// `Scheduler::live_thread_group`.
+    /// `Scheduler::live_process_threads`, and for a process's own threads
+    /// after Linux reused a thread ID, `Scheduler::process_threads`. Each
+    /// node is expanded once, at its first visit: the tree keeps every edge
+    /// it was ever given, so a reused ID can be listed under two parents, or
+    /// twice under one, and an ID whose former holder created a thread that
+    /// later created the ID's new holder closes a cycle. Without a reused ID
+    /// no node is reached twice, so the order is the plain walk's.
     ///
     /// Locks: takes scheduler lock.
     pub fn my_thread_group(&self, me: &DetTid) -> Vec<DetTid> {
@@ -3465,8 +3563,12 @@ impl ThreadTree {
         };
         let mut stack: Vec<DetTid> = vec![root_tid];
         let mut acc: Vec<DetTid> = vec![];
+        let mut visited: HashSet<DetTid> = HashSet::new();
 
         while let Some(first) = stack.pop() {
+            if !visited.insert(first) {
+                continue;
+            }
             if self.thread_group_leaders.contains(&first) && first != root_tid {
                 continue; // Stop traversal when we walk into child processes.
             } else {
@@ -5596,26 +5698,16 @@ impl Scheduler {
             .find(|tid| self.physical_thread_pidfds.contains_key(tid))
     }
 
-    /// The threads the thread tree lists in `detpid`'s group that still lead
-    /// back to it, in DetTid order. The tree never drops an edge, so after a
-    /// thread id is reused it can also be listed under its old group (Claude
-    /// review of https://github.com/rrnewton/hermit/pull/4439, R3).
+    /// The threads of `detpid`'s process (`process_threads`), in DetTid
+    /// order. The tree never drops an edge, so after a thread id is reused it
+    /// can also be listed under its old group (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4439, R3), and the tree's walk
+    /// can miss a thread of the process (`process_threads` lists the ways).
     fn live_group_members(&self, detpid: DetPid) -> Vec<DetTid> {
         if !self.thread_tree.contains(&detpid) {
             return Vec::new();
         }
-        let leader = DetTid::from_raw(detpid.as_raw());
-        let mut group: Vec<DetTid> = self
-            .thread_tree
-            .my_thread_group(&detpid)
-            .into_iter()
-            .filter(|tid| {
-                self.thread_tree
-                    .thread_to_leader
-                    .get(tid)
-                    .is_none_or(|owner| *owner == leader)
-            })
-            .collect();
+        let mut group = self.process_threads(detpid);
         group.sort();
         group
     }
@@ -7012,12 +7104,7 @@ impl Scheduler {
     /// The parent-death signals Detcore holds for `child`'s live tasks, leader
     /// first, then by tid.
     fn held_parent_death_signals(&self, child: DetPid) -> Vec<i32> {
-        let mut tasks: Vec<DetTid> = self
-            .thread_tree
-            .my_thread_group(&DetTid::from_raw(child.as_raw()))
-            .into_iter()
-            .filter(|tid| self.next_turns.contains_key(tid))
-            .collect();
+        let mut tasks: Vec<DetTid> = self.live_process_threads(child).collect();
         tasks.sort_by_key(|tid| (tid.as_raw() != child.as_raw(), *tid));
         tasks
             .iter()
@@ -7104,14 +7191,8 @@ impl Scheduler {
         }
         if !self.thread_tree.granted_exits.contains(&process) {
             let mut live: Vec<DetTid> = self
-                .thread_tree
-                .my_thread_group(&DetTid::from_raw(process.as_raw()))
-                .into_iter()
-                .filter(|tid| {
-                    *tid != exited
-                        && self.next_turns.contains_key(tid)
-                        && !self.committed_exits.contains(tid)
-                })
+                .live_process_threads(process)
+                .filter(|tid| *tid != exited && !self.committed_exits.contains(tid))
                 .collect();
             live.sort_by_key(|tid| (tid.as_raw() != process.as_raw(), *tid));
             if let Some(heir) = live.first() {
@@ -7282,12 +7363,7 @@ impl Scheduler {
             if self.thread_tree.is_child_subreaper(candidate)
                 && !self.is_dying_sigkill_victim(candidate)
             {
-                let mut live: Vec<DetTid> = self
-                    .thread_tree
-                    .my_thread_group(&candidate)
-                    .into_iter()
-                    .filter(|tid| self.next_turns.contains_key(tid))
-                    .collect();
+                let mut live: Vec<DetTid> = self.live_process_threads(candidate).collect();
                 live.sort_by_key(|tid| (*tid != candidate, *tid));
                 if let Some(owner) = live.first() {
                     return Some((candidate, *owner));
@@ -7379,12 +7455,7 @@ impl Scheduler {
         if init == exited {
             return None;
         }
-        let mut live: Vec<DetTid> = self
-            .thread_tree
-            .my_thread_group(&init)
-            .into_iter()
-            .filter(|tid| self.next_turns.contains_key(tid))
-            .collect();
+        let mut live: Vec<DetTid> = self.live_process_threads(init).collect();
         live.sort_by_key(|tid| (*tid != init, *tid));
         live.first().map(|owner| (init, *owner))
     }
@@ -7441,7 +7512,7 @@ impl Scheduler {
             child_tid_addr,
             reconnect_priority,
         } = reconnect;
-        let group = self.thread_tree.my_thread_group(&detpid);
+        let group = self.process_threads(detpid);
         assert!(group.contains(&caller));
         assert!(group.contains(&new_leader));
         if let Some(owners) = &mut self.boundary_owners {
@@ -8136,11 +8207,7 @@ impl Scheduler {
             && self.committed_exits.contains(&leader)
             && self.rpc_incarnation_matches(leader, mm)
             && self.next_turns.contains_key(&leader)
-            && self
-                .thread_tree
-                .my_thread_group(&process)
-                .into_iter()
-                .any(|tid| tid != leader && self.next_turns.contains_key(&tid))
+            && self.live_process_threads(process).any(|tid| tid != leader)
     }
 
     /// Whether `named` is a leader `retire_exited_leader` retired at its own
@@ -8280,12 +8347,32 @@ impl Scheduler {
         }
     }
 
+    /// At `caller`'s granted `exit_group`, logically kill every other thread
+    /// of its process: they get no further turns, and the kernel kills them
+    /// whatever they are blocked on. The caller itself leaves by the same
+    /// mechanics as a normal exit.
+    pub(crate) fn logically_kill_exit_group_siblings(
+        &mut self,
+        caller: DetTid,
+        process: DetPid,
+        mm: MmId,
+    ) {
+        // The caller's own process, which `thread_to_leader` names even when
+        // the caller's ID once led another process.
+        let own = self.registered_process(caller).unwrap_or(caller);
+        for tid in self.process_threads(own) {
+            if tid != caller {
+                self.logically_kill_thread(&tid, &process, mm);
+            }
+        }
+    }
+
     /// At an exit_group's grant, hold turns until the kernel has ended every
     /// thread of `process` whose host thread has a registered pidfd
     /// (`exited_thread_barriers`). The threads the grant kills have no Exit
     /// grant of their own, so their deregistrations add no hold.
     pub(crate) fn hold_turns_until_the_group_ends(&mut self, process: DetPid) {
-        for thread in self.thread_tree.my_thread_group(&process) {
+        for thread in self.process_threads(process) {
             self.hold_turns_until_gone(thread);
         }
     }
@@ -11223,31 +11310,22 @@ impl Scheduler {
         process: DetPid,
         bit: u64,
     ) -> bool {
-        let sigtimedwait = self
-            .thread_tree
-            .my_thread_group(&process)
-            .iter()
-            .any(|thread| {
+        let threads = self.process_threads(process);
+        let sigtimedwait = threads.iter().any(|thread| {
+            *thread != dettid
+                && self
+                    .sigtimedwait_sets
+                    .get(thread)
+                    .is_some_and(|set| set & bit != 0)
+        });
+        let signalfd_read = self.signalfd_may_read(bit)
+            && threads.iter().any(|thread| {
                 *thread != dettid
                     && self
-                        .sigtimedwait_sets
+                        .background_signalfd_reads
                         .get(thread)
-                        .is_some_and(|set| set & bit != 0)
+                        .is_some_and(|op| self.blocked.external_io_blockers.get(thread) == Some(op))
             });
-        let signalfd_read = self.signalfd_may_read(bit)
-            && self
-                .thread_tree
-                .my_thread_group(&process)
-                .iter()
-                .any(|thread| {
-                    *thread != dettid
-                        && self
-                            .background_signalfd_reads
-                            .get(thread)
-                            .is_some_and(|op| {
-                                self.blocked.external_io_blockers.get(thread) == Some(op)
-                            })
-                });
         sigtimedwait || signalfd_read
     }
 
@@ -11328,21 +11406,18 @@ impl Scheduler {
     pub(crate) fn outside_call_may_take_sigchld(&self, dtid: DetTid) -> bool {
         let bit = kernel_signal_bit(libc::SIGCHLD);
         let process = self.sigchld_process(dtid);
-        self.thread_tree
-            .my_thread_group(&process)
-            .iter()
-            .any(|thread| {
-                *thread != dtid
-                    && (self
-                        .blocked
-                        .out_of_scheduler_masks
-                        .get(thread)
-                        .is_some_and(|mask| mask.is_none_or(|mask| mask & bit == 0))
-                        || self.background_reads.get(thread).is_some_and(|read| {
-                            self.blocked.external_io_blockers.get(thread) == Some(&read.op)
-                                && read.signals.may_read(bit)
-                        }))
-            })
+        self.process_threads(process).iter().any(|thread| {
+            *thread != dtid
+                && (self
+                    .blocked
+                    .out_of_scheduler_masks
+                    .get(thread)
+                    .is_some_and(|mask| mask.is_none_or(|mask| mask & bit == 0))
+                    || self.background_reads.get(thread).is_some_and(|read| {
+                        self.blocked.external_io_blockers.get(thread) == Some(&read.op)
+                            && read.signals.may_read(bit)
+                    }))
+        })
     }
 
     /// The thread of `process` that a timer's process-directed `sig` is sent
@@ -11741,7 +11816,7 @@ impl Scheduler {
     /// Linux flushes its pending copies from every thread (`do_sigaction`), so
     /// no timer's copy of it is pending anywhere in the process.
     pub(crate) fn forget_thread_timer_copies(&mut self, process: DetPid, signo: i32) {
-        let threads: Vec<DetTid> = self.thread_tree.my_thread_group(&process);
+        let threads: Vec<DetTid> = self.process_threads(process);
         self.thread_timer_copies
             .retain(|(thread, signal), _| *signal != signo || !threads.contains(thread));
     }
@@ -11761,6 +11836,14 @@ impl Scheduler {
     /// Only a backend that keeps the guest's SIGALRM virtual
     /// (`virtualizes_guest_sigalrm`) has such a sleep; this reads that fact
     /// rather than comparing the whole capability set with one backend's.
+    /// Only a single-threaded process's leader has one: its group in the
+    /// tree is itself alone, and it never had another thread since its pid
+    /// started the process (`ThreadTree::has_had_other_threads`), which
+    /// covers any other live thread too; after Linux reused a thread ID the
+    /// tree's walk alone can miss a thread, live or exited
+    /// (`process_threads`), and can list an old process's thread under a
+    /// reused pid, which refuses a single-threaded new process, as at the
+    /// base.
     fn in_guest_sleep_sigalrm(
         &self,
         thread: DetTid,
@@ -11768,6 +11851,7 @@ impl Scheduler {
         if !self.backend.virtualizes_guest_sigalrm
             || self.registered_process(thread) != Some(thread)
             || self.thread_tree.my_thread_group(&thread) != [thread]
+            || self.thread_tree.has_had_other_threads(thread)
         {
             return None;
         }
@@ -11840,7 +11924,8 @@ impl Scheduler {
 
     /// Authenticate the retained caller request after the typed grant cleared
     /// its scheduler slot. This rejects a fabricated generic fatal resource,
-    /// a stale address space, or a grant belonging to another task.
+    /// a stale address space, or a grant belonging to another task, and a
+    /// process that has had another thread, as `in_guest_sleep_sigalrm` does.
     pub(crate) fn in_guest_fatal_alarm_response_matches(
         &self,
         thread: DetTid,
@@ -11856,6 +11941,7 @@ impl Scheduler {
                 .is_some_and(|(snapshot, _)| snapshot.ends_process())
             && self.registered_process(thread) == Some(process)
             && self.thread_tree.my_thread_group(&thread) == [thread]
+            && !self.thread_tree.has_had_other_threads(thread)
             && mm.is_some_and(|mm| self.rpc_incarnation_matches(thread, mm))
             && self.holds_serial_grant(thread)
     }
@@ -11887,7 +11973,9 @@ impl Scheduler {
         if !self.chaos_target_races {
             return None;
         }
-        let group = self.thread_tree.my_thread_group(&detpid);
+        // The walk's order, which the draw indexes: without a reused thread ID
+        // the same seed picks the same thread as the tree's walk did.
+        let group = self.process_threads(detpid);
         let eligible: Vec<DetTid> = group
             .into_iter()
             .filter(|t| !matches!(self.thread_status(*t), ThreadStatus::Gone))
@@ -11996,8 +12084,7 @@ impl Scheduler {
                 if self.thread_tree.thread_group_leaders.contains(&process) && listed(process) =>
             {
                 let mut threads: Vec<i32> = self
-                    .thread_tree
-                    .my_thread_group(&process)
+                    .process_threads(process)
                     .into_iter()
                     .filter(|tid| *tid == process || self.next_turns.contains_key(tid))
                     .map(|tid| tid.as_raw())
@@ -12107,11 +12194,7 @@ impl Scheduler {
             return ExactChildWaitState::Unknown;
         }
 
-        let live = self
-            .thread_tree
-            .my_thread_group(&child)
-            .into_iter()
-            .any(|tid| self.next_turns.contains_key(&tid));
+        let live = self.live_process_threads(child).next().is_some();
         if live {
             return ExactChildWaitState::Running;
         }
@@ -12262,8 +12345,7 @@ impl Scheduler {
         // running thread to quiesce); the held thread's is not, so only the
         // dying sibling can tell.
         let (live, gone): (Vec<DetTid>, Vec<DetTid>) = self
-            .thread_tree
-            .my_thread_group(&leader)
+            .process_threads(leader)
             .into_iter()
             .partition(|tid| self.next_turns.contains_key(tid));
         gone.iter().all(|tid| self.committed_exits.contains(tid))
@@ -12670,7 +12752,7 @@ impl Scheduler {
         let Some(leader) = self.signal_target_process(detpid) else {
             return Vec::new();
         };
-        self.live_thread_group(&leader).collect()
+        self.live_process_threads(leader).collect()
     }
 
     /// The live threads of the thread group that `member` belongs to, in
@@ -12684,7 +12766,10 @@ impl Scheduler {
     /// thread under its earlier group, or twice, and `thread_group_leaders`
     /// still holds an ID that once led a process; `thread_to_leader`, which
     /// maps every registered thread (a leader to itself), holds its current
-    /// group.
+    /// group. Production paths name the process instead
+    /// (`live_process_threads`); the tests that pin this equivalence ask by
+    /// member.
+    #[cfg(test)]
     pub(crate) fn live_thread_group(&self, member: &DetTid) -> impl Iterator<Item = DetTid> + '_ {
         let leader = *self
             .thread_tree
@@ -12699,7 +12784,10 @@ impl Scheduler {
     /// `live_thread_group`, this names the process by its ID, not by one of
     /// its members: after Linux gives the ID of a process that has gone to a
     /// thread of another process, the gone process has no live threads here,
-    /// and the other process's threads are not taken for its own.
+    /// and the other process's threads are not taken for its own. Only the
+    /// current threads of `process` count (`ThreadTree::is_current_thread_of`):
+    /// a thread of a process that held the pid before, whose deregistration
+    /// has not arrived yet, is not a thread of the new process.
     pub(crate) fn live_process_threads(
         &self,
         process: DetPid,
@@ -12707,7 +12795,59 @@ impl Scheduler {
         self.next_turns
             .keys()
             .copied()
-            .filter(move |tid| self.thread_tree.thread_to_leader.get(tid) == Some(&process))
+            .filter(move |tid| self.thread_tree.is_current_thread_of(*tid, process))
+    }
+
+    /// Every thread of the process `process`, live or exited, each once: the
+    /// threads the tree's walk lists (`ThreadTree::my_thread_group`, first
+    /// visits only) that are still `process`'s, in the walk's order, then
+    /// every other thread whose `thread_to_leader` entry names `process`, in
+    /// DetTid order. For the paths whose decision follows the order of the
+    /// group, or that also read the group's exited threads; the others take
+    /// `live_process_threads`.
+    ///
+    /// The tree never drops an edge, and Linux reuses an exited thread's ID,
+    /// as a thread of any process or as a new process. The walk then goes
+    /// wrong in four ways, and the current membership of each process
+    /// (`thread_to_leader` and `leader_threads`) corrects each:
+    ///
+    /// - it lists a former thread of `process` whose ID is now another
+    ///   process's thread (dropped here);
+    /// - it stops at a former thread whose ID now leads another process, and
+    ///   so misses the threads that thread created for `process` (added
+    ///   here, live or exited);
+    /// - it stops at a thread of `process` whose ID once led a process,
+    ///   because `thread_group_leaders` keeps every ID that ever led one, and
+    ///   at the threads it created (added here);
+    /// - when `process`'s own ID is a reused pid, it lists the threads of the
+    ///   process that held the pid before (dropped here: they are not current
+    ///   threads of `process`, `ThreadTree::is_current_thread_of`).
+    ///
+    /// Without a reused ID every thread the walk lists maps to `process` and
+    /// the walk reaches every thread of `process`, so this is the walk
+    /// itself, in the walk's order.
+    pub(crate) fn process_threads(&self, process: DetPid) -> Vec<DetTid> {
+        let tree = &self.thread_tree;
+        let root = if tree.thread_group_leaders.contains(&process) {
+            process
+        } else {
+            *tree
+                .thread_to_leader
+                .get(&process)
+                .expect("thread must be in to_leader table")
+        };
+        let mut threads: Vec<DetTid> = tree
+            .my_thread_group(&process)
+            .into_iter()
+            .filter(|tid| tree.is_current_thread_of(*tid, root))
+            .collect();
+        let walked: BTreeSet<DetTid> = threads.iter().copied().collect();
+        let unreached: Vec<DetTid> = tree
+            .threads_led_by(root)
+            .filter(|tid| !walked.contains(tid))
+            .collect();
+        threads.extend(unreached);
+        threads
     }
 
     fn wake_timed_event(&mut self, time_ns: LogicalTime, dettid: DetTid) {
@@ -29279,8 +29419,7 @@ mod test {
         let process = DetPid::from_raw(7);
         scheduler
             .thread_tree
-            .thread_to_leader
-            .insert(doomed, process);
+            .set_test_thread_leader(doomed, process);
         scheduler.sigkilled_processes.insert(process);
         scheduler.blocked.timed_waiters.insert(at(2_000), doomed);
         scheduler.poll_deadlines.insert((at(3_000), doomed));
@@ -30177,6 +30316,695 @@ mod test {
             victims.iter().map(|victim| victim.tid).collect::<Vec<_>>(),
             [former_leader, new_leader]
         );
+    }
+
+    /// Process 38 (created by 37) had thread 39, which exited, and Linux gave
+    /// 39 to a thread of process 50, which lives. The tree keeps the edge
+    /// from 38 to 39, so the tree's walk of 38's group lists 50's thread.
+    /// Every thread has turn state and its process's address space.
+    fn reused_thread_family() -> (Scheduler, DetPid, DetTid, DetPid) {
+        let tid = DetTid::from_raw;
+        let (parent, process, reused, other) = (tid(37), tid(38), tid(39), tid(50));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, process, true);
+        scheduler.thread_tree.add_child(process, reused, false);
+        scheduler.thread_tree.add_child(parent, other, true);
+        scheduler.thread_tree.add_child(other, reused, false);
+        for (thread, leader) in [
+            (parent, parent),
+            (process, process),
+            (reused, other),
+            (other, other),
+        ] {
+            register_known_thread(&mut scheduler, thread);
+            scheduler.record_thread_mm(thread, MmId::initial(leader));
+        }
+        assert!(
+            scheduler
+                .thread_tree
+                .my_thread_group(&process)
+                .contains(&reused),
+            "the stale edge these tests are about must exist"
+        );
+        (scheduler, process, reused, other)
+    }
+
+    /// Process 38's thread 39 created thread 40 and exited, and Linux gave 39
+    /// to a new process, created by 37. The tree's walk of 38's group stops
+    /// at 39, now a leader, and misses 38's live thread 40; the walk of
+    /// process 39's group descends into 40.
+    fn reused_creator_family() -> (Scheduler, DetPid, DetTid, DetPid) {
+        let tid = DetTid::from_raw;
+        let (parent, process, creator, orphan) = (tid(37), tid(38), tid(39), tid(40));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, process, true);
+        scheduler.thread_tree.add_child(process, creator, false);
+        scheduler.thread_tree.add_child(creator, orphan, false);
+        scheduler.thread_tree.add_child(parent, creator, true);
+        for (thread, leader) in [
+            (parent, parent),
+            (process, process),
+            (orphan, process),
+            (creator, creator),
+        ] {
+            register_known_thread(&mut scheduler, thread);
+            scheduler.record_thread_mm(thread, MmId::initial(leader));
+        }
+        assert_eq!(scheduler.thread_tree.my_thread_group(&process), [process]);
+        assert!(
+            scheduler
+                .thread_tree
+                .my_thread_group(&creator)
+                .contains(&orphan),
+            "the stale edge these tests are about must exist"
+        );
+        (scheduler, process, orphan, creator)
+    }
+
+    /// An `exit_group` grant takes the turns of the caller's process's other
+    /// threads, as Linux's `zap_other_threads` kills the caller's own thread
+    /// group: not a live thread of another process whose ID the tree still
+    /// lists under the caller's process, and also a live thread of the
+    /// process that the tree's walk misses because its creator's ID now leads
+    /// another process.
+    #[test]
+    fn an_exit_group_grant_kills_only_its_own_processes_threads() {
+        let (mut scheduler, process, reused, other) = reused_thread_family();
+        scheduler.logically_kill_exit_group_siblings(process, process, MmId::initial(process));
+        assert!(scheduler.next_turns.contains_key(&reused));
+        assert!(scheduler.next_turns.contains_key(&other));
+
+        let (mut scheduler, process, orphan, creator) = reused_creator_family();
+        scheduler.logically_kill_exit_group_siblings(creator, creator, MmId::initial(creator));
+        assert!(scheduler.next_turns.contains_key(&orphan));
+        scheduler.logically_kill_exit_group_siblings(process, process, MmId::initial(process));
+        assert!(!scheduler.next_turns.contains_key(&orphan));
+        assert!(scheduler.next_turns.contains_key(&creator));
+
+        // Process 38 was reaped and Linux gave 38 to a thread of process 50,
+        // beside 50's thread 51. 38's exit_group kills 50's other threads:
+        // its process is 50, whatever process its ID once led.
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw;
+        let (parent, caller, other, sibling) = (tid(37), tid(38), tid(50), tid(51));
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, caller, true);
+        scheduler.thread_tree.add_child(parent, other, true);
+        scheduler.thread_tree.add_child(other, caller, false);
+        scheduler.thread_tree.add_child(other, sibling, false);
+        for thread in [parent, caller, other, sibling] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        scheduler.logically_kill_exit_group_siblings(caller, other, MmId::initial(other));
+        assert!(!scheduler.next_turns.contains_key(&sibling));
+        assert!(!scheduler.next_turns.contains_key(&other));
+        assert!(scheduler.next_turns.contains_key(&caller));
+        assert!(scheduler.next_turns.contains_key(&parent));
+    }
+
+    /// An `exit_group` grant holds turns until each thread of the process
+    /// with a registered host thread is gone. A barrier on a live thread of
+    /// another process, which the stale tree edge names, would hold every
+    /// turn until a thread exits that has no reason to. A live thread of the
+    /// process that the tree's walk misses is waited for.
+    #[test]
+    fn an_exit_group_holds_turns_only_for_its_own_processes_threads() {
+        let host_pid = std::process::id() as i32;
+        let host_tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        let register = |scheduler: &mut Scheduler, thread: DetTid| {
+            let mm = scheduler.thread_mm(thread).unwrap();
+            scheduler
+                .register_physical_thread(thread, mm, host_pid, host_tid)
+                .expect("PIDFD_THREAD must bind the current test thread");
+        };
+        let (mut scheduler, process, reused, _) = reused_thread_family();
+        register(&mut scheduler, process);
+        register(&mut scheduler, reused);
+        scheduler.hold_turns_until_the_group_ends(process);
+        assert!(scheduler.exited_thread_barriers.contains_key(&process));
+        assert!(!scheduler.exited_thread_barriers.contains_key(&reused));
+
+        let (mut scheduler, process, orphan, creator) = reused_creator_family();
+        register(&mut scheduler, orphan);
+        register(&mut scheduler, creator);
+        scheduler.hold_turns_until_the_group_ends(creator);
+        assert!(scheduler.exited_thread_barriers.contains_key(&creator));
+        assert!(!scheduler.exited_thread_barriers.contains_key(&orphan));
+        scheduler.exited_thread_barriers.clear();
+        scheduler.hold_turns_until_the_group_ends(process);
+        assert!(scheduler.exited_thread_barriers.contains_key(&orphan));
+    }
+
+    /// A leader whose exit was granted leaves the scheduler at its exit only
+    /// while another thread of its process lives. A live thread of another
+    /// process whose ID the tree lists under it is not one, so the last
+    /// thread is left to its deregistration, as Linux's `exit_notify` reaps a
+    /// leader whose group is empty (`thread_group_empty`) rather than
+    /// delaying it as a zombie (`delay_group_leader`).
+    #[test]
+    fn a_reused_thread_of_another_process_does_not_keep_a_leader_as_a_zombie() {
+        let (mut scheduler, process, reused, _) = reused_thread_family();
+        assert!(!scheduler.retire_test_exited_leader(process, MmId::initial(process)));
+        assert!(scheduler.next_turns.contains_key(&process));
+        assert!(scheduler.next_turns.contains_key(&reused));
+    }
+
+    /// Under targeted chaos a process-directed signal goes to a random live
+    /// thread of the process (Linux's `complete_signal` picks among the
+    /// group's own threads): never to another process's thread whose ID the
+    /// tree lists under it, and possibly to a live thread the tree's walk
+    /// misses.
+    #[test]
+    fn targeted_chaos_steers_a_process_signal_only_to_its_own_threads() {
+        let (mut scheduler, process, reused, _) = reused_thread_family();
+        scheduler.chaos_target_races = true;
+        for thread in [process, reused] {
+            scheduler.runqueue_push_back(thread);
+        }
+        for draw in 0..32 {
+            assert_eq!(
+                scheduler.chaos_signal_target(process),
+                Some(process),
+                "draw {draw}"
+            );
+        }
+
+        let (mut scheduler, process, orphan, creator) = reused_creator_family();
+        scheduler.chaos_target_races = true;
+        for thread in [process, orphan, creator] {
+            scheduler.runqueue_push_back(thread);
+        }
+        let drawn: std::collections::BTreeSet<DetTid> = (0..32)
+            .map(|_| scheduler.chaos_signal_target(process).unwrap())
+            .collect();
+        assert_eq!(drawn, [process, orphan].into_iter().collect());
+        for draw in 0..32 {
+            assert_eq!(
+                scheduler.chaos_signal_target(creator),
+                Some(creator),
+                "draw {draw}"
+            );
+        }
+    }
+
+    /// The checks of whether another call of a process can take a signal
+    /// waiting in its shared queue, or its SIGCHLD, read the process's own
+    /// threads: a signalfd read or `rt_sigtimedwait` dequeues from the
+    /// caller's own process, so a call of another process whose thread holds
+    /// an ID the tree lists under it cannot take it. 50's own checks still
+    /// see its thread 39.
+    #[test]
+    fn a_processs_signal_takers_are_its_own_threads() {
+        let (mut scheduler, process, reused, other) = reused_thread_family();
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        scheduler.sigtimedwait_sets.insert(reused, usr1);
+        assert!(!scheduler.another_call_may_take_waiting_signal(process, process, usr1));
+        assert!(scheduler.another_call_may_take_waiting_signal(other, other, usr1));
+        scheduler.sigtimedwait_sets.clear();
+
+        let read = ExternalOpId::new(reused, 1);
+        scheduler.signalfd_masks.insert(other, usr1);
+        scheduler.background_signalfd_reads.insert(reused, read);
+        scheduler.blocked.external_io_blockers.insert(reused, read);
+        assert!(!scheduler.another_call_may_take_waiting_signal(process, process, usr1));
+        assert!(scheduler.another_call_may_take_waiting_signal(other, other, usr1));
+
+        scheduler
+            .blocked
+            .out_of_scheduler_masks
+            .insert(reused, None);
+        assert!(!scheduler.outside_call_may_take_sigchld(process));
+        assert!(scheduler.outside_call_may_take_sigchld(other));
+    }
+
+    /// A disposition that ignores a signal flushes its pending copies from
+    /// the threads of its own process (Linux's `do_sigaction` flushes the
+    /// thread group's queues), not from another process's thread whose ID
+    /// the tree lists under it.
+    #[test]
+    fn an_ignored_signal_forgets_only_its_own_processes_timer_copies() {
+        let (mut scheduler, process, reused, other) = reused_thread_family();
+        let signo = libc::SIGUSR1;
+        for (thread, owner) in [(process, process), (reused, other)] {
+            scheduler.thread_timer_copies.insert(
+                (thread, signo),
+                timed_waiters::SignalTimerId::Posix(owner, 0),
+            );
+        }
+        scheduler.forget_thread_timer_copies(process, signo);
+        assert!(
+            !scheduler
+                .thread_timer_copies
+                .contains_key(&(process, signo))
+        );
+        assert!(scheduler.thread_timer_copies.contains_key(&(reused, signo)));
+    }
+
+    /// `signal_target_process` names a former leader that has no
+    /// `thread_to_leader` entry as its own process. Its signal targets are
+    /// then read by that process ID, without the member lookup that expects
+    /// an entry. Production cannot build this state (`add_child` records a
+    /// leader in both tables and nothing removes an entry); the test pins
+    /// that the `expect` is gone, not a panic a run could reach.
+    #[test]
+    fn the_signal_targets_of_a_leader_without_a_leader_entry_are_read_by_its_id() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (parent, leader) = (DetTid::from_raw(37), DetTid::from_raw(38));
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, leader, true);
+        register_known_thread(&mut scheduler, parent);
+        scheduler.thread_tree.remove_test_thread_leader(leader);
+        assert_eq!(scheduler.signal_target_process(leader), Some(leader));
+        assert_eq!(
+            scheduler.process_signal_targets(leader),
+            Vec::<DetTid>::new()
+        );
+    }
+
+    /// The parent-death signals a process holds, and the thread that inherits
+    /// an exiting thread's children (Linux's `find_alive_thread` walks the
+    /// exiting thread's own group), are its own threads': not those of a
+    /// thread of another process whose ID the tree lists under it.
+    #[test]
+    fn parent_death_reads_only_the_processs_own_threads() {
+        let (mut scheduler, process, reused, _) = reused_thread_family();
+        scheduler
+            .thread_tree
+            .parent_death_signals
+            .insert(reused, libc::SIGTERM);
+        assert_eq!(
+            scheduler.held_parent_death_signals(process),
+            Vec::<i32>::new()
+        );
+        // 38's leader is its last thread: no thread of 38 inherits.
+        assert_ne!(scheduler.parent_death_heir(process, process), Some(reused));
+    }
+
+    /// A subreaper, or a PID namespace's init, whose leader has exited
+    /// adopts an orphan by its own first live thread (Linux's
+    /// `find_alive_thread`), not by a live thread of another process whose
+    /// ID the tree lists under it, even one with a lower ID.
+    #[test]
+    fn a_reaper_adopts_by_its_own_live_thread() {
+        let tid = DetTid::from_raw;
+        let (parent, reaper, reused, own, other, orphan) =
+            (tid(37), tid(38), tid(39), tid(41), tid(50), tid(60));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, reaper, true);
+        scheduler.thread_tree.add_child(reaper, reused, false);
+        scheduler.thread_tree.add_child(reaper, own, false);
+        scheduler.thread_tree.add_child(own, orphan, true);
+        scheduler.thread_tree.add_child(parent, other, true);
+        scheduler.thread_tree.add_child(other, reused, false);
+        // 38's leader has exited; its thread 41 lives on.
+        for thread in [parent, reused, own, other, orphan] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        assert_eq!(scheduler.thread_tree.parent_process(&orphan), Some(reaper));
+        scheduler.thread_tree.set_child_subreaper(reaper, true);
+        assert_eq!(scheduler.find_child_reaper(orphan), Some((reaper, own)));
+
+        scheduler.thread_tree.set_child_subreaper(reaper, false);
+        let namespaces = &mut scheduler.thread_tree.pid_namespaces;
+        namespaces.record(reaper, &[reaper], &[38, 1]).unwrap();
+        namespaces.record(orphan, &[reaper], &[60, 2]).unwrap();
+        assert_eq!(scheduler.namespace_reaper(orphan), Some((reaper, own)));
+    }
+
+    /// A process's `/proc/<pid>/task` lists its own threads (Linux's
+    /// `proc_task_readdir` walks the thread group), and an exact child wait
+    /// sees the child running only while a thread of its own lives.
+    #[test]
+    fn a_processs_task_listing_and_wait_state_count_only_its_own_threads() {
+        let (mut scheduler, process, _, _) = reused_thread_family();
+        assert_eq!(
+            scheduler.procfs_listing(Some(process)).threads,
+            [process.as_raw()]
+        );
+        // 38's last thread exits; 50's thread 39 lives on.
+        scheduler.next_turns.remove(&process);
+        assert_ne!(
+            scheduler.exact_child_wait_state(DetPid::from_raw(37), process),
+            ExactChildWaitState::Running
+        );
+    }
+
+    /// A successful exec retires the other threads of its own process
+    /// (Linux's `de_thread` kills the caller's thread group), not a live
+    /// thread of another process whose ID the tree lists under it.
+    #[test]
+    fn an_exec_retires_only_its_own_processes_threads() {
+        let (mut scheduler, process, reused, _) = reused_thread_family();
+        let pre_exec_mm = MmId::initial(process);
+        let retired = scheduler.reconnect_after_exec(ExecReconnect {
+            caller: process,
+            new_leader: process,
+            detpid: process,
+            pre_exec_mm,
+            post_exec_mm: pre_exec_mm.for_exec(process),
+            child_tid_addr: 0,
+            reconnect_priority: Some(DEFAULT_PRIORITY),
+        });
+        assert_eq!(retired, Vec::<DetTid>::new());
+        assert!(scheduler.next_turns.contains_key(&reused));
+    }
+
+    /// A child process counts as stuck, for the deadlock check of its
+    /// parent's wait, when its own live threads all wait with no way on: a
+    /// live thread of another process whose ID the tree lists under it does
+    /// not decide whether the child can run again.
+    #[test]
+    fn a_child_is_stuck_by_its_own_threads_alone() {
+        let (mut scheduler, process, _, _) = reused_thread_family();
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, process);
+        assert!(scheduler.child_is_stuck(None, process, &BTreeSet::new()));
+    }
+
+    /// Without reused IDs `process_threads` is the tree's walk of the group,
+    /// exited threads included and in the walk's order, which differs from
+    /// DetTid order: targeted chaos draws an index into this list, so a seed
+    /// picks the same thread as the walk did before.
+    #[test]
+    fn process_threads_are_the_tree_walk_without_reused_ids() {
+        let tid = DetTid::from_raw;
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (root, a, b) = (tid(1), tid(2), tid(9));
+        scheduler.thread_tree.add_child(root, root, true);
+        for (parent, child, leader) in [
+            (root, tid(3), false),
+            (root, a, true),
+            (a, tid(4), false),
+            (a, tid(5), false),
+            (tid(4), tid(6), false),
+            (root, tid(7), false),
+            (a, b, true),
+            (tid(5), tid(8), false),
+            (b, tid(10), false),
+        ] {
+            scheduler.thread_tree.add_child(parent, child, leader);
+        }
+        for raw in 1..=10 {
+            register_known_thread(&mut scheduler, tid(raw));
+        }
+        // An exited thread stays listed.
+        scheduler.next_turns.remove(&tid(4));
+        for process in [root, a, b] {
+            assert_eq!(
+                scheduler.process_threads(process),
+                scheduler.thread_tree.my_thread_group(&process)
+            );
+        }
+        let walk = scheduler.process_threads(a);
+        let mut sorted = walk.clone();
+        sorted.sort();
+        assert_ne!(
+            walk, sorted,
+            "the walk's order must differ from DetTid order"
+        );
+    }
+
+    /// A process-directed SIGKILL whose victim's leader has exited reaches
+    /// the host through a registered thread of the victim's own process,
+    /// also one the tree's walk misses because its creator's ID now leads
+    /// another process; without it the kill could not be traced and the run
+    /// would end in a deadlock report.
+    #[test]
+    fn a_sigkill_victim_is_known_by_a_thread_the_tree_walk_misses() {
+        let (mut scheduler, process, orphan, _) = reused_creator_family();
+        let mm = scheduler.thread_mm(orphan).unwrap();
+        scheduler
+            .register_physical_thread(orphan, mm, std::process::id() as i32, unsafe {
+                libc::syscall(libc::SYS_gettid) as i32
+            })
+            .expect("PIDFD_THREAD must bind the current test thread");
+        assert_eq!(
+            scheduler.sigkill_victim_registered_thread(process, process, true),
+            Some(orphan)
+        );
+    }
+
+    /// Process 38 reuses an ID among its own threads: its thread 39 exited
+    /// and Linux gave 39 to a new thread of 38. The tree lists 39 twice
+    /// under 38; the process has it once, and `/proc/38/task` lists it once.
+    #[test]
+    fn a_thread_id_reused_within_its_process_is_listed_once() {
+        let tid = DetTid::from_raw;
+        let (parent, process, reused) = (tid(37), tid(38), tid(39));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, process, true);
+        scheduler.thread_tree.add_child(process, reused, false);
+        scheduler.thread_tree.add_child(process, reused, false);
+        for thread in [parent, process, reused] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        assert_eq!(scheduler.process_threads(process), [process, reused]);
+        assert_eq!(
+            scheduler.procfs_listing(Some(process)).threads,
+            [process.as_raw(), reused.as_raw()]
+        );
+    }
+
+    /// Process 38's thread 39 created thread 40 and exited, and Linux gave 39
+    /// to a thread 40 created. The tree keeps both edges, 39 to 40 and 40 to
+    /// 39, a cycle: the walk ends, and lists each thread once.
+    #[test]
+    fn a_cycle_of_reused_thread_ids_ends_the_walk() {
+        let tid = DetTid::from_raw;
+        let (parent, process, first, second) = (tid(37), tid(38), tid(39), tid(40));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, process, true);
+        scheduler.thread_tree.add_child(process, first, false);
+        scheduler.thread_tree.add_child(first, second, false);
+        scheduler.thread_tree.add_child(second, first, false);
+        for thread in [parent, process, first, second] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        // A walk that never ends would keep its thread running, and growing,
+        // after this test failed; under a single-process runner that thread
+        // would outlive the test, so a timeout aborts the process instead.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send((
+                scheduler.process_threads(process),
+                format!("{}", scheduler.thread_tree),
+            ));
+        });
+        let (threads, printed) = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|_| {
+                eprintln!("the walk did not end on a cycle of reused IDs");
+                std::process::abort()
+            });
+        assert_eq!(threads, [process, first, second]);
+        // The run summary prints the tree: each thread once, and the edge
+        // that closes the cycle as a repeat.
+        assert_eq!(printed, "[37 [38 (39 (40 <again 39>))]]");
+    }
+
+    /// A thread of process 38 that the tree's walk misses, because its
+    /// creator's ID 39 now leads another process, counts after it exits too:
+    /// its exit was not committed, so 38 is going down and does not count as
+    /// stuck (its parent's wait is real), although 38's leader waits with no
+    /// deadline.
+    #[test]
+    fn an_exited_thread_the_walk_misses_still_counts_for_a_stuck_child() {
+        let (mut scheduler, process, orphan, _) = reused_creator_family();
+        scheduler.next_turns.remove(&orphan);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, process);
+        assert_eq!(scheduler.process_threads(process), [process, orphan]);
+        assert!(!scheduler.child_is_stuck(None, process, &BTreeSet::new()));
+    }
+
+    /// Process 38 was reaped and Linux gave 38 to a new process. The old
+    /// process's thread 39, which left without a committed exit, still names
+    /// 38 in `thread_to_leader`, and the tree still lists it under 38; it is
+    /// no thread of the new process, so the new 38, whose only thread waits
+    /// with no deadline, counts as stuck.
+    #[test]
+    fn a_reused_process_id_starts_with_none_of_the_old_processs_threads() {
+        let tid = DetTid::from_raw;
+        let (parent, process, old_thread) = (tid(37), tid(38), tid(39));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, process, true);
+        scheduler.thread_tree.add_child(process, old_thread, false);
+        // The old 38 and its thread 39 are gone; a new process gets 38.
+        scheduler.thread_tree.add_child(parent, process, true);
+        for thread in [parent, process] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        assert!(
+            scheduler
+                .thread_tree
+                .my_thread_group(&process)
+                .contains(&old_thread),
+            "the stale edge this test is about must exist"
+        );
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, process);
+        assert_eq!(scheduler.process_threads(process), [process]);
+        assert!(scheduler.child_is_stuck(None, process, &BTreeSet::new()));
+    }
+
+    /// The same reused pid, but the old process's thread 39 still has turn
+    /// state: its deregistration has not reached Detcore. It is still no
+    /// thread of the new process 38, for the paths that read live threads
+    /// only: the new 38's leader is its last thread at its exit, and once it
+    /// has gone a wait does not see the new 38 running.
+    #[test]
+    fn a_reused_process_id_does_not_count_an_old_thread_still_registered() {
+        let tid = DetTid::from_raw;
+        let (parent, process, old_thread) = (tid(37), tid(38), tid(39));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, process, true);
+        scheduler.thread_tree.add_child(process, old_thread, false);
+        scheduler.thread_tree.add_child(parent, process, true);
+        for thread in [parent, process, old_thread] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        assert_eq!(
+            scheduler.live_process_threads(process).collect::<Vec<_>>(),
+            [process]
+        );
+        assert!(!scheduler.retire_test_exited_leader(process, MmId::initial(process)));
+        scheduler.next_turns.remove(&process);
+        assert_ne!(
+            scheduler.exact_child_wait_state(parent, process),
+            ExactChildWaitState::Running
+        );
+    }
+
+    /// Process 38's leader left at its own exit while its thread 39 lived on,
+    /// which dropped 38's SIGALRM state; 39 then published a SIGALRM handler
+    /// for 38. 39's exit_group ends the process, so nothing of 38's SIGALRM
+    /// state may outlive it: a new process that Linux gives pid 38 must not
+    /// have its SIGALRM diverted as if it handled it. The grant's kill of the
+    /// exited leader is what drops it (the caller, 39, leaves by its own
+    /// exit; the grant kills 40).
+    #[test]
+    fn an_exit_group_drops_its_processs_sigalrm_state_after_the_leader_left() {
+        let tid = DetTid::from_raw;
+        let (parent, leader, sibling, other) = (tid(37), tid(38), tid(39), tid(40));
+        let mm = MmId::initial(leader);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, leader, true);
+        scheduler.thread_tree.add_child(leader, sibling, false);
+        scheduler.thread_tree.add_child(leader, other, false);
+        for thread in [parent, leader, sibling, other] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        scheduler.logically_kill_thread(&leader, &leader, mm);
+        assert!(!scheduler.next_turns.contains_key(&leader));
+        scheduler.set_sigalrm_handled(leader, true);
+        scheduler.logically_kill_exit_group_siblings(sibling, leader, mm);
+        assert!(!scheduler.next_turns.contains_key(&other));
+        assert!(scheduler.next_turns.contains_key(&sibling));
+        assert!(!scheduler.sigalrm_handled(leader));
+    }
+
+    /// `has_had_other_threads` is per process incarnation: an exec, which
+    /// leaves its process one thread, keeps it, and a new process that Linux
+    /// gives the pid starts without it, whatever the old one had.
+    #[test]
+    fn the_had_other_threads_flag_survives_exec_and_resets_at_a_new_process() {
+        let tid = DetTid::from_raw;
+        let (parent, process, sibling) = (tid(37), tid(38), tid(39));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, process, true);
+        assert!(!scheduler.thread_tree.has_had_other_threads(process));
+        scheduler.thread_tree.add_child(process, sibling, false);
+        for thread in [parent, process, sibling] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        assert!(scheduler.thread_tree.has_had_other_threads(process));
+
+        let pre_exec_mm = MmId::initial(process);
+        let retired = scheduler.reconnect_after_exec(ExecReconnect {
+            caller: process,
+            new_leader: process,
+            detpid: process,
+            pre_exec_mm,
+            post_exec_mm: pre_exec_mm.for_exec(process),
+            child_tid_addr: 0,
+            reconnect_priority: Some(DEFAULT_PRIORITY),
+        });
+        assert_eq!(retired, [sibling]);
+        scheduler.record_successful_exec(process);
+        assert!(scheduler.thread_tree.has_had_other_threads(process));
+
+        // The process has gone; Linux gives 38 to a new process.
+        scheduler.logically_kill_thread(&process, &process, pre_exec_mm.for_exec(process));
+        scheduler.thread_tree.add_child(parent, process, true);
+        assert!(!scheduler.thread_tree.has_had_other_threads(process));
+    }
+
+    /// Threads of process 38 that the tree's walk misses come after the walk,
+    /// in DetTid order, whatever order they were created in.
+    #[test]
+    fn threads_the_walk_misses_follow_it_in_tid_order() {
+        let tid = DetTid::from_raw;
+        let (parent, process, creator, late, early) = (tid(37), tid(38), tid(39), tid(42), tid(40));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, process, true);
+        scheduler.thread_tree.add_child(process, creator, false);
+        scheduler.thread_tree.add_child(creator, late, false);
+        scheduler.thread_tree.add_child(creator, early, false);
+        scheduler.thread_tree.add_child(parent, creator, true);
+        for thread in [parent, process, creator, late, early] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        assert_eq!(scheduler.process_threads(process), [process, early, late]);
+    }
+
+    /// Targeted chaos draws its index into the tree walk's order, not DetTid
+    /// order, so a fuzz seed picks the same thread as it did before reused
+    /// IDs were handled: the draws equal `chaos_pick` over the walk.
+    #[test]
+    fn targeted_chaos_draws_in_the_tree_walks_order() {
+        let tid = DetTid::from_raw;
+        let mut scheduler = Scheduler::new(&Config::default());
+        let root = tid(1);
+        scheduler.thread_tree.add_child(root, root, true);
+        for child in 2..=6 {
+            scheduler.thread_tree.add_child(root, tid(child), false);
+        }
+        for raw in 1..=6 {
+            register_known_thread(&mut scheduler, tid(raw));
+            scheduler.runqueue_push_back(tid(raw));
+        }
+        scheduler.chaos_target_races = true;
+        let walk = scheduler.thread_tree.my_thread_group(&root);
+        let mut sorted = walk.clone();
+        sorted.sort();
+        assert_ne!(
+            walk, sorted,
+            "the walk's order must differ from DetTid order"
+        );
+        let mut prng = scheduler.fuzz_prng.clone();
+        let expected: Vec<DetTid> = (0..32)
+            .map(|_| chaos_pick(&mut prng, &walk).unwrap())
+            .collect();
+        let drawn: Vec<DetTid> = (0..32)
+            .map(|_| scheduler.chaos_signal_target(root).unwrap())
+            .collect();
+        assert_eq!(drawn, expected);
     }
 
     /// A cross-task signal must interrupt a precise-mode futex waiter, which sleeps
@@ -45342,6 +46170,99 @@ mod test {
         scheduler.backend = physical_liteinst;
         assert!(scheduler.in_guest_sleep_sigalrm(target).is_none());
         assert!(!scheduler.in_guest_fatal_alarm_response_matches(target, target, mm, &original));
+    }
+
+    /// The in-guest SIGALRM sleep and its fatal response belong to a
+    /// single-threaded process only. Each refuses a leader with another
+    /// thread that the tree's walk misses: a new thread that got the pid of
+    /// a former child process (still in `thread_group_leaders`), and a
+    /// thread whose creating thread's ID now leads another process. They
+    /// still refuse after that thread exited and Linux gave its ID to a
+    /// thread of another process: it may have changed the process's shared
+    /// signal state before it left.
+    #[test]
+    fn in_guest_sigalrm_refuses_a_process_with_a_thread_the_walk_misses() {
+        let add_missed_thread = |scheduler: &mut Scheduler, target: DetTid, shape: &str| {
+            let live = DetTid::from_raw(target.as_raw() + 2);
+            if shape == "former child pid" {
+                scheduler.thread_tree.add_child(target, live, true);
+                scheduler.thread_tree.add_child(target, live, false);
+            } else {
+                let creator = DetTid::from_raw(target.as_raw() + 1);
+                scheduler.thread_tree.add_child(target, creator, false);
+                scheduler.thread_tree.add_child(creator, live, false);
+                scheduler.thread_tree.add_child(target, creator, true);
+            }
+            register_known_thread(scheduler, live);
+            assert_eq!(scheduler.thread_tree.my_thread_group(&target), [target]);
+        };
+        // The missed thread exits, and its ID goes to a thread of another
+        // process, 3 above the target.
+        let exit_and_reuse = |scheduler: &mut Scheduler, target: DetTid| {
+            let missed = DetTid::from_raw(target.as_raw() + 2);
+            let other = DetTid::from_raw(target.as_raw() + 3);
+            scheduler.next_turns.remove(&missed);
+            scheduler.thread_tree.add_child(target, other, true);
+            scheduler.thread_tree.add_child(other, missed, false);
+            register_known_thread(scheduler, other);
+            register_known_thread(scheduler, missed);
+            assert_eq!(scheduler.thread_tree.my_thread_group(&target), [target]);
+            assert_eq!(
+                scheduler.live_process_threads(target).collect::<Vec<_>>(),
+                [target]
+            );
+        };
+        let sleep = || {
+            in_guest_alarm_sleep(
+                LogicalTime::INDEFINITE,
+                PAUSE_FYI,
+                default_sleep_alarm_snapshot(),
+                false,
+            )
+        };
+        for shape in ["former child pid", "reused creator"] {
+            let (mut scheduler, target, _) = sleep();
+            assert!(
+                scheduler.in_guest_sleep_sigalrm(target).is_some(),
+                "{shape}"
+            );
+            add_missed_thread(&mut scheduler, target, shape);
+            assert!(
+                scheduler.in_guest_sleep_sigalrm(target).is_none(),
+                "{shape}"
+            );
+            exit_and_reuse(&mut scheduler, target);
+            assert!(
+                scheduler.in_guest_sleep_sigalrm(target).is_none(),
+                "{shape}"
+            );
+
+            let (mut scheduler, target, original) = sleep();
+            let mm = scheduler.exec_incarnations.get(&target).copied();
+            assert!(scheduler.divert_in_guest_fatal_alarm(
+                LogicalTime::from_nanos(10),
+                timed_waiters::SignalTimerId::Alarm(target),
+                target,
+                Signal::SIGALRM,
+                LogicalTime::ZERO
+            ));
+            let response = scheduler.next_turns[&target].resp.clone();
+            assert!(scheduler.unblock_guest(target, &response).is_ok());
+            assert!(
+                scheduler.in_guest_fatal_alarm_response_matches(target, target, mm, &original),
+                "{shape}"
+            );
+            add_missed_thread(&mut scheduler, target, shape);
+            assert!(
+                !scheduler.in_guest_fatal_alarm_response_matches(target, target, mm, &original),
+                "{shape}"
+            );
+            exit_and_reuse(&mut scheduler, target);
+            assert!(
+                !scheduler.in_guest_fatal_alarm_response_matches(target, target, mm, &original),
+                "{shape}"
+            );
+        }
     }
 
     /// Drive the real pop, diversion and typed grant boundaries directly,

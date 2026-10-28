@@ -372,10 +372,7 @@ impl Scheduler {
         if group {
             return true;
         }
-        self.thread_tree
-            .my_thread_group(&process)
-            .into_iter()
-            .filter(|member| self.next_turns.contains_key(member))
+        self.live_process_threads(process)
             .all(|member| member == tid)
     }
 
@@ -1032,8 +1029,10 @@ impl Scheduler {
                     ExitStatus::from_raw(wait_status),
                 );
             if !settles_committed_group_exit {
-                let targets = if group {
-                    self.thread_tree.my_thread_group(&pid)
+                // The exiting process's own live threads; the retire list is
+                // sorted below, so their order here decides nothing.
+                let targets: Vec<DetTid> = if group {
+                    self.live_process_threads(pid).collect()
                 } else {
                     vec![tid]
                 };
