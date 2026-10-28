@@ -343,13 +343,11 @@ impl Scheduler {
         // `complete_signal` (`prepare_signal`, signal.c:1053-1054), so it
         // moves nothing and takes no thread; its copy is dropped at the send.
         let discarded = self.discarded_when_sent_to(named, signo, Some(sender));
-        if let Some(thread) = moved
-            && !discarded
-        {
-            self.signal_curr_targets.insert(process, thread);
-        }
         // Under ptrace the sender is the only thread the kernel's own
         // `complete_signal` admits, so a forwarded copy reaches it first.
+        // This refusal is decided before `curr_target` moves: Linux moves
+        // the pointer only on a successful walk choice, and a refused send
+        // chooses nothing.
         if let ProcessSignalReceiver::Thread { thread, .. } = receiver
             && thread != sender
             && process == self.sigchld_process(sender)
@@ -358,6 +356,11 @@ impl Scheduler {
                 .is_none_or(|mask| mask & bit == 0)
         {
             return ProcessSignalReceiver::SenderTakesIt;
+        }
+        if let Some(thread) = moved
+            && !discarded
+        {
+            self.signal_curr_targets.insert(process, thread);
         }
         if let ProcessSignalReceiver::Thread {
             thread,

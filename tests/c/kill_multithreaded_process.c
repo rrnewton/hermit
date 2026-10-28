@@ -11,8 +11,9 @@
  * process, first with one thread and then with a second thread waiting in
  * sigsuspend() (https://github.com/rrnewton/hermit/issues/4034). Linux's
  * complete_signal picks the receiving thread from the threads that want the
- * signal, and Hermit sends it to the thread Detcore picks by the same rule, so
- * every call returns what Linux returns. A zombie child (exited, not reaped)
+ * signal, and Hermit sends it to the thread Detcore picks by the same rule.
+ * The two-thread step here is still refused by name, because the second
+ * thread sleeps in sigsuspend, outside the schedule. A zombie child (exited, not reaped)
  * is still signalled successfully, and once reaped it is ESRCH
  * (https://github.com/rrnewton/hermit/issues/4091). A child that is never a
  * zombie is ESRCH once it exits: its parent ignores SIGCHLD or sets

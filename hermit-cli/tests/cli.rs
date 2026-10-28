@@ -36280,6 +36280,10 @@ fn a_process_directed_signal_to_a_sleeping_sibling_is_refused_by_name() {
 /// - `term-one`: with SIGTERM blocked in every thread but worker 2, worker 2;
 /// - `term-queued`: with SIGTERM blocked in every thread, it stays pending
 ///   until worker 2 unblocks it, and worker 2 takes it;
+/// - `term-busy`: as `term`, but worker 1 is runnable and spinning instead
+///   of parked: the main thread still takes it, and the child exits before
+///   the spinning worker can print, so this case fails if the chosen thread
+///   is not resumed before any other runnable thread;
 /// - `segv-pidfd`: a worker's `pidfd_send_signal` of SIGSEGV to its own
 ///   two-thread process, at its default disposition, ends the whole process.
 ///
@@ -36303,6 +36307,7 @@ fn a_process_directed_signal_goes_to_the_thread_linux_chooses() {
             "pending after the send: SIGTERM\n".to_owned() + &receiver("worker 2") + exited,
             true,
         ),
+        ("term-busy", receiver("main thread") + exited, true),
         (
             "segv-pidfd",
             "child killed by signal 11\n".to_owned(),
@@ -39055,8 +39060,11 @@ fn a_pidfd_signal_through_hermits_own_proc_directories_is_eperm() {
 /// returns ENOSYS. The two sends through `PIDFD_SELF_THREAD_GROUP` and
 /// through `PIDFD_SELF_THREAD` with `PIDFD_SIGNAL_THREAD_GROUP`, which name
 /// the same process (https://github.com/rrnewton/hermit/issues/4147), are
-/// answered as this host's kernel answers them natively (EBADF for the
-/// sentinel it does not know, and 0): before, both were refused.
+/// forwarded to the host kernel, so which of its two answers appears here
+/// depends on the kernel: EBADF from a kernel that does not know the
+/// sentinel, and 0 with the handler run from one that does (Linux 7.1).
+/// This test accepts either; the deterministic answer for this send is
+/// asserted by `pidfd_send_signal_flags_and_proc_descriptors_answer_as_linux_does_at_bitwise_parity`.
 #[test]
 fn a_pidfd_signal_through_a_siblings_proc_directory_names_the_process() {
     let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags")
@@ -39127,14 +39135,23 @@ fn a_pidfd_signal_through_a_siblings_proc_directory_names_the_process() {
         "stdout:\n{stdout}\nstderr:\n{log}"
     );
     let (pid, text) = refusal(&stdout);
-    assert_eq!(
-        stdout,
-        format!(
-            "process {pid}\n/proc/<sibling tid> rc=-1 ENOSYS ran=0\n\
-             PIDFD_SELF_THREAD_GROUP rc=-1 EBADF ran=0\n\
-             worker, PIDFD_SELF_THREAD, thread group rc=0 - ran=0\n"
-        ),
-        "stderr:\n{log}"
+    // The forwarded sentinel send is answered by the host kernel: EBADF
+    // where it does not know the sentinel, 0 with the handler run where it
+    // does. Both are the kernel's answer; everything else must match.
+    let sentinel_lines = [
+        "PIDFD_SELF_THREAD_GROUP rc=-1 EBADF ran=0\n",
+        "PIDFD_SELF_THREAD_GROUP rc=0 - ran=1\n",
+    ];
+    assert!(
+        sentinel_lines.iter().any(|line| {
+            stdout
+                == format!(
+                    "process {pid}\n/proc/<sibling tid> rc=-1 ENOSYS ran=0\n\
+                     {line}\
+                     worker, PIDFD_SELF_THREAD, thread group rc=0 - ran=0\n"
+                )
+        }),
+        "stdout:\n{stdout}\nstderr:\n{log}"
     );
     assert_eq!(
         log.matches(&text).count(),
@@ -42291,8 +42308,8 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
 /// `forged_shared`, the shared-queue form of the forged row, was refused by
 /// the https://github.com/rrnewton/hermit/issues/4034 rule and is now
 /// delivered: the sender blocks SIGUSR1, so Linux gives the copy to the parked
-/// worker, which is what Detcore chooses. It prints `forged_shared queue=0`,
-/// as natively (3 of 3 runs).
+/// worker, which is what Detcore chooses. It prints
+/// `forged_shared queue=0 deliveries=1 on_worker=1`, as natively.
 ///
 /// Known divergences, with Linux's answer beside Hermit's:
 /// - `fallback_pipe`, `fallback_cont` and `fallback_alrm`: SIGPIPE and SIGCONT
@@ -42388,6 +42405,37 @@ fn posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named() {
             "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
         );
         assert_eq!(stdout, hermit, "{mode}: stderr:\n{log}");
+    }
+    // `forged_shared` is no longer refused: the sender blocks SIGUSR1, so
+    // the copy is delivered to the parked worker Detcore chooses, as Linux
+    // chooses it. Assert that delivery, not only the doc comment above.
+    {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                "forged_shared",
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "forged_shared:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(
+            stdout, "forged_shared queue=0 deliveries=1 on_worker=1\n",
+            "forged_shared: stderr:\n{log}"
+        );
     }
 }
 

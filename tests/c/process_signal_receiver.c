@@ -23,6 +23,11 @@
  *   term-queued the same, with SIGTERM blocked in every thread: it stays
  *               pending (sigpending shows it) until worker 2 unblocks it and
  *               takes it.
+ *   term-busy   the same as term, but worker 1 is runnable and spinning
+ *               instead of parked in pause(): the main thread still takes
+ *               it, and the child exits before the spinning worker prints,
+ *               so the chosen thread must be resumed before any other
+ *               runnable thread.
  *   usr1-self   worker 1's kill(getpid(), SIGUSR1) in a four-thread process
  *               whose threads all leave it unblocked: the main thread takes it.
  *   segv-pidfd  a two-thread child whose worker sends its own process SIGSEGV
@@ -116,12 +121,25 @@ static void raise_flag(int* flag) {
 /* A worker installs its mask, says it is ready, and waits. Once told to,
  * worker 2 unblocks every signal (term-queued), and `usr1_sender` sends its
  * process SIGUSR1 (usr1-self). */
+/* In term-busy, worker 1 spins instead of parking (busy_worker). */
+static int busy_worker;
+
 static void* worker(void* arg) {
   role = (int)(long)arg;
   if (pthread_sigmask(SIG_SETMASK, &worker_masks[role], NULL) != 0) {
     die("pthread_sigmask");
   }
   raise_flag(&ready);
+  if (busy_worker && role == 1) {
+    /* Runnable the whole time: if the scheduler runs this thread before
+     * the chosen receiver, it prints first and the test sees it. The spin
+     * is long enough that the chosen thread, resumed first, exits the
+     * child before it ends. */
+    for (volatile unsigned long spin = 0; spin < 3000000000UL; spin++) {
+    }
+    printf("busy worker ran first\n");
+    fflush(stdout);
+  }
   wait_for(&go, 1);
   if (role == 2) {
     sigset_t none;
@@ -233,6 +251,11 @@ static int term(int queued, int one) {
   return 0;
 }
 
+static int term_busy(void) {
+  busy_worker = 1;
+  return term(0, 0);
+}
+
 /* The main thread tells the workers to go only once it is past
  * pthread_create, which blocks every signal while it runs. */
 static int usr1_self(void) {
@@ -307,12 +330,15 @@ int main(int argc, char** argv) {
   if (strcmp(mode, "term-queued") == 0) {
     return term(1, 0);
   }
+  if (strcmp(mode, "term-busy") == 0) {
+    return term_busy();
+  }
   if (strcmp(mode, "usr1-self") == 0) {
     return usr1_self();
   }
   if (strcmp(mode, "segv-pidfd") == 0) {
     return segv_pidfd();
   }
-  fprintf(stderr, "usage: %s term|term-one|term-queued|usr1-self|segv-pidfd\n", argv[0]);
+  fprintf(stderr, "usage: %s term|term-one|term-queued|term-busy|usr1-self|segv-pidfd\n", argv[0]);
   return 2;
 }

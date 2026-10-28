@@ -13,6 +13,8 @@
  * process, so this is a process-directed signal: Linux's complete_signal picks
  * the receiving thread, and Hermit sends it to the thread Detcore picks by the
  * same rule, as for kill (https://github.com/rrnewton/hermit/issues/4034).
+ * The two-thread step here is still refused by name, because the second
+ * thread sleeps in sigsuspend, outside the schedule.
  * Everything else is the kernel's answer: signal 0, a zombie target (still
  * 0), and SIGKILL to a two-threaded child, which kills it whichever thread it
  * reaches. A one-thread child blocked in pause() must be woken to run its
