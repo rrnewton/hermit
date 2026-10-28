@@ -18370,6 +18370,49 @@ mod test {
         }));
     }
 
+    /// A thread waiting on a guest whose request already carries a signal
+    /// (`inbound_signals`) may take its turn at any pass, so no other thread
+    /// runs alone beside it: whether it sleeps in `rt_sigsuspend` with an
+    /// `InboundSignal` filed or in a child wait with a `WaitidSignals` batch.
+    /// The same thread without the signal leaves the other thread alone.
+    #[test]
+    fn a_guest_waiter_with_a_signal_already_pending_means_no_thread_runs_alone() {
+        let runner = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let with = |signal: Option<ResourceID>, parked: &dyn Fn(&mut Scheduler)| {
+            let mut sched = Scheduler::new(&lone_config());
+            register_known_thread(&mut sched, runner);
+            register_known_thread(&mut sched, other);
+            let mut resources = Resources::new(other);
+            if let Some(signal) = signal {
+                resources.insert(signal, Permission::W);
+            }
+            sched.next_turns[&other].req.put(Ok(resources));
+            parked(&mut sched);
+            assert!(!sched.pass_has_pending_work());
+            sched.runs_alone_until_it_enters_detcore(runner)
+        };
+        let sigsuspend = |sched: &mut Scheduler| {
+            sched
+                .blocked
+                .rt_sigsuspend_blockers
+                .insert(other, ExternalOpId::new(other, 1));
+        };
+        let child_wait = |sched: &mut Scheduler| {
+            sched.blocked.child_waiters.insert(
+                other,
+                (DetPid::from_raw(5), normal_wait(ChildWaitSelector::Any)),
+            );
+        };
+        let inbound = ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1));
+        let batch = ResourceID::WaitidSignals(vec![SigWrapper::from(Signal::SIGUSR1)]);
+        assert!(with(None, &sigsuspend));
+        assert!(!with(Some(inbound.clone()), &sigsuspend));
+        assert!(with(None, &child_wait));
+        assert!(!with(Some(batch), &child_wait));
+        assert!(!with(Some(inbound), &child_wait));
+    }
+
     /// A queued thread, even an idle poller that
     /// [`Scheduler::nothing_else_can_run`] counts as waiting, takes turns at
     /// slice ends; so may a registered thread not yet admitted.

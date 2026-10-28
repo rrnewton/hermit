@@ -1592,7 +1592,9 @@ impl Config {
     /// preemptions or events, no turn-numbered triggers (`--stop-after-turn`,
     /// `--stop-after-iter`, `--signal-at`), no happens-before program, no
     /// manual interrupt points and no syscall-boundary deadline
-    /// (`--target-timeslice`).
+    /// (`--target-timeslice`). Never with a gdbserver either: a debugger is
+    /// served at the stops, and between skipped ends it would see Detcore's
+    /// slice bookkeeping lag the guest's program counter.
     pub fn replays_lone_preemptions(&self) -> bool {
         !self.eager_lone_preemptions
             && self.use_preemption_timer()
@@ -1612,6 +1614,7 @@ impl Config {
             && self.signal_at.is_none()
             && self.happens_before.is_none()
             && self.interrupt_at.is_empty()
+            && !self.gdbserver
     }
 
     /// Should we use RCB in computing logical time?
@@ -6240,6 +6243,13 @@ mod tests {
                         edges: Vec::new(),
                         max_hold_ns: None,
                     }),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--gdbserver",
+                Config {
+                    gdbserver: true,
                     ..base.clone()
                 },
             ),

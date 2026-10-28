@@ -683,14 +683,14 @@ impl Scheduler {
             .retain(|victim, _| retained.keys().any(|(tid, _)| tid == victim));
     }
 
-    /// Once no committed victim's physical exit is outstanding, run every
-    /// retained wake batch, before step2 drains anything.
     /// Whether futex wakes a SIGKILL victim's exit left are retained until
     /// the fence lifts (`run_retained_sigkill_wakes`).
     pub(crate) fn has_retained_sigkill_wakes(&self) -> bool {
         !self.sigkill.retained_wakes.is_empty()
     }
 
+    /// Once no committed victim's physical exit is outstanding, run every
+    /// retained wake batch, before step2 drains anything.
     pub(crate) fn run_retained_sigkill_wakes(&mut self) {
         if !self.sigkill_fence_holds() && !self.sigkill.retained_wakes.is_empty() {
             self.run_retained_wakes_of(|_| true);

@@ -1178,6 +1178,14 @@ fn skipped_slice_ends_come_before_a_trapped_instruction() {
     assert!(skipped > 0, "no slice end was taken without a stop");
 }
 
+/// Ends skipped before a trapped cpuid are processed before Detcore handles
+/// the instruction (`handle_cpuid_event`, a path apart from rdtsc's).
+#[test]
+fn skipped_slice_ends_come_before_a_cpuid() {
+    let skipped = lone_and_eager_agree("cpuid", "1000");
+    assert!(skipped > 0, "no slice end was taken without a stop");
+}
+
 /// Ends skipped before a signal (a SIGSEGV the guest handles) are processed
 /// before Detcore handles the signal.
 #[test]
@@ -1187,12 +1195,22 @@ fn skipped_slice_ends_come_before_a_signal() {
 }
 
 /// A lone stretch longer than the backstop timer of a thread running alone
-/// (at 1000000 ns, about 60 slice ends in 6M branches), and an exec right
-/// after a lone stretch, leave the run unchanged.
+/// (2M branches; at 1000000 ns the stretch is about 40 slice ends, 37 of them
+/// taken without a stop, and the backstop fires once) leaves the run
+/// unchanged. Its eager run costs about 3.4 us per branch (8 CPU seconds,
+/// measured 2026-10-27 on an AMD EPYC host) and can take a skid-overshoot
+/// retry (https://github.com/rrnewton/hermit/issues/1845), so the stretch is
+/// kept short, and apart from the exec case, for one retry to fit the
+/// per-test budgets.
 #[test]
-fn skipped_slice_ends_survive_the_backstop_and_exec() {
+fn skipped_slice_ends_survive_the_backstop() {
     let skipped = lone_and_eager_agree("long", "1000000");
     assert!(skipped > 20, "long: {skipped} ends taken without a stop");
+}
+
+/// An exec right after a lone stretch leaves the run unchanged.
+#[test]
+fn skipped_slice_ends_survive_exec() {
     let skipped = lone_and_eager_agree("exec", "1000");
     assert!(skipped > 0, "exec: no slice end was taken without a stop");
 }

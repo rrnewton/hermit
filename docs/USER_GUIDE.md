@@ -480,16 +480,16 @@ comparison, and `--summary` reports how many ends were taken without a stop.
 Inputs from the host are the exception, as they are timed by the host either
 way: a signal sent from outside (which can also wake a thread asleep in
 `rt_sigsuspend`, a call that waits in the kernel) is seen at the next scheduler
-turn, which may come later than a stop would have; a thread killed from outside
-with `SIGKILL` never has its skipped ends processed; and a debugger that stops
-the thread between skipped ends sees Hermit's slice bookkeeping behind its
-program counter.
+turn, which may come later than a stop would have; and a thread killed from
+outside with `SIGKILL` never has its skipped ends processed.
 Slice ends while two threads can run still stop the guest. This applies to the
 ptrace backend's precise timer, and not where the run records or replays
 preemptions or schedules, or uses `--target-timeslice`,
 `--chaos-per-thread-slowdown`, `--imprecise-timers`, turn-numbered triggers
 (`--stop-after-turn`, `--stop-after-iter`, `--signal-at`), stack traces at
-preemptions or events, manual interrupt points or a happens-before program.
+preemptions or events, manual interrupt points, a happens-before program or
+`--gdbserver` (a debugger stopping the thread between skipped ends would see
+Hermit's slice bookkeeping behind its program counter).
 
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with

@@ -18,15 +18,19 @@
 //   main exits without waking it.
 // - "rdtsc": "wait", with an rdtsc every 1000 iterations of main's loop (an
 //   instruction Hermit traps).
+// - "cpuid": "wait", with a cpuid every 1000 iterations of main's loop (an
+//   instruction Hermit traps through CPUID faulting).
 // - "segv": "wait", with a null store right after main's loop that a SIGSEGV
 //   handler, installed before the loop, recovers from; the fault is the
 //   first event after the loop.
-// - "long": "wait" with 3000000 iterations, more branches than the backstop
-//   timer of a thread running alone waits.
+// - "long": "wait" with 1250000 iterations, more branches than the backstop
+//   timer of a thread running alone waits (2000000): it fires once, at about
+//   2020000.
 // - "exec": no worker; main runs the loop alone, then execs this program with
 //   "done", which prints and exits.
 // Prints the loop's sum, the counter and CLOCK_MONOTONIC in nanoseconds.
 
+#include <cpuid.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -77,12 +81,21 @@ static void on_segv(int signal) {
   siglongjmp(recover, 1);
 }
 
-static unsigned long compute(unsigned long iterations, int trap) {
+// What main's loop traps every 1000 iterations.
+enum trap { TRAP_NONE, TRAP_RDTSC, TRAP_CPUID };
+
+static unsigned long compute(unsigned long iterations, enum trap trap) {
   volatile unsigned long sum = 0;
   for (unsigned long i = 0; i < iterations; i++) {
     sum += i;
-    if (trap && i % 1000 == 0) {
-      ticks += __rdtsc();
+    if (trap != TRAP_NONE && i % 1000 == 0) {
+      if (trap == TRAP_RDTSC) {
+        ticks += __rdtsc();
+      } else {
+        unsigned int a, b, c, d;
+        __cpuid(0, a, b, c, d);
+        ticks += a ^ b ^ c ^ d;
+      }
     }
   }
   return sum;
@@ -106,7 +119,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (strcmp(mode, "exec") == 0) {
-    print(compute(25000, 0));
+    print(compute(25000, TRAP_NONE));
     char* const args[] = {argv[0], "done", NULL};
     execv(argv[0], args);
     return 2;
@@ -116,7 +129,7 @@ int main(int argc, char** argv) {
   pthread_create(&thread, NULL, worker, NULL);
   unsigned long iterations = 25000;
   if (strcmp(mode, "long") == 0) {
-    iterations = 3000000;
+    iterations = 1250000;
   } else if (napping) {
     iterations = 8000;
   }
@@ -125,7 +138,13 @@ int main(int argc, char** argv) {
     signal(SIGSEGV, on_segv);
   }
   if (!segv || sigsetjmp(recover, 1) == 0) {
-    loop_sum = compute(iterations, strcmp(mode, "rdtsc") == 0);
+    enum trap trap = TRAP_NONE;
+    if (strcmp(mode, "rdtsc") == 0) {
+      trap = TRAP_RDTSC;
+    } else if (strcmp(mode, "cpuid") == 0) {
+      trap = TRAP_CPUID;
+    }
+    loop_sum = compute(iterations, trap);
     if (segv) {
       *(volatile int*)0 = 1;
     }
