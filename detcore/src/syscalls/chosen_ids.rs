@@ -1111,7 +1111,7 @@ fn read_guest_set_tid<M: MemoryAccess>(
         &mut bytes,
     );
     if read.is_err() {
-        return Err(if range_is_unmapped(tid, address as usize, bytes.len()) {
+        return Err(if range_faults(tid, address as usize, bytes.len()) {
             SetTidUnread::Refused
         } else {
             SetTidUnread::Unreadable
@@ -1217,7 +1217,13 @@ fn read_clone_args<M: MemoryAccess>(memory: &M, tid: i32, clone: &syscalls::Clon
         .args()
         .and_then(|args| Addr::<u8>::from_raw(args.as_raw()))
     else {
-        return Clone3Read::Refused;
+        // NULL faults unless page 0 is mapped (mmap_min_addr 0, or
+        // CAP_SYS_RAWIO); Detcore cannot read it either way.
+        return if range_faults(tid, 0, clone.size()) {
+            Clone3Read::Refused
+        } else {
+            Clone3Read::Unreadable { flags: None }
+        };
     };
     let mut bytes = vec![0u8; clone.size()];
     // Exactly the struct, with the guest's own access, as copy_from_user
@@ -1228,7 +1234,7 @@ fn read_clone_args<M: MemoryAccess>(memory: &M, tid: i32, clone: &syscalls::Clon
     {
         return Clone3Read::Bytes(bytes);
     }
-    if range_is_unmapped(tid, address.as_raw(), bytes.len()) {
+    if range_faults(tid, address.as_raw(), bytes.len()) {
         return Clone3Read::Refused;
     }
     // Mapped, but not readable with the guest's access (writable only):
@@ -1249,8 +1255,9 @@ enum Clone3Read {
     /// Its bytes, read as `copy_from_user` reads them.
     Bytes(Vec<u8>),
     /// Every kernel refuses the call before creating a task: the struct is
-    /// larger than a page (`E2BIG`), or not all in the guest's mappings
-    /// (`EFAULT`).
+    /// shorter than its first version (`EINVAL`) or larger than a page
+    /// (`E2BIG`), or reading it is proved to fault (`EFAULT`,
+    /// [`range_faults`]).
     Refused,
     /// It lies in the guest's mappings, but Detcore could not read it with
     /// the guest's access, while the kernel may (a page mapped writable, not
@@ -1258,13 +1265,27 @@ enum Clone3Read {
     Unreadable { flags: Option<u64> },
 }
 
+/// The end of user memory, exclusive (`TASK_SIZE_MAX`, page aligned), from
+/// `user_ptr_max`, the highest start `access_ok` accepts for a four-byte
+/// word. Kernels up to 6.1 check the word's end, so that start is four bytes
+/// short of the end; later x86 kernels check only a small access's start,
+/// against `TASK_SIZE_MAX` itself, relying on the unmapped page there. Both
+/// round down to the end.
+fn user_memory_end() -> Option<usize> {
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    let word_end = super::threads::user_ptr_max().checked_add(std::mem::size_of::<u32>())?;
+    Some(word_end & !(page - 1))
+}
+
 /// Whether some byte of the guest's `address..address + len` is one the
 /// kernel's `copy_from_user` faults on in every case (`EFAULT`), from the
 /// calling thread `tid`'s mappings (`/proc/<tid>/smaps`; the leader's are
 /// empty once it has exited): see [`range_faults_in`]. False when nothing is
-/// proved, as when the mappings cannot be read.
-fn range_is_unmapped(tid: i32, address: usize, len: usize) -> bool {
-    let Some(limit) = super::threads::user_ptr_max().checked_add(std::mem::size_of::<u32>()) else {
+/// proved, as when the mappings cannot be read. Reading smaps walks the page
+/// tables of every mapping, which is why it is read only after a read with
+/// the guest's own access has failed, a rare event.
+fn range_faults(tid: i32, address: usize, len: usize) -> bool {
+    let Some(limit) = user_memory_end() else {
         return false;
     };
     let Ok(smaps) = std::fs::read_to_string(format!("/proc/{tid}/smaps")) else {
@@ -1276,7 +1297,8 @@ fn range_is_unmapped(tid: i32, address: usize, len: usize) -> bool {
 /// Whether some byte of `address..address + len` is, by `smaps` (a
 /// `/proc/<tid>/smaps` text), one the kernel's `copy_from_user` faults on in
 /// every case:
-/// - at or beyond `limit`, the end of user memory (exclusive);
+/// - from below `limit`, the end of user memory (exclusive), to at or beyond
+///   it;
 /// - in a mapping without any permission (`---p`, such as a thread stack's
 ///   guard);
 /// - in no mapping, below a mapping that does not grow down. A mapping that
@@ -1284,16 +1306,24 @@ fn range_is_unmapped(tid: i32, address: usize, len: usize) -> bool {
 ///   on a fault, within the faulting task's own `RLIMIT_STACK`, which is the
 ///   guest's, not the tracer's, so such a hole proves nothing.
 ///
-/// False when nothing is proved, as when `smaps` lists no mapping.
+/// False when nothing is proved, as when `smaps` lists no mapping, or the
+/// address itself is at or beyond `limit`: it may be a tagged pointer (arm64's
+/// top-byte ignore, which bionic enables, or x86's linear address masking),
+/// which the kernel untags for a task that enabled tagging before it checks
+/// the range.
 fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> bool {
+    if address >= limit {
+        return false;
+    }
     let Some(end) = address.checked_add(len.max(1)) else {
         return true;
     };
     if end > limit {
         return true;
     }
-    // (start, end, any permission, grows down), in address order.
-    let mut mappings: Vec<(usize, usize, bool, bool)> = Vec::new();
+    // (start, end, any permission, grows down if its VmFlags were read), in
+    // address order.
+    let mut mappings: Vec<(usize, usize, bool, Option<bool>)> = Vec::new();
     for line in smaps.lines() {
         let mut fields = line.split_whitespace();
         let Some(first) = fields.next() else {
@@ -1301,7 +1331,7 @@ fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> boo
         };
         if let Some(flags) = line.strip_prefix("VmFlags:") {
             if let Some(last) = mappings.last_mut() {
-                last.3 = flags.split_whitespace().any(|flag| flag == "gd");
+                last.3 = Some(flags.split_whitespace().any(|flag| flag == "gd"));
             }
             continue;
         }
@@ -1316,7 +1346,7 @@ fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> boo
             continue;
         };
         let permitted = perms.bytes().take(3).any(|perm| perm != b'-');
-        mappings.push((start, stop, permitted, false));
+        mappings.push((start, stop, permitted, None));
     }
     if mappings.is_empty() {
         return false;
@@ -1334,7 +1364,9 @@ fn range_faults_in(smaps: &str, limit: usize, address: usize, len: usize) -> boo
                     .iter()
                     .filter(|(start, _, _, _)| *start > at)
                     .min_by_key(|(start, _, _, _)| *start);
-                return !matches!(above, Some(&(_, _, _, true)));
+                // Proved only below a mapping known not to grow down (or
+                // below none at all).
+                return matches!(above, None | Some(&(_, _, _, Some(false))));
             }
         }
     }
@@ -1807,10 +1839,36 @@ VmFlags: rd wr mr mw me gd ac
                 limit - len,
                 len
             ));
-            assert!(faults(limit - len + 1, len));
+            // One byte more crosses the end (a single byte cannot, as its
+            // address would be the end itself).
+            if len > 1 {
+                assert!(faults(limit - len + 1, len));
+            }
         }
-        assert!(faults(usize::MAX - 2, 8));
+        // At or beyond the end, an address may be a tagged pointer, which the
+        // kernel untags first: nothing is proved.
+        assert!(!faults(limit, 8));
+        assert!(!faults(0x0f00_0000_0000_4000, 8));
+        assert!(!faults(usize::MAX - 2, 8));
         // No mappings listed: nothing is proved.
         assert!(!super::range_faults_in("", limit, 0x4000, 8));
+        // A mapping whose VmFlags are missing might grow down: a hole below
+        // it proves nothing. Below no mapping at all, it does.
+        let unflagged = "5000-6000 rw-p 00000000 00:00 0\n";
+        assert!(!super::range_faults_in(unflagged, limit, 0x4000, 8));
+        assert!(super::range_faults_in(unflagged, limit, 0x7000, 8));
+        // Page zero, when mapped, is read like any other page.
+        assert!(!super::range_faults_in(
+            "0-1000 rw-p 00000000 00:00 0\nVmFlags: rd wr\n",
+            limit,
+            0,
+            88
+        ));
+        // The end of user memory is a page boundary, at most four bytes past
+        // the last four-byte word access_ok accepts.
+        let end = super::user_memory_end().unwrap();
+        let word = super::super::threads::user_ptr_max();
+        assert_eq!(end % 4096, 0, "{end:#x}");
+        assert!(word < end + 4096 && end <= word + 4, "{word:#x} {end:#x}");
     }
 }
