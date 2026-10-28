@@ -2260,7 +2260,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/replay_desync_spinner.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/replay_desync_spinner.c is owned by hermit-cli/tests/cli.rs: a_replay_stuck_off_its_schedule_lets_every_thread_run records it joining its worker at once and replays the record with its spin argument, where the main thread spins on sched_yield until the sleeping worker sets a flag; the replay leaves its schedule at the first sched_yield and must let the worker run instead of giving the spinner every turn. It needs a recording and a replay of different arguments, so it remains a guest fixture rather than a manifest cell."
+      "why": "tests/c/replay_desync_spinner.c is owned by hermit-cli/tests/cli.rs: a_replay_stuck_off_its_schedule_lets_every_thread_run records it joining its worker at once and replays the record with its spin argument, where the main thread spins on sched_yield until the sleeping worker sets a flag; the replay leaves its schedule at the first sched_yield and must let the worker run instead of giving the spinner every turn; a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic replays the same record under --replay-exhausted-panic, which must stop the run at the release with exit status 1. It needs a recording and a replay of different arguments, so it remains a guest fixture rather than a manifest cell."
     },
     {
       "disposition": "cargo-integration-test-fixture",

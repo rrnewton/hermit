@@ -257,7 +257,9 @@ impl State {
     }
 
     /// Drop the remaining checkpoints: the replay no longer follows the
-    /// schedule they belong to (`Replayer::release_schedule`).
+    /// schedule they belong to (`Replayer::release_schedule`). The scheduler
+    /// drops its copy at the reply that has the thread call this
+    /// (`Scheduler::schedule_replay_reply`).
     pub(crate) fn release(&mut self) {
         self.checkpoints.clear();
     }

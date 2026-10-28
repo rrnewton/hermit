@@ -4082,6 +4082,9 @@ impl GlobalState {
                         if let Err(refusal) = sched.authenticate_priority_birth(dettid) {
                             crate::scheduler::exit_on_scheduler_refusal(&refusal);
                         }
+                        // A thread born after the replay released its schedule
+                        // starts without the checkpoints, in both copies.
+                        sched.drop_released_callback_checkpoints(dettid);
                         let startup = crate::preemptions::callback_history::Startup {
                             checkpoints: sched
                                 .callback_checkpoints
@@ -6474,11 +6477,13 @@ impl GlobalState {
 
             // Read after any wait for the schedule: a release another thread's
             // event made meanwhile, in an earlier turn, counts too, and so does
-            // the end of the schedule.
-            let (schedule_released, schedule_over) = {
-                let sched = self.lock_rpc_scheduler(false).await;
-                (sched.schedule_released(), sched.schedule_replay_over())
-            };
+            // the end of the schedule. On a release the scheduler drops its
+            // copy of this thread's callback checkpoints here, and the thread
+            // drops its own when this reply reaches it.
+            let (schedule_released, schedule_over) = self
+                .lock_rpc_scheduler(false)
+                .await
+                .schedule_replay_reply(ev.dettid);
             TraceSchedEventResponse {
                 print_stack_strace: print_stack.or(print_stack2),
                 timeslice: end_of_timeslice,

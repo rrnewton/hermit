@@ -22463,9 +22463,18 @@ fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
     assert_success(&record, &record_args);
 
     let replay_from = format!("--replay-schedule-from={}", schedule.display());
+    let summary = directory.path().join("replay.summary");
+    let summary_to = format!("--summary-json={}", summary.display());
     let mut replay_args = vec!["--log=warn"];
     replay_args.extend(common);
-    replay_args.extend(["--timeout=20", replay_from.as_str(), "--", guest, "spin"]);
+    replay_args.extend([
+        "--timeout=20",
+        replay_from.as_str(),
+        summary_to.as_str(),
+        "--",
+        guest,
+        "spin",
+    ]);
     let replay = hermit(&replay_args);
     let log = stderr(&replay);
     assert_eq!(
@@ -22479,6 +22488,67 @@ fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
         log.contains("the replay no longer follows the schedule"),
         "the replay did not leave its schedule, so this is not the case:\n{log}"
     );
+    // The run summary, which `hermit analyze` keeps for each trial, says so
+    // too: a released trial is not a faithful replay of its schedule.
+    let summary: RunSummary = serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+    let desyncs = summary.desync_descrip.unwrap_or_default();
+    assert!(
+        desyncs.contains("RELEASED replayed schedule at event #"),
+        "the summary does not record the release:\n{desyncs}"
+    );
+}
+
+/// Under `--replay-exhausted-panic` a replay that leaves its schedule stops
+/// there, as one that runs out of it does, instead of running on unguided:
+/// the container exits with status 1 (`immediate_fatal_exit`), which hermit
+/// reports as its internal-failure exit, with the reason on stderr, and the
+/// guest never finishes.
+#[test]
+fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
+    let _guard = hermit_run_guard();
+    let guest = replay_desync_spinner_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let common = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    let record_to = format!("--record-preemptions-to={}", schedule.display());
+    let mut record_args: Vec<&str> = common.to_vec();
+    record_args.extend([record_to.as_str(), "--", guest]);
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+
+    let replay_from = format!("--replay-schedule-from={}", schedule.display());
+    let mut replay_args = vec!["--log=warn"];
+    replay_args.extend(common);
+    replay_args.extend([
+        "--timeout=20",
+        "--replay-exhausted-panic",
+        replay_from.as_str(),
+        "--",
+        guest,
+        "spin",
+    ]);
+    let replay = hermit(&replay_args);
+    let log = stderr(&replay);
+    assert_eq!(
+        replay.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{replay_args:?}:\n{}",
+        log.lines().take(40).collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        log.contains("The replay left its schedule at event #")
+            && log.contains("stopping (--replay-exhausted-panic)")
+            && log.contains("class=container-child-exit status=Exited(1)"),
+        "the replay did not stop where it left its schedule:\n{log}"
+    );
+    assert_eq!(stdout(&replay), "", "the guest ran on past the release");
 }
 
 /// A gate on a vfork child before its exec can never open: while the child
