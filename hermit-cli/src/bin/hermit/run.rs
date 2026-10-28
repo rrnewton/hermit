@@ -3770,6 +3770,7 @@ fn non_elf_entrypoints_skip_e9patch_preprocessing() {
         "run",
         &unrelated_mount,
         &tmp,
+        "--",
         "/tmp/script",
     ]);
     let plan = ro.adapter_executable_overlay_plan().unwrap();
@@ -5144,6 +5145,7 @@ fn cap_preemption_charge_parses_round_trips_and_is_refused_where_inert() {
                 "--backend=dbt",
                 "run",
                 "--cap-preemption-charge",
+                "--",
                 "fakeprog",
             ],
             "--cap-preemption-charge is not qualified for executable-selected backend `dbt`",
