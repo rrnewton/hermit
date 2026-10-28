@@ -27618,6 +27618,94 @@ mod test {
         assert!(!scheduler.blocked.sigchld_takers.contains(&target));
     }
 
+    /// A process (`leader` first) of `members`, each with the signal state
+    /// `state(blocked)`: SIGUSR1 caught, and `blocked` its mask.
+    fn signal_process(
+        scheduler: &mut Scheduler,
+        leader: DetTid,
+        members: &[(DetTid, u64)],
+        caught: u64,
+    ) {
+        scheduler.thread_tree.add_child(leader, leader, true);
+        for &(tid, blocked) in members {
+            if tid != leader {
+                scheduler.thread_tree.add_child(leader, tid, false);
+            }
+            register_known_thread(scheduler, tid);
+            scheduler.test_kernel_signal_states.insert(
+                tid,
+                KernelSignalState {
+                    caught,
+                    blocked,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// The thread chosen to take a guest's process-directed signal, which a
+    /// sibling could take from the shared queue too, resumes before that
+    /// sibling, though the sibling is first in line: Linux woke no
+    /// ptrace-stopped thread, so the first thread to resume would take the
+    /// copy (https://github.com/rrnewton/hermit/issues/4034). Once the copy is
+    /// gone from the shared queue, the sibling runs first again and the mark
+    /// goes.
+    #[test]
+    fn a_chosen_receiver_resumes_before_a_sibling_first_in_line() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let mut scheduler = gated_scheduler();
+        let leader = DetTid::from_raw(100);
+        let chosen = DetTid::from_raw(101);
+        let sibling = DetTid::from_raw(102);
+        // The leader sends and blocks SIGUSR1; the other two catch it.
+        signal_process(
+            &mut scheduler,
+            leader,
+            &[(leader, usr1), (chosen, 0), (sibling, 0)],
+            usr1,
+        );
+        let process = DetPid::from_raw(100);
+        assert_eq!(
+            scheduler.process_signal_receiver(process, leader, leader, libc::SIGUSR1),
+            process_signal_receiver::ProcessSignalReceiver::Thread {
+                thread: chosen,
+                sole: false
+            }
+        );
+        scheduler
+            .priorities
+            .insert(sibling, runqueue::FIRST_PRIORITY);
+        scheduler
+            .priorities
+            .insert(chosen, runqueue::LAST_PRIORITY - 1);
+        scheduler.runqueue_push_back(sibling);
+        scheduler.runqueue_push_back(chosen);
+        // The forwarded copy waits in the shared queue.
+        for tid in [leader, chosen, sibling] {
+            scheduler
+                .test_kernel_signal_states
+                .get_mut(&tid)
+                .unwrap()
+                .shared_pending = usr1;
+        }
+        let (selected, _, _) = scheduler.step3_peek().expect("a thread is runnable");
+        assert_eq!(selected, chosen);
+        scheduler.run_queue.undo_tentative_pop();
+
+        // The copy taken: the sibling first, and the mark gone.
+        for tid in [leader, chosen, sibling] {
+            scheduler
+                .test_kernel_signal_states
+                .get_mut(&tid)
+                .unwrap()
+                .shared_pending = 0;
+        }
+        let (selected, _, _) = scheduler.step3_peek().expect("a thread is runnable");
+        assert_eq!(selected, sibling);
+        scheduler.run_queue.undo_tentative_pop();
+        assert!(!scheduler.process_signal_takers.contains_key(&chosen));
+    }
+
     /// The readmission that broke record/replay of make -jN (minibeads
     /// dh-ojrf): make (7), a SIGCHLD taker, is backgrounded in a `pselect6`
     /// and a child (173) in a `connect`. Both calls have finished by one
