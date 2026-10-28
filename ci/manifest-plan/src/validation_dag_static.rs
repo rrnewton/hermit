@@ -1221,7 +1221,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // And host_input::tests::host_file_identities_without_and_with_contents
     // (a property snapshot copy is identified by its contents): 1930, listed.
-    ("test.regular_crates", 1930),
+    // And host_input::tests::a_flattened_identity_does_not_clash_with_a_records_own_content
+    // (the snapshot hash's JSON key is not a record's own `content`): 1931,
+    // listed.
+    ("test.regular_crates", 1931),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -6171,7 +6174,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // And the same host_input identity unit: 1916.
-    ("test.regular_crates_on_host", 1916),
+    // And the same flattened-identity unit: 1917.
+    ("test.regular_crates_on_host", 1917),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
