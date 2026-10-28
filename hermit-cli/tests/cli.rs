@@ -31945,6 +31945,47 @@ fn run_timeout_fires_by_name_and_unwinds_the_container() {
     );
 }
 
+/// A root that exits while a child it never reaped sits blocked: the run lasts
+/// until every guest process exits, so it reaches the bound. The report then
+/// names the process left running and the call it is in, not only the bound;
+/// before, it named the bound alone, which reads like a stuck root.
+#[test]
+fn run_timeout_names_the_guest_process_left_running_after_its_root_exited() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // `cat` opens a FIFO nothing will ever write, and blocks in that open; the
+    // shell that started it in the background exits at once. The FIFO's name
+    // carries this test process's pid and is removed afterwards: a fixed name
+    // would survive in /tmp, the next run's `mkfifo` would fail on it, and no
+    // `cat` would ever block.
+    let fifo = format!("/tmp/never-written-{}", std::process::id());
+    let _ = std::fs::remove_file(&fifo);
+    let script = format!("mkfifo {fifo} && exec cat {fifo} & exit 0");
+    let child = spawn_timed_run(RUN_TIMEOUT_SECS, &["/bin/sh", "-c", &script]);
+    let session = child.id() as i32;
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for hermit run --timeout");
+    let _ = std::fs::remove_file(&fifo);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    for pid in run_timeout_pids_in_session(session) {
+        // SAFETY: `kill` takes a pid and a signal and touches no caller memory;
+        // a stale pid can only fail with ESRCH.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    assert_eq!(output.status.code(), Some(124), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("1 guest process was still running: pid ")
+            && stderr.contains("\"cat\"")
+            && stderr.contains("orphaned: its parent exited")
+            && stderr.contains(" in openat"),
+        "the timeout report must name the guest process left running, `cat`, say it \
+         was orphaned, and name the call it is blocked in, not only the bound. \
+         stderr:\n{stderr}"
+    );
+}
+
 /// INSIDE the bound: a guest that finishes in time is untouched.
 ///
 /// Without this direction the cell above is satisfied by a `--timeout` that
