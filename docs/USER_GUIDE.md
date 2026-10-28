@@ -472,10 +472,34 @@ CPU-bound work therefore appears about `1 + charge / slice` times slower to
 the guest: 501 times at `--max-timeslice=1000`, so a test's own timeouts can
 expire before the code under test runs. `--cap-preemption-charge` charges a
 turn that ends an expired slice at most the virtual time its thread ran since
-its previous turn, which bounds that factor at 2; slices at least one charge
-long are charged as before. It changes the guest-visible time of short-slice
-runs, so a recorded schedule stores the setting and a replay under the other
-is refused.
+its previous turn, which bounds that factor at 2. A thread's previous turn can
+be a syscall inside the same slice: a preemption whose thread ran at least one
+charge since its previous turn is charged as before, and one that follows a
+syscall by less is charged only the time since that syscall, however long the
+slice was. A capped turn whose full charge is nonzero still adds at least
+one virtual nanosecond; a full charge that `--clock-multiplier` makes zero
+stays zero. A recorded schedule stores the setting, and a replay under the
+other is refused.
+
+The option changes what the guest observes. After a capped preemption,
+`clock_gettime(CLOCK_MONOTONIC)`, and every other clock Hermit derives from
+the same virtual time, has advanced less than it would without the option. A
+timer or timeout measured on those clocks (a sleep, a futex, `poll` or
+`epoll_wait` timeout, a POSIX timer or `timerfd`) therefore expires after more
+guest work, and a program that times its own work sees shorter intervals.
+Linux defines no cost for a context switch that Hermit could copy. What it
+does define for `CLOCK_MONOTONIC` still holds. `clock_gettime` calls the
+clock's `clock_get_timespec`
+([kernel/time/posix-timers.c:1132-1148 at v6.9](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v6.9#n1132)),
+which for `CLOCK_MONOTONIC` is `posix_get_monotonic_timespec`, a read of
+`ktime_get_ts64`
+([:154-159](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v6.9#n154),
+[:1448-1451](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v6.9#n1448)),
+a clock that never goes back. Under the option Hermit's virtual time still
+never goes back either: a thread's own work only adds to it, and a capped
+scheduler charge only shrinks what a turn adds, never below zero. The
+one-nanosecond floor further keeps a capped turn whose full charge is nonzero
+from adding nothing.
 
 Most of that cost comes from stopping the guest at the end of every slice,
 and much of it is saved where no other thread could run. When every other

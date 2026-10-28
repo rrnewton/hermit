@@ -17032,8 +17032,10 @@ impl Scheduler {
     /// expired timeslice (`Resources::slice_expired`), the difference from
     /// its previous turn's clock, the virtual time it ran in that slice,
     /// caps the turn's charge (`preemption_cap`). Two kinds of turn are not
-    /// recorded: a host-timed polling retry, so how many retries ran cannot
-    /// change a cap, and a schedule replay's own switch turn (`TraceReplay`,
+    /// recorded: a host-timed polling retry, so a retry does not restart the
+    /// measure (a retry adds nothing to the thread's clock beyond its own work,
+    /// and the cap reads only that clock), and a schedule replay's own switch
+    /// turn (`TraceReplay`,
     /// `is_internal_turn`), which its recording does not have: granted to a
     /// thread stopped at a request it has not yet been granted, it would
     /// restart that thread's measure, so a replayed preemption would be
@@ -24021,6 +24023,22 @@ mod test {
             charge(true, &[(expired(thread), 1_000, 0)]),
             full,
             "no earlier turn on record"
+        );
+        // The measure starts at the thread's previous granted turn, a syscall
+        // in the same slice included, not at the slice's start: a thread that
+        // has already run two charges' worth (a nonzero clock) is charged the
+        // 1,000 ns since its last turn, not its clock.
+        assert_eq!(
+            charge(
+                true,
+                &[
+                    (plain(thread), 0, 0),
+                    (plain(thread), 2 * full, 0),
+                    (expired(thread), 1_000, 0)
+                ]
+            ),
+            1_000,
+            "the time since its previous turn, not since the slice began"
         );
         assert_eq!(
             charge(true, &[(plain(thread), 0, 0), (plain(thread), 1_000, 0)]),

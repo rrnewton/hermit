@@ -1127,11 +1127,16 @@ pub struct Config {
     /// `--max-timeslice`, or a short `--chaos` draw, multiplies the guest-visible time of
     /// CPU-bound work by about `1 + charge / slice`: 501 times at `--max-timeslice=1000`,
     /// enough for a test's own timeouts to expire before it reaches the code under test. With
-    /// it the factor is at most 2, what a slice one full charge long already costs; a slice
-    /// at least that long is charged as before. A capped turn is charged at least one virtual
-    /// nanosecond. An explicit `sched_yield`, and every turn that does not end a timeslice,
-    /// keep the full charge. This changes the guest-visible time of runs with short slices:
-    /// recorded schedules store the setting, and a replay under the other is refused.
+    /// it the factor is at most 2, what a slice one full charge long already costs. A
+    /// preemption whose thread ran at least one full charge since its previous turn is
+    /// charged as before; a thread's turns include its syscalls, so one that follows a syscall
+    /// by less is charged only the time since that syscall, however long the slice. A capped
+    /// turn is charged at least one virtual nanosecond, unless its full charge after
+    /// `--clock-multiplier` is zero. An explicit `sched_yield`, and every
+    /// turn that does not end a timeslice, keep the full charge. This changes what the guest
+    /// reads from `clock_gettime(CLOCK_MONOTONIC)` and the other virtual clocks, and so when
+    /// its timers and timeouts expire: recorded schedules store the setting, and a replay
+    /// under the other is refused.
     /// Refused where no timeslice ends by expiry (`--max-timeslice=disabled` without
     /// `--target-timeslice`) or no Detcore scheduler orders the threads (`--namespace-only`,
     /// `--strace-only`, `--no-sequentialize-threads`), and with the DBT backend; never applied
