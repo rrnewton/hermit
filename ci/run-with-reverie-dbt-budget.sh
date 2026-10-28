@@ -3126,7 +3126,18 @@ fi
 # are object-identical. The calibrated numeric budgets and widths are
 # unchanged. This is source/SDK-budget carry, not fresh Hermit execution;
 # the companion fixture repair requires its own actual controls.
-expected_pin=90f9928cf3a2f6dde48bcd5cba7a52f6669faa76
+# BUDGET TO e99426e3b2b0728905f935dbf9d7301422cf7652 (2026-10-28): private
+# libc read/write adapters now translate raw errors into that thread's errno.
+# The vendor loader changes, so this is not unchanged-SDK-input carry. The new
+# SDK recipe 84595fbb0161561a90ec12c2bffca4149649ef4ba5611b283edd8687f8479617
+# completed its source build in 50.45 seconds at two jobs (100.89 job-seconds)
+# in one bounded local sample; the 107-file installation was verified. This
+# sample does not recalibrate hosted-runner budgets: numeric limits and width
+# remain unchanged. build.rs/native/toolchain are unchanged; current native
+# images still require their own producer. Five added regression fixture/test
+# files raise the tracked DBT inventory to 1043. The LiteInst source catalog
+# remains 73 rows. No Hermit runtime result is inferred from this budget binding.
+expected_pin=e99426e3b2b0728905f935dbf9d7301422cf7652
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
