@@ -34,13 +34,13 @@ pub use hermit::canonical_verdict::VerificationRun;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
+/// A parsed mount specification retained exactly for command reconstruction.
+pub use super::run::MountArg;
 pub use super::run::RunLatches;
 /// Stamp only the common invocation-bound pending NO-RESULT report. This is
 /// the same fixed operation used by the shared application and saved comparison;
 /// terminal verdicts and their publication remain owned by the common driver.
 pub use super::verify::write_pending_verification_json;
-/// A parsed mount specification retained exactly for command reconstruction.
-pub use super::run::MountArg;
 
 /// The operation whose physical execution the application is preparing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,8 +101,7 @@ pub trait BackendAdapter {
     const NATIVE_IDENTITY_DIAGNOSTIC: Option<&'static str> = None;
     /// Reason text for the core's mandatory early refusal of a nondefault CPU
     /// profile. An adapter cannot admit a profile through this declaration.
-    const NONDEFAULT_CPU_PROFILE_REFUSAL: &'static str =
-        "only the ptrace backend is qualified";
+    const NONDEFAULT_CPU_PROFILE_REFUSAL: &'static str = "only the ptrace backend is qualified";
 
     type Options;
     type Session;
@@ -122,12 +121,14 @@ pub trait BackendAdapter {
     fn validate_mode(&self, mode: Mode) -> Result<(), Error> {
         match mode {
             Mode::Ordinary | Mode::VerificationPair => Ok(()),
-            Mode::SavedVerification => Err(Error::new(hermit::PolicyRefusal).context(format!(
-                "--verify-run is not yet supported by executable-selected backend `{}`: \
+            Mode::SavedVerification => {
+                Err(Error::new(super::container::PolicyRefusal).context(format!(
+                    "--verify-run is not yet supported by executable-selected backend `{}`: \
                  this adapter has not admitted the saved-record operation; \
                  use live --verify instead",
-                Self::NAME
-            ))),
+                    Self::NAME
+                )))
+            }
         }
     }
 
@@ -1567,17 +1568,15 @@ mod tests {
         }
         // The current core qualifies virtual CPU topology only for ptrace.
         // An executable-selected adapter cannot inherit that default identity.
-        let mut unqualified = super::super::run::RunOpts::parse_from([
-            "run",
-            "--virtual-cpus=1",
-            "--",
-            "/bin/true",
-        ]);
+        let mut unqualified =
+            super::super::run::RunOpts::parse_from(["run", "--virtual-cpus=1", "--", "/bin/true"]);
         unqualified
             .select_application_backend(StaticAdapter::NAME)
             .unwrap();
         let global = super::super::global_opts::GlobalOpts::parse_from(["hermit-dynamorio"]);
-        let error = unqualified.main_with_backend(&global, &adapter, 7).unwrap_err();
+        let error = unqualified
+            .main_with_backend(&global, &adapter, 7)
+            .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("--virtual-cpus"), "{message}");
         assert!(message.contains("dynamorio"), "{message}");
