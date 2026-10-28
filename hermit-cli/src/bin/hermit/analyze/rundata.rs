@@ -11,9 +11,13 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::num::NonZeroU32;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::bail;
@@ -26,14 +30,163 @@ use detcore::preemptions::PreemptionRecord;
 use detcore::preemptions::strip_times_from_events_file;
 use detcore::types::SchedEvent;
 use detcore_model::config::ExpiredWaitCharge;
+use detcore_model::summary::RunSummary;
 use hermit::process::Bind;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
 use crate::analyze::consts::*;
 use crate::analyze::types::AnalyzeOpts;
+use crate::analyze::types::CONFIRM_BOUND_FACTOR;
+use crate::analyze::types::ContinuationTimeslice;
+use crate::analyze::types::NANOS_PER_SECOND;
+use crate::analyze::types::TRIAL_LOG_FACTOR;
+use crate::analyze::types::TRIAL_LOG_FLOOR;
+use crate::analyze::types::TRIAL_TIMEOUT_BACKSTOP_FACTOR;
+use crate::analyze::types::TRIAL_TIMEOUT_FACTOR;
+use crate::analyze::types::TRIAL_TIMEOUT_FLOOR;
+use crate::analyze::types::TRIAL_VIRTUAL_TIMEOUT_FACTOR;
+use crate::analyze::types::TRIAL_VIRTUAL_TIMEOUT_FLOOR;
+use crate::analyze::types::TrialTimeout;
+use crate::analyze::types::TrialVirtualTimeout;
+use crate::container::RunTimeoutMarker;
 use crate::global_opts::GlobalOpts;
 use crate::run::RunOpts;
+
+/// How a trial ended ([`RunData::launch_trial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialEnd {
+    /// It finished and met the target criteria.
+    Met,
+    /// It finished and did not meet them.
+    Missed,
+    /// It stopped before it finished, so it did not reach the target.
+    Unfinished(Stop),
+}
+
+/// What stopped an unfinished trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// A wall-clock bound: `--trial-timeout`, or a `--timeout` in the run
+    /// arguments. It stops a trial wherever the guest has got to when the
+    /// host's clock runs out, so another run of the trial can finish.
+    Bound,
+    /// A virtual-time bound, in virtual nanoseconds: `--trial-virtual-timeout`,
+    /// or a `--virtual-timeout` in the run arguments. The trial's summary says
+    /// the scheduler granted no turn past it, which happens at the same turn
+    /// in every run of the trial, on every host.
+    VirtualBound(u64),
+    /// Hermit refused it (exit 122) when the guest reached an operation it
+    /// does not support.
+    Refusal,
+}
+
+/// A run's summary says that its `--virtual-timeout` bound, this many virtual
+/// nanoseconds, stopped it (`RunSummary::virtual_timeout_ns`): the scheduler
+/// granted no turn past it, and the run finished there with the output its
+/// guest had written, not with an outcome of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualBoundStop(pub u64);
+
+impl std::fmt::Display for VirtualBoundStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the run's virtual clock passed --virtual-timeout={} (virtual nanoseconds since the \
+             run began), where Hermit stopped it",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for VirtualBoundStop {}
+
+impl TrialEnd {
+    /// Whether the trial met the target criteria.
+    pub fn reached_target(self) -> bool {
+        self == TrialEnd::Met
+    }
+
+    /// Whether the trial finished.
+    pub fn finished(self) -> bool {
+        !matches!(self, TrialEnd::Unfinished(_))
+    }
+
+    /// How a trial that `launched` with this result ended; any error but a
+    /// wall-clock bound's, a virtual-time bound's ([`VirtualBoundStop`]) and
+    /// a run-time refusal ([`guest_reached_a_refusal`]) is returned
+    /// unchanged. `matched` says whether a finished trial met the criteria;
+    /// `log` is the trial's own log file, if it has one, where a refusal's
+    /// reason is.
+    ///
+    /// A trial replays a schedule no endpoint run took, and that can lead
+    /// the guest to an operation Hermit refuses
+    /// (https://github.com/rrnewton/hermit/issues/4034, for example), which
+    /// stops it before it can show either outcome.
+    fn classify(
+        launched: anyhow::Result<()>,
+        matched: impl FnOnce() -> bool,
+        log: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let error = match launched {
+            Ok(()) if matched() => return Ok(TrialEnd::Met),
+            Ok(()) => return Ok(TrialEnd::Missed),
+            Err(error) => error,
+        };
+        if let Some(&VirtualBoundStop(bound)) = error.downcast_ref() {
+            eprintln!(" => Stopped in virtual time ({error}); counted as not meeting the target");
+            return Ok(TrialEnd::Unfinished(Stop::VirtualBound(bound)));
+        }
+        match error {
+            error if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                eprintln!(" => Timed out ({error}); counted as not meeting the target");
+                Ok(TrialEnd::Unfinished(Stop::Bound))
+            }
+            error if guest_reached_a_refusal(&error) => {
+                eprintln!(
+                    " => {} Hermit refused this trial when the guest reached an operation it \
+                     does not support (exit 122; the reason is in {}); counted as not meeting \
+                     the target",
+                    "WARNING:".yellow().bold(),
+                    log.map_or("hermit's log above".to_owned(), |log| log
+                        .display()
+                        .to_string())
+                );
+                Ok(TrialEnd::Unfinished(Stop::Refusal))
+            }
+            error => Err(error),
+        }
+    }
+}
+
+/// How a finished run ended, from the `--virtual-timeout` bound its summary
+/// says stopped it (`stopped`, [`RunData::read_summary`]) and, when none did,
+/// from whether its output `matched` the target criteria. A stopped run
+/// finished with the output its guest had written and the bound's exit
+/// status 124, not with an outcome of its own, so that output is not matched:
+/// the default target ("nonzero") would count it as met.
+fn finished_run_outcome(
+    stopped: Option<u64>,
+    matched: impl FnOnce() -> bool,
+) -> Result<bool, VirtualBoundStop> {
+    match stopped {
+        Some(bound) => Err(VirtualBoundStop(bound)),
+        None => Ok(matched()),
+    }
+}
+
+/// Whether Hermit refused a run after its guest started, at an operation it
+/// does not support. The container's exit-122 arm returns a bare
+/// `PolicyRefusal`, whose reason Detcore logged before exiting. A refusal
+/// decided before the guest starts (an option or a backend Hermit does not
+/// admit) carries its reason as context instead; it is the same for every
+/// trial, so it ends the analysis.
+pub fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
+    error.chain().count() == 1
+        && error
+            .downcast_ref::<crate::container::PolicyRefusal>()
+            .is_some()
+}
 
 /// A single run plus the results of the run, either in memory or on disk.
 pub struct RunData {
@@ -58,6 +211,18 @@ pub struct RunData {
     in_mem_sched_out: Option<PreemptionRecord>,
 
     is_a_match: Option<bool>,
+
+    /// The `--trial-timeout` bound this run took, when it is shorter than the
+    /// run arguments' own `--timeout` ([`AnalyzeOpts::trial_bound`]).
+    trial_bound: Option<NonZeroU64>,
+    /// How long the run took, once it finished.
+    wall: Option<Duration>,
+    /// The run's virtual time, in virtual nanoseconds, once it finished and
+    /// its summary said (`virttime_elapsed`).
+    virtual_elapsed: Option<u64>,
+    /// The log file the run wrote, once it launched (`--verbose` or
+    /// `--selfcheck`).
+    logged_to: Option<PathBuf>,
 }
 
 impl RunData {
@@ -159,19 +324,18 @@ impl RunData {
         self.is_a_match.is_some()
     }
 
-    /// Called after the run has been launched, normalize the output preemptions and swap around so
-    /// that our output file points to the normalized version.
-    pub fn normalize_preempts_out(&mut self) {
+    /// Write a normalized copy of the output preemption record, for reading
+    /// only, beside it, and return its path and contents. The run keeps its
+    /// own record: normalization renumbers priorities across the scheduler's
+    /// fixed ones, so the copy can replay another schedule.
+    pub fn write_normalized_preempts(&mut self) -> (PathBuf, PreemptionRecord) {
         assert!(self.has_launched());
-        let preempts_path = self.preempts_path_out();
-        let normalized_path = preempts_path.with_extension("normalized");
-
+        let normalized_path = self.preempts_path_out().with_extension("normalized");
         let normalized = self.preempts_out().normalize();
         normalized
             .write_to_disk(&normalized_path)
             .expect("write of preempts file to succeed");
-        self.in_mem_sched_out = Some(normalized);
-        self.sched_path_out = Some(normalized_path);
+        (normalized_path, normalized)
     }
 
     /// The global options a trial run is launched with. Trials go through
@@ -188,6 +352,11 @@ impl RunData {
                 None
             },
             backend: self.analyze_opts.backend,
+            // A run analyze bounds in time also gets the log bound.
+            log_file_limit: self
+                .analyze_opts
+                .trial_bound(&self.runopts)
+                .and(self.analyze_opts.trial_log_limit()),
             // Every trial charges the invocation's ONE budget, as verify's
             // per-run logs do. Without --verbose/--selfcheck a trial traces to
             // hermit's own stderr -- the public stream the cap exists to bound.
@@ -209,6 +378,7 @@ impl RunData {
         // /tmp -- but the fix is the same and costs nothing.
         let mut gopts = gopts;
         gopts.open_log_file()?;
+        self.logged_to = gopts.log_file.clone();
         let final_record_path = self
             .runopts
             .det_opts
@@ -228,8 +398,13 @@ impl RunData {
         std::fs::write(repro_file, self.to_repro() + "\n")?;
         self.runopts.write_debug_options_dump()?;
 
-        let (_, output) = self.runopts.run(&gopts, true)?;
+        let started = Instant::now();
+        let (_, output) = self
+            .runopts
+            .run(&gopts, true)
+            .map_err(|error| self.name_the_trial_bound(error))?;
         let output: Output = output.context("expected captured output")?;
+        self.wall = Some(started.elapsed());
 
         File::create(root.with_extension("stdout"))
             .unwrap()
@@ -252,7 +427,10 @@ impl RunData {
             self.runopts.det_opts.det_config.record_preemptions_to = final_record_path;
         }
 
-        self.is_a_match = Some(self.analyze_opts.output_matches(&output));
+        let outcome = finished_run_outcome(self.read_summary()?, || {
+            self.analyze_opts.output_matches(&output)
+        });
+        self.is_a_match = outcome.ok();
 
         if self.analyze_opts.verbose {
             println!(
@@ -264,7 +442,138 @@ impl RunData {
                 String::from_utf8(output.stderr).unwrap()
             );
         }
-        Ok(())
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(stop) => Err(self.name_the_virtual_bound(stop)),
+        }
+    }
+
+    /// Read the summary of a run that finished: its virtual time, which an
+    /// endpoint run contributes to the trials' bounds, and the
+    /// `--virtual-timeout` bound that stopped it, if one did
+    /// (`RunSummary::virtual_timeout_ns`). Both stay unknown where the
+    /// backend wrote no summary. A run bounded in virtual time on a backend
+    /// that writes the summary of a run its bound stopped
+    /// (`RunOpts::virtual_timeout_trial_refusal`) must have one: without it a
+    /// stopped run would read as one that finished.
+    fn read_summary(&mut self) -> anyhow::Result<Option<u64>> {
+        let Some(path) = &self.runopts.summary_json else {
+            return Ok(None);
+        };
+        let bounded = self.runopts.det_opts.det_config.virtual_timeout.is_some()
+            && self.runopts.virtual_timeout_trial_refusal().is_none();
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !bounded => {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot read the run summary {}", path.display()));
+            }
+        };
+        let summary: RunSummary = serde_json::from_slice(&bytes)
+            .with_context(|| format!("cannot parse the run summary {}", path.display()))?;
+        self.virtual_elapsed = Some(summary.virttime_elapsed);
+        Ok(summary.virtual_timeout_ns)
+    }
+
+    /// Launch a trial and say how it ended ([`TrialEnd::classify`]).
+    pub fn launch_trial(&mut self) -> anyhow::Result<TrialEnd> {
+        let launched = self.launch();
+        TrialEnd::classify(launched, || self.is_a_match(), self.logged_to.as_deref())
+    }
+
+    /// Bound the run's virtual time ([`AnalyzeOpts::trial_virtual_bound`])
+    /// and its wall-clock time ([`AnalyzeOpts::trial_bound`]) by the endpoint
+    /// runs measured before it was created.
+    fn apply_trial_bound(&mut self) {
+        if let Some(bound) = self.analyze_opts.trial_virtual_bound(&self.runopts) {
+            let own = &mut self.runopts.det_opts.det_config.virtual_timeout;
+            *own = Some(own.map_or(bound, |own| own.min(bound)));
+        }
+        let Some(bound) = self.analyze_opts.trial_bound(&self.runopts) else {
+            return;
+        };
+        if self
+            .runopts
+            .run_timeout()
+            .is_none_or(|own| own.as_secs() > bound.get())
+        {
+            self.trial_bound = Some(bound);
+        }
+        self.runopts.bound_run_timeout(bound);
+    }
+
+    /// A run that `--trial-timeout`'s bound ended says so, and how to change
+    /// the bound: the error itself names only the run's `--timeout`, which
+    /// the user did not pass.
+    fn name_the_trial_bound(&self, error: anyhow::Error) -> anyhow::Error {
+        match self.trial_bound {
+            Some(bound) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                error.context(format!(
+                    "{} reached hermit analyze's bound of {bound} s for this run \
+                     (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)",
+                    self.runname
+                ))
+            }
+            _ => error,
+        }
+    }
+
+    /// A run a virtual-time bound stopped says which bound it was and how to
+    /// change it, as [`Self::name_the_trial_bound`] does for the wall-clock
+    /// bound: the run arguments' own `--virtual-timeout`, analyze's
+    /// (`--trial-virtual-timeout`), which a run may also carry over from the
+    /// run whose options it copied, or both, when they are equal.
+    fn name_the_virtual_bound(&self, stop: VirtualBoundStop) -> anyhow::Error {
+        let VirtualBoundStop(bound) = stop;
+        let own = self.analyze_opts.run_args_virtual_timeout() == Some(bound);
+        let analyze = self
+            .analyze_opts
+            .trial_virtual_bound(&self.runopts)
+            .map(NonZeroU64::get)
+            == Some(bound);
+        let which = match (own, analyze) {
+            (true, true) => format!(
+                "the run arguments' --virtual-timeout={bound}, which is also hermit analyze's \
+                 virtual-time bound for this run (raise both: --virtual-timeout in the run \
+                 arguments, and --trial-virtual-timeout=FACTOR)"
+            ),
+            (true, false) => format!(
+                "the run arguments' --virtual-timeout={bound} (raise or drop --virtual-timeout \
+                 in the run arguments)"
+            ),
+            (false, _) => format!(
+                "hermit analyze's virtual-time bound of {bound} ns for this run \
+                 (--trial-virtual-timeout=FACTOR raises it, --trial-virtual-timeout=off lifts it)"
+            ),
+        };
+        anyhow::Error::new(stop).context(format!("{} reached {which}", self.runname))
+    }
+
+    /// The run's virtual time, in virtual nanoseconds, once it finished and
+    /// its summary said: what an endpoint run contributes to the trials'
+    /// virtual-time bound.
+    pub fn virtual_elapsed(&self) -> Option<u64> {
+        self.virtual_elapsed
+    }
+
+    /// How long the run took and how large its log file grew, once it
+    /// finished: what an endpoint run contributes to the trials' bounds.
+    pub fn measurement(&self) -> Option<(Duration, Option<u64>)> {
+        let wall = self.wall?;
+        let log_bytes = self
+            .logged_to
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len());
+        Some((wall, log_bytes))
+    }
+
+    /// This run's name in the workspace.
+    pub fn name(&self) -> &str {
+        &self.runname
     }
 
     /// Any post-processing that needs to be applied to a recorded file of SchedEvents
@@ -294,7 +603,16 @@ impl RunData {
         lvl
     }
 
+    /// A run with `runopts`, bounded by the endpoint runs measured so far
+    /// ([`AnalyzeOpts::trial_bound`]).
     pub fn new(aopts: &AnalyzeOpts, runname: String, runopts: RunOpts) -> Self {
+        let mut run = Self::new_unbounded(aopts, runname, runopts);
+        run.apply_trial_bound();
+        run
+    }
+
+    /// A run with `runopts` that no `--trial-timeout` bounds: the target run.
+    fn new_unbounded(aopts: &AnalyzeOpts, runname: String, runopts: RunOpts) -> Self {
         let log_level: LevelFilter = Self::log_level(aopts);
         let mut rd = RunData {
             runname,
@@ -308,6 +626,10 @@ impl RunData {
             in_mem_sched_out: None,
             is_a_match: None,
             log_level,
+            trial_bound: None,
+            wall: None,
+            virtual_elapsed: None,
+            logged_to: None,
         };
 
         // By default we save the config for every run.
@@ -326,10 +648,11 @@ impl RunData {
         Ok(Self::new(aopts, runname, ro))
     }
 
-    /// Create a run for the initial on-target execution.
+    /// Create a run for the initial on-target execution. It is the first
+    /// run, and the trials' bound derives from it, so nothing bounds it.
     pub fn new_run1_target(aopts: &AnalyzeOpts, runname: String) -> anyhow::Result<Self> {
         let ro = Self::get_run1_runopts(aopts)?;
-        Ok(Self::new(aopts, runname, ro))
+        Ok(Self::new_unbounded(aopts, runname, ro))
     }
 
     /// Replay with the selected run's seeds and the original replay policy.
@@ -348,6 +671,8 @@ impl RunData {
         config.rng_seed = target.rng_seed;
         config.fuzz_seed = target.fuzz_seed;
         config.sched_seed = target.sched_seed;
+        // A replay of the target run is a trial, bounded like the others.
+        replay.apply_trial_bound();
         Ok(replay)
     }
 
@@ -510,6 +835,10 @@ impl RunData {
             in_mem_preempts_in: None,
             // Invariant: minimize should always return an on-target configuration:
             is_a_match: Some(true),
+            trial_bound: None,
+            wall: None,
+            virtual_elapsed: None,
+            logged_to: None,
         }
     }
 
@@ -534,6 +863,10 @@ impl RunData {
             in_mem_preempts_in: None,
             // Don't claim that it was run:
             is_a_match: None,
+            trial_bound: None,
+            wall: None,
+            virtual_elapsed: None,
+            logged_to: None,
         }
     }
 
@@ -607,6 +940,308 @@ impl RunData {
 }
 
 impl AnalyzeOpts {
+    /// The factor `--trial-virtual-timeout` gives:
+    /// [`TRIAL_VIRTUAL_TIMEOUT_FACTOR`] when it is not given, none with `off`.
+    fn trial_virtual_factor(&self) -> Option<NonZeroU32> {
+        match self.trial_virtual_timeout {
+            None => Some(TRIAL_VIRTUAL_TIMEOUT_FACTOR),
+            Some(TrialVirtualTimeout::Factor(factor)) => Some(factor),
+            Some(TrialVirtualTimeout::Off) => None,
+        }
+    }
+
+    /// The virtual-time bound, in virtual nanoseconds, on a run with
+    /// `trial`'s options (`--trial-virtual-timeout`): max(60 s, the factor
+    /// times the longest endpoint run measured so far). None with `off`,
+    /// before an endpoint run's summary gave its virtual time, and where the
+    /// run could not report that the bound stopped it
+    /// (`RunOpts::virtual_timeout_trial_refusal`).
+    ///
+    /// Nothing in the bound comes from the host: each endpoint run's virtual
+    /// time is a function of its schedule, so every host derives the same
+    /// bound, and a trial stops at the same scheduler turn on each.
+    pub fn trial_virtual_bound(&self, trial: &RunOpts) -> Option<NonZeroU64> {
+        let factor = self.trial_virtual_factor()?;
+        if trial.virtual_timeout_trial_refusal().is_some() {
+            return None;
+        }
+        let longest = self.endpoints.longest_virtual?;
+        NonZeroU64::new(
+            longest
+                .saturating_mul(u64::from(factor.get()))
+                .max(TRIAL_VIRTUAL_TIMEOUT_FLOOR),
+        )
+    }
+
+    /// The wall-clock bound, in whole seconds, on a run with `trial`'s
+    /// options (`--trial-timeout`): none where `--timeout` cannot be
+    /// enforced, and with `auto` max(60 s, 10 times the slowest endpoint run
+    /// measured so far), none before one was, times
+    /// [`TRIAL_TIMEOUT_BACKSTOP_FACTOR`] while the run is bounded in virtual
+    /// time too ([`AnalyzeOpts::trial_virtual_bound`]), times
+    /// [`AnalyzeOpts::trial_bound_factor`].
+    pub fn trial_bound(&self, trial: &RunOpts) -> Option<NonZeroU64> {
+        self.trial_bound_times(trial, self.trial_bound_factor)
+    }
+
+    /// [`AnalyzeOpts::trial_bound`] with the bound multiplied by `factor`.
+    fn trial_bound_times(&self, trial: &RunOpts, factor: u32) -> Option<NonZeroU64> {
+        if !trial.accepts_run_timeout() {
+            return None;
+        }
+        match self.trial_timeout {
+            TrialTimeout::Off => None,
+            TrialTimeout::Seconds(seconds) => {
+                NonZeroU64::new(seconds.get().saturating_mul(u64::from(factor)))
+            }
+            TrialTimeout::Auto => {
+                // With the virtual-time bound in place, this one only has to
+                // stop a hang in which no virtual time passes.
+                let backstop = match self.trial_virtual_bound(trial) {
+                    Some(_) => TRIAL_TIMEOUT_BACKSTOP_FACTOR,
+                    None => 1,
+                };
+                let bound = self
+                    .endpoints
+                    .slowest?
+                    .saturating_mul(TRIAL_TIMEOUT_FACTOR)
+                    .max(TRIAL_TIMEOUT_FLOOR)
+                    .saturating_mul(backstop)
+                    .saturating_mul(factor);
+                NonZeroU64::new(bound.as_secs() + u64::from(bound.subsec_nanos() > 0))
+            }
+        }
+    }
+
+    /// The wall-clock bound, in whole seconds, a `--prefix-search` trial gets
+    /// when it runs again to confirm the boundary: [`CONFIRM_BOUND_FACTOR`]
+    /// times `--trial-timeout`'s, within the run arguments' own `--timeout`.
+    /// None unless that is longer than the bound trials get now: none with
+    /// `--trial-timeout=off`, once the bound was raised, or where a shorter
+    /// `--timeout` in the run arguments applies.
+    pub fn confirmation_bound(&self) -> Option<u64> {
+        if self.trial_bound_factor != 1 {
+            return None;
+        }
+        let longer = self.effective_trial_bound_times(CONFIRM_BOUND_FACTOR)?;
+        self.effective_trial_bound_times(1)
+            .is_some_and(|now| longer > now)
+            .then_some(longer)
+    }
+
+    /// The run arguments' own `--timeout`, in whole seconds.
+    pub fn run_args_timeout(&self) -> Option<u64> {
+        RunData::get_raw_runopts(self)
+            .run_timeout()
+            .map(|own| own.as_secs())
+    }
+
+    /// The virtual-time bound, in virtual nanoseconds, a trial created now
+    /// gets from analyze ([`AnalyzeOpts::trial_virtual_bound`]), whatever
+    /// the run arguments' own `--virtual-timeout`.
+    pub fn current_trial_virtual_bound(&self) -> Option<u64> {
+        self.trial_virtual_bound(&RunData::get_raw_runopts(self))
+            .map(NonZeroU64::get)
+    }
+
+    /// The run arguments' own `--virtual-timeout`, in virtual nanoseconds.
+    pub fn run_args_virtual_timeout(&self) -> Option<u64> {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .virtual_timeout
+            .map(NonZeroU64::get)
+    }
+
+    /// The wall-clock bound, in whole seconds, a trial created now runs
+    /// under: [`AnalyzeOpts::trial_bound`], or the run arguments' own
+    /// `--timeout` where that is shorter.
+    pub fn effective_trial_bound(&self) -> Option<u64> {
+        self.effective_trial_bound_times(self.trial_bound_factor)
+    }
+
+    /// [`AnalyzeOpts::effective_trial_bound`] with `--trial-timeout`'s bound
+    /// multiplied by `factor`.
+    fn effective_trial_bound_times(&self, factor: u32) -> Option<u64> {
+        let trial = RunData::get_raw_runopts(self);
+        let own = trial.run_timeout().map(|own| own.as_secs());
+        let analyze = self.trial_bound_times(&trial, factor).map(NonZeroU64::get);
+        match (own, analyze) {
+            (Some(own), Some(analyze)) => Some(own.min(analyze)),
+            (own, analyze) => own.or(analyze),
+        }
+    }
+
+    /// The cap on a trial's log file while trials are bounded: max(64 MiB,
+    /// 10 times the largest endpoint log), once an endpoint run has written
+    /// one.
+    pub fn trial_log_limit(&self) -> Option<u64> {
+        if self.trial_timeout == TrialTimeout::Off {
+            return None;
+        }
+        let largest = self.endpoints.largest_log?;
+        Some(
+            largest
+                .saturating_mul(TRIAL_LOG_FACTOR)
+                .max(TRIAL_LOG_FLOOR),
+        )
+    }
+
+    /// Record a finished endpoint `run`, and say what bounds the runs after it
+    /// now get, when they changed.
+    pub fn record_endpoint(&mut self, run: &RunData) {
+        let Some((wall, log_bytes)) = run.measurement() else {
+            return;
+        };
+        let trial = RunData::get_raw_runopts(self);
+        let first = self.endpoints.slowest.is_none();
+        let before = self.trial_bound(&trial);
+        let virtual_before = self.trial_virtual_bound(&trial);
+        let slowest = self.endpoints.record(wall, log_bytes);
+        if let Some(elapsed) = run.virtual_elapsed() {
+            self.endpoints.record_virtual(elapsed);
+        }
+        self.announce_virtual_bound(&trial, run, first, virtual_before);
+        if self.trial_timeout != TrialTimeout::Auto {
+            return;
+        }
+        let Some(bound) = self.trial_bound(&trial) else {
+            if !first {
+                return;
+            }
+            eprintln!(
+                ":: {} the runs' backend does not enforce hermit run --timeout, so analyze \
+                 does not bound them (--trial-timeout). Bound the whole analysis from outside \
+                 instead, for example with timeout(1).",
+                "WARNING:".yellow().bold()
+            );
+            return;
+        };
+        if before == Some(bound) {
+            return;
+        }
+        let shorter = trial
+            .run_timeout()
+            .filter(|own| own.as_secs() < bound.get())
+            .map_or(String::new(), |own| {
+                format!(
+                    "; the run arguments' shorter --timeout={} applies instead",
+                    own.as_secs()
+                )
+            });
+        let slowest = match (slowest, self.endpoints.slowest) {
+            (false, Some(slowest)) => format!("at {:.1} s", slowest.as_secs_f64()),
+            _ => format!("{} at {:.1} s", run.name(), wall.as_secs_f64()),
+        };
+        let usual = format!(
+            "max({} s, {TRIAL_TIMEOUT_FACTOR} x the slowest endpoint run, {slowest})",
+            TRIAL_TIMEOUT_FLOOR.as_secs()
+        );
+        if self.trial_virtual_bound(&trial).is_some() {
+            eprintln!(
+                ":: Runs from here on are bounded at {bound} s of wall-clock time: \
+                 {TRIAL_TIMEOUT_BACKSTOP_FACTOR} x {usual}, a backstop to the virtual-time bound \
+                 for a hang in which no virtual time passes (--trial-timeout{shorter})."
+            );
+        } else {
+            eprintln!(
+                ":: Runs from here on are bounded at {bound} s of wall-clock time: {usual} \
+                 (--trial-timeout{shorter})."
+            );
+        }
+    }
+
+    /// Say what virtual-time bound the runs after the endpoint `run` now get,
+    /// when it changed (`run` is then the longest endpoint run), or, after
+    /// the first endpoint run, why they get none where
+    /// `--trial-virtual-timeout` asks for one. `before` is the bound before
+    /// `run` was recorded.
+    fn announce_virtual_bound(
+        &self,
+        trial: &RunOpts,
+        run: &RunData,
+        first: bool,
+        before: Option<NonZeroU64>,
+    ) {
+        let Some(factor) = self.trial_virtual_factor() else {
+            return;
+        };
+        if let Some(reason) = trial.virtual_timeout_trial_refusal() {
+            if first {
+                eprintln!(
+                    ":: {} {reason}, so analyze does not bound the runs in virtual time \
+                     (--trial-virtual-timeout).",
+                    "Note:".yellow().bold()
+                );
+            }
+            return;
+        }
+        let (Some(bound), Some(elapsed)) = (self.trial_virtual_bound(trial), run.virtual_elapsed())
+        else {
+            return;
+        };
+        if before == Some(bound) {
+            return;
+        }
+        let shorter = trial
+            .det_opts
+            .det_config
+            .virtual_timeout
+            .filter(|&own| own <= bound)
+            .map_or(String::new(), |own| {
+                if own < bound {
+                    format!("; the run arguments' shorter --virtual-timeout={own} applies instead")
+                } else {
+                    format!("; the run arguments' --virtual-timeout={own} is the same bound")
+                }
+            });
+        eprintln!(
+            ":: Runs from here on are bounded at {bound} ns of virtual time: max({} s, {factor} x \
+             the longest endpoint run, {} at {elapsed} ns) (--trial-virtual-timeout{shorter}).",
+            TRIAL_VIRTUAL_TIMEOUT_FLOOR / NANOS_PER_SECOND,
+            run.name(),
+        );
+    }
+
+    /// Refuses (exit 122) an explicit `--trial-timeout=SECONDS` where the
+    /// trials' backend does not enforce `hermit run --timeout`
+    /// (`RunOpts::ensure_timeout_supported`), before any workspace or trial
+    /// exists: the bound could not be kept.
+    pub fn refuse_unenforceable_trial_timeout(&self) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        match self.trial_timeout {
+            TrialTimeout::Seconds(seconds) if !trial.accepts_run_timeout() => Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "--trial-timeout={seconds} cannot be enforced: the trials run on a backend \
+                     on which `hermit run --timeout` is not qualified. Use --trial-timeout=off \
+                     and an outer bound (see docs/TIMEOUT_LADDER.md)."
+                )),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuses (exit 122) an explicit `--trial-virtual-timeout=FACTOR` where
+    /// the trials could not report that a virtual-time bound stopped them
+    /// (`RunOpts::virtual_timeout_trial_refusal`), before any workspace or
+    /// trial exists: the bound could not be kept.
+    pub fn refuse_inapplicable_trial_virtual_timeout(&self) -> anyhow::Result<()> {
+        let Some(TrialVirtualTimeout::Factor(factor)) = self.trial_virtual_timeout else {
+            return Ok(());
+        };
+        match RunData::get_raw_runopts(self).virtual_timeout_trial_refusal() {
+            Some(reason) => Err(anyhow::Error::new(crate::container::PolicyRefusal).context(
+                format!(
+                    "--trial-virtual-timeout={factor} cannot be applied: {reason}. Omit it, or \
+                     pass --trial-virtual-timeout=off: the trials are then bounded by \
+                     --trial-timeout alone, where their backend enforces `hermit run --timeout` \
+                     (see docs/TIMEOUT_LADDER.md)."
+                ),
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// Refuses `--max-log-bytes` (exit 122) where the cap's `_exit(123)` could
     /// leave a trial's guest running (`RunOpts::log_cap_refusal`). `run` makes
     /// this check in `RunOpts::main`, but trials go straight to `RunOpts::run`,
@@ -768,6 +1403,43 @@ impl AnalyzeOpts {
         )
     }
 
+    /// Refuses (exit 122) a `--continuation-timeslice` that would change the
+    /// replayed prefix, before any workspace or trial: one shorter than the
+    /// run's `--max-timeslice`, which also ends the prefix's slices that its
+    /// schedule does not end, or one for a run without PMU timeslices, whose
+    /// clock it would change.
+    pub fn refuse_unsound_continuation_timeslice(&self) -> anyhow::Result<()> {
+        let ContinuationTimeslice::Nanos(nanos) = self.continuation_timeslice else {
+            return Ok(());
+        };
+        let reason = match self.trial_max_timeslice() {
+            None => "the run arguments disable PMU timeslices, and a continuation timeslice \
+                     would turn them on for the replayed prefix too"
+                .to_owned(),
+            Some(run) if nanos < run => format!(
+                "it is shorter than the run's --max-timeslice={run}, and the trials' timeslice \
+                 also ends the replayed prefix's slices that its schedule does not end, so it \
+                 would change the prefix"
+            ),
+            Some(_) => return Ok(()),
+        };
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "--continuation-timeslice={nanos} is refused: {reason}. Omit it (auto), or pass \
+                 a timeslice at least as long as the run's own."
+            )),
+        )
+    }
+
+    /// The trials' `--max-timeslice`, from their run arguments (`None` for
+    /// disabled).
+    pub fn trial_max_timeslice(&self) -> detcore_model::config::MaybeTimeslice {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .max_timeslice
+    }
+
     /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
     /// for off).
     pub fn trial_pipe_wake_latency(&self) -> Option<u64> {
@@ -853,9 +1525,17 @@ impl AnalyzeOpts {
     }
 
     /// Write the schedule `events` for a trial to replay, stamped
-    /// ([`Self::stamp_trial_record`]).
+    /// ([`Self::stamp_trial_record`]). The events alone carry no callback
+    /// checkpoints: a schedule analyze edits (a swap, a reordering) has no
+    /// recorded slice ends to keep.
     pub fn write_trial_schedule(&self, events: Vec<SchedEvent>, path: &Path) -> anyhow::Result<()> {
-        self.stamp_trial_record(PreemptionRecord::from_sched_events(events))
+        self.write_trial_record(PreemptionRecord::from_sched_events(events), path)
+    }
+
+    /// Write `record` for a trial to replay, stamped
+    /// ([`Self::stamp_trial_record`]).
+    pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
+        self.stamp_trial_record(record)
             .write_to_disk(path)
             .map_err(anyhow::Error::msg)
     }
@@ -1590,14 +2270,33 @@ mod tests {
         }
     }
 
-    /// Through `main`: the dropped-option, overwritten-output and
-    /// unqualified-timeout refusals are in analyze's preflight, before the
-    /// workspace and every trial. `--run1-schedule` stops a `main` that passed
-    /// them, with its own refusal right after that preflight, so each case
-    /// asserts which refusal fired and that it was not that one (see the
-    /// strict counter test below).
+    /// Through `main`: the dropped-option, overwritten-output,
+    /// unqualified-timeout and inapplicable virtual-timeout refusals are in
+    /// analyze's preflight, before the workspace and every trial.
+    /// `--run1-schedule` stops a `main` that passed them, with its own refusal
+    /// right after that preflight, so each case asserts which refusal fired and
+    /// that it was not that one (see the strict counter test below).
     #[test]
     fn trials_refuse_run_options_only_main_applies_before_their_workspace() {
+        let refused_in_preflight = |argv: &[&str], named: &str| {
+            let args = crate::Args::try_parse_from(argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            let error = options.main(&args.global).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{argv:?}: {error:#}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(named), "{argv:?}: {error:#}");
+            assert!(
+                !message.contains("does not implement"),
+                "{argv:?}: main passed the preflight refusal: {error:#}"
+            );
+        };
         for (backend, extra, named) in [
             (None, "--namespace-only", "--namespace-only"),
             (None, "--lite", "--namespace-only"),
@@ -1669,24 +2368,20 @@ mod tests {
                 extra,
                 "/bin/true",
             ]);
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
-                panic!("{argv:?} is not analyze")
-            };
-            let error = options.main(&args.global).unwrap_err();
-            assert!(
-                error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
-                    .is_some(),
-                "{argv:?}: {error:#}"
-            );
-            let message = error.to_string();
-            assert!(message.contains(named), "{argv:?}: {error:#}");
-            assert!(
-                !message.contains("does not implement"),
-                "{argv:?}: main passed the preflight refusal: {error:#}"
-            );
+            refused_in_preflight(&argv, named);
         }
+        refused_in_preflight(
+            &[
+                "hermit",
+                "--backend=kvm",
+                "analyze",
+                "--trial-virtual-timeout=3",
+                "--run1-schedule=/nonexistent/schedule.json",
+                "--",
+                "/bin/true",
+            ],
+            "--trial-virtual-timeout=3 cannot be applied: the trials run on the kvm backend",
+        );
     }
 
     /// Analyze's trials apply `--skid-margin`: its preflight records it as the
@@ -2092,5 +2787,802 @@ mod tests {
                 Some(&workspace.path().join("replay_out.preempts")),
             );
         }
+    }
+
+    /// `--trial-timeout=auto` bounds a run at max(60 s, 10 times the
+    /// slowest endpoint run measured so far), rounded up to whole seconds,
+    /// and gives no bound before an endpoint was measured; a number of
+    /// seconds bounds every run but the target run, and `off` none.
+    #[test]
+    fn the_trial_bound_derives_from_the_slowest_endpoint_run() {
+        use std::time::Duration;
+        let options = |extra: &[&str]| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.extend(["--", "/bin/true"]);
+            AnalyzeOpts::try_parse_from(argv).unwrap()
+        };
+        let mut auto = options(&[]);
+        let trial = RunData::get_raw_runopts(&auto);
+        assert_eq!(auto.trial_bound(&trial), None, "nothing measured yet");
+        assert!(auto.endpoints.record(Duration::from_secs(2), None));
+        assert_eq!(auto.trial_bound(&trial), NonZeroU64::new(60), "the floor");
+        assert!(auto.endpoints.record(Duration::from_millis(30_150), None));
+        assert_eq!(auto.trial_bound(&trial), NonZeroU64::new(302));
+        assert!(
+            !auto.endpoints.record(Duration::from_secs(1), None),
+            "a faster endpoint changes nothing"
+        );
+        assert_eq!(auto.trial_bound(&trial), NonZeroU64::new(302));
+
+        let explicit = options(&["--trial-timeout=5"]);
+        assert_eq!(
+            explicit.trial_bound(&trial),
+            NonZeroU64::new(5),
+            "an explicit bound needs no measurement"
+        );
+        let mut off = options(&["--trial-timeout=off"]);
+        off.endpoints.record(Duration::from_secs(30), None);
+        assert_eq!(off.trial_bound(&trial), None);
+        for refused in ["--trial-timeout=0", "--trial-timeout=soon"] {
+            let error = AnalyzeOpts::try_parse_from(["analyze", refused, "--", "/bin/true"])
+                .expect_err(refused);
+            assert!(
+                error.to_string().contains("positive number of seconds"),
+                "{refused}: {error}"
+            );
+        }
+    }
+
+    /// A run created after an endpoint run was measured runs under the
+    /// bound, or under the run arguments' own `--timeout` where that is
+    /// shorter, and so does its printed reproducer; the target run is not
+    /// bounded.
+    #[test]
+    fn runs_take_the_bound_and_the_target_run_does_not() {
+        let created = |run_args: &[&str], explicit: Option<&str>| {
+            let mut argv = vec!["analyze"];
+            argv.extend(explicit);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            options
+                .endpoints
+                .record(std::time::Duration::from_secs(10), None);
+            let trial = RunData::new_baseline(&options, "bounded".to_owned()).unwrap();
+            let target = RunData::new_run1_target(&options, "target".to_owned()).unwrap();
+            let seconds = |run: &RunData| run.runopts.run_timeout().map(|bound| bound.as_secs());
+            assert_eq!(
+                trial.to_repro().contains(" --timeout="),
+                seconds(&trial).is_some(),
+                "{}",
+                trial.to_repro()
+            );
+            (seconds(&trial), seconds(&target), trial.trial_bound)
+        };
+        assert_eq!(created(&[], None), (Some(100), None, NonZeroU64::new(100)));
+        assert_eq!(created(&["--timeout=30"], None), (Some(30), Some(30), None));
+        assert_eq!(
+            created(&["--timeout=300"], None),
+            (Some(100), Some(300), NonZeroU64::new(100))
+        );
+        assert_eq!(
+            created(&[], Some("--trial-timeout=off")),
+            (None, None, None)
+        );
+    }
+
+    /// A `--prefix-search` confirmation runs under 4 times `--trial-timeout`'s
+    /// bound, within the run arguments' own `--timeout`, and once the bound
+    /// is raised the runs created after that take it. `off`, a shorter
+    /// `--timeout` in the run arguments, or a bound raised already leaves
+    /// nothing longer to give.
+    #[test]
+    fn a_confirmation_lengthens_the_trial_bound() {
+        let options = |extra: &[&str], run_args: &[&str]| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            options
+                .endpoints
+                .record(std::time::Duration::from_millis(10_400), None);
+            options
+        };
+        assert_eq!(options(&[], &[]).confirmation_bound(), Some(416));
+        assert_eq!(
+            options(&[], &["--timeout=120"]).confirmation_bound(),
+            Some(120)
+        );
+        assert_eq!(options(&[], &["--timeout=30"]).confirmation_bound(), None);
+        assert_eq!(
+            options(&["--trial-timeout=5"], &[]).confirmation_bound(),
+            Some(20)
+        );
+        assert_eq!(
+            options(&["--trial-timeout=off"], &[]).confirmation_bound(),
+            None
+        );
+        let mut raised = options(&[], &[]);
+        assert_eq!(raised.effective_trial_bound(), Some(104));
+        raised.trial_bound_factor = CONFIRM_BOUND_FACTOR;
+        assert_eq!(raised.confirmation_bound(), None);
+        assert_eq!(raised.effective_trial_bound(), Some(416));
+        let workspace = tempfile::tempdir().unwrap();
+        raised.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_baseline(&raised, "prefix_round_002".to_owned()).unwrap();
+        assert_eq!(
+            run.runopts.run_timeout().map(|bound| bound.as_secs()),
+            Some(416)
+        );
+        assert_eq!(run.trial_bound, NonZeroU64::new(416));
+    }
+
+    /// A run that the bound ended says which bound it was and how to change
+    /// it; one that its own `--timeout` ended, or that failed otherwise, is
+    /// left as it was.
+    #[test]
+    fn a_run_the_trial_bound_ends_names_the_bound() {
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        options
+            .endpoints
+            .record(std::time::Duration::from_secs(1), None);
+        let run = RunData::new_baseline(&options, "run2_baseline".to_owned()).unwrap();
+        let timed_out = run.name_the_trial_bound(anyhow::Error::new(RunTimeoutMarker));
+        assert!(timed_out.downcast_ref::<RunTimeoutMarker>().is_some());
+        let message = format!("{timed_out:#}");
+        assert!(
+            message.starts_with(
+                "run2_baseline reached hermit analyze's bound of 60 s for this run \
+                 (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)"
+            ),
+            "{message}"
+        );
+        let other = run.name_the_trial_bound(anyhow::anyhow!("no such file"));
+        assert_eq!(format!("{other:#}"), "no such file");
+    }
+
+    /// While trials are bounded, a trial's log file is capped at
+    /// max(64 MiB, 10 times the largest endpoint log); before an endpoint
+    /// wrote one, or with `--trial-timeout=off`, by HERMIT_LOG_MAX_BYTES alone.
+    #[test]
+    fn a_trials_log_is_capped_by_the_largest_endpoint_log() {
+        use std::time::Duration;
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        assert_eq!(options.trial_log_limit(), None);
+        options
+            .endpoints
+            .record(Duration::from_secs(1), Some(1 << 20));
+        assert_eq!(options.trial_log_limit(), Some(64 << 20));
+        options
+            .endpoints
+            .record(Duration::from_secs(1), Some(100 << 20));
+        assert_eq!(options.trial_log_limit(), Some(1000 << 20));
+        options
+            .endpoints
+            .record(Duration::from_secs(1), Some(2 << 20));
+        assert_eq!(options.trial_log_limit(), Some(1000 << 20));
+        options.trial_timeout = TrialTimeout::Off;
+        assert_eq!(options.trial_log_limit(), None);
+    }
+
+    /// A trial that did not finish did not reach the target: one that a
+    /// bound ended, or that Hermit refused at run time (a bare refusal, whose
+    /// reason Detcore logged). A refusal decided before the guest started
+    /// (with its reason attached) and any other failure (here: the log cap)
+    /// end the analysis with their error, still of their type.
+    #[test]
+    fn a_trial_that_did_not_finish_did_not_reach_the_target() {
+        let classify = |launched: anyhow::Result<()>, matched: bool| {
+            TrialEnd::classify(launched, || matched, None)
+        };
+        assert_eq!(classify(Ok(()), true).unwrap(), TrialEnd::Met);
+        assert_eq!(classify(Ok(()), false).unwrap(), TrialEnd::Missed);
+        let timed_out = anyhow::Error::new(RunTimeoutMarker)
+            .context("Guest exceeded the --timeout bound of 3 seconds");
+        let end = classify(Err(timed_out), true).unwrap();
+        assert_eq!(end, TrialEnd::Unfinished(Stop::Bound));
+        assert!(!end.reached_target() && !end.finished());
+        let refused = anyhow::Error::new(crate::container::PolicyRefusal);
+        assert_eq!(
+            classify(Err(refused), true).unwrap(),
+            TrialEnd::Unfinished(Stop::Refusal)
+        );
+        let admission = anyhow::Error::new(crate::container::PolicyRefusal)
+            .context("unsupported_preemption: --backend=kvm refuses --max-timeslice");
+        let admission = classify(Err(admission), true).unwrap_err();
+        assert!(
+            admission
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some()
+                && format!("{admission:#}").contains("unsupported_preemption"),
+            "{admission:#}"
+        );
+        let capped = classify(
+            Err(anyhow::Error::new(crate::container::LogCapExceeded)),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            capped
+                .downcast_ref::<crate::container::LogCapExceeded>()
+                .is_some(),
+            "{capped:#}"
+        );
+    }
+
+    /// An explicit `--trial-timeout` that the runs cannot keep (KVM, which
+    /// does not enforce `--timeout`, and the in-guest runtime, which refuses
+    /// one) is refused before any workspace or run; `auto` does without it.
+    #[test]
+    fn an_unenforceable_trial_timeout_is_refused_and_auto_does_without() {
+        let options = |argv: &[&str]| {
+            let args = crate::Args::try_parse_from(argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        let mut backends = vec!["kvm"];
+        if cfg!(feature = "liteinst") {
+            backends.push("liteinst");
+        }
+        for backend in backends {
+            let backend = format!("--backend={backend}");
+            let explicit = options(&[
+                "hermit",
+                &backend,
+                "analyze",
+                "--trial-timeout=5",
+                "--",
+                "/bin/true",
+            ]);
+            let error = explicit
+                .refuse_unenforceable_trial_timeout()
+                .expect_err("the runs cannot keep a --timeout");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{backend}: {error:#}"
+            );
+            assert!(error.to_string().contains("--trial-timeout=5"), "{error:#}");
+
+            let mut auto = options(&["hermit", &backend, "analyze", "--", "/bin/true"]);
+            auto.refuse_unenforceable_trial_timeout().unwrap();
+            auto.endpoints
+                .record(std::time::Duration::from_secs(10), None);
+            assert_eq!(
+                auto.trial_bound(&RunData::get_raw_runopts(&auto)),
+                None,
+                "{backend}"
+            );
+        }
+        options(&["hermit", "analyze", "--trial-timeout=5", "--", "/bin/true"])
+            .refuse_unenforceable_trial_timeout()
+            .unwrap();
+    }
+
+    /// A `--continuation-timeslice` shorter than the run's `--max-timeslice`,
+    /// or one for a run without PMU timeslices, is refused before any
+    /// workspace or trial, naming what to pass instead; one at least as long
+    /// is accepted.
+    #[test]
+    fn a_continuation_timeslice_that_would_change_the_prefix_is_refused() {
+        let refusal = |argv: &[&str]| {
+            let mut full = vec!["analyze", "--prefix-search"];
+            full.extend(argv);
+            full.push("/bin/true");
+            AnalyzeOpts::try_parse_from(full)
+                .unwrap()
+                .refuse_unsound_continuation_timeslice()
+        };
+        for (argv, reason) in [
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=100000",
+                ][..],
+                "shorter than the run's --max-timeslice=100000",
+            ),
+            (
+                &["--continuation-timeslice=20000000", "--"][..],
+                "shorter than the run's --max-timeslice=200000000",
+            ),
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=disabled",
+                ][..],
+                "disable PMU timeslices",
+            ),
+        ] {
+            let error = refusal(argv).expect_err(reason);
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(reason) && message.contains("Omit it (auto)"),
+                "{argv:?}: {message}"
+            );
+        }
+        refusal(&[
+            "--continuation-timeslice=200000000",
+            "--",
+            "--max-timeslice=1000",
+        ])
+        .unwrap();
+        refusal(&["--"]).unwrap();
+    }
+
+    /// The normalized copy of a run's preemption record is written beside it
+    /// for reading, and the run keeps its own record: the target endpoint
+    /// and --minimize's baseline replay the record that met the target.
+    /// Before, the run switched to the copy, whose renumbered priorities can
+    /// run another schedule, and a minimized record that met the target was
+    /// then "still not matching" it.
+    #[test]
+    fn a_normalized_record_is_written_for_reading_and_not_replayed() {
+        use detcore::preemptions::PreemptionRecord;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let recorded = workspace.path().join("round_014.preempts");
+        let history = vec![
+            (detcore::types::LogicalTime::from_nanos(1_000), 352),
+            (detcore::types::LogicalTime::from_nanos(2_000), 4923),
+        ];
+        let record = PreemptionRecord::from_vecs(&std::collections::BTreeMap::from([(
+            detcore::DetTid::from_raw(7),
+            history,
+        )]));
+        record.write_to_disk(&recorded).unwrap();
+        let mut run = RunData::from_minimize_output(
+            &options,
+            "minimized".to_owned(),
+            RunData::get_raw_runopts(&options),
+            record.clone(),
+            recorded.clone(),
+            workspace.path().join("round_014.log"),
+        );
+        let (normalized_path, normalized) = run.write_normalized_preempts();
+        assert_eq!(
+            normalized_path,
+            workspace.path().join("round_014.normalized")
+        );
+        assert!(normalized_path.exists());
+        assert_ne!(normalized, record, "normalizing renumbers the priorities");
+        assert_eq!(run.preempts_path_out(), recorded.as_path());
+        assert_eq!(run.preempts_out(), &record);
+    }
+
+    /// `--trial-virtual-timeout` bounds a run at max(60 s, the factor times
+    /// the longest endpoint run's virtual time), 10 times when the option is
+    /// not given. It gives no bound before an endpoint run's summary gave its
+    /// virtual time, with `off`, or with `--no-virtualize-time` in the run
+    /// arguments. A factor is a positive whole number, and the help says what
+    /// the bound measures and what it changes.
+    #[test]
+    fn the_trial_virtual_bound_derives_from_the_longest_endpoint_run() {
+        use clap::CommandFactory;
+        let options = |extra: &[&str], run_args: &[&str]| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            AnalyzeOpts::try_parse_from(argv).unwrap()
+        };
+        let mut default = options(&[], &[]);
+        let trial = RunData::get_raw_runopts(&default);
+        assert_eq!(
+            default.trial_virtual_bound(&trial),
+            None,
+            "nothing measured"
+        );
+        default.endpoints.record_virtual(2_000_000_000);
+        assert_eq!(
+            default.trial_virtual_bound(&trial),
+            NonZeroU64::new(60_000_000_000),
+            "the floor"
+        );
+        default.endpoints.record_virtual(7_500_000_001);
+        assert_eq!(
+            default.trial_virtual_bound(&trial),
+            NonZeroU64::new(75_000_000_010)
+        );
+        default.endpoints.record_virtual(1_000);
+        assert_eq!(
+            default.trial_virtual_bound(&trial),
+            NonZeroU64::new(75_000_000_010),
+            "a shorter endpoint run changes nothing"
+        );
+
+        let mut three = options(&["--trial-virtual-timeout=3"], &[]);
+        three.endpoints.record_virtual(30_000_000_000);
+        assert_eq!(
+            three.trial_virtual_bound(&trial),
+            NonZeroU64::new(90_000_000_000)
+        );
+        let mut off = options(&["--trial-virtual-timeout=off"], &[]);
+        off.endpoints.record_virtual(30_000_000_000);
+        assert_eq!(off.trial_virtual_bound(&trial), None);
+        let mut untimed = options(&[], &["--no-virtualize-time"]);
+        untimed.endpoints.record_virtual(30_000_000_000);
+        assert_eq!(
+            untimed.trial_virtual_bound(&RunData::get_raw_runopts(&untimed)),
+            None
+        );
+        for refused in ["0", "2.5", "auto", "-1"] {
+            let flag = format!("--trial-virtual-timeout={refused}");
+            let error = AnalyzeOpts::try_parse_from(["analyze", flag.as_str(), "--", "/bin/true"])
+                .expect_err(&flag);
+            assert!(
+                error
+                    .to_string()
+                    .contains("expected a positive whole factor or `off`"),
+                "{flag}: {error}"
+            );
+        }
+
+        let help = AnalyzeOpts::command().render_long_help().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for expected in [
+            "--trial-virtual-timeout <FACTOR|off>",
+            "at max(60 s, FACTOR times the longest endpoint run so far) of virtual time, read as \
+             the `virttime_elapsed` of each endpoint run's summary",
+            "stops at the same scheduler turn on every host and in every run",
+            "the report calls it a hang, a third outcome. Unlike a trial the wall-clock bound \
+             stops, it is not confirmed with a longer bound: a rerun at the same bound stops at \
+             the same turn",
+            "`--trial-timeout=off` leaves the virtual bound without a backstop",
+            "where it is shorter than a trial takes to reach the virtual bound, host time decides \
+             whether that trial finishes",
+            "`off` lifts the wall-clock bound only: the virtual-time bound, where it applies, \
+             still does, without this backstop",
+            "`--trial-timeout=auto` gives 4 times its usual wall-clock bound",
+            "and at 4 times that while `--trial-virtual-timeout` bounds the runs in virtual time",
+        ] {
+            assert!(
+                help.contains(expected),
+                "{expected:?} missing from:\n{help}"
+            );
+        }
+    }
+
+    /// While the virtual-time bound applies, `--trial-timeout=auto` gives 4
+    /// times its usual bound, a backstop for a hang that passes no virtual
+    /// time, and a confirmation 4 times that. An explicit
+    /// `--trial-timeout=SECONDS` is used as given; with
+    /// `--trial-virtual-timeout=off`, or before an endpoint run's virtual
+    /// time is known, the usual bound applies.
+    #[test]
+    fn the_wall_clock_bound_is_a_backstop_while_the_virtual_bound_applies() {
+        let measured = |extra: &[&str], wall: Duration, virtual_ns: Option<u64>| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.extend(["--", "/bin/true"]);
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            options.endpoints.record(wall, None);
+            if let Some(elapsed) = virtual_ns {
+                options.endpoints.record_virtual(elapsed);
+            }
+            options
+        };
+        let slow = Duration::from_millis(10_400);
+        let backstop = measured(&[], slow, Some(5_000_000));
+        assert_eq!(backstop.effective_trial_bound(), Some(416));
+        assert_eq!(backstop.confirmation_bound(), Some(1_664));
+        assert_eq!(
+            measured(&[], Duration::from_secs(1), Some(1_000)).effective_trial_bound(),
+            Some(240),
+            "4 times the floor"
+        );
+        assert_eq!(measured(&[], slow, None).effective_trial_bound(), Some(104));
+        assert_eq!(
+            measured(&["--trial-virtual-timeout=off"], slow, Some(5_000_000))
+                .effective_trial_bound(),
+            Some(104)
+        );
+        assert_eq!(
+            measured(&["--trial-timeout=30"], slow, Some(5_000_000)).effective_trial_bound(),
+            Some(30),
+            "an explicit bound is used as given"
+        );
+    }
+
+    /// A run created once an endpoint run's virtual time is known runs under
+    /// `--virtual-timeout` at the virtual bound, or under the run arguments'
+    /// own where that is shorter, and its printed reproducer carries it and
+    /// reproduces the run's options; the target run is not bounded, and
+    /// `--trial-virtual-timeout=off` bounds no run in virtual time.
+    #[test]
+    fn runs_take_the_virtual_bound_and_their_reproducer_carries_it() {
+        use clap::CommandFactory;
+        let workspace = tempfile::tempdir().unwrap();
+        let created = |run_args: &[&str], explicit: Option<&str>| {
+            let mut argv = vec!["analyze"];
+            argv.extend(explicit);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            options.endpoints.record(Duration::from_secs(10), None);
+            options.endpoints.record_virtual(8_000_000_000);
+            let trial = RunData::new_baseline(&options, "bounded".to_owned()).unwrap();
+            let target = RunData::new_run1_target(&options, "target".to_owned()).unwrap();
+            let bound = |run: &RunData| {
+                run.runopts
+                    .det_opts
+                    .det_config
+                    .virtual_timeout
+                    .map(NonZeroU64::get)
+            };
+            let repro = trial.to_repro();
+            match bound(&trial) {
+                Some(nanos) => assert_eq!(
+                    repro
+                        .matches(&format!(" --virtual-timeout={nanos}"))
+                        .count(),
+                    1,
+                    "{repro}"
+                ),
+                None => assert!(!repro.contains("--virtual-timeout"), "{repro}"),
+            }
+            let matches = crate::Args::command()
+                .try_get_matches_from(shell_words::split(&repro).unwrap())
+                .unwrap();
+            let args = crate::args_from_matches_with_clock(&matches, || {
+                panic!("analyzer reproduction must retain its actual fixed input")
+            })
+            .unwrap();
+            let crate::Subcommand::Run(mut parsed) = args.command else {
+                panic!("expected run")
+            };
+            parsed.validate_args().unwrap();
+            assert_eq!(parsed.to_string(), trial.runopts.to_string());
+            (
+                bound(&trial),
+                bound(&target),
+                trial.runopts.run_timeout().map(|wall| wall.as_secs()),
+            )
+        };
+        assert_eq!(created(&[], None), (Some(80_000_000_000), None, Some(400)));
+        assert_eq!(
+            created(&["--virtual-timeout=5000000"], None),
+            (Some(5_000_000), Some(5_000_000), Some(400))
+        );
+        assert_eq!(
+            created(&["--virtual-timeout=900000000000"], None),
+            (Some(80_000_000_000), Some(900_000_000_000), Some(400))
+        );
+        assert_eq!(
+            created(&[], Some("--trial-virtual-timeout=off")),
+            (None, None, Some(100))
+        );
+    }
+
+    /// Whether the virtual-time bound stopped a run comes from the run's
+    /// summary (`virtual_timeout_ns`), not from its exit status or stderr,
+    /// and so does an endpoint run's virtual time. Such a run's output is not
+    /// matched against the target: its status is the bound's 124, which the
+    /// default target ("nonzero") would count as met. The trial did not
+    /// finish and did not reach the target, and the error names the bound
+    /// with the way to change it: analyze's, the run arguments' own, or both
+    /// when they are equal.
+    /// Without a summary both stay unknown for a run without a virtual
+    /// bound; for one with it, a missing or unreadable summary is an error
+    /// rather than a run that finished.
+    #[test]
+    fn a_trial_its_virtual_bound_stopped_is_read_from_its_summary() {
+        let workspace = tempfile::tempdir().unwrap();
+        let options = |extra: &[&str], run_args: &[&str]| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            options.endpoints.record(Duration::from_secs(1), None);
+            options.endpoints.record_virtual(1_000_000);
+            options
+        };
+        let mut unbounded = RunData::new_baseline(
+            &options(&["--trial-virtual-timeout=off"], &[]),
+            "prefix_round_006".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(unbounded.read_summary().unwrap(), None, "no summary");
+        assert_eq!(unbounded.virtual_elapsed(), None);
+
+        let analyze = options(&[], &[]);
+        let mut run = RunData::new_baseline(&analyze, "prefix_round_007".to_owned()).unwrap();
+        let missing = run.read_summary().unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("cannot read the run summary"),
+            "{missing:#}"
+        );
+
+        let path = run.runopts.summary_json.clone().unwrap();
+        let write = |summary: RunSummary| {
+            std::fs::write(&path, serde_json::to_vec(&summary).unwrap()).unwrap()
+        };
+        write(RunSummary {
+            virttime_elapsed: 4_200_000,
+            ..Default::default()
+        });
+        assert_eq!(run.read_summary().unwrap(), None);
+        assert_eq!(run.virtual_elapsed(), Some(4_200_000));
+
+        write(RunSummary {
+            virttime_elapsed: 60_000_000_123,
+            virtual_timeout_ns: Some(60_000_000_000),
+            ..Default::default()
+        });
+        let bound = run.read_summary().unwrap();
+        assert_eq!(bound, Some(60_000_000_000));
+        let stopped_output = Output {
+            status: reverie::process::ExitStatus::Exited(124),
+            stdout: b"tick 0\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(
+            analyze.output_matches(&stopped_output),
+            "the default target counts exit 124 as met"
+        );
+        let matched = || analyze.output_matches(&stopped_output);
+        assert_eq!(
+            finished_run_outcome(bound, matched),
+            Err(VirtualBoundStop(60_000_000_000))
+        );
+        assert_eq!(finished_run_outcome(None, matched), Ok(true));
+
+        let stopped = run.name_the_virtual_bound(VirtualBoundStop(60_000_000_000));
+        assert_eq!(
+            stopped.to_string(),
+            "prefix_round_007 reached hermit analyze's virtual-time bound of 60000000000 ns for \
+             this run (--trial-virtual-timeout=FACTOR raises it, --trial-virtual-timeout=off \
+             lifts it)"
+        );
+        let end = TrialEnd::classify(
+            Err(stopped),
+            || unreachable!("a stopped trial has no outcome to match"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            end,
+            TrialEnd::Unfinished(Stop::VirtualBound(60_000_000_000))
+        );
+        assert!(!end.reached_target() && !end.finished());
+
+        // The target run is not bounded by analyze, so only its own bound
+        // can stop it.
+        let target = RunData::new_run1_target(
+            &options(&[], &["--virtual-timeout=5000000"]),
+            "run1_target".to_owned(),
+        )
+        .unwrap();
+        let own = target.name_the_virtual_bound(VirtualBoundStop(5_000_000));
+        assert_eq!(
+            own.to_string(),
+            "run1_target reached the run arguments' --virtual-timeout=5000000 (raise or drop \
+             --virtual-timeout in the run arguments)"
+        );
+        assert_eq!(
+            TrialEnd::classify(Err(own), || unreachable!(), None).unwrap(),
+            TrialEnd::Unfinished(Stop::VirtualBound(5_000_000))
+        );
+
+        // The run arguments' own bound equals analyze's (the 60 s floor):
+        // dropping it would change nothing, so both are named.
+        let tied = RunData::new_baseline(
+            &options(&[], &["--virtual-timeout=60000000000"]),
+            "prefix_round_008".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            tied.name_the_virtual_bound(VirtualBoundStop(60_000_000_000))
+                .to_string(),
+            "prefix_round_008 reached the run arguments' --virtual-timeout=60000000000, which is \
+             also hermit analyze's virtual-time bound for this run (raise both: --virtual-timeout \
+             in the run arguments, and --trial-virtual-timeout=FACTOR)"
+        );
+
+        std::fs::write(&path, b"not json").unwrap();
+        let unreadable = run.read_summary().unwrap_err();
+        assert!(
+            format!("{unreadable:#}").contains("cannot parse the run summary"),
+            "{unreadable:#}"
+        );
+    }
+
+    /// An explicit `--trial-virtual-timeout` that the trials could not report
+    /// back (KVM, which writes no summary for a run its virtual bound
+    /// stopped, the in-guest runtime, which refuses the bound, or
+    /// `--no-virtualize-time`) is refused before any workspace or run,
+    /// naming the cause and the way out. Without the option those trials get
+    /// no virtual-time bound, and on ptrace an explicit factor is accepted.
+    #[test]
+    fn an_inapplicable_trial_virtual_timeout_is_refused() {
+        let options = |global: &[&str], extra: &[&str], run_args: &[&str]| {
+            let mut argv = vec!["hermit"];
+            argv.extend(global);
+            argv.push("analyze");
+            argv.extend(extra);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        let mut cases = vec![
+            (
+                &["--backend=kvm"][..],
+                &[][..],
+                "the trials run on the kvm backend",
+            ),
+            (
+                &[][..],
+                &["--no-virtualize-time"][..],
+                "--no-virtualize-time",
+            ),
+        ];
+        if cfg!(feature = "liteinst") {
+            cases.push((
+                &["--backend=liteinst"][..],
+                &[][..],
+                "the trials run on the liteinst backend",
+            ));
+        }
+        for (global, run_args, cause) in cases {
+            let error = options(global, &["--trial-virtual-timeout=3"], run_args)
+                .refuse_inapplicable_trial_virtual_timeout()
+                .expect_err(cause);
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{cause}: {error:#}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.starts_with("--trial-virtual-timeout=3 cannot be applied: ")
+                    && message.contains(cause)
+                    && message.contains("Omit it, or pass --trial-virtual-timeout=off"),
+                "{message}"
+            );
+            let mut default = options(global, &[], run_args);
+            default.refuse_inapplicable_trial_virtual_timeout().unwrap();
+            default.endpoints.record_virtual(10_000_000_000);
+            assert_eq!(
+                default.trial_virtual_bound(&RunData::get_raw_runopts(&default)),
+                None,
+                "{cause}"
+            );
+        }
+        options(&[], &["--trial-virtual-timeout=3"], &[])
+            .refuse_inapplicable_trial_virtual_timeout()
+            .unwrap();
     }
 }

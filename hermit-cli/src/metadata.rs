@@ -1250,6 +1250,8 @@ fn record_or_replay_config_with_timer_support(
         // scheduling, and recordings made before the option existed, charge
         // every turn in full.
         cap_preemption_charge: false,
+        // A `hermit run` option; record and replay take none.
+        virtual_timeout: None,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,

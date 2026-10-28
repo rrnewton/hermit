@@ -550,13 +550,15 @@ impl VerificationReport {
         if let Some(NoResultReason::ContainerFailed(failure)) = &self.no_result_reason {
             let valid_status = match failure.disposition {
                 // classify_container_result reserves these normal exit codes
-                // for policy refusal, deadline, and mapped signal stops.
+                // for policy refusal, guest deadlock, deadline, and mapped
+                // signal stops.
                 ContainerDisposition::Exited { code } => {
                     // The deadline constant currently lives in hermit-cli,
                     // which this shared schema's manifest reader cannot import.
                     const DEADLINE_EXIT: i32 = 124;
                     (0..=255).contains(&code)
                         && code != detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+                        && code != detcore_model::HERMIT_GUEST_DEADLOCK_EXIT
                         && code != DEADLINE_EXIT
                         && detcore_model::signal_from_exit_status(code).is_none()
                 }
@@ -1065,7 +1067,7 @@ mod tests {
             ContainerDisposition::Exited { code: 0 },
         );
         let value = serde_json::to_value(report).unwrap();
-        for code in [-1, 122, 124, 129, 142, 192, 256] {
+        for code in [-1, 121, 122, 124, 129, 142, 192, 256] {
             let mut bad = value.clone();
             bad["no_result_reason"]["disposition"]["code"] = code.into();
             assert!(

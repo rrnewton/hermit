@@ -165,6 +165,7 @@ impl Record {
             metadata_path,
         } = self;
         let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
+        let terminal_outcome = global_state.terminal_outcome();
         let provenance = global_state
             .mount_identity_provenance()
             .map(|value| value.map(|p| (p.mountinfo_order, p.assignment_order)))
@@ -172,6 +173,11 @@ impl Record {
         let finalized = global_state.clean_up(false, &None).await;
         // Publish completed metadata only after provenance and finalization succeed.
         Self::finish_completed_metadata(&mut metadata, &metadata_path, provenance, finalized)?;
+        // A deadlocked guest's recording is complete: its replay deadlocks at
+        // the same point.
+        if let Some(outcome) = terminal_outcome {
+            return Err(Error::new(crate::SchedulerEndedRun::new(outcome, None)));
+        }
         Ok(exit_status)
     }
 
@@ -183,6 +189,7 @@ impl Record {
             metadata_path,
         } = self;
         let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
+        let terminal_outcome = global_state.terminal_outcome();
         let provenance = global_state
             .mount_identity_provenance()
             .map(|value| value.map(|p| (p.mountinfo_order, p.assignment_order)))
@@ -190,6 +197,12 @@ impl Record {
         let finalized = global_state.clean_up(false, &None).await;
         // Publish completed metadata only after provenance and finalization succeed.
         Self::finish_completed_metadata(&mut metadata, &metadata_path, provenance, finalized)?;
+        if let Some(outcome) = terminal_outcome {
+            return Err(Error::new(crate::SchedulerEndedRun::new(
+                outcome,
+                Some(output),
+            )));
+        }
         Ok(output)
     }
 }

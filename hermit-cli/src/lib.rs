@@ -173,6 +173,15 @@ pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
 /// refusal that arrives as 122 and needs its own arm for the same reason.
 pub const HERMIT_DEADLINE_EXIT: i32 = 124;
 
+// `--virtual-timeout` ends a run with the same deadline status, from detcore
+// (`TerminalOutcome::exit_status`); its class line, `class=virtual-timeout`,
+// tells it from `--timeout`'s `class=run-timeout`.
+const _: () = assert!(
+    detcore_model::TerminalOutcome::VirtualTimeout { bound_ns: 1 }.exit_status()
+        == HERMIT_DEADLINE_EXIT,
+    "a virtual timeout exits the deadline status"
+);
+
 /// Hermit's own log output exceeded `--max-log-bytes`: **123**.
 ///
 /// The status hermit exits with when the byte budget on its tracing output
@@ -237,9 +246,17 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //   0          success.
 //   1          HERMIT_VERIFICATION_DIVERGENCE_EXIT, matching `diff`; also a
 //              legal guest status. Read the verification JSON to distinguish.
-//   2 ..= 121  THE GUEST'S OWN STATUS, passed through untouched. (The range
-//              stops at 121 because 122 is reserved below; a guest may still
+//   2 ..= 120  THE GUEST'S OWN STATUS, passed through untouched. (The range
+//              stops at 120 because 121 is reserved below; a guest may still
 //              CHOOSE any value, see the caveat at the end.)
+//   121        HERMIT_GUEST_DEADLOCK_EXIT -- the GUEST DEADLOCKED: Detcore's
+//              scheduler found every remaining thread blocked with no possible
+//              wake and printed its "Deadlock detected" report. A guest
+//              outcome (natively the program hangs forever), not a hermit
+//              failure; the virtual-time analogue of 124. Prints
+//              `HERMIT_GUEST_DEADLOCK class=guest-deadlock`. The scheduler's
+//              own `HERMIT_DEADLOCK:` verdicts are NOT this: they stay 125.
+//              Defined in `detcore-model` for the reason 122 is.
 //   122        HERMIT_POLICY_REFUSAL_EXIT -- hermit REFUSED the run under a
 //              fail-closed policy. Hermit WORKED; the run was stopped on
 //              purpose and the reason was printed. Distinct from 125 because
@@ -4873,6 +4890,113 @@ impl std::fmt::Display for GuestTimedOut {
 
 impl std::error::Error for GuestTimedOut {}
 
+/// The run ended with a scheduler terminal outcome
+/// ([`detcore::TerminalOutcome`]): the guest deadlocked (Detcore's scheduler
+/// found every remaining thread blocked with no possible wake), or the run's
+/// virtual clock passed `--virtual-timeout`. The scheduler printed its report.
+///
+/// The ptrace runtime publishes it as the termination that tears the parked
+/// guest down, as `--timeout` publishes [`GuestTimedOut`]. Once the run is
+/// finished (summary printed, recording metadata written) the run functions
+/// return it as their error, carrying the output the guest wrote before the
+/// outcome when the run captured it; that output's status is the outcome's
+/// ([`detcore::TerminalOutcome::exit_status`]). A run whose teardown failed is
+/// not this but a ptrace failure, reported as Hermit's. The CLI reports it by
+/// the outcome's class line rather than as a guest exit status or an internal
+/// failure. Backends whose scheduler cannot hand the outcome back to the run
+/// exit the process with the outcome's status instead.
+#[non_exhaustive]
+pub struct SchedulerEndedRun {
+    /// How the scheduler ended the run.
+    pub outcome: detcore::TerminalOutcome,
+    /// The captured output, for a run that captured it.
+    pub output: Option<Output>,
+}
+
+impl SchedulerEndedRun {
+    /// A finished run that ended with `outcome`, with its output when it
+    /// captured one.
+    pub fn new(outcome: detcore::TerminalOutcome, output: Option<Output>) -> Self {
+        Self { outcome, output }
+    }
+
+    /// Separate a finished run's terminal outcome from its other errors. An
+    /// outcome beside a skid overshoot stays the overshoot's error, which
+    /// refuses the run.
+    pub fn split<T>(result: Result<T, Error>) -> Result<Result<T, SchedulerEndedRun>, Error> {
+        match result {
+            Ok(value) => Ok(Ok(value)),
+            Err(error) if error.downcast_ref::<SkidOvershootError>().is_some() => Err(error),
+            Err(error) => error.downcast::<SchedulerEndedRun>().map(Err),
+        }
+    }
+
+    /// The output of a run that ended with an outcome and captured it.
+    pub fn into_output(self) -> Result<Output, Error> {
+        self.output.ok_or_else(|| {
+            Error::msg("a run that captured output ended with a terminal outcome and returned none")
+        })
+    }
+
+    /// A finished run's status, and the outcome it ended with, if any, in
+    /// which case the status is the outcome's.
+    pub fn status_of(
+        result: Result<ExitStatus, Error>,
+    ) -> Result<(ExitStatus, Option<detcore::TerminalOutcome>), Error> {
+        Ok(match Self::split(result)? {
+            Ok(status) => (status, None),
+            Err(ended) => (
+                ExitStatus::Exited(ended.outcome.exit_status()),
+                Some(ended.outcome),
+            ),
+        })
+    }
+
+    /// A finished run's output, and the outcome it ended with, if any, in
+    /// which case the output's status is the outcome's.
+    pub fn output_of(
+        result: Result<Output, Error>,
+    ) -> Result<(Output, Option<detcore::TerminalOutcome>), Error> {
+        Ok(match Self::split(result)? {
+            Ok(output) => (output, None),
+            Err(ended) => {
+                let outcome = ended.outcome;
+                (ended.into_output()?, Some(outcome))
+            }
+        })
+    }
+}
+
+impl std::fmt::Debug for SchedulerEndedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("SchedulerEndedRun");
+        debug.field("outcome", &self.outcome);
+        if let Some(output) = &self.output {
+            debug
+                .field("stdout_bytes", &output.stdout.len())
+                .field("stderr_bytes", &output.stderr.len());
+        }
+        debug.finish()
+    }
+}
+
+impl std::fmt::Display for SchedulerEndedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.outcome {
+            detcore::TerminalOutcome::GuestDeadlock => write!(
+                f,
+                "Guest deadlocked: every remaining thread is blocked with no possible wake"
+            ),
+            detcore::TerminalOutcome::VirtualTimeout { bound_ns } => write!(
+                f,
+                "The run's virtual clock passed --virtual-timeout={bound_ns} (virtual nanoseconds)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SchedulerEndedRun {}
+
 /// Nonordinary backends retain their existing cooperative timeout behavior.
 /// There is no process-wide alarm in this library. A caller needing a bound on
 /// synchronous stalls must own external supervision; the CLI arms its own
@@ -5111,6 +5235,7 @@ async fn dispatch_backend(
     .await?;
     let stats_source = tracer.backend_stats();
     let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
+    let terminal_outcome = global_state.terminal_outcome();
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
@@ -5121,6 +5246,9 @@ async fn dispatch_backend(
                 "ptrace cleanup after observed guest status {exit_status:?}"
             ))
         })?; // Before it's dropped by this function.
+    if let Some(outcome) = terminal_outcome {
+        return Err(Error::new(SchedulerEndedRun::new(outcome, None)));
+    }
     Ok(exit_status)
 }
 
@@ -5473,6 +5601,7 @@ async fn dispatch_output_backend(
     .await?;
     let stats_source = tracer.backend_stats();
     let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
+    let terminal_outcome = global_state.terminal_outcome();
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
@@ -5484,6 +5613,9 @@ async fn dispatch_output_backend(
                 output.status
             ))
         })?;
+    if let Some(outcome) = terminal_outcome {
+        return Err(Error::new(SchedulerEndedRun::new(outcome, Some(output))));
+    }
     Ok(output)
 }
 

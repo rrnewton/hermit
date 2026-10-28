@@ -25,6 +25,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use detcore_model::TerminalOutcome;
 use detcore_model::summary::RunSummary;
 use hermit::Backend;
 use hermit::Context;
@@ -329,6 +330,8 @@ pub(crate) fn compare(
         status: status1,
         skid_overshoots: skid1,
         forwarded_syscalls: forwarded1,
+        guest_deadlock: guest_deadlock1,
+        virtual_timeout_ns: virtual_timeout1,
     } = record1.outcome
     else {
         retain(&[&run1])?;
@@ -342,12 +345,17 @@ pub(crate) fn compare(
         )?);
     };
     let out1 = run1.output(status1)?;
+    let outcome1 = TerminalOutcome::from_fields(guest_deadlock1, virtual_timeout1);
     // Prepared where `run --verify` prepares them, and queued the same way:
     // by every return below that does not verify the runs.
     let mut signal_reports = SignalTerminationReports::default();
     signal_reports.prepare("run 1", out1.status, &run1.directory.join(LOG));
-    if let Some(error) =
-        reject_first_run(verify_json, verify_allow, &out1, skid1, summary1.as_ref())
+    // A run 1 that ended with a terminal outcome (a deadlock, a virtual
+    // timeout) is compared under every `--verify-allow`, as `run --verify`
+    // compares it: its guest exited with no status of its own.
+    if outcome1.is_none()
+        && let Some(error) =
+            reject_first_run(verify_json, verify_allow, &out1, skid1, summary1.as_ref())
     {
         retain(&[&run1])?;
         return Err(error);
@@ -394,6 +402,8 @@ pub(crate) fn compare(
         status: status2,
         skid_overshoots: skid2,
         forwarded_syscalls: forwarded2,
+        guest_deadlock: guest_deadlock2,
+        virtual_timeout_ns: virtual_timeout2,
     } = record2.outcome
     else {
         retain(&[&run1, &run2])?;
@@ -490,6 +500,13 @@ pub(crate) fn compare(
         eprintln!(":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)");
     }
     emit_compared_guest_output(true, &out1, &out2)?;
+    // Verified runs that both ended with the same terminal outcome end with
+    // it, as `run --verify` ends.
+    if let Some(outcome) = outcome1
+        && outcome1 == TerminalOutcome::from_fields(guest_deadlock2, virtual_timeout2)
+    {
+        return Err(Error::new(super::container::SchedulerOutcome(outcome)));
+    }
     Ok(outcome.guest_status)
 }
 
@@ -505,10 +522,20 @@ fn compare_recording_and_replay(
     retain: &dyn Fn(&[&VerifyRunDirectory]) -> Result<(), Error>,
 ) -> Result<ExitStatus, Error> {
     let completed = |run: &VerifyRunDirectory, label: &str| match &run.record.outcome {
-        VerifyRunOutcome::Completed { status, .. } => run.output(*status),
+        VerifyRunOutcome::Completed {
+            status,
+            guest_deadlock,
+            virtual_timeout_ns,
+            ..
+        } => run.output(*status).map(|output| {
+            (
+                output,
+                TerminalOutcome::from_fields(*guest_deadlock, *virtual_timeout_ns),
+            )
+        }),
         outcome => Err(Error::msg(format!("{label} did not complete: {outcome:?}"))),
     };
-    let recording = match completed(run1, "the recording") {
+    let (recording, recording_outcome) = match completed(run1, "the recording") {
         Ok(output) => output,
         Err(error) => {
             retain(&[run1])?;
@@ -536,7 +563,7 @@ fn compare_recording_and_replay(
             record2.comparison,
         );
     }
-    let replay = match completed(&run2, "the replay") {
+    let (replay, replay_outcome) = match completed(&run2, "the replay") {
         Ok(output) => output,
         Err(error) => {
             retain(&[run1, &run2])?;
@@ -568,7 +595,10 @@ fn compare_recording_and_replay(
         Ok(_) if read_verified(verify_json) => retain(&[run1])?,
         _ => retain(&[run1, &run2])?,
     }
-    status
+    // A matched pair returns the recording's status; when both runs ended
+    // with the same terminal outcome that status is the outcome's, reported
+    // as the outcome, as `record start --verify` reports it.
+    super::record_start::ended_pair_outcome(status?, recording_outcome, replay_outcome)
 }
 
 /// Whether the report at `verify_json` says the runs were verified; false
@@ -697,6 +727,8 @@ mod tests {
                 status: RecordedStatus::Exited { code: 0 },
                 skid_overshoots: 0,
                 forwarded_syscalls: None,
+                guest_deadlock: false,
+                virtual_timeout_ns: None,
             },
         };
         let json = serde_json::to_value(&record).unwrap();

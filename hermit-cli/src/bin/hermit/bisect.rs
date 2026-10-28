@@ -104,6 +104,8 @@ impl BisectOpts {
             search: false,
             run_needleman: self.needleman,
             minimize: false,
+            prefix_search: false,
+            continuation_timeslice: crate::analyze::ContinuationTimeslice::Auto,
             imprecise_search: false,
             run1_seed: None,
             run1_preemptions: None,
@@ -128,6 +130,12 @@ impl BisectOpts {
             log_budget: global.log_budget(),
             inexact_branch_counter: self.inexact_branch_counter,
             branch_counter_warning: None,
+            // Bisect runs no endpoint to measure: its replays are bounded by
+            // the run arguments' --timeout and --virtual-timeout alone.
+            trial_timeout: crate::analyze::TrialTimeout::Off,
+            trial_virtual_timeout: Some(crate::analyze::TrialVirtualTimeout::Off),
+            endpoints: Default::default(),
+            trial_bound_factor: 1,
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.

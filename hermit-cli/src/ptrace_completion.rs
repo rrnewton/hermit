@@ -35,6 +35,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
 
+use reverie_ptrace::CapturedPrefix;
 use reverie_ptrace::PtraceCallbackDiagnostic;
 use reverie_ptrace::PtraceRunFailure;
 use reverie_ptrace::PtraceTerminationHandle;
@@ -45,6 +46,7 @@ use serde::Serialize;
 use crate::Error;
 use crate::FailureKind;
 use crate::GuestTimedOut;
+use crate::SchedulerEndedRun;
 
 const ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
@@ -387,6 +389,38 @@ impl OriginalProcess {
     }
 }
 
+/// The result a run that ended with a scheduler terminal outcome reports in
+/// place of the guest status it never had: the outcome's status
+/// ([`detcore::TerminalOutcome::exit_status`]), with the output the guest
+/// wrote before it. `None` when the run kept no output to report.
+pub(crate) trait TerminalOutcomeResult: Sized {
+    fn terminal_outcome(
+        outcome: detcore::TerminalOutcome,
+        captured: Option<&CapturedPrefix>,
+    ) -> Option<Self>;
+}
+impl TerminalOutcomeResult for reverie::ExitStatus {
+    fn terminal_outcome(
+        outcome: detcore::TerminalOutcome,
+        _: Option<&CapturedPrefix>,
+    ) -> Option<Self> {
+        Some(reverie::ExitStatus::Exited(outcome.exit_status()))
+    }
+}
+impl TerminalOutcomeResult for reverie::process::Output {
+    fn terminal_outcome(
+        outcome: detcore::TerminalOutcome,
+        captured: Option<&CapturedPrefix>,
+    ) -> Option<Self> {
+        let captured = captured?;
+        Some(reverie::process::Output {
+            status: reverie::ExitStatus::Exited(outcome.exit_status()),
+            stdout: captured.stdout().to_vec(),
+            stderr: captured.stderr().to_vec(),
+        })
+    }
+}
+
 pub(crate) struct Control {
     termination: RefCell<Option<PtraceTerminationHandle>>,
     timeout: Option<(Instant, Duration)>,
@@ -420,6 +454,23 @@ impl Control {
         if self.expired.get() {
             self.publish_timeout();
         }
+    }
+    /// Let the scheduler hand this run's terminal outcome (a guest deadlock,
+    /// a virtual timeout) to the run instead of exiting the process, while the
+    /// returned guard lives: the unwind publishes the termination that tears
+    /// the parked guest down, as `--timeout` does, and reports whether it
+    /// became the run's cause. Only a run with a termination handle installs
+    /// it. The scheduler task runs on this thread (the run's current-thread
+    /// runtime), where the guard installs it.
+    fn unwind_terminal_outcomes(&self) -> Option<detcore::TerminalOutcomeUnwindGuard> {
+        let handle = self.termination.borrow().clone()?;
+        Some(detcore::TerminalOutcomeUnwindGuard::install(Box::new(
+            move |outcome| {
+                handle.terminate(reverie::Error::Tool(Error::new(SchedulerEndedRun::new(
+                    outcome, None,
+                ))))
+            },
+        )))
     }
     fn publish_timeout(&self) {
         if let (Some(handle), Some((_, limit))) = (self.termination.borrow().as_ref(), self.timeout)
@@ -711,21 +762,47 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
     }
 }
 
+/// Wait for the run. A terminal outcome the scheduler hands this run
+/// (`detcore::TerminalOutcomeUnwindGuard`: a guest deadlock, a virtual
+/// timeout) is torn down like a `--timeout` and completes with the outcome's
+/// status; `GlobalState::terminal_outcome` then says the status is that, not
+/// the guest's.
 pub(crate) async fn wait(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::ExitStatus, detcore::GlobalState), Error> {
     control.register(tracer.termination_handle());
+    let _unwind = control.unwind_terminal_outcomes();
     consume(tracer.wait_completion().await, control).await
 }
+/// [`wait`], with the guest's output; a terminal outcome keeps the output the
+/// guest wrote before it.
 pub(crate) async fn wait_with_output(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::process::Output, detcore::GlobalState), Error> {
     control.register(tracer.termination_handle());
+    let _unwind = control.unwind_terminal_outcomes();
     consume(tracer.wait_with_output_completion().await, control).await
 }
-async fn consume<R>(
+/// The outcome of a failed run that is a clean terminal-outcome teardown: the
+/// unwind's cause is the `primary`, so no earlier failure of the run is
+/// hidden, and the teardown recorded no failure of its own (`secondaries`: a
+/// capture drain or cleanup error), so the captured output is the whole
+/// output. Any other teardown stays a failed run, which
+/// `classify_ptrace_primary` reports as Hermit's.
+pub(crate) fn clean_terminal_outcome(
+    primary: &reverie::Error,
+    secondaries: usize,
+) -> Option<detcore::TerminalOutcome> {
+    match primary {
+        reverie::Error::Tool(inner) if secondaries == 0 => inner
+            .downcast_ref::<SchedulerEndedRun>()
+            .map(|ended| ended.outcome),
+        _ => None,
+    }
+}
+async fn consume<R: TerminalOutcomeResult>(
     mut outcome: ToolRunOutcome<detcore::GlobalState, R>,
     control: Rc<Control>,
 ) -> Result<(R, detcore::GlobalState), Error> {
@@ -736,6 +813,17 @@ async fn consume<R>(
                 control.termination.borrow_mut().take();
                 return match completion.result {
                     Ok(result) => Ok((result, completion.global_state)),
+                    Err(failure)
+                        if let Some(outcome) = clean_terminal_outcome(
+                            failure.primary(),
+                            failure.secondary().len(),
+                        ) && let Some(result) =
+                            R::terminal_outcome(outcome, failure.captured_prefix()) =>
+                    {
+                        // The guest's outcome, not a failed run: the caller
+                        // finishes the run (summary, recording) as for an exit.
+                        Ok((result, completion.global_state))
+                    }
                     Err(failure) => {
                         control.global_failure(&failure, callbacks.clone());
                         let cleanup = completion

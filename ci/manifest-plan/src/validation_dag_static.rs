@@ -1195,7 +1195,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // capability_clear_image_readiness_preserves_legacy_conditions: 1883, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1894.
     // Train 6 recount (measured on 21f770f6 base): 1899.
-    ("test.regular_crates", 1899),
+    // And detcore-model's
+    // terminal_outcome_tests::terminal_outcomes_carry_their_status_and_class_line
+    // and config::tests::virtual_timeout_round_trips_but_never_enters_the_legacy_form
+    // (--virtual-timeout): 1901.
+    ("test.regular_crates", 1901),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1848,7 +1852,70 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
     // Train 6 recount (measured on 21f770f6 base): 1187.
-    ("test.hermit_unit", 1187),
+    // And analyze --prefix-search: phases::tests::the_prefix_search_finds_the_deciding_event
+    // and schedule_search::tests::{a_failure_on_failing_only_events_ends_with_no_single_swap,
+    // an_unstable_control_schedule_is_an_error,
+    // two_agreeing_replays_classify_a_schedule_after_an_outlier}: 1191.
+    // And phases::tests::a_prefix_trial_keeps_the_target_checkpoints_within_its_prefix
+    // (a prefix trial keeps the callback checkpoints its events reach): 1192.
+    // (a prefix trial keeps the callback checkpoints of the slices its events
+    // end): 1106.
+    // And phases::tests::a_prefix_report_says_when_both_stacks_are_one_thread: 1193.
+    // And analyze's per-trial bound: rundata::tests::{the_trial_bound_derives_from_the_slowest_endpoint_run,
+    // runs_take_the_bound_and_the_target_run_does_not, a_run_the_trial_bound_ends_names_the_bound,
+    // a_trials_log_is_capped_by_the_largest_endpoint_log,
+    // a_trial_that_a_bound_ends_did_not_reach_the_target,
+    // an_unenforceable_trial_timeout_is_refused_and_auto_does_without} and
+    // global_opts::tests::a_runs_log_bound_only_tightens_the_environment_bound: 1200.
+    // And the prefix search's continuation timeslice: phases::tests::{auto_continuations_only_get_coarser,
+    // the_prefix_search_continues_at_the_first_usable_timeslice} and
+    // rundata::tests::a_continuation_timeslice_that_would_change_the_prefix_is_refused: 1203.
+    // And the report's stacks: phases::tests::{only_the_criteria_a_run_misses_are_reported,
+    // a_replay_leaves_its_schedule_at_the_first_other_event,
+    // each_racing_stack_comes_from_a_replay_that_reached_it,
+    // a_target_replay_with_another_failure_than_the_target_run_is_named,
+    // a_report_without_a_deciding_event_reads,
+    // a_timing_decision_names_the_thread_that_runs_next_in_each_continuation}: 1209.
+    // And phases::tests::slice_ends_are_reported_only_when_the_next_stacks_tell_nothing_apart: 1210.
+    // And --minimize's replay of its own record:
+    // rundata::tests::a_normalized_record_is_written_for_reading_and_not_replayed and
+    // phases::tests::the_baseline_knock_out_removes_a_real_intervention_until_none_is_left: 1212.
+    // And --minimize's baseline search and minimization: phases::tests::the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses and
+    // minimize::tests::a_failed_cut_of_a_threads_last_interventions_is_tested_again: 1214.
+    // And the confirmation of a boundary trial the bound stopped:
+    // phases::tests::{a_trial_a_bound_stopped_does_not_decide_the_boundary,
+    // a_confirmed_trial_keeps_the_boundary,
+    // a_refuted_boundary_resumes_above_the_last_finished_miss,
+    // an_empty_prefix_that_meets_the_target_given_longer_ends_the_search} and
+    // rundata::tests::a_confirmation_lengthens_the_trial_bound: 1133.
+    // And phases::tests::a_boundary_trial_still_stopped_is_reported_as_a_hang,
+    // the_longest_finished_prefix_below_the_boundary_is_named and
+    // a_confirmation_raises_the_bound_and_keeps_it_once_finished: 1222.
+    // And the guest-deadlock outcome's units:
+    // container::tests::a_container_child_exiting_guest_deadlock_is_a_guest_outcome,
+    // tests::guest_deadlock_uses_its_own_exit_and_marker,
+    // ptrace_completion::tests::a_guest_deadlock_completes_with_its_status_and_the_captured_output
+    // and error::tests::a_guest_deadlock_is_the_guests_outcome_only_once_the_run_finished:
+    // 1226, listed.
+    // 1095, listed. (--virtual-timeout renamed the last three to
+    // tests::terminal_outcomes_use_their_own_exit_and_marker,
+    // ptrace_completion::tests::a_terminal_outcome_completes_with_its_status_and_the_captured_output
+    // and error::tests::a_terminal_outcome_is_the_guests_only_once_the_run_finished.)
+    // And --virtual-timeout's
+    // container::tests::a_deadline_exit_is_a_virtual_timeout_only_with_its_note,
+    // terminal_outcome_note::tests::a_virtual_timeout_noted_by_an_exiting_child_reaches_its_parent_once
+    // and run::virtual_timeout_parses_round_trips_and_is_refused_without_the_scheduler:
+    // 1229.
+    // And analyze's virtual-time trial bound:
+    // rundata::tests::{the_trial_virtual_bound_derives_from_the_longest_endpoint_run,
+    // the_wall_clock_bound_is_a_backstop_while_the_virtual_bound_applies,
+    // runs_take_the_virtual_bound_and_their_reproducer_carries_it,
+    // a_trial_its_virtual_bound_stopped_is_read_from_its_summary,
+    // an_inapplicable_trial_virtual_timeout_is_refused}
+    // and phases::tests::{a_trial_the_virtual_bound_stopped_is_not_confirmed,
+    // a_virtual_bound_boundary_is_reported_as_a_hang_without_a_longer_bound}:
+    // 1145.
+    ("test.hermit_unit", 1236),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3064,7 +3131,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit", 2788),
+    // And preemptions::tests::a_schedule_prefix_keeps_the_checkpoints_its_events_reach
+    // (a replay of a schedule's first events keeps their callback
+    // checkpoints): 2789, listed.
+    // And preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities: 2790.
+    // And scheduler::test::terminal_verdicts_carry_the_kind_that_decides_the_status
+    // (the guest-deadlock outcome): 2791, listed.
+    // And scheduler::test::
+    // a_deadlock_unwind_retires_the_remaining_threads_in_tid_order:
+    // 2792, listed.
+    // And scheduler::test::a_virtual_timeout_stops_the_run_at_the_first_commit_past_its_bound
+    // and scheduler::test::a_virtual_timeout_is_not_recorded_once_no_thread_can_be_granted_a_turn
+    // (--virtual-timeout): 2794.
+    ("test.detcore_unit", 2794),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4360,7 +4439,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 666),
+    // And a_guest_deadlock_is_the_guests_outcome_not_an_internal_failure,
+    // a_guest_deadlock_verifies_as_the_same_outcome_in_both_runs and
+    // a_recorded_guest_deadlock_replays_to_the_same_outcome (the guest-deadlock
+    // outcome, tests/c/condvar_join_deadlock.c): 669, listed.
+    // And a_guest_deadlock_that_kills_several_threads_verifies_at_parity: 670,
+    // listed.
+    // And a_virtual_timeout_stops_a_guest_that_never_ends,
+    // a_virtual_timeout_the_guest_never_reaches_changes_nothing and
+    // a_virtual_timeout_verifies_as_the_same_stop_in_both_runs
+    // (--virtual-timeout, tests/c/virtual_timeout_loop.c; the node skips
+    // run_kvm_virtual_timeout_is_reported_from_the_childs_note): 673.
+    ("test.cli", 673),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4903,7 +4993,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 585),
+    // And the same three guest-deadlock outcome tests: 588, listed.
+    // And the same several-thread guest-deadlock parity test: 589, listed.
+    // And the same three --virtual-timeout tests (this node skips the KVM
+    // one too): 592.
+    ("test.cli_on_host", 592),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5374,7 +5468,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three working-directory units: 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit_on_host", 2788),
+    // And the same schedule-prefix unit: 2789, listed.
+    // And the same normalize test: 2790.
+    // And the same guest-deadlock terminal-verdict unit: 2791, listed.
+    // And the same unwind retirement unit: 2792, listed.
+    // And the same two --virtual-timeout scheduler units: 2794.
+    ("test.detcore_unit_on_host", 2794),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5745,7 +5844,21 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
-    ("test.hermit_unit_on_host", 1181),
+    // And the same four analyze --prefix-search tests: 1185.
+    // And the same prefix-trial checkpoint test: 1186.
+    // And the same one-thread prefix report test: 1187.
+    // And the same seven analyze per-trial bound tests: 1194.
+    // And the same three continuation-timeslice tests: 1197.
+    // And the same six report-stack tests: 1203.
+    // And the same slice-end test: 1204.
+    // And the same two minimize tests: 1206.
+    // And the same two --minimize tests: 1208.
+    // And the same five boundary-confirmation tests: 1133.
+    // And the same three prefix-hang tests: 1216.
+    // And the same four guest-deadlock outcome units: 1220, listed.
+    // And the same three --virtual-timeout units: 1223.
+    // And the same seven virtual-time trial-bound tests: 1230.
+    ("test.hermit_unit_on_host", 1230),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5955,7 +6068,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hosted exclusions unchanged: 1869, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1880.
     // Train 6 recount (measured on 21f770f6 base): 1885.
-    ("test.regular_crates_on_host", 1885),
+    // And the same two --virtual-timeout detcore-model tests: 1887.
+    ("test.regular_crates_on_host", 1887),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

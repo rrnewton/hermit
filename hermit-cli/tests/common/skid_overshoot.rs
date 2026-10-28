@@ -26,13 +26,15 @@ pub const SKID_OVERSHOOT_REFUSAL_PREFIX: &str =
 
 /// Line prefixes that mark a second outcome beside a skid refusal: Hermit's
 /// other one-line classifications (another policy refusal, an internal
-/// failure, a signal death, a run timeout, a log cap) and a task panic.
-const SKID_RETRY_DISQUALIFYING_PREFIXES: [&str; 6] = [
+/// failure, a signal death, a run timeout, a log cap, a guest deadlock) and a
+/// task panic.
+const SKID_RETRY_DISQUALIFYING_PREFIXES: [&str; 7] = [
     "HERMIT_POLICY_REFUSAL",
     "HERMIT_INTERNAL_FAILURE",
     "HERMIT_SIGNAL_DEATH",
     "HERMIT_RUN_TIMEOUT",
     "HERMIT_LOG_CAP",
+    "HERMIT_GUEST_DEADLOCK",
     "HERMIT_TASK_PANIC",
 ];
 

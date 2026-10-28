@@ -991,6 +991,16 @@ pub(crate) fn run_failure_of(error: &Error) -> Option<RunFailure> {
         .is_some()
     {
         Some(RunFailure::PolicyRefusal)
+    } else if matches!(
+        error.downcast_ref::<super::container::SchedulerOutcome>(),
+        Some(super::container::SchedulerOutcome(
+            detcore::TerminalOutcome::GuestDeadlock
+        ))
+    ) {
+        // Not a virtual timeout: `--verify` with the bound is refused on
+        // every backend that cannot unwind the guest, and on ptrace a stopped
+        // run completes and is compared.
+        Some(RunFailure::Deadlock)
     } else {
         None
     }
@@ -2724,6 +2734,7 @@ mod tests {
             0,
             101,
             detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
             hermit::HERMIT_DEADLINE_EXIT,
             hermit::HERMIT_LOG_CAP_EXIT,
             detcore_model::signal_exit_status(libc::SIGTERM),
@@ -2755,6 +2766,16 @@ mod tests {
                             .is_some()
                     );
                     assert_eq!(report, VerificationReport::no_result());
+                }
+                121 => {
+                    assert!(matches!(
+                        error.downcast_ref::<super::super::container::SchedulerOutcome>(),
+                        Some(super::super::container::SchedulerOutcome(
+                            detcore::TerminalOutcome::GuestDeadlock
+                        ))
+                    ));
+                    assert_eq!(report, VerificationReport::no_result());
+                    assert_eq!(super::super::failure_exit_code(&error), 121);
                 }
                 124 => {
                     assert!(
@@ -2809,6 +2830,18 @@ mod tests {
                 Error::msg("the guest program is statically linked")
                     .context(super::super::container::PolicyRefusal),
                 Some(RunFailure::PolicyRefusal),
+            ),
+            (
+                Error::new(super::super::container::SchedulerOutcome(
+                    detcore::TerminalOutcome::GuestDeadlock,
+                )),
+                Some(RunFailure::Deadlock),
+            ),
+            (
+                Error::new(super::super::container::SchedulerOutcome(
+                    detcore::TerminalOutcome::VirtualTimeout { bound_ns: 1 },
+                )),
+                None,
             ),
             // Already published as its infrastructure error.
             (
@@ -3387,6 +3420,7 @@ mod tests {
             max_log_bytes: None,
             log_budget: None,
             log_file_handle: None,
+            log_file_limit: None,
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }

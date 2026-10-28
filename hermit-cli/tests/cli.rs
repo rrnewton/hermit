@@ -270,6 +270,8 @@ static CLONE3_SET_TID_REUSE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARENT_DEATH_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CONDVAR_JOIN_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static VIRTUAL_TIMEOUT_LOOP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_PERMITS_PER_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GROUP_EXIT_SIGNAL_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3260,6 +3262,58 @@ fn child_wait_deadlock_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "child-wait-deadlock guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn condvar_join_deadlock_guest() -> &'static Path {
+    CONDVAR_JOIN_DEADLOCK_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("condvar-join-deadlock");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the condvar-join-deadlock guest directory");
+        let guest = build_root.join("condvar_join_deadlock");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/condvar_join_deadlock.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the condvar-join-deadlock guest");
+        assert!(
+            output.status.success(),
+            "condvar-join-deadlock guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn virtual_timeout_loop_guest() -> &'static Path {
+    VIRTUAL_TIMEOUT_LOOP_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("virtual-timeout-loop");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the virtual-timeout-loop guest directory");
+        let guest = build_root.join("virtual_timeout_loop");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/virtual_timeout_loop.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the virtual-timeout-loop guest");
+        assert!(
+            output.status.success(),
+            "virtual-timeout-loop guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -35747,12 +35801,13 @@ fn a_wait_after_a_sigkill_to_an_exited_leader_is_a_deadlock() {
         );
         assert_eq!(
             status.and_then(|status| status.code()),
-            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
             "{mode}: {log}"
         );
         assert!(
             log.contains("Deadlock detected")
-                && log.contains("thread(s) waiting for a child that cannot exit"),
+                && log.contains("thread(s) waiting for a child that cannot exit")
+                && log.contains("HERMIT_GUEST_DEADLOCK class=guest-deadlock"),
             "{mode}: the deadlock report must name the wait:\n{log}"
         );
     }
@@ -39642,14 +39697,651 @@ fn a_clone_pidfd_is_known_to_detcore() {
     );
 }
 
+/// The stdout `tests/c/condvar_join_deadlock.c` writes before it deadlocks.
+const CONDVAR_JOIN_DEADLOCK_STDOUT: &str = "main: joining a thread that waits forever\n";
+
+/// A guest that deadlocks (main joins a thread waiting on a condition
+/// variable nobody signals) ends with the guest-deadlock outcome, not as an
+/// internal failure: exit 121 and `HERMIT_GUEST_DEADLOCK class=guest-deadlock`
+/// after the scheduler's report, with the output written before the deadlock
+/// kept and the run summary saying the guest deadlocked. Before, the container
+/// child exited 1 and the run reported
+/// `HERMIT_INTERNAL_FAILURE class=container-child-exit` and exit 125, with no
+/// summary (ptrace, `--strict`, `--chaos`).
+#[test]
+fn a_guest_deadlock_is_the_guests_outcome_not_an_internal_failure() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--chaos",
+            "--seed=1",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--summary",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        "{log}"
+    );
+    assert_eq!(stdout, CONDVAR_JOIN_DEADLOCK_STDOUT, "{log}");
+    let line_of = |wanted: &str| {
+        log.lines()
+            .position(|line| line == wanted)
+            .unwrap_or_else(|| panic!("no line {wanted:?}:\n{log}"))
+    };
+    let report =
+        line_of("Deadlock detected: thread(s) waiting on futex, but no runnable threads left.");
+    let summary =
+        line_of("The guest deadlocked: every remaining thread was blocked with no possible wake.");
+    let class = line_of("HERMIT_GUEST_DEADLOCK class=guest-deadlock");
+    assert!(
+        report < summary && summary < class,
+        "the report, then the summary, then the class line:\n{log}"
+    );
+    assert!(!log.contains("HERMIT_INTERNAL_FAILURE"), "{log}");
+    assert!(!log.contains("backend failure"), "{log}");
+}
+
+/// Two runs of a guest that deadlocks reach the same deadlock, so `--verify
+/// --verify-strict` compares them and establishes bitwise parity, with the
+/// default `--verify-allow` and with `failure` alike (a deadlocked guest
+/// exited with no status of its own), and the verification ends with the
+/// guest's outcome: the stdout both runs agreed on once, the class line and
+/// exit 121. Before, run 1's container child exited 1 and the report was
+/// `no_result` with `container_failed` under either (ptrace, `--strict`).
+#[test]
+fn a_guest_deadlock_verifies_as_the_same_outcome_in_both_runs() {
+    let _guard = hermit_run_guard();
+    let guest = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    for allow in [None, Some("--verify-allow=failure")] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report_path = directory.path().join("verify.json");
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_path.to_str().unwrap(),
+        ];
+        args.extend(allow);
+        args.extend(["--", guest.as_str()]);
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "{allow:?}: {log}"
+        );
+        assert_eq!(
+            stdout(&output),
+            CONDVAR_JOIN_DEADLOCK_STDOUT,
+            "{allow:?}: {log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{allow:?}: {log}"
+        );
+        assert!(
+            log.ends_with(
+                "HERMIT_GUEST_DEADLOCK class=guest-deadlock\nError: The guest deadlocked: every \
+                 remaining thread is blocked with no possible wake, so natively it would hang \
+                 forever. This is the guest's outcome, not a hermit failure; the deadlock \
+                 report is above. If the program does not hang natively, report it as a \
+                 hermit bug.\n"
+            ),
+            "{allow:?}: {log}"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(report["verdict"], serde_json::json!("matched"), "{report}");
+        assert_eq!(report["verified"], serde_json::json!(true), "{report}");
+        assert_eq!(
+            report["bitwise_parity"],
+            serde_json::json!(true),
+            "{report}"
+        );
+        assert_eq!(
+            report["guest_exit_code"],
+            serde_json::json!(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "{report}"
+        );
+    }
+}
+
+/// The deadlock's teardown kills several threads at once when four waiters
+/// are blocked, and the host reports their deaths in any order (the leader's
+/// last). They are retired at the deadlock in DetTid order instead: the
+/// log's `logically_kill` records name the five threads in rising order, and
+/// repeated runs verify at bitwise parity (ptrace, `--strict`). Before, those
+/// records followed the host's death reports, ended with the leader's, and
+/// their order differed between runs.
+#[test]
+fn a_guest_deadlock_that_kills_several_threads_verifies_at_parity() {
+    let _guard = hermit_run_guard();
+    let guest = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let strict = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+
+    let log_path = directory.path().join("hermit.log");
+    let log_arg = format!("--log-file={}", log_path.display());
+    let mut args = vec!["--log=info", log_arg.as_str()];
+    args.extend(strict);
+    args.extend(["--", guest.as_str(), "4"]);
+    let output = hermit(&args);
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        "{}",
+        stderr(&output)
+    );
+    let log = fs::read_to_string(&log_path).unwrap();
+    let marker = "logically_kill: Scheduler removing all knowledge of [det]tid ";
+    let retired: Vec<u32> = log
+        .lines()
+        .filter_map(|line| line.split_once(marker))
+        .map(|(_, rest)| rest.split(' ').next().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(retired.len(), 5, "{retired:?}");
+    assert!(
+        retired.windows(2).all(|pair| pair[0] < pair[1]),
+        "{retired:?}"
+    );
+
+    for attempt in 0..3 {
+        let report_path = directory.path().join(format!("verify{attempt}.json"));
+        let mut args = strict.to_vec();
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_path.to_str().unwrap(),
+            "--",
+            guest.as_str(),
+            "4",
+        ]);
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "attempt {attempt}: {log}"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        let compared = &report["compared_log_messages"];
+        assert_eq!(
+            report["bitwise_parity"], true,
+            "attempt {attempt}: {report}"
+        );
+        assert!(
+            compared["left"].as_u64().is_some_and(|left| left > 0)
+                && compared["left"] == compared["right"],
+            "attempt {attempt}: {report}"
+        );
+    }
+}
+
+/// A recording of a guest that deadlocks is kept, ends with the guest's
+/// outcome, and replays to the same deadlock; `record start --verify
+/// --verify-strict` finds the recording and its replay identical (ptrace,
+/// `--strict` recording). Before, the recorder's container child exited 1 and
+/// the recording was discarded.
+#[test]
+fn a_recorded_guest_deadlock_replays_to_the_same_outcome() {
+    let _guard = hermit_run_guard();
+    let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let directory = data.path().to_str().unwrap();
+    let guest = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    let deadlocked = |output: &Output, what: &str| {
+        let log = stderr(output);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "{what}: {log}"
+        );
+        assert_eq!(
+            stdout(output),
+            CONDVAR_JOIN_DEADLOCK_STDOUT,
+            "{what}: {log}"
+        );
+        assert!(
+            log.contains("HERMIT_GUEST_DEADLOCK class=guest-deadlock"),
+            "{what}: {log}"
+        );
+        log
+    };
+    let record_args = [
+        "record",
+        "start",
+        "--strict",
+        "--base-env=minimal",
+        "--data-dir",
+        directory,
+        "--",
+        guest.as_str(),
+    ];
+    let record_log = deadlocked(&hermit(&record_args), "record");
+    assert!(record_log.contains("RECORDING COMPLETE!"), "{record_log}");
+    let replay_log = deadlocked(
+        &hermit(&["replay", "--autopilot", "--data-dir", directory]),
+        "replay",
+    );
+    assert!(
+        replay_log.contains(
+            "Deadlock detected: thread(s) waiting on futex, but no runnable threads left."
+        ),
+        "{replay_log}"
+    );
+    let verify_args = [
+        "record",
+        "start",
+        "--strict",
+        "--base-env=minimal",
+        "--data-dir",
+        directory,
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest.as_str(),
+    ];
+    let verify_log = deadlocked(&hermit(&verify_args), "record --verify");
+    assert!(
+        verify_log.contains(":: Success: replay matched recording."),
+        "{verify_log}"
+    );
+}
+
+/// The `--virtual-timeout` the virtual-timeout tests give the sleeping
+/// `tests/c/virtual_timeout_loop.c`, in virtual nanoseconds: three and a half
+/// of its one-second sleeps.
+const VIRTUAL_TIMEOUT_SLEEP_BOUND: &str = "3500000000";
+
+/// What the sleeping `tests/c/virtual_timeout_loop.c` prints before
+/// [`VIRTUAL_TIMEOUT_SLEEP_BOUND`] stops it.
+const VIRTUAL_TIMEOUT_SLEEP_STDOUT: &str = "tick 0\ntick 1\ntick 2\ntick 3\n";
+
+/// A guest that never ends stops at `--virtual-timeout`: exit 124 and
+/// `HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=N` after the
+/// scheduler's report and the summary, never `--timeout`'s
+/// `class=run-timeout` or an internal failure. A guest that sleeps keeps the
+/// ticks it printed before the bound, and its summary records the bound and
+/// an elapsed virtual time past it, the quantity the bound measures. A guest
+/// that spins without a system call is stopped by the same bound, through its
+/// preemption turns. A guest that deadlocks under a bound it does not reach
+/// still ends with the guest-deadlock outcome (ptrace, `--strict`).
+#[test]
+fn a_virtual_timeout_stops_a_guest_that_never_ends() {
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let bound = format!("--virtual-timeout={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    let class =
+        format!("HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary_path = directory.path().join("summary.json");
+    let summary_json = format!("--summary-json={}", summary_path.display());
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--summary",
+            summary_json.as_str(),
+            bound.as_str(),
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(status.and_then(|status| status.code()), Some(124), "{log}");
+    assert_eq!(stdout, VIRTUAL_TIMEOUT_SLEEP_STDOUT, "{log}");
+    let line_of = |wanted: &dyn Fn(&str) -> bool, what: &str| {
+        log.lines()
+            .position(wanted)
+            .unwrap_or_else(|| panic!("no {what} line:\n{log}"))
+    };
+    let report = line_of(
+        &|line| line.starts_with("Virtual timeout: at scheduler turn "),
+        "report",
+    );
+    let summary = line_of(
+        &|line| {
+            line == format!(
+                "The run's virtual clock passed {bound}: no scheduler turn was granted after it."
+            )
+        },
+        "summary",
+    );
+    let class_line = line_of(&|line| line == class, "class");
+    assert!(
+        report < summary && summary < class_line,
+        "the report, then the summary, then the class line:\n{log}"
+    );
+    assert!(!log.contains("class=run-timeout"), "{log}");
+    assert!(!log.contains("HERMIT_INTERNAL_FAILURE"), "{log}");
+    assert!(!log.contains("backend failure"), "{log}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(&summary_path).unwrap()).unwrap();
+    let bound_ns: u64 = VIRTUAL_TIMEOUT_SLEEP_BOUND.parse().unwrap();
+    assert_eq!(
+        summary["virtual_timeout_ns"],
+        serde_json::json!(bound_ns),
+        "{summary}"
+    );
+    assert!(
+        summary["virttime_elapsed"].as_u64().unwrap() > bound_ns,
+        "the bound measures the summary's elapsed virtual time: {summary}"
+    );
+
+    let spin = run_pmu_spinner_retrying_skid(
+        "a_virtual_timeout_stops_a_guest_that_never_ends",
+        &[
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--virtual-timeout=200000000",
+            "--",
+            guest.as_str(),
+            "spin",
+        ],
+        Duration::from_secs(120),
+        |stdout| assert_eq!(stdout, "spinning\n"),
+    );
+    assert_eq!(
+        spin.status.and_then(|status| status.code()),
+        Some(124),
+        "{}",
+        spin.stderr
+    );
+    assert_eq!(spin.stdout, "spinning\n", "{}", spin.stderr);
+    assert!(
+        spin.stderr
+            .lines()
+            .any(|line| line == "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=200000000"),
+        "{}",
+        spin.stderr
+    );
+
+    let deadlock = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--virtual-timeout=1000000000000",
+            "--",
+            deadlock.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.contains("HERMIT_GUEST_DEADLOCK class=guest-deadlock")
+            && !log.contains("class=virtual-timeout"),
+        "{log}"
+    );
+}
+
+/// A bound the guest never reaches changes nothing, for a guest that ends on
+/// its own either way: one that sleeps three times and exits 0, and one that
+/// sleeps three times beside a thread parked in pause() and then dies of
+/// SIGTERM, whose delivery records the doom of its process because the bound
+/// is set. Each runs to its own end with `--virtual-timeout` set past it,
+/// with the same stdout, the same elapsed virtual time and an INFO stream
+/// that `log-diff --canonical-info` matches against the run without the
+/// bound. Nor does a bound that only the commit after the exiting guest's
+/// last exit grant passes: no thread is left that a turn could be granted to,
+/// so its own status stands (ptrace, `--strict`). The SIGTERM is delivered to
+/// the thread that raised it, in a turn charged nothing, so that run has no
+/// commit after the delivery to test; the scheduler unit tests cover a doomed
+/// process.
+#[test]
+fn a_virtual_timeout_the_guest_never_reaches_changes_nothing() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let bound: u64 = VIRTUAL_TIMEOUT_SLEEP_BOUND.parse().unwrap();
+    // The scheduler charges a turn this much (`--scheduler-turn-cost`'s
+    // default). A guest that exits 0 ends in an exit grant, after which the
+    // run's last commit is at least this far past any commit at which its
+    // thread could run.
+    const SCHEDULER_TURN_CHARGE: u64 = 500_000;
+    for (mode, ending, after_the_end) in [
+        (&["3"][..], "exit 0", Some(SCHEDULER_TURN_CHARGE / 2)),
+        (&["term", "3"][..], "SIGTERM", None),
+    ] {
+        let run = |name: &str, bound: Option<u64>| {
+            let name = format!("{}-{name}", mode.join("-"));
+            let log = directory.path().join(format!("{name}.log"));
+            let summary = directory.path().join(format!("{name}.json"));
+            let log_file = format!("--log-file={}", log.display());
+            let summary_json = format!("--summary-json={}", summary.display());
+            let bound = bound.map(|bound| format!("--virtual-timeout={bound}"));
+            let mut args = vec![
+                "--log=info",
+                log_file.as_str(),
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                summary_json.as_str(),
+            ];
+            args.extend(bound.as_deref());
+            args.push("--");
+            args.push(guest.as_str());
+            args.extend(mode);
+            let run_directory = directory.path().join(&name);
+            fs::create_dir(&run_directory).unwrap();
+            let (status, stderr) = run_with_deadline(
+                hermit_command(&args),
+                &run_directory,
+                Duration::from_secs(120),
+                false,
+            );
+            let stdout = fs::read_to_string(run_directory.join("deadline-run.stdout")).unwrap();
+            let status = status.unwrap_or_else(|| panic!("{name}: no status: {stderr}"));
+            match ending {
+                "exit 0" => assert_eq!(status.code(), Some(0), "{name}: {stderr}"),
+                _ => assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {stderr}"),
+            }
+            assert_eq!(stdout, "tick 0\ntick 1\ntick 2\n", "{name}: {stderr}");
+            assert!(!stderr.contains("HERMIT_RUN_TIMEOUT"), "{name}: {stderr}");
+            let summary: serde_json::Value =
+                serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+            assert!(
+                summary.get("virtual_timeout_ns").is_none(),
+                "{name}: {summary}"
+            );
+            (log, summary["virttime_elapsed"].as_u64().unwrap())
+        };
+        let (unbounded_log, elapsed) = run("unbounded", None);
+        assert!(
+            elapsed < bound,
+            "{ending}: the three ticks end before the bound: {elapsed}"
+        );
+        let (bounded_log, bounded_elapsed) = run("bounded", Some(bound));
+        assert_eq!(bounded_elapsed, elapsed, "{ending}");
+        let comparison = directory.path().join(format!("{}.json", mode.join("-")));
+        let diff = hermit(&[
+            "log-diff",
+            "--canonical-info",
+            "--json",
+            comparison.to_str().unwrap(),
+            unbounded_log.to_str().unwrap(),
+            bounded_log.to_str().unwrap(),
+        ]);
+        assert!(
+            diff.status.success(),
+            "{ending}: {}{}",
+            stdout(&diff),
+            stderr(&diff)
+        );
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&comparison).unwrap()).unwrap();
+        assert_eq!(verdict["verdict"], "matched", "{ending}: {verdict:#}");
+        assert!(
+            verdict["selected_messages"]["left"].as_u64().unwrap() > 0,
+            "{ending}: {verdict:#}"
+        );
+        if let Some(after_the_end) = after_the_end {
+            run("after-the-end", Some(elapsed - after_the_end));
+        }
+    }
+}
+
+/// Two runs of a guest that never ends stop at the same turn of
+/// `--virtual-timeout`, so `--verify --verify-strict` compares them and
+/// establishes bitwise parity, with the default `--verify-allow` and with
+/// `failure` alike (a guest the scheduler stopped exited with no status of
+/// its own), and the verification ends with the bound's outcome: the stdout
+/// both runs agreed on once, the class line and exit 124 (ptrace, `--strict`).
+#[test]
+fn a_virtual_timeout_verifies_as_the_same_stop_in_both_runs() {
+    let _guard = hermit_run_guard();
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let bound = format!("--virtual-timeout={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    for allow in [None, Some("--verify-allow=failure")] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report_path = directory.path().join("verify.json");
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            bound.as_str(),
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_path.to_str().unwrap(),
+        ];
+        args.extend(allow);
+        args.extend(["--", guest.as_str()]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(240),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(124),
+            "{allow:?}: {log}"
+        );
+        assert_eq!(stdout, VIRTUAL_TIMEOUT_SLEEP_STDOUT, "{allow:?}: {log}");
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{allow:?}: {log}"
+        );
+        let class = format!(
+            "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={VIRTUAL_TIMEOUT_SLEEP_BOUND}\n\
+             Error: The run's virtual clock passed {bound} (virtual nanoseconds since the run \
+             began)"
+        );
+        assert!(log.contains(&class), "{allow:?}: {log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(report["verdict"], serde_json::json!("matched"), "{report}");
+        assert_eq!(report["verified"], serde_json::json!(true), "{report}");
+        assert_eq!(
+            report["bitwise_parity"],
+            serde_json::json!(true),
+            "{report}"
+        );
+        assert_eq!(
+            report["guest_exit_code"],
+            serde_json::json!(124),
+            "{report}"
+        );
+    }
+}
+
+/// On KVM, whose scheduler cannot hand the stop to the run, the scheduler
+/// exits the container child 124 and leaves the bound in the note the child
+/// shares with Hermit, so the run still reports `class=virtual-timeout` with
+/// the output written before the bound, never `--timeout`'s
+/// `class=run-timeout` or an internal failure.
+#[test]
+fn run_kvm_virtual_timeout_is_reported_from_the_childs_note() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let bound = format!("--virtual-timeout={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--backend",
+            "kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            bound.as_str(),
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(status.and_then(|status| status.code()), Some(124), "{log}");
+    assert_eq!(stdout, VIRTUAL_TIMEOUT_SLEEP_STDOUT, "{log}");
+    assert!(
+        log.lines().any(|line| line
+            == format!(
+                "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={VIRTUAL_TIMEOUT_SLEEP_BOUND}"
+            )),
+        "{log}"
+    );
+    assert!(!log.contains("class=run-timeout"), "{log}");
+    assert!(!log.contains("HERMIT_INTERNAL_FAILURE"), "{log}");
+}
+
 /// A parent waiting for a child that cannot exit (its only thread paused
 /// forever, waiting on a futex no one wakes, or itself waiting for a paused
-/// grandchild) ends the run with Detcore's deadlock report, exit 125, as the
-/// same child without the wait does. Before, the run spun until the outer
-/// timeout (https://github.com/rrnewton/hermit/issues/4430). The report is
-/// the same in two runs with the same epoch. A wait that can end (a second
-/// parent thread kills the child after a sleep; the child's alarm wakes it)
-/// still ends as on Linux (ptrace, `--strict`).
+/// grandchild) ends the run with Detcore's deadlock report, exit 121 (class
+/// guest-deadlock), as the same child without the wait does. Before, the run
+/// spun until the outer timeout (https://github.com/rrnewton/hermit/issues/4430).
+/// The report is the same in two runs with the same epoch. A wait that can end
+/// (a second parent thread kills the child after a sleep; the child's alarm
+/// wakes it) still ends as on Linux (ptrace, `--strict`).
 #[test]
 fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
     let guest = child_wait_deadlock_guest().to_str().unwrap().to_owned();
@@ -39680,11 +40372,16 @@ fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
         ("chain", "thread(s) waiting indefinitely"),
     ] {
         let (code, stdout, log) = run(mode);
-        assert_eq!(code, Some(125), "{mode}: {stdout}\n{log}");
+        assert_eq!(
+            code,
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "{mode}: {stdout}\n{log}"
+        );
         assert!(
             log.contains("Deadlock detected")
                 && log.contains(class)
-                && log.contains("thread(s) waiting for a child that cannot exit"),
+                && log.contains("thread(s) waiting for a child that cannot exit")
+                && log.contains("HERMIT_GUEST_DEADLOCK class=guest-deadlock"),
             "{mode}: the deadlock report must name the wait:\n{log}"
         );
     }

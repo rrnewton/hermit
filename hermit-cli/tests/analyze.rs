@@ -49,6 +49,7 @@ struct AnalyzeWorkloads {
     hello_race: PathBuf,
     racewrite_nostdlib: PathBuf,
     nanosleep_nocrash: PathBuf,
+    race_then: PathBuf,
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
@@ -145,23 +146,35 @@ fn workloads() -> &'static AnalyzeWorkloads {
             &nanosleep_nocrash,
         );
 
+        let race_then = build_root.join("analyze_race_then");
+        compile_c_pthread(
+            &repository.join("hermit-cli/tests/fixtures/analyze_race_then.c"),
+            &race_then,
+        );
+
         AnalyzeWorkloads {
             hello_race,
             racewrite_nostdlib,
             nanosleep_nocrash,
+            race_then,
         }
     })
 }
 
-/// Runs `hermit analyze --search` over `guest` and returns the combined
-/// stdout+stderr, asserting a successful exit and that at least one guest stack
-/// trace was printed. `expected_output`, when non-empty, must also appear (used
-/// to pin the blamed source line).
+/// Runs `hermit analyze --search` over `guest` and returns its report file,
+/// asserting a successful exit and that at least one guest stack trace was
+/// printed. `expected_output`, when non-empty, must also appear in the
+/// combined stdout+stderr (used to pin the blamed source line).
 ///
 /// Mirrors `tests/util/hermit_analyze_test.sh`: `--analyze-seed=0 --search`,
 /// then a chaotic run with a tight preemption timeout so the search has enough
 /// scheduling change points to expose the race.
-fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output: &str) {
+fn run_analyze(
+    label: &str,
+    guest: &Path,
+    analyze_opts: &[&str],
+    expected_output: &str,
+) -> serde_json::Value {
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
@@ -187,6 +200,25 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
     assert!(
         combined.contains("Stack trace for thread"),
         "{label}: hermit analyze did not print a guest stack trace\n{combined}"
+    );
+    // The runs after the target run are bounded in virtual time
+    // (--trial-virtual-timeout, by default 10 times the longest endpoint run
+    // and at least 60 s of virtual time) and, as a backstop, in wall-clock
+    // time (--trial-timeout=auto: 4 times the larger of 60 s and 10 times the
+    // slowest endpoint run).
+    let bound = |unit: &str| {
+        regex::Regex::new(&format!(r"Runs from here on are bounded at (\d+) {unit}"))
+            .unwrap()
+            .captures(&combined)
+            .and_then(|found| found[1].parse::<u64>().ok())
+    };
+    assert!(
+        bound("ns of virtual time").is_some_and(|nanos| nanos >= 60_000_000_000),
+        "{label}: no virtual-time trial bound of at least 60 s\n{combined}"
+    );
+    assert!(
+        bound("s of wall-clock time").is_some_and(|seconds| seconds >= 240),
+        "{label}: no wall-clock backstop of at least 240 s\n{combined}"
     );
     if !expected_output.is_empty() {
         assert!(
@@ -215,6 +247,10 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
         warnings.first().copied(),
         "{label}: {report}\n{combined}"
     );
+    let report = fs::read_to_string(&report_file)
+        .unwrap_or_else(|error| panic!("{label}: no report file: {error}\n{combined}"));
+    serde_json::from_str(&report)
+        .unwrap_or_else(|error| panic!("{label}: unreadable report file: {error}\n{report}"))
 }
 
 /// Exercises analyze's fail-closed endpoint check for a workload whose target
@@ -282,6 +318,38 @@ fn analyze_racewrite_nostdlib() {
     );
 }
 
+/// `--prefix-search` finds the same race from the target schedule alone: the
+/// deciding event is the parent's return from fork, and the thread the
+/// scheduler would run there instead is the child at its racing write. The
+/// parent's slice ends right after that return in the target schedule, and a
+/// trial that stops there leaves that slice end to the scheduler; one that
+/// replayed it would name the parent's next event, one too late.
+#[test]
+#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_racewrite_nostdlib_prefix_search() {
+    let report = run_analyze(
+        "analyze racewrite_nostdlib --prefix-search",
+        &workloads().racewrite_nostdlib,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-exit-code=0",
+            "--target-stdout=foobar",
+        ],
+        "racewrite_nostdlib.c:35",
+    );
+    let header = report["header"].as_str().unwrap_or_default();
+    assert!(header.contains("Syscall(fork, Posthook)"), "{report}");
+    let thread = |event: &str| report[event]["stack"]["thread_id"].as_i64();
+    assert!(thread("critical_event1").is_some(), "{report}");
+    assert!(thread("critical_event2").is_some(), "{report}");
+    assert_ne!(
+        thread("critical_event1"),
+        thread("critical_event2"),
+        "{report}"
+    );
+}
+
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
@@ -290,4 +358,319 @@ fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
         &workloads().nanosleep_nocrash,
         &["--run-arg=--base-env=empty", "--target-exit-code=0"],
     );
+}
+
+/// The first chaos seed under which `analyze_race_then THEN`, run with
+/// `run_args`, takes the order that finishes ("b-first", exit 0). A run in
+/// the other order may not end by itself, so each is bounded at 5 s.
+fn race_then_target_seed(then: &str, run_args: &[&str]) -> u64 {
+    let guest = &workloads().race_then;
+    (0..40)
+        .find(|seed| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+            command
+                .args(["run", "--chaos", "--timeout=5"])
+                .args(run_args)
+                .arg(format!("--seed={seed}"))
+                .arg("--")
+                .arg(guest)
+                .arg(then);
+            let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+            output.status.success() && output.stdout == b"b-first\n"
+        })
+        .expect("no chaos seed in 0..40 lets thread b win the race")
+}
+
+fn combined_output(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// `hermit analyze` over `analyze_race_then THEN` from a target seed, with
+/// more analyze options and run arguments: its output and report, if it
+/// wrote one.
+fn analyze_race_then_with(
+    then: &str,
+    analyze_opts: &[&str],
+    run_args: &[&str],
+) -> (Output, Option<serde_json::Value>) {
+    let seed = race_then_target_seed(then, run_args);
+    let _guard = analyze_lock();
+    let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
+    let report_file = report_dir.path().join("report.json");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .arg("analyze")
+        .args(["--target-stdout=b-first", "--target-exit-code=0"])
+        .args(analyze_opts)
+        .arg(format!("--run1-seed={seed}"))
+        .arg(format!("--report-file={}", report_file.display()))
+        .args(["--", "--chaos"])
+        .args(run_args)
+        .arg("--")
+        .arg(&workloads().race_then)
+        .arg(then);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let report = fs::read_to_string(&report_file).ok().map(|text| {
+        serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("unreadable report: {error}\n{}", combined_output(&output))
+        })
+    });
+    (output, report)
+}
+
+/// [`analyze_race_then_with`], asserting that analyze succeeded and wrote a
+/// report naming a critical event: the combined output and the report.
+fn analyze_race_then(
+    label: &str,
+    then: &str,
+    analyze_opts: &[&str],
+) -> (String, serde_json::Value) {
+    let (output, report) = analyze_race_then_with(then, analyze_opts, &[]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label} failed: {}\n{combined}",
+        output.status
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert!(
+        report["critical_event1"]["event_index"].is_u64(),
+        "{label}: {report}"
+    );
+    (combined, report)
+}
+
+/// A wall-clock bound short enough that a trial that never ends reaches it
+/// long before the virtual-time bound.
+const TRIAL_TIMEOUT_3: &str = "--trial-timeout=3";
+
+const BOUND_REACHED: &str = "reached hermit analyze's bound of 3 s for this run \
+                             (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)); \
+                             counted as not meeting the target";
+
+/// Every prefix trial in which thread a wins the race spins for ever, the
+/// run without chaos (the prefix search's baseline) among them. Each is
+/// bounded by `--trial-timeout` and counts as not meeting the target, so
+/// the search still finds the deciding event. Before the bound, the first
+/// such trial never ended. The trial on the boundary's baseline side runs
+/// once more with 4 times the bound, does not finish then either, and the
+/// report says the boundary rests on that bound rather than on an outcome.
+/// The virtual-time bound is off: a confirmation of 12 s could otherwise
+/// reach it first on a fast host.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_bounds_trials_that_never_end() {
+    let label = "analyze --prefix-search analyze_race_then spin";
+    let (combined, report) = analyze_race_then(
+        label,
+        "spin",
+        &[
+            "--prefix-search",
+            TRIAL_TIMEOUT_3,
+            "--trial-virtual-timeout=off",
+        ],
+    );
+    assert!(
+        combined.contains(BOUND_REACHED),
+        "{label}: no trial reached the bound\n{combined}"
+    );
+    assert!(
+        combined.contains("running it again with a bound of 12 s, so that a finished trial"),
+        "{label}: the boundary was not confirmed\n{combined}"
+    );
+    let header = report["header"].as_str().unwrap();
+    assert!(
+        header.contains("does not finish, which the search counts as not meeting")
+            && header.contains("this boundary rests on a wall-clock bound, not on an outcome"),
+        "{label}: {report}"
+    );
+}
+
+/// The same spinning trials under the default virtual-time bound: each
+/// reaches it (60 s of virtual time) at the same scheduler turn on every
+/// host. Such a trial counts as not meeting the target, and the one on the
+/// boundary's baseline side is not confirmed with a longer bound, since a
+/// rerun at the same bound stops at the same turn: the report calls it a
+/// hang that the boundary rests on a virtual-time bound for. A stopped trial
+/// keeps its recorded schedule, so the report also shows the thread the
+/// scheduler runs instead (stack2). A debug build took 87 to 121 s of host
+/// time to reach the bound in this spin, so the wall-clock bound is raised
+/// from the 240 s backstop to 600 s, for the virtual-time bound to stop every
+/// trial on a slower or busier host too.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_bounds_trials_that_never_end_in_virtual_time() {
+    let label = "analyze --prefix-search analyze_race_then spin, virtual-time bound";
+    let (combined, report) =
+        analyze_race_then(label, "spin", &["--prefix-search", "--trial-timeout=600"]);
+    assert!(
+        combined.contains("reached hermit analyze's virtual-time bound of"),
+        "{label}: no trial reached the virtual-time bound\n{combined}"
+    );
+    assert!(
+        combined.contains("Stopped in virtual time"),
+        "{label}: no trial was stopped in virtual time\n{combined}"
+    );
+    assert!(
+        !combined.contains("running it again with a bound"),
+        "{label}: a trial the virtual-time bound stopped was confirmed\n{combined}"
+    );
+    // The final recheck runs the boundary's trials once more; the one the
+    // virtual-time bound stopped stops at the same turn again.
+    assert!(
+        !combined.contains("gave other outcomes"),
+        "{label}: a recheck of the boundary did not repeat\n{combined}"
+    );
+    let header = report["header"].as_str().unwrap();
+    assert!(
+        header.contains("this boundary rests on a virtual-time bound, not on an outcome"),
+        "{label}: {report}"
+    );
+    assert!(
+        report["critical_event2"]["stack"].is_object(),
+        "{label}: no stack2\n{report}"
+    );
+}
+
+/// The default search's baseline is the run without chaos, which here spins
+/// for ever. The bound ends it too, and with no baseline schedule analyze
+/// searches within the target schedule instead. Before, the baseline run
+/// never ended, whatever --trial-timeout said.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_searches_the_target_schedule_when_the_baseline_never_ends() {
+    let label = "analyze analyze_race_then spin";
+    let (combined, _) = analyze_race_then(label, "spin", &[TRIAL_TIMEOUT_3]);
+    assert!(
+        combined.contains(
+            "the baseline run (non-chaos (0 extra preemptions) run) did not finish, so it \
+             recorded no schedule to bisect against"
+        ) && combined.contains("Searching within the target schedule instead"),
+        "{label}: no fallback\n{combined}"
+    );
+}
+
+/// Every prefix trial in which thread a wins the race asks for something
+/// Hermit refuses at run time (exit 122), the run without chaos (the prefix
+/// search's baseline) among them. Each counts as not meeting the target, with
+/// a warning, and the report says how many were refused. Before, the first
+/// refused trial ended the whole analysis with exit 122. The refusal is
+/// Detcore's for a process-directed signal while several threads live
+/// (https://github.com/rrnewton/hermit/issues/4034); once that is supported,
+/// the fixture needs another refused operation.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_counts_a_refused_trial_as_the_baseline() {
+    let label = "analyze --prefix-search analyze_race_then refuse";
+    let (combined, report) =
+        analyze_race_then(label, "refuse", &["--prefix-search", TRIAL_TIMEOUT_3]);
+    assert!(
+        combined.contains(
+            "Hermit refused this trial when the guest reached an operation it does not support"
+        ),
+        "{label}: no trial was refused\n{combined}"
+    );
+    assert!(
+        report["header"]
+            .as_str()
+            .unwrap()
+            .contains("trial(s) were refused by Hermit (exit 122) and counted as not reaching"),
+        "{label}: {report}"
+    );
+}
+
+/// The target run itself is refused: it cannot be studied, so analyze ends
+/// with Hermit's refusal (exit 122) rather than counting it.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_ends_with_a_refused_target_run() {
+    let label = "analyze analyze_race_then refuse, target refused";
+    let guest = &workloads().race_then;
+    // The run without chaos takes the order Hermit refuses.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["analyze", "--prefix-search", "--target-stdout=a-first"])
+        .args(["--", "--timeout=30", "--"])
+        .arg(guest)
+        .arg("refuse");
+    let output = hermit_test::hermit_output(label, &mut command);
+    let combined = combined_output(&output);
+    assert_eq!(output.status.code(), Some(122), "{label}\n{combined}");
+    assert!(
+        combined.contains("HERMIT_POLICY_REFUSAL"),
+        "{label}\n{combined}"
+    );
+}
+
+/// A race found only at a short timeslice: at the run's own 100 us, thread a
+/// is preempted before it claims even without chaos, so the scheduler alone
+/// meets the target and gives the prefix search nothing to bisect against.
+/// The search says so and continues at hermit's default 200 ms, where it
+/// does not. Before, the analysis ended there with exit 125.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_continues_prefixes_at_a_coarser_timeslice() {
+    let label = "analyze --prefix-search analyze_race_then late-a --max-timeslice=100000";
+    let (output, report) = analyze_race_then_with(
+        "late-a",
+        &["--prefix-search", TRIAL_TIMEOUT_3],
+        &["--max-timeslice=100000"],
+    );
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label}: {}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains(
+            "Continuing without chaos at a 100000 ns timeslice, the scheduler alone, replaying \
+             none of the target schedule, meets the target"
+        ),
+        "{label}\n{combined}"
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert!(
+        report["header"]
+            .as_str()
+            .unwrap()
+            .contains("scheduling without chaos at a 200000000 ns timeslice does not meet"),
+        "{label}: {report}"
+    );
+}
+
+/// The same race with `--continuation-timeslice=100000`: there is no other
+/// continuation to try, so analyze fails, saying that the outcome does not
+/// depend on a chaos decision and what to run or pass instead.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_explains_a_target_the_scheduler_meets_alone() {
+    let label = "analyze --prefix-search analyze_race_then late-a --continuation-timeslice=100000";
+    let (output, _) = analyze_race_then_with(
+        "late-a",
+        &[
+            "--prefix-search",
+            "--continuation-timeslice=100000",
+            TRIAL_TIMEOUT_3,
+        ],
+        &["--max-timeslice=100000"],
+    );
+    let combined = combined_output(&output);
+    assert!(!output.status.success(), "{label}\n{combined}");
+    for expected in [
+        "no event of the target schedule decides the outcome: without chaos, the scheduler alone \
+         already meets the target criteria at a 100000 ns timeslice",
+        "prefix_round_001.repro",
+        "pass --continuation-timeslice",
+        "--run2-seed",
+    ] {
+        assert!(
+            combined.contains(expected),
+            "{label}: no {expected:?}\n{combined}"
+        );
+    }
 }

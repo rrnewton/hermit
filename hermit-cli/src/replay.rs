@@ -208,8 +208,15 @@ impl Replay {
             _materialization_scope,
         } = self;
         let (exit_status, global_state) = crate::ptrace_completion::wait(tracer, control).await?;
+        let terminal_outcome = global_state.terminal_outcome();
         let finalized = global_state.clean_up(false, &None).await;
         finish_replay_chroot(finalized, chroot)?;
+        // A recording of a deadlocked guest replays to the same deadlock.
+        if let Some(outcome) = terminal_outcome {
+            return Err(crate::Error::new(crate::SchedulerEndedRun::new(
+                outcome, None,
+            )));
+        }
         Ok(exit_status)
     }
 
@@ -225,8 +232,15 @@ impl Replay {
         } = self;
         let (output, global_state) =
             crate::ptrace_completion::wait_with_output(tracer, control).await?;
+        let terminal_outcome = global_state.terminal_outcome();
         let finalized = global_state.clean_up(false, &None).await;
         finish_replay_chroot(finalized, chroot)?;
+        if let Some(outcome) = terminal_outcome {
+            return Err(crate::Error::new(crate::SchedulerEndedRun::new(
+                outcome,
+                Some(output),
+            )));
+        }
         Ok(output)
     }
 }

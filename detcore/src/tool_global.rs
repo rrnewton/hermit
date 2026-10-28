@@ -2156,6 +2156,13 @@ impl GlobalState {
         }
     }
 
+    /// The terminal outcome this run ended with, when its backend unwound the
+    /// guest for it (`TerminalOutcomeUnwindGuard`): the status the run
+    /// completed with is then the outcome's, not one the guest exited with.
+    pub fn terminal_outcome(&self) -> Option<crate::TerminalOutcome> {
+        self.sched.lock().unwrap().terminal_outcome()
+    }
+
     /// Consume failed-run state after the scheduler has naturally finished.
     ///
     /// A failed run has no successful run summary. Preserve the scheduler's
