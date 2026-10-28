@@ -1193,7 +1193,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // virtual_cpus_parse_from_1_to_128: 1882.
     // The shared caller/ABI16 companion adds detcore-dbt's
     // capability_clear_image_readiness_preserves_legacy_conditions: 1883, listed.
-    ("test.regular_crates", 1891),
+    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1894.
+    ("test.regular_crates", 1894),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1844,7 +1845,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1121, listed (1114 on main plus seven).
     // And the fourteen pinned_cpu::tests units, which choose the CPU a run is
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
-    ("test.hermit_unit", 1169),
+    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
+    ("test.hermit_unit", 1172),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5730,7 +5732,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
-    ("test.hermit_unit_on_host", 1163),
+    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
+    ("test.hermit_unit_on_host", 1166),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5938,7 +5941,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two --virtual-cpus config tests: 1868.
     // The same shared caller/ABI16 legacy-readiness test, with all fourteen
     // hosted exclusions unchanged: 1869, listed.
-    ("test.regular_crates_on_host", 1877),
+    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1880.
+    ("test.regular_crates_on_host", 1880),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
