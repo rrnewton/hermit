@@ -3051,7 +3051,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_kvms_synthetic_procfs_device_is_proved_by_its_stat_fields with the
     // KVM /proc anchor's device check it tested: 2695 - 1 = 2694, listed.
     // And syscalls::helpers::tests::only_msg_dontwait_keeps_a_socket_call_from_waiting: 2723.
-    ("test.detcore_unit", 2723),
+    // And the decision it feeds, syscalls::helpers::kernel_signal_wait_failures::
+    // msg_dontwait_runs_a_call_once_on_a_socket_the_guest_left_blocking: 2724.
+    ("test.detcore_unit", 2724),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5327,7 +5329,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same protection-key subscription unit: 2692, listed.
     // And the same P2b deletion of the anchor device unit: 2694, listed.
     // And the same MSG_DONTWAIT unit: 2723.
-    ("test.detcore_unit_on_host", 2723),
+    // And the same MSG_DONTWAIT decision unit: 2724.
+    ("test.detcore_unit_on_host", 2724),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
