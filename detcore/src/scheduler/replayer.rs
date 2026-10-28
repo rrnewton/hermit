@@ -295,7 +295,12 @@ impl Replayer {
     /// RIP, but are followed directly by more branches or by another thread's
     /// event, which marks them as stops too.
     ///
-    /// Branches without a RIP followed by the thread's OtherInstructions
+    /// A batch with an instruction offset (`--chaos-instruction-offset`) is a
+    /// timer preemption too, though its recording follows it with the
+    /// thread's OtherInstructions (the instructions the timer stepped past the
+    /// branch target) and gives it no RIP.
+    ///
+    /// Other branches without a RIP followed by the thread's OtherInstructions
     /// reached a check-in after them: a syscall, a trapped instruction, a
     /// signal or an exec. The thread reaches that check-in on its own, and a
     /// context switch the schedule puts after it happens there. A stop on the
@@ -308,12 +313,19 @@ impl Replayer {
             count,
             dettid,
             end_rip,
+            instruction_offset,
             ..
         } = next
         else {
             return None;
         };
+        // A batch with an instruction offset ended at an offset timer
+        // (`--chaos-instruction-offset`) by construction. Its recording
+        // follows it with the thread's OtherInstructions, the instructions
+        // the timer stepped past the branch target, and gives it no RIP, so
+        // the shape alone would read as a slice that reached a check-in.
         let timer_preemption = end_rip.is_some()
+            || instruction_offset.is_some()
             || self
                 .cursor
                 .peek_nth(1)
@@ -1160,14 +1172,12 @@ mod tests {
         );
         assert_eq!(replayer.next_instruction_offset(), Some(offset));
 
-        // A known gap, as a recording produces it: the offset timer's batch,
-        // its `OtherInstructions` event, then a syscall of the same thread at
-        // once (the thread kept running after the slice end). The replayer
-        // gives such a batch no timeslice (`resolve_time_to_run`), so its
-        // offset is not armed and its replay desyncs. A slice end of the same
-        // shape without an offset (a stop at a branch followed by the same
-        // thread's syscall) has the same gap today
-        // (https://github.com/rrnewton/hermit/issues/4833).
+        // As a recording produces it when the thread kept running after the
+        // slice end: the offset timer's batch, its `OtherInstructions`
+        // event, then a syscall of the same thread at once. The batch keeps
+        // its timeslice and offset (`resolve_time_to_run`), as a timer stop
+        // with its RIP does, so the replay stops the thread where the
+        // recording did before it runs on to the syscall.
         let continued_to_a_syscall = vec![
             b.other(SOME_RIP, tid(3)),
             b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
@@ -1177,9 +1187,9 @@ mod tests {
         let mut replayer = Replayer::new(continued_to_a_syscall.clone());
         assert_eq!(
             replayer.observe_event(&continued_to_a_syscall[0]),
-            ReplayAction::Continue(None)
+            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
         );
-        assert_eq!(replayer.next_instruction_offset(), None);
+        assert_eq!(replayer.next_instruction_offset(), Some(offset));
     }
 
     /// A batch of branches observed without the offset its recording carries
