@@ -68,6 +68,11 @@ fn initial_strings(context: &exec_stop::EntryContext) -> (Vec<Vec<u8>>, Vec<Vec<
 
 #[test]
 fn shared_exec_stop_preserves_command_inside_the_common_container() {
+    if crate::run_in_fresh_process(
+        "exec_stop_launch_tests::shared_exec_stop_preserves_command_inside_the_common_container",
+    ) {
+        return;
+    }
     use std::os::fd::AsFd;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
