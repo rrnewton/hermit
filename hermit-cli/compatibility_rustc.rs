@@ -25,8 +25,8 @@ use super::compatibility_graph::Unit;
 
 pub const CAPTURE_ENV: &str = "HERMIT_COMPATIBILITY_RUSTC_CAPTURE";
 pub const GATE_ENV: &str = "HERMIT_COMPATIBILITY_RUSTC_GATE";
-pub const CAPTURE_SCHEMA: &str = "hermit-actual-rustc-capture/v2";
-pub const NORMALIZATION: &str = "hermit-shared-rustc-semantics/v2";
+pub const CAPTURE_SCHEMA: &str = "hermit-actual-rustc-capture/v3";
+pub const NORMALIZATION: &str = "hermit-shared-rustc-semantics/v3";
 pub const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_COMMANDS: usize = 4096;
@@ -50,6 +50,59 @@ pub struct Compiler {
     pub identity: FileIdentity,
     pub sha256: String,
     pub verbose_version: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerQuery {
+    pub argv: Vec<Vec<u8>>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: i32,
+}
+
+/// Directory size/timestamps change as unrelated Cargo units finish. The
+/// directory inode/type and the complete relevant candidate inventory, not
+/// unrelated entries, own this narrowly restricted search observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SysrootArtifact {
+    pub path: Vec<u8>,
+    pub identity: FileIdentity,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SysrootSearch {
+    pub argument: usize,
+    pub directory: Vec<u8>,
+    pub canonical_directory: Vec<u8>,
+    pub identity: DirectoryIdentity,
+    pub candidates: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SysrootExtern {
+    pub argument: usize,
+    pub name: Vec<u8>,
+    pub compiler: Compiler,
+    pub host: String,
+    pub query: CompilerQuery,
+    pub directory: Vec<u8>,
+    pub canonical_directory: Vec<u8>,
+    pub identity: DirectoryIdentity,
+    pub artifacts: Vec<SysrootArtifact>,
+    pub searches: Vec<SysrootSearch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +204,9 @@ pub struct Invocation {
     pub context: Context,
     pub response_files: Vec<ResponseFile>,
     pub source: Option<CompilerInput>,
+    /// Mandatory even when empty. Old captures cannot acquire a sysroot
+    /// resolution assertion after their compiler population has finished.
+    pub sysroot_externs: Vec<SysrootExtern>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +335,7 @@ impl Bundle {
                     );
                 }
             }
+            validate_sysroot_externs(command, &bundle.target_directory)?;
         }
         Ok(bundle)
     }
@@ -356,6 +413,19 @@ enum Argument {
         name: Vec<u8>,
         artifact: Box<ArtifactIdentity>,
     },
+    SysrootExtern {
+        name: Vec<u8>,
+        host: String,
+        artifacts: Vec<SysrootArtifactSemantics>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SysrootArtifactSemantics {
+    filename: Vec<u8>,
+    bytes: u64,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +464,282 @@ fn split_equal(value: &[u8]) -> Option<(&[u8], &[u8])> {
         .iter()
         .position(|byte| *byte == b'=')
         .map(|index| (&value[..index], &value[index + 1..]))
+}
+
+pub struct SysrootShape {
+    pub arguments: Vec<usize>,
+    pub host: String,
+    pub searches: Vec<(usize, Vec<u8>)>,
+}
+
+/// Only the observed host proc-macro form is supported. In particular, a
+/// bare extern is not a general permission to search for an arbitrary crate.
+pub fn sysroot_extern_shape(command: &Invocation) -> Result<Option<SysrootShape>, String> {
+    let mut arguments = Vec::new();
+    let mut index = 0;
+    while index < command.argv.len() {
+        let arg = &command.argv[index];
+        if let Some((value, count)) = option(arg, b"--extern", command.argv.get(index + 1)) {
+            if split_equal(value).is_none() {
+                if value != b"proc_macro" {
+                    return Err("unsupported bare rustc extern name".to_owned());
+                }
+                arguments.push(index);
+            }
+            index += count;
+        } else {
+            if arg == b"--extern" {
+                return Err("rustc extern has no value".to_owned());
+            }
+            index += 1;
+        }
+    }
+    if arguments.is_empty() {
+        return Ok(None);
+    }
+    if arguments.len() != 1
+        || !command.response_files.is_empty()
+        || command.argv.iter().any(|arg| {
+            arg.starts_with(b"@")
+                || arg == b"--target"
+                || arg.starts_with(b"--target=")
+                || arg == b"--sysroot"
+                || arg.starts_with(b"--sysroot=")
+                || arg == b"--library-path"
+                || arg.starts_with(b"--library-path=")
+        })
+    {
+        return Err(
+            "implicit proc_macro has a duplicate, target/sysroot/search override or response file"
+                .to_owned(),
+        );
+    }
+    let crate_types: Vec<_> = command
+        .argv
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| option(arg, b"--crate-type", command.argv.get(index + 1)))
+        .map(|(value, _)| value)
+        .collect();
+    if crate_types != [b"proc-macro".as_slice()] {
+        return Err("implicit proc_macro is not one host proc-macro compilation".to_owned());
+    }
+    let version = text(&command.compiler.verbose_version, "compiler identity")?;
+    let hosts: Vec<_> = version
+        .lines()
+        .filter_map(|line| line.strip_prefix("host: "))
+        .collect();
+    if hosts.len() != 1
+        || hosts[0].is_empty()
+        || !hosts[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("implicit proc_macro has no unique exact compiler host".to_owned());
+    }
+    let mut searches = Vec::new();
+    index = 0;
+    while index < command.argv.len() {
+        let arg = &command.argv[index];
+        let library = if arg == b"-L" {
+            Some((
+                command
+                    .argv
+                    .get(index + 1)
+                    .ok_or_else(|| "rustc search has no value".to_owned())?
+                    .as_slice(),
+                2,
+            ))
+        } else {
+            arg.strip_prefix(b"-L")
+                .filter(|value| !value.is_empty())
+                .map(|value| (value, 1))
+        };
+        if let Some((value, count)) = library {
+            let directory = value
+                .strip_prefix(b"dependency=")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "implicit proc_macro has an unclassified library search".to_owned()
+                })?;
+            searches.push((index, directory.to_vec()));
+            index += count;
+        } else {
+            index += 1;
+        }
+    }
+    if searches.len() != 1 {
+        return Err(
+            "implicit proc_macro requires the observed single dependency search".to_owned(),
+        );
+    }
+    Ok(Some(SysrootShape {
+        arguments,
+        host: hosts[0].to_owned(),
+        searches,
+    }))
+}
+
+/// Return the exact crate-disambiguator stem and artifact kind. Other crate
+/// names (including proc_macro2) are unrelated; unknown matching forms refuse.
+pub fn proc_macro_artifact_name(name: &[u8]) -> Result<Option<(Vec<u8>, bool)>, String> {
+    if !(name == b"libproc_macro"
+        || name.starts_with(b"libproc_macro-")
+        || name.starts_with(b"libproc_macro."))
+    {
+        return Ok(None);
+    }
+    let (stem, rlib) = if let Some(stem) = name.strip_suffix(b".rlib") {
+        (stem, true)
+    } else if let Some(stem) = name.strip_suffix(b".rmeta") {
+        (stem, false)
+    } else {
+        return Err("unrecognized matching proc_macro artifact form".to_owned());
+    };
+    let hash = stem
+        .strip_prefix(b"libproc_macro-")
+        .ok_or_else(|| "proc_macro artifact has no exact stem".to_owned())?;
+    if hash.len() != 16
+        || !hash
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err("proc_macro artifact has an unsupported disambiguator".to_owned());
+    }
+    Ok(Some((stem.to_vec(), rlib)))
+}
+
+fn canonical_absolute(value: &[u8]) -> Result<PathBuf, String> {
+    let value = path(value)?;
+    if !value.is_absolute()
+        || value.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err("sysroot custody has a noncanonical absolute path".to_owned());
+    }
+    Ok(value)
+}
+
+fn sysroot_semantics(
+    command: &Invocation,
+    target: &Path,
+) -> Result<BTreeMap<usize, Argument>, String> {
+    if command.schema != CAPTURE_SCHEMA {
+        return Err("unsupported actual rustc capture schema".to_owned());
+    }
+    let Some(shape) = sysroot_extern_shape(command)? else {
+        if !command.sysroot_externs.is_empty() {
+            return Err("sysroot capture has no corresponding actual bare extern".to_owned());
+        }
+        return Ok(BTreeMap::new());
+    };
+    if command.sysroot_externs.len() != shape.arguments.len() {
+        return Err("implicit extern capture is missing or repeated".to_owned());
+    }
+    let mut result = BTreeMap::new();
+    for captured in &command.sysroot_externs {
+        let directory = canonical_absolute(&captured.directory)?;
+        let canonical = canonical_absolute(&captured.canonical_directory)?;
+        let mut query_output = captured.directory.clone();
+        query_output.push(b'\n');
+        if !shape.arguments.contains(&captured.argument)
+            || captured.name != b"proc_macro"
+            || captured.compiler != command.compiler
+            || captured.host != shape.host
+            || captured.query.argv != [b"--print".to_vec(), b"target-libdir".to_vec()]
+            || captured.query.stdout != query_output
+            || !captured.query.stderr.is_empty()
+            || captured.query.exit_code != 0
+            || !directory.ends_with(Path::new("lib/rustlib").join(&shape.host).join("lib"))
+            || !canonical.ends_with(Path::new("lib/rustlib").join(&shape.host).join("lib"))
+            || captured.identity.mode & 0o170000 != 0o040000
+            || captured.artifacts.len() != 2
+            || captured.searches.len() != shape.searches.len()
+        {
+            return Err("implicit extern compiler/query/argument binding differs".to_owned());
+        }
+        let cwd = path(&command.cwd)?;
+        let mut search_indices = BTreeSet::new();
+        for search in &captured.searches {
+            let raw = shape
+                .searches
+                .iter()
+                .find(|(argument, _)| *argument == search.argument)
+                .ok_or_else(|| "sysroot search has no exact argument".to_owned())?;
+            let resolved = canonical_absolute(&search.canonical_directory)?;
+            if absolute(&cwd, &raw.1)? != path(&search.directory)?
+                || !resolved.starts_with(target)
+                || resolved == target
+                || search.identity.mode & 0o170000 != 0o040000
+                || !search.candidates.is_empty()
+                || !search_indices.insert(search.argument)
+            {
+                return Err(
+                    "implicit extern search is outside its fresh target or contains a shadow"
+                        .to_owned(),
+                );
+            }
+        }
+        let mut artifacts = Vec::new();
+        let mut stems = BTreeSet::new();
+        let mut kinds = BTreeSet::new();
+        let mut total = 0u64;
+        for artifact in &captured.artifacts {
+            let filename = canonical_absolute(&artifact.path)?;
+            let basename = filename
+                .file_name()
+                .ok_or_else(|| "sysroot artifact has no filename".to_owned())?;
+            let basename = bytes(Path::new(basename));
+            let (stem, rlib) = proc_macro_artifact_name(&basename)?
+                .ok_or_else(|| "sysroot capture contains a different crate".to_owned())?;
+            total = total
+                .checked_add(artifact.identity.bytes)
+                .ok_or_else(|| "sysroot artifact size overflow".to_owned())?;
+            if filename.parent() != Some(canonical.as_path())
+                || artifact.identity.mode & 0o170000 != 0o100000
+                || artifact.identity.bytes == 0
+                || total > MAX_CAPTURE_BYTES as u64
+                || !full_digest(&artifact.sha256)
+                || !kinds.insert(rlib)
+            {
+                return Err(
+                    "implicit extern artifact custody is incomplete or ambiguous".to_owned(),
+                );
+            }
+            stems.insert(stem);
+            artifacts.push(SysrootArtifactSemantics {
+                filename: basename,
+                bytes: artifact.identity.bytes,
+                sha256: artifact.sha256.clone(),
+            });
+        }
+        if stems.len() != 1 || kinds.len() != 2 {
+            return Err("implicit extern rlib/rmeta stems do not match exactly".to_owned());
+        }
+        artifacts.sort_by(|a, b| a.filename.cmp(&b.filename));
+        if result
+            .insert(
+                captured.argument,
+                Argument::SysrootExtern {
+                    name: captured.name.clone(),
+                    host: captured.host.clone(),
+                    artifacts,
+                },
+            )
+            .is_some()
+        {
+            return Err("implicit extern capture repeats an argument".to_owned());
+        }
+    }
+    Ok(result)
+}
+
+pub fn validate_sysroot_externs(command: &Invocation, target: &Path) -> Result<(), String> {
+    sysroot_semantics(command, target).map(|_| ())
 }
 
 fn actual_features(command: &Invocation) -> Result<Vec<String>, String> {
@@ -614,12 +960,23 @@ pub fn auxiliary_for_invocation(
     reference: &Bundle,
     command: &Invocation,
 ) -> Result<Option<Auxiliary>, String> {
+    validate_sysroot_externs(command, &bundle.target_directory)?;
     if compiler_probe(command) {
         return Ok(None);
     }
     let package = owner(graph, command)?;
-    if actual_source_unit(graph, package, command)?.is_some() {
+    if let Some((_, _, unit)) = actual_source_unit(graph, package, command)? {
+        if !command.sysroot_externs.is_empty()
+            && (unit.kind != ["proc-macro"] || unit.crate_types != ["proc-macro"])
+        {
+            return Err("implicit proc_macro is not an actual Cargo proc-macro unit".to_owned());
+        }
         return Ok(None);
+    }
+    if !command.sysroot_externs.is_empty() {
+        return Err(
+            "implicit sysroot externs in auxiliary compiler calls are unsupported".to_owned(),
+        );
     }
     if !command.response_files.is_empty() || command.argv.iter().any(|arg| arg.starts_with(b"@")) {
         return Err(
@@ -893,6 +1250,7 @@ pub fn for_invocation_with_reference(
     reference: &Bundle,
     command: &Invocation,
 ) -> Result<Option<Semantics>, String> {
+    let sysroot = sysroot_semantics(command, &bundle.target_directory)?;
     if compiler_probe(command) {
         return Ok(None);
     }
@@ -915,6 +1273,11 @@ pub fn for_invocation_with_reference(
         auxiliary_for_invocation(graph, bundle, reference, command)?;
         return Ok(None);
     };
+    if !sysroot.is_empty()
+        && (actual_unit.kind != ["proc-macro"] || actual_unit.crate_types != ["proc-macro"])
+    {
+        return Err("implicit proc_macro is not an actual Cargo proc-macro unit".to_owned());
+    }
     if !closure.contains(&package.id) || core_entry_binary(core, package, actual_unit) {
         return Ok(None);
     }
@@ -1001,6 +1364,18 @@ pub fn for_invocation_with_reference(
             continue;
         }
         if let Some((value, count)) = option(argument, b"--extern", command.argv.get(index + 1)) {
+            if split_equal(value).is_none() {
+                arguments.push(
+                    sysroot
+                        .get(&index)
+                        .ok_or_else(|| {
+                            "implicit extern has no exact captured resolution".to_owned()
+                        })?
+                        .clone(),
+                );
+                index += count;
+                continue;
+            }
             let (name, filename) = split_equal(value).ok_or_else(|| {
                 "unsupported rustc extern without a bound artifact path".to_owned()
             })?;
@@ -1181,6 +1556,298 @@ pub fn require_compiler(bundle: &Bundle, version: &[u8], sha256: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sysroot_proc_macro_semantics_require_complete_capture_and_exact_artifacts() {
+        use std::os::unix::fs::MetadataExt;
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "hermit-sysroot-semantics-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _fixture = Fixture(root.clone());
+        let target = root.join("target");
+        let deps = target.join("debug/deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        let definitions = [
+            ("core", "hermit-run", "hermit", "lib", "hermit-cli"),
+            ("helper", "helper", "helper", "lib", "helper"),
+            (
+                "macro",
+                "fixture-macro",
+                "fixture_macro",
+                "proc-macro",
+                "macro",
+            ),
+        ];
+        for (_, name, _, _, directory) in &definitions {
+            std::fs::create_dir_all(root.join(directory).join("src")).unwrap();
+            std::fs::write(
+                root.join(directory).join("Cargo.toml"),
+                format!("[package]\nname={name:?}\nversion=\"0.5.4\"\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(directory).join("src/lib.rs"),
+                b"// real fixture source\n",
+            )
+            .unwrap();
+        }
+        let manifest = root.join("Cargo.toml");
+        let lock = root.join("Cargo.lock");
+        std::fs::write(&manifest, b"[workspace]\n").unwrap();
+        std::fs::write(&lock, b"version = 4\n").unwrap();
+        let metadata = serde_json::json!({"version":1,"workspace_root":root,
+            "packages":definitions.iter().map(|(id,name,crate_name,kind,directory)| serde_json::json!({
+                "id":id,"name":name,"version":"0.5.4","source":null,
+                "manifest_path":root.join(directory).join("Cargo.toml"),
+                "targets":[{"name":crate_name,"kind":[kind],"crate_types":[kind],"src_path":root.join(directory).join("src/lib.rs")}]
+            })).collect::<Vec<_>>(),
+            "resolve":{"nodes":[{"id":"core","deps":[{"pkg":"macro","dep_kinds":[{"kind":null}]}]},
+                {"id":"macro","deps":[{"pkg":"helper","dep_kinds":[{"kind":null}]}]},
+                {"id":"helper","deps":[]}]}});
+        let metadata_path = root.join("metadata.json");
+        std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        let mut artifact_bytes = Vec::new();
+        for (id, _, name, kind, directory) in &definitions {
+            let extension = if *kind == "proc-macro" { "so" } else { "rlib" };
+            let artifact = serde_json::json!({"reason":"compiler-artifact","package_id":id,
+                "target":{"name":name,"kind":[kind],"crate_types":[kind],"src_path":root.join(directory).join("src/lib.rs")},
+                "features":[],"profile":{"opt_level":"0","test":false},"filenames":[deps.join(format!("lib{name}.{extension}"))],"executable":null});
+            artifact_bytes.extend(serde_json::to_vec(&artifact).unwrap());
+            artifact_bytes.push(b'\n');
+        }
+        artifact_bytes.extend(b"{\"reason\":\"build-finished\",\"success\":true}\n");
+        let artifacts_path = root.join("artifacts.jsonl");
+        std::fs::write(&artifacts_path, artifact_bytes).unwrap();
+        let input_file = |path: &Path| InputFile {
+            path: path.to_owned(),
+            sha256: digest(&std::fs::read(path).unwrap()),
+        };
+        let artifacts = input_file(&artifacts_path);
+        let input = super::super::compatibility_graph::BuildInput {
+            schema: super::super::compatibility_graph::INPUT_SCHEMA.to_owned(),
+            metadata: input_file(&metadata_path),
+            first_artifacts: artifacts.clone(),
+            artifacts: artifacts.clone(),
+            rustc_first: artifacts.clone(),
+            rustc_second: artifacts.clone(),
+            source_snapshot: artifacts,
+            manifest: input_file(&manifest),
+            lock: input_file(&lock),
+            package: "hermit-run".to_owned(),
+            binary: "hermit".to_owned(),
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            profile: "dev".to_owned(),
+        };
+        let graph = Graph::read(&input).unwrap();
+        let file_identity = |path: &Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            FileIdentity {
+                device: meta.dev(),
+                inode: meta.ino(),
+                bytes: meta.len(),
+                mode: meta.mode(),
+                modified: (meta.mtime(), meta.mtime_nsec()),
+                changed: (meta.ctime(), meta.ctime_nsec()),
+            }
+        };
+        let compiler_path = root.join("fixture-rustc");
+        std::fs::write(&compiler_path, b"fixture compiler, not executed").unwrap();
+        let compiler = Compiler {
+            path: bytes(&compiler_path),
+            identity: file_identity(&compiler_path),
+            sha256: digest(&std::fs::read(&compiler_path).unwrap()),
+            verbose_version: format!(
+                "rustc fixture\ncommit-hash: {}\nhost: x86_64-unknown-linux-gnu\n",
+                "b".repeat(40)
+            )
+            .into_bytes(),
+        };
+        let source = root.join("macro/src/lib.rs");
+        let mut command = Invocation {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            pid: 1,
+            compiler,
+            cwd: bytes(&root),
+            argv: vec![
+                b"--crate-name".to_vec(),
+                b"fixture_macro".to_vec(),
+                bytes(&source),
+                b"--crate-type".to_vec(),
+                b"proc-macro".to_vec(),
+                b"--emit=link".to_vec(),
+                b"--out-dir".to_vec(),
+                bytes(&deps),
+                b"-L".to_vec(),
+                [b"dependency=".as_slice(), &bytes(&deps)].concat(),
+                b"--extern".to_vec(),
+                b"proc_macro".to_vec(),
+                b"--extern".to_vec(),
+                [b"helper=".as_slice(), &bytes(&deps.join("libhelper.rlib"))].concat(),
+            ],
+            context: Context {
+                package: Some("fixture-macro".to_owned()),
+                version: Some("0.5.4".to_owned()),
+                manifest_directory: Some(bytes(&root.join("macro"))),
+            },
+            response_files: vec![],
+            source: Some(CompilerInput::File {
+                argument: 2,
+                path: bytes(&source),
+                canonical_path: bytes(&source),
+                identity: file_identity(&source),
+                bytes: std::fs::read(&source).unwrap(),
+                sha256: digest(&std::fs::read(&source).unwrap()),
+            }),
+            sysroot_externs: vec![],
+        };
+        let libdir = root.join("toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let mut sysroot_artifacts = Vec::new();
+        for kind in ["rlib", "rmeta"] {
+            let path = libdir.join(format!("libproc_macro-0123456789abcdef.{kind}"));
+            std::fs::write(&path, format!("real fixture {kind} bytes")).unwrap();
+            sysroot_artifacts.push(SysrootArtifact {
+                path: bytes(&path),
+                identity: file_identity(&path),
+                sha256: digest(&std::fs::read(&path).unwrap()),
+            });
+        }
+        let directory_identity = |path: &Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            DirectoryIdentity {
+                device: meta.dev(),
+                inode: meta.ino(),
+                mode: meta.mode(),
+            }
+        };
+        command.sysroot_externs.push(SysrootExtern {
+            argument: 10,
+            name: b"proc_macro".to_vec(),
+            compiler: command.compiler.clone(),
+            host: "x86_64-unknown-linux-gnu".to_owned(),
+            query: CompilerQuery {
+                argv: vec![b"--print".to_vec(), b"target-libdir".to_vec()],
+                stdout: [bytes(&libdir), vec![b'\n']].concat(),
+                stderr: vec![],
+                exit_code: 0,
+            },
+            directory: bytes(&libdir),
+            canonical_directory: bytes(&libdir),
+            identity: directory_identity(&libdir),
+            artifacts: sysroot_artifacts,
+            searches: vec![SysrootSearch {
+                argument: 8,
+                directory: bytes(&deps),
+                canonical_directory: bytes(&deps),
+                identity: directory_identity(&deps),
+                candidates: vec![],
+            }],
+        });
+        let bundle = Bundle {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            wrapper_sha256: "c".repeat(64),
+            target_directory: target,
+            commands: vec![],
+        };
+        let actual = for_invocation(&graph, &bundle, &command).unwrap().unwrap();
+        assert_eq!(
+            actual
+                .arguments
+                .iter()
+                .filter(|arg| matches!(arg, Argument::SysrootExtern { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            actual
+                .arguments
+                .iter()
+                .filter(|arg| matches!(arg,Argument::Extern {name,..} if name==b"helper"))
+                .count(),
+            1,
+            "ordinary name=path Cargo artifact semantics must stay present"
+        );
+        let refusal =
+            |changed: &Invocation| assert!(for_invocation(&graph, &bundle, changed).is_err());
+        for mutation in 0..14 {
+            let mut changed = command.clone();
+            match mutation {
+                0 => changed.schema = "hermit-actual-rustc-capture/v2".to_owned(),
+                1 => changed.sysroot_externs.clear(),
+                2 => changed
+                    .sysroot_externs
+                    .push(changed.sysroot_externs[0].clone()),
+                3 => changed.sysroot_externs[0].argument = 12,
+                4 => changed.sysroot_externs[0].name = b"other".to_vec(),
+                5 => changed.sysroot_externs[0].compiler.sha256 = "d".repeat(64),
+                6 => changed.sysroot_externs[0].host = "other-host".to_owned(),
+                7 => changed.sysroot_externs[0].query.exit_code = 1,
+                8 => {
+                    changed.sysroot_externs[0].artifacts.pop();
+                }
+                9 => changed.sysroot_externs[0].artifacts[0].sha256 = "incomplete".to_owned(),
+                10 => {
+                    changed.sysroot_externs[0].artifacts[1].path =
+                        bytes(&libdir.join("libproc_macro-fedcba9876543210.rmeta"))
+                }
+                11 => changed.sysroot_externs[0].searches[0]
+                    .candidates
+                    .push(b"libproc_macro-shadow.rlib".to_vec()),
+                12 => changed.sysroot_externs[0].searches[0].argument = 7,
+                _ => changed
+                    .argv
+                    .extend([b"--extern".to_vec(), b"proc_macro".to_vec()]),
+            }
+            refusal(&changed);
+        }
+        let mut changed = command.clone();
+        changed.sysroot_externs[0].artifacts[0].sha256 = "e".repeat(64);
+        assert_ne!(
+            for_invocation(&graph, &bundle, &changed).unwrap().unwrap(),
+            actual,
+            "a changed required artifact must never compare equal"
+        );
+        let mut unrelated = command.clone();
+        unrelated.sysroot_externs.clear();
+        unrelated.argv[11] = b"other".to_vec();
+        refusal(&unrelated);
+        let mut missing = serde_json::to_value(&command).unwrap();
+        missing.as_object_mut().unwrap().remove("sysroot_externs");
+        assert!(
+            serde_json::from_value::<Invocation>(missing).is_err(),
+            "old capture fields cannot be retrofitted"
+        );
+        let mut wrong_unit = Graph::read(&input).unwrap();
+        let unit = &mut wrong_unit.units.get_mut("macro").unwrap()[0];
+        let old_key = unit.key().unwrap();
+        unit.kind = vec!["lib".to_owned()];
+        unit.crate_types = vec!["lib".to_owned()];
+        let key = unit.key().unwrap();
+        let locators = wrong_unit
+            .source_locators
+            .remove(&("macro".to_owned(), old_key))
+            .unwrap();
+        wrong_unit
+            .source_locators
+            .insert(("macro".to_owned(), key), locators);
+        assert!(
+            for_invocation(&wrong_unit, &bundle, &command)
+                .unwrap_err()
+                .contains("actual Cargo proc-macro")
+        );
+    }
 
     /// Synthetic Cargo/capture fixtures exercise the actual normalizer; they
     /// do not execute a compiler, producer, probe, Hermit or guest.
@@ -1390,6 +2057,7 @@ mod tests {
                         manifest_directory: Some(bytes(&root.join(directory))),
                     },
                     response_files: vec![],
+                    sysroot_externs: vec![],
                     source: Some(CompilerInput::File {
                         argument: 2,
                         path: bytes(&root.join(source)),
