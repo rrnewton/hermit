@@ -2541,15 +2541,12 @@ mod tests {
             );
             units.push(unit);
         }
-        let graph = Graph {
-            packages: [(package.id.clone(), package)].into_iter().collect(),
-            edges: BTreeMap::new(),
-            units: [("cfg-if".to_owned(), units)].into_iter().collect(),
-            executables: BTreeMap::new(),
+        let graph = Graph::for_source_unit_test(
+            [(package.id.clone(), package)].into_iter().collect(),
+            [("cfg-if".to_owned(), units)].into_iter().collect(),
             artifacts,
             source_locators,
-            build_outputs: BTreeMap::new(),
-        };
+        );
         let command = Invocation {
             schema: CAPTURE_SCHEMA.to_owned(),
             pid: 1,

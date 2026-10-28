@@ -224,6 +224,25 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Assemble selector test data without exposing the private dependency graph.
+    #[cfg(test)]
+    pub(super) fn for_source_unit_test(
+        packages: BTreeMap<String, Package>,
+        units: BTreeMap<String, Vec<Unit>>,
+        artifacts: BTreeMap<PathBuf, (String, Unit)>,
+        source_locators: BTreeMap<(String, String), SourceLocators>,
+    ) -> Self {
+        Self {
+            packages,
+            edges: BTreeMap::new(),
+            units,
+            executables: BTreeMap::new(),
+            artifacts,
+            source_locators,
+            build_outputs: BTreeMap::new(),
+        }
+    }
+
     pub fn read(input: &BuildInput) -> Result<Self, String> {
         input.manifest.read(MAX_GRAPH_BYTES)?;
         input.lock.read(MAX_GRAPH_BYTES)?;
