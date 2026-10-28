@@ -10292,8 +10292,9 @@ fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
 /// A guest `clone3` with `CLONE_NEWPID` and its own `set_tid`. With two
 /// entries the array names its task's ID in Hermit's namespace too, and the
 /// task has that ID. With one, Detcore adds the chosen ID for Hermit's
-/// namespace, in both kinds of run. After the guest gives up its
-/// capabilities, `CLONE_NEWUSER` lets its own one-entry call through, but the
+/// namespace, in both kinds of run, also when the one entry is the last four
+/// bytes of a page that an unmapped page follows (Detcore reads exactly the
+/// array, as the kernel does). After the guest gives up its capabilities, `CLONE_NEWUSER` lets its own one-entry call through, but the
 /// added entry needs a capability over Hermit's namespace: an explicit base
 /// refuses the call before the task exists, and a default run issues the
 /// guest's own call, whose task gets a host ID, with a warning and the
@@ -10315,6 +10316,16 @@ fn no_namespace_completes_a_guest_set_tid_with_the_chosen_id() {
             "--summary",
             &["own-tid", "1"],
             "clone3 own-tid: child +1, exit 0\n",
+        ),
+        (
+            "--pid-base=5000",
+            &["edge-tid"],
+            "clone3 edge-tid: child +1, exit 0\n",
+        ),
+        (
+            "--summary",
+            &["edge-tid"],
+            "clone3 edge-tid: child +1, exit 0\n",
         ),
     ] {
         let output = no_namespace_in_own_pid_namespace(&[base], call);
@@ -10395,7 +10406,9 @@ fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
 /// A call that cannot carry a chosen ID is refused by an explicit base
 /// before its task exists, even where Linux would refuse it too: a raw clone
 /// with exit signal 65, which clone accepts and clone3 does not (also with
-/// `CLONE_VFORK`, whose host ID a default run reports before the call); one with new
+/// `CLONE_VFORK`, whose host ID a default run reports before the call); a
+/// clone3 whose struct clone_args Detcore cannot read (on a page mapped
+/// writable, not readable), which the kernel reads all the same; one with new
 /// stack pointer 1, which clone3 cannot express; and a fork by a task inside
 /// a PID namespace the guest made (a `CLONE_NEWPID` child), whose new task's
 /// ID in that namespace is the kernel's. A default run issues the first and
@@ -10411,6 +10424,16 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
     for (call, reason, before) in [
         ("signal65", "its exit signal 65 is not a signal number", ""),
         ("vfork65", "its exit signal 65 is not a signal number", ""),
+        (
+            "wronly-args",
+            "Detcore could not read its struct clone_args",
+            "",
+        ),
+        (
+            "wronly-vfork",
+            "Detcore could not read its struct clone_args",
+            "",
+        ),
         ("sp1", "its new stack pointer 0x1 has no clone3 form", ""),
         (
             "newpid-fork",
@@ -10451,6 +10474,22 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
             stdout(&tolerant) == expected
                 && stderr(&tolerant).contains("1 task(s) got a host ID instead")
                 && (call != "vfork65" || stderr(&tolerant).contains("reported before the call")),
+            "{call}: stdout:\n{}\nstderr:\n{}",
+            stdout(&tolerant),
+            stderr(&tolerant)
+        );
+    }
+    // A struct the kernel reads but Detcore cannot (a page mapped writable,
+    // not readable) is issued as made by a default run, its task's host ID
+    // reported (a vfork's before the call).
+    for call in ["wronly-args", "wronly-vfork"] {
+        let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &[call]);
+        assert_success(&tolerant, &[call]);
+        assert!(
+            stdout(&tolerant).starts_with(&format!("clone3 {call}: child "))
+                && stderr(&tolerant).contains("1 task(s) got a host ID instead")
+                && (call != "wronly-vfork"
+                    || stderr(&tolerant).contains("reported before the call")),
             "{call}: stdout:\n{}\nstderr:\n{}",
             stdout(&tolerant),
             stderr(&tolerant)
