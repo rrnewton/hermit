@@ -126,8 +126,20 @@ fn strict_output(
     hermit_args: &[&str],
     run_args: &[&str],
 ) -> (Output, String) {
+    strict_output_env(guest, guest_args, hermit_args, run_args, &[])
+}
+
+/// [`strict_output`] with `env` set for Hermit.
+fn strict_output_env(
+    guest: &Path,
+    guest_args: &[&str],
+    hermit_args: &[&str],
+    run_args: &[&str],
+    env: &[(&str, &str)],
+) -> (Output, String) {
     let mut command = Command::new("timeout");
     command
+        .envs(env.iter().copied())
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
         .arg(hermit_test::hermit_binary())
@@ -1206,6 +1218,25 @@ fn skipped_slice_ends_come_before_a_signal() {
 fn skipped_slice_ends_survive_the_backstop() {
     let skipped = lone_and_eager_agree("long", "1000000");
     assert!(skipped > 20, "long: {skipped} ends taken without a stop");
+    // The stretch must cross the backstop, or the case tests nothing: a
+    // compiler that hoisted the loop's trap check would halve its branches
+    // (measured: 19136 to 2519268 with GCC -O2, the backstop at 2019216).
+    // reverie_ptrace's debug line for an imprecise timer counts the backstop
+    // events, the only imprecise timer of a skipping run.
+    let guest = fixture(&LONE_SPIN, "lone_spin_then_race");
+    let (output, rendered) = strict_output_env(
+        guest,
+        &["long"],
+        &["--log=info"],
+        &["--chaos", "--seed=3", "--max-timeslice=1000000"],
+        &[("RUST_LOG", "reverie_ptrace::timer=debug")],
+    );
+    let (_, stderr) = checked(output, &rendered);
+    let backstops = stderr
+        .lines()
+        .filter(|line| line.contains("Imprecise timer event delivered"))
+        .count();
+    assert_eq!(backstops, 1, "long: backstop events");
 }
 
 /// An exec right after a lone stretch leaves the run unchanged.

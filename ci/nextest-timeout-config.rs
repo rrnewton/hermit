@@ -211,6 +211,24 @@ const EPOLL_PWAIT_MASK_CPU_SECONDS: u64 = 34;
 // wall). Its modes are now split across three tests of 5, each about a third
 // of that cost, so all three keep the ordinary 22-second cap
 // (https://github.com/rrnewton/hermit/issues/4783).
+// hermit-run::deadline_slice_cap skipped_slice_ends_survive_the_backstop
+// (node test.pmu_integration_cases) runs the lone_spin_then_race fixture's
+// "long" mode skipping lone slice-end stops, again with a stop at every end
+// (--eager-lone-preemptions, about 3.4 microseconds of ptrace work per
+// retired branch), and once more to count backstop events. Its eager run can
+// end in the typed skid-overshoot refusal that the test retries
+// (https://github.com/rrnewton/hermit/issues/1845), and each retry repeats
+// that whole run. Measured 2026-10-27, one test at a time on a 316-CPU AMD
+// EPYC development host (name withheld): before the counting run, 12 runs, 9
+// without a retry at 8.4 to 9.3 CPU seconds and 3 with one retry at 16.9 to
+// 17.1; with it, 6 runs without a retry at 8.8 to 9.2. Two retries, about a
+// 6% chance per execution at that rate, would take about 26 and pass the
+// 22-second cap. ceil(1.5 * 17.1) = 26 would leave two retries no
+// room for host contention, which costs this host's ptrace tests two to four
+// times their quiet CPU (above), so this takes the 34 seconds most
+// contended-host allowances here carry.
+const LONE_BACKSTOP_WRAPPER_NAME: &str = "hermit-lone-backstop-cpu";
+const LONE_BACKSTOP_CPU_SECONDS: u64 = 34;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy)]
@@ -245,7 +263,7 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 30] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 31] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         package: "hermit-run",
@@ -445,6 +463,14 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 30] = [
         binary: "hermit-run::epoll_determinism",
         test: "epoll_pwait_sleeps_under_its_temporary_mask",
         cpu_seconds: EPOLL_PWAIT_MASK_CPU_SECONDS,
+        wall_seconds: None,
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: LONE_BACKSTOP_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::deadline_slice_cap",
+        test: "skipped_slice_ends_survive_the_backstop",
+        cpu_seconds: LONE_BACKSTOP_CPU_SECONDS,
         wall_seconds: None,
     },
 ];
@@ -1161,7 +1187,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -2306,6 +2332,13 @@ mod tests {
                 EPOLL_PWAIT_MASK_WRAPPER_NAME,
                 34,
             ),
+            (
+                "hermit-run",
+                "hermit-run::deadline_slice_cap",
+                "skipped_slice_ends_survive_the_backstop",
+                LONE_BACKSTOP_WRAPPER_NAME,
+                34,
+            ),
         ]);
         let identities = expected
             .iter()
@@ -2669,7 +2702,7 @@ mod tests {
             prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
                 .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 30);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 31);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),
