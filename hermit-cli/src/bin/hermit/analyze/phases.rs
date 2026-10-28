@@ -2810,7 +2810,7 @@ mod tests {
 
         // Records without a seed change nothing.
         let unseeded = prepared_with(dir, &[run1(None), run2(None)], &[]).unwrap();
-        assert!(unseeded.run_arg.is_empty(), "{:?}", unseeded.run_arg);
+        assert_eq!(unseeded.run_arg, ["--expired-wait-charge=each"]);
 
         // The recorded seed reaches the target trial and the baseline, from
         // either record, also over the run arguments' --seed, which seeds the
@@ -2832,7 +2832,7 @@ mod tests {
         // An equal explicit --rng-seed adds no second one; a different one is
         // refused, naming the remedy.
         let explicit = prepared_with(dir, &[run1(Some(7))], &["--rng-seed=7"]).unwrap();
-        assert!(explicit.run_arg.is_empty(), "{:?}", explicit.run_arg);
+        assert_eq!(explicit.run_arg, ["--expired-wait-charge=each"]);
         refused(
             prepared_with(dir, &[run1(Some(7))], &["--rng-seed=3"]).unwrap_err(),
             "pass --rng-seed=7",
@@ -2900,7 +2900,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path();
         let run1 = prepared_with(dir, &["--run1-seed=5".to_owned()], &[]).unwrap();
-        assert_eq!(run1.run_arg, ["--rng-seed=5"]);
+        assert_eq!(run1.run_arg, ["--expired-wait-charge=each", "--rng-seed=5"]);
         assert_eq!(run1.trial_rng_seeds_for_test(), (5, 5));
         let both = prepared_with(
             dir,
@@ -2911,7 +2911,7 @@ mod tests {
         assert_eq!(both.trial_rng_seeds_for_test(), (5, 5));
         let explicit =
             prepared_with(dir, &["--run1-seed=5".to_owned()], &["--rng-seed=3"]).unwrap();
-        assert!(explicit.run_arg.is_empty(), "{:?}", explicit.run_arg);
+        assert_eq!(explicit.run_arg, ["--expired-wait-charge=each"]);
         assert_eq!(explicit.trial_rng_seeds_for_test(), (3, 3));
 
         // Phase 4 builds the --run2-seed baseline from the baseline options by
@@ -2924,7 +2924,10 @@ mod tests {
         // (`--seed`) takes the target's seed too, as it does beside a record
         // that stores none.
         let run2_only = prepared_with(dir, &["--run2-seed=9".to_owned()], &["--seed=4"]).unwrap();
-        assert_eq!(run2_only.run_arg, ["--rng-seed=4"]);
+        assert_eq!(
+            run2_only.run_arg,
+            ["--expired-wait-charge=each", "--rng-seed=4"]
+        );
         assert_eq!(run2_only.trial_rng_seeds_for_test(), (4, 4));
         let unseeded_record = format!(
             "--run1-preemptions={}",
