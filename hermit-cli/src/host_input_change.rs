@@ -199,7 +199,11 @@ pub fn find_pattern_difference(run1: &HostInputs, run2: &HostInputs) -> Option<P
         if (&left.path, left.dtid, left.syscall) != (&right.path, right.dtid, right.syscall) {
             return None;
         }
-        if is_kernel_object(&left.path) {
+        // A kernel object by its path, or by what the open reached (a FIFO,
+        // a socket or a device, whose times move with every write, so an
+        // open finding its same inode at another time would end the walk
+        // below before a real change at a later open).
+        if is_kernel_object(&left.path) || left.kernel_object || right.kernel_object {
             continue;
         }
         let (new1, previous1) = pattern1.open(left);
@@ -430,6 +434,32 @@ mod tests {
         run2.complete = false;
         assert_eq!(find_pattern_difference(&run1, &run2), None);
         assert_eq!(find_pattern_difference(&run2, &run1), None);
+    }
+
+    /// A FIFO the guest writes is recorded as a kernel object
+    /// ([`HostInputRecord::kernel_object`]), and passed over: its second open
+    /// finds the same inode at another time in one run, which would end the
+    /// walk, so a real change at a later open is still named.
+    #[test]
+    fn a_fifo_whose_times_moved_does_not_hide_a_later_change() {
+        let mut run1 = opens(&[("/tmp/f", 4), ("/tmp/f", 4), ("/etc/a", 1), ("/etc/a", 2)]);
+        let mut run2 = opens(&[("/tmp/f", 4), ("/tmp/f", 4), ("/etc/a", 1), ("/etc/a", 1)]);
+        run1.records[1].identity.mtime_sec += 1;
+        let flag = |runs: [&mut HostInputs; 2], kernel_object: bool| {
+            for run in runs {
+                run.records[0].kernel_object = kernel_object;
+                run.records[1].kernel_object = kernel_object;
+            }
+        };
+        flag([&mut run1, &mut run2], true);
+        let named = find_pattern_difference(&run1, &run2).expect("the change to /etc/a is named");
+        assert_eq!(
+            (named.run, named.path.as_str(), named.syscall),
+            (VerificationRun::Run1, "/etc/a", 13)
+        );
+        // Unflagged, the FIFO's moved time ends the walk first.
+        flag([&mut run1, &mut run2], false);
+        assert_eq!(find_pattern_difference(&run1, &run2), None);
     }
 
     #[test]

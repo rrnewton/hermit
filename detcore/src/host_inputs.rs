@@ -245,45 +245,105 @@ fn directory_digest(
     Some(hex(&hasher.finalize()))
 }
 
-/// The program interpreter (`PT_INTERP`) of the exec image the guest names
-/// `image` and the kernel named `source`, read at the run's end when the
-/// image still has the identity it had at the exec: the path the image
-/// names, and where that path is from the tool's root, inside the root the
-/// guest's process had (`source` without `image` at its end). `None` for an
-/// image without one, a changed or unreadable image, and an interpreter path
-/// that is not absolute. Under a chroot an absolute symbolic link on the
-/// interpreter's path resolves from the tool's root, not the guest's (as for
-/// `fifo_peer::fifo_at`).
-pub(crate) fn interpreter_at_end(
-    image: &str,
-    source: &Path,
-    identity: HostFileIdentity,
-) -> Option<(String, PathBuf)> {
-    let stat = crate::util::raw_stat(source).ok()?;
-    if HostFileIdentity::from_stat(&stat) != identity {
-        return None;
+/// A file mapped in a process, as a `/proc/<pid>/maps` line shows it: its
+/// name, the inode number of the object mapped, and the mapping's address
+/// range as the line spells it, which names the mapping's
+/// `/proc/<pid>/map_files` link.
+#[derive(Debug, PartialEq)]
+struct MappedFile {
+    path: PathBuf,
+    ino: u64,
+    range: String,
+}
+
+impl MappedFile {
+    /// Whether `stat`, taken through [`Self::path`], is of the object mapped.
+    ///
+    /// Where the tool may follow the mapping's `map_files` link (`mapped`, a
+    /// stat through it; Linux allows that only to a holder of
+    /// CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the initial user
+    /// namespace), the two have the same device and inode, which keeps the
+    /// filesystem and, on btrfs, the subvolume.
+    ///
+    /// Otherwise the inode number is all that names the object mapped: a
+    /// maps line shows its superblock's device (`show_map_vma`), while btrfs
+    /// reports a subvolume's own device in a stat (`btrfs_getattr`), so the
+    /// devices differ for the same file. The mapping holds the mapped inode,
+    /// so a file that replaced it at the path has another number on that
+    /// filesystem; what the number cannot rule out is another filesystem or
+    /// subvolume mounted over the path with an inode of the same number. On
+    /// overlayfs a maps line names the underlying file, whose number a stat
+    /// through the overlay need not report, so the object may not be
+    /// identified there.
+    fn identifies(&self, stat: &libc::stat, mapped: Option<&libc::stat>) -> bool {
+        match mapped {
+            Some(mapped) => (mapped.st_dev, mapped.st_ino) == (stat.st_dev, stat.st_ino),
+            None => stat.st_ino == self.ino,
+        }
     }
-    let image = Path::new(image).strip_prefix("/").ok()?;
-    let root = source.ancestors().nth(image.components().count())?;
-    if root.join(image) != source {
-        return None;
-    }
-    let interpreter = crate::exec_record::program_interpreter(source)?;
-    let host = root.join(interpreter.strip_prefix("/").ok()?);
-    Some((interpreter.to_str()?.to_owned(), host))
+}
+
+/// The file mapped at `address` in a process whose `/proc/<pid>/maps` is
+/// `maps`: the mapping's pathname field, when it names a file (absolute, and
+/// not deleted since it was mapped), and its inode field. Linux shows the
+/// name from the reader's root, and the inode of the file mapped
+/// (`show_map_vma`, fs/proc/task_mmu.c).
+fn mapped_file(maps: &[u8], address: u64) -> Option<MappedFile> {
+    maps.split(|byte| *byte == b'\n').find_map(|line| {
+        let line = std::str::from_utf8(line).ok()?;
+        // address perms offset dev inode pathname: the pathname is the rest of
+        // the line after the fifth field, and may hold spaces.
+        let mut fields = line.splitn(6, ' ');
+        let range = fields.next()?;
+        let (start, end) = range.split_once('-')?;
+        let (start, end) = (
+            u64::from_str_radix(start, 16).ok()?,
+            u64::from_str_radix(end, 16).ok()?,
+        );
+        if !(start..end).contains(&address) {
+            return None;
+        }
+        let ino = fields.nth(3)?.parse().ok()?;
+        let path = fields.next()?.trim_start();
+        (path.starts_with('/') && !path.ends_with(" (deleted)")).then(|| MappedFile {
+            path: PathBuf::from(path),
+            ino,
+            range: range.to_owned(),
+        })
+    })
 }
 
 impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
-    /// Report the image the kernel opened for the exec this image came from
-    /// to the global state's host-input records ([`HostInputRecord::exec`]):
-    /// its path in the process's root and its identity, through the kernel's
-    /// own `exe` link, and where the tool finds it, for the run's end to read
-    /// its bytes and its program interpreter (`interpreter_at_end`), which
-    /// joins the records then. Nothing is opened now (see the module
-    /// documentation). For a `#!` script the image is the interpreter the
-    /// kernel finally ran, not the script. Nothing where the tool cannot see
-    /// the thread's procfs directory. Raw syscalls only, as for
-    /// [`read_digest`].
+    /// Report the files the kernel opened for the exec this image came from
+    /// to the global state's host-input records ([`HostInputRecord::exec`]),
+    /// each with its path in the process's root, its identity now, at the
+    /// exec, and where the tool finds it for the run's end to read its bytes
+    /// ([`content_at_end`], which reads only a file that still has that
+    /// identity):
+    /// - the image, through the kernel's own `exe` link; for a `#!` script,
+    ///   the interpreter the kernel finally ran, not the script;
+    /// - its program interpreter, if it has one: the file mapped where the
+    ///   auxiliary vector's `AT_BASE` says the kernel loaded it, by the name
+    ///   `/proc/<tid>/maps` shows ([`mapped_file`]), when a stat through that
+    ///   name finds the object mapped: the device and inode a stat through
+    ///   the mapping's `map_files` link finds, where the tool may follow it,
+    ///   and otherwise the inode number the maps line names
+    ///   ([`MappedFile::identifies`]). Otherwise the mapped object cannot be
+    ///   identified and nothing is recorded for it, rather than a file that
+    ///   replaced it at that name since (or, on overlayfs, an overlay file
+    ///   that does not report the underlying number).
+    ///
+    /// Both identities are the exec's: a file replaced while the run goes on
+    /// keeps the identity the process ran with, as a file the guest opens
+    /// keeps the one its open found. Where the tool may not follow
+    /// `map_files`, only the interpreter's inode number is compared, so an
+    /// inode of the same number that another filesystem or btrfs subvolume
+    /// exposes at the name cannot be told apart. Nothing is opened but the thread's own
+    /// procfs files (the `auxv` and `maps` files, read as
+    /// `Self::check_brk_model` reads `auxv`), and the image and its
+    /// interpreter only have their status taken (see the module
+    /// documentation). Nothing where the tool cannot see the thread's procfs
+    /// directory. Raw syscalls only, as for [`read_digest`].
     pub(crate) async fn record_exec_host_inputs<G: reverie::Guest<Self>>(&self, guest: &mut G) {
         let Some(task) = self.guest_task_directory(guest) else {
             return;
@@ -305,16 +365,37 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
         let Ok(stat) = crate::util::raw_stat(&exe) else {
             return;
         };
-        crate::tool_global::record_host_input(
-            guest,
-            image.to_string_lossy().into_owned(),
-            HostFileIdentity::from_stat(&stat),
-            source.to_str().map(str::to_owned),
-            stat.st_mode & libc::S_IFMT == libc::S_IFREG,
-            true,
-            false,
-        )
-        .await;
+        let mut files = vec![(image, source, stat)];
+        if let Some(mapped) = crate::util::raw_read_file(&task.join("auxv"))
+            .ok()
+            .and_then(|auxv| crate::exec_record::auxv_entry(&auxv, libc::AT_BASE))
+            .filter(|base| *base != 0)
+            .and_then(|base| {
+                mapped_file(&crate::util::raw_read_file(&task.join("maps")).ok()?, base)
+            })
+            && let Ok(stat) = crate::util::raw_stat(&mapped.path)
+            && mapped.identifies(
+                &stat,
+                crate::util::raw_stat(&task.join("map_files").join(&mapped.range))
+                    .ok()
+                    .as_ref(),
+            )
+            && let Ok(relative) = mapped.path.strip_prefix(&root)
+        {
+            files.push((Path::new("/").join(relative), mapped.path.clone(), stat));
+        }
+        for (path, source, stat) in files {
+            crate::tool_global::record_host_input(
+                guest,
+                path.to_string_lossy().into_owned(),
+                HostFileIdentity::from_stat(&stat),
+                source.to_str().map(str::to_owned),
+                stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+                true,
+                false,
+            )
+            .await;
+        }
     }
 }
 
@@ -742,26 +823,83 @@ mod tests {
         assert_eq!(replay.finish(|_| Some("bb".to_owned()), &mutated), []);
     }
 
-    /// An exec image's interpreter is the one it names, found under the root
-    /// its process had: the image's host path without its guest path.
+    /// The program interpreter is the file mapped at the auxiliary vector's
+    /// `AT_BASE`: for this test binary, which is dynamically linked, the
+    /// dynamic loader, under the name the mapping shows, and a stat through
+    /// that name identifies the object mapped. A mapping of a deleted file,
+    /// or of no file, names none. Another inode at the name is not the object
+    /// mapped, and nor is an inode of the same number on another device where
+    /// the mapping's `map_files` link can be followed.
     #[test]
-    fn an_exec_image_names_its_interpreter_under_its_root() {
-        let image = crate::util::raw_read_link(Path::new("/proc/self/exe")).unwrap();
-        let identity = HostFileIdentity::from_stat(&crate::util::raw_stat(&image).unwrap());
-        let (interpreter, host) = interpreter_at_end(image.to_str().unwrap(), &image, identity)
-            .expect("the test binary is dynamically linked");
-        assert!(interpreter.starts_with('/'), "{interpreter}");
-        assert_eq!(host, Path::new(&interpreter));
-        // A guest path that is not the end of the host path names no root.
-        assert_eq!(interpreter_at_end("/elsewhere", &image, identity), None);
-        // Nor does an image that changed since the exec.
-        let changed = HostFileIdentity {
-            ino: identity.ino ^ 1,
-            ..identity
-        };
-        assert_eq!(
-            interpreter_at_end(image.to_str().unwrap(), &image, changed),
-            None
+    fn the_interpreter_is_the_file_mapped_at_the_base_the_auxv_names() {
+        let auxv = crate::util::raw_read_file(Path::new("/proc/self/auxv")).unwrap();
+        let base = crate::exec_record::auxv_entry(&auxv, libc::AT_BASE).unwrap();
+        assert_ne!(base, 0, "the test binary is dynamically linked");
+        let maps = crate::util::raw_read_file(Path::new("/proc/self/maps")).unwrap();
+        let mapped = mapped_file(&maps, base).expect("a file is mapped at AT_BASE");
+        let interpreter = &mapped.path;
+        assert!(interpreter.is_absolute(), "{}", interpreter.display());
+        // The dynamic loader: `ld-linux-<arch>.so.<n>` or `ld-musl-<arch>.so.1`.
+        assert!(
+            interpreter
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("ld-")),
+            "{} is not a dynamic loader",
+            interpreter.display()
         );
+        // A stat through the name finds the object mapped, except where the
+        // loader is on overlayfs, whose maps lines name the underlying file.
+        let stat = crate::util::raw_stat(interpreter).unwrap();
+        let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let name = std::ffi::CString::new(interpreter.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is NUL-terminated and `fs` is written before it is read.
+        assert_eq!(unsafe { libc::statfs(name.as_ptr(), fs.as_mut_ptr()) }, 0);
+        // SAFETY: statfs returned 0, so it filled `fs`.
+        let overlay = unsafe { fs.assume_init() }.f_type == libc::OVERLAYFS_SUPER_MAGIC;
+        let link = Path::new("/proc/self/map_files").join(&mapped.range);
+        let through_link = crate::util::raw_stat(&link).ok();
+        assert!(
+            mapped.identifies(&stat, through_link.as_ref()) || overlay,
+            "{mapped:?}"
+        );
+        assert!(mapped.identifies(&stat, None) || overlay, "{mapped:?}");
+        // Another inode at the name is not the object mapped, with or without
+        // the link.
+        let mut replaced = stat;
+        replaced.st_ino ^= 1;
+        assert!(!mapped.identifies(&replaced, None));
+        assert!(!mapped.identifies(&replaced, Some(&stat)));
+        // An inode of the same number on another device (another filesystem,
+        // or another btrfs subvolume, mounted over the name) is the object
+        // mapped only by its number: the link's device tells it apart where
+        // the tool may follow the link.
+        let mut covering = stat;
+        covering.st_dev ^= 1;
+        assert!(!mapped.identifies(&covering, Some(&stat)));
+        assert!(mapped.identifies(&covering, None));
+
+        let maps = b"00400000-00401000 r-xp 00000000 08:01 12 /usr/bin/a b\n\
+            7f0000000000-7f0000001000 r--p 00000000 08:01 13 /lib/ld (deleted)\n\
+            7f0000002000-7f0000003000 r--p 00000000 00:00 0 \n\
+            7f0000004000-7f0000005000 r--p 00000000 103:1a 4096 /lib/ld-x.so\n";
+        assert_eq!(
+            mapped_file(maps, 0x400800),
+            Some(MappedFile {
+                path: PathBuf::from("/usr/bin/a b"),
+                ino: 12,
+                range: "00400000-00401000".to_owned(),
+            })
+        );
+        assert_eq!(
+            mapped_file(maps, 0x7f0000004000),
+            Some(MappedFile {
+                path: PathBuf::from("/lib/ld-x.so"),
+                ino: 4096,
+                range: "7f0000004000-7f0000005000".to_owned(),
+            })
+        );
+        assert_eq!(mapped_file(maps, 0x7f0000000000), None);
+        assert_eq!(mapped_file(maps, 0x7f0000002000), None);
+        assert_eq!(mapped_file(maps, 0x500000), None);
     }
 }

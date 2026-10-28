@@ -5314,7 +5314,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .ok()
                     })
                     .flatten();
-                    let kernel_object = target.as_deref().is_some_and(|target| {
+                    // A FIFO, a socket or a device holds no bytes the run's
+                    // end could read and no content a replay could compare:
+                    // what the guest reads from it comes from whatever
+                    // writes to it, and its times move with each write
+                    // (the recorded run's own writes to a FIFO among them).
+                    // It counts as a kernel object, as one under /dev does.
+                    let kernel_object = matches!(
+                        file_type,
+                        libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK
+                    ) || target.as_deref().is_some_and(|target| {
                         detcore_model::host_input::is_kernel_object(&target.to_string_lossy())
                     });
                     let source = target

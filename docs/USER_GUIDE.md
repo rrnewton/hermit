@@ -485,7 +485,16 @@ HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed si
 
 The comparison counts the files the guest opens and those the kernel opens
 for its execs: each program image and its ELF interpreter (for a `#!`
-script, the interpreter the kernel ran, not the script). A file whose bytes
+script, the interpreter the kernel ran, not the script), each with the
+identity it had when the guest opened it or the kernel ran it, so a file
+replaced later in the run is reported against the one the guest used. An
+interpreter Hermit cannot identify as the file the kernel mapped (on an
+overlayfs root, for example) is left out, and a comparison then has no
+evidence about it. Where Hermit may not follow `/proc/<pid>/map_files` (it
+needs CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the initial user
+namespace), it identifies the interpreter by its inode number alone, so a
+file of the same inode number that another filesystem or btrfs subvolume
+exposes at the interpreter's name cannot be told apart. A file whose bytes
 were hashed in both runs counts as changed only if its bytes differ, so a
 file rewritten unchanged, as `ldconfig` rewrites `/etc/ld.so.cache`, is not
 reported; a directory counts as changed only if the names in it differ,
@@ -499,7 +508,8 @@ raises an inotify event for every open and read of a file, and a guest
 watching the file's directory would see those reads. So a regular file whose
 size changed is reported at the guest's first open of it, and any other
 change when the run ends. Kernel objects (paths under
-`/proc`, `/sys` and `/dev`, and names that lead there, such as `/etc/mtab`)
+`/proc`, `/sys` and `/dev`, names that lead there, such as `/etc/mtab`, and
+FIFOs, sockets and devices wherever they are, which hold no bytes to compare)
 are left out, and so are paths the guest itself renamed, linked or unlinked,
 or opened with `O_CREAT`. Under `--backend=dbt` nothing is recorded. The
 line is information, not a refusal: Hermit does not make a changing
