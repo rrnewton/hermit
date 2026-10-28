@@ -434,21 +434,39 @@ pub(crate) fn read_guest_exact<M: MemoryAccess>(
     }
 }
 
-/// Capacity used for pipes that Detcore makes physically nonblocking.
+/// Capacity used for pipes that Detcore makes physically nonblocking: two of
+/// the host's pages.
 ///
-/// Linux normally creates 64-KiB pipes on this platform, but silently falls back to two pages
-/// once the creating UID crosses `pipe-user-pages-soft`. That host-global accounting can change
-/// between the two executions of `hermit run --verify`, changing whether the same write succeeds
-/// immediately or enters the scheduler's `InternalIOPolling` retry path. Two pages is the
-/// pressure-mode capacity on supported x86-64 Linux hosts and, unlike 64 KiB, never requires an
+/// Linux normally creates 16-page pipes (64 KiB on 4 KiB pages), but silently falls back to two
+/// pages once the creating UID crosses `pipe-user-pages-soft`. That host-global accounting can
+/// change between the two executions of `hermit run --verify`, changing whether the same write
+/// succeeds immediately or enters the scheduler's `InternalIOPolling` retry path. Two pages is the
+/// pressure-mode capacity (`PIPE_MIN_DEF_BUFFERS`, fs/pipe.c) and, unlike 16, never requires an
 /// unprivileged capacity increase while the soft limit is active.
 ///
+/// It is counted in pages because Linux sizes every pipe in whole pages: `F_SETPIPE_SZ` rounds a
+/// request up to a power-of-two number of them (`round_pipe_size`). Two pages is 8 KiB on 4 KiB
+/// pages (every x86-64 host) and 128 KiB on a 64 KiB-page aarch64 kernel. A fixed 8 KiB pin could
+/// not be applied there: Linux gives the pipe one 64 KiB page, and the creation pin, which accepts
+/// only exactly the capacity it asked for, ends the run (`pipe_capacity_failure`).
+///
 /// This is also the ceiling the guest is allowed to raise a pipe to, and the
-/// value `/proc/sys/fs/pipe-max-size` reports. Those three must be ONE constant:
+/// value `/proc/sys/fs/pipe-max-size` reports. Those three must be ONE value:
 /// a pinned capacity, an advertised maximum and an enforced maximum that can
 /// drift apart are three copies of one rule, and a duplicated rule drifts in
 /// N-1 places while each copy looks right on its own.
-pub(crate) const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
+pub(crate) fn deterministic_pipe_capacity_bytes() -> i32 {
+    static CAPACITY: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        i32::try_from(page)
+            .ok()
+            .filter(|page| *page > 0)
+            .and_then(|page| page.checked_mul(2))
+            .expect("the host's page size is a small positive number")
+    })
+}
 
 /// Whether a guest's `F_SETPIPE_SZ` request must be refused as a growth past
 /// the deterministic ceiling.
@@ -459,16 +477,16 @@ pub(crate) const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
 /// guest that reads `/proc/sys/fs/pipe-max-size` and asks for precisely what it
 /// was told.
 pub(crate) fn pipe_capacity_request_exceeds_ceiling(requested: i32) -> bool {
-    requested > DETERMINISTIC_PIPE_CAPACITY_BYTES
+    requested > deterministic_pipe_capacity_bytes()
 }
 
 /// The capacity a guest's `F_GETPIPE_SZ` reports for a pipe or FIFO whose
 /// host capacity is `host`: never more than the deterministic ceiling.
 ///
 /// A pipe Hermit did not create (an inherited stdout, a FIFO whose other end
-/// is on the host) keeps the capacity the host gave it: 64 KiB normally, but
-/// two pages (8192) once the user crosses `pipe-user-pages-soft`, which host
-/// load decides. Passed through, that made the same guest read 65536 in one
+/// is on the host) keeps the capacity the host gave it: 16 pages (64 KiB)
+/// normally, but two pages (8192 on 4 KiB pages) once the user crosses
+/// `pipe-user-pages-soft`, which host load decides. Passed through, that made the same guest read 65536 in one
 /// run of `--verify` and 8192 in the other (`/bin/cat` on DBT, the validate of
 /// hermit 2cd56771). A pipe can never hold more than the ceiling a guest can
 /// raise it to, so above it the ceiling is reported, as `pipe-max-size` is. A
@@ -485,7 +503,7 @@ pub(crate) fn pipe_capacity_request_exceeds_ceiling(requested: i32) -> bool {
 /// Only the reported value is made deterministic. A write to a pipe drained on
 /// the host still completes as far as its real capacity and that reader allow.
 pub(crate) fn reported_pipe_capacity(host: i64) -> i64 {
-    host.min(i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES))
+    host.min(i64::from(deterministic_pipe_capacity_bytes()))
 }
 
 /// SIGIO and SIGURG, the signals Linux sends to a descriptor's owner when
@@ -666,7 +684,7 @@ fn pipe_capacity_failure(
     capacity_result: Result<i64, Errno>,
 ) -> Option<PipeCapacityFailure> {
     let error = match capacity_result {
-        Ok(applied) if applied == i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES) => return None,
+        Ok(applied) if applied == i64::from(deterministic_pipe_capacity_bytes()) => return None,
         Ok(_) => Errno::EIO,
         Err(error) => error,
     };
@@ -3586,12 +3604,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return;
         };
-        if capacity > i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES)
+        if capacity > i64::from(deterministic_pipe_capacity_bytes())
             && let Err(errno) = guest
                 .inject(
                     syscalls::Fcntl::new()
                         .with_fd(fd)
-                        .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY_BYTES)),
+                        .with_cmd(F_SETPIPE_SZ(deterministic_pipe_capacity_bytes())),
                 )
                 .await
         {
@@ -10871,7 +10889,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             F_SETPIPE_SZ(requested) if pipe_capacity_request_exceeds_ceiling(requested) => {
                 trace!(
                     "[detcore] refusing F_SETPIPE_SZ({}) above the deterministic pipe ceiling {}",
-                    requested, DETERMINISTIC_PIPE_CAPACITY_BYTES
+                    requested,
+                    deterministic_pipe_capacity_bytes()
                 );
                 Err(Errno::EPERM.into())
             }
@@ -12360,7 +12379,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .inject(
                         syscalls::Fcntl::new()
                             .with_fd(fds[0])
-                            .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY_BYTES)),
+                            .with_cmd(F_SETPIPE_SZ(deterministic_pipe_capacity_bytes())),
                     )
                     .await;
                 if let Some(failure) = pipe_capacity_failure(fds, capacity_result) {
@@ -12389,7 +12408,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     error!(
                         "[detcore] cannot pin scheduler-managed pipe to {} bytes (fds {:?}): {}. \
                          Determinism is unavailable for this run.",
-                        DETERMINISTIC_PIPE_CAPACITY_BYTES, failure.created_fds, failure.error,
+                        deterministic_pipe_capacity_bytes(),
+                        failure.created_fds,
+                        failure.error,
                     );
                     // Fail-closed policy: determinism is unavailable for this run.
                     unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await;
@@ -16191,7 +16212,7 @@ mod test {
     use reverie::syscalls::LocalMemory;
     use reverie::syscalls::Whence;
 
-    use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+    use super::deterministic_pipe_capacity_bytes;
     use super::fcntl_host_timed_signals;
     use super::ioctl_host_timed_signals;
     use super::may_have_acquired_controlling_terminal;
@@ -16955,16 +16976,27 @@ mod test {
     /// The ceiling is inclusive. A guest that reads the advertised
     /// `pipe-max-size` and asks for exactly that must be allowed to have it;
     /// refusing at the boundary would advertise a size that cannot be set.
+    /// The pin is two of the host's pages, which Linux applies exactly at any
+    /// page size; on x86-64 that is the 8 KiB it always was.
+    #[test]
+    fn the_pipe_capacity_is_two_host_pages() {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert_eq!(i64::from(deterministic_pipe_capacity_bytes()), 2 * page);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(deterministic_pipe_capacity_bytes(), 8192);
+    }
+
     #[test]
     fn the_pipe_ceiling_admits_exactly_the_pinned_capacity() {
         assert!(!pipe_capacity_request_exceeds_ceiling(
-            DETERMINISTIC_PIPE_CAPACITY_BYTES
+            deterministic_pipe_capacity_bytes()
         ));
         assert!(!pipe_capacity_request_exceeds_ceiling(
-            DETERMINISTIC_PIPE_CAPACITY_BYTES - 1
+            deterministic_pipe_capacity_bytes() - 1
         ));
         assert!(pipe_capacity_request_exceeds_ceiling(
-            DETERMINISTIC_PIPE_CAPACITY_BYTES + 1
+            deterministic_pipe_capacity_bytes() + 1
         ));
     }
 
@@ -16974,7 +17006,7 @@ mod test {
     /// (Hermit's pin, or a guest's own shrink) reads as it is.
     #[test]
     fn a_host_pipe_capacity_reads_no_larger_than_the_ceiling() {
-        let ceiling = i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES);
+        let ceiling = i64::from(deterministic_pipe_capacity_bytes());
         assert_eq!(super::reported_pipe_capacity(65536), ceiling);
         assert_eq!(super::reported_pipe_capacity(1 << 20), ceiling);
         assert_eq!(super::reported_pipe_capacity(ceiling), ceiling);
@@ -16987,7 +17019,7 @@ mod test {
     /// repository already locked.
     #[test]
     fn shrinking_is_never_refused_by_the_ceiling() {
-        for requested in [1, 4096, DETERMINISTIC_PIPE_CAPACITY_BYTES / 2] {
+        for requested in [1, 4096, deterministic_pipe_capacity_bytes() / 2] {
             assert!(
                 !pipe_capacity_request_exceeds_ceiling(requested),
                 "shrink to {requested} must remain permitted"
@@ -17040,7 +17072,7 @@ mod test {
 
         // The only success shape: Linux applied EXACTLY the capacity we asked for.
         assert_eq!(
-            pipe_capacity_failure(created, Ok(i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES))),
+            pipe_capacity_failure(created, Ok(i64::from(deterministic_pipe_capacity_bytes()))),
             None
         );
 
@@ -17048,7 +17080,7 @@ mod test {
         // kernel errno, so it is reported as EIO rather than dressed up as one.
         let mismatch = pipe_capacity_failure(
             created,
-            Ok(i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES) * 2),
+            Ok(i64::from(deterministic_pipe_capacity_bytes()) * 2),
         )
         .expect("a capacity Linux rounded away from the pin must not read as success");
         assert_eq!(mismatch.created_fds, created);
