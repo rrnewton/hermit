@@ -1643,9 +1643,9 @@ pub struct RunOpts {
     /// backend steps the guest through the last skid margin of each slice (all of a slice shorter
     /// than the margin, which is 100 to 10000 branches depending on the processor). Needs a backend with a
     /// PMU timer (ptrace, with or without e9patch preprocessing); elsewhere use
-    /// `--target-timeslice`. Cannot be combined with a positive `--max-timeslice` or with
-    /// `--target-timeslice`. There is nothing to draw with `--max-timeslice=disabled` or on a host
-    /// without usable performance counters, and a run that replays preemptions or a schedule keeps
+    /// `--target-timeslice`. Cannot be combined with a positive `--max-timeslice`, with
+    /// `--target-timeslice` or with `--chaos-timeslice-range`. There is nothing to draw with
+    /// `--max-timeslice=disabled` or on a host without usable performance counters, and a run that replays preemptions or a schedule keeps
     /// the default maximum, since the recording supplies its preemption points.
     #[clap(long, requires = "chaos")]
     chaos_seeded_timeslice: bool,
@@ -4542,7 +4542,7 @@ fn replay_takes_the_recorded_rng_seed_and_refuses_another() {
 /// `--chaos-timeslice-range` sets the run's `--max-timeslice` to the range's
 /// MAX, through `validate_args` and again on a second validation (analyze
 /// revalidates its trials), and refuses an explicit `--max-timeslice` in any
-/// spelling beside it.
+/// spelling, or `--chaos-seeded-timeslice`, beside it.
 #[test]
 fn a_chaos_timeslice_range_caps_the_run_at_its_max() {
     let mut validated = run_opts_for(&[
@@ -4559,7 +4559,11 @@ fn a_chaos_timeslice_range_caps_the_run_at_its_max() {
             std::num::NonZeroU64::new(5_000_000)
         );
     }
-    for explicit in ["--max-timeslice=disabled", "--preemption-timeout=1000"] {
+    for explicit in [
+        "--max-timeslice=disabled",
+        "--preemption-timeout=1000",
+        "--chaos-seeded-timeslice",
+    ] {
         let mut refused = run_opts_for(&[
             "hermit",
             "run",
@@ -4576,6 +4580,12 @@ fn a_chaos_timeslice_range_caps_the_run_at_its_max() {
             error.contains("give one of them, not both"),
             "{explicit}: {error}"
         );
+        if explicit == "--chaos-seeded-timeslice" {
+            assert!(
+                error.contains("--chaos-seeded-timeslice draws --max-timeslice from the scheduler"),
+                "{error}"
+            );
+        }
     }
     let resolve = |argv: &[&str]| {
         let mut ro = run_opts_for(argv);
@@ -12547,13 +12557,24 @@ impl RunOpts {
 
     /// Under `--chaos-timeslice-range`, the run's `--max-timeslice` is the
     /// range's MAX: chaos draws each slice's mean from the range and caps it
-    /// there. An explicit `--max-timeslice` with a range is refused rather than
-    /// letting one silently win. Repeating this (analyze revalidates its trials'
-    /// options) gives the same result.
+    /// there. An explicit `--max-timeslice` or `--chaos-seeded-timeslice` with a
+    /// range is refused rather than letting one silently win. Repeating this
+    /// (analyze revalidates its trials' options) gives the same result.
     fn resolve_chaos_timeslice_range(&mut self) -> Result<(), Error> {
         let Some(range) = self.det_opts.det_config.chaos_timeslice_range else {
             return Ok(());
         };
+        // `--chaos-seeded-timeslice` would replace the MAX with its own draw
+        // once the seed is settled, so the run would report one maximum and
+        // run under the other.
+        if self.chaos_seeded_timeslice {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "--chaos-timeslice-range={range} sets the run's --max-timeslice to its MAX ({} \
+                 ns), and --chaos-seeded-timeslice draws --max-timeslice from the scheduler \
+                 seed; give one of them, not both",
+                range.max
+            )));
+        }
         if self.max_timeslice_explicit {
             return Err(Error::new(PolicyRefusal).context(format!(
                 "--chaos-timeslice-range={range} sets the run's --max-timeslice to its MAX ({} \
