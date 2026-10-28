@@ -9873,6 +9873,16 @@ impl Scheduler {
         if !self.queued_sleeps_registered_at_first_pass {
             return;
         }
+        // Only where the guest's signal state can be read (the condition
+        // `signal_sleep` requires): on a backend that cannot report it, a
+        // parked sleep could only be woken unclassified by a scheduler-sent
+        // signal, ending sleeps Linux would let finish and losing wakes it
+        // would deliver. There first-pass registration does not apply: a
+        // plain sleep stays queued, as before this pass existed, until
+        // step 3 chooses it.
+        if !self.models_signal_targets && !self.in_guest_signal_delivery {
+            return;
+        }
         let committed = self.committed_time;
         let sleeps: Vec<(LogicalTime, DetTid)> = self
             .run_queue
@@ -12355,7 +12365,25 @@ impl Scheduler {
                 // sibling took the process-directed copy, and a `pause` that
                 // found no signal for itself never returned
                 // (https://github.com/rrnewton/hermit/issues/4333).
-                let parked_sleep = self.signal_sleep(dettid).is_some();
+                // As a queued sleep above: a `nanosleep` whose deadline
+                // has passed completes at its timed pop, and a signal that
+                // lands after the deadline but before the pop must not end
+                // it (Linux `do_nanosleep` returns 0 there), so leave it
+                // parked for the pop.
+                let parked_sleep = match self.signal_sleep(dettid) {
+                    Some(sleep_signal::SignalSleep::Pause) => true,
+                    Some(sleep_signal::SignalSleep::Nanosleep { deadline }) => {
+                        if deadline <= self.committed_time {
+                            debug!(
+                                "[dtid {}] signal {} lands after its sleep's deadline; leaving it to complete.",
+                                dettid, signal
+                            );
+                            return;
+                        }
+                        true
+                    }
+                    None => false,
+                };
                 if parked_sleep && !gated_wakes {
                     // Under the gate, as a queued sleep above.
                     debug!(
@@ -26028,6 +26056,9 @@ mod test {
     fn a_queued_sleep_is_a_timed_waiter_from_the_first_pass() {
         let config = Config::default();
         let mut scheduler = Scheduler::new(&config);
+        // A backend that reports the guest's signal state, as ptrace does:
+        // first-pass registration applies only there.
+        scheduler.models_signal_targets = true;
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         scheduler.committed_time = at(0);
         let worker = DetTid::from_raw(3);
@@ -26212,6 +26243,8 @@ mod test {
             let case =
                 format!("worker priority {worker_priority}, sleeper priority {sleeper_priority}");
             let mut scheduler = Scheduler::new(&config);
+            // As ptrace: a backend that reports the guest's signal state.
+            scheduler.models_signal_targets = true;
             scheduler.committed_time = at(0);
             for (tid, request, priority) in [
                 (worker, Resources::new(worker), worker_priority),
@@ -26240,6 +26273,7 @@ mod test {
         // A thread pending removal is left alone: its old queue entry is
         // still there until the drain takes it.
         let mut scheduler = Scheduler::new(&config);
+        scheduler.models_signal_targets = true;
         scheduler.committed_time = at(0);
         queue_request(&mut scheduler, sleeper, sleep_request(sleeper, at(7_000)));
         scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
@@ -27547,6 +27581,62 @@ mod test {
                 );
             }
         }
+    }
+
+    /// A scheduler-sent signal that lands after a parked `nanosleep`'s
+    /// deadline but before its timed pop does not end the sleep: Linux
+    /// `do_nanosleep` returns 0 once the deadline has passed. The same
+    /// signal before the deadline wakes it, as a queued sleep's does.
+    #[test]
+    fn a_signal_after_a_parked_sleeps_deadline_leaves_it_to_complete() {
+        let mut scheduler = gated_scheduler();
+        let deadline = scheduler.committed_time;
+        let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+        scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+        assert!(scheduler.inbound_signals(target).is_empty());
+        assert!(!scheduler.run_queue.contains_tid(target));
+
+        let mut scheduler = gated_scheduler();
+        let deadline = scheduler.committed_time + LogicalTime::from_nanos(1_000_000);
+        let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+        scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper::from(Signal::SIGUSR1)]
+        );
+    }
+
+    /// First-pass registration applies only where the guest's signal
+    /// state can be read: with neither modeled signal targets nor the
+    /// in-guest gate, a queued plain sleep stays queued at the first
+    /// pass instead of parking where a signal could only wake it
+    /// unclassified.
+    #[test]
+    fn first_pass_registration_needs_a_readable_signal_state() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        assert!(!scheduler.models_signal_targets && !scheduler.in_guest_signal_delivery);
+        assert!(scheduler.queued_sleeps_registered_at_first_pass);
+        let sleeper = DetTid::from_raw(5);
+        queue_request(
+            &mut scheduler,
+            sleeper,
+            sleep_request(sleeper, LogicalTime::from_nanos(7_000)),
+        );
+        scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+        scheduler.step2_register_queued_sleeps();
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            None
+        );
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        scheduler.models_signal_targets = true;
+        scheduler.step2_register_queued_sleeps();
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(LogicalTime::from_nanos(7_000))
+        );
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
     }
 
     /// The mask that decides a discard is the first source present: the

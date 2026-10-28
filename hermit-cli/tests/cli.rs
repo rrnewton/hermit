@@ -40947,6 +40947,51 @@ fn a_childs_sigchld_ends_a_sleep_only_when_caught_and_unblocked() {
     }
 }
 
+static SLEEP_DEADLINE_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// Guest level, under the first-pass sleep registration that is now the
+/// default: a timer that lands after a `nanosleep`'s deadline does not
+/// end it (the first sleep returns 0 with no handler run), a timer that
+/// lands before the deadline does (the second sleep returns EINTR), and
+/// a default-ignored `SIGCHLD` from a child that exits during a sleep
+/// never wakes it (the sleep runs to its full length). The scheduler
+/// units alone built these states by hand before this test.
+#[test]
+fn a_signal_after_a_sleeps_deadline_and_an_ignored_sigchld_leave_it_to_finish() {
+    let guest = compiled_c_guest(&SLEEP_DEADLINE_SIGNAL_GUEST, "sleep_deadline_signal")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for (mode, expected) in [
+        (
+            "timer-after-deadline",
+            "first nanosleep 0, alarms 0\nsecond nanosleep -4, alarms 1\n",
+        ),
+        ("ignored-sigchld", "nanosleep 0\n"),
+    ] {
+        let command = hermit_command(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            mode,
+        ]);
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+    }
+}
+
 /// The orders of https://github.com/rrnewton/hermit/issues/4346 that host
 /// timing alone gives too rarely to test, forced by the test-only fault hook
 /// `HERMIT_TEST_SIGCHLD_CLAIM_FAULT`, in the `sfdheld` setup, where a woken

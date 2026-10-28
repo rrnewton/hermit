@@ -4975,6 +4975,10 @@ fn the_controlled_loop_registers_a_queued_sleep() {
     use futures::FutureExt;
 
     let mut s = scheduler_for(BackendCapabilities::KVM, true);
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass
+    // registration applies in the controlled loop.
+    s.models_signal_targets = true;
     s.install_signal_control(
         Some(BackendSignalControl {
             process: Arc::new(Backend::default()),
