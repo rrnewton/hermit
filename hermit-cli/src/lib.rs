@@ -27,8 +27,6 @@ pub(crate) use app::exec_initial;
 #[cfg(feature = "liteinst")]
 reverie_liteinst::declare_legacy_tool_backing!();
 
-
-
 pub mod backend_stats;
 pub mod build_info;
 pub mod canonical_verdict;
@@ -39,7 +37,6 @@ use hermit_record_format::consts;
 pub mod logdiff_report;
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch preprocessing API.
 pub mod cpu_profile_admission;
-pub mod e9patch;
 mod error;
 use hermit_record_format::event;
 use hermit_record_format::event_stream;
@@ -380,37 +377,24 @@ const _: () = assert!(
 mod record;
 use hermit_record_format::record_replay_path;
 mod replay;
-#[cfg(feature = "sabre")]
-mod sabre_bootstrap;
-#[cfg(feature = "sabre")]
-mod sabre_ptrace;
+
 use hermit_record_format::script;
 mod tracer_thread;
 
-#[cfg(feature = "sabre")]
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
-#[cfg(feature = "dbt")]
-use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
-#[cfg(any(feature = "sabre", all(test, feature = "liteinst")))]
+#[cfg(all(test, feature = "liteinst"))]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(feature = "sabre")]
-use std::os::unix::fs::OpenOptionsExt;
-#[cfg(any(feature = "sabre", feature = "liteinst"))]
+#[cfg(feature = "liteinst")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(feature = "sabre")]
-use std::sync::Arc;
 use std::sync::Mutex;
-#[cfg(feature = "sabre")]
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -426,29 +410,13 @@ pub use detcore::Config as DetConfig;
 pub use detcore::Detcore;
 pub use detcore::RecordOrReplay;
 #[doc(hidden)]
-#[cfg(feature = "dbt")]
-pub use detcore_dbt::reverie_dbt_runtime_background_init_v2;
 #[doc(hidden)]
-#[cfg(feature = "dbt")]
-pub use detcore_dbt::reverie_dbt_runtime_background_init_v3;
 #[doc(hidden)]
-#[cfg(feature = "dbt")]
-pub use detcore_dbt::reverie_dbt_runtime_name;
 #[doc(hidden)]
-#[cfg(feature = "dbt")]
-pub use detcore_dbt::reverie_dbt_runtime_pre_syscall;
 #[doc(hidden)]
-#[cfg(feature = "dbt")]
-pub use detcore_dbt::reverie_dbt_runtime_ready;
 #[doc(hidden)]
-#[cfg(feature = "dbt")]
-pub use detcore_dbt::reverie_dbt_runtime_thread_exit;
 #[doc(hidden)]
-#[cfg(feature = "dbt")]
-pub use detcore_dbt::reverie_dbt_runtime_thread_init;
 #[doc(hidden)]
-#[cfg(feature = "dbt")]
-pub use detcore_dbt::reverie_dbt_runtime_totals;
 pub use error::Context;
 pub use error::Error;
 pub use error::FailureKind;
@@ -467,8 +435,6 @@ pub use ptrace_completion::RecoveryRefusal;
 use record::Record;
 use replay::Replay;
 pub use reverie::ExitStatus;
-#[cfg(feature = "sabre")]
-use reverie::GlobalTool;
 pub use reverie::process;
 pub use reverie::process::Command;
 pub use reverie::process::Mount;
@@ -821,52 +787,6 @@ fn check_tracing_environment(
         );
     }
     Ok(())
-}
-
-#[cfg(feature = "dbt")]
-fn is_dynamorio_sdk(path: &Path) -> bool {
-    path.join("include/dr_api.h").is_file()
-        || path.join("DynamoRIOConfig.cmake").is_file()
-        || path.join("cmake/DynamoRIOConfig.cmake").is_file()
-}
-
-#[cfg(feature = "dbt")]
-fn dynamorio_sdk_available() -> bool {
-    if hermit_resources::resource("dynamorio/bin64/drrun")
-        .is_ok_and(|path| path.is_some_and(|path| path.is_file()))
-    {
-        return true;
-    }
-    if reverie_dbt::bundled_drrun_path().is_file() {
-        return true;
-    }
-    const DEFAULT_ROOTS: [&str; 3] = [
-        "/usr/lib/cmake/DynamoRIO",
-        "/usr/local/lib/cmake/DynamoRIO",
-        "/opt/dynamorio",
-    ];
-
-    ["DYNAMORIO_HOME", "DynamoRIO_DIR"]
-        .into_iter()
-        .filter_map(std::env::var_os)
-        .map(PathBuf::from)
-        .chain(DEFAULT_ROOTS.into_iter().map(PathBuf::from))
-        .any(|path| is_dynamorio_sdk(&path))
-}
-
-#[cfg(feature = "dbt")]
-fn dbt_runtime_unavailable_reason() -> Option<String> {
-    dbt_runtime_unavailable_reason_from(detcore_dbt::runtime_library_path())
-}
-
-#[cfg(feature = "dbt")]
-fn dbt_runtime_unavailable_reason_from(runtime: io::Result<PathBuf>) -> Option<String> {
-    runtime.err().map(|error| {
-        format!(
-            "the Detcore DBT runtime is unavailable: {error}; build the hermit binary and \
-             cdylib in the same target directory"
-        )
-    })
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2328,8 +2248,6 @@ pub enum Backend {
     /// Use Reverie's ptrace backend.
     #[default]
     Ptrace,
-    /// Use the DynamoRIO backend.
-    Dbt,
     /// Use LiteInst, with Detcore's Tool running inside the guest.
     Liteinst,
     /// Use in-guest LiteInst with syscall site patching off: the same
@@ -2339,13 +2257,8 @@ pub enum Backend {
     /// guest's environment and refuses a run whose environment asks for any
     /// other value.
     InGuestTrap,
-    /// Use the SaBRe static binary rewriting backend.
-    Sabre,
     /// Use the KVM backend.
     Kvm,
-    /// Preprocess the main ELF with e9patch, then use the ptrace runtime.
-    // TODO-HUMAN-REVIEW(PR-594): Review the CLI-only hybrid backend selection.
-    E9patch,
 }
 
 /// A requested backend could not start because its required runtime support is absent.
@@ -2390,26 +2303,15 @@ impl std::fmt::Display for BackendUnavailable {
 impl std::error::Error for BackendUnavailable {}
 
 impl Backend {
-    const ALL: [Self; 7] = [
-        Self::Ptrace,
-        Self::Dbt,
-        Self::Liteinst,
-        Self::InGuestTrap,
-        Self::Sabre,
-        Self::Kvm,
-        Self::E9patch,
-    ];
+    const ALL: [Self; 4] = [Self::Ptrace, Self::Liteinst, Self::InGuestTrap, Self::Kvm];
 
     /// Returns the command-line spelling for this backend.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ptrace => "ptrace",
-            Self::Dbt => "dbt",
             Self::Liteinst => "liteinst",
             Self::InGuestTrap => "in-guest-trap",
-            Self::Sabre => "sabre",
             Self::Kvm => "kvm",
-            Self::E9patch => "e9patch",
         }
     }
 
@@ -2435,9 +2337,9 @@ impl Backend {
 
     fn uses_ptrace_pmu_timers(self) -> bool {
         match self {
-            Self::Ptrace | Self::E9patch => true,
+            Self::Ptrace => true,
             // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
-            Self::Liteinst | Self::InGuestTrap | Self::Dbt | Self::Sabre | Self::Kvm => false,
+            Self::Liteinst | Self::InGuestTrap | Self::Kvm => false,
         }
     }
 
@@ -2482,13 +2384,9 @@ impl Backend {
             Self::Ptrace => validate_tracing_environment(namespaces)
                 .err()
                 .map(|error| error.to_string()),
-            Self::Dbt => dbt_unavailable_reason(),
             // The same runtime, so the same prerequisites and the same reason.
             Self::Liteinst | Self::InGuestTrap => liteinst_unavailable_reason(),
-            // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
-            Self::Sabre => sabre_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
-            Self::E9patch => e9patch_unavailable_reason(),
         }
     }
 }
@@ -2599,151 +2497,12 @@ impl SkidOvershootReport {
 // SaBRe's statistics and RPC support are selected only by `sabre`; the external
 // loader and Detcore plugin must also be supplied. e9patch preprocessing requires
 // external `e9tool`/`e9patch` artifacts. Neither path is enabled by default.
-#[cfg(feature = "sabre")]
-fn sabre_unavailable_reason() -> Option<String> {
-    sabre_runtime_unavailable_reason()
-}
-
-#[cfg(not(feature = "sabre"))]
-fn sabre_unavailable_reason() -> Option<String> {
-    Some("the `sabre` feature is not enabled in this build; rebuild with `--features sabre` (or `--features third-party-backends`). This says nothing about whether SaBRe works on this machine -- it has not been checked".to_owned())
-}
-
-#[cfg(feature = "e9patch")]
-fn e9patch_unavailable_reason() -> Option<String> {
-    // e9patch overlays the rewritten ELF in a mount namespace, so it always
-    // creates namespaces (run refuses `--backend=e9patch --no-namespace`).
-    validate_tracing_environment(NamespaceUse::Creates)
-        .err()
-        .map(|error| error.to_string())
-        .or_else(e9patch::unavailable_reason)
-}
-
-#[cfg(not(feature = "e9patch"))]
-fn e9patch_unavailable_reason() -> Option<String> {
-    Some("the `e9patch` feature is not enabled in this build; rebuild with `--features e9patch` (or `--features third-party-backends`). This says nothing about whether e9patch works on this machine -- it has not been checked".to_owned())
-}
-
-#[cfg(feature = "dbt")]
-fn dbt_unavailable_reason() -> Option<String> {
-    if !dynamorio_sdk_available() {
-        return Some(
-            "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
-                .to_owned(),
-        );
-    }
-    dbt_runtime_unavailable_reason()
-}
-
-#[cfg(not(feature = "dbt"))]
-// TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBT compile-time feature boundary.
-fn dbt_unavailable_reason() -> Option<String> {
-    Some(dbt_disabled_build_reason(cfg!(hermit_registry_build)))
-}
-
-/// `registry_build`: this crate's package metadata explicitly identifies the
-/// registry projection (`cfg(hermit_registry_build)`, set by build.rs). A core
-/// source build stays a source build regardless of its backend features. The
-/// package name cannot tell them apart: both are `hermit-run`.
-#[cfg(not(feature = "dbt"))]
-fn dbt_disabled_build_reason(registry_build: bool) -> String {
-    if registry_build {
-        "the dbt backend is not included in this registry release; use a source build from https://github.com/rrnewton/hermit with `--features dbt`. The registry's `third-party-backends` feature does not include DBT. DynamoRIO availability on this machine has not been checked".to_owned()
-    } else {
-        "the `dbt` feature is not enabled in this source build; rebuild with `--features dbt` (or `--features third-party-backends`). DynamoRIO availability on this machine has not been checked".to_owned()
-    }
-}
-
-#[cfg(feature = "sabre")]
-const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
-
-#[cfg(feature = "sabre")]
-fn is_executable_file(path: &Path) -> bool {
-    fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
 
 // TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
-#[cfg(feature = "sabre")]
-fn resolve_sabre_binary_from(
-    override_path: Option<&OsStr>,
-    packaged_path: Option<&Path>,
-    executable: &Path,
-    path_env: &OsStr,
-) -> Result<PathBuf, Error> {
-    if let Some(requested) = override_path {
-        if requested.is_empty() {
-            return Err(anyhow!("{SABRE_BINARY_ENV} is empty"));
-        }
-        let path = PathBuf::from(requested);
-        return is_executable_file(&path)
-            .then_some(path.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "{SABRE_BINARY_ENV}={} is not an executable file",
-                    path.display()
-                )
-            });
-    }
 
-    if let Some(path) = packaged_path
-        && is_executable_file(path)
-    {
-        return Ok(path.to_path_buf());
-    }
-
-    let directory = executable
-        .parent()
-        .ok_or_else(|| anyhow!("Hermit executable has no parent directory"))?;
-    let sibling = directory.join("sabre");
-    let target_build = directory.parent().map(|target| target.join("sabre/sabre"));
-
-    if is_executable_file(&sibling) {
-        return Ok(sibling);
-    }
-    if let Some(candidate) = &target_build
-        && is_executable_file(candidate)
-    {
-        return Ok(candidate.clone());
-    }
-    if !path_env.is_empty()
-        && let Some(candidate) = std::env::split_paths(path_env)
-            .map(|directory| directory.join("sabre"))
-            .find(|candidate| is_executable_file(candidate))
-    {
-        return Ok(candidate);
-    }
-
-    Err(anyhow!(
-        "SaBRe executable was not found in the Hermit installation, beside {}, or in PATH; set {} or {SABRE_BINARY_ENV}",
-        executable.display(),
-        hermit_resources::INSTALL_DIR_ENV
-    ))
-}
-
-#[cfg(feature = "sabre")]
-fn resolve_sabre_binary() -> Result<PathBuf, Error> {
-    let executable =
-        std::env::current_exe().context("failed to locate running Hermit executable")?;
-    let override_path = std::env::var_os(SABRE_BINARY_ENV);
-    let packaged_path = hermit_resources::resource("sabre")?;
-    let path_env = std::env::var_os("PATH").unwrap_or_default();
-    resolve_sabre_binary_from(
-        override_path.as_deref(),
-        packaged_path.as_deref(),
-        &executable,
-        &path_env,
-    )
-}
-
-#[cfg(feature = "sabre")]
-const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
-#[cfg(feature = "sabre")]
-const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 /// `reverie_sabre::TOOL_OUTPUT_ENV`: the descriptor reverie-sabre protects
 /// for the in-guest tool's own output. Hermit does not link reverie-sabre.
-#[cfg(feature = "sabre")]
-const SABRE_TOOL_OUTPUT_ENV: &str = "REVERIE_SABRE_TOOL_OUTPUT_FD";
+
 /// `detcore_liteinst::DETLOG_FORWARD_ENV`; that crate is a preload `cdylib`, so
 /// Hermit cannot import the constant.
 #[cfg(feature = "liteinst")]
@@ -2848,8 +2607,6 @@ pub fn inheritable_in_guest_detlog_socket() -> Result<Option<std::os::fd::OwnedF
         std::os::fd::OwnedFd::from_raw_fd(duplicate)
     }))
 }
-#[cfg(feature = "sabre")]
-const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
 
 /// The INFO policy for DETLOG records an in-guest Detcore (SaBRe's plugin,
 /// in-guest LiteInst) forwards: the current subscriber's answer for every
@@ -2861,182 +2618,20 @@ pub fn in_guest_detlog_forward_policy() -> detcore::detlog::ForwardPolicy {
     let directives = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).unwrap_or_default();
     detcore::detlog::ForwardPolicy::from_current_subscriber(&directives)
 }
-#[cfg(feature = "sabre")]
-const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
-
-#[cfg(feature = "sabre")]
-struct StagedSabreProgram {
-    path: PathBuf,
-}
-
-#[cfg(feature = "sabre")]
-impl Drop for StagedSabreProgram {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-#[cfg(feature = "sabre")]
-fn sabre_program_needs_neutral_name(program: &Path) -> bool {
-    program
-        .file_name()
-        .is_some_and(|name| name.as_bytes().starts_with(b"ld"))
-}
 
 // TODO-HUMAN-REVIEW(PR-845): Review the neutral-name workaround for SaBRe's
 // dynamic-loader prefix collision.
-#[cfg(feature = "sabre")]
-fn stage_sabre_program_in(
-    program: &Path,
-    staging_directory: &Path,
-) -> Result<Option<StagedSabreProgram>, Error> {
-    if !sabre_program_needs_neutral_name(program) {
-        return Ok(None);
-    }
-
-    let path = staging_directory.join(format!("hermit-sabre-program-{}", std::process::id()));
-    let mut source = fs::File::open(program).map_err(|error| {
-        anyhow!(
-            "failed to open SaBRe guest executable {} for neutral-name staging: {error}",
-            program.display()
-        )
-    })?;
-    let mut staged = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(&path)
-        .map_err(|error| {
-            anyhow!(
-                "failed to stage SaBRe guest executable {} as {}: {error}",
-                program.display(),
-                path.display()
-            )
-        })?;
-    if let Err(error) = io::copy(&mut source, &mut staged) {
-        let _ = fs::remove_file(&path);
-        return Err(anyhow!(
-            "failed to stage SaBRe guest executable {} as {}: {error}",
-            program.display(),
-            path.display()
-        ));
-    }
-    drop(staged);
-
-    Ok(Some(StagedSabreProgram { path }))
-}
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
-#[cfg(feature = "sabre")]
-fn sabre_runtime_library_path() -> io::Result<PathBuf> {
-    if let Some(path) = hermit_resources::resource("libdetcore_sabre.so")?
-        && path.is_file()
-    {
-        return Ok(path);
-    }
-
-    let executable = std::env::current_exe()?;
-    let directory = executable.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Hermit executable has no parent directory",
-        )
-    })?;
-    [
-        directory.join("libdetcore_sabre.so"),
-        directory.join("deps/libdetcore_sabre.so"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "libdetcore_sabre.so was not built beside {}",
-                executable.display()
-            ),
-        )
-    })
-}
-
-#[cfg(feature = "sabre")]
-fn sabre_runtime_unavailable_reason() -> Option<String> {
-    if let Err(error) = resolve_sabre_binary() {
-        return Some(error.to_string());
-    }
-    sabre_runtime_library_path().err().map(|error| {
-        format!(
-            "the Detcore SaBRe plugin is unavailable: {error}; build detcore-sabre and hermit in the same target directory"
-        )
-    })
-}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-774): Review the bounded SaBRe RPC disconnect drain.
-#[cfg(feature = "sabre")]
-const SABRE_RPC_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-
-#[cfg(feature = "sabre")]
-async fn wait_for_sabre_rpc_disconnects<T>(
-    global: &Arc<T>,
-    timeout: Duration,
-) -> Result<(), usize> {
-    let disconnected = tokio::time::timeout(timeout, async {
-        while Arc::strong_count(global) > 1 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await;
-
-    if disconnected.is_ok() {
-        return Ok(());
-    }
-
-    let live_references = Arc::strong_count(global).saturating_sub(1);
-    if live_references == 0 {
-        Ok(())
-    } else {
-        Err(live_references)
-    }
-}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-782): Review SaBRe RPC server shutdown errors.
-#[cfg(feature = "sabre")]
-async fn stop_sabre_rpc_server<E>(
-    server_task: tokio::task::JoinHandle<Result<(), E>>,
-) -> Result<(), Error>
-where
-    E: std::fmt::Display,
-{
-    server_task.abort();
-    match server_task.await {
-        Err(error) if error.is_cancelled() => Ok(()),
-        Err(error) => Err(anyhow!("SaBRe coordinator task failed: {error}")),
-        Ok(Err(error)) => Err(anyhow!("SaBRe coordinator server failed: {error}")),
-        Ok(Ok(())) => Err(anyhow!("SaBRe coordinator server stopped unexpectedly")),
-    }
-}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-789): Review complete SaBRe RPC shutdown ordering.
-#[cfg(feature = "sabre")]
-async fn shutdown_sabre_rpc<T, E>(
-    server_task: tokio::task::JoinHandle<Result<(), E>>,
-    global: &Arc<T>,
-    timeout: Duration,
-) -> Result<(), Error>
-where
-    E: std::fmt::Display,
-{
-    let server_result = stop_sabre_rpc_server(server_task).await;
-    let disconnect_result = wait_for_sabre_rpc_disconnects(global, timeout).await;
-
-    server_result?;
-    disconnect_result.map_err(|live_references| {
-        anyhow!("SaBRe coordinator stopped with {live_references} live RPC reference(s)")
-    })
-}
 
 fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     // The CLI probes ptrace readiness before entering its container; repeating
@@ -3044,12 +2639,7 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
     if backend == Backend::Ptrace {
         return Ok(());
     }
-    if backend == Backend::E9patch {
-        return Err(anyhow!(
-            "backend `e9patch` requires CLI preprocessing; library callers must use \
-             e9patch::prepare and then select `ptrace`"
-        ));
-    }
+
     // KVM and DBT have dedicated dispatches (`run_kvm` and `run_dbt`); neither
     // must reach this generic rejection path.
     backend.ensure_available()?;
@@ -3063,353 +2653,9 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
 /// the single GlobalState held by this Hermit coordinator process.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review SaBRe coordinator lifetime and artifact loading.
-#[cfg(feature = "sabre")]
-async fn run_sabre(
-    mut command: Command,
-    config: DetConfig,
-    print_summary: bool,
-    print_summary_to_json_file: &Option<PathBuf>,
-    capture_output: bool,
-) -> Result<Output, Error> {
-    let path_evidence_file = std::env::var_os(SABRE_PATH_EVIDENCE_ENV).map(PathBuf::from);
-    // Whether this run passes the plugin a DETLOG socket (below), in which case
-    // every Tool image must forward on it; see
-    // detcore::Config::in_guest_detlog_forward_policy.
-    let mut config = config;
-    let policy = in_guest_detlog_forward_policy();
-    config.in_guest_detlog_forward_policy = (policy.forwards_any()
-        && IN_GUEST_DETLOG_SINK.lock().unwrap().is_some())
-    .then(|| policy.encode());
-    let sabre = resolve_sabre_binary()?;
-    // The kernel execs SaBRe's loader, which loads the guest itself, so the
-    // kernel's `exe` link names the loader (`detcore::LaunchImage::launcher`).
-    // Declared even where the first image could not be resolved, so that a
-    // link Detcore cannot answer is refused rather than named the loader.
-    config
-        .launch_image
-        .get_or_insert(detcore::LaunchImage {
-            exe: None,
-            launcher: None,
-        })
-        .launcher = Some(PathBuf::from(&sabre));
-    let plugin = sabre_runtime_library_path()
-        .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
-    let program = command.find_program().map_err(|error| {
-        anyhow!(
-            "failed to resolve SaBRe guest executable {:?}: {error}",
-            command.get_program()
-        )
-    })?;
-    let staged_program = stage_sabre_program_in(&program, Path::new(SABRE_STAGING_DIRECTORY))?;
-    let launch_program = staged_program
-        .as_ref()
-        .map_or(program.as_path(), |staged| staged.path.as_path());
-
-    let bootstrap_launch =
-        sabre_bootstrap::Launch::new(Path::new(&sabre), launch_program, &config)?;
-
-    // This runs after Hermit enters the guest mount namespace, where `/tmp`
-    // names the container-visible temporary filesystem. Do not inherit a
-    // host-side nested TMPDIR: validation commonly sets TMPDIR=/tmp/<run>/tmp,
-    // but that parent path is hidden once the private `/tmp` mount is active.
-    // The SaBRe plugin and coordinator must name the socket through the same
-    // namespace-visible path.
-    let socket_dir = tempfile::Builder::new()
-        .prefix("hermit-sabre-rpc-")
-        .tempdir_in(Path::new("/tmp"))?;
-    let socket_path = socket_dir.path().join("coordinator.sock");
-    let fallback_ready = Arc::new(AtomicBool::new(false));
-    let global = Arc::new(detcore::GlobalState::init_global_state(&config).await);
-    let server = reverie_rpc_transport::RpcServer::bind_with_readiness(
-        &socket_path,
-        global.clone(),
-        config.clone(),
-        fallback_ready.clone(),
-    )
-    .map_err(|error| anyhow!("failed to start SaBRe coordinator RPC: {error}"))?;
-    let server_task = tokio::spawn(async move { server.serve().await });
-
-    // SaBRe runs with the guest's own argv and environment, so the kernel
-    // builds the guest's initial stack, /proc/self/cmdline and
-    // /proc/self/environ from them, as for an exec of the guest itself. The
-    // plugin and image paths and the plugin's settings go in a sealed launch
-    // specification instead (reverie_sabre_stats::launch), which SaBRe's loader
-    // reads and closes before the guest starts. A script runs as its
-    // interpreter, with the argv the kernel would give it.
-    let mut first_bytes = vec![0u8; 256];
-    let read = std::fs::File::open(launch_program)
-        .and_then(|mut file| std::io::Read::read(&mut file, &mut first_bytes))
-        .map_err(|error| {
-            anyhow!(
-                "failed to read SaBRe guest executable {}: {error}",
-                launch_program.display()
-            )
-        })?;
-    first_bytes.truncate(read);
-    let arg0 = command.get_arg0().to_owned();
-    let client = match reverie_sabre_stats::launch::shebang(&first_bytes) {
-        Some((interpreter, argument)) => {
-            command.program(&sabre);
-            command.arg0(OsStr::from_bytes(&interpreter));
-            let mut words: Vec<&OsStr> = argument
-                .iter()
-                .map(|word| OsStr::from_bytes(word))
-                .collect();
-            words.push(launch_program.as_os_str());
-            command.prepend_args(words);
-            PathBuf::from(OsStr::from_bytes(&interpreter))
-        }
-        None => {
-            command.program(&sabre);
-            command.arg0(&arg0);
-            launch_program.to_path_buf()
-        }
-    };
-    let mut launch_settings: Vec<Vec<u8>> = Vec::new();
-    let mut setting = |name: &str, value: &OsStr| {
-        let mut entry = name.as_bytes().to_vec();
-        entry.push(b'=');
-        entry.extend_from_slice(value.as_bytes());
-        launch_settings.push(entry);
-    };
-    setting(SABRE_RPC_SOCKET_ENV, socket_path.as_os_str());
-    command.env_remove(SABRE_RPC_SOCKET_ENV);
-    command.env_remove(sabre_bootstrap::ENVIRONMENT);
-    if bootstrap_launch.initializes_random() {
-        setting(sabre_bootstrap::ENVIRONMENT, OsStr::new("1"));
-    }
-    // Publish the configuration and clock RPC fingerprint for this coordinator.
-    // The plugin is a separate artifact in the same target directory, so it can
-    // be stale without looking it. Its check before connecting names the mismatch
-    // instead of failing to decode Config or a later DetTime request field.
-    // See detcore::config_wire_fingerprint.
-    setting(
-        detcore::CONFIG_FINGERPRINT_ENV,
-        OsStr::new(&detcore::config_wire_fingerprint()),
-    );
-    command.env_remove(detcore::CONFIG_FINGERPRINT_ENV);
-    command.env_remove(SABRE_PATH_EVIDENCE_ENV);
-    command.env_remove(SABRE_DETLOG_FORWARD_ENV);
-    // Per emitting module, as each in-process `detlog!` callsite asks tracing:
-    // asking only about `detcore` dropped every record a target-scoped
-    // RUST_LOG (warn,detcore::random=info) keeps under ptrace.
-    command.env_remove(SABRE_TOOL_OUTPUT_ENV);
-    let detlog_policy = in_guest_detlog_forward_policy();
-    // Kept open until the guest has started (it inherits its own copy).
-    let mut _detlog_descriptor = None;
-    if detlog_policy.forwards_any() {
-        setting(
-            SABRE_DETLOG_FORWARD_ENV,
-            OsStr::new(&detlog_policy.encode()),
-        );
-        // With a socket (`hermit run --verify`), the plugin sends each record
-        // on it from a descriptor reverie-sabre protects from the guest, and
-        // the coordinator writes each thread's records into the log at that
-        // thread's scheduler turns, as for in-guest LiteInst. Without one it
-        // writes them to the guest's standard error.
-        if let Some(socket) = inheritable_in_guest_detlog_socket()? {
-            setting(
-                SABRE_TOOL_OUTPUT_ENV,
-                OsStr::new(&detcore::detlog::tool_output_env_value(socket.as_raw_fd())?),
-            );
-            _detlog_descriptor = Some(socket);
-        }
-    }
-    command.env_remove("SABRE_BINARY");
-    command.env_remove("SABRE_PLUGIN");
-    // Always collect: the statistics page is a descriptor the guest can see,
-    // so creating it only when a summary or DEBUG log is requested would make
-    // those flags change the guest's view. Its number travels in the launch
-    // specification, and the descriptor sits above the plugin's fixed RPC
-    // socket.
-    let stats = reverie_sabre_stats::SabreStats::create(reverie::BackendStatsRequest::ENABLED)
-        .map_err(|error| anyhow!("failed to create the SaBRe statistics page: {error}"))?
-        .expect("an enabled request creates the statistics page");
-    setting(
-        reverie_sabre_stats::BACKEND_STATS_ENV,
-        OsStr::new(&stats.raw_fd().to_string()),
-    );
-    command.env_remove(reverie_sabre_stats::BACKEND_STATS_ENV);
-    let launch_settings: Vec<&[u8]> = launch_settings.iter().map(Vec::as_slice).collect();
-    let launch_spec = reverie_sabre_stats::launch::spec_bytes(
-        plugin.as_os_str().as_bytes(),
-        client.as_os_str().as_bytes(),
-        &launch_settings,
-    )
-    .ok_or_else(|| anyhow!("the SaBRe launch specification is malformed or too large"))?;
-    // Kept open until the guest has started (it inherits its own copy, which
-    // SaBRe's loader closes).
-    let _launch_spec = reverie_sabre_stats::launch::spec_fd(&launch_spec)
-        .map_err(|error| anyhow!("failed to create the SaBRe launch specification: {error}"))?;
-
-    // THE SOCKET PATH IS DELIBERATELY RANDOM AND MUST NOT BE COMPARED.
-    //
-    // `tempfile` appends a random 6-character suffix to the directory above, so
-    // the absolute path differs on every launch by design -- that is what keeps
-    // concurrent hermit invocations on a shared host from binding the same
-    // coordinator socket. Emitting it at INFO put per-launch randomness into the
-    // INFO stream, which `--verify-strict` compares:
-    //
-    //   Mismatch at log messages 2 (run 1) and 2 (run 2):
-    //   < socket=/tmp/hermit-sabre-rpc-Gw6tUi/coordinator.sock
-    //   > socket=/tmp/hermit-sabre-rpc-7SZ94p/coordinator.sock
-    //
-    // That fails EVERY SaBRe verify cell before the guest executes an
-    // instruction, for a host-side value with no guest-visible content. The
-    // defect was in the oracle, not the backend.
-    //
-    // WHY THE VALUE IS DROPPED FROM INFO RATHER THAN MADE DETERMINISTIC: the two
-    // `--verify` runs execute in SEPARATE CHILD PROCESSES, so any path stable
-    // across both would have to be derived from state shared between them. That
-    // trades `tempfile`'s guaranteed-fresh directory for a reused one, and a
-    // run1 that dies holding the socket would then make run2 fail to bind -- a
-    // real new failure mode in exchange for a cosmetic field. The path keeps its
-    // randomness; only the compared stream stops carrying it.
-    //
-    // This is NOT a comparator relaxation. No normalization envelope is widened,
-    // so any future randomness leaking into this banner still fails the
-    // comparison. The full path remains available one level down.
-    tracing::debug!(
-        target: "hermit::sabre",
-        socket = %socket_path.display(),
-        "SaBRe coordinator RPC socket (per-launch temp path, deliberately not at INFO)",
-    );
-    tracing::info!(
-        target: "hermit::sabre",
-        guest = %program.display(),
-        plugin = %plugin.display(),
-        "launching Detcore guest through SaBRe with coordinator RPC",
-    );
-
-    let supervised = match sabre_ptrace::run(
-        command.into_std_lossy(),
-        PathBuf::from(&sabre),
-        plugin.clone(),
-        fallback_ready,
-        global.clone(),
-        bootstrap_launch,
-        stats.clone(),
-        capture_output,
-    )
-    .await
-    {
-        Ok(supervised) => supervised,
-        Err(error) => {
-            global.release_all_physical_process_exits();
-            global.force_shutdown_with_error();
-            let _ = shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await;
-            return Err(error);
-        }
-    };
-    // The supervisor returns only after every tracee reached a final kernel wait status. Release
-    // the root process's barrier (and any intentionally unreaped child barriers) before scheduler
-    // shutdown; no guest thread remains that could race timer fast-forward here.
-    global.release_all_physical_process_exits();
-    // A SaBRe execution in which no guest thread ever reached the coordinator
-    // is an execution in which Detcore was never loaded as a Reverie tool: the
-    // guest ran on bare Linux. Treat it exactly like a failed run so the
-    // scheduler is torn down here instead of blocking forever in `clean_up`
-    // below, waiting for a guest thread that will never register.
-    let detcore_never_engaged = !supervised.path_evidence.guest_rpc_observed;
-    let requires_forced_shutdown = !supervised.status.success() || detcore_never_engaged;
-    if requires_forced_shutdown {
-        global.force_shutdown_with_error();
-    }
-    // Emit one unconditional, machine-readable per-run fact instead of a
-    // free-form warning. SaBRe loads the guest interpreter before the Detcore
-    // plugin, so pre-plugin loader syscalls are structurally absent from its
-    // observation envelope. Versioning that fact lets scorecard consumers
-    // reject old or incomplete records rather than infer coverage from silence.
-    //
-    // Keep this in the controller-diagnostic stream rather than writing
-    // directly to the process stderr that also carries captured guest stderr.
-    // WARN is Hermit's default tracing level, and `--log-file` can therefore
-    // separate the unconditional controller fact from guest output without a
-    // comparator exception. A missing record remains distinct from a record
-    // whose counters are zero.
-    let backend_evidence = sabre_backend_evidence_line(&supervised.path_evidence);
-    tracing::warn!(target: "hermit::sabre", "{backend_evidence}");
-    if let Some(path) = path_evidence_file {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|error| {
-                anyhow!(
-                    "failed to open SaBRe path evidence {}: {error}",
-                    path.display()
-                )
-            })?;
-        serde_json::to_writer(&mut file, &supervised.path_evidence)?;
-        writeln!(file)?;
-    }
-    let output = Output {
-        status: supervised.status.into(),
-        stdout: supervised.stdout,
-        stderr: supervised.stderr,
-    };
-
-    shutdown_sabre_rpc(server_task, &global, SABRE_RPC_DISCONNECT_TIMEOUT).await?;
-    let mut global = Arc::try_unwrap(global).map_err(|global| {
-        anyhow!(
-            "SaBRe coordinator stopped with {} live RPC reference(s)",
-            Arc::strong_count(&global) - 1
-        )
-    })?;
-    if requires_forced_shutdown {
-        global.cancel_internal_scheduler().await;
-    }
-    let dispatch_stats = backend_stats::report(
-        Backend::Sabre,
-        backend_stats::request(print_summary_to_json_file),
-        &stats,
-    );
-    // SaBRe's plugin starts after the guest's dynamic loader, whose syscalls
-    // the histogram therefore misses.
-    global.note_syscall_observation_gap(detcore::SyscallObservationGap::InProcessRuntimeStart);
-    let finalized = global
-        .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
-        .await;
-    tracing::info!(
-        target: "hermit::sabre::fallback",
-        ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
-        trusted_shared_object_sites = supervised.path_evidence.trusted_shared_object_sites,
-        guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
-        "SaBRe ptrace fallback completed",
-    );
-    if detcore_never_engaged {
-        return detcore::combine_finalization(
-            Err(Error::new(BackendRunFailure)
-                .context(sabre_uninstrumented_guest_message(&output.status))),
-            finalized,
-        );
-    }
-    detcore::combine_finalization(Ok(output), finalized)
-}
-
-#[cfg(not(feature = "sabre"))]
-async fn run_sabre(
-    _command: Command,
-    _config: DetConfig,
-    _print_summary: bool,
-    _print_summary_to_json_file: &Option<PathBuf>,
-    _capture_output: bool,
-) -> Result<Output, Error> {
-    Backend::Sabre.ensure_available()?;
-    unreachable!("SaBRe availability must fail when the feature is disabled");
-}
 
 /// Classify the existing SaBRe reach evidence without collapsing "never
 /// engaged" into the same zero-valued state as a fully exercised run.
-#[cfg(feature = "sabre")]
-fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> &'static str {
-    match (guest_rpc_observed, ptrace_fallback_sites) {
-        (false, _) => "no-detcore-reached",
-        (true, 1..) => "degraded-ptrace-fallback",
-        (true, 0) => "sabre-exercised",
-    }
-}
 
 /// Produce the versioned SaBRe backend fact consumed by compatibility reports.
 ///
@@ -3423,19 +2669,6 @@ fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> 
 /// 14 under ptrace; the 11 absent records were the loader's libc.so.6 path
 /// resolution. The launch-order fact, not that host-specific count, is the
 /// runtime contract.
-#[cfg(feature = "sabre")]
-fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String {
-    format!(
-        ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
-         evidence_schema={}; preplugin_coverage=absent; ptrace_fallback_sites={}; \
-         trusted_shared_object_sites={}; guest_rpc_observed={}; reach_state={}",
-        evidence.schema,
-        evidence.ptrace_fallback_sites,
-        evidence.trusted_shared_object_sites,
-        evidence.guest_rpc_observed,
-        sabre_reach_state(evidence.guest_rpc_observed, evidence.ptrace_fallback_sites),
-    )
-}
 
 /// Explain a SaBRe run whose guest never reached the Detcore coordinator.
 ///
@@ -3451,16 +2684,6 @@ fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String 
 /// statically linked ELF is the sharp edge: it has no dynamic loader and no
 /// shared library through which SaBRe could regain control, so an unrewritten
 /// static client runs entirely on bare Linux with no second chance.
-#[cfg(feature = "sabre")]
-fn sabre_uninstrumented_guest_message(status: &ExitStatus) -> String {
-    format!(
-        "the SaBRe backend finished ({status:?}) without the guest ever reaching the Detcore \
-         coordinator: no syscall was intercepted, so this run applied no determinization at all \
-         and its result is not a Hermit guarantee. This means SaBRe rewrote no syscall site in \
-         the guest -- most often a statically linked ELF, whose syscall sites SaBRe must patch \
-         in the client image itself because there is no dynamic loader to intercept."
-    )
-}
 
 /// Guest-physical memory available to the single-process KVM personality.
 // The KVM personality is a sparse MAP_NORESERVE address space. QEMU needs room
@@ -4004,18 +3227,9 @@ mod kvm_execution_tests;
 
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
 
-
-
-
-
-
-
-
-
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-737): Review public DBT dispatch and child environment ownership.
 /// Dispatch a command onto the Detcore-linked reverie-dbt runtime.
-
 
 // NOTE: A single-threaded executor is used here so that the tokio threads
 // themselves wouldn't contribute non-determinism to the PID namespace. This
@@ -4274,15 +3488,11 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
         // ptrace backend (`hermit run --backend=e9patch` configures its run as
         // `Backend::Ptrace`), so it has ptrace's capabilities. A direct caller
         // used to get two of them turned off by this name.
-        Backend::Ptrace | Backend::E9patch => {
-            <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
-        }
+        Backend::Ptrace => <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
         Backend::Kvm => reverie_kvm::KvmBackend::capabilities(),
         // Site patching changes how a syscall reaches the Tool, not what the
         // Tool host can do, so in-guest-trap has in-guest LiteInst's capabilities.
         Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,
-        Backend::Sabre => reverie::BackendCapabilities::SABRE,
-        Backend::Dbt => reverie::BackendCapabilities::DBT,
     }
 }
 
@@ -4485,17 +3695,7 @@ async fn dispatch_backend(
         .await?
         .status);
     }
-    if backend == Backend::Sabre {
-        return Ok(run_sabre(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            false,
-        )
-        .await?
-        .status);
-    }
+
     if backend.is_in_guest_liteinst() {
         #[cfg(feature = "liteinst")]
         {
@@ -4828,21 +4028,7 @@ async fn dispatch_output_backend(
         )
         .await;
     }
-    if backend == Backend::Sabre {
-        #[cfg(not(feature = "sabre"))]
-        backend.ensure_available()?;
-        command.stdin(output_backend_stdin()?);
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        return run_sabre(
-            command,
-            config,
-            print_summary,
-            print_summary_to_json_file,
-            true,
-        )
-        .await;
-    }
+
     if backend.is_in_guest_liteinst() {
         #[cfg(feature = "liteinst")]
         {
@@ -5825,6 +5011,41 @@ mod in_guest_delivery_harness;
 mod tests {
     use super::*;
 
+    // Historical capability rows are test data, not public backend selections.
+    // Core rows still call the real builtin preparation path; external rows
+    // exercise the same neutral normalizer with the actual declared contract.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CapabilityCase {
+        Ptrace,
+        Kvm,
+        Liteinst,
+        InGuestTrap,
+        Dbt,
+        Sabre,
+        E9patch,
+    }
+
+    fn prepare_capability_case(config: DetConfig, case: CapabilityCase) -> DetConfig {
+        let core = match case {
+            CapabilityCase::Ptrace => Some(Backend::Ptrace),
+            CapabilityCase::Kvm => Some(Backend::Kvm),
+            CapabilityCase::Liteinst => Some(Backend::Liteinst),
+            CapabilityCase::InGuestTrap => Some(Backend::InGuestTrap),
+            CapabilityCase::Dbt | CapabilityCase::Sabre | CapabilityCase::E9patch => None,
+        };
+        if let Some(core) = core {
+            return prepare_backend_config(config, core);
+        }
+        let capabilities = match case {
+            CapabilityCase::Dbt => reverie::BackendCapabilities::DBT,
+            CapabilityCase::Sabre => reverie::BackendCapabilities::SABRE,
+            // e9patch preprocesses then executes through the real ptrace Tool.
+            CapabilityCase::E9patch => reverie::BackendCapabilities::PTRACE,
+            _ => unreachable!("core capability cases return through their real owner"),
+        };
+        super::prepare_backend_config_with_capabilities(config, capabilities)
+    }
+
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Runs `check_tracing_environment` against probes that report `denied`
@@ -6570,12 +5791,8 @@ mod tests {
 
     #[test]
     fn only_ptrace_hosted_backends_consume_skid_overshoot_reports() {
-        for backend in [Backend::Ptrace, Backend::E9patch] {
-            assert!(backend.uses_ptrace_pmu_timers(), "{backend:?}");
-        }
-        for backend in [Backend::Dbt, Backend::Sabre, Backend::Kvm] {
-            assert!(!backend.uses_ptrace_pmu_timers(), "{backend:?}");
-        }
+        assert!(Backend::Ptrace.uses_ptrace_pmu_timers());
+        assert!(!Backend::Kvm.uses_ptrace_pmu_timers());
         // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
         assert!(!Backend::Liteinst.uses_ptrace_pmu_timers());
         assert!(!Backend::InGuestTrap.uses_ptrace_pmu_timers());
@@ -6700,13 +5917,7 @@ mod tests {
     fn in_guest_trap_is_in_guest_liteinst_and_forces_site_patching_off() {
         assert!(Backend::Liteinst.is_in_guest_liteinst());
         assert!(Backend::InGuestTrap.is_in_guest_liteinst());
-        for backend in [
-            Backend::Ptrace,
-            Backend::Dbt,
-            Backend::Sabre,
-            Backend::Kvm,
-            Backend::E9patch,
-        ] {
+        for backend in [Backend::Ptrace, Backend::Kvm] {
             assert!(!backend.is_in_guest_liteinst(), "{backend:?}");
             assert_eq!(backend.runtime_name(), backend.as_str(), "{backend:?}");
             assert_eq!(forced_site_patching_value(backend), None, "{backend:?}");
@@ -7933,12 +7144,6 @@ mod tests {
     #[test]
     fn an_unbuilt_backend_names_the_flag_and_claims_nothing_about_the_machine() {
         let feature_disabled_backends: &[(Backend, &str)] = &[
-            #[cfg(not(feature = "dbt"))]
-            (Backend::Dbt, "dbt"),
-            #[cfg(not(feature = "sabre"))]
-            (Backend::Sabre, "sabre"),
-            #[cfg(not(feature = "e9patch"))]
-            (Backend::E9patch, "e9patch"),
             #[cfg(not(feature = "liteinst"))]
             (Backend::Liteinst, "liteinst"),
             // in-guest-trap is the same runtime behind the same feature.
@@ -7961,135 +7166,27 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "dbt"))]
-    #[test]
-    fn dbt_registry_diagnostic_redirects_to_a_source_build() {
-        let reason = super::dbt_disabled_build_reason(true);
-        assert!(reason.contains("not included in this registry release"));
-        assert!(reason.contains("source build from https://github.com/rrnewton/hermit"));
-        assert!(reason.contains("`third-party-backends` feature does not include DBT"));
-        assert!(reason.contains("has not been checked"));
-
-        let source_reason = super::dbt_disabled_build_reason(false);
-        assert!(source_reason.contains("rebuild with `--features dbt`"));
-        assert!(!source_reason.contains("not included in this registry release"));
-        // This tree's package metadata says `source`, independently of the
-        // package name and the backend features it declares.
-        const { assert!(!cfg!(hermit_registry_build)) };
-    }
-
-    #[cfg(not(feature = "sabre"))]
-    #[tokio::test]
-    async fn disabled_sabre_dispatch_refuses_before_resolving_the_program() {
-        let program = "/hermit-missing-disabled-sabre-program";
-        let error = super::dispatch_backend(
-            super::Command::new(program),
-            super::DetConfig::default(),
-            false,
-            &None,
-            Backend::Sabre,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("the `sabre` feature is not enabled")
-        );
-        let error = super::dispatch_output_backend(
-            super::Command::new(program),
-            super::DetConfig::default(),
-            false,
-            &None,
-            Backend::Sabre,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("the `sabre` feature is not enabled")
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn a_cold_dbt_runtime_diagnostic_is_not_feature_absence() {
-        let reason = dbt_runtime_unavailable_reason_from(Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Hermit DBT runtime was not built beside /cold-target/hermit or in its deps directory",
-        )))
-        .expect("a missing cold-target runtime must remain unavailable");
-
-        assert!(reason.contains("was not built beside"));
-        assert!(reason.contains("build the hermit binary and cdylib"));
-        assert!(!reason.contains("not enabled in this build"));
-        assert!(!reason.contains("has not been checked"));
-    }
-
     /// A DBT runtime that does not export the fingerprint check's symbol, as
     /// one built before the check does not, is refused before DBT starts
     /// (this test's own executable exports no such symbol), and so is a file
     /// that is not ELF.
-    
-    
-        #[cfg(feature = "sabre")]
-    use std::ffi::OsStr;
     use std::fs;
-    #[cfg(feature = "sabre")]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    #[cfg(feature = "sabre")]
-    use std::sync::Arc;
-    #[cfg(feature = "sabre")]
-    use std::time::Duration;
 
     use super::Backend;
-    #[cfg(any(feature = "sabre", feature = "liteinst"))]
+    #[cfg(feature = "liteinst")]
     use super::ExitStatus;
     use super::HermitData;
     use super::Id;
-    #[cfg(feature = "sabre")]
-    use super::SABRE_RPC_SOCKET_ENV;
     use super::collect_recording_ids;
-    #[cfg(feature = "dbt")]
-    use super::dbt_runtime_unavailable_reason;
-    #[cfg(feature = "dbt")]
-    use super::dbt_runtime_unavailable_reason_from;
-    #[cfg(feature = "dbt")]
-    use super::dynamorio_sdk_available;
-    use super::ensure_backend_dispatch;
-    #[cfg(feature = "dbt")]
-    use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
     #[cfg(feature = "liteinst")]
     use super::liteinst_requires_forced_shutdown;
-    #[cfg(feature = "dbt")]
     use super::liteinst_unavailable_reason;
     use super::output_backend_stdin_file;
     use super::prepare_backend_config;
     use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
-    #[cfg(feature = "sabre")]
-    use super::resolve_sabre_binary_from;
-    #[cfg(feature = "sabre")]
-    use super::sabre_backend_evidence_line;
-    #[cfg(feature = "sabre")]
-    use super::sabre_program_needs_neutral_name;
-    #[cfg(feature = "sabre")]
-    use super::sabre_reach_state;
-    #[cfg(feature = "sabre")]
-    use super::sabre_uninstrumented_guest_message;
-    #[cfg(feature = "sabre")]
-    use super::shutdown_sabre_rpc;
-    #[cfg(feature = "sabre")]
-    use super::stage_sabre_program_in;
-    #[cfg(feature = "sabre")]
-    use super::stop_sabre_rpc_server;
-    #[cfg(feature = "sabre")]
-    use super::wait_for_sabre_rpc_disconnects;
 
     #[test]
     fn recording_inventory_preserves_missing_and_non_recording_cases() {
@@ -8240,91 +7337,6 @@ mod tests {
         assert!(!liteinst_requires_forced_shutdown(ExitStatus::Exited(128)));
     }
 
-    /// A SaBRe guest that never reaches the coordinator ran with no Detcore in
-    /// the loop at all. The diagnosis must say so in those terms -- a
-    /// zero-syscall SaBRe run is not a weak result, it is *no* result -- and it
-    /// must name the statically linked ELF case, which is the shape that
-    /// reaches this path in practice because a static client has no dynamic
-    /// loader through which SaBRe could regain control.
-    #[test]
-    #[cfg(feature = "sabre")]
-    fn uninstrumented_sabre_guest_is_reported_as_no_determinization() {
-        let message = sabre_uninstrumented_guest_message(&ExitStatus::Exited(0));
-        assert!(
-            message.contains("no determinization at all"),
-            "must not present an uninstrumented run as a weaker guarantee: {message}"
-        );
-        assert!(
-            message.contains("Detcore coordinator"),
-            "must name the authority that was never reached: {message}"
-        );
-        assert!(
-            message.contains("statically linked ELF"),
-            "must name the dominant cause so the reader can act: {message}"
-        );
-        // The exit status is carried because a successful-looking status is
-        // exactly what makes this failure mode dangerous.
-        assert!(
-            message.contains("Exited(0)"),
-            "must carry the observed status: {message}"
-        );
-        assert!(
-            sabre_uninstrumented_guest_message(&ExitStatus::Exited(139)).contains("Exited(139)"),
-            "must carry a failing status too"
-        );
-    }
-
-    /// The old two-way banner treated both `guest_rpc_observed=false` and an
-    /// engaged zero-fallback run as `sabre-exercised`. Assert the three states
-    /// together so no pair can collapse back onto one value.
-    #[test]
-    #[cfg(feature = "sabre")]
-    fn sabre_reach_states_are_pairwise_distinct() {
-        let no_detcore = sabre_reach_state(false, 0);
-        let degraded = sabre_reach_state(true, 1);
-        let exercised = sabre_reach_state(true, 0);
-
-        assert_eq!(no_detcore, "no-detcore-reached");
-        assert_eq!(degraded, "degraded-ptrace-fallback");
-        assert_eq!(exercised, "sabre-exercised");
-        assert_ne!(no_detcore, degraded);
-        assert_ne!(no_detcore, exercised);
-        assert_ne!(degraded, exercised);
-        assert_eq!(
-            sabre_reach_state(false, 9),
-            "no-detcore-reached",
-            "absence of a guest RPC must dominate any fallback count"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "sabre")]
-    fn sabre_backend_fact_is_versioned_and_names_preplugin_coverage() {
-        let exercised = super::sabre_ptrace::PathEvidence {
-            schema: 1,
-            guest_rpc_observed: true,
-            ptrace_fallback_sites: 0,
-            trusted_shared_object_sites: 2,
-            trusted_shared_objects: vec!["/usr/lib/libc.so.6".to_owned()],
-        };
-        assert_eq!(
-            sabre_backend_evidence_line(&exercised),
-            ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
-             evidence_schema=1; preplugin_coverage=absent; ptrace_fallback_sites=0; \
-             trusted_shared_object_sites=2; guest_rpc_observed=true; \
-             reach_state=sabre-exercised"
-        );
-
-        let unengaged = super::sabre_ptrace::PathEvidence {
-            guest_rpc_observed: false,
-            ..exercised
-        };
-        let fact = sabre_backend_evidence_line(&unengaged);
-        assert!(fact.contains("preplugin_coverage=absent"));
-        assert!(fact.contains("reach_state=no-detcore-reached"));
-        assert!(!fact.contains("reach_state=sabre-exercised"));
-    }
-
     #[test]
     fn liteinst_backend_config_preserves_the_requested_timeslice() {
         // Configuration must not silently clear a requested timeslice: the
@@ -8368,7 +7380,7 @@ mod tests {
     #[test]
     fn sabre_backend_configures_process_local_capabilities() {
         let config = super::DetConfig::default();
-        let sabre = prepare_backend_config(config.clone(), Backend::Sabre).backend;
+        let sabre = prepare_capability_case(config.clone(), CapabilityCase::Sabre).backend;
         assert!(sabre.tool_shares_guest_descriptor_table);
         assert!(sabre.rediscovers_descriptors_after_exec);
         assert!(sabre.loopback_pollers_yield_to_peers);
@@ -8378,7 +7390,7 @@ mod tests {
         assert!(sabre.tracks_process_children);
         assert!(!sabre.runs_exit_robust_list);
         assert!(!sabre.requires_thread_directed_process_signals);
-        let ptrace = prepare_backend_config(config, Backend::Ptrace).backend;
+        let ptrace = prepare_capability_case(config, CapabilityCase::Ptrace).backend;
         assert!(!ptrace.tool_shares_guest_descriptor_table);
         assert!(!ptrace.rediscovers_descriptors_after_exec);
         assert!(!ptrace.loopback_pollers_yield_to_peers);
@@ -8424,7 +7436,7 @@ mod tests {
     fn kvm_backend_config_marks_concurrent_process_children() {
         let defaults = super::DetConfig::default();
         assert!(!defaults.sequentialize_threads);
-        let nonsequential = prepare_backend_config(defaults, Backend::Kvm);
+        let nonsequential = prepare_capability_case(defaults, CapabilityCase::Kvm);
         assert!(nonsequential.backend.provides_process_signal_control);
         assert!(nonsequential.backend.emulates_child_waits);
         assert!(!may_observe_signal_dequeues(&nonsequential));
@@ -8434,7 +7446,7 @@ mod tests {
             sequentialize_threads: true,
             ..super::DetConfig::default()
         };
-        let kvm = prepare_backend_config(config, Backend::Kvm);
+        let kvm = prepare_capability_case(config, CapabilityCase::Kvm);
         assert!(may_observe_signal_dequeues(&kvm));
         assert!(requires_signal_control(&kvm));
         assert!(kvm.backend.needs_killed_thread_rpc_cancellation);
@@ -8445,18 +7457,18 @@ mod tests {
         // A controlled run needs both the backend's process-signal control and
         // sequentialized threads; neither alone admits one.
         for backend in [
-            Backend::Ptrace,
-            Backend::Dbt,
-            Backend::Sabre,
-            Backend::Liteinst,
-            Backend::InGuestTrap,
-            Backend::E9patch,
+            CapabilityCase::Ptrace,
+            CapabilityCase::Dbt,
+            CapabilityCase::Sabre,
+            CapabilityCase::Liteinst,
+            CapabilityCase::InGuestTrap,
+            CapabilityCase::E9patch,
         ] {
             let config = super::DetConfig {
                 sequentialize_threads: true,
                 ..super::DetConfig::default()
             };
-            let prepared = prepare_backend_config(config, backend);
+            let prepared = prepare_capability_case(config, backend);
             assert!(!may_observe_signal_dequeues(&prepared), "{backend:?}");
             assert!(!requires_signal_control(&prepared), "{backend:?}");
         }
@@ -8502,12 +7514,15 @@ mod tests {
     /// on ptrace. `reports_kernel_child_exit_signals` is true for ptrace,
     /// e9patch and SaBRe, whose signal callbacks see the kernel's child-exit
     /// SIGCHLD with its siginfo and can suppress or rewrite it.
-    fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
-        let sabre = backend == Backend::Sabre;
-        let kvm = backend == Backend::Kvm;
-        let dbt = backend == Backend::Dbt;
+    fn golden_backend_capabilities(backend: CapabilityCase) -> serde_json::Value {
+        let sabre = backend == CapabilityCase::Sabre;
+        let kvm = backend == CapabilityCase::Kvm;
+        let dbt = backend == CapabilityCase::Dbt;
         // LiteInst runs only through its in-guest runtime.
-        let in_guest_liteinst = matches!(backend, Backend::Liteinst | Backend::InGuestTrap);
+        let in_guest_liteinst = matches!(
+            backend,
+            CapabilityCase::Liteinst | CapabilityCase::InGuestTrap
+        );
         serde_json::json!({
             "tool_shares_guest_descriptor_table": sabre || dbt,
             "rediscovers_descriptors_after_exec": sabre || dbt,
@@ -8518,52 +7533,52 @@ mod tests {
             "process_exits_complete_asynchronously": in_guest_liteinst,
             "virtualizes_guest_sigalrm": in_guest_liteinst,
             "tracks_process_children": !dbt,
-            "runs_exit_robust_list": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "runs_exit_robust_list": matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
             "requires_thread_directed_process_signals": dbt,
             "supports_parked_write_signal_interruption":
-                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
+                matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch | CapabilityCase::Kvm),
             "reports_child_exit_publication":
-                matches!(backend, Backend::Ptrace | Backend::E9patch),
+                matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
             "reports_kernel_child_exit_signals":
-                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Sabre),
+                matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch | CapabilityCase::Sabre),
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
             // A Config field Hermit set from the backend's name before it was
             // a stated capability. e9patch runs on ptrace and has its value.
             "supports_blocked_wait_signal_interruption":
-                matches!(backend, Backend::Ptrace | Backend::E9patch),
+                matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
             // Readings of the field above until A5 step 3c.0 split them out,
             // with its value on every backend.
-            "kernel_signal_state_is_guests": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "kernel_signal_state_is_guests": matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
             "kernel_signal_targets_are_predictable":
-                matches!(backend, Backend::Ptrace | Backend::E9patch),
+                matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
             "host_task_reads_reach_guest_threads":
-                matches!(backend, Backend::Ptrace | Backend::E9patch),
+                matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
             "host_timed_signals_are_physical":
-                matches!(backend, Backend::Ptrace | Backend::E9patch),
+                matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
             "delivers_preemption_timer_events":
-                matches!(backend, Backend::Ptrace | Backend::E9patch),
+                matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
             "runs_guest_code_between_injections": sabre || in_guest_liteinst,
             "promotes_open_files_before_native_lifecycle": dbt || in_guest_liteinst,
             // Hermit runs e9patch preprocessing as a ptrace run (empty
             // trampolines keep the original syscall instruction), whose
             // rt_sigreturns reach the seccomp stop that reports them.
-            "reports_sigreturns": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "reports_sigreturns": matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
         })
     }
 
     #[test]
     fn backend_capabilities_match_the_golden_table() {
         for backend in [
-            Backend::Ptrace,
-            Backend::Kvm,
-            Backend::E9patch,
-            Backend::Liteinst,
-            Backend::InGuestTrap,
-            Backend::Sabre,
-            Backend::Dbt,
+            CapabilityCase::Ptrace,
+            CapabilityCase::Kvm,
+            CapabilityCase::E9patch,
+            CapabilityCase::Liteinst,
+            CapabilityCase::InGuestTrap,
+            CapabilityCase::Sabre,
+            CapabilityCase::Dbt,
         ] {
-            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            let config = prepare_capability_case(super::DetConfig::default(), backend);
             assert_eq!(
                 serde_json::to_value(config.backend).unwrap(),
                 golden_backend_capabilities(backend),
@@ -8601,19 +7616,6 @@ mod tests {
             assert_eq!(
                 super::backend_capabilities(Backend::InGuestTrap),
                 <reverie_liteinst::LiteinstBackend as reverie::Backend>::capabilities()
-            );
-        }
-        #[cfg(feature = "dbt")]
-        {
-            assert_eq!(
-                super::backend_capabilities(Backend::Dbt),
-                reverie_dbt::DbtRunner::capabilities()
-            );
-            // The DBT runtime re-asserts the same value when it loads the
-            // configuration this crate serializes for it.
-            assert_eq!(
-                super::backend_capabilities(Backend::Dbt),
-                detcore_dbt::backend_capabilities()
             );
         }
     }
@@ -8678,12 +7680,12 @@ mod tests {
             ),
             (
                 "dbt",
-                prepare_backend_config(sequential(default_config()), Backend::Dbt),
+                prepare_capability_case(sequential(default_config()), CapabilityCase::Dbt),
                 include_str!("../tests/fixtures/dbt/detconfig-before-capabilities-dbt.json"),
             ),
             (
                 "rich_dbt",
-                prepare_backend_config(sequential(rich_detconfig()), Backend::Dbt),
+                prepare_capability_case(sequential(rich_detconfig()), CapabilityCase::Dbt),
                 include_str!("../tests/fixtures/dbt/detconfig-before-capabilities-rich_dbt.json"),
             ),
         ] {
@@ -8755,16 +7757,28 @@ mod tests {
     #[test]
     fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [
-            (Backend::Ptrace, "010000011000100", "010000011000100"),
-            (Backend::E9patch, "010000011000100", "010000011000100"),
-            (Backend::Liteinst, "010001010000000", "010001010000000"),
-            (Backend::InGuestTrap, "010001010000000", "010001010000000"),
-            (Backend::Sabre, "011101110000000", "011101110000000"),
-            (Backend::Dbt, "011001000100000", "011001000100000"),
-            (Backend::Kvm, "010001010010100", "010001010011100"),
+            (CapabilityCase::Ptrace, "010000011000100", "010000011000100"),
+            (
+                CapabilityCase::E9patch,
+                "010000011000100",
+                "010000011000100",
+            ),
+            (
+                CapabilityCase::Liteinst,
+                "010001010000000",
+                "010001010000000",
+            ),
+            (
+                CapabilityCase::InGuestTrap,
+                "010001010000000",
+                "010001010000000",
+            ),
+            (CapabilityCase::Sabre, "011101110000000", "011101110000000"),
+            (CapabilityCase::Dbt, "011001000100000", "011001000100000"),
+            (CapabilityCase::Kvm, "010001010010100", "010001010011100"),
         ] {
             for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
-                let config = prepare_backend_config(
+                let config = prepare_capability_case(
                     DetConfig {
                         sequentialize_threads,
                         ..DetConfig::default()
@@ -8792,7 +7806,7 @@ mod tests {
 
     #[test]
     fn dbt_backend_config_translates_process_signals_to_host_threads() {
-        let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbt);
+        let config = prepare_capability_case(super::DetConfig::default(), CapabilityCase::Dbt);
         assert!(config.backend.needs_killed_thread_rpc_cancellation);
         assert!(!config.backend.tracks_process_children);
         assert!(!config.backend.runs_exit_robust_list);
@@ -8802,15 +7816,15 @@ mod tests {
     #[test]
     fn backend_write_signal_contract_is_explicit() {
         for (backend, supports_interruption) in [
-            (Backend::Ptrace, true),
-            (Backend::Dbt, false),
-            (Backend::Kvm, true),
-            (Backend::Sabre, false),
-            (Backend::Liteinst, false),
-            (Backend::InGuestTrap, false),
-            (Backend::E9patch, true),
+            (CapabilityCase::Ptrace, true),
+            (CapabilityCase::Dbt, false),
+            (CapabilityCase::Kvm, true),
+            (CapabilityCase::Sabre, false),
+            (CapabilityCase::Liteinst, false),
+            (CapabilityCase::InGuestTrap, false),
+            (CapabilityCase::E9patch, true),
         ] {
-            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            let config = prepare_capability_case(super::DetConfig::default(), backend);
             assert_eq!(
                 config.backend.supports_parked_write_signal_interruption, supports_interruption,
                 "unexpected parked-write signal support for {backend:?}"
@@ -8824,15 +7838,15 @@ mod tests {
     #[test]
     fn backend_timer_delivery_is_explicit() {
         for (backend, delivers) in [
-            (Backend::Ptrace, true),
-            (Backend::Dbt, false),
-            (Backend::Kvm, false),
-            (Backend::Sabre, false),
-            (Backend::Liteinst, false),
-            (Backend::InGuestTrap, false),
-            (Backend::E9patch, true),
+            (CapabilityCase::Ptrace, true),
+            (CapabilityCase::Dbt, false),
+            (CapabilityCase::Kvm, false),
+            (CapabilityCase::Sabre, false),
+            (CapabilityCase::Liteinst, false),
+            (CapabilityCase::InGuestTrap, false),
+            (CapabilityCase::E9patch, true),
         ] {
-            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            let config = prepare_capability_case(super::DetConfig::default(), backend);
             assert_eq!(
                 config.backend.delivers_preemption_timer_events, delivers,
                 "unexpected timer delivery for {backend:?}"
@@ -8845,15 +7859,15 @@ mod tests {
     #[test]
     fn backend_guest_code_between_injections_is_explicit() {
         for (backend, runs) in [
-            (Backend::Ptrace, false),
-            (Backend::Dbt, false),
-            (Backend::Kvm, false),
-            (Backend::Sabre, true),
-            (Backend::Liteinst, true),
-            (Backend::InGuestTrap, true),
-            (Backend::E9patch, false),
+            (CapabilityCase::Ptrace, false),
+            (CapabilityCase::Dbt, false),
+            (CapabilityCase::Kvm, false),
+            (CapabilityCase::Sabre, true),
+            (CapabilityCase::Liteinst, true),
+            (CapabilityCase::InGuestTrap, true),
+            (CapabilityCase::E9patch, false),
         ] {
-            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            let config = prepare_capability_case(super::DetConfig::default(), backend);
             assert_eq!(
                 config.backend.runs_guest_code_between_injections, runs,
                 "unexpected guest code between injections for {backend:?}"
@@ -8864,15 +7878,15 @@ mod tests {
     #[test]
     fn backend_blocked_wait_signal_contract_is_explicit() {
         for (backend, supports_interruption) in [
-            (Backend::Ptrace, true),
-            (Backend::Dbt, false),
-            (Backend::Kvm, false),
-            (Backend::Sabre, false),
-            (Backend::Liteinst, false),
-            (Backend::InGuestTrap, false),
-            (Backend::E9patch, true),
+            (CapabilityCase::Ptrace, true),
+            (CapabilityCase::Dbt, false),
+            (CapabilityCase::Kvm, false),
+            (CapabilityCase::Sabre, false),
+            (CapabilityCase::Liteinst, false),
+            (CapabilityCase::InGuestTrap, false),
+            (CapabilityCase::E9patch, true),
         ] {
-            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            let config = prepare_capability_case(super::DetConfig::default(), backend);
             assert_eq!(
                 config.backend.supports_blocked_wait_signal_interruption, supports_interruption,
                 "unexpected blocked-wait signal support for {backend:?}"
@@ -8911,20 +7925,20 @@ mod tests {
     #[test]
     fn only_gated_backends_record_an_inherited_terminal() {
         for backend in [
-            Backend::Dbt,
-            Backend::Kvm,
-            Backend::Sabre,
-            Backend::Liteinst,
-            Backend::InGuestTrap,
-            Backend::E9patch,
+            CapabilityCase::Dbt,
+            CapabilityCase::Kvm,
+            CapabilityCase::Sabre,
+            CapabilityCase::Liteinst,
+            CapabilityCase::InGuestTrap,
+            CapabilityCase::E9patch,
         ] {
-            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            let config = prepare_capability_case(super::DetConfig::default(), backend);
             assert!(
                 !config.guest_may_inherit_a_terminal,
                 "unexpected terminal record for {backend:?}"
             );
         }
-        let config = prepare_backend_config(super::DetConfig::default(), Backend::Ptrace);
+        let config = prepare_capability_case(super::DetConfig::default(), CapabilityCase::Ptrace);
         assert_eq!(
             config.guest_may_inherit_a_terminal,
             super::launcher_may_pass_a_terminal()
@@ -8976,17 +7990,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "dbt")]
     fn default_and_available_backends_reflect_host_probes() {
         assert_eq!(Backend::default(), Backend::Ptrace);
         let available = Backend::available().collect::<Vec<_>>();
         assert_eq!(
             available.contains(&Backend::Ptrace),
             Backend::Ptrace.is_available()
-        );
-        assert_eq!(
-            available.contains(&Backend::Dbt),
-            dynamorio_sdk_available() && dbt_runtime_unavailable_reason().is_none()
         );
         assert_eq!(
             available.contains(&Backend::Liteinst),
@@ -8998,234 +8007,21 @@ mod tests {
             available.contains(&Backend::Liteinst)
         );
         assert_eq!(
-            available.contains(&Backend::Sabre),
-            Backend::Sabre.is_available()
-        );
-        assert_eq!(
             available.contains(&Backend::Kvm),
             kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_none(),
-        );
-        assert_eq!(
-            available.contains(&Backend::E9patch),
-            Backend::E9patch.is_available()
         );
     }
 
     #[test]
-    #[cfg(feature = "dbt")]
     fn dependency_probes_require_usable_paths() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(!is_dynamorio_sdk(temp.path()));
-        fs::create_dir(temp.path().join("include")).unwrap();
-        fs::write(temp.path().join("include/dr_api.h"), b"/* marker */").unwrap();
-        assert!(is_dynamorio_sdk(temp.path()));
-
         let reason = kvm_device_unavailable_reason(temp.path())
             .expect("a directory must not pass the read-write KVM device probe");
         assert!(reason.contains("read-write"));
     }
 
-    #[cfg(feature = "sabre")]
-    fn write_test_executable(path: &std::path::Path) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"test loader").unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).unwrap();
-    }
-
     #[test]
-    #[cfg(feature = "sabre")]
-    fn sabre_rpc_socket_uses_private_exec_environment() {
-        assert!(SABRE_RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
-    }
-
-    #[test]
-    #[cfg(feature = "sabre")]
-    fn sabre_stages_program_names_that_collide_with_loader_prefix() {
-        assert!(sabre_program_needs_neutral_name(
-            PathBuf::from("/usr/bin/ld").as_path()
-        ));
-        assert!(sabre_program_needs_neutral_name(
-            PathBuf::from("/usr/bin/ld.bfd").as_path()
-        ));
-        assert!(!sabre_program_needs_neutral_name(
-            PathBuf::from("/usr/bin/gold").as_path()
-        ));
-    }
-
-    #[test]
-    #[cfg(feature = "sabre")]
-    fn sabre_neutral_name_staging_preserves_program_bytes_and_cleans_up() {
-        let temp = tempfile::tempdir().unwrap();
-        let program = temp.path().join("ld.test");
-        fs::write(&program, b"linker image").unwrap();
-
-        let staged = stage_sabre_program_in(&program, temp.path())
-            .unwrap()
-            .expect("ld-prefixed program should be staged");
-        let staged_path = staged.path.clone();
-        assert_eq!(fs::read(&staged_path).unwrap(), b"linker image");
-        assert!(
-            staged_path
-                .file_name()
-                .unwrap()
-                .as_encoded_bytes()
-                .starts_with(b"hermit-sabre-program-")
-        );
-
-        drop(staged);
-        assert!(!staged_path.exists());
-    }
-
-    #[tokio::test(start_paused = true)]
-    #[cfg(feature = "sabre")]
-    async fn sabre_rpc_disconnect_wait_observes_delayed_release() {
-        let global = Arc::new(());
-        let connection = global.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            drop(connection);
-        });
-
-        assert_eq!(
-            wait_for_sabre_rpc_disconnects(&global, Duration::from_millis(50)).await,
-            Ok(())
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    #[cfg(feature = "sabre")]
-    async fn sabre_rpc_disconnect_wait_reports_stuck_connection() {
-        let global = Arc::new(());
-        let _connection = global.clone();
-
-        assert_eq!(
-            wait_for_sabre_rpc_disconnects(&global, Duration::from_millis(10)).await,
-            Err(1)
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sabre")]
-    async fn sabre_rpc_server_intentional_abort_is_clean() {
-        let server_task = tokio::spawn(std::future::pending::<Result<(), &'static str>>());
-
-        assert!(stop_sabre_rpc_server(server_task).await.is_ok());
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "sabre")]
-    async fn sabre_rpc_server_failure_is_reported() {
-        let server_task = tokio::spawn(async { Err::<(), _>("accept failed") });
-        while !server_task.is_finished() {
-            tokio::task::yield_now().await;
-        }
-
-        let error = stop_sabre_rpc_server(server_task).await.unwrap_err();
-        assert!(error.to_string().contains("accept failed"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    #[cfg(feature = "sabre")]
-    async fn sabre_rpc_shutdown_drains_connections_after_server_failure() {
-        let global = Arc::new(());
-        let connection = global.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            drop(connection);
-        });
-        let server_task = tokio::spawn(async { Err::<(), _>("accept failed") });
-        while !server_task.is_finished() {
-            tokio::task::yield_now().await;
-        }
-
-        let error = shutdown_sabre_rpc(server_task, &global, Duration::from_millis(50))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("accept failed"));
-        assert_eq!(Arc::strong_count(&global), 1);
-    }
-
-    #[test]
-    #[cfg(feature = "sabre")]
-    fn sabre_binary_resolver_finds_cargo_target_build() {
-        let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("target/release/hermit");
-        let loader = temp.path().join("target/sabre/sabre");
-        write_test_executable(&loader);
-
-        assert_eq!(
-            resolve_sabre_binary_from(None, None, &executable, OsStr::new("")).unwrap(),
-            loader
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "sabre")]
-    fn sabre_binary_resolver_uses_packaged_loader() {
-        let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("target/release/hermit");
-        let packaged = temp.path().join("install_pkg/rsrcs/sabre");
-        write_test_executable(&packaged);
-
-        assert_eq!(
-            resolve_sabre_binary_from(None, Some(&packaged), &executable, OsStr::new("")).unwrap(),
-            packaged
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "sabre")]
-    fn sabre_binary_resolver_prefers_and_validates_override() {
-        let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("target/release/hermit");
-        let discovered = temp.path().join("target/sabre/sabre");
-        let requested = temp.path().join("requested-sabre");
-        write_test_executable(&discovered);
-        write_test_executable(&requested);
-
-        assert_eq!(
-            resolve_sabre_binary_from(
-                Some(requested.as_os_str()),
-                Some(&discovered),
-                &executable,
-                OsStr::new(""),
-            )
-            .unwrap(),
-            requested
-        );
-
-        let mut permissions = fs::metadata(&requested).unwrap().permissions();
-        permissions.set_mode(0o600);
-        fs::set_permissions(&requested, permissions).unwrap();
-        let error = resolve_sabre_binary_from(
-            Some(requested.as_os_str()),
-            Some(&discovered),
-            &executable,
-            OsStr::new(""),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("is not an executable file"));
-    }
-
-    #[test]
-    #[cfg(feature = "dbt")]
     fn optional_backends_report_accurate_availability() {
-        match Backend::Dbt.ensure_available() {
-            Ok(()) => assert!(
-                dynamorio_sdk_available() && dbt_runtime_unavailable_reason().is_none(),
-                "DBT reported available without its SDK and runtime"
-            ),
-            Err(dbt_error) => {
-                let message = dbt_error.to_string();
-                assert!(
-                    message.contains("DynamoRIO runtime")
-                        || message.contains("Detcore DBT runtime"),
-                    "unexpected DBT availability error: {message}"
-                );
-            }
-        }
         assert_eq!(
             Backend::Liteinst.ensure_available().is_ok(),
             liteinst_unavailable_reason().is_none()
@@ -9250,45 +8046,6 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn public_backend_dispatch_rejects_unprepared_e9patch() {
-        let error = ensure_backend_dispatch(Backend::E9patch).unwrap_err();
-        assert!(
-            error.to_string().contains("requires CLI preprocessing"),
-            "unexpected error: {error}"
-        );
-    }
-
-    
-
-    
-
-    
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn dbt_library_environment_privacy_is_caller_selected() {
-        #[cfg(not(feature = "dbt"))]
-        {
-            assert!(
-                std::env::var_os("HERMIT_REQUIRE_DBT").is_none(),
-                "HERMIT_REQUIRE_DBT is set, but this test binary was built WITHOUT \
-                 the `dbt` feature; rebuild with --features dbt to exercise the \
-                 library's environment-privacy policy",
-            );
-            eprintln!(
-                "skipping dbt_library_environment_privacy_is_caller_selected: \
-                 built without the `dbt` feature",
-            );
-        }
-        
-    }
-
-    
-
-    
-
-    
 
     #[test]
     fn kvm_runs_dynamic_echo_through_detcore() {
@@ -9550,7 +8307,6 @@ mod tests {
     /// `warn,detcore::random=info` once yielded no forwarding at all, because
     /// only the generic `detcore` target was asked, so SaBRe dropped the
     /// AT_RANDOM and early getrandom records ptrace prints.
-    #[cfg(feature = "sabre")]
     #[test]
     fn sabre_detlog_forwarding_answers_each_target_as_the_cli_filter_does() {
         use detcore::detlog::ForwardPolicy;

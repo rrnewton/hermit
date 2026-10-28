@@ -69,12 +69,20 @@ impl RecordOpts {
     }
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.main_with_backend(global, &super::core_adapter::CoreApplicationAdapter)
+    }
+
+    pub fn main_with_backend<A: super::backend_hook::BackendAdapter>(
+        &self,
+        global: &GlobalOpts,
+        adapter: &A,
+    ) -> Result<ExitStatus, Error> {
         match &self.record_command {
             Some(RecordCommand::List(x)) => x.main(global),
             Some(RecordCommand::Remove(x)) => x.main(global),
             Some(RecordCommand::Clean(x)) => x.main(global),
-            Some(RecordCommand::Start(x)) => x.main(global),
-            None => self.start.main(global),
+            Some(RecordCommand::Start(x)) => x.main_with_backend(global, adapter),
+            None => self.start.main_with_backend(global, adapter),
         }
     }
 }

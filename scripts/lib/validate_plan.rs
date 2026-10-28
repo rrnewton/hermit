@@ -252,27 +252,6 @@ fn shell_quote_fixture_operand(path: &str) -> String {
     quoted
 }
 
-fn compat_guest_command(row: &validate_corpus::CorpusRow, paths: &CorpusPaths) -> String {
-    row.argv
-        .iter()
-        .enumerate()
-        .map(|(index, arg)| {
-            // bash -c SCRIPT NAME ARG...: only explicit fixture operands get this
-            // treatment. Never interpolate the script body or alter ordinary argv.
-            if index >= 4
-                && row.argv[0] == "bash"
-                && row.argv[1] == "-c"
-                && Path::new(arg).starts_with(paths.real_compat_fixtures)
-            {
-                shell_quote_fixture_operand(arg)
-            } else {
-                shell_quote(arg)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The always-on preflight gates and the manifest-audit binary producer, as DAG nodes.
 ///
 /// Submodule verification is deliberately non-mutating and first. Initializing
@@ -602,72 +581,6 @@ pub fn partition_host_inapplicable(
 ///     built from structured results instead of a scraped TSV; and
 ///   * the corpus becomes parallel, which is where a large part of the wall-clock
 ///     win in this profile is expected to come from.
-pub fn compat_nodes(
-    root: &Path,
-    mode: CompatMode,
-    hermit_bin: &str,
-    nsswitch: &str,
-    paths: &CorpusPaths,
-    gate_dep: Option<&str>,
-) -> Result<Vec<Step>, String> {
-    let rows = validate_corpus::load(root, mode.corpus_name(), paths)?;
-    let mut out = Vec::new();
-    for row in rows {
-        let mut argv: Vec<String> = vec![hermit_bin.to_string()];
-        argv.extend(mode.run_args(&row.label, nsswitch, row.proc.as_deref()));
-        let wall = mode.timeout_for(&row.label);
-        let description = match mode {
-            CompatMode::E9patch => format!(
-                "One per-program probe of the e9patch-compat-only profile, generated from a row of ci/compat/{}. It runs `target/release/hermit --backend e9patch run --strict --epoch=<canonical test epoch> --verify -- <program>` with stdin from /dev/null. That is e9patch binary-rewriting preprocessing with the ptrace backend, not a backend of its own: Hermit rewrites the guest's main ELF with e9tool and e9patch, then runs the rewritten program on the ptrace backend under strict mode, twice, comparing the runs with the Stripped comparator of plain --verify, so no row establishes L2. The rows range from coreutils such as echo and cat to bash pipelines and tests/compat/real_compat_workload.sh workloads; whoami, groups, pinky, logname, tar and chown also bind the files-only nsswitch.conf over /etc/nsswitch.conf. The profile counts every failure as blocking, for example a rewritten binary that crashes or two runs whose output differs.",
-                mode.corpus_name()
-            ),
-        };
-        // Per-node TMPDIR and bytecode cache: the probes run in parallel
-        // under one validate-owned TMPDIR, and Detcore makes guest-visible
-        // time and pids deterministic, so two probes' `mktemp -d` pick the
-        // SAME name and collide (mkdir Ok in one run, EEXIST in the other),
-        // and one probe's python bytecode cache is visible to the next.
-        // A private directory per probe removes the cross-probe sharing;
-        // the two --verify runs of one probe stay sequential in it. The
-        // `probe-` prefix keeps a label such as `users` from producing a
-        // `/users/` path segment, which the portability checks reject as a
-        // user home directory.
-        let node_tmp = format!(
-            "{}/compat-tmp/probe-{}",
-            paths.validation_tmp_dir,
-            sanitize_job(&row.label)
-        );
-        let node_pycache = format!("{node_tmp}/python-cache");
-        // Exported in the command shell, not through the step's env map:
-        // the runner sets env values literally, so the run-state token in
-        // them would reach Hermit unexpanded and its verification logs
-        // would be created under a directory named after the token.
-        let mut step = node(
-            "compat",
-            &sanitize_job(&row.label),
-            &format!("{} compatibility: {}", mode.display_name(), row.label),
-            format!(
-                "mkdir -p {} {} && export TMPDIR={} PYTHONPYCACHEPREFIX={} && {} {} </dev/null",
-                shell_quote(&node_tmp),
-                shell_quote(&node_pycache),
-                shell_quote(&node_tmp),
-                shell_quote(&node_pycache),
-                shell_join(&argv),
-                compat_guest_command(&row, paths)
-            ),
-            gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
-            wall,
-            COMPAT_CPU_TIMEOUT_S.max(wall),
-            COMPAT_MEM_BYTES,
-        );
-        step.description = description;
-        out.push(step);
-    }
-    if out.is_empty() {
-        return Err(format!("compatibility mode {mode:?} selected zero probes"));
-    }
-    Ok(out)
-}
 
 /// DAG tags are `group.job`, so a job containing `.` would produce an ambiguous
 /// tag. Corpus labels are shell-command names (`c++filt`, `wc-lines`), none of

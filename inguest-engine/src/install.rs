@@ -10,7 +10,12 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
 use reverie_inguest::guest::support::describe_io_error;
-use crate::runtime::{EngineRuntime, FrameHookHost};
+
+use crate::runtime::EngineRuntime;
+use crate::runtime::FrameHookHost;
+
+#[path = "loader_settings.rs"]
+mod loader_settings;
 
 const DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
 const DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLICY";
@@ -18,7 +23,10 @@ static TOOL_OUTPUT_IDENTITY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLo
 
 // Loader selection for ordinary entry only, never a private phase authority.
 #[derive(Clone, Copy)]
-enum Mechanism { PatchedSites, SavedFrames }
+enum Mechanism {
+    PatchedSites,
+    SavedFrames,
+}
 
 struct InitializationInputs {
     coordinator_socket: OsString,
@@ -45,12 +53,15 @@ pub(crate) unsafe fn preload() {
                 });
             // SAFETY: as below.
             unsafe {
-                initialize_detcore(Mechanism::PatchedSites, InitializationInputs {
-                    coordinator_socket: bootstrap.coordinator.into_os_string(),
-                    forward_request: launch.forward_request.map(OsString::from),
-                    forward_policy: launch.forward_policy.map(OsString::from),
-                    coordinator_fingerprint: launch.coordinator_fingerprint.map(OsString::from),
-                });
+                initialize_detcore(
+                    Mechanism::PatchedSites,
+                    InitializationInputs {
+                        coordinator_socket: bootstrap.coordinator.into_os_string(),
+                        forward_request: launch.forward_request.map(OsString::from),
+                        forward_policy: launch.forward_policy.map(OsString::from),
+                        coordinator_fingerprint: launch.coordinator_fingerprint.map(OsString::from),
+                    },
+                );
             }
             return;
         }
@@ -89,12 +100,15 @@ pub(crate) unsafe fn preload() {
     // SAFETY: this is the loader's single-threaded constructor window, and
     // its private allocation/dispatch scope remains live through installation.
     unsafe {
-        initialize_detcore(Mechanism::PatchedSites, InitializationInputs {
-            coordinator_socket: socket,
-            forward_request,
-            forward_policy,
-            coordinator_fingerprint,
-        });
+        initialize_detcore(
+            Mechanism::PatchedSites,
+            InitializationInputs {
+                coordinator_socket: socket,
+                forward_request,
+                forward_policy,
+                coordinator_fingerprint,
+            },
+        );
     }
 }
 
@@ -128,21 +142,30 @@ pub(crate) unsafe fn loader(argc: usize, argv: *const *const c_char) {
             fail("duplicate saved-frame loader common-engine setting");
         }
     }
-    let socket = socket.filter(|s| !s.is_empty())
+    let socket = socket
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fail("saved-frame loader common-engine coordinator is missing"));
-    let fingerprint = fingerprint.filter(|s| !s.is_empty())
+    let fingerprint = fingerprint
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fail("saved-frame loader common-engine fingerprint is missing"));
     // SAFETY: genuine post_load, with fixed storage and allocation scope live.
-    unsafe { initialize_detcore(Mechanism::SavedFrames, InitializationInputs {
-        coordinator_socket: socket,
-        forward_request,
-        forward_policy,
-        coordinator_fingerprint: Some(fingerprint),
-    }) };
+    unsafe {
+        initialize_detcore(
+            Mechanism::SavedFrames,
+            InitializationInputs {
+                coordinator_socket: socket,
+                forward_request,
+                forward_policy,
+                coordinator_fingerprint: Some(fingerprint),
+            },
+        )
+    };
 }
 
 unsafe fn bounded_setting(pointer: *const c_char) -> Vec<u8> {
-    if pointer.is_null() { fail("null saved-frame loader setting"); }
+    if pointer.is_null() {
+        fail("null saved-frame loader setting");
+    }
     for length in 0..16_384 {
         // SAFETY: the loader promised a valid NUL-terminated string. The cap
         // only bounds work; it cannot authenticate an arbitrary pointer.
@@ -188,17 +211,12 @@ unsafe fn initialize_detcore(mechanism: Mechanism, inputs: InitializationInputs)
         };
         // Hermit sends the policy with the descriptor; without a readable one
         // this process cannot forward the records ptrace would log.
-        let policy = match forward_policy.as_deref().map(|value| {
-            value
-                .to_str()
-                .ok_or_else(|| "it is not UTF-8".to_owned())
-                .and_then(detcore::detlog::ForwardPolicy::decode)
-        }) {
-            Some(Ok(policy)) => policy,
-            Some(Err(error)) => fail(&format!(
+        let policy = match loader_settings::forwarding_policy(forward_policy.as_deref()) {
+            Ok(Some(policy)) => policy,
+            Err(error) => fail(&format!(
                 "the DETLOG forwarding policy is unreadable: {error}"
             )),
-            None => fail("the DETLOG forwarding policy is missing"),
+            Ok(None) => fail("the DETLOG forwarding policy is missing"),
         };
         // A signal handler installed by guest code that ran before this
         // constructor could otherwise replace the number between the identity
@@ -230,8 +248,8 @@ unsafe fn initialize_detcore(mechanism: Mechanism, inputs: InitializationInputs)
         restore_signals(&blocked);
         match reserved {
             Ok(_) => {
-                    let _ = TOOL_OUTPUT_IDENTITY.set(identity);
-                    let _ = detcore::detlog::set_forwarder(forward_detlog, policy);
+                let _ = TOOL_OUTPUT_IDENTITY.set(identity);
+                let _ = detcore::detlog::set_forwarder(forward_detlog, policy);
             }
             Err(error) => fail(&format!(
                 "cannot reserve the DETLOG forwarding descriptor {fd}: {error}"
@@ -267,21 +285,29 @@ unsafe fn initialize_detcore(mechanism: Mechanism, inputs: InitializationInputs)
     // concrete backend services stay boxed within the same engine DSO.
     let installed = match mechanism {
         Mechanism::PatchedSites => unsafe {
-            reverie_liteinst::install_tool_from_bootstrap_with_runtime::<detcore::Detcore, EngineRuntime>(
-                Path::new(&socket), EngineRuntime::new,
-            )
+            reverie_liteinst::install_tool_from_bootstrap_with_runtime::<
+                detcore::Detcore,
+                EngineRuntime,
+            >(Path::new(&socket), EngineRuntime::new)
         },
         Mechanism::SavedFrames => unsafe {
             reverie_inguest::guest::tool_install::install_tool_with_runtime_and_root_initializer::<
-                detcore::Detcore, _, EngineRuntime, _,
+                detcore::Detcore,
+                _,
+                EngineRuntime,
+                _,
             >(
-                Path::new(&socket), false, FrameHookHost::new(),
+                Path::new(&socket),
+                false,
+                FrameHookHost::new(),
                 |services| EngineRuntime::new(Box::new(services)),
                 crate::loader_state::initialize_root,
             )
         },
     };
-    if let Err(error) = installed { fail(&describe_io_error(&error)); }
+    if let Err(error) = installed {
+        fail(&describe_io_error(&error));
+    }
     // `--backend=in-guest-trap`: the Tool's constructor recorded the host's
     // request from the coordinator's configuration; compare it with the
     // settings the runtime actually captured while installing, which guest
@@ -474,9 +500,16 @@ pub(crate) fn refuse(message: &[u8]) -> ! {
 
 fn write_stderr(message: &[u8]) {
     unsafe {
-        reverie_inguest::trap::raw_syscall6(libc::SYS_write, [
-            libc::STDERR_FILENO as u64, message.as_ptr() as u64,
-            message.len() as u64, 0, 0, 0,
-        ]);
+        reverie_inguest::trap::raw_syscall6(
+            libc::SYS_write,
+            [
+                libc::STDERR_FILENO as u64,
+                message.as_ptr() as u64,
+                message.len() as u64,
+                0,
+                0,
+                0,
+            ],
+        );
     }
 }

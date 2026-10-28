@@ -25,7 +25,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends,kvm-native-test-support",
+            "kvm-native-test-support,liteinst",
             "--lib",
             "--bins",
         ]),
@@ -34,7 +34,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "inherited_terminal_read",
         ]),
@@ -61,7 +61,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "aio_nr_determinism",
             "--test",
@@ -108,8 +108,6 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "cpufreq_avg_determinism",
             "--test",
             "cpuidle_determinism",
-            "--test",
-            "dbt_copied_tty",
             "--test",
             "deadline_slice_cap",
             "--test",
@@ -329,7 +327,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "arbitrary_binaries",
         ]),
@@ -337,7 +335,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "liteinst_allocator",
         ]),
@@ -345,7 +343,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "liteinst_stacks",
         ]),
@@ -362,7 +360,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "cli",
         ]),
@@ -372,7 +370,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends,kvm-execution-tests",
+            "kvm-execution-tests,liteinst",
             "--lib",
             "--test",
             "cli",
@@ -381,7 +379,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "sabre_examples",
         ]),
@@ -396,7 +394,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "hermit_modes",
         ]),
@@ -404,7 +402,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "app_strict_verify",
         ]),
@@ -412,7 +410,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "command_strict_verify",
         ]),
@@ -420,7 +418,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "epoll_determinism",
             "--test",
@@ -430,7 +428,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "rr_suite",
         ]),
@@ -439,7 +437,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "relaxed_flag_matrix",
         ]),
@@ -447,7 +445,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "pselect6_simulation",
         ]),
@@ -455,7 +453,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "record_replay",
         ]),
@@ -463,7 +461,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "ipc_determinism",
         ]),
@@ -471,7 +469,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "random_determinism",
         ]),
@@ -479,7 +477,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "integration_matrix",
         ]),
@@ -488,7 +486,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
                 "-p",
                 "hermit-run",
                 "--features",
-                "third-party-backends",
+                "liteinst",
                 "--test",
                 "stress_suite",
             ])
@@ -497,7 +495,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "analyze",
         ]),
@@ -505,7 +503,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "leveldb",
         ]),
@@ -513,7 +511,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "sqlite_veryquick",
         ]),
@@ -717,9 +715,9 @@ pub(super) fn assert_producers_build_the_unified_selection(
                 step.tag()
             ));
         }
-        if !expected.contains("hermit-run/third-party-backends") {
+        if !expected.contains("hermit-run/liteinst") {
             return Err(format!(
-                "{} links the E2E Hermit without hermit-run/third-party-backends: `{expected}`",
+                "{} links the E2E Hermit without hermit-run/liteinst: `{expected}`",
                 step.tag()
             ));
         }
@@ -1125,8 +1123,7 @@ mod tests {
         );
         // The CLI opt-in alone does not enable the installer package's full
         // bundle. A producer that drops only that opt-in is not the union.
-        let core_installer =
-            mutated(&|cmd| cmd.replace("hermit-install/third-party-backends,", ""));
+        let core_installer = mutated(&|cmd| cmd.replace("hermit-install/liteinst,", ""));
         assert!(
             core_installer.contains("must end with its unified workspace build"),
             "{core_installer}"
@@ -1144,7 +1141,7 @@ mod tests {
             if let Some(index) = args.iter().position(|arg| arg == "--features") {
                 let kept = args[index + 1]
                     .split(',')
-                    .filter(|feature| *feature != "third-party-backends")
+                    .filter(|feature| *feature != "liteinst")
                     .collect::<Vec<_>>()
                     .join(",");
                 if kept.is_empty() {
@@ -1161,7 +1158,7 @@ mod tests {
                 crate::nextest_binaries::unified_prebuild_command(&graph, profile).unwrap();
             let after =
                 crate::nextest_binaries::unified_prebuild_command(&stripped, profile).unwrap();
-            assert!(!after.contains("third-party-backends"), "{after}");
+            assert!(!after.contains("liteinst"), "{after}");
             // The pinned compile half carries only the Cargo build, the text
             // of the union before its `prepare` tail, so it follows that part.
             let cargo_half = |union: &str| {
@@ -1181,10 +1178,7 @@ mod tests {
             }
         }
         let error = assert_producers_build_the_unified_selection(&stripped).unwrap_err();
-        assert!(
-            error.contains("without hermit-run/third-party-backends"),
-            "{error}"
-        );
+        assert!(error.contains("without hermit-run/liteinst"), "{error}");
     }
 
     #[test]
@@ -1285,7 +1279,7 @@ mod tests {
                 "-p",
                 "hermit-run",
                 "--features",
-                "third-party-backends",
+                "liteinst",
                 "--test",
                 "inherited_terminal_read",
             ]
@@ -1301,7 +1295,7 @@ mod tests {
         for tag in ["test.hermit_unit", "test.hermit_unit_on_host"] {
             let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
             let selection: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
-            assert!(selection.contains(&"third-party-backends,kvm-native-test-support".into()));
+            assert!(selection.contains(&"kvm-native-test-support,liteinst".into()));
             assert!(
                 !selection
                     .iter()

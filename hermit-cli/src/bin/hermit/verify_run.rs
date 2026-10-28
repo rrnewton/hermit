@@ -544,11 +544,7 @@ fn compare_with_application(
             anyhow::bail!(
                 "{} verification captured no syscall DETLOG records: run1={forwarded1}, \
                  run2={forwarded2}",
-                application_backend.unwrap_or(if backend == Backend::Sabre {
-                    "SaBRe"
-                } else {
-                    "LiteInst"
-                })
+                application_backend.unwrap_or("LiteInst")
             );
         }
     }
@@ -590,9 +586,7 @@ fn compare_with_application(
     } else {
         None
     };
-    let outcome = if backend == Backend::Dbt && application.is_none() {
-        conclude_dbt([&run1, &run2], [&out1, &out2], logs, verify_json)?
-    } else {
+    let outcome = {
         let [log1, log2] = logs;
         conclude_verification(
             VerificationConclusion {
@@ -634,7 +628,7 @@ fn compare_with_application(
     // adapter shows run 1's output after a match, and the others also after
     // a divergence where both runs' output agreed.
     if !outcome.verified() {
-        if backend != Backend::Dbt && !native_selected {
+        if !native_selected {
             emit_compared_guest_output(false, &out1, &out2)?;
         }
         return outcome.into_exit_status();
@@ -752,63 +746,6 @@ fn retain_logs(logs: &Path, runs: &[&VerifyRunDirectory]) -> Result<(), Error> {
         eprintln!("::   run {}: {}", index + 1, retained.display());
     }
     Ok(())
-}
-
-/// Compare two completed DBT runs as `run_dbt` compares its two
-/// (`backends::conclude_dbt_verification`): the logs, then the counted-branch
-/// clocks and the typed statistics in each directory's [`DBT_STATS`].
-#[cfg(feature = "dbt")]
-fn conclude_dbt(
-    runs: [&VerifyRunDirectory; 2],
-    outputs: [&Output; 2],
-    logs: [tempfile::TempPath; 2],
-    verify_json: Option<&Path>,
-) -> Result<super::verify::VerificationOutcome, Error> {
-    use super::backends::DbtCompletedRun;
-    use super::backends::DbtConclusion;
-    use super::backends::conclude_dbt_verification;
-    use super::backends::require_dbt_stats;
-
-    let [log1, log2] = logs;
-    let completed = |run: &VerifyRunDirectory, output, log| -> Result<DbtCompletedRun<'_>, Error> {
-        let record = run.record.dbt.ok_or_else(|| {
-            Error::msg(format!(
-                "{} is a DBT run whose record has no DBT section",
-                run.directory.display()
-            ))
-        })?;
-        Ok(DbtCompletedRun {
-            output,
-            log,
-            stats: require_dbt_stats(&reverie_dbt::backend_stats::DbtStatsCapture::read(
-                &run.directory.join(DBT_STATS),
-            ))?,
-            initialization_records: usize::try_from(record.initialization_records)?,
-        })
-    };
-    let comparison = runs[0].record.comparison;
-    conclude_dbt_verification(
-        completed(runs[0], outputs[0], log1)?,
-        completed(runs[1], outputs[1], log2)?,
-        DbtConclusion {
-            verify_json,
-            verify_verbose: comparison.diagnostic_full_trace,
-            compare_io_buffers: comparison.compare_io_buffers,
-            virtualize_time: comparison.virtualize_time,
-            keep_logs: false,
-            caller_owns_logs: true,
-        },
-    )
-}
-
-#[cfg(not(feature = "dbt"))]
-fn conclude_dbt(
-    _runs: [&VerifyRunDirectory; 2],
-    _outputs: [&Output; 2],
-    _logs: [tempfile::TempPath; 2],
-    _verify_json: Option<&Path>,
-) -> Result<super::verify::VerificationOutcome, Error> {
-    anyhow::bail!("these --verify-run directories are DBT runs, and this Hermit has no DBT backend")
 }
 
 #[cfg(test)]

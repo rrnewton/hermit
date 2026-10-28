@@ -410,6 +410,14 @@ impl HostRuntime for NativeRuntime {
     fn emit_stage(&self, stage: &[u8]) {
         diagnostics::emit(stage);
     }
+    #[cfg(feature = "native-first-instruction-observer")]
+    fn observe_native_entry(
+        &self,
+        stage: reverie_inguest::guest::native_services::NativeEntryStage,
+        observation: reverie_inguest::guest::native_services::NativeEntryObservation<'_, '_>,
+    ) {
+        super::first_instruction_observer::observe(stage, observation);
+    }
     fn fork_child_reset(&self, _event: &reverie_inguest::guest::event::SyscallEvent) {
         panic!("native fork cannot use the local runtime reset");
     }

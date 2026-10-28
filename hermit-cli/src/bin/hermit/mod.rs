@@ -16,11 +16,11 @@
 
 mod analyze;
 pub mod backend_hook;
-mod backends;
 mod bisect;
 mod clean;
 mod cli_owned_lifecycle;
 mod container;
+mod core_adapter;
 mod dap_adapter;
 mod dispatch_entry;
 mod dispatch_executable;
@@ -574,31 +574,10 @@ impl Subcommand {
         // analyze` ran its target trial on KVM). Before `run` lost its own `--backend`, this was spelled
         // `analyze --run-arg=--backend=kvm`.
         let runs_trials = matches!(self, Subcommand::Analyze(_) | Subcommand::Bisect(_));
-        if backend == Some(hermit::Backend::Sabre)
-            && !matches!(self, Subcommand::Strace(_) | Subcommand::Run(_))
-        {
-            // The predicate admits Strace AND Run, and `run` genuinely works --
-            // measured 2026-08-06 on a 4-thread guest: `hermit --backend sabre run`
-            // exited 0 with the correct deterministic result. The message used to
-            // name only `strace`, so it told users a working path was unsupported
-            // and hid real backend maturity. Message and predicate are now derived
-            // from the same list; if the predicate changes, this text must too.
-            anyhow::bail!(
-                "the SaBRe backend is available only through `hermit --backend sabre run` \
-                 and `hermit --backend sabre strace`"
-            );
-        }
+
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-696): Review the expanded e9patch CLI scope.
-        let starts_e9patch_guest = matches!(self, Subcommand::Run(_))
-            || matches!(self, Subcommand::Record(record) if record.starts_recording());
-        if backend == Some(hermit::Backend::E9patch) && !starts_e9patch_guest {
-            anyhow::bail!(
-                "the e9patch preprocessor is available only through `hermit --backend e9patch \
-                 run` and `hermit --backend e9patch record`; other subcommands, including \
-                 `analyze` and `bisect`, do not preprocess their guest"
-            );
-        }
+
         if let Some(backend) = backend.filter(|backend| backend.is_in_guest_liteinst())
             && !matches!(self, Subcommand::Run(_))
         {
@@ -618,14 +597,40 @@ impl Subcommand {
                  replay require the ptrace runtime's sequentialized scheduler"
             );
         }
-        if backend == Some(hermit::Backend::Dbt) && !matches!(self, Subcommand::Run(_)) {
-            anyhow::bail!(
-                "the DBT backend is available only through `hermit --backend dbt run`; record \
-                 and replay use the ptrace runtime, and `analyze` and `bisect` bind a \
-                 workspace into every trial, which DBT cannot apply"
-            );
-        }
+
         Ok(())
+    }
+
+    fn validate_application_backend_scope(
+        &self,
+        name: &'static str,
+        prepares_record: bool,
+        supports_strace: bool,
+    ) -> Result<(), Error> {
+        let record = prepares_record
+            && matches!(self, Subcommand::Record(record) if record.starts_recording());
+        let strace = supports_strace && matches!(self, Subcommand::Strace(_));
+        // Preserve every existing nonlaunch shared command, including Common
+        // and Native named saved-log comparison. Only guest-starting commands
+        // need a physical operation supplied by the executable's adapter.
+        if !self.starts_guest() || matches!(self, Subcommand::Run(_)) || record || strace {
+            return Ok(());
+        }
+        let mut forms = vec![
+            format!("{name} run"),
+            format!("hermit --backend {name} run"),
+        ];
+        if prepares_record {
+            forms.push(format!("{name} record"));
+        }
+        if supports_strace {
+            forms.push(format!("{name} strace"));
+        }
+        Err(Error::msg(format!(
+            "this executable's physical backend is available only through {}; \
+             other record and replay operations use the ptrace runtime and have no qualified adapter here",
+            forms.join(", "),
+        )))
     }
 
     /// Whether this invocation starts a guest, and so must first check for an
@@ -675,7 +680,7 @@ impl Subcommand {
     ) -> Result<ExitStatus, Error> {
         self.main_with_backend_and_host_admission(
             global,
-            &backends::BuiltinAdapter,
+            &core_adapter::CoreApplicationAdapter,
             (),
             false,
             admit_host,
@@ -725,12 +730,12 @@ impl Subcommand {
             Subcommand::Oci(oci) => oci.refuse_unready_exec_stop()?,
             _ => (),
         }
-        if selected_by_executable && self.starts_guest() && !matches!(self, Subcommand::Run(_)) {
-            return Err(Error::msg(format!(
-                "backend `{}` is selected by this executable and supports the run operation; \
-                 this operation has no qualified physical adapter",
-                A::NAME
-            )));
+        if selected_by_executable {
+            self.validate_application_backend_scope(
+                A::NAME,
+                A::PREPARES_RECORD,
+                A::SUPPORTS_STRACE,
+            )?;
         }
         self.validate_backend_scope(global.backend)?;
         // After the verdict stamp above, so a refused run leaves a no-result
@@ -743,8 +748,8 @@ impl Subcommand {
             Subcommand::HostCapabilities(x) => x.main(),
             Subcommand::Version(x) => x.main(),
             Subcommand::Run(x) => x.main_with_backend(global, adapter, adapter_options),
-            Subcommand::Strace(x) => x.main(global),
-            Subcommand::Record(x) => x.main(global),
+            Subcommand::Strace(x) => x.main_with_backend(global, adapter),
+            Subcommand::Record(x) => x.main_with_backend(global, adapter),
             Subcommand::Replay(x) => x.main(global),
             Subcommand::List(x) => x.main(),
             Subcommand::Show(x) => x.main(),
@@ -762,7 +767,7 @@ impl Subcommand {
 
 /// Run the application after the executable has initialized its process.
 pub fn main() {
-    main_application(backends::BuiltinAdapter, false);
+    main_application(core_adapter::CoreApplicationAdapter, false);
 }
 
 /// Run the shared application with this executable's one linked backend.
@@ -2043,10 +2048,10 @@ mod tests {
 
     #[test]
     fn backend_unavailability_is_classified_by_type_not_message() {
-        let typed = Error::new(BackendUnavailable::new(Backend::Dbt, "SDK absent"));
+        let typed = Error::new(BackendUnavailable::new(Backend::Kvm, "device absent"));
         assert_eq!(
             classify_failure(&typed),
-            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=dbt"
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=kvm"
         );
 
         let prose_only = Error::msg("backend `dbt` is unavailable: SDK absent");
@@ -2314,27 +2319,12 @@ mod tests {
             );
             hits[0]
         };
-        let ordinary = sole_offset(
-            "if (backend == Backend::Dbt || self.application_backend.is_some()) && !self.verify",
-        );
+        let ordinary = sole_offset("if self.application_backend.is_some() && !self.verify");
         let prepare = sole_offset("let mut session = adapter.prepare(");
         let physical = sole_offset("return adapter.execute(");
         let verify =
-            sole_offset("self.verify(global, dbt_verification_stdin, adapter, adapter_options)");
+            sole_offset("self.verify(global, application_stdin, adapter, adapter_options)");
         assert!(ordinary < prepare && prepare < physical && physical < verify);
-        let adapter = compact(
-            include_str!("backends.rs")
-                .split_once("    fn execute(")
-                .unwrap()
-                .1
-                .split_once("    fn finish(")
-                .unwrap()
-                .0,
-        );
-        assert!(
-            adapter.find("returninvocation.verify_run(").unwrap()
-                < adapter.find("invocation.run(").unwrap()
-        );
         let dispatch = compact(
             source
                 .split_once("    pub(super) fn verify_sharing_ld_so_cache<")
@@ -2346,10 +2336,6 @@ mod tests {
         );
         assert_eq!(dispatch.matches("adapter.prepare(").count(), 1);
         assert!(dispatch.contains("mode:Mode::VerificationPair"));
-        assert!(
-            compact(include_str!("backends.rs"))
-                .contains("verification:invocation.verification(request.stdin.take())?")
-        );
         assert_eq!(dispatch.matches("options.run_verify(").count(), 1);
         let common = compact(
             source
@@ -2380,15 +2366,11 @@ mod tests {
                 .count(),
             1
         );
-        let physical = include_str!("backends.rs")
-            .split_once("impl DbtVerification {")
-            .unwrap()
-            .1
-            .split_once("/// Stats are consumed")
-            .unwrap()
-            .0;
-        assert!(!physical.contains("compare_two_runs("));
-        assert!(source.contains("self.verify_run(directory, global)"));
+        assert!(
+            source.contains(
+                "self.verify_run_with_adapter(directory, global, adapter, adapter_options)"
+            )
+        );
     }
 
     /// DBT completion and evidence errors return to the same run-labelled
@@ -2413,19 +2395,6 @@ mod tests {
             .unwrap()
             .1;
         assert!(conclusion.contains("write_verification_json(path, &outcome)"));
-        let physical = include_str!("backends.rs")
-            .split_once("    fn execute(")
-            .unwrap()
-            .1
-            .split_once("    fn finish(")
-            .unwrap()
-            .0;
-        let physical = physical
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect::<String>();
-        assert!(physical.contains("verification.run("));
-        assert!(physical.contains("verify_json.as_deref()"));
         assert!(common.contains("finish(pending1, &out1, VerificationRun::Run1)"));
         assert!(common.contains("finish(pending2, &out2, VerificationRun::Run2)"));
     }
@@ -2449,7 +2418,6 @@ mod tests {
             .unwrap()
             .0;
         let block = options;
-        let source = include_str!("backends.rs");
 
         let record_envelope_literal = || {
             block
@@ -2468,24 +2436,6 @@ mod tests {
              records included at their stream positions, and also compares the initialization \
              count as a typed dimension. Changing this envelope changes which records are \
              compared, so update the adapter and its evidence together, not just this literal"
-        );
-        // Naming the envelope is worth nothing if the adapter applies another
-        // unreported filter while materializing the already decoded records.
-        // `write_canonical_info_with_filter` invites that at a backend boundary,
-        // so pin the unfiltered call.
-        let materialize = source
-            .find("fn materialize_dbt_comparison_log")
-            .expect("DBT comparison log materialization");
-        let body = &source[materialize..];
-        let body = &body[..body.find("\n}\n").expect("materialization body end")];
-        assert!(
-            body.contains("detcore::logdiff::write_canonical_info(path, &mut std::io::sink())"),
-            "the DBT comparison log must be materialized unfiltered; filtering here would \
-             contradict the envelope the verdict publishes"
-        );
-        assert!(
-            !body.contains("write_canonical_info_with_filter"),
-            "filtering at the DBT boundary would apply an undisclosed second policy"
         );
         // Bind the literal above to the real policy, so renaming the
         // constructor without preserving its meaning fails here too.
@@ -2758,6 +2708,13 @@ mod tests {
             .expect("global-position --backend should parse");
         assert_eq!(args.global.backend, Some(Backend::Kvm));
         assert!(matches!(args.command, Subcommand::Run(_)));
+        // Changed core interface: foreign physical backends are selected by
+        // executable dispatch, and are no longer core enum/feature variants.
+        for name in ["dbt", "sabre", "e9patch"] {
+            let error = Args::try_parse_from(["hermit", "--backend", name, "run", "prog"])
+                .expect_err("foreign selectors require their static executable path");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        }
     }
 
     /// `analyze` and `bisect` launch trials through `RunOpts::run`, which skips
@@ -2789,9 +2746,23 @@ mod tests {
                     "/bin/true",
                 ],
             ] {
-                let args = Args::try_parse_from(&argv)
-                    .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-                let scope = args.command.validate_backend_scope(args.global.backend);
+                let external = matches!(backend, "dbt" | "sabre" | "e9patch");
+                let args = if external {
+                    application_args(backend, &argv)
+                } else {
+                    Args::try_parse_from(&argv)
+                        .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"))
+                };
+                let scope = if external {
+                    args.command.validate_application_backend_scope(
+                        backend,
+                        backend == "e9patch",
+                        backend == "sabre",
+                        backend_hook::EvidenceRequirement::Common,
+                    )
+                } else {
+                    args.command.validate_backend_scope(args.global.backend)
+                };
                 if in_scope {
                     scope.unwrap_or_else(|error| panic!("{argv:?} must be in scope: {error:#}"));
                 } else {
@@ -2806,12 +2777,25 @@ mod tests {
                 }
             }
             if backend != "ptrace" {
-                let args = Args::try_parse_from(["hermit", "--backend", backend, "record", "list"])
-                    .unwrap();
+                let argv = ["hermit", "--backend", backend, "record", "list"];
+                let external = matches!(backend, "dbt" | "sabre" | "e9patch");
+                let args = if external {
+                    application_args(backend, &argv)
+                } else {
+                    Args::try_parse_from(argv).unwrap()
+                };
+                let scope = if external {
+                    args.command.validate_application_backend_scope(
+                        backend,
+                        backend == "e9patch",
+                        backend == "sabre",
+                        backend_hook::EvidenceRequirement::Common,
+                    )
+                } else {
+                    args.command.validate_backend_scope(args.global.backend)
+                };
                 assert!(
-                    args.command
-                        .validate_backend_scope(args.global.backend)
-                        .is_err(),
+                    scope.is_err(),
                     "--backend {backend} record list must stay out of scope"
                 );
             }
@@ -2950,10 +2934,18 @@ mod tests {
         assert!(args_from_matches_with_clock(&matches, || panic!("no clock")).is_ok());
     }
 
+    fn application_args(name: &'static str, argv: &[&str]) -> Args {
+        let schema = Args::command();
+        let raw = argv
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        let (parsed, _) = super::run_config::application_arguments(&schema, &raw, name).unwrap();
+        Args::from_arg_matches(&schema.try_get_matches_from(parsed).unwrap()).unwrap()
+    }
+
     #[test]
     fn e9patch_is_allowed_for_recording_but_rejected_for_management_and_replay() {
-        use hermit::Backend;
-
         for command in [
             vec![
                 "hermit",
@@ -2973,9 +2965,14 @@ mod tests {
                 "/bin/true",
             ],
         ] {
-            let args = Args::try_parse_from(command).unwrap();
+            let args = application_args("e9patch", &command);
             args.command
-                .validate_backend_scope(Some(Backend::E9patch))
+                .validate_application_backend_scope(
+                    "e9patch",
+                    true,
+                    false,
+                    backend_hook::EvidenceRequirement::Common,
+                )
                 .unwrap();
         }
 
@@ -2989,10 +2986,15 @@ mod tests {
                 "0123456789abcdef0123456789abcdef",
             ],
         ] {
-            let args = Args::try_parse_from(command).unwrap();
+            let args = application_args("e9patch", &command);
             let error = args
                 .command
-                .validate_backend_scope(Some(Backend::E9patch))
+                .validate_application_backend_scope(
+                    "e9patch",
+                    true,
+                    false,
+                    backend_hook::EvidenceRequirement::Common,
+                )
                 .unwrap_err();
             assert!(error.to_string().contains("only through"));
         }
@@ -3066,27 +3068,39 @@ mod tests {
 
     #[test]
     fn dbt_is_rejected_outside_run_instead_of_silently_recording_with_ptrace() {
-        use hermit::Backend;
-
-        let run =
-            Args::try_parse_from(["hermit", "--backend", "dbt", "run", "--", "/bin/true"]).unwrap();
+        let run = application_args(
+            "dbt",
+            &["hermit", "--backend", "dbt", "run", "--", "/bin/true"],
+        );
         run.command
-            .validate_backend_scope(Some(Backend::Dbt))
+            .validate_application_backend_scope(
+                "dbt",
+                false,
+                false,
+                backend_hook::EvidenceRequirement::NativeCounters,
+            )
             .expect("DBT run is the supported DBT execution path");
 
-        let record = Args::try_parse_from([
-            "hermit",
-            "--backend",
+        let record = application_args(
             "dbt",
-            "record",
-            "start",
-            "--",
-            "/bin/true",
-        ])
-        .unwrap();
+            &[
+                "hermit",
+                "--backend",
+                "dbt",
+                "record",
+                "start",
+                "--",
+                "/bin/true",
+            ],
+        );
         let error = record
             .command
-            .validate_backend_scope(Some(Backend::Dbt))
+            .validate_application_backend_scope(
+                "dbt",
+                false,
+                false,
+                backend_hook::EvidenceRequirement::NativeCounters,
+            )
             .expect_err("DBT record must not silently execute through ptrace");
         assert!(error.to_string().contains("use the ptrace runtime"));
     }
@@ -3120,40 +3134,44 @@ mod tests {
     /// predicate-only test.
     #[test]
     fn sabre_scope_admits_exactly_run_and_strace() {
-        use hermit::Backend;
-
         // POSITIVE: both admitted subcommands must pass the scope guard.
         for sub in ["run", "strace"] {
-            let args = Args::try_parse_from([
-                "hermit",
-                "--backend",
+            let args = application_args(
                 "sabre",
-                sub,
-                "--",
-                "/bin/echo",
-                "hi",
-            ])
-            .unwrap_or_else(|e| panic!("`--backend sabre {sub}` should parse: {e}"));
-            assert_eq!(args.global.backend, Some(Backend::Sabre));
+                &["hermit", "--backend", "sabre", sub, "--", "/bin/echo", "hi"],
+            );
+            assert_eq!(args.global.backend, None);
             args.command
-                .validate_backend_scope(args.global.backend)
+                .validate_application_backend_scope(
+                    "sabre",
+                    false,
+                    true,
+                    backend_hook::EvidenceRequirement::Common,
+                )
                 .unwrap_or_else(|e| panic!("`--backend sabre {sub}` must be in scope: {e}"));
         }
 
         // NEGATIVE: something outside the set is still refused. Without this the
         // guard could admit everything and still pass the positives above.
-        let args = Args::try_parse_from([
-            "hermit",
-            "--backend",
+        let args = application_args(
             "sabre",
-            "log-diff",
-            "/dev/null",
-            "/dev/null",
-        ])
-        .expect("log-diff should parse");
+            &[
+                "hermit",
+                "--backend",
+                "sabre",
+                "log-diff",
+                "/dev/null",
+                "/dev/null",
+            ],
+        );
         let err = args
             .command
-            .validate_backend_scope(args.global.backend)
+            .validate_application_backend_scope(
+                "sabre",
+                false,
+                true,
+                backend_hook::EvidenceRequirement::Common,
+            )
             .expect_err("`--backend sabre log-diff` must be rejected");
 
         // And the refusal must NAME both supported forms. A message that omits
@@ -3169,19 +3187,19 @@ mod tests {
 
     #[test]
     fn sabre_strace_command_parses_in_requested_form() {
-        use hermit::Backend;
-
-        let args = Args::try_parse_from([
-            "hermit",
-            "--backend",
+        let args = application_args(
             "sabre",
-            "strace",
-            "--",
-            "/bin/echo",
-            "hello",
-        ])
-        .expect("requested SaBRe strace form should parse");
-        assert_eq!(args.global.backend, Some(Backend::Sabre));
+            &[
+                "hermit",
+                "--backend",
+                "sabre",
+                "strace",
+                "--",
+                "/bin/echo",
+                "hello",
+            ],
+        );
+        assert_eq!(args.global.backend, None);
         assert!(matches!(args.command, Subcommand::Strace(_)));
     }
 
@@ -3194,7 +3212,8 @@ mod tests {
             "--env=SHOULD_NOT_BE_IGNORED=1",
             "--workdir=/tmp",
         ] {
-            let result = Args::try_parse_from([
+            let schema = Args::command();
+            let raw = [
                 "hermit",
                 "--backend",
                 "sabre",
@@ -3202,7 +3221,11 @@ mod tests {
                 option,
                 "--",
                 "/bin/true",
-            ]);
+            ]
+            .map(std::ffi::OsString::from);
+            let (parsed, _) =
+                super::run_config::application_arguments(&schema, &raw, "sabre").unwrap();
+            let result = schema.try_get_matches_from(parsed);
             assert!(
                 result.is_err(),
                 "SaBRe strace unexpectedly accepted unsupported option {option}"

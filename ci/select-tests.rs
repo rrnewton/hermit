@@ -1426,12 +1426,157 @@ fn self_test() {
     check("glob mid doublestar", glob_match("a/**/z.c", "a/b/c/z.c"));
     check("glob mid doublestar empty", glob_match("a/**/z.c", "a/z.c"));
 
-    // --- selection scenarios ---
+    // Current core inputs must come from the normal generators. Historical
+    // fixture success cannot substitute for this production graph check.
     let root = repo_root();
-    let fp = Footprints::load(&root.join("ci/test-footprints.json"));
-    let dag = Dag::load(&root.join("ci/dag/validate.json"));
-    let shards = Shards::load(&root.join("ci/portable-shards.json"));
-    let plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
+    let core_fp = Footprints::load(&root.join("ci/test-footprints.json"));
+    let core_dag = Dag::load(&root.join("ci/dag/validate.json"));
+    let core_shards = Shards::load(&root.join("ci/portable-shards.json"));
+    let core_plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
+    println!("Current generated core selection contract:");
+    check(
+        "current core inputs have real nonempty populations",
+        !core_fp.footprints.is_empty()
+            && !core_dag.all_nodes.is_empty()
+            && !core_shards.debug.is_empty()
+            && !core_plan.cells.is_empty(),
+    );
+    check(
+        "current core shards all resolve in the actual hosted graph",
+        core_shards
+            .debug
+            .iter()
+            .chain(&core_shards.release)
+            .all(|shard| resolved_shard_nodes(shard, &core_dag).is_ok()),
+    );
+    check(
+        "current generated footprint references all resolve",
+        core_fp.footprints.iter().all(|entry| {
+            let mut refs = BTreeSet::new();
+            core_fp.expand(&entry.nodes, &mut refs, &mut BTreeSet::new());
+            refs.iter()
+                .all(|node| core_dag.resolve_selection_node(node).is_some())
+        }),
+    );
+    let policy: Value = serde_json::from_slice(
+        &std::fs::read(root.join("ci/test-footprints-policy.json")).unwrap(),
+    )
+    .unwrap();
+    check(
+        "current core policy resolves its real nodes and contains no removed package rule",
+        ["package_rules", "path_footprints"].iter().all(|key| {
+            policy[*key].as_array().unwrap().iter().all(|rule| {
+                str_vec(&rule["nodes"])
+                    .iter()
+                    .all(|node| core_dag.resolve_selection_node(node).is_some())
+                    && str_vec(&rule["packages"]).iter().all(|package| {
+                        !matches!(
+                            package.as_str(),
+                            "detcore-dbt" | "detcore-dbt-cdylib" | "detcore-sabre"
+                        )
+                    })
+            })
+        }),
+    );
+    check(
+        "current core graph has no external private shard or corpus node",
+        [
+            "check.dbt_runtime_abi",
+            "check.dbt_runtime_abi_on_host",
+            "test.sabre_examples",
+            "test.sabre_examples_on_host",
+            "check.e9patch_corpus",
+        ]
+        .iter()
+        .all(|tag| !core_dag.all_nodes.contains(*tag)),
+    );
+    check(
+        "current core cell plan contains only its owned backends",
+        core_plan
+            .cells
+            .iter()
+            .all(|cell| !matches!(cell.backend.as_str(), "dbt" | "sabre" | "e9patch")),
+    );
+    let core_lock = select(&core_fp, &core_dag, &["Cargo.lock".into()]);
+    let current_full = derive_run_plan(&core_lock, &core_shards, &core_plan, &core_dag);
+    check(
+        "current full selection retains every actual shard and cell",
+        core_lock.decision == Decision::Full
+            && core_lock.nodes == core_dag.all_nodes
+            && current_full.shards.len() == core_shards.debug.len() + core_shards.release.len()
+            && current_full.cells.len() == core_plan.cells.len()
+            && current_full.build_debug
+            && !current_full.build_dbt,
+    );
+    let current_core = select(&core_fp, &core_dag, &["detcore/src/scheduler.rs".into()]);
+    check(
+        "current shared core source retains strict compatibility and unit consumers",
+        current_core.decision == Decision::Selective
+            && current_core.e2e_all
+            && current_core.nodes.contains("test.detcore_unit_on_host")
+            && current_core.nodes.contains("e2e.manifest_compat_on_host")
+            && derive_run_plan(&current_core, &core_shards, &core_plan, &core_dag)
+                .cells
+                .len()
+                == core_plan.cells.len(),
+    );
+    check(
+        "removed core package and corpus paths conservatively select the full current suite",
+        [
+            "detcore-dbt/src/lib.rs",
+            "detcore-dbt-cdylib/src/lib.rs",
+            "detcore-sabre/src/lib.rs",
+            "tests/e9patch/e9patch_corpus.py",
+        ]
+        .iter()
+        .all(|path| {
+            let selected = select(&core_fp, &core_dag, &[(*path).into()]);
+            selected.decision == Decision::Full
+                && selected.nodes == core_dag.all_nodes
+                && selected
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("unmapped path"))
+        }),
+    );
+    let current_unknown = select(&core_fp, &core_dag, &["some/brand/new/area/file.py".into()]);
+    check(
+        "current unknown source path still forces full",
+        current_unknown.decision == Decision::Full
+            && current_unknown
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("unmapped path")),
+    );
+    check(
+        "current inert documentation still requires its positive skip proof",
+        select(&core_fp, &core_dag, &["docs/selection-contract.md".into()]).decision
+            == Decision::Skip,
+    );
+    let mut stale_core = Dag {
+        all_nodes: core_dag.all_nodes.clone(),
+        deps: core_dag.deps.clone(),
+    };
+    let had_consumer = stale_core.all_nodes.remove("test.detcore_unit_on_host");
+    let stale_selection = select(&core_fp, &stale_core, &["detcore/src/scheduler.rs".into()]);
+    check(
+        "current removed footprint consumer fails closed through the real stale-map branch",
+        had_consumer
+            && stale_selection.decision == Decision::Full
+            && stale_selection
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("absent from validate.json")),
+    );
+
+    // Preserve all original selector assertions against their frozen data.
+    // This section does not claim that core builds external packages or SDKs.
+    println!("Historical pre-split selection fixture (no current external-build credit):");
+    let fixture = root.join("ci/testdata/pre-split-selection");
+    let fp = Footprints::load(&fixture.join("test-footprints.json"));
+    let dag = Dag::load(&fixture.join("validate.json"));
+    let shards = Shards::load(&fixture.join("portable-shards.json"));
+    let plan = Plan::load(&fixture.join("expected-e2e-plan.json"));
 
     check(
         "every declared shard node resolves in the actual hosted DAG",

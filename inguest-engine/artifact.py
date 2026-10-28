@@ -138,7 +138,7 @@ def select_engine(records: list[dict], metadata: dict, root: Path) -> tuple[dict
                 and row["target"].get("crate_types") == ["cdylib"]],
                "Cargo must emit exactly one concrete engine cdylib unit")
     require(not unit["profile"].get("test"), "a test unit is not the engine DSO")
-    require(set(unit["features"]) <= {"default", "dispatch-observer"},
+    require(set(unit["features"]) <= {"default", "dispatch-observer", "native-first-instruction-observer"},
             "unexpected engine feature selection")
     return package, unit
 
@@ -282,7 +282,7 @@ def check(path: Path) -> dict:
     revision(record["core_h_tree"])
     revision(record["core_r_revision"])
     require(isinstance(record["features"], list)
-            and set(record["features"]) <= {"default", "dispatch-observer"},
+            and set(record["features"]) <= {"default", "dispatch-observer", "native-first-instruction-observer"},
             "unexpected engine features")
     require(isinstance(record["profile"], dict) and not record["profile"].get("test"),
             "invalid engine artifact profile")

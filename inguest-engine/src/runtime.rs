@@ -33,6 +33,14 @@ impl HostRuntime for EngineRuntime {
         self.services.emit_stage(stage);
     }
 
+    fn observe_native_entry(
+        &self,
+        stage: reverie_inguest::guest::native_services::NativeEntryStage,
+        observation: reverie_inguest::guest::native_services::NativeEntryObservation<'_, '_>,
+    ) {
+        self.services.observe_native_entry(stage, observation);
+    }
+
     fn fork_child_reset(&self, event: &SyscallEvent) {
         self.services.fork_child_reset(event);
     }

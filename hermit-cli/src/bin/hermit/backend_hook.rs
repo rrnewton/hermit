@@ -89,6 +89,11 @@ impl VerificationLogTransport {
 /// of these public types depends on a third-party backend enum or feature.
 pub trait BackendAdapter {
     const NAME: &'static str;
+    /// Static record preprocessing support. Core retains the ptrace recorder,
+    /// canonical program resolver, identity mounts, IO and publication.
+    const PREPARES_RECORD: bool = false;
+    /// Static syscall-tracing support, checked before host or artifact work.
+    const SUPPORTS_STRACE: bool = false;
     const EVIDENCE: EvidenceRequirement;
     /// The actual physical runtime's facts, not an assurance or test verdict.
     const CAPABILITIES: reverie::BackendCapabilities;
@@ -113,6 +118,22 @@ pub trait BackendAdapter {
     }
 
     fn parse(&self, matches: &ArgMatches) -> Result<Self::Options, clap::Error>;
+
+    /// Prepare only the supplied core-resolved original program. Return the
+    /// rewritten file, or None when no overlay is required; this callback
+    /// cannot select mounts or run a second recorder. Called at each actual
+    /// recording-container preparation, after common admission.
+    fn prepare_record_program(&self, _target: &Path) -> Result<Option<PathBuf>, Error> {
+        Err(Error::new(super::container::PolicyRefusal)
+            .context("this executable-selected backend has not admitted record preparation"))
+    }
+
+    /// Run only this executable's admitted physical tracer. Common logging
+    /// admission has already completed; this hook cannot select a verdict.
+    fn strace(&self, _program: &Path, _args: &[String]) -> Result<ExitStatus, Error> {
+        Err(Error::new(super::container::PolicyRefusal)
+            .context("this executable-selected backend does not support syscall tracing"))
+    }
 
     /// Static operation support, checked before input/resource/writer work.
     /// This must not probe a runtime or create resources. Saved execution is
@@ -764,6 +785,34 @@ impl ContainerScope {
 
     pub fn uses_namespace(&self) -> bool {
         self.options.adapter_uses_namespace()
+    }
+
+    /// Select a stable private runtime directory from this invocation's
+    /// admitted bind targets. No host directory contents affect the choice.
+    /// A launch outside the common namespace keeps its existing host path.
+    pub fn runtime_directory_target(&self, prefix: &str) -> Result<Option<PathBuf>, Error> {
+        if !self.uses_namespace() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            !prefix.is_empty()
+                && !prefix.as_bytes().contains(&0)
+                && Path::new(prefix).file_name() == Some(std::ffi::OsStr::new(prefix)),
+            "runtime directory prefix must be one normal path component"
+        );
+        let binds = self.options.adapter_binds();
+        // Admission accepts only normal descendants of /tmp. Each declared
+        // target can overlap at most one of these direct sibling directories.
+        // Do not consult host contents: those differ between physical runs.
+        let directory = (0..=binds.len())
+            .map(|slot| PathBuf::from(format!("/tmp/{prefix}{slot}")))
+            .find(|candidate| {
+                binds.iter().all(|(_, target)| {
+                    !candidate.starts_with(target) && !target.starts_with(candidate)
+                })
+            })
+            .ok_or_else(|| Error::msg("runtime directory conflicts with declared binds"))?;
+        Ok(Some(directory))
     }
 
     pub fn mounts_tmpfs_at(&self, target: &Path) -> bool {
@@ -1609,6 +1658,79 @@ mod tests {
         ] {
             assert!(compose(super::super::Args::command(), vec![schema]).is_err());
         }
+    }
+
+    // Original 207/208 declaration/admission half; private fixture shape is
+    // the same real PreparedPhysical -> Prepare::container path used below.
+    #[test]
+    fn runtime_directory_target_avoids_declared_targets_without_mutating_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = options(directory.path());
+        for target in [
+            "/tmp/.hermit-dbt-stats-0/child",
+            "/tmp/.hermit-dbt-stats-1",
+            "/tmp/.hermit-dbt-stats-2-other",
+            "/ignored/.hermit-dbt-stats-2",
+        ] {
+            options
+                .bind
+                .push(reverie::process::Bind::new(directory.path(), target));
+        }
+        // Bind the real declared capabilities before freezing the admitted
+        // options; ContainerScope must preserve those, including this field.
+        options = options.with_adapter_capabilities(StaticAdapter::CAPABILITIES);
+        let original = format!("{options:?}");
+        let physical = PreparedPhysical::new(&options, StaticAdapter::CAPABILITIES);
+        let global = super::super::global_opts::GlobalOpts::parse_from(["hermit"]);
+        let request = Prepare {
+            options: &options,
+            global: &global,
+            mode: Mode::VerificationPair,
+            stdin: None,
+            physical: Some(&physical),
+        };
+        let scope = request.container();
+        let target = Some(PathBuf::from("/tmp/.hermit-dbt-stats-2"));
+        assert_eq!(
+            scope
+                .runtime_directory_target(".hermit-dbt-stats-")
+                .unwrap(),
+            target
+        );
+        assert_eq!(
+            scope
+                .runtime_directory_target(".hermit-dbt-stats-")
+                .unwrap(),
+            target
+        );
+        assert_eq!(format!("{options:?}"), original);
+        assert_eq!(format!("{:?}", scope.options), original);
+    }
+
+    #[test]
+    fn runtime_directory_target_without_namespace_keeps_the_host_address() {
+        let mut options =
+            super::super::run::RunOpts::parse_from(["run", "--no-namespace", "--", "/bin/true"]);
+        options
+            .select_application_backend(StaticAdapter::NAME)
+            .unwrap();
+        let physical = PreparedPhysical::new(&options, StaticAdapter::CAPABILITIES);
+        let global = super::super::global_opts::GlobalOpts::parse_from(["hermit"]);
+        let request = Prepare {
+            options: &options,
+            global: &global,
+            mode: Mode::Ordinary,
+            stdin: None,
+            physical: Some(&physical),
+        };
+        assert!(!request.container().uses_namespace());
+        assert_eq!(
+            request
+                .container()
+                .runtime_directory_target(".hermit-dbt-stats-")
+                .unwrap(),
+            None,
+        );
     }
 
     #[test]

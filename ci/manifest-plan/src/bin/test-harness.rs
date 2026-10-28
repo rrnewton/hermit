@@ -105,7 +105,8 @@ Selection options:
   --backend <ptrace|dbt|kvm|sabre|liteinst>
   --exclude-backend <ptrace|dbt|kvm|sabre|liteinst>
                                    Omit that backend's cells; may repeat
-  --label <LABEL[,LABEL...]>       Keep tests carrying any named label; may repeat
+  --execution-owner <OWNER>        Select the declared source owner (default: core)
+  --label <LABEL[,LABEL...]>        Keep tests carrying any named label; may repeat
   --exclude-category <CATEGORY>    Omit that manifest category's cells; may repeat
   --ci-only                        Select required CI cells
   --include-occasional             Include occasional cells
@@ -456,6 +457,7 @@ fn root(repo_root: Option<&Path>) -> PathBuf {
 #[derive(Default)]
 struct Args {
     selection: Selection,
+    execution_owner: Option<String>,
     prebuilt: bool,
     diagnostic_results: bool,
     allow_empty: bool,
@@ -523,6 +525,9 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             "--test" => set_once(&mut args.selection.test, &mut values, "--test"),
             "--mode" => set_once(&mut args.selection.mode, &mut values, "--mode"),
             "--backend" => set_once(&mut args.selection.backend, &mut values, "--backend"),
+            "--execution-owner" => {
+                set_once(&mut args.execution_owner, &mut values, "--execution-owner")
+            }
             "--label" => {
                 for label in required_value(&mut values, "--label").split(',') {
                     if label.is_empty() || args.selection.labels.iter().any(|l| l == label) {
@@ -1034,15 +1039,30 @@ fn main() -> ExitCode {
     }
     if command == "expected-plan"
         && !values.chunks(2).all(
-            |pair| matches!(pair, [flag, _] if flag == "--repo-root" || flag == "--source-sha"),
+            |pair| matches!(pair, [flag, _] if flag == "--repo-root" || flag == "--source-sha" || flag == "--execution-owner"),
         )
     {
-        fail("expected-plan accepts only --repo-root DIR and --source-sha SHA");
+        fail("expected-plan accepts only --repo-root DIR, --source-sha SHA and --execution-owner OWNER");
     }
-    let args = parse(values.into_iter());
+    let mut args = parse(values.into_iter());
     validate_args(&command, &args);
     let root = root(args.repo_root.as_deref());
+    if matches!(command.as_str(), "build" | "run" | "plan" | "audit-compile") {
+        let owners = hermit_manifest_plan::execution_owners::ExecutionOwners::load(&root)
+            .unwrap_or_else(|e| fail(e));
+        args.selection.execution_backends = Some(
+            owners
+                .backends_for_selection(
+                    args.execution_owner.as_deref().unwrap_or("core"),
+                    &args.selection.labels,
+                )
+                .unwrap_or_else(|e| fail(e)),
+        );
+    }
     let manifests = ManifestSet::load(&root).unwrap_or_else(|error| fail(error));
+    hermit_manifest_plan::execution_owners::ExecutionOwners::load(&root)
+        .and_then(|owners| owners.validate_manifest_backends(&manifests))
+        .unwrap_or_else(|e| fail(e));
     // One front-door schema/inventory authority governs every command, not
     // only the metadata gate. This prevents a direct/manual run from accepting
     // a recipe that the canonical manifest planner would refuse.
@@ -1050,7 +1070,22 @@ fn main() -> ExitCode {
     match command.as_str() {
         "validate" => validate(&root, &manifests),
         "plan" => print_plan(&manifests, &args, Population::Required),
-        "expected-plan" => print_expected_plan(&root, &manifests),
+        "expected-plan" if args.execution_owner.is_none() => print_expected_plan(&root, &manifests),
+        "expected-plan" => {
+            let owners = hermit_manifest_plan::execution_owners::ExecutionOwners::load(&root)
+                .unwrap_or_else(|e| fail(e));
+            let backends = owners
+                .backends(args.execution_owner.as_deref().unwrap_or("core"))
+                .unwrap_or_else(|e| fail(e));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&expected_plan_document_for(
+                    &root, &manifests, backends
+                ))
+                .unwrap()
+            );
+            ExitCode::SUCCESS
+        }
         "audit-gaps" => print_plan(&manifests, &args, Population::Disabled),
         "audit-inventory" | "audit-test-binary-registration" => ExitCode::SUCCESS,
         "audit-test-footprints" => {
@@ -1401,9 +1436,20 @@ fn unique_plan_rows(label: &str, rows: Vec<JsonValue>) -> Result<BTreeSet<String
 }
 
 fn required_plan_rows(manifests: &ManifestSet) -> (usize, Vec<JsonValue>) {
+    required_plan_rows_for(
+        manifests,
+        hermit_manifest_plan::execution_owners::core_backends(),
+    )
+}
+
+fn required_plan_rows_for(
+    manifests: &ManifestSet,
+    backends: BTreeSet<String>,
+) -> (usize, Vec<JsonValue>) {
     let cells = manifests
         .select(&Selection {
             population: Some(Population::Required),
+            execution_backends: Some(backends),
             ..Selection::default()
         })
         .unwrap_or_else(|e| fail(e));
@@ -1448,7 +1494,19 @@ fn required_plan_rows(manifests: &ManifestSet) -> (usize, Vec<JsonValue>) {
 }
 
 fn expected_plan_document(root: &Path, manifests: &ManifestSet) -> JsonValue {
-    let (_, cells) = required_plan_rows(manifests);
+    expected_plan_document_for(
+        root,
+        manifests,
+        hermit_manifest_plan::execution_owners::core_backends(),
+    )
+}
+
+fn expected_plan_document_for(
+    root: &Path,
+    manifests: &ManifestSet,
+    backends: BTreeSet<String>,
+) -> JsonValue {
+    let (_, cells) = required_plan_rows_for(manifests, backends);
     let mut remaining = cells
         .into_iter()
         .map(|row| {

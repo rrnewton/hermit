@@ -90,9 +90,9 @@ pub(crate) fn initialize_root(
 ) -> io::Result<()> {
     let image = own_initial_image(pid.as_raw())?;
     let mut bytes = [0; MAX_STATE_BYTES];
-    let count = CALLBACK.take(&mut bytes)?.ok_or_else(|| {
-        io::Error::other("required initial random handoff was not negotiated")
-    })?;
+    let count = CALLBACK
+        .take(&mut bytes)?
+        .ok_or_else(|| io::Error::other("required initial random handoff was not negotiated"))?;
     apply_handoff(&bytes[..count], config, image, state)
 }
 
@@ -102,9 +102,7 @@ fn apply_handoff(
     image: detcore::random::InitialImage,
     state: &mut RootState,
 ) -> io::Result<()> {
-    match detcore::random::decode_loader_state(bytes, config, image)
-        .map_err(io::Error::other)?
-    {
+    match detcore::random::decode_loader_state(bytes, config, image).map_err(io::Error::other)? {
         detcore::random::LoaderState::InitialRandom { .. } => {
             state
                 .apply_initial_random_state(bytes, config, image)
@@ -197,12 +195,16 @@ mod tests {
     unsafe extern "C" fn refused(_: *mut libc::c_void, _: usize) -> libc::c_long {
         -(libc::ESTALE as libc::c_long)
     }
-    unsafe extern "C" fn empty(_: *mut libc::c_void, _: usize) -> libc::c_long { 0 }
+    unsafe extern "C" fn empty(_: *mut libc::c_void, _: usize) -> libc::c_long {
+        0
+    }
     unsafe extern "C" fn too_long(_: *mut libc::c_void, capacity: usize) -> libc::c_long {
         capacity as libc::c_long + 1
     }
     unsafe extern "C" fn valid(buffer: *mut libc::c_void, capacity: usize) -> libc::c_long {
-        if capacity < 2 { return -(libc::ENOSPC as libc::c_long); }
+        if capacity < 2 {
+            return -(libc::ENOSPC as libc::c_long);
+        }
         unsafe { core::ptr::copy_nonoverlapping([0x12, 0x34].as_ptr(), buffer.cast::<u8>(), 2) };
         2
     }
@@ -217,14 +219,28 @@ mod tests {
             let slot = LoaderCallback::new();
             let mut bytes = [0xa5; 32];
             unsafe { slot.install(callback) }.unwrap();
-            assert_eq!(slot.take(&mut bytes).unwrap_err().raw_os_error(), Some(expected));
+            assert_eq!(
+                slot.take(&mut bytes).unwrap_err().raw_os_error(),
+                Some(expected)
+            );
             assert_eq!(bytes, [0xa5; 32]);
-            assert_eq!(slot.take(&mut bytes).unwrap_err().raw_os_error(), Some(libc::EPROTO));
+            assert_eq!(
+                slot.take(&mut bytes).unwrap_err().raw_os_error(),
+                Some(libc::EPROTO)
+            );
         }
         let slot = LoaderCallback::new();
         assert_eq!(slot.take(&mut [0; 1]).unwrap(), None);
-        assert_eq!(slot.take(&mut []).unwrap_err().raw_os_error(), Some(libc::EINVAL));
-        assert_eq!(slot.take(&mut [0; MAX_STATE_BYTES + 1]).unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(
+            slot.take(&mut []).unwrap_err().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            slot.take(&mut [0; MAX_STATE_BYTES + 1])
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
     }
 
     #[test]
@@ -235,7 +251,10 @@ mod tests {
         let mut bytes = [0xa5; 4];
         assert_eq!(slot.take(&mut bytes).unwrap(), Some(2));
         assert_eq!(bytes, [0x12, 0x34, 0xa5, 0xa5]);
-        assert_eq!(slot.take(&mut bytes).unwrap_err().raw_os_error(), Some(libc::EPROTO));
+        assert_eq!(
+            slot.take(&mut bytes).unwrap_err().raw_os_error(),
+            Some(libc::EPROTO)
+        );
     }
 
     fn root(config: &detcore::Config, pid: i32) -> RootState {
@@ -244,13 +263,25 @@ mod tests {
         tool.init_thread_state(pid, None)
     }
     fn normal_fields(state: &RootState) -> String {
-        format!("{:?}", (
-            state.dettid, state.detpid, state.physical_tid, state.mm_id,
-            &state.chaos_prng, &state.thread_logical_time, state.committed_clock_value,
-        ))
+        format!(
+            "{:?}",
+            (
+                state.dettid,
+                state.detpid,
+                state.physical_tid,
+                state.mm_id,
+                &state.chaos_prng,
+                &state.thread_logical_time,
+                state.committed_clock_value,
+            )
+        )
     }
     fn image() -> detcore::random::InitialImage {
-        detcore::random::InitialImage { pid: 31, start_time_ticks: 17, at_random: 0x1000 }
+        detcore::random::InitialImage {
+            pid: 31,
+            start_time_ticks: 17,
+            at_random: 0x1000,
+        }
     }
 
     #[test]
@@ -260,7 +291,8 @@ mod tests {
         let mut state = root(&config, image.pid);
         let fields = normal_fields(&state);
         let prng = detcore::random::root_prng(97);
-        let bytes = detcore::random::encode_initial_state(&config, image, &prng, [0x5a; 16], &[]).unwrap();
+        let bytes =
+            detcore::random::encode_initial_state(&config, image, &prng, [0x5a; 16], &[]).unwrap();
         apply_handoff(&bytes, &config, image, &mut state).unwrap();
         assert_eq!(format!("{:?}", state.prng), format!("{prng:?}"));
         assert_eq!(normal_fields(&state), fields);
@@ -291,16 +323,47 @@ mod tests {
         let config = detcore::Config::default();
         let image = image();
         let prng = detcore::random::root_prng(97);
-        let bytes = detcore::random::encode_initial_state(&config, image, &prng, [0x5a; 16], &[]).unwrap();
+        let bytes =
+            detcore::random::encode_initial_state(&config, image, &prng, [0x5a; 16], &[]).unwrap();
         let mut state = root(&config, image.pid);
         let fields = normal_fields(&state);
         let rng = format!("{:?}", state.prng);
         let mut other_config = config.clone();
         other_config.seed ^= 1;
         assert!(apply_handoff(&bytes, &other_config, image, &mut state).is_err());
-        assert!(apply_handoff(&bytes, &config, detcore::random::InitialImage { start_time_ticks: 18, ..image }, &mut state).is_err());
-        assert!(apply_handoff(&bytes, &config, detcore::random::InitialImage { pid: 37, ..image }, &mut state).is_err());
-        assert!(apply_handoff(&bytes, &config, detcore::random::InitialImage { at_random: 0x2000, ..image }, &mut state).is_err());
+        assert!(
+            apply_handoff(
+                &bytes,
+                &config,
+                detcore::random::InitialImage {
+                    start_time_ticks: 18,
+                    ..image
+                },
+                &mut state
+            )
+            .is_err()
+        );
+        assert!(
+            apply_handoff(
+                &bytes,
+                &config,
+                detcore::random::InitialImage { pid: 37, ..image },
+                &mut state
+            )
+            .is_err()
+        );
+        assert!(
+            apply_handoff(
+                &bytes,
+                &config,
+                detcore::random::InitialImage {
+                    at_random: 0x2000,
+                    ..image
+                },
+                &mut state
+            )
+            .is_err()
+        );
         let mut noncanonical = bytes.clone();
         noncanonical.push(b' ');
         assert!(apply_handoff(&noncanonical, &config, image, &mut state).is_err());
@@ -310,9 +373,70 @@ mod tests {
     }
 
     #[test]
+    fn initial_generation_accepts_raw_worker_comm_and_rejects_invalid_identity() {
+        struct RestoreComm {
+            tid: i32,
+            name: [u8; 16],
+        }
+        impl Drop for RestoreComm {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { libc::syscall(libc::SYS_gettid) } as i32, self.tid);
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_SET_NAME, self.name.as_ptr()) },
+                    0
+                );
+            }
+        }
+        // /proc/self/stat names the leader. Use this owned libtest worker's
+        // actual stat to exercise the same production parser without renaming
+        // the leader or claiming that an injected SaBRe guest was executed.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let path = format!("/proc/{tid}/stat");
+        let expected = initial_image_generation(tid, &std::fs::read(&path).unwrap()).unwrap();
+        let mut restore = RestoreComm { tid, name: [0; 16] };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_NAME, restore.name.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NAME, c"raw) \xff) task".as_ptr()) },
+            0
+        );
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() <= 4096);
+        assert!(std::str::from_utf8(&bytes).is_err());
+        assert!(bytes.windows(12).any(|row| row == b"raw) \xff) task"));
+        assert_eq!(initial_image_generation(tid, &bytes).unwrap(), expected);
+        assert!(
+            initial_image_generation(tid + 1, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("owner mismatch")
+        );
+        assert!(initial_image_generation(tid, b"missing delimiter").is_err());
+        let end = bytes.windows(2).rposition(|row| row == b") ").unwrap();
+        let mut fields: Vec<&[u8]> = bytes[end + 2..]
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .collect();
+        let mut malformed = bytes[..end + 2].to_vec();
+        fields[19] = b"not-a-number";
+        malformed.extend(fields.join(&b' '));
+        assert!(initial_image_generation(tid, &malformed).is_err());
+        assert!(initial_image_generation(tid, &bytes[..end + 2]).is_err());
+        let owner_end = bytes.windows(2).position(|row| row == b" (").unwrap();
+        let mut malformed_owner = b"not-a-pid".to_vec();
+        malformed_owner.extend_from_slice(&bytes[owner_end..]);
+        assert!(initial_image_generation(tid, &malformed_owner).is_err());
+        drop(restore);
+    }
+
+    #[test]
     fn raw_stat_parser_binds_owner_generation_and_reads_real_initial_identity() {
         let mut stat = b"31 (raw) \xff) task) S".to_vec();
-        for _ in 0..18 { stat.extend_from_slice(b" 0"); }
+        for _ in 0..18 {
+            stat.extend_from_slice(b" 0");
+        }
         stat.extend_from_slice(b" 17 0\n");
         assert_eq!(initial_image_generation(31, &stat).unwrap(), 17);
         assert!(initial_image_generation(37, &stat).is_err());
@@ -333,8 +457,12 @@ mod tests {
         let mut state = root(&config, pid);
         let fields = normal_fields(&state);
         let rng = format!("{:?}", state.prng);
-        assert!(initialize_root(&config, Pid::from_raw(pid), &mut state)
-            .unwrap_err().to_string().contains("not negotiated"));
+        assert!(
+            initialize_root(&config, Pid::from_raw(pid), &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("not negotiated")
+        );
         assert_eq!(normal_fields(&state), fields);
         assert_eq!(format!("{:?}", state.prng), rng);
         // A separate slot exercises the actual setter's duplicate refusal;

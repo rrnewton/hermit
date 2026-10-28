@@ -804,6 +804,73 @@ fn owner<'a>(graph: &'a Graph, command: &Invocation) -> Result<&'a Package, Stri
     Ok(package)
 }
 
+struct EmittedUnitOptions {
+    name: String,
+    crate_types: Vec<String>,
+    output: PathBuf,
+    optimization: String,
+}
+
+fn emitted_unit_options(command: &Invocation) -> Result<EmittedUnitOptions, String> {
+    let mut name = None;
+    let mut crate_types = None;
+    let mut output = None;
+    let mut optimization = None;
+    for (index, argument) in command.argv.iter().enumerate() {
+        for (option_name, slot) in [
+            (b"--crate-name".as_slice(), &mut name),
+            (b"--crate-type".as_slice(), &mut crate_types),
+            (b"--out-dir".as_slice(), &mut output),
+        ] {
+            if let Some((value, _)) = option(argument, option_name, command.argv.get(index + 1))
+                && slot.replace(value.to_vec()).is_some()
+            {
+                return Err("actual rustc repeats a Cargo unit identity option".to_owned());
+            }
+        }
+        let codegen = if argument == b"-C" {
+            command.argv.get(index + 1).map(Vec::as_slice)
+        } else {
+            argument
+                .strip_prefix(b"-C")
+                .filter(|value| !value.is_empty())
+        };
+        if let Some(value) = codegen.and_then(|value| value.strip_prefix(b"opt-level="))
+            && optimization
+                .replace(text(value, "actual optimization level")?)
+                .is_some()
+        {
+            return Err("actual rustc repeats its optimization level".to_owned());
+        }
+    }
+    let mut crate_types = text(
+        &crate_types.ok_or_else(|| "actual Cargo unit has no crate type".to_owned())?,
+        "actual crate type",
+    )?
+    .split(',')
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    crate_types.sort();
+    if crate_types.iter().any(String::is_empty)
+        || crate_types.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return Err("actual Cargo unit has invalid or repeated crate types".to_owned());
+    }
+    Ok(EmittedUnitOptions {
+        name: text(
+            &name.ok_or_else(|| "actual Cargo unit has no crate name".to_owned())?,
+            "actual crate name",
+        )?,
+        crate_types,
+        output: absolute(
+            &path(&command.cwd)?,
+            &output.ok_or_else(|| "actual Cargo unit has no output directory".to_owned())?,
+        )?,
+        // rustc's default optimization level is zero, as in the measured host build.
+        optimization: optimization.unwrap_or_else(|| "0".to_owned()),
+    })
+}
+
 /// Resolve only a captured source against actual artifact-unit locators. An
 /// unrelated unbuilt metadata target is never required to exist.
 fn actual_source_unit<'a>(
@@ -821,7 +888,7 @@ fn actual_source_unit<'a>(
     };
     let candidate = path(canonical_path)?;
     let features = actual_features(command)?;
-    let mut found = None;
+    let mut sources = Vec::new();
     for unit in graph.units.get(&package.id).into_iter().flatten() {
         if unit.features != features {
             continue;
@@ -837,11 +904,50 @@ fn actual_source_unit<'a>(
                 "actual Cargo target source differs from its metadata declaration".to_owned(),
             );
         }
-        if candidate == declared && found.replace((source.argument(), declared, unit)).is_some() {
-            return Err("rustc source target is ambiguous in its original argv".to_owned());
+        if candidate == declared {
+            sources.push((declared, unit));
         }
     }
-    Ok(found)
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let options = emitted_unit_options(command)?;
+    let mut found = None;
+    for (declared, unit) in sources {
+        let mut crate_types = unit.crate_types.clone();
+        crate_types.sort();
+        if unit.target.replace('-', "_") != options.name
+            || crate_types != options.crate_types
+            || unit
+                .profile
+                .get("opt_level")
+                .and_then(serde_json::Value::as_str)
+                != Some(options.optimization.as_str())
+        {
+            continue;
+        }
+        let output_matches = graph.artifacts.iter().any(|(filename, (owner, artifact))| {
+            owner == &package.id
+                && artifact == unit
+                && (filename.parent() == Some(options.output.as_path())
+                    // Cargo publishes an executable one level above rustc's deps output.
+                    || (unit.kind == ["bin"]
+                        && unit.crate_types == ["bin"]
+                        && options.output.file_name() == Some(std::ffi::OsStr::new("deps"))
+                        && filename.parent() == options.output.parent()
+                        && graph.executables.get(&(package.id.clone(), unit.target.clone()))
+                            == Some(filename)))
+        });
+        if !output_matches {
+            continue;
+        }
+        if found.replace((source.argument(), declared, unit)).is_some() {
+            return Err("actual rustc source has ambiguous emitted Cargo unit owners".to_owned());
+        }
+    }
+    found
+        .map(Some)
+        .ok_or_else(|| "actual rustc source has no matching emitted Cargo unit identity".to_owned())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1842,8 +1948,16 @@ mod tests {
         wrong_unit
             .source_locators
             .insert(("macro".to_owned(), key), locators);
+        for (owner, artifact) in wrong_unit.artifacts.values_mut() {
+            if owner == "macro" {
+                artifact.kind = vec!["lib".to_owned()];
+                artifact.crate_types = vec!["lib".to_owned()];
+            }
+        }
+        let mut wrong_command = command.clone();
+        wrong_command.argv[4] = b"lib".to_vec();
         assert!(
-            for_invocation(&wrong_unit, &bundle, &command)
+            for_invocation(&wrong_unit, &bundle, &wrong_command)
                 .unwrap_err()
                 .contains("actual Cargo proc-macro")
         );
@@ -1980,7 +2094,9 @@ mod tests {
             for (index, (id, _, name, kind, crate_type, source)) in
                 definitions[..length].iter().enumerate()
             {
-                let filename = target_directory.join(format!("unit-{index}"));
+                let filename = target_directory
+                    .join("debug/deps")
+                    .join(format!("unit-{index}"));
                 let artifact = serde_json::json!({
                     "reason":"compiler-artifact", "package_id":id,
                     "target":{"name":name,"kind":[kind],"crate_types":[crate_type],"src_path":root.join(source)},
@@ -2340,5 +2456,185 @@ mod tests {
         let old_path = root.join("old-incomplete-capture.json");
         std::fs::write(&old_path, serde_json::to_vec(&old).unwrap()).unwrap();
         assert!(Bundle::read(&input_file(&old_path)).is_err());
+    }
+
+    struct SourceUnitFixture {
+        root: PathBuf,
+        graph: Graph,
+        command: Invocation,
+    }
+
+    impl Drop for SourceUnitFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn source_unit_fixture() -> SourceUnitFixture {
+        use std::os::unix::fs::MetadataExt;
+
+        use super::super::compatibility_graph::SourceLocators;
+        use super::super::compatibility_graph::Target;
+        let root = std::env::temp_dir().join(format!(
+            "hermit-source-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("lib.rs");
+        let body = b"pub fn same_real_source() {}\n";
+        std::fs::write(&source, body).unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        let identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            mode: metadata.mode(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        };
+        let package = Package {
+            id: "cfg-if".to_owned(),
+            name: "cfg-if".to_owned(),
+            version: "1.0.4".to_owned(),
+            source: None,
+            manifest_path: root.join("Cargo.toml"),
+            targets: vec![Target {
+                name: "cfg_if".to_owned(),
+                kind: vec!["lib".to_owned()],
+                crate_types: vec!["lib".to_owned()],
+                src_path: source.clone(),
+            }],
+        };
+        let mut units = Vec::new();
+        let mut artifacts = BTreeMap::new();
+        let mut source_locators = BTreeMap::new();
+        for (optimization, directory) in [
+            ("0", "target/validate/deps"),
+            ("3", "target/x86_64-unknown-linux-gnu/validate/deps"),
+        ] {
+            let unit = Unit {
+                package: package.name.clone(),
+                version: package.version.clone(),
+                target: "cfg_if".to_owned(),
+                kind: vec!["lib".to_owned()],
+                crate_types: vec!["lib".to_owned()],
+                features: vec![],
+                profile: serde_json::json!({"opt_level":optimization,"debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false}),
+            };
+            source_locators.insert(
+                (package.id.clone(), unit.key().unwrap()),
+                SourceLocators {
+                    declared: source.clone(),
+                    emitted: source.clone(),
+                },
+            );
+            artifacts.insert(
+                root.join(directory).join("libcfg_if.rlib"),
+                (package.id.clone(), unit.clone()),
+            );
+            units.push(unit);
+        }
+        let graph = Graph {
+            packages: [(package.id.clone(), package)].into_iter().collect(),
+            edges: BTreeMap::new(),
+            units: [("cfg-if".to_owned(), units)].into_iter().collect(),
+            executables: BTreeMap::new(),
+            artifacts,
+            source_locators,
+            build_outputs: BTreeMap::new(),
+        };
+        let command = Invocation {
+            schema: CAPTURE_SCHEMA.to_owned(),
+            pid: 1,
+            compiler: Compiler {
+                path: bytes(&root.join("not-executed-rustc")),
+                identity: identity.clone(),
+                sha256: "a".repeat(64),
+                verbose_version: b"synthetic selector control; compiler not executed".to_vec(),
+            },
+            cwd: bytes(&root),
+            argv: vec![
+                b"--crate-name".to_vec(),
+                b"cfg_if".to_vec(),
+                bytes(&source),
+                b"--crate-type".to_vec(),
+                b"lib".to_vec(),
+                b"--out-dir".to_vec(),
+                bytes(&root.join("target/x86_64-unknown-linux-gnu/validate/deps")),
+                b"-C".to_vec(),
+                b"opt-level=3".to_vec(),
+                b"--target".to_vec(),
+                b"x86_64-unknown-linux-gnu".to_vec(),
+            ],
+            context: Context {
+                package: Some("cfg-if".to_owned()),
+                version: Some("1.0.4".to_owned()),
+                manifest_directory: Some(bytes(&root)),
+            },
+            response_files: vec![],
+            sysroot_externs: vec![],
+            source: Some(CompilerInput::File {
+                argument: 2,
+                path: bytes(&source),
+                canonical_path: bytes(&source),
+                identity,
+                bytes: body.to_vec(),
+                sha256: digest(body),
+            }),
+        };
+        SourceUnitFixture {
+            root,
+            graph,
+            command,
+        }
+    }
+
+    #[test]
+    fn emitted_source_unit_distinguishes_host_and_target_profiles_and_outputs() {
+        let fixture = source_unit_fixture();
+        let package = &fixture.graph.packages["cfg-if"];
+        let (_, _, target) = actual_source_unit(&fixture.graph, package, &fixture.command)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.profile["opt_level"], "3");
+        let mut host = fixture.command.clone();
+        host.argv.truncate(7); // The real host form has no target or explicit opt-level.
+        host.argv[6] = bytes(&fixture.root.join("target/validate/deps"));
+        let (_, _, unit) = actual_source_unit(&fixture.graph, package, &host)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unit.profile["opt_level"], "0");
+        assert_ne!(target, unit);
+        let mut crossed = fixture.command.clone();
+        crossed.argv[6] = host.argv[6].clone();
+        assert!(actual_source_unit(&fixture.graph, package, &crossed).is_err());
+        let mut wrong_name = fixture.command.clone();
+        wrong_name.argv[1] = b"different_crate".to_vec();
+        assert!(actual_source_unit(&fixture.graph, package, &wrong_name).is_err());
+    }
+
+    #[test]
+    fn emitted_source_unit_refuses_indistinguishable_duplicate_owners() {
+        let mut fixture = source_unit_fixture();
+        let duplicate = fixture.graph.units["cfg-if"][1].clone();
+        fixture
+            .graph
+            .units
+            .get_mut("cfg-if")
+            .unwrap()
+            .push(duplicate);
+        assert!(
+            actual_source_unit(
+                &fixture.graph,
+                &fixture.graph.packages["cfg-if"],
+                &fixture.command
+            )
+            .unwrap_err()
+            .contains("ambiguous emitted Cargo unit owners")
+        );
     }
 }

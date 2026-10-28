@@ -51,7 +51,6 @@ use super::record_envelope::RecordEnvelope;
 use super::run::BaseEnv;
 use super::run::NetworkingMode;
 use super::run::apply_base_environment;
-use super::run::is_elf_file;
 use super::run::parse_assignment;
 use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
@@ -67,9 +66,15 @@ use super::verify::write_pending_verification_json;
 use super::verify::write_verification_json;
 
 #[derive(Debug)]
-struct E9patchRecordOverlay {
+struct RecordOverlay {
     source: PathBuf,
     target: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct RecordPreparation<'a> {
+    backend_name: &'static str,
+    prepare: Option<&'a dyn Fn(&Path) -> Result<Option<PathBuf>, Error>>,
 }
 
 static TIMEOUT_MESSAGE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
@@ -396,80 +401,58 @@ impl StartOpts {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-696): Review /proc magic-link rejection for record overlays.
-    fn resolve_e9patch_record_target(&self) -> Result<PathBuf, Error> {
+    fn resolve_record_target(&self, backend: &str) -> Result<PathBuf, Error> {
         let command = Command::new(self.program());
         let resolved = command.find_program().with_context(|| {
             format!(
-                "Could not resolve program {:?} in PATH for e9patch preprocessing",
+                "Could not resolve program {:?} in PATH for {backend} preprocessing",
                 self.program()
             )
         })?;
         if path_resolution_visits_prefix(&resolved, Path::new("/proc"))? {
             anyhow::bail!(
-                "e9patch cannot safely overlay executable {} because its path resolves through \
+                "{backend} cannot safely overlay executable {} because its path resolves through \
                  /proc; use the executable's stable filesystem path",
                 self.program().display()
             );
         }
         fs::canonicalize(&resolved).with_context(|| {
             format!(
-                "failed to resolve e9patch executable {}",
+                "failed to resolve {backend} executable {}",
                 resolved.display()
             )
         })
     }
 
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-696): Review e9patch record preparation and executable overlaying.
-    fn prepare_e9patch_overlay(
+    fn prepare_record_overlay(
         &self,
         global: &GlobalOpts,
-    ) -> Result<Option<E9patchRecordOverlay>, Error> {
-        if global.backend != Some(Backend::E9patch) {
+        preparation: RecordPreparation<'_>,
+    ) -> Result<Option<RecordOverlay>, Error> {
+        let Some(prepare) = preparation.prepare else {
+            // No optional built-in preprocessor remains here. Preserve the
+            // former unavailable-backend refusal until its CLI enum is retired.
+            if let Some(backend) = global.backend {
+                if backend != Backend::Ptrace {
+                    backend.ensure_available()?;
+                    anyhow::bail!(
+                        "record preprocessing requires its statically selected executable"
+                    );
+                }
+            }
             return Ok(None);
-        }
-
-        #[cfg(not(feature = "e9patch"))]
-        Backend::E9patch.ensure_available()?;
-        Backend::Ptrace.ensure_available()?;
-        let target = self.resolve_e9patch_record_target()?;
-        if !is_elf_file(&target)? {
-            eprintln!(
-                ":: Backend: e9patch preprocessing + ptrace record runtime; mapped_sites=0; \
-                 main_executable=non-ELF; preprocessing=not-applicable"
-            );
-            return Ok(None);
-        }
-        if let Some(reason) = hermit::e9patch::unavailable_reason() {
-            anyhow::bail!("backend `e9patch` is unavailable: {reason}");
-        }
-
-        let prepared = hermit::e9patch::prepare(&target)?;
-        let rewrite_cache = if prepared.patched_sites == 0 {
-            "not-applicable"
-        } else if prepared.rewrite_cache_hit {
-            "hit"
-        } else {
-            "miss"
         };
-        eprintln!(
-            ":: Backend: e9patch preprocessing + ptrace record runtime; candidate_sites={}; \
-             mapped_sites={}; b0_sites={}; instruction_map_cache={:?}; rewrite_cache={}; \
-             artifact_sha256={}",
-            prepared.candidate_sites,
-            prepared.patched_sites,
-            prepared.b0_sites,
-            prepared.instruction_map_cache_status,
-            rewrite_cache,
-            prepared.artifact_sha256.as_deref().unwrap_or("none"),
-        );
+        Backend::Ptrace.ensure_available()?;
+        self.resolve_and_prepare_record_overlay(preparation.backend_name, prepare)
+    }
 
-        Ok(
-            (prepared.patched_sites != 0).then_some(E9patchRecordOverlay {
-                source: prepared.binary,
-                target,
-            }),
-        )
+    fn resolve_and_prepare_record_overlay(
+        &self,
+        backend: &str,
+        prepare: &dyn Fn(&Path) -> Result<Option<PathBuf>, Error>,
+    ) -> Result<Option<RecordOverlay>, Error> {
+        let target = self.resolve_record_target(backend)?;
+        Ok(prepare(&target)?.map(|source| RecordOverlay { source, target }))
     }
 
     /// What the recording stores for its replays to honor.
@@ -522,11 +505,12 @@ impl StartOpts {
     fn recording_container(
         &self,
         global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
     ) -> Result<(Container, IdentityGuard), Error> {
-        let overlay = self.prepare_e9patch_overlay(global)?;
+        let overlay = self.prepare_record_overlay(global, preparation)?;
         let (mut container, mut identity_guard) = self.configured_container(self.network())?;
         if let Some(overlay) = overlay {
-            // The rewritten program over its original path: e9patch's own
+            // The rewritten program over its original path: backend-owned
             // mounts, which the guest's mount table leaves out.
             identity_guard.add_backend_mounts(
                 &mut container,
@@ -587,6 +571,35 @@ impl StartOpts {
     }
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.main_with_backend(global, &super::core_adapter::CoreApplicationAdapter)
+    }
+
+    pub fn main_with_backend<A: super::backend_hook::BackendAdapter>(
+        &self,
+        global: &GlobalOpts,
+        adapter: &A,
+    ) -> Result<ExitStatus, Error> {
+        let prepare = |target: &Path| adapter.prepare_record_program(target);
+        let preparation = RecordPreparation {
+            backend_name: if A::PREPARES_RECORD {
+                A::NAME
+            } else {
+                global.backend.unwrap_or_default().as_str()
+            },
+            prepare: if A::PREPARES_RECORD {
+                Some(&prepare)
+            } else {
+                None
+            },
+        };
+        self.main_with_preparation(global, preparation)
+    }
+
+    fn main_with_preparation(
+        &self,
+        global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
+    ) -> Result<ExitStatus, Error> {
         hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
             |refusal| Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string()),
         )?;
@@ -602,20 +615,20 @@ impl StartOpts {
         }
         if self.verify {
             validate_log_level(global)?;
-            self.record_verify(global)
+            self.record_verify(global, preparation)
         } else if let Some(directory) = &self.verify_run {
             validate_log_level(global)?;
-            self.record_verify_run(directory, global)
+            self.record_verify_run(directory, global, preparation)
         } else if !self.gdbex.is_empty() {
             self.admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)?;
-            self.record_verify_debug(global)
+            self.record_verify_debug(global, preparation)
         } else {
             self.admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)?;
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
             let record_options = self.record_options();
 
-            let (mut container, identity_guard) = self.recording_container(global)?;
+            let (mut container, identity_guard) = self.recording_container(global, preparation)?;
 
             // Parent-owned for BOTH deadline and unbounded spellings. No
             // metadata/last-id commit occurs before real successful completion.
@@ -691,7 +704,11 @@ impl StartOpts {
     }
 
     /// This is called when `--verify` is passed to the command line.
-    fn record_verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    fn record_verify(
+        &self,
+        global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
+    ) -> Result<ExitStatus, Error> {
         // `record start` runs on the ptrace record runtime, whose virtual clock
         // is the retired-branch counter, and installs no PMU configuration of
         // its own, so Reverie's validation can run here.
@@ -715,7 +732,8 @@ impl StartOpts {
             setup_double_run(global, "record", "replay", strictness)
                 .context("Failed to create verification log files")?;
 
-        let (mut recording_container, record_identity_guard) = self.recording_container(global)?;
+        let (mut recording_container, record_identity_guard) =
+            self.recording_container(global, preparation)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -800,6 +818,7 @@ impl StartOpts {
         &self,
         directory: &Path,
         global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
     ) -> Result<ExitStatus, Error> {
         use super::verify_run;
 
@@ -825,7 +844,13 @@ impl StartOpts {
         let result = match &first {
             None => self
                 .admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)
-                .and_then(|()| self.record_into(&writer.path(verify_run::RECORDING), &run_global)),
+                .and_then(|()| {
+                    self.record_into(
+                        &writer.path(verify_run::RECORDING),
+                        &run_global,
+                        preparation,
+                    )
+                }),
             Some(first) => {
                 self.replay_from(&first.directory().join(verify_run::RECORDING), &run_global)
             }
@@ -847,7 +872,7 @@ impl StartOpts {
         };
         writer.commit(&verify_run::VerifyRunRecord {
             schema: verify_run::SCHEMA,
-            backend: global.backend.unwrap_or_default().as_str().to_string(),
+            backend: preparation.backend_name.to_string(),
             comparison: verify_run::RecordedComparison {
                 strictness,
                 diagnostic_full_trace: false,
@@ -873,9 +898,10 @@ impl StartOpts {
         &self,
         data: &Path,
         global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
     ) -> Result<reverie::process::Output, Error> {
         fs::create_dir(data).with_context(|| format!("creating {}", data.display()))?;
-        let (mut container, identity_guard) = self.recording_container(global)?;
+        let (mut container, identity_guard) = self.recording_container(global, preparation)?;
         eprintln!(":: {}", "Recording...".yellow().bold());
         let record_timeout = self.record_timeout();
         let record_options = self.record_options();
@@ -947,8 +973,12 @@ impl StartOpts {
     }
 
     /// This is called when `--verify-with-gdbex` is passed to the command line.
-    fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        let (mut container, identity_guard) = self.recording_container(global)?;
+    fn record_verify_debug(
+        &self,
+        global: &GlobalOpts,
+        preparation: RecordPreparation<'_>,
+    ) -> Result<ExitStatus, Error> {
+        let (mut container, identity_guard) = self.recording_container(global, preparation)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
 
@@ -1692,6 +1722,73 @@ mod tests {
     }
 
     #[test]
+    fn static_record_preparation_uses_the_canonical_target_and_optional_overlay() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("original");
+        let alias = directory.path().join("program-alias");
+        let rewritten = directory.path().join("rewritten");
+        fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&rewritten, b"rewritten image bytes").unwrap();
+        std::os::unix::fs::symlink(&program, &alias).unwrap();
+        let canonical = fs::canonicalize(&program).unwrap();
+        let mut options = start_options(Vec::new());
+        options.program = Some(alias);
+        let calls = RefCell::new(Vec::new());
+        let unchanged = |target: &Path| {
+            calls.borrow_mut().push(target.to_path_buf());
+            Ok(None)
+        };
+        assert!(
+            options
+                .resolve_and_prepare_record_overlay("static-test", &unchanged)
+                .unwrap()
+                .is_none()
+        );
+        let rewrite = |target: &Path| {
+            calls.borrow_mut().push(target.to_path_buf());
+            Ok(Some(rewritten.clone()))
+        };
+        let overlay = options
+            .resolve_and_prepare_record_overlay("static-test", &rewrite)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overlay.target, canonical);
+        assert_eq!(overlay.source, rewritten);
+        assert_eq!(*calls.borrow(), vec![canonical.clone(), canonical]);
+        assert_eq!(fs::read(program).unwrap(), b"#!/bin/sh\nexit 0\n");
+    }
+
+    #[test]
+    fn static_record_preparation_preserves_callback_errors_without_an_overlay() {
+        let options = start_options(Vec::new());
+        let calls = std::cell::Cell::new(0);
+        let prepare = |target: &Path| {
+            assert_eq!(target, fs::canonicalize("/bin/true").unwrap());
+            calls.set(calls.get() + 1);
+            Err(Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "record preprocessor refused this actual target",
+            )))
+        };
+        let error = options
+            .resolve_and_prepare_record_overlay("static-test", &prepare)
+            .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied,
+        );
+        assert_eq!(
+            error.to_string(),
+            "record preprocessor refused this actual target"
+        );
+    }
+
+    #[test]
     fn e9patch_record_target_rejects_proc_magic_links() {
         let options = StartOpts {
             program: Some(PathBuf::from("/proc/self/exe")),
@@ -1716,10 +1813,24 @@ mod tests {
             gdbex: Vec::new(),
             inexact_branch_counter: || None,
         };
-        let error = options.resolve_e9patch_record_target().unwrap_err();
+        let error = options.resolve_record_target("e9patch").unwrap_err();
         assert!(
             error.to_string().contains("resolves through /proc"),
             "unexpected error: {error}"
+        );
+        let calls = std::cell::Cell::new(0);
+        let prepare = |_target: &Path| {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        };
+        let error = options
+            .resolve_and_prepare_record_overlay("e9patch", &prepare)
+            .unwrap_err();
+        assert!(error.to_string().contains("resolves through /proc"));
+        assert_eq!(
+            calls.get(),
+            0,
+            "the refused /proc target reached preprocessing"
         );
     }
 }

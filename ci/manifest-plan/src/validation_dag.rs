@@ -213,7 +213,7 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
     // wrapper still REACHES its wrapped command at the recorded pin.
     ToolSelfTest {
         name: "dbt_budget",
-        program: "ci/run-with-reverie-dbt-budget-test.sh",
+        program: "ci/run-with-core-build-test.sh",
         args: &[],
         run_when_changed: None,
         manifest_plan_helper: false,
@@ -967,12 +967,24 @@ fn expected_cells(root: &Path) -> Result<Populations, String> {
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let full = expected_cells_from_json(&text)
         .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+    let owners = crate::execution_owners::ExecutionOwners::load(root)?;
+    for cell in &full {
+        if owners.owner(cell.backend.as_deref())? != "core" {
+            return Err(format!(
+                "{EXPECTED_PLAN} still claims a transferred cell; regenerate the actual core expected plan and retain that identity in its extension owner"
+            ));
+        }
+    }
     let manifests = crate::runner::ManifestSet::load(root)?;
     let mut labelled = BTreeMap::new();
     for label in crate::validation_dag_static::manifest_run_types() {
+        if owners.run_type_owner(label) != "core" {
+            continue;
+        }
         let cells = manifests
             .select(&crate::runner::Selection {
                 population: Some(crate::runner::Population::Required),
+                execution_backends: Some(owners.backends("core")?),
                 labels: vec![label.to_string()],
                 ..Default::default()
             })?
@@ -1163,7 +1175,7 @@ const PORTABLE_FOCUSED_COMPAT_TAG: &str = "portablecompat.manifest_compat";
 
 /// Backends whose cells the `PORTABLE_FOCUSED_COMPAT_TAG` step omits with
 /// `--exclude-backend`. Its release build, `cargo build --release -p hermit-run
-/// --features third-party-backends`, does not build the in-guest Detcore
+/// --features liteinst`, does not build the in-guest Detcore
 /// runtime (libdetcore_liteinst.so, the separate detcore-liteinst package)
 /// that the `liteinst` and `in-guest-trap` backends load, so each of their
 /// cells would end backend-unavailable. The run type stays what it was, the
@@ -1508,12 +1520,13 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // 19 since test.liteinst_strict, whose hosted twin was
     // test.liteinst_strict_on_host, was retired with the LiteInst host hybrid
     // (https://github.com/rrnewton/hermit/issues/3520).
-    if split.len() != 19 {
+    let expected_roots = crate::dag_source_ownership::hosted_split_tags(false);
+    if split != expected_roots {
         return Err(format!(
-            "hosted test split has {} roots, expected 19",
-            split.len()
+            "hosted core roots changed: {split:?} != {expected_roots:?}"
         ));
     }
+
     // The hosted test consumers need a producer whose prepared population and
     // metadata belong to their committed profile. Keep the shared test cases
     // and features, including kvm-native-test-support, while separating the
@@ -1552,12 +1565,13 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // tests/backend-parity (also slice S13). 23 since test.detcore_time and its hosted twin were enrolled.
     // 22 since test.liteinst_strict, one of the split's roots, was retired
     // with the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520).
-    if split.len() != 22 {
+    let expected_closure = crate::dag_source_ownership::hosted_split_tags(true);
+    if split != expected_closure {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 22",
-            split.len()
+            "hosted core dependency closure changed: {split:?} != {expected_closure:?}"
         ));
     }
+
     let mut variants = Vec::new();
     for step in &mut cfg.steps {
         if split.contains(&step.tag()) {
@@ -2652,6 +2666,15 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     cfg.steps.extend(twins);
     route_host_consumers_to_pinned_build(cfg)?;
     retire_unconsumed_host_producers(cfg);
+    if cfg.steps.iter().any(|step| {
+        step.deps
+            .iter()
+            .any(|dependency| dependency == "compatprep.hermit_release")
+    }) {
+        return Err("first-party graph retained a host focused-template consumer".into());
+    }
+    cfg.steps
+        .retain(|step| step.tag() != "compatprep.hermit_release");
     Ok(())
 }
 
@@ -2917,59 +2940,78 @@ fn generated_partition(step: &Step) -> Option<GeneratedPartition> {
     None
 }
 
+fn partition_source_tags(partition: GeneratedPartition, core_only: bool) -> BTreeSet<String> {
+    use GeneratedPartition::*;
+    let (prefixes, exact): (&[&str], &[&str]) = match partition {
+        PortableCompat => (&["compat."], &["compatprep.fixtures"]),
+        PortableFocusedCompat => (&["portablecompatprep."], &[]),
+        SabreCompat => (&["sabrecompatprep."], &[]),
+        E9patchCompat => (&["e9patchcompat.", "e9patchcompatprep."], &[]),
+        RrCompat => (&["rrcompatprep."], &[]),
+        SuperCompat => (&[], &["super-compatprep.fixtures"]),
+        SuperStress => (&["superstress."], &[]),
+    };
+    crate::dag_source_ownership::source_partition_tags(prefixes, exact, core_only)
+}
 fn refresh_generated_partitions(
     mut committed: DagConfig,
     generated: DagConfig,
 ) -> Result<DagConfig, String> {
+    // These complete original partition oracles retain their source meaning.
+    // External physical producers moved to the real catalogs; their absence
+    // is not turned into a smaller original assertion or a successful result.
+    const ORIGINAL: &[(GeneratedPartition, usize)] = &[
+        (GeneratedPartition::PortableCompat, 1),
+        (GeneratedPartition::PortableFocusedCompat, 1),
+        (GeneratedPartition::SabreCompat, 1),
+        (GeneratedPartition::E9patchCompat, 175),
+        (GeneratedPartition::RrCompat, 1),
+        (GeneratedPartition::SuperCompat, 1),
+        (GeneratedPartition::SuperStress, 7),
+    ];
     let mut replacements = BTreeMap::<GeneratedPartition, Vec<Step>>::new();
+    let mut seen = BTreeSet::new();
     for step in generated.steps {
+        if !seen.insert(step.tag()) {
+            return Err(format!("duplicate actual generated node {}", step.tag()));
+        }
         let Some(partition) = generated_partition(&step) else {
             if step.labels == ["generator-dependency-anchor"] || step.tag() == "build.rust_scripts"
             {
                 continue;
             }
             return Err(format!(
-                "generated-plan exporter emitted static-looking node {}",
+                "generated exporter emitted static-looking node {}",
                 step.tag()
             ));
         };
         replacements.entry(partition).or_default().push(step);
     }
-    for (partition, expected) in [
-        // 1 since the portable strict corpus became the manifest bucket
-        // e2e.manifest_compat on 2026-10-01: only compatprep.fixtures remains.
-        (GeneratedPartition::PortableCompat, 1usize),
-        // 1 since the focused portable lane runs the same bucket through the
-        // static node portablecompat.manifest_compat: only its fixtures remain.
-        (GeneratedPartition::PortableFocusedCompat, 1usize),
-        // 1 since the SaBRe lane's 212 probes became compat.yaml cells run by
-        // the static node sabrecompat.manifest_compat: only its fixtures remain.
-        (GeneratedPartition::SabreCompat, 1usize),
-        // 175 since the one-build change of 2026-09-30 added
-        // e9patchcompatprep.release_resources, which stages the release
-        // resources the retired host build.runtime_release used to provide.
-        (GeneratedPartition::E9patchCompat, 175usize),
-        // 1 since the rr lane's 139 probes became compat.yaml replay cells run
-        // by the static node rrcompat.manifest_compat: only its fixtures remain.
-        (GeneratedPartition::RrCompat, 1usize),
-        // 1 since the super run type's four heavy rows became compat.yaml
-        // cells run by the static node supercompat.manifest_compat
-        // (https://github.com/rrnewton/hermit/issues/4276): only its fixtures
-        // remain.
-        (GeneratedPartition::SuperCompat, 1usize),
-        // 7 since each stress probe's 20 repetition nodes became one node that
-        // runs the repetitions and reports each as a structured test result:
-        // the 2 availability nodes plus 5 probe nodes.
-        (GeneratedPartition::SuperStress, 7usize),
-    ] {
-        let actual = replacements.get(&partition).map_or(0, Vec::len);
-        if actual != expected {
+    let mut expected_partitions = BTreeSet::new();
+    for &(partition, original_count) in ORIGINAL {
+        let original = partition_source_tags(partition, false);
+        if original.len() != original_count {
             return Err(format!(
-                "generated {partition:?} partition has {actual} nodes, expected {expected}"
+                "original {partition:?} source partition changed: {} != {original_count}",
+                original.len()
             ));
         }
+        let expected = partition_source_tags(partition, true);
+        let actual = replacements
+            .get(&partition)
+            .into_iter()
+            .flatten()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(format!(
+                "actual core {partition:?} source tags changed: {actual:?} != {expected:?}"
+            ));
+        }
+        if !expected.is_empty() {
+            expected_partitions.insert(partition);
+        }
     }
-
     let mut inserted = BTreeSet::new();
     let mut steps = Vec::with_capacity(committed.steps.len());
     for step in committed.steps {
@@ -2977,40 +3019,30 @@ fn refresh_generated_partitions(
             steps.push(step);
             continue;
         };
+        if !expected_partitions.contains(&partition) {
+            return Err(format!(
+                "core static source retained external partition {partition:?}"
+            ));
+        }
         if inserted.insert(partition) {
             steps.extend(
                 replacements
                     .remove(&partition)
-                    .expect("validated generated partition exists"),
+                    .expect("validated core partition exists"),
             );
         }
     }
-    // The independent typed source intentionally contains no corpus-derived
-    // partition anchors. Append every generated partition exactly once in a
-    // stable order after replacing any legacy anchors supplied by a focused
-    // test fixture.
-    for partition in [
-        GeneratedPartition::PortableCompat,
-        GeneratedPartition::PortableFocusedCompat,
-        GeneratedPartition::SabreCompat,
-        GeneratedPartition::E9patchCompat,
-        GeneratedPartition::RrCompat,
-        GeneratedPartition::SuperCompat,
-        GeneratedPartition::SuperStress,
-    ] {
-        if inserted.insert(partition) {
+    for &(partition, _) in ORIGINAL {
+        if expected_partitions.contains(&partition) && inserted.insert(partition) {
             steps.extend(
                 replacements
                     .remove(&partition)
-                    .expect("validated generated partition exists"),
+                    .expect("validated core partition exists"),
             );
         }
     }
-    if inserted.len() != 7 {
-        return Err(format!(
-            "committed DAG has anchors for {} of 7 generated partitions",
-            inserted.len()
-        ));
+    if inserted != expected_partitions || !replacements.is_empty() {
+        return Err("core generated partition placement changed".into());
     }
     committed.steps = steps;
     Ok(committed)
@@ -3099,6 +3131,16 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         ));
     }
 
+    let expected_core_group_counts = StructuredResultProducerKind::ALL
+        .into_iter()
+        .map(|kind| {
+            kind.tags()
+                .iter()
+                .filter(|tag| crate::dag_source_ownership::is_core(tag))
+                .count()
+        })
+        .collect::<Vec<_>>();
+    expected.retain(|tag, _| crate::dag_source_ownership::is_core(tag));
     let mut expected_counts = NEXTEST_EXPECTED_COUNTS
         .iter()
         .copied()
@@ -3125,6 +3167,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         ));
     }
 
+    expected_counts.retain(|tag, _| crate::dag_source_ownership::is_core(tag));
     let mut seen_by_kind = BTreeMap::<StructuredResultProducerKind, usize>::new();
     for step in &cfg.steps {
         let tag = step.tag();
@@ -3273,7 +3316,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // The second PMU integration shard adds the 77th Nextest writer.
     // Conformance 3: the three isolation-matrix nodes (2026-10-17).
     // sabrecompat.sabre_examples adds the 78th Nextest writer (2026-10-26).
-    if actual_group_counts != [78, 56, 7, 2, 3] {
+    if actual_group_counts != expected_core_group_counts {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -4483,10 +4526,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // (441 + 1).
     // 443 with sabrecompat.sabre_examples, the archived SaBRe suite's tests
     // outside the per-commit smoke pair, in the SaBRe run type (442 + 1).
-    if cfg.steps.len() != 443 {
+    let actual_tags = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let expected_tags = crate::dag_source_ownership::core_tags();
+    if actual_tags != expected_tags || actual_tags.len() != cfg.steps.len() {
         return Err(format!(
-            "superset has {} steps, expected 443",
-            cfg.steps.len()
+            "core source owner tags differ: missing={:?}, extra={:?}",
+            expected_tags.difference(&actual_tags).collect::<Vec<_>>(),
+            actual_tags.difference(&expected_tags).collect::<Vec<_>>()
         ));
     }
     // manifest_guest is 12 since 2026-10-17 (it was 8): e2e.manifest_c_programs and
@@ -4615,7 +4661,6 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         // relinking builder, the token only queued them behind test.cli.
         let mut expected = BTreeMap::from([(portable.to_string(), 1)]);
         if binary == "cli" {
-            expected.insert("test.isolated_dbt_workdir".into(), 1);
             expected.insert("privileged-cpuid.cpu_profile_v3".into(), 1);
         } else {
             expected.insert(privileged.to_string(), 1);
@@ -4645,28 +4690,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             ));
         }
     }
-    let focused_release = step("compatprep.hermit_release")?;
-    // sabre-compat-only left it on 2026-10-01, and strict-compat-only and
-    // rr-compat-only on 2026-10-02: those run types' buckets run the
-    // validation's one build, the e2e artifact.
-    let expected_focused_labels = ["e9patch-compat-only"];
-    if focused_release.cmd != "cargo build --release -p hermit-run --features third-party-backends"
-        || focused_release.deps != ["gate.manifest"]
-        || focused_release.labels
-            != expected_focused_labels
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect::<Vec<_>>()
-        || focused_release.timeout != 420
-        // 2400 since 2026-10-26: a cold build measured 1,155 CPU-s.
-        || focused_release.cpu_timeout != 2400
-        || focused_release.hint.hard_mem_max_bytes != Some(16 * 1024 * 1024 * 1024)
-        || focused_release.hint.preferred_inner_jobs != Some(8)
-    {
-        return Err("focused compatibility release producer changed command, dependency, labels, or measured resources".into());
-    }
     let focused_image = step("compatprep.hermit_release_in_pinned_root")?;
-    if crate::nextest_build_selections::execution_command(focused_image)? != focused_release.cmd
+    crate::dag_source_ownership::assert_producer_resources(
+        focused_image,
+        "compatprep.hermit_release_in_pinned_root",
+    )?;
+    if crate::nextest_build_selections::execution_command(focused_image)?
+        != "cargo build --release -p hermit-run --features liteinst"
         || focused_image.labels != ["portable-strict-compat-only"]
         || focused_image.deps
             != [
@@ -4674,24 +4704,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 "gate.manifest",
                 "setup.pinned_root_fetch",
             ]
-        || focused_image.timeout != focused_release.timeout
-        || focused_image.cpu_timeout != focused_release.cpu_timeout
-        || focused_image.hint.resources != focused_release.hint.resources
-        || focused_image.hint.est_duration_s != focused_release.hint.est_duration_s
-        || focused_image.hint.rss_baseline_bytes != focused_release.hint.rss_baseline_bytes
-        || focused_image.hint.rss_baseline_inner_jobs
-            != focused_release.hint.rss_baseline_inner_jobs
-        || focused_image.hint.hard_mem_max_bytes != focused_release.hint.hard_mem_max_bytes
-        || focused_image.hint.classification != focused_release.hint.classification
-        || focused_image.hint.preferred_inner_jobs != focused_release.hint.preferred_inner_jobs
-        || focused_image.hint.measured_effective_cores
-            != focused_release.hint.measured_effective_cores
-        || focused_image.hint.measured_cpu_utilization
-            != focused_release.hint.measured_cpu_utilization
-        || focused_image.jobs_flag != focused_release.jobs_flag
-        || focused_image.jobs_env != focused_release.jobs_env
+        || focused_image.timeout != 420
+        || focused_image.cpu_timeout != 2400
+        || focused_image.hint.hard_mem_max_bytes != Some(16 * 1024 * 1024 * 1024)
+        || focused_image.hint.preferred_inner_jobs != Some(8)
     {
-        return Err("portable focused release producer changed the dedicated command or resources, or lost its gate/image prerequisites".into());
+        return Err("portable focused first-party producer changed payload, source prerequisites or measured bounds".into());
     }
     let pinned_manifest_setup = step("setup.manifest_plan_in_pinned_root")?;
     let pinned_manifest_command =
@@ -4703,19 +4721,14 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             "pinned-root manifest setup can reacquire the shared dagrun cache lock or lost its manifest build: {pinned_manifest_command}"
         ));
     }
-    for group in [
-        "portablecompatprep",
-        "sabrecompatprep",
-        "e9patchcompatprep",
-        "rrcompatprep",
-    ] {
+    for group in ["portablecompatprep", "rrcompatprep"] {
         let prep = step(&format!("{group}.fixtures"))?;
         // The SaBRe and rr run types take the validation's one build,
         // linked on the host by build.host_hermit_link, instead of a dedicated
         // release build.
         let producer = match group {
             "portablecompatprep" => "compatprep.hermit_release_in_pinned_root",
-            "sabrecompatprep" | "rrcompatprep" => HOST_HERMIT_LINK_TAG,
+            "rrcompatprep" => HOST_HERMIT_LINK_TAG,
             _ => "compatprep.hermit_release",
         };
         if !prep.deps.iter().any(|dependency| dependency == producer)
@@ -4885,25 +4898,51 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         }
     }
     for profile in PROFILES {
+        let old_direct = crate::dag_source_ownership::source_profile(profile.label, false, false)?;
+        let old_selected = crate::dag_source_ownership::source_profile(profile.label, false, true)?;
+        if old_direct.len() != profile.direct_steps || old_selected.len() != profile.selected_steps
+        {
+            return Err(format!(
+                "retained source lineage for {} changed",
+                profile.label
+            ));
+        }
+        let source_direct =
+            crate::dag_source_ownership::source_profile(profile.label, true, false)?;
+        let source_selected =
+            crate::dag_source_ownership::source_profile(profile.label, true, true)?;
         let direct = cfg
             .steps
             .iter()
             .filter(|step| step.labels.iter().any(|label| label == profile.label))
-            .count();
-        if direct != profile.direct_steps {
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        if direct != source_direct {
             return Err(format!(
-                "{} label has {direct} direct steps, expected {}",
-                profile.label, profile.direct_steps
+                "{} core direct source owners changed: expected={source_direct:?}, actual={direct:?}",
+                profile.label
             ));
+        }
+        if source_direct.is_empty() {
+            if !source_selected.is_empty() {
+                return Err(format!("{} has an unprovided core closure", profile.label));
+            }
+            // The original full lineage was asserted above. This run type is
+            // required by its actual external catalog, never run as core or
+            // represented by an empty successful core verification.
+            continue;
         }
         let selected = select_steps_by_labels(cfg, &[profile.label.to_string()])
             .map_err(|error| format!("{} label selection failed: {error}", profile.label))?;
-        if selected.steps.len() != profile.selected_steps {
+        let selected_tags = selected
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        if selected_tags != source_selected || selected_tags.len() != selected.steps.len() {
             return Err(format!(
-                "{} label closes over {} steps, expected {}",
-                profile.label,
-                selected.steps.len(),
-                profile.selected_steps
+                "{} core dependency-closed source owners changed: expected={source_selected:?}, actual={selected_tags:?}",
+                profile.label
             ));
         }
         let expected_results = cells.for_label(profile.label);
@@ -5105,6 +5144,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             }
             let expected_resources = HOSTED_RESOURCE_TUPLES
                 .iter()
+                .filter(|(tag, _, _, _)| crate::dag_source_ownership::is_core(tag))
                 .map(|(tag, resource, demand, capacity)| {
                     ((*tag).into(), (*resource).into(), *demand, *capacity)
                 })
@@ -5196,6 +5236,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     }
     let cells = expected_cells(root)?;
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
+    crate::dag_source_ownership::transfer_diagnostic_dependencies(&mut refreshed)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_hosted_test_variants(&mut refreshed)?;
     materialize_shards(&mut refreshed)?;
@@ -5206,8 +5247,21 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     materialize_quick_super_budgets(&mut refreshed);
     materialize_runtime_policy(&mut refreshed);
     materialize_regular_calibration_launch(&mut refreshed)?;
+    crate::dag_source_ownership::select_core(&mut refreshed)?;
     attach_result_ownership(&mut refreshed, &cells);
     assert_invariants(&refreshed, &cells)?;
+    for step in &refreshed.steps {
+        for result in step.effective_result_manifests() {
+            if let ResultManifest::ManifestCell(cell) = result {
+                if matches!(cell.backend.as_deref(), Some("dbt" | "sabre")) {
+                    return Err(format!(
+                        "core node {} retained an external result",
+                        step.tag()
+                    ));
+                }
+            }
+        }
+    }
     Ok(refreshed)
 }
 
@@ -6558,7 +6612,12 @@ sys.exit(37)
         // 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13); 251 before.
-        assert_eq!(selected.steps.len(), 67);
+        crate::dag_source_ownership::assert_profile_population(
+            HOSTED_PORTABLE_LABEL,
+            67,
+            selected.steps.iter().map(Step::tag).collect(),
+        )
+        .unwrap();
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -6645,6 +6704,7 @@ sys.exit(37)
         assert_eq!(expected.len(), 16);
         assert!(expected.is_disjoint(&new_variants));
         expected.extend(new_variants);
+        expected.retain(|tag| crate::dag_source_ownership::is_core(tag));
         assert_eq!(
             selected
                 .steps
@@ -7103,7 +7163,17 @@ sys.exit(37)
         // 99 again since that check runs in Reverie's own validate and CI
         // (102 full nodes), and 100 with build.liteinst_runtime_in_pinned_root
         // (103 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 100);
+        crate::dag_source_ownership::assert_profile_population(
+            FULL_BUCK_E2E_LABEL,
+            100,
+            buck_e2e_selection(&committed)
+                .unwrap()
+                .steps
+                .iter()
+                .map(Step::tag)
+                .collect(),
+        )
+        .unwrap();
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

@@ -4,7 +4,9 @@
 //! A generation is an observed image identity, never caller-runtime or private
 //! phase authority. Readiness is published only by the real scheduler owner.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY: AtomicU64 = AtomicU64::new(0);
@@ -40,11 +42,16 @@ unsafe extern "C" fn image_body() {
     // Distinct ordinary/native installation states also prevent a native
     // image from entering the preload/saved-frame dispatcher. They are
     // process-image bookkeeping and cannot issue phase/lifecycle permits.
-    if crate::INSTALLATION.compare_exchange(0, 4, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if crate::INSTALLATION
+        .compare_exchange(0, 4, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         crate::install::fail("the common engine already has an image installation");
     }
     if let Err(error) = reverie_liteinst::preflight_tool_allocator() {
-        crate::install::fail(&format!("native engine allocator bootstrap refused: {error}"));
+        crate::install::fail(&format!(
+            "native engine allocator bootstrap refused: {error}"
+        ));
     }
     SHUTDOWN.store(false, Ordering::Release);
     PAUSE_REQUESTED.store(false, Ordering::Release);
@@ -57,7 +64,9 @@ unsafe extern "C" fn image_body() {
 
 core::arch::global_asm!(".protected hermit_engine_native_image_begin_v1");
 
-pub(super) fn generation() -> u64 { GENERATION.load(Ordering::Acquire) }
+pub(super) fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
 
 /// Called after constructing the actual external-scheduler future: its first
 /// log announcement must precede admission of the root's first lifecycle.
@@ -67,18 +76,27 @@ pub(super) fn publish_ready(generation: u64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn hermit_engine_native_ready_v1(generation: u64) -> i32 {
-    i32::from(generation != 0 && READY.load(Ordering::Acquire) == generation)
+    i32::from(
+        generation != 0
+            && READY.load(Ordering::Acquire) == generation
+            && !PAUSE_REQUESTED.load(Ordering::Acquire)
+            && !PAUSED.load(Ordering::Acquire),
+    )
 }
 
 pub(super) fn request_pause() {
     READY.store(0, Ordering::Release);
     PAUSE_REQUESTED.store(true, Ordering::Release);
-    while !PAUSED.load(Ordering::Acquire) { std::thread::yield_now(); }
+    while !PAUSED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
 }
 
 pub(super) fn resume() {
     PAUSE_REQUESTED.store(false, Ordering::Release);
-    while PAUSED.load(Ordering::Acquire) { std::thread::yield_now(); }
+    while PAUSED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
     READY.store(generation(), Ordering::Release);
 }
 

@@ -14,6 +14,6 @@ path = "src/lib.rs"
 default = []
 
 [dependencies]
-reverie-liteinst-artifact = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "05e82111a13bc066654e8dff33a0802ac1ba8a17", default-features = false }
+reverie-liteinst-artifact = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "677c46ded01d7aa2e7554194ac8af9ae77b4a12c", default-features = false }
 serde_json = "1"
 toml = "0.8"

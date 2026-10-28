@@ -8,17 +8,22 @@ oncall("hermit")
 rust_library(
     name = "hermit-inguest-engine",
     srcs = [
+        "inguest-engine/build.rs",
         "inguest-engine/src/install.rs",
         "inguest-engine/src/lib.rs",
+        "inguest-engine/src/loader_settings.rs",
         "inguest-engine/src/loader_state.rs",
         "inguest-engine/src/native/abi.rs",
         "inguest-engine/src/native/auxv.rs",
         "inguest-engine/src/native/bootstrap.rs",
         "inguest-engine/src/native/config.rs",
         "inguest-engine/src/native/copied.rs",
+        "inguest-engine/src/native/copied_action.rs",
         "inguest-engine/src/native/copied_policy.rs",
         "inguest-engine/src/native/diagnostics.rs",
+        "inguest-engine/src/native/log_record.rs",
         "inguest-engine/src/native/entry.rs",
+        "inguest-engine/src/native/first_instruction_observer.rs",
         "inguest-engine/src/native/image.rs",
         "inguest-engine/src/native/lifecycle.rs",
         "inguest-engine/src/native/mod.rs",
@@ -33,6 +38,11 @@ rust_library(
     crate_root = "inguest-engine/src/lib.rs",
     edition = "2024",
     preferred_linkage = "any",
+    # This engine supports GNU Linux x86-64 only. Keep the Cargo build.rs
+    # static unwinder / no build-root RUNPATH policy in the native output.
+    rustc_flags = ["-lstatic:-bundle=gcc_eh"],
+    linker_flags = ["-Wl,-u,_Unwind_RaiseException"],
+    env = {"NIX_DONT_SET_RPATH_x86_64_unknown_linux_gnu": "1"},
     features = [],
     unittests = False,
     doctests = False,
@@ -42,6 +52,7 @@ rust_library(
             "package": {
                 "name": "hermit-inguest-engine",
                 "version": "0.5.4",
+                "build": "build.rs",
                 "publish": False,
             },
             "lib": {

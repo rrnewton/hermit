@@ -13,8 +13,10 @@ mod copied;
 mod copied_policy;
 mod diagnostics;
 mod entry;
+#[cfg(feature = "native-first-instruction-observer")]
+mod first_instruction_observer;
 mod image;
 mod lifecycle;
 mod owner;
-mod prelude;
 mod policy;
+mod prelude;
