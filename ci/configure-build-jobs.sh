@@ -3140,15 +3140,15 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 (2026-10-28): from 688a542d75af8310c4ddd97eadbf2434abb067ff.
+# CARRY TO 4868e0c0afa0321a200d2fc84f718066dbed423c (2026-10-28): from 688a542d75af8310c4ddd97eadbf2434abb067ff.
 # Interval: KVM initial-FPU signal handlers (6276eee1), DBT executable-selection
 # reland (90f9928c), private-libc errno translation (940407c8, e99426e3),
 # paired Strace lifecycle test (63107ba4) and strict-loader verification
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4868e0c0afa0321a200d2fc84f718066dbed423c ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4868e0c0afa0321a200d2fc84f718066dbed423c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
