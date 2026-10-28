@@ -260,6 +260,64 @@ def _is_ancestor(ledger, ancestor, descendant):
     return result.returncode == 0
 
 
+def _folded_tips(ledger, descendant):
+    """Old tips that squash snapshots in DESCENDANT's history fold in.
+
+    A ledger squash replaces main with a parentless snapshot commit whose
+    tree is exactly the old tip's tree and whose message ends with the
+    trailer ``Ledger-Snapshot-Of: <old tip>``. Commits published before the
+    squash are then no longer ancestors of main, but a checkout that still
+    holds the old history can prove they are folded in. This mirrors the
+    ledger's own snapshot rule; it only ever widens what the fetch below
+    treats as reachable, never what the website builder admits.
+    """
+    def read(*args):
+        try:
+            return run(["git", "--no-replace-objects", "-C", ledger, *args]).decode().strip()
+        except (subprocess.CalledProcessError, ValueError):
+            return None
+
+    tips = []
+    current = descendant
+    for _ in range(64):
+        roots = (read("rev-list", "--max-parents=0", current) or "").split()
+        if len(roots) != 1:
+            break
+        raw = read("cat-file", "commit", roots[0])
+        if raw is None:
+            break
+        headers, separator, body = raw.partition("\n\n")
+        if not separator or any(line.startswith("parent ") for line in headers.split("\n")):
+            break
+        lines = body.rstrip("\n").split("\n")
+        match = re.fullmatch(r"Ledger-Snapshot-Of: ([0-9a-f]{40})", lines[-1]) if lines else None
+        if match is None:
+            break
+        tip = match.group(1)
+        trees = (read("rev-parse", roots[0] + "^{tree}", tip + "^{tree}") or "").split()
+        if len(trees) != 2 or trees[0] != trees[1]:
+            break
+        tips.append(tip)
+        current = tip
+    return tips
+
+
+def _is_ancestor_or_folded(ledger, ancestor, descendant):
+    """Whether ANCESTOR is an ancestor of DESCENDANT or folded into it.
+
+    After a squash the parity summary's commit is folded in, not an
+    ancestor, so the fetch must stop deepening once the snapshot proving
+    that is present instead of deepening to the limit. The builder still
+    refuses a summary it cannot place; this only bounds the fetch.
+    """
+    if _is_ancestor(ledger, ancestor, descendant):
+        return True
+    return any(
+        _is_ancestor(ledger, ancestor, tip)
+        for tip in _folded_tips(ledger, descendant)
+    )
+
+
 def _history_complete(ledger, ledger_commit, depth):
     """Whether the fetch at DEPTH already reached ledger_commit's root commit.
 
@@ -284,7 +342,7 @@ def fetch_ledger(ledger, ledger_commit):
     summarized = _parity_summary_commit(ledger, ledger_commit)
     while (
         summarized not in (None, ledger_commit)
-        and not _is_ancestor(ledger, summarized, ledger_commit)
+        and not _is_ancestor_or_folded(ledger, summarized, ledger_commit)
         and depth < LEDGER_DEEPEN_LIMIT
         and not _history_complete(ledger, ledger_commit, depth)
     ):
