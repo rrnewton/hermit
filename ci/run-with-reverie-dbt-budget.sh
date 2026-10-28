@@ -3069,10 +3069,13 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 (2026-10-28): from 82482ba80a1638d36ebf50d9518dfdfc6bb91185.
-# The reverie-dbt tree, root Cargo.toml/Cargo.lock and rust-toolchain.toml
-# are byte-identical. Inventory remains 1037. Shared stdio and private package
-# proofs changed; the existing SDK budget carries, not runtime equivalence.
+# CARRY TO 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 (2026-10-28): from 688a542d75af8310c4ddd97eadbf2434abb067ff.
+# Interval: KVM initial-FPU signal handlers (6276eee1), DBT executable-selection
+# reland (90f9928c), private-libc errno translation (940407c8, e99426e3),
+# paired Strace lifecycle test (63107ba4) and strict-loader verification
+# (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
+# changed and the committed inventory is 1043. The existing SDK budget
+# carries, not runtime equivalence.
 expected_pin=56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
