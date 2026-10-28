@@ -176,8 +176,10 @@ impl PreemptionRecord {
             epoch,
             pipe_wake_latency,
             signal_state_copy,
+            cap_preemption_charge,
             callback_checkpoints,
             rng_seed,
+            expired_wait_runs_charged_once,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -219,8 +221,10 @@ impl PreemptionRecord {
             epoch: *epoch,
             pipe_wake_latency: *pipe_wake_latency,
             signal_state_copy: *signal_state_copy,
+            cap_preemption_charge: *cap_preemption_charge,
             callback_checkpoints,
             rng_seed: *rng_seed,
+            expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
         }
     }
 
