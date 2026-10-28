@@ -3123,7 +3123,23 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=bca5399182dae3dc22ac959e3873e44be9271a69
+# CARRY TO e1b54ae6eb90aeb05d745d4d6a159b8f2470ec87 (2026-11-01): from bca5399182dae3dc22ac959e3873e44be9271a69.
+# Interval: Reverie main bca53991..1c22fadd, four commits: c5c58265 (LinuxEmu
+# answers pkey_alloc, pkey_free and pkey_mprotect as Linux does on a CPU
+# without protection keys), a63aaed1 (LinuxEmu's mprotect makes Linux's checks
+# in Linux's order and accepts PROT_SEM), 2c42eca3 (mprotect with one grows
+# flag finds its mapping past the arena or a window) and 1c22fadd (the
+# protection-key review markers name Reverie #1233); then Reverie #1153
+# (3154bafd, e1b54ae6) on 1c22fadd, in reverie-kvm/src/preemption_timer.rs,
+# reverie-ptrace/src/timer.rs, reverie/src/pmu_config.rs and that file's
+# LiteInst source-catalog row; it is not on Reverie's main branch yet, and the
+# pin moves to the landed revision once it is. The reverie-dbt tree is
+# unchanged (3771fc9c), so the committed inventory stays as it is;
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native and
+# third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=e1b54ae6eb90aeb05d745d4d6a159b8f2470ec87
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
