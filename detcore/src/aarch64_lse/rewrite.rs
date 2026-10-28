@@ -93,6 +93,10 @@ pub enum Refusal {
     /// A relocation points into the sequence, so the loader writes those
     /// bytes itself, for the instruction that used to be there.
     Relocated,
+    /// Only the unwind table says the sequence is code, and an `LDR`
+    /// (literal) or `ADR` reaches its bytes, so they may be a literal pool
+    /// inside the function the table covers.
+    LiteralInsideSequence,
 }
 
 /// A sequence the rewriter replaces, and its replacement.

@@ -3227,7 +3227,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Less #4740's tests, which main counts since train 10: 3381.
     // And record_serde's the_in_memory_exclusive_rewrite_survives_the_record_serde:
     // 3381 + 1 = 3382.
-    ("test.detcore_unit", 3382),
+    // And the nineteen units that tell code from data by mapping symbols and
+    // the unwind table (aarch64_lse::mapping, aarch64_lse::elf and the
+    // store-exclusive census): 3401, listed.
+    ("test.detcore_unit", 3401),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5744,7 +5747,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same prefix-record unit: 3393.
     // Less #4740's tests, which main counts since train 10: 3381.
     // And the same record_serde unit: 3382.
-    ("test.detcore_unit_on_host", 3382),
+    // And the same nineteen code-from-data units: 3401, listed.
+    ("test.detcore_unit_on_host", 3401),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
