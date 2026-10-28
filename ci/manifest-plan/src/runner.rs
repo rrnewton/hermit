@@ -18664,6 +18664,29 @@ fi
     /// no live poll at all.
     #[test]
     fn a_process_that_moves_out_of_its_invocation_cgroup_is_stopped_and_refused() {
+        const CHILD: &str = "HERMIT_TEST_CGROUP_MOVE_REFUSAL_CHILD";
+        const CASE: &str = "runner::tests::a_process_that_moves_out_of_its_invocation_cgroup_is_stopped_and_refused";
+        if std::env::var_os(CHILD).is_none() {
+            // Each case below must be refused inside a few seconds of wall
+            // budget. In the parallel libtest process the escaping process
+            // and the monitor that must catch it can sit unscheduled behind
+            // every other test's children until the budget is spent, so the
+            // measurement is made in an isolated child process, as the
+            // descriptor-reserve test isolates its process-wide rlimit.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         use crate::invocation_cgroup::tests::KillPidFile;
         use crate::invocation_cgroup::tests::OWN_CGROUP_SH;
         use crate::invocation_cgroup::tests::RemoveLeftoverCgroup;
@@ -19286,6 +19309,29 @@ int main(int argc, char **argv) {
 
     #[test]
     fn live_cpu_budget_counts_descendant_work() {
+        const CHILD: &str = "HERMIT_TEST_DESCENDANT_CPU_BUDGET_CHILD";
+        const CASE: &str = "runner::tests::live_cpu_budget_counts_descendant_work";
+        if std::env::var_os(CHILD).is_none() {
+            // The descendant burner must accumulate its CPU budget well
+            // inside the wall backstop. In the parallel libtest process it
+            // can sit unscheduled behind every other test's children until
+            // the backstop fires first, so the measurement is made in an
+            // isolated child process, as the descriptor-reserve test
+            // isolates its process-wide rlimit.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-descendant-cpu-budget-{}",
             std::process::id()

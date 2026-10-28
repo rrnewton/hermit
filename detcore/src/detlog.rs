@@ -2697,6 +2697,31 @@ mod tests {
     /// receiver task takes them off the socket as they arrive, queued for their
     /// thread, and they are written only at the points the order rule names
     /// (here the end of the run), in the order they were sent.
+    /// Run the test named `case` in an isolated child process, returning
+    /// true when this invocation is the parent and the caller must return
+    /// at once. The native-cut scenarios below drive a real receiver task
+    /// and assert what it has observed by a deadline-free check; under
+    /// plain `cargo test` hundreds of sibling threads can starve that
+    /// task past the check. A child process has no sibling load, as under
+    /// nextest.
+    fn isolated_child(case: &str) -> bool {
+        const CHILD: &str = "HERMIT_DETLOG_NATIVE_CUT_CHILD";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(case)) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case, "--nocapture", "--test-threads=1"])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        true
+    }
+
     /// Serializes the tests that use the process-wide forwarding source, so
     /// one's notices never land in another's sink.
     fn global_source_test() -> std::sync::MutexGuard<'static, ()> {
@@ -2782,6 +2807,11 @@ mod tests {
 
     #[test]
     fn native_coordinator_cut_checks_zero_and_nonzero_real_socket_intervals() {
+        if isolated_child(
+            "detlog::tests::native_coordinator_cut_checks_zero_and_nonzero_real_socket_intervals",
+        ) {
+            return;
+        }
         let _guard = global_source_test();
         let mut fixture = NativeCutSource::new();
         let first = fixture.check(0).unwrap();
@@ -2837,6 +2867,11 @@ mod tests {
 
     #[test]
     fn native_coordinator_cut_refuses_unchecked_counts_without_consuming_them() {
+        if isolated_child(
+            "detlog::tests::native_coordinator_cut_refuses_unchecked_counts_without_consuming_them",
+        ) {
+            return;
+        }
         use super::CoordinatorForwardingCutError as Error;
         let _guard = global_source_test();
         for (indexes, produced, expected) in [
@@ -2939,6 +2974,11 @@ mod tests {
 
     #[test]
     fn native_coordinator_cut_retains_other_owner_records_and_requires_order_point() {
+        if isolated_child(
+            "detlog::tests::native_coordinator_cut_retains_other_owner_records_and_requires_order_point",
+        ) {
+            return;
+        }
         use super::CoordinatorForwardingCutError as Error;
         let _guard = global_source_test();
         let mut fixture = NativeCutSource::new();
@@ -2976,6 +3016,11 @@ mod tests {
 
     #[test]
     fn native_coordinator_cut_requires_a_healthy_actual_message_source() {
+        if isolated_child(
+            "detlog::tests::native_coordinator_cut_requires_a_healthy_actual_message_source",
+        ) {
+            return;
+        }
         use std::os::fd::FromRawFd;
 
         use super::CoordinatorForwardingCutError as Error;
@@ -3051,6 +3096,11 @@ mod tests {
 
     #[test]
     fn native_coordinator_cut_receipt_rechecks_generation_socket_and_owner() {
+        if isolated_child(
+            "detlog::tests::native_coordinator_cut_receipt_rechecks_generation_socket_and_owner",
+        ) {
+            return;
+        }
         use super::CoordinatorForwardingCutError as Error;
         let _guard = global_source_test();
         let mut fixture = NativeCutSource::new();
@@ -3100,6 +3150,11 @@ mod tests {
 
     #[test]
     fn native_coordinator_cut_refuses_real_loss_notices_and_persistent_process_loss() {
+        if isolated_child(
+            "detlog::tests::native_coordinator_cut_refuses_real_loss_notices_and_persistent_process_loss",
+        ) {
+            return;
+        }
         use std::os::fd::AsRawFd;
 
         use super::CoordinatorForwardingCutError as Error;
@@ -3153,6 +3208,11 @@ mod tests {
 
     #[test]
     fn native_coordinator_cut_restores_unchecked_queue_after_sink_closure() {
+        if isolated_child(
+            "detlog::tests::native_coordinator_cut_restores_unchecked_queue_after_sink_closure",
+        ) {
+            return;
+        }
         use super::CoordinatorForwardingCutError as Error;
         let _guard = global_source_test();
         let fixture = NativeCutSource::new();
@@ -3185,6 +3245,11 @@ mod tests {
 
     #[test]
     fn native_coordinator_cut_rechecks_loss_reported_by_the_record_sink() {
+        if isolated_child(
+            "detlog::tests::native_coordinator_cut_rechecks_loss_reported_by_the_record_sink",
+        ) {
+            return;
+        }
         use super::CoordinatorForwardingCutError as Error;
         let _guard = global_source_test();
         let fixture = NativeCutSource::new();
@@ -3219,6 +3284,11 @@ mod tests {
 
     #[test]
     fn native_coordinator_cut_retains_actual_packet_that_arrives_during_sink_write() {
+        if isolated_child(
+            "detlog::tests::native_coordinator_cut_retains_actual_packet_that_arrives_during_sink_write",
+        ) {
+            return;
+        }
         use std::os::fd::AsRawFd;
 
         use super::CoordinatorForwardingCutError as Error;
@@ -4097,6 +4167,11 @@ mod tests {
     }
     #[test]
     fn model_native_final_drain_requires_actual_death_and_credited_real_source() {
+        if isolated_child(
+            "detlog::tests::model_native_final_drain_requires_actual_death_and_credited_real_source",
+        ) {
+            return;
+        }
         use std::os::fd::AsRawFd;
 
         use super::CoordinatorForwardingCutError as Error;
@@ -4129,6 +4204,11 @@ mod tests {
     }
     #[test]
     fn model_native_final_drain_retains_transport_loss_tail_and_identity_failures() {
+        if isolated_child(
+            "detlog::tests::model_native_final_drain_retains_transport_loss_tail_and_identity_failures",
+        ) {
+            return;
+        }
         use std::os::fd::AsRawFd;
 
         use super::CoordinatorForwardingCutError as Error;
@@ -4191,6 +4271,11 @@ mod tests {
 
     #[test]
     fn model_native_final_drain_refuses_another_births_completion_without_consuming_source() {
+        if isolated_child(
+            "detlog::tests::model_native_final_drain_refuses_another_births_completion_without_consuming_source",
+        ) {
+            return;
+        }
         use std::os::fd::AsRawFd;
 
         use super::CoordinatorForwardingCutError as Error;
@@ -4376,6 +4461,26 @@ mod tests {
 
     #[test]
     fn forwarded_receiver_retires_after_real_eof_without_rearming() {
+        const CHILD: &str = "HERMIT_TEST_FORWARDED_RECEIVER_CHILD";
+        const CASE: &str =
+            "detlog::tests::forwarded_receiver_retires_after_real_eof_without_rearming";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+            // The forwarded source, its generations, and its stop owner are
+            // process-global, and a receiver task spawned by another test in
+            // this binary can still be running against them, so the scenario
+            // runs in an isolated child process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, CASE)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         use std::os::fd::AsRawFd;
         let _guard = global_source_test();
         let _cleanup = ForwardedReceiverSourceCleanup;
@@ -4456,6 +4561,24 @@ mod tests {
 
     #[test]
     fn forwarded_receiver_replacement_preserves_new_generation() {
+        const CHILD: &str = "HERMIT_TEST_FORWARDED_RECEIVER_CHILD";
+        const CASE: &str = "detlog::tests::forwarded_receiver_replacement_preserves_new_generation";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+            // Isolated in a child process for the same reason as the
+            // real-EOF retirement test above: the forwarded source and its
+            // generations are process-global.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, CASE)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         let _guard = global_source_test();
         let _cleanup = ForwardedReceiverSourceCleanup;
         let ReceiverSource {
@@ -4524,6 +4647,25 @@ mod tests {
 
     #[test]
     fn forwarded_receiver_retirement_preserves_uncredited_tail_refusal() {
+        const CHILD: &str = "HERMIT_TEST_FORWARDED_RECEIVER_CHILD";
+        const CASE: &str =
+            "detlog::tests::forwarded_receiver_retirement_preserves_uncredited_tail_refusal";
+        if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(CASE)) {
+            // Isolated in a child process for the same reason as the other
+            // forwarded-receiver tests: the forwarded source and its
+            // generations are process-global.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, CASE)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         use std::os::fd::AsRawFd;
 
         use super::CoordinatorForwardingCutError as Error;

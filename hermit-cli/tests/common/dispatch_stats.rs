@@ -44,7 +44,9 @@ int main(void) {
 
 /// A directory under `CARGO_TARGET_TMPDIR` owned by this test process. Nextest
 /// runs every test in its own process, so with a shared path two tests running
-/// at once would write, or run, the same file.
+/// at once would write, or run, the same file. Under plain `cargo test` the
+/// tests of one binary share a process, so everything below this root that a
+/// test removes or rewrites must also be unique per test or per call.
 fn process_build_root() -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("dispatch-stats")
@@ -215,7 +217,16 @@ pub(super) fn guest_summary(
     env: &[(&str, &Path)],
     guest: &Path,
 ) -> RunSummary {
-    let summary_dir = process_build_root().join(format!("{backend}-summary"));
+    // One summary directory per call: two tests of one binary share this
+    // process under `cargo test`, and a shared `summary.json` lets one test
+    // remove or replace another's summary between its run and its read.
+    static SUMMARY_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = SUMMARY_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guest_name = guest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "guest".to_owned());
+    let summary_dir = process_build_root().join(format!("{backend}-summary-{guest_name}-{call}"));
     fs::create_dir_all(&summary_dir).expect("failed to create summary directory");
     let summary = summary_dir.join("summary.json");
     let _ = fs::remove_file(&summary);
