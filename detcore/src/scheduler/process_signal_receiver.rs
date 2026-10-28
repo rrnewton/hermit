@@ -548,7 +548,6 @@ impl Scheduler {
     fn wants_signal(&self, thread: DetTid, sender: DetTid, bit: u64) -> Wants {
         if self.parked.exit_fences.contains_key(&thread)
             || self.logically_killed_threads.contains(&thread)
-            || self.parked.exits_awaiting_permit.contains(&thread)
             || self.filed_exit_request(thread)
         {
             return Wants::No;
