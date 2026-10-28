@@ -42,6 +42,8 @@
  * - `unknown-flag`: `own-tid 1` with an unknown flag bit too (EINVAL);
  * - `edge-tid`: `own-tid 1` with the array in the last four bytes of a page
  *   that an unmapped page follows;
+ * - `kernel-args`: a clone3 whose struct clone_args pointer is in the
+ *   kernel half, (void*)-4096 (EFAULT);
  * - `wronly-args`, `wronly-vfork`: a clone3 (with CLONE_VFORK for the
  *   second) whose struct clone_args is on a page mapped writable but not
  *   readable, which the kernel reads all the same; `wronly-tid` the same for
@@ -167,6 +169,11 @@ static int one_call(int argc, char** argv) {
       waitpid((pid_t)child, NULL, __WALL);
     }
     printf("clone %s: %s\n", what, child < 0 ? strerror(errno) : "created");
+    return 0;
+  }
+  if (strcmp(what, "kernel-args") == 0) {
+    long child = syscall(SYS_clone3, (void*)-4096L, 88);
+    printf("clone3 kernel-args: %s\n", child < 0 ? strerror(errno) : "created");
     return 0;
   }
   if (strcmp(what, "sighand") == 0) {

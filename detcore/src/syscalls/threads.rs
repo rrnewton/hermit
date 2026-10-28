@@ -4455,10 +4455,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // EFAULT. A nonzero tail beyond the fields this code knows is not
         // read as a reason to let the call through, since a newer kernel may
         // accept it.
+        // Past user memory there is nothing to read, and a read's address
+        // arithmetic near the top of the address space would overflow.
+        let address = clone.args()?.as_raw();
+        if !super::chosen_ids::within_user_memory(address, size) {
+            return None;
+        }
         let mut raw = vec![0u8; size];
         let memory = guest.memory();
         memory
-            .read_exact(Addr::<u8>::from_raw(clone.args()?.as_raw())?, &mut raw)
+            .read_exact(Addr::<u8>::from_raw(address)?, &mut raw)
             .ok()?;
         let field = |offset: usize| u64::from_ne_bytes(raw[offset..offset + 8].try_into().unwrap());
         let flags = field(0);
@@ -4475,6 +4481,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel copies the whole array next (EFAULT) and takes no entry
         // below 1 (EINVAL).
         let mut tids = vec![0 as libc::pid_t; set_tid_size as usize];
+        if !super::chosen_ids::within_user_memory(
+            set_tid as usize,
+            tids.len() * std::mem::size_of::<libc::pid_t>(),
+        ) {
+            return None;
+        }
         memory
             .read_values(Addr::<libc::pid_t>::from_raw(set_tid as usize)?, &mut tids)
             .ok()?;
@@ -6039,8 +6051,15 @@ pub(crate) fn user_ptr_max() -> usize {
             ret >= 0
         };
         // Binary search over 4-aligned addresses: 0 is accepted, and an address
-        // with the top bit set never is.
-        let (mut ok, mut bad) = (0usize, 1usize << 63);
+        // past the largest user address space never is. The bound stays below
+        // any tag bits (arm64's top byte, x86's bits 57 to 62), so the search
+        // stays monotone even if Hermit itself ran with tagging enabled.
+        let bad_start = if cfg!(target_arch = "aarch64") {
+            1usize << 55
+        } else {
+            1usize << 57
+        };
+        let (mut ok, mut bad) = (0usize, bad_start);
         while bad - ok > 4 {
             let mid = (ok + (bad - ok) / 2) & !3;
             if accepted(mid) { ok = mid } else { bad = mid }
