@@ -3042,7 +3042,16 @@ fi
 # SDK width and 1050 effective-job-second limits carry without
 # recalibration. This is not whole-runtime equivalence or a new cold-SDK
 # timing sample.
-expected_pin=44f07af7468099a43ce30fc29dbc6023f4ed45b3
+# CARRY TO a39a5ca1de64cd49cc44ce7c292c91dacafbfe20 (2026-10-27): from
+# 44f07af7468099a43ce30fc29dbc6023f4ed45b3. Reverie 880071e1 (dbt lane)
+# replayed with an identical patch-id: caller admission, test fixtures and
+# the shared transport change. SDK build.rs ff1eeb32b140, vendor/dynamorio
+# tree 4ab89708f2e9 and native tree 0e9ffd386dbf are object-identical.
+# The committed DBT inventory grows from 1035 to 1037. Existing SDK width
+# and 1050 effective-job-second limits carry without recalibration. Rust
+# runtime changes require current artifacts and validation; this carries the
+# SDK budget only, not runtime equivalence or a new cold-SDK timing sample.
+expected_pin=a39a5ca1de64cd49cc44ce7c292c91dacafbfe20
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

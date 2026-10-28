@@ -3113,8 +3113,17 @@ fi
 # SDK width and 1050 effective-job-second limits carry without
 # recalibration. This is not whole-runtime equivalence or a new cold-SDK
 # timing sample.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 44f07af7468099a43ce30fc29dbc6023f4ed45b3 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 44f07af7468099a43ce30fc29dbc6023f4ed45b3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a39a5ca1de64cd49cc44ce7c292c91dacafbfe20 (2026-10-27): from
+# 44f07af7468099a43ce30fc29dbc6023f4ed45b3. Reverie 880071e1 (dbt lane)
+# replayed with an identical patch-id: caller admission, test fixtures and
+# the shared transport change. SDK build.rs ff1eeb32b140, vendor/dynamorio
+# tree 4ab89708f2e9 and native tree 0e9ffd386dbf are object-identical.
+# The committed DBT inventory grows from 1035 to 1037. Existing SDK width
+# and 1050 effective-job-second limits carry without recalibration. Rust
+# runtime changes require current artifacts and validation; this carries the
+# SDK budget only, not runtime equivalence or a new cold-SDK timing sample.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a39a5ca1de64cd49cc44ce7c292c91dacafbfe20 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a39a5ca1de64cd49cc44ce7c292c91dacafbfe20 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
