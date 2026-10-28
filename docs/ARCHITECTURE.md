@@ -23,9 +23,9 @@ The most important boundary is:
 These rules bind every backend and every change, and a review checks a change
 against them (owner, 2026-10-15). A *backend* is a Reverie implementation of
 the `Tool`/`Guest` contract (ptrace, dbt, in-guest-trap, liteinst, sabre,
-e9patch, kvm); the *tool* is Detcore. Known violations are listed in the
-[backend architecture audit](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-10-15-kvm-backend-architecture-audit.md)
-and tracked from https://github.com/rrnewton/hermit/issues/4485.
+e9patch, kvm); the *tool* is Detcore. Known violations are tracked from
+https://github.com/rrnewton/hermit/issues/4485 and its successor
+https://github.com/rrnewton/hermit/issues/4659.
 
 1. **A backend only intercepts.** It hooks guest syscalls and other events and
    delivers them to the tool through the standard callbacks. How it hooks, and

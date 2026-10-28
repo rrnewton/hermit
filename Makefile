@@ -203,6 +203,7 @@ LINT_CHECK_TARGETS := \
     lint-check-docs-pages-contract \
     lint-check-pre-push-submodule-diagnosis \
     lint-check-doc-bare-urls \
+    lint-check-private-workspace-refs \
     lint-check-pre-push-doc-bare-urls \
     lint-check-required-check-outcomes \
     lint-check-check-status-outcome \
@@ -263,6 +264,9 @@ lint-check-pre-push-submodule-diagnosis:
 
 lint-check-doc-bare-urls:
 	./scripts/check-doc-bare-urls.rs
+
+lint-check-private-workspace-refs:
+	./scripts/check-private-workspace-refs.sh
 
 lint-check-pre-push-doc-bare-urls:
 	./scripts/test-pre-push-doc-bare-urls.sh

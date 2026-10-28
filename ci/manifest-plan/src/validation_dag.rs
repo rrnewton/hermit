@@ -1444,7 +1444,7 @@ pub(crate) fn refresh_pinned_root_environment(tag: &str, command: &str) -> Resul
 /// with no seed and no cap: peaks of 1,133,400,064 and 1,142,509,568 bytes
 /// (most of it page cache from writing a ~958 MB Cargo home), 20-22 s. The
 /// earlier 1 GiB cap OOM-killed every cold fetch, which is every
-/// `--frozen-validate` run (https://github.com/rrnewton/dev-hermit/issues/549).
+/// `--frozen-validate` run, because such a run starts with an empty Cargo home.
 /// 1.5x the higher peak is 1,713,764,352 bytes, rounded up to 7 x 256 MiB.
 fn pinned_root_fetch() -> Result<Step, String> {
     let text = format!(

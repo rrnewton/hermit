@@ -991,14 +991,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/4029)
     // retains all 1039: 1040.
     // The required allocator prerequisite mutation test retains all 1039 prior identities: 1040.
-    // The four retained cell-results tests in ledger::tests
-    // (https://github.com/rrnewton/dev-hermit/issues/552) retain all 1042: 1046.
+    // The four retained cell-results tests in ledger::tests (memory cut for
+    // validate-status) retain all 1042: 1046.
     // happens_before::tests::{a_posthook_anchor_is_counted_at_entry_and_refused_on_no_return_syscalls,
     // a_posthook_anchor_shares_its_counter_and_starts_windows_at_its_entry}
     // (https://github.com/rrnewton/hermit/issues/3929) retain all 1046: 1048.
     // The four retained-census, transcoding, depth and key-order tests in
-    // ledger::tests (https://github.com/rrnewton/dev-hermit/issues/552)
-    // retain all 1048: 1052.
+    // ledger::tests (memory cut for validate-status) retain all 1048: 1052.
     // The DBT startup-authority refusal regression retains all 1048 prior identities.
     // The depth-boundary test in ledger::tests and the repeated-census-key and
     // extension-count tests in ledger::admission::tests retain all 1053: 1056.
@@ -3942,7 +3941,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // verify_tmpdir_does_not_reach_the_guest_environment,
     // a_killed_verify_leaves_its_logs_in_verify_tmpdir_not_tmpdir and
     // an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable
-    // (https://github.com/rrnewton/dev-hermit/issues/553) retain all 294: 297.
+    // (retained verify logs filled the host /tmp) retain all 294: 297.
     // group_kills_never_reach_the_host_without_sequentialized_threads
     // (https://github.com/rrnewton/hermit/issues/4057) retains all 297: 298.
     // a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word
@@ -7118,7 +7117,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"build"########,
         job: r########"liteinst_runtime"########,
         desc: r########"Build the ordinary in-guest Detcore runtime in the liteinst-runtime profile ahead of its packaging finalizer"########,
-        description: r########"PREBUILD 2026-10-18 (liteinst contract, temp/liteinst-status.md "Packaging prebuild contract", 1:51 AM ET). Runs exactly the Cargo command the packaged-LiteInst finalizer (hermit-install/src/bin/stage-detcore-liteinst.rs) runs, `cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target`, so that its pinned-root twin compiles the ordinary runtime beside build.workspace_compile_in_pinned_root instead of after it. The finalizer is unchanged: it still runs after every producer, invokes the same command (which Cargo then answers from these artifacts, and the receipt records cargo_artifact.fresh), selects Cargo's reported artifact, and performs every qualification, identity, source-close and receipt step. Only build.workspace_in_pinned_root, which runs the finalizer, depends on the twin. The allocator fixtures keep their own dedicated target (build.liteinst_allocator_fixtures). WHY: the cold liteinst-runtime build is the finalizer's cost. At main 359ab376, eight CPUs (CPUQuota 800%, CARGO_BUILD_JOBS=8), the finalizer took 107 s and 456 CPU-s with target/liteinst-runtime absent (cargo build 97 s), 81 s and 195 CPU-s with only the path crates stale (cargo build 71 s; a warm seed leaves them so), and 9.8 s and 5.7 CPU-s when the runtime was already built; all three qualified the same bytes. In the full validations of 4dc66c9c and 359ab376 the finalizer lengthened build.workspace_in_pinned_root from 38-40 s to 135-153 s on the critical path. LOCKS: Cargo locks each profile directory (target/validate/.cargo-lock, target/liteinst-runtime/.cargo-lock); a validate-profile build and this command started together in one target directory logged no `Blocking waiting for file lock` line. MEMORY: cold peak 2.65 GiB (cgroup memory.peak) at eight jobs, so rss_baseline 3 GiB and the hard cap 5 GiB. The build is a chain of path crates (detcore-model, detcore, detcore-liteinst with ThinLTO), 2.7 cores busy on average when only they rebuild, so eight jobs are enough."########,
+        description: r########"PREBUILD 2026-10-18 (the LiteInst packaging prebuild contract). Runs exactly the Cargo command the packaged-LiteInst finalizer (hermit-install/src/bin/stage-detcore-liteinst.rs) runs, `cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target`, so that its pinned-root twin compiles the ordinary runtime beside build.workspace_compile_in_pinned_root instead of after it. The finalizer is unchanged: it still runs after every producer, invokes the same command (which Cargo then answers from these artifacts, and the receipt records cargo_artifact.fresh), selects Cargo's reported artifact, and performs every qualification, identity, source-close and receipt step. Only build.workspace_in_pinned_root, which runs the finalizer, depends on the twin. The allocator fixtures keep their own dedicated target (build.liteinst_allocator_fixtures). WHY: the cold liteinst-runtime build is the finalizer's cost. At main 359ab376, eight CPUs (CPUQuota 800%, CARGO_BUILD_JOBS=8), the finalizer took 107 s and 456 CPU-s with target/liteinst-runtime absent (cargo build 97 s), 81 s and 195 CPU-s with only the path crates stale (cargo build 71 s; a warm seed leaves them so), and 9.8 s and 5.7 CPU-s when the runtime was already built; all three qualified the same bytes. In the full validations of 4dc66c9c and 359ab376 the finalizer lengthened build.workspace_in_pinned_root from 38-40 s to 135-153 s on the critical path. LOCKS: Cargo locks each profile directory (target/validate/.cargo-lock, target/liteinst-runtime/.cargo-lock); a validate-profile build and this command started together in one target directory logged no `Blocking waiting for file lock` line. MEMORY: cold peak 2.65 GiB (cgroup memory.peak) at eight jobs, so rss_baseline 3 GiB and the hard cap 5 GiB. The build is a chain of path crates (detcore-model, detcore, detcore-liteinst with ThinLTO), 2.7 cores busy on average when only they rebuild, so eight jobs are enough."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target"########,
         cmdtype: CmdType::Unknown,

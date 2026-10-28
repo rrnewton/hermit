@@ -300,7 +300,7 @@ where
                 .to_owned()
         })?,
         safehermit: safehermit.ok_or_else(|| {
-            "missing --safehermit; provide dev-hermit/bin/safehermit explicitly".to_owned()
+            "missing --safehermit; provide the path to a safehermit wrapper explicitly".to_owned()
         })?,
     }))
 }
