@@ -1504,8 +1504,8 @@ mod tests {
         assert!(result.is_ok() && lines.is_empty(), "{lines:?}");
     }
 
-    /// The refusal needs `--strict` and an inexact counter, and covers e9patch
-    /// preprocessing, which records on the same ptrace runtime and counter.
+    /// The refusal needs `--strict` and an inexact counter, including the common
+    /// ptrace record path before executable-selected e9patch preprocessing.
     #[test]
     fn record_refusal_needs_strict_and_an_inexact_counter() {
         #[derive(clap::Parser)]
@@ -1531,12 +1531,37 @@ mod tests {
             .refuse_strict_with_inexact_branch_counter(&ptrace)
             .unwrap();
 
-        let e9patch = <GlobalOpts as clap::Parser>::parse_from(["hermit", "--backend=e9patch"]);
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let prepare_calls = std::cell::Cell::new(0);
+        let prepare = |_target: &Path| -> Result<Option<PathBuf>, Error> {
+            prepare_calls.set(prepare_calls.get() + 1);
+            panic!("an inexact counter reached e9patch record preprocessing");
+        };
         let error = options
-            .refuse_strict_with_inexact_branch_counter(&e9patch)
+            .main_with_preparation(
+                &ptrace,
+                RecordPreparation {
+                    backend_name: "e9patch",
+                    prepare: Some(&prepare),
+                },
+            )
             .unwrap_err();
-        assert!(error.to_string().contains("`e9patch` backend"), "{error:#}");
+        assert!(
+            error
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("`ptrace` backend"), "{error:#}");
+        assert!(
+            error.to_string().contains("SpecLockMap is enabled"),
+            "{error:#}"
+        );
+        assert_eq!(
+            prepare_calls.get(),
+            0,
+            "a refused recording reached preprocessing"
+        );
     }
 
     /// `record start` takes `run`'s networking contract, local by default,
