@@ -132,6 +132,7 @@ async fn a_retired_siblings_late_request_stays_unanswered() {
                         syscall_count: 0,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: true,
                     }),
                 ),
             )
