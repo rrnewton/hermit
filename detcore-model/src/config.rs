@@ -3414,7 +3414,6 @@ mod legacy_backend_json {
         // `chaos_timeslice_range` came after it too: the scheduler draws the
         // slices, not the runtime, so it is never written and reads as unset.
         // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
-        // reason; they read as `slice` and unset.
         // reason; they read as unset.
         "backend",
         "strict_schedule_boundaries",

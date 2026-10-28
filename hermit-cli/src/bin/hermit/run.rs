@@ -4796,7 +4796,8 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
 /// explicitly does, through `validate_args` and again on a second
 /// validation; `slice` without a range draws each slice's mean from it. A
 /// plain `--chaos` run is unchanged. The draw needs `--chaos`, conflicts with
-/// an explicit `--max-timeslice` and `--target-timeslice`, needs the PMU
+/// an explicit `--max-timeslice`, `--target-timeslice` and
+/// `--chaos-seeded-timeslice`, needs the PMU
 /// timer, and its range must start at one RCB or more at the run's clock
 /// multiplier (seed 0 draws 2123 ns, below the 3000 ns of one RCB at
 /// `--clock-multiplier=300`, which `Detcore::new` would refuse by panicking).
@@ -4892,6 +4893,26 @@ fn a_draw_without_a_range_uses_the_recommended_range() {
         &["hermit", "run", "--chaos-timeslice-draw=run", "prog"],
         true,
         "--chaos-timeslice-draw=run chooses how a chaos run draws its timeslice; add --chaos",
+    );
+    // `--chaos-seeded-timeslice` would replace the drawn maximum with its own.
+    let seeded = [
+        "hermit",
+        "run",
+        "--chaos",
+        "--chaos-seeded-timeslice",
+        "--chaos-timeslice-draw=run",
+        "prog",
+    ];
+    refused(
+        &seeded,
+        true,
+        "--chaos-timeslice-draw (drawing from the recommended range",
+    );
+    refused(
+        &seeded,
+        true,
+        "and --chaos-seeded-timeslice draws --max-timeslice from the scheduler seed; give one \
+         of them, not both",
     );
     refused(
         &[
