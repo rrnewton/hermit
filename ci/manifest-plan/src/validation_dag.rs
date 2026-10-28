@@ -207,12 +207,12 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         run_when_changed: None,
         manifest_plan_helper: false,
     },
-    // The DBT budget wrapper gates roughly twenty portable nodes and fails
-    // CLOSED on a pin it is not calibrated for. Nothing else notices: a
-    // truncated node reads like a fast one. This asserts end to end that the
-    // wrapper still REACHES its wrapped command at the recorded pin.
+    // The core build wrapper checks the actual local source pin and the
+    // runner-admitted width before entering its command. Keep the end-to-end
+    // command sentinel, refusal, status and timing controls; no SDK calibration
+    // is selected by this first-party self-test.
     ToolSelfTest {
-        name: "dbt_budget",
+        name: "core_build",
         program: "ci/run-with-core-build-test.sh",
         args: &[],
         run_when_changed: None,
@@ -7608,10 +7608,10 @@ sys.exit(37)
         );
         refused(
             &|cfg| {
-                let index = step_mut(cfg, "quick-super-selftest.dbt_budget");
+                let index = step_mut(cfg, "quick-super-selftest.core_build");
                 cfg.steps[index].cmd = "true".into();
             },
-            &["quick-super-selftest.dbt_budget must run exactly"],
+            &["quick-super-selftest.core_build must run exactly"],
         );
         refused(
             &|cfg| {

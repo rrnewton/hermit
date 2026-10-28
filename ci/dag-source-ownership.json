@@ -2430,7 +2430,7 @@
         "pre.reverie_pin"
       ]
     },
-    "selftest.dbt_budget": {
+    "selftest.core_build": {
       "owner": "core",
       "labels": [
         "full",
@@ -4920,7 +4920,7 @@
         "quick-super-gate.manifest"
       ]
     },
-    "quick-super-selftest.dbt_budget": {
+    "quick-super-selftest.core_build": {
       "owner": "core",
       "labels": [
         "quick",
