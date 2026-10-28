@@ -1052,7 +1052,7 @@ fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), 
 
 /// Runs each `program` (Cargo) command of `listings` (arguments, output file), which
 /// must compile nothing, such as `nextest list` given both metadata files, up
-/// to [`preparation_build_jobs`] at a time and without
+/// to `jobs` at a time and without
 /// ci/run-with-reverie-dbt-budget.sh. That wrapper binds the Reverie DBT build
 /// budget to its pin with a pin check of about 0.8 s a call, and a command
 /// that builds nothing has no budget to bind; `run` already starts its
@@ -1064,11 +1064,9 @@ fn listing_outputs(
     root: &Path,
     program: &std::ffi::OsStr,
     listings: &[(Vec<String>, PathBuf)],
+    jobs: usize,
 ) -> Result<(), PreparationError> {
-    let jobs = preparation_build_jobs()
-        .parse::<usize>()
-        .unwrap_or(1)
-        .max(1);
+    let jobs = jobs.max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failures = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
@@ -2004,7 +2002,12 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     }
     // Nextest itself must accept every complete metadata pair after the final
     // build; this enumerates tests and never invokes the compiler.
-    listing_outputs(&root, "cargo".as_ref(), &listings)?;
+    listing_outputs(
+        &root,
+        "cargo".as_ref(),
+        &listings,
+        preparation_build_jobs().parse::<usize>().unwrap_or(1),
+    )?;
     let guests = if needs_guests {
         guest_executables(
             &fs::read_to_string(&guest_path).map_err(|e| e.to_string())?,
@@ -2299,9 +2302,7 @@ mod tests {
                 )
             })
             .collect();
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("CARGO_BUILD_JOBS", "4") };
-        listing_outputs(&root, program.as_os_str(), &listings).unwrap();
+        listing_outputs(&root, program.as_os_str(), &listings, 4).unwrap();
         for index in 0..4 {
             assert_eq!(
                 fs::read_to_string(root.join(format!("{index}.json"))).unwrap(),
@@ -2316,7 +2317,7 @@ mod tests {
             "the listings never overlapped: {overlap:?}"
         );
         let failing = vec![(args("fail now"), root.join("fail.json"))];
-        let error = listing_outputs(&root, program.as_os_str(), &failing).unwrap_err();
+        let error = listing_outputs(&root, program.as_os_str(), &failing, 4).unwrap_err();
         assert!(
             error.message.contains("Cargo listing failed"),
             "{}",
