@@ -675,7 +675,7 @@ pub(crate) async fn queued_before<G, T, C>(guest: &mut G, fd: RawFd, call: C) ->
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
-    C: SyscallInfo + Into<Syscall>,
+    C: SyscallInfo + Into<Syscall> + crate::syscalls::helpers::NonblockableSyscall,
 {
     let config = guest.config();
     if !config.sequentialize_threads || config.recordreplay_modes {

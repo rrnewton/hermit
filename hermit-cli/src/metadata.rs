@@ -836,16 +836,15 @@ impl RecordVersion {
 // --chaos --seed=N`), and replay follows it. An older reader would replay a
 // chaos recording under the default schedule and fall out of step, so it is
 // refused here.
-// 0x186 -> 0x18b (provisional: 0x187-0x18a are held by open pull requests
-// #4592, #4593, #4594 and #4603; the lander re-checks HIGHEST_SHIPPED + 1 at
-// land): a send or receive with MSG_DONTWAIT on a socketpair end the guest
+// 0x187 -> 0x188 (allocated at land time as HIGHEST_SHIPPED + 1, from the
+// branch's provisional 0x18b): a send or receive with MSG_DONTWAIT on a socketpair end the guest
 // left blocking runs once, as on Linux, where Detcore polled it until it
 // stopped failing with EAGAIN. A recording of such a call that polled until
 // another thread wrote holds those retries and the data, while this build
 // returns the first EAGAIN to the guest and falls out of step. One that
 // succeeded at once also took a polling turn that this build no longer
 // takes, so its schedule differs. Both are refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18b);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x188);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -870,7 +869,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18b);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18b;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x188;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -2332,6 +2331,9 @@ mod tests {
     /// it once, so the version gate must refuse it.
     #[test]
     fn record_version_rejects_polled_dontwait_socketpair_recordings() {
+        // The version current before this change, on the main this branch
+        // was rebased onto, not only the version before the original bump.
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
     }
 

@@ -1282,25 +1282,36 @@ pub fn ioaction_based_on_fd_status<
         phys,
         virt
     );
+    Ok(ioaction_for_fd_status(
+        fd,
+        virt,
+        phys,
+        call.flags_forbid_waiting(),
+    ))
+}
+
+/// The decision of [`ioaction_based_on_fd_status`] from the descriptor's
+/// virtual and physical nonblocking state and the call's own no-wait flags,
+/// split out so the decision itself is unit-testable without a guest.
+fn ioaction_for_fd_status(fd: i32, virt: bool, phys: bool, flags_forbid_waiting: bool) -> IOAction {
     if virt && !phys {
         // TF: simulate nonblocking on top of physically blocking? How?
         panic!(
-            "Invariant violation, fd {}: we cannot simulate nonblocking behavior when set to blocking mode in the kernel.",
-            fd
+            "Invariant violation, fd {fd}: we cannot simulate nonblocking behavior when set to blocking mode in the kernel."
         );
     } else if !virt && !phys {
         // FF: logically blocking, physically blocking, this could only work with BlockingExternalIO.
-        Ok(IOAction::Blocking)
+        IOAction::Blocking
     } else if virt && phys {
         // TT: both nonblocking, so firing once is sufficient
-        Ok(IOAction::PassThru)
-    } else if call.flags_forbid_waiting() {
+        IOAction::PassThru
+    } else if flags_forbid_waiting {
         // FT, but the call itself does not wait (MSG_DONTWAIT), so firing once
         // is what Linux does.
-        Ok(IOAction::PassThru)
+        IOAction::PassThru
     } else {
         // FT: Need to simulate blocking on top of nonblocking.
-        Ok(IOAction::NonblockizeRetry)
+        IOAction::NonblockizeRetry
     }
 }
 
@@ -2070,6 +2081,27 @@ impl NonblockableSyscall for reverie::syscalls::Readv {
 
     fn ends_at_read_shutdown(&self) -> bool {
         true
+    }
+}
+
+/// Positioned vectored reads have the same blocking behavior as vectored
+/// reads on pipes and sockets, and `RWF_NOWAIT` keeps the call itself from
+/// waiting on a file the guest left blocking.
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::Preadv2 {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        network_comm_syscall(self, guest)
+    }
+
+    fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
+        res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn flags_forbid_waiting(&self) -> bool {
+        self.flags() & libc::RWF_NOWAIT != 0
     }
 }
 
@@ -5889,8 +5921,50 @@ mod tests {
             assert!(!without, "{name} without MSG_DONTWAIT never waits");
         }
         assert!(!Read::new().flags_forbid_waiting());
+        assert!(
+            Preadv2::new()
+                .with_flags(libc::RWF_NOWAIT)
+                .flags_forbid_waiting(),
+            "preadv2 with RWF_NOWAIT may wait"
+        );
+        assert!(
+            !Preadv2::new()
+                .with_flags(libc::RWF_HIPRI)
+                .flags_forbid_waiting(),
+            "preadv2 without RWF_NOWAIT never waits"
+        );
         assert!(!Accept4::new().flags_forbid_waiting());
         assert!(!Connect::new().flags_forbid_waiting());
+    }
+
+    /// The `ioaction_based_on_fd_status` decision itself: a call whose own
+    /// flags forbid waiting (MSG_DONTWAIT, RWF_NOWAIT) on a descriptor the
+    /// guest left blocking runs once (PassThru), where the same call without
+    /// them is retried (NonblockizeRetry). A mutant dropping the flags term
+    /// fails this test.
+    #[test]
+    fn ioaction_decision_runs_a_nowait_call_once_on_a_blocking_descriptor() {
+        use super::IOAction;
+        use super::ioaction_for_fd_status;
+        // FT with no-wait flags: runs once, as Linux does.
+        assert_eq!(
+            ioaction_for_fd_status(3, false, true, true),
+            IOAction::PassThru
+        );
+        // FT without them: simulate blocking by retrying.
+        assert_eq!(
+            ioaction_for_fd_status(3, false, true, false),
+            IOAction::NonblockizeRetry
+        );
+        // TT already runs once, flags or not; FF can only block externally.
+        assert_eq!(
+            ioaction_for_fd_status(3, true, true, false),
+            IOAction::PassThru
+        );
+        assert_eq!(
+            ioaction_for_fd_status(3, false, false, true),
+            IOAction::Blocking
+        );
     }
 
     #[test]
