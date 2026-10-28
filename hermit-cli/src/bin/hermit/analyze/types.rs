@@ -8,8 +8,10 @@
 
 //! A mode for analyzing a hermit run.
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use clap::Parser;
 use regex::Regex;
@@ -18,6 +20,9 @@ use reverie::process::ExitStatus;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::metadata::LevelFilter;
+
+use crate::analyze::verdict::Verdict;
+use crate::analyze::verdict::VerdictReason;
 
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///
@@ -74,9 +79,16 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub run_needleman: bool,
 
-    /// Given a passing/failing run pair, based on different chaos seeds, first minimize the
-    /// chaos-mode interventions necessary to flip between the two outcomes.  This may accelerate
-    /// the subsequent binary search.
+    /// Before searching, minimize the target run's chaos-mode interventions (its preemptions
+    /// and priority changes) to those it needs to meet the target criteria, by knocking them out
+    /// a batch at a time. This may accelerate the subsequent binary search.
+    ///
+    /// The baseline is then the minimized record with its latest intervention knocked out, and
+    /// knocked out again while the replay still meets the target; when no intervention is left,
+    /// or the knocked-out run does not finish, analyze searches within the target schedule
+    /// instead (as `--prefix-search` does). So `--minimize` finds its own baseline and does not
+    /// take `--run2-seed`, `--run2-preemptions` or `--run2-schedule`. To search between a given
+    /// pair of runs, omit `--minimize`.
     #[clap(
         long,
         conflicts_with = "run2_seed",
@@ -84,6 +96,47 @@ pub struct AnalyzeOpts {
         conflicts_with = "run2_schedule"
     )]
     pub minimize: bool,
+
+    /// Search within the target run's schedule instead of between it and a baseline run.
+    ///
+    /// Each trial replays the first K events of the target schedule and then lets the
+    /// scheduler continue without chaos. Replaying none of it gives the baseline outcome and
+    /// replaying all of it the target outcome; a binary search finds the K at which the
+    /// outcome flips. Event #K is the scheduling decision that commits the run to the target:
+    /// the report shows the stack of the thread the target schedule runs there and of the
+    /// thread the scheduler would run instead.
+    ///
+    /// Unlike the default search, it needs no baseline schedule, so events that only one of
+    /// two unrelated runs executed (timeslices that end at other points, iterations of a
+    /// polling loop) cannot stop it. It takes about log2(schedule length) trials, two more for
+    /// each continuation (`--continuation-timeslice`) it tries, and two to recheck the
+    /// boundary.
+    #[clap(
+        long,
+        conflicts_with = "minimize",
+        conflicts_with = "run2_seed",
+        conflicts_with = "run2_preemptions",
+        conflicts_with = "run2_schedule",
+        conflicts_with = "run_needleman"
+    )]
+    pub prefix_search: bool,
+
+    /// The timeslice, in virtual nanoseconds, with which `--prefix-search` trials continue
+    /// without chaos after their replayed prefix: `auto` (the default) or a number.
+    ///
+    /// A race found only at a short timeslice often shows without chaos at that timeslice too:
+    /// the scheduler alone, replaying none of the target schedule, already meets the target,
+    /// and the search has nothing to bisect against. With `auto` the search continues at the
+    /// run's own `--max-timeslice`, and when that cannot serve (the scheduler alone meets the
+    /// target, or replaying the whole schedule misses it) at hermit's default 200 ms. This also
+    /// applies to the prefix search the default search falls back to. The report names the
+    /// timeslice the search used.
+    ///
+    /// The value is the trials' `--max-timeslice`, which also ends the replayed prefix's
+    /// slices that its schedule does not end, so it may not be shorter than the run's own, and
+    /// a run whose arguments disable PMU timeslices takes none.
+    #[clap(long, value_name = "NANOS|auto", default_value = "auto")]
+    pub continuation_timeslice: ContinuationTimeslice,
 
     /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
     /// enabled.
@@ -163,6 +216,9 @@ pub struct AnalyzeOpts {
     pub analyze_seed: Option<u64>,
 
     /// Print quite a bit of extra information so that you can see exactly what is happening.
+    ///
+    /// Each run then writes its log into the workspace (see --tmp-dir), and analyze keeps the
+    /// workspace when it exits, as --keep-tmp does, so that the logs can be read.
     #[clap(long, short)]
     pub verbose: bool,
 
@@ -178,13 +234,63 @@ pub struct AnalyzeOpts {
     /// Directory under which the analysis creates its workspace of temporary artifacts
     /// (schedules, logs, reports of every run), created if missing.
     ///
-    /// By default the workspace is a directory in `/tmp`
+    /// By default the workspace is created in the system's temporary directory: $TMPDIR, or
+    /// /tmp when TMPDIR is unset. Analyze removes the workspace when it exits, unless
+    /// --keep-tmp or --verbose; this directory itself stays.
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
+    /// Keep the workspace (see --tmp-dir) when analyze exits.
+    ///
+    /// The workspace holds every run's schedules, logs, output and reproducer command, and the
+    /// paths analyze prints name it. By default analyze removes it when it exits: after its
+    /// report, after an error, and when SIGTERM, SIGINT or SIGHUP stops it. A stop signal ends
+    /// the run in progress and starts no other; analyze then removes the workspace and dies of
+    /// that signal (a shell reports 128 plus its number, 143 for SIGTERM). --verbose keeps the
+    /// workspace too. The report file (--report-file) is never removed.
+    ///
+    /// Analyze cannot clean up after SIGKILL, nor after a stop signal it does not handle: one it
+    /// inherits as ignored stays ignored, and an analyze that is PID 1 of its PID namespace
+    /// (`docker run IMAGE hermit analyze ...` without --init) leaves the stop signals at their
+    /// default actions, which Linux discards for a namespace's init. Neither does it handle
+    /// them, so that they kill it at once as before, when /proc is not its own PID namespace's
+    /// (analyze started by another process inside `unshare -pf` without --mount-proc) or
+    /// when it inherited more than 64 children.
+    #[clap(long)]
+    pub keep_tmp: bool,
+
+    /// Wall-clock bound, in seconds, on each run after the target run: `auto` (the default), a
+    /// number of seconds, or `off`.
+    ///
+    /// A replayed or spliced schedule can leave the guest spinning, or waiting for an event that
+    /// never comes. The endpoint runs are measured: the target run (or, with `--run1-preemptions`,
+    /// the first replay of its record) and the baseline run (from `--run2-seed`,
+    /// `--run2-preemptions`, or the run without chaos). With `auto`, every run after the first
+    /// measured one is bounded at max(60 s, 10 times the slowest endpoint run so far), the baseline
+    /// run included. A trial that reaches the bound counts as not meeting the target, as a trial
+    /// that a `--timeout` in the run arguments ends does. It does not decide a `--prefix-search`
+    /// boundary, though: when the search settles next to such a trial, it runs that trial again
+    /// with 4 times the bound (within the run arguments' own `--timeout`). If that confirmation
+    /// finishes, whatever its outcome, every later run keeps the longer bound, and if it met the
+    /// target the search goes on below it. If it is still stopped, or no longer bound can be given,
+    /// the report calls the trial a hang, a third outcome, and a bound this confirmation raised
+    /// goes back to the usual one. A baseline run that reaches it gives no baseline, so analyze
+    /// searches within the target schedule instead (as `--prefix-search` does). A `--timeout` in
+    /// the run arguments still bounds every run, and wins where it is shorter. The bound needs a
+    /// backend on which `hermit run --timeout` is qualified; elsewhere `auto` gives none, and an
+    /// explicit number is refused.
+    ///
+    /// While trials are bounded, the log file a trial writes under `--verbose` or `--selfcheck`
+    /// is capped too, at max(64 MiB, 10 times the largest endpoint log) and within
+    /// HERMIT_LOG_MAX_BYTES (0 there lifts both caps); `off` lifts it as well.
+    #[clap(long, value_name = "SECONDS|auto|off", default_value = "auto")]
+    pub trial_timeout: TrialTimeout,
+
     /// Specify that analyze itself should return a non-zero exit code on success.
-    /// This is needed under esoteric invocation scenarios.
-    #[clap(long, value_name = "INT32")]
+    /// This is needed under esoteric invocation scenarios. 2 and 120 to 127 are refused:
+    /// analyze exits 2 when its inputs do not give it what it needs, and Hermit reserves
+    /// 120 to 127 for its own statuses.
+    #[clap(long, value_name = "INT32", value_parser = parse_success_exit_code)]
     pub success_exit_code: Option<i32>,
 
     /// Additional arguments to pass through unmodified to the hermit run subcommand.  While
@@ -224,6 +330,112 @@ pub struct AnalyzeOpts {
     /// (`Report::branch_counter_warning`); `None` when it printed none.
     #[clap(skip)]
     pub branch_counter_warning: Option<String>,
+
+    /// What the endpoint runs measured so far; the trials' bounds derive
+    /// from it ([`AnalyzeOpts::trial_bound`]). Every `RunData` copies these
+    /// options when it is created, so a run takes the bound of the endpoints
+    /// measured before it.
+    #[clap(skip)]
+    pub endpoints: EndpointMeasurements,
+
+    /// How many times its usual `--trial-timeout` bound a run gets
+    /// ([`AnalyzeOpts::trial_bound`]): 1, or [`CONFIRM_BOUND_FACTOR`] from
+    /// the moment a `--prefix-search` confirmation raised it, unless that
+    /// confirmation was stopped again (`factor_after_confirmation` in phases.rs): it
+    /// stays raised after a confirmation that met or missed the target or
+    /// that Hermit refused.
+    #[clap(skip = 1u32)]
+    pub trial_bound_factor: u32,
+}
+
+/// `--continuation-timeslice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationTimeslice {
+    /// Short first, then coarser where the short one cannot serve.
+    Auto,
+    /// This many virtual nanoseconds.
+    Nanos(NonZeroU64),
+}
+
+impl FromStr for ContinuationTimeslice {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "auto" {
+            return Ok(ContinuationTimeslice::Auto);
+        }
+        match s.parse::<NonZeroU64>() {
+            Ok(nanos) if nanos.get() >= detcore_model::time::NANOS_PER_RCB as u64 => {
+                Ok(ContinuationTimeslice::Nanos(nanos))
+            }
+            _ => Err(format!(
+                "expected `auto` or a timeslice of at least one RCB ({} virtual nanoseconds), \
+                 got {s:?}",
+                detcore_model::time::NANOS_PER_RCB
+            )),
+        }
+    }
+}
+
+/// `--trial-timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialTimeout {
+    /// Derived from the endpoint runs' wall-clock time.
+    Auto,
+    /// No bound beyond the run arguments' own `--timeout`.
+    Off,
+    /// This many seconds.
+    Seconds(NonZeroU64),
+}
+
+impl FromStr for TrialTimeout {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(TrialTimeout::Auto),
+            "off" => Ok(TrialTimeout::Off),
+            _ => s.parse().map(TrialTimeout::Seconds).map_err(|_| {
+                format!("expected a positive number of seconds, `auto` or `off`, got {s:?}")
+            }),
+        }
+    }
+}
+
+/// The least wall-clock bound `--trial-timeout=auto` gives a trial.
+pub const TRIAL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
+/// How many times the slowest endpoint run `--trial-timeout=auto` gives a trial.
+pub const TRIAL_TIMEOUT_FACTOR: u32 = 10;
+/// How many times its usual `--trial-timeout` bound a `--prefix-search` trial
+/// gets when it runs again to confirm the boundary the search settled on.
+pub const CONFIRM_BOUND_FACTOR: u32 = 4;
+/// The least cap on a trial's log file.
+pub const TRIAL_LOG_FLOOR: u64 = 64 << 20;
+/// How many times the largest endpoint log a trial's log file may grow to.
+pub const TRIAL_LOG_FACTOR: u64 = 10;
+
+/// The slowest wall-clock time and the largest log file of the endpoint runs
+/// measured so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointMeasurements {
+    /// The slowest endpoint run, if one has been measured.
+    pub slowest: Option<Duration>,
+    /// The largest endpoint log file, if an endpoint run wrote one.
+    pub largest_log: Option<u64>,
+}
+
+impl EndpointMeasurements {
+    /// Record one endpoint run. Returns true if it is the slowest so far.
+    pub fn record(&mut self, wall: Duration, log_bytes: Option<u64>) -> bool {
+        if let Some(bytes) = log_bytes {
+            self.largest_log = self.largest_log.max(Some(bytes));
+        }
+        let slowest = self.slowest.is_none_or(|slowest| wall > slowest);
+        if slowest {
+            self.slowest = Some(wall);
+        }
+        slowest
+    }
 }
 
 // TODO: introduce a new type to encapsulate the state of the search, and make it immutable.
@@ -270,23 +482,62 @@ impl FromStr for ExitStatusConstraint {
     }
 }
 
+/// `--success-exit-code`: any status but those that already mean something
+/// else for analyze (see the exit-code allocation table in `hermit::lib`).
+fn parse_success_exit_code(text: &str) -> Result<i32, String> {
+    let code: i32 = text
+        .parse()
+        .map_err(|error| format!("{text:?} is not a 32-bit integer: {error}"))?;
+    match code {
+        hermit::HERMIT_ANALYZE_PRECONDITION_EXIT => Err(format!(
+            "{code} is the status analyze exits with when its inputs do not give it what it \
+             needs (HERMIT_ANALYZE_PRECONDITION), so a success could not be told apart from it"
+        )),
+        120..=127 => Err(format!(
+            "{code} is in 120 to 127, which Hermit reserves for its own statuses (122 a refusal, \
+             123 the log cap, 124 a deadline, 125 an internal failure, 126 and 127 a program \
+             that cannot run), so a success could not be told apart from them"
+        )),
+        _ => Ok(code),
+    }
+}
+
 /// The final report that comes out of the analyze process.
 #[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct Report {
+    /// What the analysis concluded; read it first. `critical_events` names
+    /// the critical events below. `no_deciding_event` names none: the header
+    /// says why, and the event fields are absent. A report without the field,
+    /// from before it, names the critical events.
+    #[serde(default)]
+    pub verdict: Verdict,
+
+    /// Why the verdict names no event: `{"cause": "scheduler_alone"}`, or,
+    /// when the scheduler alone meets the target under timing settings the
+    /// recording carries and every trial keeps, `{"cause":
+    /// "timing_semantics", "options": [...]}` with those settings. Absent
+    /// when the verdict names the critical events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_reason: Option<VerdictReason>,
+
     /// A header containing some contextual information, to go at the beginning of the report.
     pub header: String,
 
     /// Some additional context about where in the execution the issue occured. (Basically used as a footer.)
+    #[serde(default)]
     pub additional_context: String,
 
     /// Is it a baseline run (e.g. passing run) vs a target run (e.g. failing/crashing).
+    #[serde(default)]
     pub baseline_run: bool,
 
     /// The runtime context for one critical event, which is racing with, and does not commute with
-    /// the other.
-    pub critical_event1: ReportCriticalEvent,
+    /// the other. Absent when the verdict names no event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_event1: Option<ReportCriticalEvent>,
     /// The runtime context for the other identified critical event.
-    pub critical_event2: ReportCriticalEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_event2: Option<ReportCriticalEvent>,
 
     /// The warning line, without its newline, that `hermit analyze` or `hermit bisect` printed
     /// before its first trial because those trials read a retired-branch counter that failed
@@ -296,6 +547,16 @@ pub struct Report {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_counter_warning: Option<String>,
+
+    /// `--prefix-search` only, when the deciding event is a timing decision
+    /// (both continuations run the same thread there, for different lengths):
+    /// that thread's stack at the deciding event. The two critical events are
+    /// then the threads that run next in each continuation, and their
+    /// `event_index` is a position in that continuation's recorded schedule
+    /// (the header names both files); where no other thread runs, it is that
+    /// schedule's length and the stack is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deciding_event: Option<ReportCriticalEvent>,
 }
 
 /// Runtime context for a critical event included in the analyze report.

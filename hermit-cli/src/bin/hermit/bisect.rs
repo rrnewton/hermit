@@ -104,6 +104,8 @@ impl BisectOpts {
             search: false,
             run_needleman: self.needleman,
             minimize: false,
+            prefix_search: false,
+            continuation_timeslice: crate::analyze::ContinuationTimeslice::Auto,
             imprecise_search: false,
             run1_seed: None,
             run1_preemptions: None,
@@ -117,6 +119,9 @@ impl BisectOpts {
             jitter_dist: self.jitter_dist,
             execution_context: self.execution_context,
             tmp_dir: None,
+            // Bisect keeps its workspace whatever this says
+            // (`bisect_schedule_pair`).
+            keep_tmp: false,
             success_exit_code: None,
             run_arg: Vec::new(),
             run_args: self.run_args.clone(),
@@ -128,6 +133,11 @@ impl BisectOpts {
             log_budget: global.log_budget(),
             inexact_branch_counter: self.inexact_branch_counter,
             branch_counter_warning: None,
+            // Bisect runs no endpoint to measure: its replays are bounded by
+            // the run arguments' --timeout alone.
+            trial_timeout: crate::analyze::TrialTimeout::Off,
+            endpoints: Default::default(),
+            trial_bound_factor: 1,
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
@@ -158,7 +168,11 @@ impl BisectOpts {
             event.end_time = None;
         }
         if good == bad {
-            bail!("the --good and --bad schedules contain identical event traces");
+            // An input bisect cannot use, not a failure of Hermit.
+            return Err(crate::analyze::AnalyzePrecondition::endpoints_identical(
+                "the --good and --bad schedules contain identical event traces",
+            )
+            .into());
         }
         Ok((analyzer, good, bad))
     }
@@ -308,6 +322,11 @@ mod tests {
             assert!(
                 error.to_string().contains("identical event traces"),
                 "{error:#}"
+            );
+            assert_eq!(crate::failure_exit_code(&error), 2, "{error:#}");
+            assert_eq!(
+                crate::classify_failure(&error),
+                "HERMIT_ANALYZE_PRECONDITION class=endpoints-identical"
             );
         }
     }

@@ -159,23 +159,58 @@ deterministic execution.
 
 ## Analyze And Schedule Search
 
+What `hermit analyze` concludes is not a failure of Hermit, and it does not
+exit 125 or print `HERMIT_INTERNAL_FAILURE`: inputs that do not give it what
+it needs exit **2**, the "trouble" code of `diff`, `cmp` and `grep`, and an
+analysis that concludes that no event decides the outcome has completed and
+exits 0. Only a failure to conclude (replay that does not reproduce, a search
+that does not converge) exits 125, under a class line that says which. The
+class line is the first line on stderr; clap's usage error exits 2 too,
+without one. `hermit bisect` verifies its `--good` and `--bad` schedules the
+same way and exits the same. Every exit status of `hermit analyze` and
+`hermit bisect`:
+
+| Exit | Line on stderr | Condition |
+| --- | --- | --- |
+| 0 (or `--success-exit-code`) | none | The report names the critical events (`"verdict": "critical_events"`). |
+| 0 (or `--success-exit-code`) | `HERMIT_ANALYZE_VERDICT class=no-deciding-event` | No event of the target schedule decides the outcome (`"verdict": "no_deciding_event"`; the report has no critical-event fields). |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | The first run without `--search`, the failing endpoint of a bisection (bisect's `--bad`), or `--minimize`'s last record does not meet the target. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | The passing endpoint (bisect's `--good`) meets the target, the baseline run meets it, or the baseline the user chose does not finish. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | No continuation timeslice allows a prefix search. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | Bisect only: no single reordering separates its endpoints. Analyze searches within the target schedule instead. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-identical` | Bisect only: `--good` and `--bad` contain identical event traces. |
+| 2 | none (clap's `error:` and usage) | The command line did not parse. |
+| 122 | `HERMIT_POLICY_REFUSAL class=policy-refusal` | Hermit refused the target run, or analyze or bisect refused its options or schedules (for example schedules recorded under different epochs). |
+| 123 | `HERMIT_LOG_CAP class=log-cap` | `--max-log-bytes` ended it. |
+| 125 | `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible` | `--selfcheck` found a difference, or a jittered control schedule never replayed the same way twice: Hermit's replay, or the host's branch counter (`hermit host-capabilities`), did not reproduce a run. |
+| 125 | `HERMIT_INTERNAL_FAILURE class=search-did-not-converge` | The event-level search did not converge within its passes. |
+| 125 | another `HERMIT_INTERNAL_FAILURE class=...` | Hermit failed. |
+| 128 + N | none | Analyze was stopped by signal N (SIGTERM, SIGINT or SIGHUP). |
+
 | Message | Class | Trigger | Fix |
 | --- | --- | --- | --- |
+| `no event of the target schedule decides the outcome`, exit 0, `HERMIT_ANALYZE_VERDICT class=no-deciding-event` | Configuration | A completed `--prefix-search`: without chaos, the scheduler alone meets the target at every continuation tried, so the outcome does not depend on a chaos decision. The report's `verdict` is `no_deciding_event`. | Debug that run directly (the reproducer the message names runs it), or pass `--continuation-timeslice` with a timeslice at which the scheduler alone misses the target, or use the default search with a passing `--run2-seed`. When the report's `verdict_reason` is `timing_semantics`, one more trial showed that the scheduler alone meets the target because of timing settings every trial keeps from the recording: the default search can end the same way, and a new failing run with the listed `alternatives` in its run arguments may have a deciding event. |
+| `no continuation allows a prefix search`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | Configuration | At no continuation timeslice does replaying the whole target schedule meet the target while the scheduler alone misses it. | Follow the remedy in the message (raise `--trial-timeout`, check `--selfcheck`), or use the default search with a passing `--run2-seed`. |
+| `the failing schedule endpoint did not reproduce the target failure`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | Configuration | Replaying the target schedule (`hermit bisect`'s `--bad`) does not meet the target. Analyze recorded its endpoints itself, so there the replay did not reproduce the run, and the message says so. | Check that the target run replays (`--selfcheck`) and that this host's branch counter is exact (`hermit host-capabilities`); for bisect, pass a `--bad` schedule recorded with the same run arguments. |
+| `the search stopped one swap from the passing schedule`; bisect: exit 2, `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | Configuration | The failure depends on events only the failing schedule executed, so no single swap separates the outcomes. Analyze then searches within the failing schedule. | For bisect, use `hermit analyze --prefix-search` on the failing run. |
+| `the --good and --bad schedules contain identical event traces`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=endpoints-identical` | Configuration | Bisect's two schedules contain the same events (ignoring event times). | Pass a `--good` and a `--bad` schedule from runs that took different orders. |
+| `the passing schedule endpoint did not reproduce a passing outcome`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | Configuration | Replaying the baseline schedule (`hermit bisect`'s `--good`) meets the target too. | Pass another baseline (`--run2-seed`, `--run2-preemptions`, or for bisect another `--good`), or tighten the target criteria. |
+| `the baseline run (...) did not finish`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | Configuration | The baseline the user chose was stopped by a bound or refused. | Pass a larger `--trial-timeout` or another baseline; without one, analyze bisects against the run without chaos. |
 | `cannot search through executions with --no-sequentialize-threads. Determinism required` | Configuration | Analyze was asked to search without deterministic scheduling. | Remove `--no-sequentialize-threads`. |
-| `FAILED. The run did not match the target criteria. Try --search.` | Configuration | A single analyze execution did not satisfy its target predicate. | Correct the predicate/input or add `--search`. |
-| `First run matched criteria but second run did not` | Configuration | A supposed target execution is not reproducible. | Fix external inputs and unsupported calls before minimizing. Pin `--analyze-seed` and workload inputs. |
-| `--selfcheck requires perfect reproducibility` | Configuration | Repeated logs differed during analyzer self-check. | Stabilize the workload. Removing `--selfcheck` only disables the diagnostic. |
-| `preemptions recorded ... did not match replayed ... (no fixed point)` | Configuration | Recorded preemption points could not be replayed exactly. | Disable `--imprecise-timers`, use the same binary/inputs/host PMU setup, and record again. |
-| `Expectations not met ... baseline run matched target criteria` | Configuration | The target filter also accepts the baseline, so search has no opposite outcomes. | Tighten or correct the target predicate. |
+| `FAILED. The run did not match the target criteria. Try --search.`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | Configuration | A single analyze execution did not satisfy its target predicate. | Correct the predicate/input or add `--search`. |
+| `First run matched criteria but second run did not`, exit 125, `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible` | Configuration | A supposed target execution is not reproducible. | Fix external inputs and unsupported calls before minimizing. Pin `--analyze-seed` and workload inputs. |
+| `--selfcheck requires perfect reproducibility`, exit 125, `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible` | Configuration | Repeated logs differed during analyzer self-check. | Stabilize the workload. Removing `--selfcheck` only disables the diagnostic. |
+| `preemptions recorded ... did not match replayed ... (no fixed point)`, exit 125, `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible` | Configuration | Recorded preemption points could not be replayed exactly. | Disable `--imprecise-timers`, use the same binary/inputs/host PMU setup, and record again. |
+| `Expectations not met ... baseline run matched target criteria`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | Configuration | The target filter also accepts the baseline, so search has no opposite outcomes. | Tighten or correct the target predicate. |
 | `Final run expected match=..., observed opposite` | Internal bug | Analyze's final replay contradicted its chosen pole. | Preserve report/log/preemption artifacts and report the reproducer. |
 | `hermit analyze does not implement --run1-schedule` (or `--run2-schedule`), exit 122 | Unsupported | These accepted analyzer inputs have no implementation, so `hermit analyze` refuses them before any workspace or trial. | Use `--run1-preemptions`, `--run2-preemptions`, or seed-based runs instead. |
-| `Final preemption record still does not match target criteria` | Configuration | Minimization produced a record that no longer reproduces the target. | Increase reproducibility first, then repeat from a fresh record. |
+| `Final preemption record still does not match target criteria`, exit 2, `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | Configuration | Minimization produced a record that no longer reproduces the target. | Increase reproducibility first, then repeat from a fresh record. |
 | `provided nonmatching preemption record appears corrupt` | Configuration | A comparison record failed validation or replay expectations. | Replace it with an unmodified generated record. |
 | `Timestamps failed to monotonically increase` or `time series ... contained duplicate entries` | Configuration | A preemption series is unordered or has duplicate timestamps. | Re-record or regenerate it; report a bug if Hermit produced it. |
 | `Hermit analyzer produced corrupt preemption record` | Internal bug | The minimizer itself constructed an invalid record. | Keep the printed corrupt and last-good records and report the reproducer. |
-| `Jittered schedule replay was not stable after N attempts` | Configuration | The same requested schedule realized different traces/outcomes beyond the jitter threshold. | Stabilize inputs and replay conditions. `--jitter-dist=N` changes the tolerated distance, but the attempt limit is currently internal. |
-| `Event-Level Search Failed - No convergence after N passes` | Configuration | Refinement did not reach adjacent schedules within its internal pass limit. | Stabilize replay and inspect unmatched events with `--verbose`; the pass limit is not currently a CLI option. |
-| `opposite-outcome schedules have no remaining reorderable event distance` | Configuration | Outcomes differ but the matched schedules contain no event reorder to explain them. | Investigate nondeterministic inputs or unsupported syscalls rather than schedule order. |
+| `Jittered schedule replay was not stable after N attempts`, exit 125, `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible` | Configuration | The same requested schedule realized different traces/outcomes beyond the jitter threshold. | Stabilize inputs and replay conditions. `--jitter-dist=N` changes the tolerated distance, but the attempt limit is currently internal. |
+| `Event-Level Search Failed - No convergence after N passes`, exit 125, `HERMIT_INTERNAL_FAILURE class=search-did-not-converge` | Configuration | Refinement did not reach adjacent schedules within its internal pass limit. | Stabilize replay and inspect unmatched events with `--verbose`; the pass limit is not currently a CLI option. |
+| `opposite-outcome schedules have no remaining reorderable event distance`; bisect: exit 2, `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | Configuration | Outcomes differ but the matched schedules contain no event reorder to explain them. | Investigate nondeterministic inputs or unsupported syscalls rather than schedule order. |
 | `schedules are one swap apart but still contain ... unmatched event edits` | Configuration | Search poles include inserted/deleted events, not only a reorder. | Stabilize control flow and inputs; inspect verbose unmatched-event output. |
 | `Needleman-Wunsch matrix dimensions overflowed` | Configuration | Schedule alignment dimensions overflowed or are impractically large. | Use shorter traces/narrower search endpoints; lower workload duration before retrying. |
 | `Expected tmp_dir to be set at this point`, `write/copy ... preempts file to succeed`, `New run to succeed`, or `Unable to write report file` | Internal bug | Analyze violated an internal phase invariant or converted an I/O failure into a panic. | Check artifact-directory permissions first; otherwise preserve the command/artifacts and report it. |
