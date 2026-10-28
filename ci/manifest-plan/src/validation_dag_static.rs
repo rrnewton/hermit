@@ -1844,9 +1844,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1121, listed (1114 on main plus seven).
     // And the fourteen pinned_cpu::tests units, which choose the CPU a run is
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
-    // And a_missing_ns_pid_means_one_namespace_only_on_this_process_procfs (a
-    // kernel without PID namespaces): 1169 + 1 = 1170, listed.
-    ("test.hermit_unit", 1170),
+    // And the_pid_namespace_is_read_from_its_entry and
+    // a_masked_ns_directory_is_not_read_as_a_kernel_without_pid_namespaces (a
+    // kernel without PID namespaces): 1169 + 2 = 1171, listed.
+    ("test.hermit_unit", 1171),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5704,8 +5705,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
-    // And the same PID-namespace unit: 1164, listed.
-    ("test.hermit_unit_on_host", 1164),
+    // And the same two PID-namespace units: 1165, listed.
+    ("test.hermit_unit_on_host", 1165),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

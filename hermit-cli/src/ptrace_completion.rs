@@ -15,6 +15,7 @@ use std::any::TypeId;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::ffi::CStr;
 use std::fmt;
 use std::fs::File;
 use std::future::Future;
@@ -356,20 +357,24 @@ pub(crate) enum PidNamespace {
 /// The calling process's PID namespace, with its `ns/pid` file opened, which
 /// a caller holds while it records the namespace's identity so that no later
 /// namespace can take that identity (none where the kernel has only the one).
-/// An error when `/proc` cannot say, as when it is not this process's procfs.
+/// An error when `/proc` cannot say.
+///
+/// Both lookups happen in the caller's own `ns` directory, held open and
+/// checked to be procfs, so neither a filesystem mounted over it nor a mount
+/// change between the lookups passes as a missing entry. A missing `pid`
+/// entry means the kernel has no PID namespaces only when the `mnt` entry,
+/// which every kernel lists, is there.
 pub(crate) fn open_pid_namespace() -> std::io::Result<(PidNamespace, Option<File>)> {
-    match File::open("/proc/self/ns/pid") {
+    let directory = File::open("/proc/self/ns")?;
+    match open_entry(&directory, c"pid") {
         Ok(file) => {
             let meta = file.metadata()?;
             Ok((PidNamespace::Inode(meta.dev(), meta.ino()), Some(file)))
         }
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
-                && missing_ns_pid_means_one_namespace(
-                    proc_is_procfs(),
-                    proc_self_pid(),
-                    std::process::id(),
-                ) =>
+                && is_procfs(&directory)
+                && has_entry(&directory, c"mnt") =>
         {
             Ok((PidNamespace::Only, None))
         }
@@ -377,31 +382,45 @@ pub(crate) fn open_pid_namespace() -> std::io::Result<(PidNamespace, Option<File
     }
 }
 
-/// Whether a missing `/proc/self/ns/pid` means the kernel has no PID
-/// namespaces: only when `/proc` is procfs (`procfs`) and its `self` names
-/// this process (`proc_self` is `own`). Otherwise `/proc` is not this
-/// process's procfs (another filesystem mounted over it, or the procfs of
-/// another PID namespace), which proves nothing about the kernel.
-fn missing_ns_pid_means_one_namespace(procfs: bool, proc_self: Option<u32>, own: u32) -> bool {
-    procfs && proc_self == Some(own)
+/// Opens the entry `name` of `directory`.
+fn open_entry(directory: &File, name: &CStr) -> std::io::Result<File> {
+    // SAFETY: `name` is a C string, and a returned descriptor is owned here.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened and nothing else owns it.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-/// Whether `/proc` is a procfs mount.
-fn proc_is_procfs() -> bool {
-    // SAFETY: an all-zero `statfs` is a valid value, and `statfs` writes only
+/// Whether `directory` is on procfs.
+fn is_procfs(directory: &File) -> bool {
+    // SAFETY: an all-zero `statfs` is a valid value, and `fstatfs` writes only
     // the struct it is given.
     let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-    let found = unsafe { libc::statfs(c"/proc".as_ptr(), &mut fs) } == 0;
+    let found = unsafe { libc::fstatfs(directory.as_raw_fd(), &mut fs) } == 0;
     found && fs.f_type == libc::PROC_SUPER_MAGIC
 }
 
-/// The process ID `/proc/self` names, if it names one.
-fn proc_self_pid() -> Option<u32> {
-    std::fs::read_link("/proc/self")
-        .ok()?
-        .to_str()?
-        .parse()
-        .ok()
+/// Whether `directory` has an entry `name`.
+fn has_entry(directory: &File, name: &CStr) -> bool {
+    // SAFETY: an all-zero `stat` is a valid value, `name` is a C string, and
+    // `fstatat` writes only the struct it is given.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) == 0
+    }
 }
 
 // A numeric PID, Rust ThreadId and namespace can all be copied across fork.

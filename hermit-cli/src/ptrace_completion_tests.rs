@@ -395,20 +395,67 @@ fn a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer() {
     );
 }
 
-/// A missing `/proc/self/ns/pid` means a kernel without PID namespaces only
-/// when `/proc` is this process's procfs; anything else over `/proc`, or the
-/// procfs of another PID namespace, keeps the refusal.
+/// This host's kernel has PID namespaces: the `pid` entry is read and held.
 #[test]
-fn a_missing_ns_pid_means_one_namespace_only_on_this_process_procfs() {
-    assert!(missing_ns_pid_means_one_namespace(true, Some(7), 7));
-    assert!(!missing_ns_pid_means_one_namespace(false, Some(7), 7));
-    assert!(!missing_ns_pid_means_one_namespace(true, Some(8), 7));
-    assert!(!missing_ns_pid_means_one_namespace(true, None, 7));
-    // This host's kernel has PID namespaces: the entry is there and held.
+fn the_pid_namespace_is_read_from_its_entry() {
     let (namespace, file) = open_pid_namespace().unwrap();
-    assert!(matches!(namespace, PidNamespace::Inode(..)) && file.is_some());
-    assert!(proc_is_procfs());
-    assert_eq!(proc_self_pid(), Some(std::process::id()));
+    let file = file.expect("the namespace file is held");
+    let meta = file.metadata().unwrap();
+    assert_eq!(namespace, PidNamespace::Inode(meta.dev(), meta.ino()));
+}
+
+/// On a kernel with PID namespaces, a `pid` entry hidden from the caller's
+/// `ns` directory is never read as a kernel without them: not under a tmpfs
+/// mounted over that directory (not procfs), nor under another procfs
+/// directory mounted there (which has no `mnt` entry either) (Codex review).
+#[test]
+fn a_masked_ns_directory_is_not_read_as_a_kernel_without_pid_namespaces() {
+    isolated_with_child_setup(
+        "a_masked_ns_directory_is_not_read_as_a_kernel_without_pid_namespaces",
+        &[],
+        enter_user_and_mount_namespaces,
+        || {
+            let pid = std::process::id();
+            let ns = std::ffi::CString::new(format!("/proc/{pid}/ns")).unwrap();
+            let fdinfo = std::ffi::CString::new(format!("/proc/{pid}/fdinfo")).unwrap();
+            let mount = |source: &std::ffi::CStr, kind: Option<&std::ffi::CStr>, flags| {
+                let result = unsafe {
+                    libc::mount(
+                        source.as_ptr(),
+                        ns.as_ptr(),
+                        kind.map_or(std::ptr::null(), |kind| kind.as_ptr()),
+                        flags,
+                        std::ptr::null(),
+                    )
+                };
+                assert_eq!(
+                    result,
+                    0,
+                    "mount over {ns:?}: {}",
+                    std::io::Error::last_os_error()
+                );
+            };
+            let unmount = || {
+                assert_eq!(unsafe { libc::umount2(ns.as_ptr(), libc::MNT_DETACH) }, 0);
+            };
+            mount(c"tmpfs", Some(c"tmpfs"), 0);
+            assert!(
+                open_pid_namespace().is_err(),
+                "a tmpfs over the ns directory"
+            );
+            unmount();
+            mount(&fdinfo, None, libc::MS_BIND);
+            assert!(
+                open_pid_namespace().is_err(),
+                "a procfs directory with no mnt entry over the ns directory"
+            );
+            unmount();
+            assert!(matches!(
+                open_pid_namespace(),
+                Ok((PidNamespace::Inode(..), Some(_)))
+            ));
+        },
+    );
 }
 
 /// Without a readable PID namespace (here a tmpfs over `/proc`), a process
