@@ -16823,22 +16823,28 @@ impl Scheduler {
     }
 
     /// Whether `tid` is queued as a poller whose attempts depend only on guest
-    /// actions (`Resources::polls_guest_state_only`), whatever its backoff,
-    /// and whose request retries after an attempt that moved nothing
+    /// actions (`polls_only_guest_state`), whatever its backoff, and whose
+    /// request retries after an attempt that moved nothing
     /// (`waits_after_a_failed_attempt`), made no earlier than `progress`
     /// (`latest_progress`): its latest attempt (`last_attempt_at`) is at or
     /// after it.
     fn is_idle_guest_poller(&self, tid: DetTid, progress: u64) -> bool {
         self.run_queue.contains_tid(tid)
             && self.attempted_since(tid, progress)
-            && self.request_satisfies(tid, Self::waits_on_guest_state)
+            // A poll with a timeout ends at its own deadline, which
+            // `fast_forward_to_next_finite_deadline` does not consider, so it is
+            // not idle: jumping over it, or opening in the kernel while it waits,
+            // would end it late.
+            && self.request_satisfies(tid, |rs| {
+                self.waits_on_guest_state(rs) && rs.poll_deadline.is_none()
+            })
     }
 
     /// A retry, after an attempt that moved nothing, of a poll whose attempts
     /// depend only on guest actions (`is_idle_guest_poller`).
-    fn waits_on_guest_state(rs: &Resources) -> bool {
+    fn waits_on_guest_state(&self, rs: &Resources) -> bool {
         Self::is_polling_turn(rs)
-            && rs.polls_guest_state_only
+            && self.polls_only_guest_state(rs)
             && Self::waits_after_a_failed_attempt(rs)
     }
 
@@ -16890,7 +16896,7 @@ impl Scheduler {
         let pollers_wait = !self.run_queue.is_empty()
             && self.run_queue.tids().all(|&tid| {
                 self.request_satisfies(tid, |rs| {
-                    Self::waits_on_guest_state(rs)
+                    self.waits_on_guest_state(rs)
                         && rs.poll_deadline.is_none()
                         && !rs.polls_a_named_fifo
                         && !rs.waits_until_nothing_else_can_run
@@ -20104,7 +20110,7 @@ mod test {
         resources.poll_deadline = Some(LogicalTime::from_nanos(1_000_000));
         sched.next_turns[&poller].req.put(Ok(resources));
         sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 1);
-        sched.last_commit_at.insert(poller, sched.progress_epoch);
+        sched.last_attempt_at.insert(poller, sched.progress_epoch);
         sched
             .guest_state_polled_at
             .insert(poller, sched.progress_epoch);
