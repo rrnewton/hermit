@@ -861,6 +861,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         blocked
     }
 
+    /// Ends a call whose posthook failed with `error` after the call
+    /// returned: publishes the posthook checkpoint with that error and
+    /// completes the call with it, as every posthook failure does.
+    async fn complete_after_posthook_failure<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        count: u64,
+        error: Error,
+        interrupted: Option<Errno>,
+    ) -> Result<i64, Error> {
+        let res = Err(error);
+        self.publish_posthook_checkpoint(guest, count, &res, interrupted)
+            .await;
+        self.complete_syscall(guest, res).await
+    }
+
     /// Publish the posthook happens-before anchors the current syscall entry
     /// reached at its prehook, now that `res` is the result the guest will
     /// get: after the last observer that can replace it, on every path that
@@ -4296,6 +4312,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     open_file_creator: None,
                     receive_geometry: None,
                     entry_import: None,
+                    polled_entry_import: None,
+                    polled_entry_displaced: Default::default(),
                     send_inspection: None,
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
@@ -5282,6 +5300,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // A vectored call's memory as it began, if its handler keeps it
         // (`ThreadState::entry_import`): never an earlier call's.
         guest.thread_state_mut().entry_import = None;
+        guest.thread_state_mut().polled_entry_import = None;
+        guest.thread_state_mut().polled_entry_displaced = Default::default();
         // Signal phase 1: a process that handles SIGALRM runs only the calls
         // its table places (`sigalrm_phase1`).
         let sigalrm_refusal = if guest.thread_state().sigalrm_handled {
@@ -6386,17 +6406,26 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // guest serve another guest's exit ends the run before anything
         // observes the result (crate::exit_dependencies).
         // It reads a received message's descriptors from the call's header,
-        // so it reads it as the kernel's view holds it (`EntryImport`).
-        // Boxed: it keeps the view across an await, which would otherwise
-        // grow every syscall's future (`hot_path_futures_stay_small`).
-        if let Ok(ret) = res
-            && let Err(error) =
+        // so after a call whose handler kept a view of it
+        // (`ThreadState::entry_import`) it reads it as the kernel's view holds
+        // it (`EntryImport`). Only that call runs the check boxed, as it keeps
+        // the view across an await; the rest run it inline. The failure path
+        // is boxed too. Neither then grows every syscall's future
+        // (`hot_path_futures_stay_small`), and no other call allocates.
+        if let Ok(ret) = res {
+            if guest.thread_state().entry_import.is_none() {
+                self.refuse_exit_dependencies(guest, &call, ret).await;
+            } else if let Err(error) =
                 Box::pin(self.refuse_exit_dependencies_in_view(guest, &call, ret)).await
-        {
-            let res = Err(error);
-            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
+            {
+                return Box::pin(self.complete_after_posthook_failure(
+                    guest,
+                    new_count,
+                    error,
+                    interrupted,
+                ))
                 .await;
-            return self.complete_syscall(guest, res).await;
+            }
         }
 
         // The guest resumes with this result in its return register (A5 step
@@ -6466,19 +6495,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
         {
-            let entry = entry_view(guest, &call);
-            let view = entry
-                .as_deref()
-                .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
-            let observed = io_buffers::detlog_io_buffers(
-                guest,
-                &call,
-                *ret,
-                dettid,
-                rng_readv_output.as_deref(),
-            );
-            let restored = restore_entry_view(guest, view);
-            if let Err(error) = restored.and(observed) {
+            // The view is dropped before any await below, so it never grows
+            // this future (`hot_path_futures_stay_small`).
+            let observed = {
+                let entry = entry_view(guest, &call);
+                let view = entry
+                    .as_deref()
+                    .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
+                let observed = io_buffers::detlog_io_buffers(
+                    guest,
+                    &call,
+                    *ret,
+                    dettid,
+                    rng_readv_output.as_deref(),
+                );
+                restore_entry_view(guest, view).and(observed)
+            };
+            if let Err(error) = observed {
                 let res = Err(error);
                 self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
                     .await;

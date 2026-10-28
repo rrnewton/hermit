@@ -37,6 +37,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::entry_import::Displaced;
 use crate::syscalls::entry_import::EntryImport;
+use crate::syscalls::entry_import::InFlightDisplaced;
 use crate::syscalls::threads::BlockedWaitSignalError;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
@@ -530,12 +531,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
                 .collect()
         };
-        // The array as the call began, in the form the guest's own `writev`
-        // copies it: that attempt may come after another thread has run
-        // (`EntryImport`), unlike the later ones, which write from `iovecs`.
-        // Boxed, so the call's future stays small (`hot_path_futures_stay_small`).
-        let entry_import =
-            EntryImport::capture(&guest.memory(), &Syscall::Writev(call)).map(Box::new);
         let requested = iovecs.iter().try_fold(0usize, |total, (_, length)| {
             total.checked_add(*length).ok_or(Errno::EINVAL)
         })?;
@@ -546,6 +541,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         if target == 0 {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
+
+        // The array as the call began, in the form the guest's own `writev`
+        // copies it: that attempt may come after another thread has run
+        // (`EntryImport`), unlike the later ones, which write from `iovecs`.
+        // Kept in the thread's state, so the call's future stays small
+        // (`ThreadState::polled_entry_import`), and taken past the early
+        // returns above that hand the call to `execute_nonblockable_fd_syscall`
+        // or fail with EINVAL: that fallback polls through
+        // `retry_nonblocking_syscall`, which keeps its own.
+        capture_polled_entry_import(guest, Syscall::Writev(call));
 
         let atomic_pipe_write = target <= PIPE_BUF;
 
@@ -724,25 +729,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 // The guest's own `writev` copies the guest's array again; a
                 // segment `write` names Hermit's copy.
-                let displaced = matches!(current, Syscall::Writev(_))
-                    .then(|| entry_import.as_ref())
-                    .flatten()
-                    .map(|entry| entry.reinstate(&mut guest.memory()));
-                let result = match subtool {
+                if matches!(current, Syscall::Writev(_)) {
+                    reinstate_polled_entry_import(guest);
+                }
+                match subtool {
                     Some(detcore) => {
                         detcore
                             .record_or_replay_preserving_tool_errors(guest, current)
                             .await
                     }
                     None => guest.inject_with_retry(current).await.map_err(Error::from),
-                };
-                if let Err(error) =
-                    put_back_entry_import(guest, &entry_import, displaced, result.is_ok())
-                {
-                    break Err(error);
                 }
-                result
             };
+            // What the guest's own attempt displaced goes back; an atomic
+            // attempt or a segment `write` displaced nothing, and this does
+            // nothing for them.
+            if let Err(error) = put_back_polled_entry_import(guest, result.is_ok()) {
+                break Err(error);
+            }
             match result {
                 Ok(written) if written > 0 => {
                     let written = match usize::try_from(written) {
@@ -837,7 +841,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             record_retry_event(guest, call).await;
         };
-        keep_entry_view(guest, entry_import);
+        keep_polled_entry_view(guest);
 
         match turn_wait {
             Some(mut wait) => {
@@ -2501,8 +2505,9 @@ where
     // below sees as it was now, as the kernel's one copy would be
     // (`EntryImport`). Linux copies it before the call can wait, so a thread
     // that rewrites it while the call waits changes nothing the call moves.
-    // Boxed, so the call's future stays small (`hot_path_futures_stay_small`).
-    let entry_import = EntryImport::capture(&guest.memory(), &call0.into()).map(Box::new);
+    // Kept in the thread's state, so the call's future stays small
+    // (`ThreadState::polled_entry_import`).
+    capture_polled_entry_import(guest, call0.into());
     // The stack-allocated memory here needs to live across the loop, which means
     // surviving multiple syscall injections:
     let (mut call, mut maybe_stackguard) = call0.into_nonblocking(guest).await;
@@ -2623,9 +2628,7 @@ where
         // The call's memory as it began, for this attempt and for the reads
         // of it below, and what another thread wrote over it meanwhile, which
         // goes back once the attempt is made.
-        let displaced = entry_import
-            .as_ref()
-            .map(|entry| entry.reinstate(&mut guest.memory()));
+        reinstate_polled_entry_import(guest);
         // A receive whose descriptors Detcore names reads its geometry again
         // right before each attempt: a sibling may have changed it while an
         // earlier attempt waited (`ThreadState::receive_geometry`).
@@ -2646,7 +2649,7 @@ where
                 Box::pin(Detcore::<T>::changed_placeholder_send(guest, &inspection)).await
         {
             tracing::error!("Detcore refuses {}: {reason}", inspection.sysno);
-            if let Err(error) = put_back_entry_import(guest, &entry_import, displaced, false) {
+            if let Err(error) = put_back_polled_entry_import(guest, false) {
                 break Err(error);
             }
             let panic_on_unsupported_syscalls = guest.config().panic_on_unsupported_syscalls;
@@ -2670,7 +2673,7 @@ where
             }
             None => guest.inject_with_retry(call).await.map_err(Error::from),
         };
-        if let Err(error) = put_back_entry_import(guest, &entry_import, displaced, res.is_ok()) {
+        if let Err(error) = put_back_polled_entry_import(guest, res.is_ok()) {
             break Err(error);
         }
         // Under record and replay the attempt is a plain injection, which the
@@ -2758,7 +2761,7 @@ where
             break res;
         }
     };
-    keep_entry_view(guest, entry_import);
+    keep_polled_entry_view(guest);
 
     // The single exit: the guest's mask goes back before the result is
     // returned. A mask `block_in_place` installed goes back through
@@ -2902,6 +2905,70 @@ where
             );
             Error::from(errno)
         })
+}
+
+/// Take the polled call's memory as it began (`EntryImport::capture`) into
+/// `ThreadState::polled_entry_import`.
+fn capture_polled_entry_import<T, G>(guest: &mut G, call: Syscall)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    debug_assert!(
+        guest.thread_state().polled_entry_displaced.0.is_none(),
+        "a polled call's displaced bytes outlived its attempt"
+    );
+    let entry_import = EntryImport::capture(&guest.memory(), &call).map(Box::new);
+    let state = guest.thread_state_mut();
+    state.polled_entry_import = entry_import;
+    state.polled_entry_displaced = Default::default();
+}
+
+/// [`keep_entry_view`] for the polled call's memory, as its polling ends.
+fn keep_polled_entry_view<T, G>(guest: &mut G)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let entry_import = guest.thread_state_mut().polled_entry_import.take();
+    keep_entry_view(guest, entry_import);
+}
+
+/// Write back the polled call's memory as it began
+/// (`ThreadState::polled_entry_import`) for its next attempt, and keep what
+/// another thread wrote over it meanwhile (`polled_entry_displaced`) until
+/// the attempt is made. Nothing for a call that keeps no import.
+fn reinstate_polled_entry_import<T, G>(guest: &mut G)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    debug_assert!(
+        guest.thread_state().polled_entry_displaced.0.is_none(),
+        "a polled call's attempt began before the last one's bytes went back"
+    );
+    let Some(entry) = guest.thread_state_mut().polled_entry_import.take() else {
+        return;
+    };
+    let displaced = entry.reinstate(&mut guest.memory());
+    let state = guest.thread_state_mut();
+    state.polled_entry_import = Some(entry);
+    state.polled_entry_displaced = InFlightDisplaced(Some(displaced));
+}
+
+/// [`put_back_entry_import`] for the polled call's memory and what the
+/// attempt's reinstatement displaced (`ThreadState::polled_entry_import`,
+/// `polled_entry_displaced`).
+fn put_back_polled_entry_import<T, G>(guest: &mut G, completed: bool) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let entry_import = guest.thread_state_mut().polled_entry_import.take();
+    let displaced = guest.thread_state_mut().polled_entry_displaced.0.take();
+    let result = put_back_entry_import(guest, &entry_import, displaced, completed);
+    guest.thread_state_mut().polled_entry_import = entry_import;
+    result
 }
 
 /// Keep a call's memory as it began (`EntryImport`) for the observers that

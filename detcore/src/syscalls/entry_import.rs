@@ -79,6 +79,19 @@ pub(crate) struct Displaced {
     regions: Vec<(usize, Vec<u8>)>,
 }
 
+/// A [`Displaced`] a thread's state holds while the attempt that displaced
+/// it is in flight (`ThreadState::polled_entry_displaced`). `ThreadState`
+/// derives `Clone` and `Displaced` is not `Clone`: a clone starts with none,
+/// since only the thread whose attempt is in flight may put the bytes back.
+#[derive(Debug, Default)]
+pub(crate) struct InFlightDisplaced(pub(crate) Option<Displaced>);
+
+impl Clone for InFlightDisplaced {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
 impl Displaced {
     /// Whether another thread had changed none of the call's memory.
     pub(crate) fn is_empty(&self) -> bool {
