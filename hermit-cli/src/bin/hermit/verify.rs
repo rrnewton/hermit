@@ -2420,6 +2420,11 @@ mod tests {
     /// the page, and a one-page pipe has no empty page for the rest.
     #[test]
     fn signal_reports_fill_a_pipe_that_cannot_take_them_whole() {
+        if crate::run_in_fresh_process(
+            "verify::tests::signal_reports_fill_a_pipe_that_cannot_take_them_whole",
+        ) {
+            return;
+        }
         let mut fds = [0; 2];
         // SAFETY: `fds` has room for the two descriptors.
         assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
@@ -2698,16 +2703,30 @@ mod tests {
 
     #[test]
     fn real_container_failure_replaces_run1_stamp() {
+        if crate::run_in_fresh_process("verify::tests::real_container_failure_replaces_run1_stamp")
+        {
+            return;
+        }
         check_real_container_failure(VerificationRun::Run1);
     }
 
     #[test]
     fn real_container_failure_replaces_run2_stamp_without_claiming_run1_status() {
+        if crate::run_in_fresh_process(
+            "verify::tests::real_container_failure_replaces_run2_stamp_without_claiming_run1_status",
+        ) {
+            return;
+        }
         check_real_container_failure(VerificationRun::Run2);
     }
 
     #[test]
     fn real_container_zero_exit_and_deliberate_stops_remain_distinct() {
+        if crate::run_in_fresh_process(
+            "verify::tests::real_container_zero_exit_and_deliberate_stops_remain_distinct",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("verify.json");
         for code in [
@@ -2846,6 +2865,11 @@ mod tests {
 
     #[test]
     fn returned_guest_signal_and_unknown_error_do_not_become_container_failure() {
+        if crate::run_in_fresh_process(
+            "verify::tests::returned_guest_signal_and_unknown_error_do_not_become_container_failure",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("verify.json");
         write_pending_verification_json(&path).unwrap();
@@ -3174,6 +3198,11 @@ mod tests {
     /// omitted when it cannot be delivered; the log is still kept.
     #[test]
     fn log_cap_retention_report_survives_a_stderr_without_a_reader() {
+        if crate::run_in_fresh_process(
+            "verify::tests::log_cap_retention_report_survives_a_stderr_without_a_reader",
+        ) {
+            return;
+        }
         retention_child_entry();
         let dir = tempfile::tempdir().unwrap();
         let (reader, writer) = retention_stderr_pipe();
@@ -3194,6 +3223,11 @@ mod tests {
     /// drains: the `eprintln!` report waited for it forever.
     #[test]
     fn log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe() {
+        if crate::run_in_fresh_process(
+            "verify::tests::log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe",
+        ) {
+            return;
+        }
         retention_child_entry();
         let dir = tempfile::tempdir().unwrap();
         let (reader, writer) = retention_stderr_pipe();
@@ -3233,6 +3267,11 @@ mod tests {
     /// failure class (a timeout stands for those here).
     #[test]
     fn retention_report_reads_as_before_when_stderr_has_room() {
+        if crate::run_in_fresh_process(
+            "verify::tests::retention_report_reads_as_before_when_stderr_has_room",
+        ) {
+            return;
+        }
         use std::io::Read as _;
         retention_child_entry();
         for class in ["log cap", "timeout"] {
@@ -4448,6 +4487,11 @@ mod tests {
 
     #[test]
     fn failed_comparison_materialization_holds_the_retained_count_at_the_bound() {
+        if crate::run_in_fresh_process(
+            "verify::tests::failed_comparison_materialization_holds_the_retained_count_at_the_bound",
+        ) {
+            return;
+        }
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         let root = temporary.path().join("verify-failures");
@@ -4476,6 +4520,11 @@ mod tests {
 
     #[test]
     fn failed_comparison_retirement_refuses_a_log_diff_reader() {
+        if crate::run_in_fresh_process(
+            "verify::tests::failed_comparison_retirement_refuses_a_log_diff_reader",
+        ) {
+            return;
+        }
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         let root = temporary.path().join("verify-failures");
@@ -4507,6 +4556,11 @@ mod tests {
 
     #[test]
     fn failed_comparison_retirement_protects_symlinked_readers() {
+        if crate::run_in_fresh_process(
+            "verify::tests::failed_comparison_retirement_protects_symlinked_readers",
+        ) {
+            return;
+        }
         for file_alias in [false, true] {
             let temporary = tempfile::tempdir().unwrap();
             let source = temporary.path().join("source");
