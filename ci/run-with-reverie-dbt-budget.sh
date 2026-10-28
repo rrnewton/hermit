@@ -3161,7 +3161,13 @@ fi
 # build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
 # This pin changes no tool selection or native recipe; limits retained.
 # This is budget carry, not a native cache HIT or a fresh timing sample.
-expected_pin=78e3cadac76b5cc3b937f46d63d2e1d73e9973f6
+# F1 CARRY TO a11b1ebb7cdd7d67b891bc88cb5caca636546482: native recipe input objects equal 78e3cadac76b5cc3b937f46d63d2e1d73e9973f6.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+# a11b1ebb7 is Reverie #1153 (47573df97, a11b1ebb7) on 78e3cadac; it is not on
+# Reverie's main branch yet, and the pin moves to the landed revision once it is.
+expected_pin=a11b1ebb7cdd7d67b891bc88cb5caca636546482
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
