@@ -47,7 +47,10 @@
 //!   (`idr_alloc_cyclic`, kernel/pid.c:237), so a later thread has the higher
 //!   id until the ids wrap.
 //! - `curr_target` starts at the leader (kernel/fork.c:1662) and moves to each
-//!   thread step 2 chooses. Linux moves it on when that thread exits
+//!   thread step 2 chooses, once the forwarded call has succeeded
+//!   (`Scheduler::process_signal_sent`): a call the kernel fails before it
+//!   queues anything, or one Detcore refuses, never reaches
+//!   `complete_signal`. Linux moves it on when that thread exits
 //!   (`__exit_signal`, kernel/exit.c:187-188); here the walk starts at the
 //!   first live thread at or after it, which is the same thread unless a
 //!   thread was created after the last thread in the list exited.
@@ -236,6 +239,9 @@ impl Scheduler {
         sender: DetTid,
         signo: i32,
     ) -> ProcessSignalReceiver {
+        // Only this choice's own move can be committed by the call that
+        // follows it.
+        self.pending_signal_curr_target = None;
         if !self.models_signal_targets {
             return ProcessSignalReceiver::NotModeled;
         }
@@ -344,13 +350,9 @@ impl Scheduler {
         // `complete_signal` (`prepare_signal`, signal.c:1053-1054), so it
         // moves nothing and takes no thread; its copy is dropped at the send.
         let discarded = self.discarded_when_sent_to(named, signo, Some(sender));
-        if let Some(thread) = moved
-            && !discarded
-        {
-            self.signal_curr_targets.insert(process, thread);
-        }
         // Under ptrace the sender is the only thread the kernel's own
-        // `complete_signal` admits, so a forwarded copy reaches it first.
+        // `complete_signal` admits, so a forwarded copy reaches it first. The
+        // send is refused, so it moves nothing.
         if let ProcessSignalReceiver::Thread { thread, .. } = receiver
             && thread != sender
             && process == self.sigchld_process(sender)
@@ -360,6 +362,12 @@ impl Scheduler {
         {
             return ProcessSignalReceiver::SenderTakesIt;
         }
+        // The walk's choice becomes `curr_target` once the forwarded call has
+        // succeeded (`process_signal_sent`), as Linux moves it only for a send
+        // that reaches `complete_signal`.
+        self.pending_signal_curr_target = moved
+            .filter(|_| !discarded)
+            .map(|thread| (sender, process, thread));
         if let ProcessSignalReceiver::Thread {
             thread,
             sole: false,
@@ -379,6 +387,19 @@ impl Scheduler {
             threads
         );
         receiver
+    }
+
+    /// `sender`'s forwarded process-directed send to `process` succeeded: the
+    /// thread the walk chose for it, if the walk chose one, becomes the
+    /// process's `curr_target` (`process_signal_receiver`). A send that failed
+    /// never reports, and the next choice discards its move.
+    pub(crate) fn process_signal_sent(&mut self, sender: DetTid, process: DetPid) {
+        if let Some((chooser, chosen_in, thread)) = self.pending_signal_curr_target.take()
+            && chooser == sender
+            && chosen_in == process
+        {
+            self.signal_curr_targets.insert(process, thread);
+        }
     }
 
     /// The thread step 3 resumes before any other because it is to take a

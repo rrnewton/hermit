@@ -2456,7 +2456,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             OwnProcessSend::NotOwn => {}
         }
         let named = DetTid::from_raw(tgid);
-        let tid = match self
+        let target = self
             .process_signal_target(
                 guest,
                 Sysno::kill,
@@ -2464,9 +2464,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 named,
                 call.sig(),
             )
-            .await?
-        {
-            ProcessSignalTarget::Thread(tid) => tid,
+            .await?;
+        let tid = match target {
+            ProcessSignalTarget::Thread(tid) | ProcessSignalTarget::Chosen(tid) => tid,
             ProcessSignalTarget::SharedQueue => {
                 return self
                     .send_guest_signal(
@@ -2567,6 +2567,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?
         };
+        if let ProcessSignalTarget::Chosen(_) = target {
+            crate::tool_global::process_signal_sent(guest, DetPid::from_raw(process)).await;
+        }
         self.notify_cross_task_signal(
             guest,
             tid,
@@ -3121,7 +3124,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let reason = match receiver {
             Some(ProcessSignalReceiver::Thread { thread, .. }) => {
-                return Ok(ProcessSignalTarget::Thread(thread));
+                return Ok(ProcessSignalTarget::Chosen(thread));
             }
             // Linux queues no second copy and chooses no thread: the call is
             // forwarded, and the thread chosen for the copy already queued
@@ -4484,7 +4487,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             target => target?,
         };
         let tid = match target {
-            ProcessSignalTarget::Thread(tid) => tid,
+            ProcessSignalTarget::Thread(tid) | ProcessSignalTarget::Chosen(tid) => tid,
             ProcessSignalTarget::SharedQueue => {
                 return self
                     .send_guest_signal(
@@ -4548,6 +4551,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?
         };
+        if let ProcessSignalTarget::Chosen(_) = target {
+            crate::tool_global::process_signal_sent(guest, DetPid::from_raw(process)).await;
+        }
         self.notify_cross_task_signal(
             guest,
             tid,
@@ -5953,6 +5959,12 @@ pub(crate) enum ProcessSignalTarget {
     /// take it from the shared queue first, the scheduler resumes this one
     /// before them (`Scheduler::first_process_signal_taker`).
     Thread(DetTid),
+    /// Like `Thread`, but chosen among several live threads by the scheduler
+    /// (`Scheduler::process_signal_receiver`): once the forwarded call
+    /// succeeds, the caller reports it (`tool_global::process_signal_sent`),
+    /// so that the walk's choice becomes the process's `curr_target`, as
+    /// Linux moves it only for a send that reaches `complete_signal`.
+    Chosen(DetTid),
     /// Several live threads and none wants the signal: the call is forwarded
     /// unchanged too, and the signal waits in the process's shared queue for
     /// the first thread that can take it, waking none.

@@ -4191,6 +4191,12 @@ impl GlobalState {
                         .process_signal_receiver(process, named, dtid, signo),
                 )
             }
+            GlobalRequest::ProcessSignalSent(process) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .process_signal_sent(dtid, process);
+                R::ProcessSignalSent(())
+            }
             GlobalRequest::SetChildTidAddress(address) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -6939,6 +6945,11 @@ pub enum GlobalRequest {
     /// (`Scheduler::process_signal_receiver`).
     ProcessSignalReceiver(DetPid, DetTid, i32),
 
+    /// The calling thread's forwarded process-directed send to this process,
+    /// whose receiver the scheduler chose, succeeded
+    /// (`Scheduler::process_signal_sent`).
+    ProcessSignalSent(DetPid),
+
     /// The calling thread sends SIGSTKFLT (`Scheduler::record_guest_marker_signal`).
     RecordGuestMarkerSignal,
 
@@ -7529,6 +7540,7 @@ pub enum GlobalResponse {
     SetSigtimedwaitSet(()),
     OwnProcessSignalInputs(OwnProcessSignalInputs),
     ProcessSignalReceiver(ProcessSignalReceiver),
+    ProcessSignalSent(()),
     RecordGuestMarkerSignal(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
@@ -8442,6 +8454,22 @@ where
     {
         GlobalResponse::ProcessSignalReceiver(receiver) => receiver,
         response => unreachable!("unexpected response to ProcessSignalReceiver: {response:?}"),
+    }
+}
+
+/// The calling thread's forwarded process-directed send to `process`, whose
+/// receiver the scheduler chose, succeeded (`Scheduler::process_signal_sent`).
+pub(crate) async fn process_signal_sent<G, T>(guest: &mut G, process: DetPid)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::ProcessSignalSent(process))
+        .await
+        .1
+    {
+        GlobalResponse::ProcessSignalSent(()) => {}
+        response => unreachable!("unexpected response to ProcessSignalSent: {response:?}"),
     }
 }
 
