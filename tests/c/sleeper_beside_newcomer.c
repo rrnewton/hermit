@@ -10,7 +10,7 @@
  * A thread that sleeps for less than a scheduler turn charge in a loop, beside
  * a thread that main creates later, or beside one that is already running.
  *
- * usage: sleeper_beside_newcomer [existing]
+ * usage: sleeper_beside_newcomer [existing|zero]
  *
  * Thread S loops on nanosleep(100 us) until told to stop.
  *   (no argument): main waits until S has slept 200 times, creates thread C
@@ -19,7 +19,8 @@
  *   existing: main creates thread C, which sleeps 50 ms, and then S, and
  *     joins C. C stops S when it wakes. Prints how late, in microseconds, C
  *     woke after its 50 ms.
- * Both also print how many times S slept.
+ *   zero: as existing, but S loops on nanosleep of zero, a yield idiom.
+ * Each also prints how many times S slept.
  */
 
 #include <pthread.h>
@@ -30,6 +31,7 @@
 
 static atomic_int stop;
 static atomic_long sleeps;
+static struct timespec interval = {.tv_sec = 0, .tv_nsec = 100000};
 static long long created_us;
 static long long first_us;
 
@@ -41,9 +43,8 @@ static long long now_us(void) {
 
 static void* sleeper(void* arg) {
   (void)arg;
-  struct timespec t = {.tv_sec = 0, .tv_nsec = 100000};
   while (!atomic_load(&stop)) {
-    nanosleep(&t, NULL);
+    nanosleep(&interval, NULL);
     atomic_fetch_add(&sleeps, 1);
   }
   return NULL;
@@ -69,8 +70,14 @@ static void* newcomer(void* arg) {
 int main(int argc, char** argv) {
   pthread_t s, c;
   if (argc > 1) {
-    if (strcmp(argv[1], "existing") ||
-        pthread_create(&c, NULL, napper, NULL) != 0 ||
+    int zero = strcmp(argv[1], "existing") != 0;
+    if (zero && strcmp(argv[1], "zero") != 0) {
+      return 2;
+    }
+    if (zero) {
+      interval.tv_nsec = 0;
+    }
+    if (pthread_create(&c, NULL, napper, NULL) != 0 ||
         pthread_create(&s, NULL, sleeper, NULL) != 0) {
       return 2;
     }

@@ -3151,7 +3151,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
-    ("test.detcore_unit", 3034),
+    // And https://github.com/rrnewton/hermit/pull/4658's
+    // scheduler::test::a_grant_notes_a_due_sleep_and_a_new_threads_lost_grant
+    // and syscalls::time::sleep_request_tests::only_a_relative_sleep_of_zero_is_a_zero_length_sleep,
+    // restored after train 7 dropped them: 3034 + 2 = 3036, listed.
+    ("test.detcore_unit", 3036),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4484,7 +4488,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
-    ("test.cli", 744),
+    // https://github.com/rrnewton/hermit/pull/4658's four chaos cases,
+    // chaos_change_points_come_within_a_timeslice_of_turn_charges,
+    // a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second,
+    // a_thread_that_has_run_still_waits_behind_a_short_sleep_loop and
+    // a_worker_is_not_held_off_by_futex_waits_that_time_out, need the PMU
+    // timer, which the hosted runner lacks, so they are skipped by exact name
+    // here and run in privileged-test.pmu_cli_cases with the fifth,
+    // a_thread_that_has_run_does_not_wait_behind_a_zero_length_sleep_loop,
+    // restored after train 7 dropped them: 744 - 4 = 740, listed.
+    ("test.cli", 740),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4571,7 +4584,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // replay needs a PMU stop on a branch count to go wrong, joins them: 17,
     // listed.
     // The PR 4853 transplant adds three timeslice cases here: 18 + 3 = 21, re-measured at this integration head.
-    ("privileged-test.pmu_cli_cases", 21),
+    // The five chaos turn-count cases of
+    // https://github.com/rrnewton/hermit/pull/4658, which need the PMU timer
+    // and a counter strict mode accepts, join them: 21 + 5 = 26, listed.
+    ("privileged-test.pmu_cli_cases", 26),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -5056,7 +5072,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
-    ("test.cli_on_host", 663),
+    // The same four PMU chaos cases of
+    // https://github.com/rrnewton/hermit/pull/4658, skipped by exact name
+    // here as in test.cli, with the fifth: 663 - 4 = 659, listed.
+    ("test.cli_on_host", 659),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5559,7 +5578,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
     // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
-    ("test.detcore_unit_on_host", 3034),
+    // And the same grant-note and zero-length-sleep units of
+    // https://github.com/rrnewton/hermit/pull/4658: 3034 + 2 = 3036, listed.
+    ("test.detcore_unit_on_host", 3036),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -9808,7 +9829,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         ],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 75.0,
+            est_duration_s: 183.0,
             rss_baseline_bytes: Some(4294967296),
             hard_mem_max_bytes: Some(8589934592),
             classification: StepClass::CpuBound,

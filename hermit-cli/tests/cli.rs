@@ -49069,6 +49069,11 @@ fn a_socket_reader_beside_a_spinner_is_retried_within_a_poll_upgrade_period() {
 /// one turn of the recording (0.6 ms of wait, one hand-off), and the seed-3
 /// recording, whose slices the bound leaves alone, must replay exactly under
 /// `--chaos --replay-preemptions-from` at another seed.
+///
+/// PMU REQUIRED: chaos change points come where the PMU timer ends a slice,
+/// and `--strict` refuses a host whose retired-branch counter fails Reverie's
+/// validation. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn chaos_change_points_come_within_a_timeslice_of_turn_charges() {
     let _guard = hermit_run_guard();
@@ -49275,6 +49280,11 @@ fn chaos_change_points_come_within_a_timeslice_of_turn_charges() {
 /// --replay-schedule-from` (as analyze trials run). Its preemption replay is
 /// one turn off until https://github.com/rrnewton/hermit/pull/4597 lands, as
 /// for chaos_change_points_come_within_a_timeslice_of_turn_charges.
+///
+/// PMU REQUIRED: chaos change points come where the PMU timer ends a slice,
+/// and `--strict` refuses a host whose retired-branch counter fails Reverie's
+/// validation. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second() {
     let _guard = hermit_run_guard();
@@ -49391,6 +49401,11 @@ fn a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second() 
 /// holding is what reproduces a real use-after-free (main held off for 3.8 s
 /// behind a 200 us sleep loop), so the test guards it: the thread must wake
 /// at least 1 s late.
+///
+/// PMU REQUIRED: chaos change points come where the PMU timer ends a slice,
+/// and `--strict` refuses a host whose retired-branch counter fails Reverie's
+/// validation. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn a_thread_that_has_run_still_waits_behind_a_short_sleep_loop() {
     let _guard = hermit_run_guard();
@@ -49425,6 +49440,67 @@ fn a_thread_that_has_run_still_waits_behind_a_short_sleep_loop() {
     );
 }
 
+/// The same guest with `zero` (tests/c/sleeper_beside_newcomer.c): the loop
+/// sleeps for no time (`nanosleep` of zero, a yield idiom) beside the thread
+/// that has run. `sleep_request` marks each of those sleeps a zero-length
+/// sleep (`Resources::zero_length_sleep`), so unlike a 100 us sleep's their
+/// turns count toward the loop's chaos slice: within about 400 of them a
+/// change point comes, and the starvation bound puts the loop behind the
+/// thread it passed over. At `--chaos --seed=4` and `--seed=8`, where the
+/// thread is drawn behind the loop, it wakes 0.30 s late. With the mark lost
+/// (`zero_length_sleep` left false), each zero-length sleep is due at its
+/// grant and leaves the count, and the thread wakes 5.8 s and 19.9 s late.
+/// Each seed must wake it within 1 s, and at least 0.1 s late: at seeds where
+/// the thread is not drawn behind the loop it wakes within 51 ms, and such a
+/// seed would prove nothing. Seed 4 is also the seed of
+/// a_thread_that_has_run_still_waits_behind_a_short_sleep_loop.
+///
+/// PMU REQUIRED: chaos change points come where the PMU timer ends a slice,
+/// and `--strict` refuses a host whose retired-branch counter fails Reverie's
+/// validation. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
+#[test]
+fn a_thread_that_has_run_does_not_wait_behind_a_zero_length_sleep_loop() {
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&SLEEPER_BESIDE_NEWCOMER_GUEST, "sleeper_beside_newcomer")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for seed in ["4", "8"] {
+        let output = hermit(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "120",
+            "--chaos",
+            "--seed",
+            seed,
+            "--",
+            &guest,
+            "zero",
+        ]);
+        let out = stdout(&output);
+        assert!(output.status.success(), "seed {seed}: {}", stderr(&output));
+        let late_us: u64 = out
+            .split_whitespace()
+            .nth(3)
+            .and_then(|word| word.parse().ok())
+            .unwrap_or_else(|| panic!("seed {seed}: unexpected output {out:?}"));
+        assert!(
+            late_us >= 100_000,
+            "seed {seed}: the thread that had run woke only {late_us} us late, so this seed no \
+             longer draws it behind the loop of zero-length sleeps; pick seeds that do (0.30 s \
+             late at seeds 4 and 8 when they were chosen)"
+        );
+        assert!(
+            late_us < 1_000_000,
+            "seed {seed}: the thread that had run woke {late_us} us late behind a loop of \
+             zero-length sleeps; check that sleep_request still marks them \
+             (Resources::zero_length_sleep) and that their turns count toward a chaos slice"
+        );
+    }
+}
+
 /// Four threads loop on a 10 us `pthread_cond_timedwait` that nobody signals,
 /// beside a compute-bound worker (tests/c/pollers_beside_worker.c). Each
 /// timed-out wait is a turn charged half a millisecond of virtual time for a
@@ -49436,6 +49512,11 @@ fn a_thread_that_has_run_still_waits_behind_a_short_sleep_loop() {
 /// not finish within 60 s. Here it is held off for at most 1.2 s at a time
 /// and finishes within 10 s of virtual time. Each seed must finish and keep
 /// the worker's longest gap under 5 s.
+///
+/// PMU REQUIRED: chaos change points come where the PMU timer ends a slice,
+/// and `--strict` refuses a host whose retired-branch counter fails Reverie's
+/// validation. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it.
 #[test]
 fn a_worker_is_not_held_off_by_futex_waits_that_time_out() {
     let _guard = hermit_run_guard();

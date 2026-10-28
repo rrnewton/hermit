@@ -778,13 +778,23 @@ pub struct Resources {
     /// because `Resources` crosses positional RPCs.
     #[serde(default)]
     pub(crate) slice_expired: bool,
-    /// Set on a sleep its caller asked to last no time (`nanosleep` of zero,
-    /// `poll` with no descriptors and a zero timeout): a yield idiom whose
-    /// deadline is the moment it was asked, not a wait for time to pass
-    /// (`scheduler::ends_a_due_sleep`). `false` for every other request,
-    /// including an absolute sleep whose deadline has already passed.
-    /// Appended last and `#[serde(default)]`: `Resources` travels in bincode
-    /// RPCs, which decode by position.
+    /// Set by `Detcore::sleep_request` on a relative sleep its caller asked to
+    /// last no time (`nanosleep` or `clock_nanosleep` of zero, `usleep(0)`): a
+    /// yield idiom whose deadline is the moment it was asked, not a wait for
+    /// time to pass (`scheduler::ends_a_due_sleep`). `false` for every other
+    /// request, including an absolute sleep whose deadline has already passed.
+    /// `handle_external_poll` also builds such a request for a `poll` of no
+    /// descriptors with a zero timeout, but it runs only without sequentialized
+    /// threads or under `hermit record`/`hermit replay` (`handle_poll`), where
+    /// no chaos hint applies. With sequentialized threads a zero-timeout `poll`
+    /// takes `zero_timeout_poll_request` instead, which is not a `SleepUntil`
+    /// and always counts toward a chaos slice.
+    /// Appended last because `Resources` travels in bincode RPCs, which decode
+    /// by position. `#[serde(default)]` does not let a payload without it
+    /// decode: bincode does not default a missing trailing field. A runtime
+    /// and a coordinator built on either side of this field refuse each other
+    /// before any request is decoded because of the global RPC revision in
+    /// the configuration fingerprint (revision 8 appended this field).
     #[serde(default)]
     pub(crate) zero_length_sleep: bool,
 }

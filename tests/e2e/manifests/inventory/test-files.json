@@ -934,7 +934,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/handoff_beside_newcomer.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/handoff_beside_newcomer.c is owned by hermit-cli/tests/cli.rs: The integration test chaos_change_points_come_within_a_timeslice_of_turn_charges runs this guest under run --strict --chaos at seeds 1-6 and requires the newly created thread's first turn within 1 s of virtual time and fewer than 10,000 hand-offs, verifies a chaos run at bitwise parity, and replays a chaos recording under --chaos --replay-schedule-from without a desync and under --chaos --replay-preemptions-from with the same output; a generic manifest cannot express the measured bounds, the parity check or the replay."
+      "why": "tests/c/handoff_beside_newcomer.c is owned by hermit-cli/tests/cli.rs: The integration test chaos_change_points_come_within_a_timeslice_of_turn_charges runs this guest under run --strict --chaos at seeds 1-6 and requires the newly created thread's first turn within 1 s of virtual time and fewer than 10,000 hand-offs, verifies a chaos run at bitwise parity, and replays a chaos recording under --chaos --replay-schedule-from without a desync and under --chaos --replay-preemptions-from with the same output; a generic manifest cannot express the measured bounds, the parity check or the replay, and the case needs the PMU timer, so it runs in privileged-test.pmu_cli_cases."
     },
     {
       "disposition": "manifest-test",
@@ -1762,7 +1762,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/pollers_beside_worker.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/pollers_beside_worker.c is owned by hermit-cli/tests/cli.rs: The integration test a_worker_is_not_held_off_by_futex_waits_that_time_out runs this guest under run --strict --chaos and requires the compute-bound worker to finish with its longest gap under 5 s of virtual time beside four pollers whose 10 us futex waits time out; a generic manifest cannot express the measured bound."
+      "why": "tests/c/pollers_beside_worker.c is owned by hermit-cli/tests/cli.rs: The integration test a_worker_is_not_held_off_by_futex_waits_that_time_out runs this guest under run --strict --chaos and requires the compute-bound worker to finish with its longest gap under 5 s of virtual time beside four pollers whose 10 us futex waits time out; a generic manifest cannot express the measured bound, and the case needs the PMU timer, so it runs in privileged-test.pmu_cli_cases."
     },
     {
       "disposition": "manifest-test",
@@ -2860,7 +2860,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/sleeper_beside_newcomer.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/sleeper_beside_newcomer.c is owned by hermit-cli/tests/cli.rs: The integration tests a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second and a_thread_that_has_run_still_waits_behind_a_short_sleep_loop run this guest under run --strict --chaos: a newly created thread must get its first turn within 1 s of virtual time beside a loop of 100 us sleeps (seeds 9, 23 and 24, with a bitwise-parity verify and a schedule replay), and a thread that has run must still wake at least 1 s late behind it (seed 4); a generic manifest cannot express the measured bounds or the parity and replay checks."
+      "why": "tests/c/sleeper_beside_newcomer.c is owned by hermit-cli/tests/cli.rs: The integration tests a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second, a_thread_that_has_run_still_waits_behind_a_short_sleep_loop and a_thread_that_has_run_does_not_wait_behind_a_zero_length_sleep_loop run this guest under run --strict --chaos: a newly created thread must get its first turn within 1 s of virtual time beside a loop of 100 us sleeps (seeds 9, 23 and 24, with a bitwise-parity verify and a schedule replay), a thread that has run must still wake at least 1 s late behind it (seed 4), and with the zero argument, behind a loop of zero-length sleeps, it must wake within 1 s (seeds 4 and 8); a generic manifest cannot express the measured bounds or the parity and replay checks, and the cases need the PMU timer, so they run in privileged-test.pmu_cli_cases."
     },
     {
       "disposition": "manifest-test",

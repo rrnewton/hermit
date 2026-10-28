@@ -1925,3 +1925,178 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sleep_request_tests {
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Tid;
+    use reverie::syscalls::Addr;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
+    use crate::Config;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::scheduler::ends_a_due_sleep;
+    use crate::tool_global::GlobalRequest;
+    use crate::tool_global::GlobalResponse;
+    use crate::types::DetPid;
+
+    /// The clock reading the coordinator answers.
+    fn now() -> LogicalTime {
+        LogicalTime::from_nanos(5_000_000)
+    }
+    const THREAD: DetPid = DetPid::from_raw(7);
+
+    /// A thread whose one RPC is the clock reading a relative sleep starts
+    /// from (`thread_observe_time`), answered with `now()`.
+    struct ClockReader {
+        config: Config,
+        thread: ThreadState<()>,
+    }
+
+    impl ClockReader {
+        fn new() -> Self {
+            let config = Config::default();
+            let mut thread = ThreadState::new(THREAD, &config, ());
+            thread.detpid = Some(THREAD);
+            Self { config, thread }
+        }
+    }
+
+    /// Building a sleep request takes no stack.
+    struct NoStack;
+    struct NoStackGuard;
+    impl Drop for NoStackGuard {
+        fn drop(&mut self) {}
+    }
+    impl Stack for NoStack {
+        type StackGuard = NoStackGuard;
+        fn size(&self) -> usize {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("building a sleep request must not use the guest stack")
+        }
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ClockReader {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            match message.2 {
+                GlobalRequest::GlobalTimeLowerBound => {
+                    (None, GlobalResponse::GlobalTimeLowerBound(now()))
+                }
+                other => panic!("building a sleep request sent {other:?}"),
+            }
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for ClockReader {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+
+        fn tid(&self) -> Tid {
+            Tid::from_raw(THREAD.as_raw())
+        }
+        fn pid(&self) -> Tid {
+            self.tid()
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            panic!("building a sleep request must not read guest memory")
+        }
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("building a sleep request must not read registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("building a sleep request must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+            panic!(
+                "building a sleep request must not inject {:?}",
+                call.number()
+            )
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("building a sleep request must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("building a sleep request must not set a timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("building a sleep request must not set a timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("building a sleep request must not read the clock")
+        }
+    }
+
+    /// `sleep_request`, which `nanosleep` and `clock_nanosleep` without
+    /// `TIMER_ABSTIME` build their request with, marks a sleep of zero length
+    /// (`usleep(0)` is `nanosleep` of zero) and no other: a yield idiom the
+    /// scheduler must not take for a due sleep at its deadline
+    /// (`ends_a_due_sleep`), so its turn counts toward a chaos slice. A sleep
+    /// of 1 ns or 100 us is not marked and is a due sleep once its deadline has
+    /// come, and so is an absolute sleep whose deadline is already now
+    /// (`sleep_request_abs`).
+    #[tokio::test]
+    async fn only_a_relative_sleep_of_zero_is_a_zero_length_sleep() {
+        for (length, zero_length) in [
+            (Duration::ZERO, true),
+            (Duration::from_nanos(1), false),
+            (Duration::from_micros(100), false),
+        ] {
+            let mut guest = ClockReader::new();
+            let request = <Detcore>::sleep_request(&mut guest, length).await;
+            let deadline = now() + length;
+            assert_eq!(request.zero_length_sleep, zero_length, "{length:?}");
+            assert_eq!(
+                request.resources.keys().collect::<Vec<_>>(),
+                [&ResourceID::SleepUntil(deadline)],
+                "{length:?}"
+            );
+            assert_eq!(
+                ends_a_due_sleep(&request, deadline),
+                !zero_length,
+                "{length:?}: a due sleep at its deadline"
+            );
+        }
+        let mut guest = ClockReader::new();
+        let request = <Detcore>::sleep_request_abs(&mut guest, now()).await;
+        assert!(!request.zero_length_sleep, "an absolute sleep");
+        assert!(
+            ends_a_due_sleep(&request, now()),
+            "an absolute sleep at its deadline"
+        );
+    }
+}
