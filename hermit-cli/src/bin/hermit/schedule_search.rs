@@ -1262,6 +1262,8 @@ mod tests {
             passing.clone(),
             failing.clone(),
             &within,
+            0,
+            &mut |_| {},
         )
         .unwrap();
         let mut realized = trimmed.clone();
@@ -1276,6 +1278,8 @@ mod tests {
             passing,
             failing,
             &Config::default(),
+            0,
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(result.failing_schedule, trimmed);
