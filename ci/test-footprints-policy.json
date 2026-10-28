@@ -234,5 +234,34 @@
       "paths": ["scripts/check-dagrun-naming.sh"],
       "nodes": ["check.dagrun_naming"]
     }
+  ],
+  "backend_rules": [
+    {
+      "_why": "Shared Reverie crates every backend builds on, plus crates whose reverse-dependency closure spans multiple backends (safeptrace, reverie-inguest; enforced by the generator closure check): a pin bump touching any of these (or the reverie workspace manifests) can affect every backend, so selection falls back to the full suite.",
+      "id": "reverie-core",
+      "paths": [],
+      "reverie_paths": [
+        "reverie/**",
+        "reverie-syscalls/**",
+        "reverie-process/**",
+        "reverie-util/**",
+        "reverie-rpc-transport/**",
+        "reverie-memory/**",
+        "reverie-loader/**",
+        "safeptrace/**",
+        "reverie-inguest/**",
+        "Cargo.toml",
+        "Cargo.lock"
+      ],
+      "backends": [
+        "*"
+      ],
+      "lanes": [
+        "portable",
+        "privileged"
+      ],
+      "extra_nodes": [],
+      "tier": "core"
+    }
   ]
 }

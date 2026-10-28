@@ -11351,10 +11351,6 @@ fn run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs() {
     assert_eq!(report["comparison"]["compare_io_buffers"], true);
 }
 
-
-
-
-
 #[test]
 fn run_dbt_verify_replays_stdin_bytes_and_eof() {
     if dbt_unavailable("run_dbt_verify_replays_stdin_bytes_and_eof") {
@@ -31046,7 +31042,6 @@ fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
 /// own fixed-stride counter, so DBT's run 1 log of `/bin/true` held none of the
 /// 10 rdtsc records ptrace's does.
 
-
 /// Detcore's syscall outputs respect page protection, as the kernel's own
 /// writes do (https://github.com/rrnewton/reverie/issues/1064, F1):
 /// - `rt_sigprocmask` makes Detcore push the filtered mask on the guest stack,
@@ -31212,7 +31207,6 @@ fn a_datagram_receive_ends_when_its_read_side_is_shut_down() {
 /// table: leaf 7 EBX was 0x001807a9 (HLE and RTM cleared) where ptrace's is
 /// 0x00180fb9, and DBT's `/proc/cpuinfo` was the host's.
 
-
 /// Under DBT, resource limits and clock resolutions are Detcore's, as under
 /// ptrace, so the two print the same bytes: getrlimit and prlimit64 for every
 /// resource, the errors for an unknown resource and a raised hard limit, a
@@ -31220,27 +31214,21 @@ fn a_datagram_receive_ends_when_its_read_side_is_shut_down() {
 /// for each clock. The DBT client no longer keeps a limit or clock table of
 /// its own (A8 step 2), so nothing but Detcore can answer these.
 
-
 /// A vfork child's clock read is refused by name under DBT. Ptrace's Detcore
 /// answers it, but a copied DBT child cannot enter Detcore, and the client no
 /// longer answers from a clock of its own (A8 step 2), so strict execution
 /// stops the run rather than let the child read the host's clock. Before, the
 /// client's own counter answered, a second clock beside Detcore's.
 
-
 /// A copied DBT child must refuse a scheduling-policy query in strict mode.
 /// Its non-strict native path and the ordinary shared Detcore answer are distinct.
 
-
 /// A copied child has no shared Tool memory writer for scheduler parameters.
-
 
 /// A copied child must not expose the host affinity mask in strict mode.
 
-
 /// A copied DBT child must refuse a priority query in strict mode.
 /// Its non-strict native path and the ordinary shared Detcore answer are distinct.
-
 
 /// [`cpuinfo_matches_cpuid`] on the DBT backend, whose `/proc/cpuinfo` Detcore
 /// now renders from the table it answers DBT's CPUID from. Before, DBT's guest
@@ -31248,11 +31236,9 @@ fn a_datagram_receive_ends_when_its_read_side_is_shut_down() {
 /// `/proc/cpuinfo` in place: on an AMD host it read AuthenticAMD while CPUID
 /// read GenuineIntel.
 
-
 /// DBT refuses `--cpu-profile x86-64-v3` by name: Detcore answers its CPUID,
 /// but the DBT runtime's configuration carries no CPU profile, so a v3 run
 /// would see the v2 table.
-
 
 /// The coordinator writes the records the in-guest Tool forwards into the log
 /// as it handles the guest's requests, so backend parity's own comparison
@@ -43371,7 +43357,6 @@ fn a_procfs_directory_keeps_its_size() {
 /// procfs entries and keeps the host's values for a directory with procfs's
 /// stat fields (`procfs_inode::unprovable_procfs_signature`; Codex and Claude
 /// re-checks of https://github.com/rrnewton/hermit/pull/4369).
-
 
 /// [`assert_procfs_directory_keeps_its_size`] on KVM.
 #[test]

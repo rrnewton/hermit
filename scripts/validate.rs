@@ -6307,6 +6307,164 @@ fn default_mode_bracket() -> Result<(), String> {
     Ok(())
 }
 
+/// Preserve the upstream DBT planner oracles against its committed 2033 graph.
+/// These are historical topology controls; the current core graph is checked
+/// independently by `selective_subset_bracket` below.
+fn historical_dbt_selective_subset_bracket(root: &Path) -> Result<(), String> {
+    let fixture = root.join("ci/testdata/coarse-selection-2033");
+    let committed = dag_from_json(
+        &std::fs::read_to_string(fixture.join("validate.json"))
+            .map_err(|error| format!("historical selective bracket: DAG: {error}"))?,
+    )
+    .map_err(|error| format!("historical selective bracket: DAG JSON: {error}"))?;
+    let full_base = dagrun::select_steps_by_labels(&committed, &["full".into()])?;
+    // Load the generated footprints for rule/footprint node sets.
+    let footprints: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.join("test-footprints.json"))
+            .map_err(|e| format!("selective bracket: footprints: {e}"))?,
+    )
+    .map_err(|e| format!("selective bracket: footprints JSON: {e}"))?;
+    let str_list = |value: &serde_json::Value, key: &str| -> Vec<String> {
+        value[key]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let local_nodes = |nodes: &[String]| -> BTreeSet<String> {
+        nodes
+            .iter()
+            .map(|node| local_validation_step_tag(node))
+            .collect()
+    };
+    let plan_tags =
+        |plan: &DagConfig| -> BTreeSet<String> { plan.steps.iter().map(Step::tag).collect() };
+    // (a) DBT route through the REAL planner: buckets == buckets that
+    // contain a DBT cell (derived from the expected plan, not hard-coded),
+    // plus the privileged DBT buckets, all hermit_integration shards and
+    // check.dbt_runtime_abi.
+    let dbt_rule = footprints["backend_rules"]
+        .as_array()
+        .and_then(|rules| rules.iter().find(|rule| rule["id"].as_str() == Some("dbt")))
+        .ok_or("selective bracket: dbt backend rule missing")?;
+    if footprints["backend_rules"].as_array().is_some_and(|rules| {
+        rules.iter().any(|r| {
+            matches!(
+                r["id"].as_str(),
+                Some("kvm" | "ptrace" | "liteinst" | "sabre" | "e9patch")
+            )
+        })
+    }) {
+        return Err("selective bracket: a dropped v1 backend route reappeared".into());
+    }
+    let expected_plan_for_buckets: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.join("expected-e2e-plan.json"))
+            .map_err(|e| format!("selective bracket: expected plan: {e}"))?,
+    )
+    .map_err(|e| format!("selective bracket: expected plan JSON: {e}"))?;
+    let derived_privileged_dbt_buckets = privileged_dbt_buckets_from_cells(
+        expected_plan_for_buckets["cells"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .as_slice(),
+    );
+    let dbt_plan = select_from_committed_decision(
+        &full_base,
+        full_base.steps.len(),
+        SelectDecision::Nodes(
+            local_nodes(&str_list(dbt_rule, "extra_nodes")),
+            SelectiveScope {
+                backends: vec!["dbt".into()],
+                backend_lanes: vec!["portable".into(), "privileged".into()],
+                backend_rules: vec!["dbt".into()],
+                ..Default::default()
+            },
+        ),
+        &derived_privileged_dbt_buckets,
+    )?;
+    let dbt_tags = plan_tags(&dbt_plan);
+    let expected_plan: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.join("expected-e2e-plan.json"))
+            .map_err(|e| format!("selective bracket: expected plan: {e}"))?,
+    )
+    .map_err(|e| format!("selective bracket: expected plan JSON: {e}"))?;
+    let mut expected_buckets: BTreeSet<String> = BTreeSet::new();
+    for cell in expected_plan["cells"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        if cell["backend"].as_str() == Some("dbt") {
+            let category = cell["category"]
+                .as_str()
+                .unwrap_or_default()
+                .replace('-', "_");
+            expected_buckets.insert(match cell["lane"].as_str() {
+                Some("privileged") => format!("privileged-e2e.manifest_{category}"),
+                _ => format!("e2e.manifest_{category}"),
+            });
+        }
+    }
+    if expected_buckets.is_empty()
+        || !expected_buckets.iter().all(|b| dbt_tags.contains(b))
+        || !dbt_tags.contains("check.dbt_runtime_abi")
+        || !dbt_tags.contains("test.hermit_integration_2")
+        || !dbt_tags.contains("test.hermit_integration_3")
+    {
+        return Err(format!(
+            "selective bracket: DBT plan misses derived buckets/ABI/shards: missing={:?}",
+            expected_buckets.difference(&dbt_tags).collect::<Vec<_>>()
+        ));
+    }
+    // v3 counterexample (privileged bucket set mismatch): production must
+    // select EXACTLY the buckets derived from cells (privileged lane cells
+    // with backend=dbt included), with no extra privileged buckets.
+    {
+        let actual_buckets: BTreeSet<String> = dbt_tags
+            .iter()
+            .filter(|tag| {
+                tag.starts_with("e2e.manifest_") || tag.starts_with("privileged-e2e.manifest_")
+            })
+            .cloned()
+            .collect();
+        if actual_buckets != expected_buckets {
+            return Err(format!(
+                "selective bracket: v3 DBT bucket set must equal the cell-derived set exactly: extra={:?} missing={:?}",
+                actual_buckets
+                    .difference(&expected_buckets)
+                    .collect::<Vec<_>>(),
+                expected_buckets
+                    .difference(&actual_buckets)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let derived_privileged: BTreeSet<String> = expected_buckets
+            .iter()
+            .filter(|tag| tag.starts_with("privileged-"))
+            .cloned()
+            .collect();
+        let actual_privileged: BTreeSet<String> = actual_buckets
+            .iter()
+            .filter(|tag| tag.starts_with("privileged-"))
+            .cloned()
+            .collect();
+        if actual_privileged != derived_privileged {
+            return Err(format!(
+                "selective bracket: v3 privileged DBT buckets must equal the privileged-cell-derived set exactly: derived={derived_privileged:?} actual={actual_privileged:?}"
+            ));
+        }
+    }
+    println!(
+        "  historical 2033 selective execution: DBT buckets equal the cell-derived set, including privileged buckets, ABI and all integration shards"
+    );
+    Ok(())
+}
+
 /// Bracket the `--selective` subset builder against the REAL portable lane.
 ///
 /// The dangerous failure here is silent under-running: a subset that drops a
@@ -6446,8 +6604,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         SelectDecision::Full("bracket".into()),
         &BTreeSet::new(),
     )?;
-    let full_decision_tags: BTreeSet<String> =
-        full_decision.steps.iter().map(Step::tag).collect();
+    let full_decision_tags: BTreeSet<String> = full_decision.steps.iter().map(Step::tag).collect();
     if full_decision_tags != full_tags
         || !full_decision_tags.contains("privileged-test.cli_kvm")
         || !full_decision_tags.contains("full-scorecard.compatibility")
@@ -6456,134 +6613,78 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
             "selective bracket: Full decision is not the Level::Full (full label) node set".into(),
         );
     }
-    // Load the generated footprints for rule/footprint node sets.
+    // The generated current graph has only the shared first-party rule.
+    // Backend-specific historical routing is exercised against the immutable
+    // upstream fixture, without adding external nodes or cells to this graph.
     let footprints: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(root.join("ci/test-footprints.json"))
-            .map_err(|e| format!("selective bracket: footprints: {e}"))?,
+            .map_err(|error| format!("selective bracket: footprints: {error}"))?,
     )
-    .map_err(|e| format!("selective bracket: footprints JSON: {e}"))?;
-    let str_list = |value: &serde_json::Value, key: &str| -> Vec<String> {
-        value[key]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let local_nodes = |nodes: &[String]| -> BTreeSet<String> {
-        nodes.iter().map(|node| local_validation_step_tag(node)).collect()
-    };
-    let plan_tags = |plan: &DagConfig| -> BTreeSet<String> {
-        plan.steps.iter().map(Step::tag).collect()
-    };
-    // (a) DBT route through the REAL planner: buckets == buckets that
-    // contain a DBT cell (derived from the expected plan, not hard-coded),
-    // plus the privileged DBT buckets, all hermit_integration shards and
-    // check.dbt_runtime_abi.
-    let dbt_rule = footprints["backend_rules"]
+    .map_err(|error| format!("selective bracket: footprints JSON: {error}"))?;
+    let rules = footprints["backend_rules"]
         .as_array()
-        .and_then(|rules| rules.iter().find(|rule| rule["id"].as_str() == Some("dbt")))
-        .ok_or("selective bracket: dbt backend rule missing")?;
-    if footprints["backend_rules"]
-        .as_array()
-        .is_some_and(|rules| rules.iter().any(|r| matches!(r["id"].as_str(), Some("kvm" | "ptrace" | "liteinst" | "sabre" | "e9patch"))))
+        .ok_or("selective bracket: generated backend_rules is not an array")?;
+    if rules.len() != 1
+        || rules[0]["id"].as_str() != Some("reverie-core")
+        || rules[0]["tier"].as_str() != Some("core")
+        || rules[0]["backends"] != serde_json::json!(["*"])
+        || rules[0]["lanes"] != serde_json::json!(["portable", "privileged"])
     {
-        return Err("selective bracket: a dropped v1 backend route reappeared".into());
+        return Err(format!(
+            "selective bracket: current graph must declare only shared Reverie core ownership: {rules:?}"
+        ));
     }
-    let expected_plan_for_buckets: serde_json::Value = serde_json::from_str(
+    let expected_plan: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(root.join("ci/expected-e2e-plan.json"))
-            .map_err(|e| format!("selective bracket: expected plan: {e}"))?,
+            .map_err(|error| format!("selective bracket: expected plan: {error}"))?,
     )
-    .map_err(|e| format!("selective bracket: expected plan JSON: {e}"))?;
-    let derived_privileged_dbt_buckets = privileged_dbt_buckets_from_cells(
-        expected_plan_for_buckets["cells"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .as_slice(),
-    );
-    let dbt_plan = select_from_committed_decision(
+    .map_err(|error| format!("selective bracket: expected plan JSON: {error}"))?;
+    let cells = expected_plan["cells"]
+        .as_array()
+        .filter(|cells| !cells.is_empty())
+        .ok_or("selective bracket: current expected plan has no cells")?;
+    if cells.iter().any(|cell| {
+        !matches!(
+            cell["backend"].as_str(),
+            Some("ptrace" | "kvm" | "liteinst" | "in-guest-trap")
+        )
+    }) || full_tags
+        .iter()
+        .any(|tag| tag.contains("dbt") || tag.contains("sabre") || tag.contains("e9patch"))
+    {
+        return Err(
+            "selective bracket: external cells or nodes reappeared in the core graph".into(),
+        );
+    }
+    let privileged_dbt_buckets = privileged_dbt_buckets_from_cells(cells);
+    if !privileged_dbt_buckets.is_empty() {
+        return Err("selective bracket: core cells produced an external DBT bucket".into());
+    }
+    let core_privileged = select_from_committed_decision(
         &full_base,
         full_base.steps.len(),
         SelectDecision::Nodes(
-            local_nodes(&str_list(dbt_rule, "extra_nodes")),
+            ["privileged-test.cli_kvm".to_string()]
+                .into_iter()
+                .collect(),
             SelectiveScope {
-                backends: vec!["dbt".into()],
-                backend_lanes: vec!["portable".into(), "privileged".into()],
-                backend_rules: vec!["dbt".into()],
+                backends: vec!["kvm".into()],
+                backend_lanes: vec!["privileged".into()],
                 ..Default::default()
             },
         ),
-        &derived_privileged_dbt_buckets,
+        &privileged_dbt_buckets,
     )?;
-    let dbt_tags = plan_tags(&dbt_plan);
-    let expected_plan: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("ci/expected-e2e-plan.json"))
-            .map_err(|e| format!("selective bracket: expected plan: {e}"))?,
-    )
-    .map_err(|e| format!("selective bracket: expected plan JSON: {e}"))?;
-    let mut expected_buckets: BTreeSet<String> = BTreeSet::new();
-    for cell in expected_plan["cells"].as_array().cloned().unwrap_or_default() {
-        if cell["backend"].as_str() == Some("dbt") {
-            let category = cell["category"].as_str().unwrap_or_default().replace('-', "_");
-            expected_buckets.insert(match cell["lane"].as_str() {
-                Some("privileged") => format!("privileged-e2e.manifest_{category}"),
-                _ => format!("e2e.manifest_{category}"),
-            });
-        }
-    }
-    if expected_buckets.is_empty()
-        || !expected_buckets.iter().all(|b| dbt_tags.contains(b))
-        || !dbt_tags.contains("check.dbt_runtime_abi")
-        || !dbt_tags.contains("test.hermit_integration_2")
-        || !dbt_tags.contains("test.hermit_integration_3")
+    if !core_privileged
+        .steps
+        .iter()
+        .any(|step| step.tag() == "privileged-test.cli_kvm")
     {
-        return Err(format!(
-            "selective bracket: DBT plan misses derived buckets/ABI/shards: missing={:?}",
-            expected_buckets.difference(&dbt_tags).collect::<Vec<_>>()
-        ));
+        return Err("selective bracket: current core KVM scope lost its selected test".into());
     }
-    // v3 counterexample (privileged bucket set mismatch): production must
-    // select EXACTLY the buckets derived from cells (privileged lane cells
-    // with backend=dbt included), with no extra privileged buckets.
-    {
-        let actual_buckets: BTreeSet<String> = dbt_tags
-            .iter()
-            .filter(|tag| {
-                tag.starts_with("e2e.manifest_") || tag.starts_with("privileged-e2e.manifest_")
-            })
-            .cloned()
-            .collect();
-        if actual_buckets != expected_buckets {
-            return Err(format!(
-                "selective bracket: v3 DBT bucket set must equal the cell-derived set exactly: extra={:?} missing={:?}",
-                actual_buckets
-                    .difference(&expected_buckets)
-                    .collect::<Vec<_>>(),
-                expected_buckets
-                    .difference(&actual_buckets)
-                    .collect::<Vec<_>>()
-            ));
-        }
-        let derived_privileged: BTreeSet<String> = expected_buckets
-            .iter()
-            .filter(|tag| tag.starts_with("privileged-"))
-            .cloned()
-            .collect();
-        let actual_privileged: BTreeSet<String> = actual_buckets
-            .iter()
-            .filter(|tag| tag.starts_with("privileged-"))
-            .cloned()
-            .collect();
-        if actual_privileged != derived_privileged {
-            return Err(format!(
-                "selective bracket: v3 privileged DBT buckets must equal the privileged-cell-derived set exactly: derived={derived_privileged:?} actual={actual_privileged:?}"
-            ));
-        }
-    }
+    historical_dbt_selective_subset_bracket(root)?;
+    let plan_tags =
+        |plan: &DagConfig| -> BTreeSet<String> { plan.steps.iter().map(Step::tag).collect() };
     // (i) Everything path: every full-label node is reachable.
     if full_decision_tags != full_tags {
         return Err("selective bracket: everything path misses full-label nodes".into());
@@ -6639,7 +6740,9 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         .ok_or("selective bracket: coverage absent_nodes is not an array")?;
     if coverage["executed_test_nodes"] != 1
         || absent.len() + 1 != population.len()
-        || absent.iter().any(|node| node.as_str() == Some(one_test.as_str()))
+        || absent
+            .iter()
+            .any(|node| node.as_str() == Some(one_test.as_str()))
     {
         return Err(format!(
             "selective bracket: unselected nodes not SKIPPED/absent from full population: {coverage}"
@@ -6655,7 +6758,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         "  selective subset: typed ID selection retained {child} and dependency {parent}; unknown IDs refused; no-change retained exact preflight; source bytes unchanged"
     );
     println!(
-        "  selective execution: DBT route buckets == buckets containing DBT cells exactly (derived, privileged included) + all integration shards; everything path == full label ({} nodes); baseline ancestor rule holds; unselected nodes absent/SKIPPED from full population",
+        "  selective execution: current core-only ownership and KVM selection retained; everything path == full label ({} nodes); baseline ancestor rule holds; unselected nodes absent/SKIPPED from full population",
         full_decision_tags.len()
     );
     Ok(())
@@ -13145,13 +13248,15 @@ fn privileged_dbt_buckets_from_cells(cells: &[serde_json::Value]) -> BTreeSet<St
     cells
         .iter()
         .filter(|cell| {
-            cell["lane"].as_str() == Some("privileged")
-                && cell["backend"].as_str() == Some("dbt")
+            cell["lane"].as_str() == Some("privileged") && cell["backend"].as_str() == Some("dbt")
         })
         .map(|cell| {
             format!(
                 "privileged-e2e.manifest_{}",
-                cell["category"].as_str().unwrap_or_default().replace('-', "_")
+                cell["category"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .replace('-', "_")
             )
         })
         .collect()
@@ -13190,11 +13295,7 @@ fn privileged_nodes_for_scope(
                 // Derived from cells, not enumerated from available tags:
                 // only privileged buckets that contain a DBT cell (today
                 // c-programs) are added.
-                wanted.extend(
-                    privileged_dbt_buckets
-                        .iter()
-                        .map(String::as_str),
-                );
+                wanted.extend(privileged_dbt_buckets.iter().map(String::as_str));
             }
             "liteinst" | "in-guest-trap" => {
                 wanted.extend(["test.liteinst_allocator", "test.liteinst_stacks"])
@@ -13247,8 +13348,7 @@ fn select_from_committed_decision(
             // backend run unfiltered (over-run, no per-cell filtering),
             // and a rule declaring the privileged lane adds the privileged
             // nodes that exercise that backend.
-            let privileged =
-                privileged_nodes_for_scope(&scope, base, privileged_dbt_buckets);
+            let privileged = privileged_nodes_for_scope(&scope, base, privileged_dbt_buckets);
             // Hosted selectors (e.g. build.workspace from
             // build.workspace_on_host) name the pinned-root producer in
             // the local full/portable graph; resolve that twin here so a
@@ -13566,11 +13666,12 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         // cells from terminal per-cell rows.
         let executed_tags: BTreeSet<String> = cfg.steps.iter().map(Step::tag).collect();
         let all_cells = validate_cell_results::expected_plan(root).unwrap_or_default();
-        let cell_slug = |cell: &serde_json::Value| {
-            complete_cell_id(cell).unwrap_or_default()
-        };
+        let cell_slug = |cell: &serde_json::Value| complete_cell_id(cell).unwrap_or_default();
         let cell_bucket = |cell: &serde_json::Value| {
-            let category = cell["category"].as_str().unwrap_or_default().replace('-', "_");
+            let category = cell["category"]
+                .as_str()
+                .unwrap_or_default()
+                .replace('-', "_");
             match cell["lane"].as_str().unwrap_or_default() {
                 "privileged" => format!("privileged-e2e.manifest_{category}"),
                 _ => format!("e2e.manifest_{category}"),
@@ -13626,8 +13727,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                         step.manifest.as_ref().is_some_and(|manifest| {
                             manifest.lane == "portable"
                                 && !scope.cells.iter().any(|cell| {
-                                    cell.split("__").nth(1)
-                                        == Some(manifest.category.as_str())
+                                    cell.split("__").nth(1) == Some(manifest.category.as_str())
                                 })
                         })
                     })
@@ -13966,10 +14066,9 @@ fn selective_skipped_reason(name: &str, selective_scope: Option<&serde_json::Val
             .and_then(|scope| scope.get("not_executed_cells"))
             .and_then(serde_json::Value::as_array)
         {
-            if let Some(entry) = not_executed
-                .iter()
-                .find(|entry| entry.get("cell").and_then(serde_json::Value::as_str) == Some(cell_id))
-            {
+            if let Some(entry) = not_executed.iter().find(|entry| {
+                entry.get("cell").and_then(serde_json::Value::as_str) == Some(cell_id)
+            }) {
                 let reason = entry
                     .get("reason")
                     .and_then(serde_json::Value::as_str)
