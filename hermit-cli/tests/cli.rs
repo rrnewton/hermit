@@ -10241,7 +10241,8 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
 /// `CLONE_DETACHED`) gets `EINVAL` as made, with no host ID reported, as do
 /// the same call with `CLONE_UNTRACED`, which is issued without that flag, and
 /// a 32-byte clone3 struct on a page mapped writable but not readable, and a
-/// clone3 struct pointer in the kernel half (`EFAULT`). An
+/// clone3 struct pointer in the kernel half, also two bytes short of the top
+/// of the address space (`EFAULT`). An
 /// unmapped `set_tid` array keeps its `EFAULT` when the thread group's leader
 /// has exited too (a thread's own maps are read, not the leader's empty
 /// ones).
@@ -10292,6 +10293,16 @@ fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
             "--summary",
             &["kernel-args"],
             "clone3 kernel-args: Bad address",
+        ),
+        (
+            "--pid-base=5000",
+            &["kernel-args-top"],
+            "clone3 kernel-args-top: Bad address",
+        ),
+        (
+            "--summary",
+            &["kernel-args-top"],
+            "clone3 kernel-args-top: Bad address",
         ),
         (
             "--pid-base=5000",
@@ -41279,6 +41290,7 @@ fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
         "autoreap",
         "orphan",
         "deep",
+        "edge",
     ] {
         let (code, stdout, log, _) = run(&["--strict"], mode);
         assert_eq!(code, Some(122), "{mode}: {stdout}\n{log}");

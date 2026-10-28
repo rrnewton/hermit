@@ -21,6 +21,8 @@
 //   orphan  the pid of a grandchild whose parent exited, reaped by init
 //   efault  a reaped child's pid, in a two-entry set_tid array whose second
 //           entry is on an unmapped page
+//   edge    a reaped child's pid, in a one-entry set_tid array in the last
+//           four bytes of a page that an unmapped page follows
 //   deep    a reaped child's pid, followed by a pid for the namespace holding
 //           the caller's (set_tid = {pid, 1})
 //   nocap   a reaped child's pid, asked for after dropping every effective
@@ -221,7 +223,7 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
-  if (!strcmp(mode, "efault")) {
+  if (!strcmp(mode, "efault") || !strcmp(mode, "edge")) {
     long page = sysconf(_SC_PAGESIZE);
     char* pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (pages == MAP_FAILED || munmap(pages + page, page) != 0) {
@@ -229,7 +231,7 @@ int main(int argc, char** argv) {
     }
     tids = (pid_t*)(pages + page - sizeof(pid_t));
     tids[0] = want;
-    args.set_tid_size = 2;
+    args.set_tid_size = strcmp(mode, "edge") ? 2 : 1;
   }
   args.set_tid = (uint64_t)(uintptr_t)tids;
   if (!strcmp(mode, "newpid") || !strcmp(mode, "newpidzero")) {

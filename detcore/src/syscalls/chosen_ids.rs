@@ -1141,6 +1141,41 @@ fn read_guest_set_tid<M: MemoryAccess>(
         .collect())
 }
 
+/// Read the guest's `pid_t` array at `address` into `tids` exactly, as
+/// `copy_from_user` reads it: with the guest's own access, or, where that
+/// fails (a page mapped writable, not readable), entry by entry through the
+/// eight-byte-aligned word holding each four-aligned entry, which never
+/// reaches into the next page as a debugger read of a four-byte value at a
+/// page's end does. `None` if neither reads it.
+pub(crate) fn read_pid_array<M: MemoryAccess>(
+    memory: &M,
+    address: usize,
+    tids: &mut [libc::pid_t],
+) -> Option<()> {
+    const ENTRY: usize = std::mem::size_of::<libc::pid_t>();
+    let mut bytes = vec![0u8; tids.len() * ENTRY];
+    let start = Addr::<u8>::from_raw(address)?;
+    if memory
+        .read_exact_with_user_access(start, &mut bytes)
+        .is_err()
+    {
+        if !address.is_multiple_of(ENTRY) {
+            return None;
+        }
+        for (index, chunk) in bytes.as_chunks_mut::<ENTRY>().0.iter_mut().enumerate() {
+            let entry = address.checked_add(index * ENTRY)?;
+            let word = entry & !(std::mem::size_of::<u64>() - 1);
+            let value: u64 = memory.read_value(Addr::<u64>::from_raw(word)?).ok()?;
+            let offset = entry - word;
+            chunk.copy_from_slice(&value.to_ne_bytes()[offset..offset + ENTRY]);
+        }
+    }
+    for (tid, chunk) in tids.iter_mut().zip(bytes.as_chunks::<ENTRY>().0) {
+        *tid = libc::pid_t::from_ne_bytes(*chunk);
+    }
+    Some(())
+}
+
 /// Why a guest `clone3`'s own `set_tid` array was not read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SetTidUnread {
@@ -1328,7 +1363,10 @@ fn range_faults(tid: i32, address: usize, len: usize) -> bool {
 }
 
 /// Whether `address..address + len` lies within user memory, where Detcore
-/// can try to read it.
+/// can try to read it. Reverie's remote read splits a range at the next page
+/// with arithmetic that overflows in the top page
+/// (https://github.com/rrnewton/reverie/issues/1185), so nothing past user
+/// memory is ever passed to it.
 pub(crate) fn within_user_memory(address: usize, len: usize) -> bool {
     user_memory_end()
         .zip(address.checked_add(len))
