@@ -685,6 +685,9 @@ fn run(args: Args, progress: &mut Progress) -> Result<()> {
         first.units == second.units,
         "the two fresh builds selected different Cargo units/features"
     );
+    for graph in [&first, &second] {
+        graph.core_library_unit().map_err(anyhow::Error::msg)?;
+    }
     let first_bundle =
         compatibility_rustc::Bundle::read(&input.rustc_first).map_err(anyhow::Error::msg)?;
     let second_bundle =

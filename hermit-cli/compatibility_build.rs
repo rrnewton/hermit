@@ -121,14 +121,8 @@ fn resolved_build(
     {
         return Err("producer's actual executable does not link this core".to_owned());
     }
-    let core_units: Vec<_> = graph.units[&core.id]
-        .iter()
-        .filter(|unit| unit.target == "hermit" && unit.kind.iter().any(|kind| kind == "lib"))
-        .collect();
-    if core_units.len() != 1 {
-        return Err("producer did not build exactly one core library feature unit".to_owned());
-    }
-    let expected_features: BTreeSet<_> = core_units[0]
+    let core_unit = graph.core_library_unit()?;
+    let expected_features: BTreeSet<_> = core_unit
         .features
         .iter()
         .map(|feature| {
@@ -145,9 +139,7 @@ fn resolved_build(
                 .map(str::to_owned)
         })
         .collect();
-    if expected_features.len() != core_units[0].features.len()
-        || expected_features != actual_features
-    {
+    if expected_features.len() != core_unit.features.len() || expected_features != actual_features {
         return Err("actual core Cargo features differ from the producer's built unit".to_owned());
     }
     let core_closure = graph.closure(&core.id)?;
@@ -251,7 +243,7 @@ fn resolved_build(
         .clone();
     Ok((
         reverie,
-        core_units[0].profile.clone(),
+        core_unit.profile.clone(),
         rustc_inputs,
         core_source,
     ))
