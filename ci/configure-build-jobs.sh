@@ -3180,7 +3180,7 @@ fi
 # src/launcher/tests without changing the 1038-file inventory, and the
 # LiteInst source catalog stays 73 rows. This is not native byte
 # equivalence or proof of Hermit native behavior.
-# CARRY TO 688a542d75af8310c4ddd97eadbf2434abb067ff (2026-10-28): from
+# CARRY TO 4b3114be8a32266f341af8501eeb55ee028b3f00 (2026-10-28): from
 # a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b. One commit, 688a542d, reverts the
 # dbt lane's executable selection (44f1f4f5, a4a654ac): its attested-frontend
 # refusal failed four Hermit DBT tests. Its tree is the T1c tree e7847776, so
@@ -3190,8 +3190,8 @@ fi
 # and reverie-dbt/native stays c1f267db81c8. The calibrated SDK budget, job
 # width and limits carry unchanged from the e9c54de9 entry; inventory stays
 # 1038 and the LiteInst source catalog 73 rows.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 688a542d75af8310c4ddd97eadbf2434abb067ff ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 688a542d75af8310c4ddd97eadbf2434abb067ff (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4b3114be8a32266f341af8501eeb55ee028b3f00 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4b3114be8a32266f341af8501eeb55ee028b3f00 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
