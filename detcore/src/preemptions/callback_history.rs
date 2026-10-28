@@ -1168,7 +1168,7 @@ mod tests {
         assert_eq!(thread.active_priority_row(), Some(ActiveRow::BeforeFirst));
         assert!(thread.pending_checkpoint().is_none());
         let history = thread.preemption_points.as_mut().unwrap();
-        history.next_with_rcbs().unwrap();
+        history.next_slice_end().unwrap();
         assert_eq!(thread.active_priority_row(), Some(ActiveRow::Row(0)));
         assert!(
             thread.pending_checkpoint().is_none(),
@@ -1178,7 +1178,7 @@ mod tests {
             .preemption_points
             .as_mut()
             .unwrap()
-            .next_with_rcbs()
+            .next_slice_end()
             .unwrap();
         assert_eq!(thread.active_priority_row(), Some(ActiveRow::Row(1)));
         assert_eq!(thread.pending_checkpoint().unwrap().origin, origin());
@@ -1187,7 +1187,7 @@ mod tests {
                 .preemption_points
                 .as_mut()
                 .unwrap()
-                .next_with_rcbs()
+                .next_slice_end()
                 .is_none()
         );
         thread.stats.last_recorded_slice = Some(thread.stats.timeslice_count);

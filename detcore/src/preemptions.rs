@@ -13,6 +13,7 @@ pub mod callback_history;
 mod record_serde;
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::iter::FromIterator;
 use std::path::Path;
@@ -33,6 +34,7 @@ use crate::scheduler::runqueue::DEFAULT_PRIORITY;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::scheduler::runqueue::is_ordinary_priority;
+use crate::slice_boundary::callbacks::Callback;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
@@ -1197,6 +1199,7 @@ impl ThreadHistory {
             full_history: self,
             ix: 0,
             chaos_epoch_ix: 0,
+            timer_ends: None,
         }
     }
 
@@ -1271,7 +1274,7 @@ impl Default for ThreadHistory {
 /// An iterator over the preemption history of a thread.  Does not include the final
 /// timeslice, which does not have an ending time.
 // TODO: in the future this will perform "lazy IO" and pull from disk in batches.
-#[derive(PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 pub struct ThreadHistoryIterator {
     /// For now we store the full history in memory:
     full_history: ThreadHistory,
@@ -1281,6 +1284,37 @@ pub struct ThreadHistoryIterator {
     // TODO-HUMAN-REVIEW(PR-1151)
     #[serde(default)]
     chaos_epoch_ix: usize,
+    /// The rows of `full_history` whose slice the PMU timer ended, by the
+    /// record's callback checkpoints, or `None` when the record has none (an
+    /// older record, or one `analyze --minimize` edited), whose rows then
+    /// replay as before. A recording that keeps checkpoints gives one to
+    /// every slice a callback ended, the PMU timer's included, so each other
+    /// row ended at a check-in (see [`RecordedSliceEnd::at_check_in`]).
+    #[serde(default)]
+    timer_ends: Option<BTreeSet<usize>>,
+}
+
+/// One recorded slice end of a thread, as its preemption replay follows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordedSliceEnd {
+    /// The thread's logical time when the slice ended.
+    pub time: LogicalTime,
+    /// The priority of the slice that ended.
+    pub priority: Priority,
+    /// The thread's PMU RCB count when the slice ended, from a record made by
+    /// a version that records it.
+    pub rcbs: Option<u64>,
+    /// Where the slice's timer was armed, if `--chaos-instruction-offset`
+    /// delivered it past its branch target (`ThreadHistory`'s
+    /// `preemption_instruction_offsets`). Only a row with `rcbs` has one.
+    pub instruction_offset: Option<InstructionOffset>,
+    /// Whether the record's callback checkpoints say the slice ended at a
+    /// check-in (a syscall, a trapped instruction, a signal, a yield or a
+    /// change point) rather than at a PMU stop. The check-in shares its RCB
+    /// count, and at a prehook its logical time too, with a PMU stop on that
+    /// count, so only this tells them apart. False when the record does not
+    /// say.
+    pub at_check_in: bool,
 }
 
 impl ThreadHistoryIterator {
@@ -1317,13 +1351,36 @@ impl ThreadHistoryIterator {
         !self.full_history.chaos_epochs.is_empty()
     }
 
+    /// Take which rows the PMU timer ended from this thread's callback
+    /// checkpoints, for a record that keeps checkpoints. A checkpoint of the
+    /// PMU timer, or of the timer that stands in for it without RCB counting,
+    /// names a timer end; every other row ended at a check-in.
+    pub(crate) fn with_callback_checkpoints(
+        mut self,
+        checkpoints: &[callback_history::Checkpoint],
+    ) -> Self {
+        self.timer_ends = Some(
+            checkpoints
+                .iter()
+                .filter(|checkpoint| {
+                    matches!(
+                        checkpoint.origin.callback,
+                        Callback::PmuTimer | Callback::NoRcbTimer
+                    )
+                })
+                .map(|checkpoint| checkpoint.history_index)
+                .collect(),
+        );
+        self
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     /// Return the next recorded logical boundary and its exact RCB target when
     /// the artifact was produced by a version that records one.
     pub fn next_with_rcbs(&mut self) -> Option<(LogicalTime, Priority, Option<u64>)> {
-        self.next_with_offset()
-            .map(|(time, priority, rcbs, _)| (time, priority, rcbs))
+        self.next_slice_end()
+            .map(|end| (end.time, end.priority, end.rcbs))
     }
 
     /// [`Self::next_with_rcbs`], with where the recorded timeslice's timer
@@ -1337,23 +1394,33 @@ impl ThreadHistoryIterator {
         Option<u64>,
         Option<InstructionOffset>,
     )> {
+        self.next_slice_end()
+            .map(|end| (end.time, end.priority, end.rcbs, end.instruction_offset))
+    }
+
+    /// Return the next recorded slice end, with its exact RCB target when the
+    /// artifact was produced by a version that records one.
+    pub fn next_slice_end(&mut self) -> Option<RecordedSliceEnd> {
         let ix = self.ix;
-        self.next().map(|(time, priority)| {
-            (
-                time,
-                priority,
-                self.full_history.preemption_rcbs.get(ix).copied(),
-                self.full_history
-                    .preemption_instruction_offsets
-                    .get(ix)
-                    .copied()
-                    .flatten(),
-            )
+        self.next().map(|(time, priority)| RecordedSliceEnd {
+            time,
+            priority,
+            rcbs: self.full_history.preemption_rcbs.get(ix).copied(),
+            instruction_offset: self
+                .full_history
+                .preemption_instruction_offsets
+                .get(ix)
+                .copied()
+                .flatten(),
+            at_check_in: self
+                .timer_ends
+                .as_ref()
+                .is_some_and(|timer_ends| !timer_ends.contains(&ix)),
         })
     }
 
     /// How many recorded rows have been installed as slice ends. The row the
-    /// current slice ends is the last of them: `next_with_rcbs` advances past
+    /// current slice ends is the last of them: `next_slice_end` advances past
     /// a row as it installs it, before that row's priority request is filed.
     pub fn installed_rows(&self) -> usize {
         self.ix
@@ -1444,6 +1511,67 @@ mod tests {
         assert!(!exact.contains("replay_departed_at"), "{exact}");
         std::fs::write(&path, &exact).unwrap();
         assert_eq!(read_recorded_replay_departure(&path), Ok(None));
+    }
+
+    /// A replayed history whose record keeps callback checkpoints marks
+    /// every row a check-in ended: each row but those with a checkpoint of the
+    /// PMU timer (or of its stand-in without RCB counting), a row with no
+    /// checkpoint (a yield or a change point) included. A history whose
+    /// record keeps none marks no row.
+    #[test]
+    fn a_replayed_history_marks_the_rows_a_check_in_ended() {
+        let checkpoint = |history_index: usize, callback: Callback| callback_history::Checkpoint {
+            history_index,
+            origin: callback_history::Origin {
+                callback,
+                site: callback_history::Site::Prehook,
+                progress: 0,
+                last_op: None,
+                time: LogicalTime::from_nanos(10 * (history_index as u64 + 1)),
+                rcbs: history_index as u64 + 1,
+            },
+        };
+        let history = ThreadHistory::new()
+            .with_prio_changes(
+                (1..=5)
+                    .map(|row| (LogicalTime::from_nanos(10 * row), 7))
+                    .collect(),
+            )
+            .with_preemption_rcbs((1..=5).collect());
+        let marks = |mut replay: ThreadHistoryIterator| -> Vec<bool> {
+            std::iter::from_fn(|| replay.next_slice_end())
+                .map(|end| end.at_check_in)
+                .collect()
+        };
+        assert_eq!(
+            marks(history.clone().into_iter().with_callback_checkpoints(&[
+                checkpoint(0, Callback::Syscall(reverie::syscalls::Sysno::write)),
+                checkpoint(1, Callback::PmuTimer),
+                checkpoint(2, Callback::NoRcbTimer),
+                checkpoint(3, Callback::Rdtsc),
+            ])),
+            [true, false, false, true, true]
+        );
+        assert_eq!(marks(history.into_iter()), [false; 5]);
+    }
+
+    /// A thread's replay crosses the thread-start RPC whole, its timer-end
+    /// marks included: both ends are one build, and the payload is the
+    /// iterator the thread replays.
+    #[test]
+    fn a_replayed_history_crosses_the_thread_start_rpc_with_its_marks() {
+        let replay = ThreadHistory::new()
+            .with_prio_changes(vec![(LogicalTime::from_nanos(10), 7)])
+            .with_preemption_rcbs(vec![1])
+            .into_iter()
+            .with_callback_checkpoints(&[]);
+        let response =
+            crate::tool_global::GlobalResponse::StartNewThread(Some(Box::new(replay)), None, None);
+        let bytes = bincode::serde::encode_to_vec(&response, bincode::config::standard()).unwrap();
+        let (decoded, used): (crate::tool_global::GlobalResponse, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, response);
+        assert_eq!(used, bytes.len());
     }
 
     /// `--pipe-wake-latency` rides in a preemption record as the epoch does:
@@ -2383,12 +2511,24 @@ mod tests {
 
         let mut exact = th1.clone().into_iter();
         assert_eq!(
-            exact.next_with_rcbs(),
-            Some((LogicalTime::from_nanos(3), 1000, Some(3)))
+            exact.next_slice_end(),
+            Some(RecordedSliceEnd {
+                time: LogicalTime::from_nanos(3),
+                priority: 1000,
+                rcbs: Some(3),
+                instruction_offset: None,
+                at_check_in: false,
+            })
         );
         assert_eq!(
-            exact.next_with_rcbs(),
-            Some((LogicalTime::from_nanos(30), 3, Some(30)))
+            exact.next_slice_end(),
+            Some(RecordedSliceEnd {
+                time: LogicalTime::from_nanos(30),
+                priority: 3,
+                rcbs: Some(30),
+                instruction_offset: None,
+                at_check_in: false,
+            })
         );
 
         let it1 = th1.into_iter();

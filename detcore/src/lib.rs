@@ -617,6 +617,37 @@ fn kept_timer_schedule(
     }
 }
 
+/// Where a replayed slice's PMU timer aims, from the slice's recorded RCB
+/// count `recorded`: the count itself, an exact stop, when the slice can end
+/// there on a branch (`can_end_on_a_branch`,
+/// `ThreadState::replay_slice_can_end_on_a_branch`), or one RCB past it when no
+/// stop on the count is the recorded end. That is a slice that cannot end
+/// there on a branch, and, for a callback-annotated row still ahead
+/// (`pending_checkpoint`: its endpoint's RCBs, and whether the endpoint is the
+/// PMU timer's own stop), an endpoint that is not the timer's stop or whose
+/// RCBs the thread already waits at (`current_pmu_rcbs`). The second value
+/// says whether the timer is only a bound: armed for a slice that cannot end
+/// on a branch, it ends at a check-in before the timer fires on a replay that
+/// follows its record, so the timer needs no exact stop and may land late.
+/// `None` when no RCB lies past the count to aim at.
+fn replay_timer_aim(
+    recorded: u64,
+    current_pmu_rcbs: u64,
+    can_end_on_a_branch: bool,
+    pending_checkpoint: Option<(u64, bool)>,
+) -> Option<(u64, bool)> {
+    let annotated_aims_past = matches!(
+        pending_checkpoint,
+        Some((endpoint, timer_endpoint)) if !timer_endpoint || endpoint == current_pmu_rcbs
+    );
+    let target = if annotated_aims_past || !can_end_on_a_branch {
+        recorded.checked_add(1)?
+    } else {
+        recorded
+    };
+    Some((target, !can_end_on_a_branch))
+}
+
 fn choose_rcb_timer(
     max_rcbs_remaining: u64,
     current_rcbs: u64,
@@ -3139,31 +3170,42 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
                 return;
             }
-            // The timer aims one RCB past an annotated row's endpoint unless
-            // the recorded endpoint is the timer's own stop, and always once
-            // the thread waits at the endpoint's RCBs. The recorded path
-            // reaches a software endpoint with no stop at those RCBs, and
-            // with no further conditional branch, so the timer fires only
-            // for a replay that branches past the endpoint, whose next
-            // check-in refuses it; the recording saw no stop there, and
-            // neither does a faithful replay. This is a physical arm target
-            // only; the recorded endpoint is unchanged.
-            let replay_rcb_end = match (replay_rcb_end, pending_checkpoint) {
-                (Some(end), Some((endpoint, timer_endpoint)))
-                    if !timer_endpoint || endpoint == current_pmu_rcbs =>
-                {
-                    assert_eq!(end, endpoint, "a checkpoint's RCBs are its row's");
-                    Some(endpoint.checked_add(1).unwrap_or_else(|| {
-                        crate::scheduler::exit_on_scheduler_refusal(&format!(
-                            "{}: dtid {} has no RCB beyond its recorded endpoint {} to aim at",
-                            preemptions::callback_history::Refusal::Overshot.name(),
-                            dettid,
-                            endpoint
-                        ))
-                    }))
-                }
-                (other, _) => other,
-            };
+            // The timer aims one RCB past the recorded count when no stop on
+            // that count is the recorded end (`replay_timer_aim`): the
+            // recorded path reaches such an end with no stop at those RCBs,
+            // and with no further conditional branch, so the timer fires only
+            // for a replay that branches past it, whose next check-in ends or
+            // refuses the slice; the recording saw no stop there, and neither
+            // does a faithful replay. This is a physical arm target only; the
+            // recorded endpoint is unchanged. A slice that cannot end on a
+            // branch at its count arms that timer as a bound only, below.
+            if let (Some(end), Some((endpoint, timer_endpoint))) =
+                (replay_rcb_end, pending_checkpoint)
+                && (!timer_endpoint || endpoint == current_pmu_rcbs)
+            {
+                assert_eq!(end, endpoint, "a checkpoint's RCBs are its row's");
+            }
+            let replay_aim = replay_rcb_end.map(|end| {
+                let can_end_on_a_branch = guest
+                    .thread_state()
+                    .replay_slice_can_end_on_a_branch(self.cfg.use_rcb_time());
+                replay_timer_aim(
+                    end,
+                    current_pmu_rcbs,
+                    can_end_on_a_branch,
+                    pending_checkpoint,
+                )
+                .unwrap_or_else(|| {
+                    crate::scheduler::exit_on_scheduler_refusal(&format!(
+                        "{}: dtid {} has no RCB beyond its recorded endpoint {} to aim at",
+                        preemptions::callback_history::Refusal::Overshot.name(),
+                        dettid,
+                        end
+                    ))
+                })
+            });
+            let replay_rcb_end = replay_aim.map(|(target, _)| target);
+            let replay_timer_is_a_bound = replay_aim.is_some_and(|(_, bound)| bound);
             // With an annotated row pending, a target that is not ahead of the
             // committed RCBs means the thread is already past the recorded
             // endpoint: refuse that by name. The assertion below still guards
@@ -3180,6 +3222,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ));
             }
             let mut replay_offset = guest.thread_state().replay_instruction_offset;
+            // A row armed only as a bound ends at a check-in before its timer
+            // fires, so an instruction offset recorded with it (a check-in
+            // ended its slice among the offset's steps, past the branch
+            // target: `ThreadState::take_ended_slice_offset`) is never
+            // stepped. That row's count is the thread's count at that
+            // check-in (`priority_changepoint_request`), which a faithful
+            // replay reaches with no stop; the offset's target alone stays
+            // in the offset. A row the timer ended keeps its exact stop at
+            // the offset's target and steps.
+            if replay_timer_is_a_bound {
+                replay_offset = None;
+            }
             let (ns_remaining, max_rcbs_remaining) = if let Some(replay_rcb_end) = replay_rcb_end {
                 // A timeslice recorded past its branch target is armed exactly
                 // as it was recorded: its end can lie up to one branch per step
@@ -3203,8 +3257,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                     };
                 assert!(
-                    target > current_pmu_rcbs,
-                    "recorded PMU RCB deadline {} is not ahead of current {}",
+                    target >= current_pmu_rcbs,
+                    "recorded PMU RCB deadline {} is behind current {}",
                     target,
                     current_pmu_rcbs
                 );
@@ -3213,7 +3267,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     LogicalTime::ZERO
                 };
-                (logical_remaining, target - current_pmu_rcbs)
+                let rcbs_remaining = if target > current_pmu_rcbs {
+                    target - current_pmu_rcbs
+                } else {
+                    // Defensive: `replay_timer_aim` aims past a reached count
+                    // unless the slice can end on a branch there, and such a
+                    // slice has already expired at this check-in
+                    // (`timeslice_expired`). The timer then only bounds a
+                    // replay that left its record.
+                    logical_remaining
+                        .into_rcbs_with_multiplier(clock_multiplier)
+                        .max(1)
+                };
+                (logical_remaining, rcbs_remaining)
             } else if let Some(offset) =
                 replay_offset.filter(|_| self.cfg.replay_schedule_from.is_some())
             {
@@ -3308,6 +3374,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         instructions,
                     })
                 };
+                // A replayed slice that cannot end on a branch at its recorded
+                // count ends at a check-in, so its timer is only a bound and
+                // may land late (`replay_slice_can_end_on_a_branch`): it has no
+                // exact target to overshoot.
+                let bound_only = timer_is_max && replay_timer_is_a_bound;
                 let replaying = guest.thread_state().replaying_lone_slice_end.is_some();
                 // A slice end armed past its branch target is never taken
                 // without a stop (`Config::slice_ends_need_a_stop`): the
@@ -3331,12 +3402,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     {
                         let thread_state = guest.thread_state_mut();
                         thread_state.lone_slice_end = None;
-                        thread_state.last_rcb_timer = Some(rcbs_remaining);
+                        thread_state.last_rcb_timer = (!bound_only).then_some(rcbs_remaining);
                         thread_state.last_rcb_timer_is_max = timer_is_max;
                         thread_state.armed_instruction_offset = armed_offset;
                     }
 
-                    if guest.config().imprecise_timers {
+                    if guest.config().imprecise_timers || bound_only {
                         guest
                             .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
                             .expect("Failed to set timer");
@@ -5371,6 +5442,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     end_of_timeslice: None,
                     replay_rcb_end: None,
                     last_replay_change_point: None,
+                    replay_ends_at_check_in: false,
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(PR-1151)
                     chaos_epoch: tool_local::chaos_epoch_sentinel(),
@@ -8468,6 +8540,40 @@ mod timeslice_timer_tests {
         assert_eq!(kept_timer_rcbs(1_000, 500, 1_500), 1);
         assert_eq!(kept_timer_rcbs(1_000, 500, 40_000_000_000), 1);
         assert_eq!(kept_timer_rcbs(u64::MAX - 10, 500, u64::MAX - 5), 5);
+    }
+
+    /// A replayed slice's timer aims at its recorded count, as an exact stop,
+    /// only when the slice can end there on a branch; otherwise one RCB past
+    /// it, as a bound only, so that Reverie does not single-step toward a
+    /// count the slice ends at a check-in on. A callback-annotated row whose
+    /// endpoint is not the timer's own stop aims one past its endpoint once,
+    /// whether or not the slice can end on a branch.
+    #[test]
+    fn a_replayed_slice_arms_an_exact_stop_only_where_a_branch_ends_it() {
+        // A slice the PMU timer ended at 500 RCBs: an exact stop on 500.
+        assert_eq!(replay_timer_aim(500, 100, true, None), Some((500, false)));
+        // A slice a check-in ended at 500 RCBs (a syscall's prehook): a bound
+        // at 501.
+        assert_eq!(replay_timer_aim(500, 100, false, None), Some((501, true)));
+        // Its count already reached, the slice ends at a later check-in.
+        assert_eq!(replay_timer_aim(500, 500, false, None), Some((501, true)));
+        // An annotated row a syscall ended: one past the endpoint, not two.
+        assert_eq!(
+            replay_timer_aim(500, 100, false, Some((500, false))),
+            Some((501, true))
+        );
+        // An annotated row the PMU timer ended: an exact stop on its endpoint,
+        // and one past it once the thread waits at the endpoint's RCBs.
+        assert_eq!(
+            replay_timer_aim(500, 100, true, Some((500, true))),
+            Some((500, false))
+        );
+        assert_eq!(
+            replay_timer_aim(500, 500, true, Some((500, true))),
+            Some((501, false))
+        );
+        // No RCB past the count to aim at.
+        assert_eq!(replay_timer_aim(u64::MAX, 0, false, None), None);
     }
 
     #[test]

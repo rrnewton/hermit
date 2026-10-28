@@ -448,11 +448,21 @@ impl HistoryReader {
             .map(|history| history.initial_priority())
     }
 
-    pub(crate) fn extract_thread_record(
+    /// The thread's recorded history, ready to replay: its rows carry the RCB
+    /// targets and, when the record keeps callback checkpoints, which of them
+    /// the PMU timer ended.
+    pub(crate) fn extract_thread_replay(
         &self,
         tid: &crate::types::DetTid,
-    ) -> Option<super::ThreadHistory> {
-        self.0.metadata().per_thread.get(tid).cloned()
+    ) -> Option<super::ThreadHistoryIterator> {
+        let record = self.0.metadata();
+        let checkpoints = record.callback_checkpoints();
+        let history = record.per_thread.get(tid).cloned()?.into_iter();
+        Some(if checkpoints.is_empty() {
+            history
+        } else {
+            history.with_callback_checkpoints(checkpoints.get(tid).map_or(&[], Vec::as_slice))
+        })
     }
 
     /// The validated callback checkpoints of this history, per thread, in
@@ -856,7 +866,10 @@ pub(super) mod tests {
             history.thread_initial_priority(&tid),
             Some(crate::scheduler::runqueue::DEFAULT_PRIORITY)
         );
-        assert_eq!(history.extract_thread_record(&tid), expected_history);
+        assert_eq!(
+            history.extract_thread_replay(&tid),
+            expected_history.map(super::super::ThreadHistory::into_iter)
+        );
         assert_eq!(history.to_string().as_bytes(), before);
         assert!(super::super::PreemptionReader::try_new(&path).is_err());
         let mut bad: serde_json::Value = serde_json::from_slice(&before).unwrap();
@@ -864,6 +877,57 @@ pub(super) mod tests {
         std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
         assert!(HistoryReader::read(&path).is_err());
         assert_ne!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// The record-wide test: a record that keeps callback checkpoints marks
+    /// every row of a thread that has none (its slices ended at a yield or a
+    /// change point), and a record that keeps none marks no row.
+    #[test]
+    fn a_thread_without_checkpoints_in_a_checkpointed_record_ends_at_check_ins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (checkpointed, quiet) = (
+            crate::types::DetTid::from_raw(3),
+            crate::types::DetTid::from_raw(5),
+        );
+        let marks = |with_checkpoint: bool| -> Vec<bool> {
+            let path = dir.path().join(format!("{with_checkpoint}.json"));
+            let mut writer = PreemptionWriter::new(Some(path.clone()));
+            for tid in [checkpointed, quiet] {
+                writer.register_thread(tid, crate::scheduler::runqueue::DEFAULT_PRIORITY);
+                writer.insert_reprioritization(
+                    tid,
+                    crate::types::LogicalTime::from_nanos(10),
+                    1,
+                    crate::scheduler::runqueue::DEFAULT_PRIORITY,
+                    crate::scheduler::runqueue::DEFAULT_PRIORITY,
+                    None,
+                );
+            }
+            if with_checkpoint {
+                writer.insert_callback_checkpoint(
+                    checkpointed,
+                    super::super::callback_history::Origin {
+                        callback: crate::slice_boundary::callbacks::Callback::PmuTimer,
+                        site: super::super::callback_history::Site::Prehook,
+                        progress: 0,
+                        last_op: None,
+                        time: crate::types::LogicalTime::from_nanos(10),
+                        rcbs: 1,
+                    },
+                );
+            }
+            writer.flush().unwrap();
+            let history = HistoryReader::read(&path).unwrap();
+            [checkpointed, quiet]
+                .iter()
+                .map(|tid| {
+                    let mut replay = history.extract_thread_replay(tid).unwrap();
+                    replay.next_slice_end().unwrap().at_check_in
+                })
+                .collect()
+        };
+        assert_eq!(marks(true), [false, true]);
+        assert_eq!(marks(false), [false, false]);
     }
 
     #[test]

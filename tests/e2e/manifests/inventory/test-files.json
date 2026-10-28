@@ -1846,7 +1846,7 @@
       "disposition": "cargo-integration-test-fixture",
       "path": "tests/c/preemption_replay_syscall_slice_end.c",
       "runner": "cargo test -p hermit-run --test cli",
-      "why": "tests/c/preemption_replay_syscall_slice_end.c is compiled and exercised by hermit-cli/tests/cli.rs: a sleeper's pending timed wait ends a computing worker's --chaos slices at the prehook of its next write, and the guest prints the virtual clock last; on PMU hosts (privileged-test.pmu_cli_cases) a replay of such a recording must reproduce it, so that no replayed slice ends at a PMU stop on the branch count before the prehook"
+      "why": "tests/c/preemption_replay_syscall_slice_end.c is compiled and exercised by hermit-cli/tests/cli.rs: a sleeper's pending timed wait ends a computing worker's --chaos slices at the prehook of its next write, and the guest prints the virtual clock last; on PMU hosts (privileged-test.pmu_cli_cases) a replay of such a recording must reproduce it, so that no replayed slice ends at a PMU stop on the branch count before the prehook, and a preemption replay of it must single-step toward a recorded count no more often than its recording did"
     },
     {
       "disposition": "manifest-test",

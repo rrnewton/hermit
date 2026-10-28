@@ -91,6 +91,7 @@ use crate::consts::ROOT_DETPID;
 use crate::fd::SharedOpenFileError;
 use crate::ivar::Ivar;
 use crate::preemptions::ThreadHistory;
+use crate::preemptions::ThreadHistoryIterator;
 use crate::preemptions::boundary_recording::HistoryReader;
 use crate::procfs_inode;
 use crate::procfs_inode::ProcfsName;
@@ -6062,7 +6063,7 @@ impl GlobalState {
         physical_ids: Option<(i32, i32)>,
         signal_identity: Option<reverie::SignalTaskIdentity>,
     ) -> SchedulerRpcResult<(
-        Option<ThreadHistory>,
+        Option<ThreadHistoryIterator>,
         Option<LogicalTime>,
         Option<crate::resources::InstructionOffset>,
     )> {
@@ -6259,12 +6260,12 @@ impl GlobalState {
                 {
                     return SchedulerRpcResult::ThreadExited;
                 }
-                let history = pr.extract_thread_record(&dettid).unwrap_or_else(|| {
+                let history = pr.extract_thread_replay(&dettid).unwrap_or_else(|| {
                     warn!(
                         "Replaying preemptions, but no record found for thread {}",
                         dettid
                     );
-                    ThreadHistory::new()
+                    ThreadHistory::new().into_iter()
                 });
                 let old_prio = sched.priorities.insert(dettid, history.initial_priority());
                 (history, old_prio)
@@ -7990,7 +7991,7 @@ pub enum GlobalResponse {
     /// that holds a `GlobalResponse` that much larger
     /// (`hot_path_futures_stay_small`).
     StartNewThread(
-        Option<Box<ThreadHistory>>,
+        Option<Box<ThreadHistoryIterator>>,
         Option<LogicalTime>,
         Option<crate::resources::InstructionOffset>,
     ),
@@ -9596,7 +9597,7 @@ pub async fn thread_start_request<G, T>(
     guest: &mut G,
     detpid: DetPid,
 ) -> (
-    Option<ThreadHistory>,
+    Option<ThreadHistoryIterator>,
     Option<LogicalTime>,
     Option<crate::resources::InstructionOffset>,
 )
@@ -9649,7 +9650,7 @@ where
 pub(crate) fn finish_thread_start<G, T>(
     cfg: &Config,
     guest: &mut G,
-    history: Option<ThreadHistory>,
+    history: Option<ThreadHistoryIterator>,
     first_slice: Option<LogicalTime>,
     first_offset: Option<crate::resources::InstructionOffset>,
 ) where
@@ -9658,7 +9659,7 @@ pub(crate) fn finish_thread_start<G, T>(
 {
     let reset = {
         let thread = guest.thread_state_mut();
-        thread.preemption_points = history.map(|history| history.into_iter());
+        thread.preemption_points = history;
         crate::slice_boundary::grant::reset_start(thread, cfg)
             .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error))
     };

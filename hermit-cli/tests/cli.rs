@@ -21339,6 +21339,176 @@ fn elf_program_interpreter(path: &Path) -> Option<String> {
         })
 }
 
+/// A preemption replay ends each slice at the callback its record says ended
+/// it.
+///
+/// Under `--chaos` a pending timed wait of the sleeper caps the worker's
+/// slices, and a capped end is observed only at the worker's next syscall, so
+/// those slices end at the prehook of the syscall after the cap. The prehook
+/// shares its RCB count and its logical time with a PMU stop after the
+/// worker's last branch before the syscall. A replay that armed an exact PMU
+/// stop on that count ended the slice at the stop instead: the re-recorded
+/// callback checkpoints named the PMU timer where the record named the
+/// syscall, and the extra scheduler turn moved the virtual clock the guest
+/// prints last. The replay re-records its own record here, checkpoints
+/// included.
+///
+/// PMU SUBJECT: the exact stop needs the PMU's retired-branch counter. test.cli
+/// and test.cli_on_host skip it by exact name; privileged-test.pmu_cli_cases
+/// runs it after privileged-pmu.preemption has shown the PMU works.
+#[test]
+fn run_chaos_preemption_replay_ends_syscall_slices_where_the_record_did() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("recorded.json");
+    let rerecord = directory.path().join("replayed.json");
+    let guest = syscall_slice_end_guest().to_str().unwrap();
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let replay_arg = format!("--replay-preemptions-from={}", record.display());
+    let rerecord_arg = format!("--record-preemptions-to={}", rerecord.display());
+    let common = [
+        "run",
+        "--base-env=minimal",
+        "--chaos",
+        "--seed=2",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    let recording_args: Vec<&str> = common
+        .iter()
+        .copied()
+        .chain([record_arg.as_str(), "--", guest])
+        .collect();
+    let recorded = hermit_test::hermit_output(
+        "chaos preemption record",
+        hermit_command(&recording_args)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
+    assert_success(&recorded, &recording_args);
+    let replay_args: Vec<&str> = common
+        .iter()
+        .copied()
+        .chain([replay_arg.as_str(), rerecord_arg.as_str(), "--", guest])
+        .collect();
+    let replayed = hermit_test::hermit_output(
+        "chaos preemption replay",
+        hermit_command(&replay_args)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
+    assert_success(&replayed, &replay_args);
+    assert_eq!(stdout(&replayed), stdout(&recorded));
+
+    let read = |path: &Path| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let (recorded, replayed) = (read(&record), read(&rerecord));
+    let syscall_prehooks = recorded["callback_checkpoints"]
+        .as_object()
+        .into_iter()
+        .flat_map(|threads| threads.values())
+        .flat_map(|checkpoints| checkpoints.as_array().unwrap())
+        .filter(|checkpoint| {
+            checkpoint["origin"]["site"] == "Prehook"
+                && checkpoint["origin"]["callback"].get("Syscall").is_some()
+        })
+        .count();
+    assert!(
+        syscall_prehooks > 0,
+        "the recording has no slice that a syscall's prehook ended, so this \
+         case cannot reach the shared branch count: {recorded}"
+    );
+    assert_eq!(
+        replayed["callback_checkpoints"], recorded["callback_checkpoints"],
+        "the replay ended a slice at another callback than the record"
+    );
+    assert_eq!(replayed["per_thread"], recorded["per_thread"]);
+    assert_eq!(replayed["global"], recorded["global"]);
+}
+
+/// A preemption replay of a syscall-heavy guest single-steps about as often as
+/// its recording did, not once per slice a check-in ended: such a slice gets
+/// only a bound
+/// one RCB past its recorded count, armed imprecisely, never an exact stop.
+///
+/// Reverie reaches an exact count by single-stepping the guest across the PMU
+/// skid margin, and logs each such approach ("Timer will single-step from ctr
+/// .. to ..") under `RUST_LOG=reverie_ptrace::timer=debug`. Most slices of
+/// this guest end at a syscall's prehook (see
+/// `run_chaos_preemption_replay_ends_syscall_slices_where_the_record_did`).
+/// A replay that aimed an exact stop at, or just past, each such slice's count
+/// stepped toward it until the syscall came first, every time: on an AMD EPYC
+/// host, 40 step sequences and 110 s for seed 2's ten prehook ends, against
+/// none and under a second for the recording and for this replay. Every exact
+/// stop a faithful replay still arms is one the recording's own timer reached
+/// for, so the replay steps at most as often as the recording, give or take a
+/// skid.
+///
+/// PMU SUBJECT: without the PMU's retired-branch counter there is no precise
+/// timer and nothing steps. test.cli and test.cli_on_host skip it by exact
+/// name; privileged-test.pmu_cli_cases runs it after
+/// privileged-pmu.preemption has shown the PMU works.
+#[test]
+fn run_chaos_preemption_replay_does_not_single_step_toward_check_in_ends() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("recorded.json");
+    let guest = syscall_slice_end_guest().to_str().unwrap();
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let replay_arg = format!("--replay-preemptions-from={}", record.display());
+    let common = [
+        "run",
+        "--base-env=minimal",
+        "--chaos",
+        "--seed=2",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    let run = |label: &str, extra: &str| {
+        let args: Vec<&str> = common.iter().copied().chain([extra, "--", guest]).collect();
+        let output = hermit_test::hermit_output(
+            label,
+            hermit_command(&args)
+                .env_remove("HERMIT_EPOCH")
+                .env("RUST_LOG", "reverie_ptrace::timer=debug")
+                .stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        let steps = String::from_utf8_lossy(&output.stderr)
+            .matches("Timer will single-step")
+            .count();
+        (output, steps)
+    };
+    let (recorded, recorded_steps) = run("chaos preemption record", &record_arg);
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let check_in_ends = json["callback_checkpoints"]
+        .as_object()
+        .into_iter()
+        .flat_map(|threads| threads.values())
+        .flat_map(|checkpoints| checkpoints.as_array().unwrap())
+        .filter(|checkpoint| {
+            checkpoint["origin"]["site"] == "Prehook"
+                && checkpoint["origin"]["callback"].get("Syscall").is_some()
+        })
+        .count();
+    assert!(
+        check_in_ends > 0,
+        "the recording has no slice that a syscall's prehook ended, so no \
+         replay of it would step toward one: {json}"
+    );
+    let (replayed, replayed_steps) = run("chaos preemption replay", &replay_arg);
+    assert_eq!(stdout(&replayed), stdout(&recorded));
+    // Two steps of slack absorb a host whose counter skids into an approach
+    // the recording did not need; the arm this rejects stepped once or more
+    // per such slice.
+    assert!(
+        replayed_steps <= recorded_steps + 2,
+        "the replay single-stepped toward a recorded count {replayed_steps} times, \
+         the recording {recorded_steps} times, for {check_in_ends} slices a \
+         syscall's prehook ended"
+    );
+}
+
 #[test]
 fn run_ptrace_nonleader_exec_refuses_preemption_artifacts() {
     nonleader_exec::run_preemption_artifacts();
