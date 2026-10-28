@@ -3071,7 +3071,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the curr_target commit unit (lander review of #4625): 2799.
     // And the fatal all-blocked unit (lander review of #4625): 2800.
     // And the own-process walk unit (second review of #4625): 2801.
-    ("test.detcore_unit", 2801),
+    // And the commit-guard unit (second review of #4625): 2802.
+    ("test.detcore_unit", 2802),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5401,7 +5402,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same curr_target commit unit: 2799.
     // And the same fatal all-blocked unit: 2800.
     // And the same own-process walk unit: 2801.
-    ("test.detcore_unit_on_host", 2801),
+    // And the same commit-guard unit: 2802.
+    ("test.detcore_unit_on_host", 2802),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -27873,6 +27873,52 @@ mod test {
         assert_eq!(foreign_receiver(&mut scheduler), eleven);
     }
 
+    /// A reported success commits only the pending choice of the sender that
+    /// reports it, for the process it chose in (`process_signal_sent`): a
+    /// report from another thread, or for another process, moves nothing,
+    /// and drops the pending choice.
+    #[test]
+    fn process_signal_sent_commits_only_the_reporting_senders_choice() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let mut scheduler = gated_scheduler();
+        let leader = DetTid::from_raw(100);
+        let first = DetTid::from_raw(101);
+        let other = DetTid::from_raw(102);
+        let process = DetPid::from_raw(100);
+        let elsewhere = DetPid::from_raw(200);
+        signal_process(
+            &mut scheduler,
+            leader,
+            &[(leader, usr1), (first, 0), (other, usr1)],
+            usr1,
+        );
+        let choose = |scheduler: &mut Scheduler| {
+            assert_eq!(
+                scheduler.process_signal_receiver(process, leader, leader, libc::SIGUSR1),
+                process_signal_receiver::ProcessSignalReceiver::Thread {
+                    thread: first,
+                    sole: true
+                }
+            );
+        };
+        choose(&mut scheduler);
+        scheduler.process_signal_sent(other, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+        scheduler.process_signal_sent(leader, process);
+        assert_eq!(
+            scheduler.signal_curr_targets.get(&process),
+            None,
+            "the mismatched report dropped the pending choice"
+        );
+        choose(&mut scheduler);
+        scheduler.process_signal_sent(leader, elsewhere);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+        assert_eq!(scheduler.signal_curr_targets.get(&elsewhere), None);
+        choose(&mut scheduler);
+        scheduler.process_signal_sent(leader, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), Some(&first));
+    }
+
     /// The readmission that broke record/replay of make -jN (minibeads
     /// dh-ojrf): make (7), a SIGCHLD taker, is backgrounded in a `pselect6`
     /// and a child (173) in a `connect`. Both calls have finished by one
