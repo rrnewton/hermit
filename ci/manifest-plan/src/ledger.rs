@@ -1142,7 +1142,7 @@ pub enum CellResultsValue {
     /// JSON text instead of a `Value` tree. A `Value` costs about 7 bytes of
     /// heap per byte of JSON: on the 2026-10-10 ledger the 616 rows with cell
     /// results held 728 MB of JSON as 4.9 GB of `Value`
-    /// (validate-status held about 7-8 GB of typed rows). It reads,
+    /// (validate-status holds every ledger row this way). It reads,
     /// compares and serializes exactly as `Other` holding the same value.
     Retained(RetainedJson),
     /// Decode-only duplicate identity state. Historical serialization and typed

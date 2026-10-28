@@ -573,8 +573,8 @@ fn default_measurement() -> MeasurementState {
 /// The part of a cell's evidence that outlives its capped observations.
 ///
 /// The document keeps only each provenance's LATEST observation (cap 1: the
-/// document holds each cell's latest state, and cut 1.56 GB to about 41 MB on
-/// the ledger of the day it landed); the full history lives in the series and
+/// document holds each cell's latest state; d4a43db3c31 measured 1.56 GB ->
+/// 40.7 MB on that day's ledger); the full history lives in the series and
 /// the validation history. Before older observations are
 /// dropped, what they said is folded in here, so [`derive_measurement`] keeps
 /// its meaning: a cell that ever diverged still reads `diverged`.
@@ -11730,9 +11730,10 @@ fn verify_combined_write_state(
     }
     // Compared in chunks, not by reading the files: cells.json is 1.27 GB, and
     // a whole copy of it per check, beside the original and the generated
-    // bytes, set the write-back's peak (the publication step that runs it was
-    // measured at 13.5 GB resident). The parity file is still read, as before,
-    // so an unreadable one still refuses.
+    // bytes, set the write-back's peak. With the rebuilt history below, this
+    // cut the write-back's peak RSS from 15,464 MB to 12,684 MB on real inputs
+    // (measured in 49fa9f99eb95). The parity file is still read, as before, so
+    // an unreadable one still refuses.
     let (scorecard, cells) = history_files(root, false)?;
     let parity = history_parity_file(root, false)?;
     if !file_holds_exactly(&scorecard, expected_scorecard)? {
@@ -12453,7 +12454,7 @@ where
 
     // The reconciled history as read, rebuilt from the held bytes whenever a
     // fresh copy of it is needed, instead of keeping a 2.7 GB clone (`before`)
-    // from here to the end (that clone raised the write-back's peak memory).
+    // from here to the end (49fa9f99eb95 measured the pair of changes here).
     // Parsing and reconciling the same bytes against the same checkout gives
     // the same history; only the first reconciliation checks the committed
     // document and announces retirements.
@@ -12659,8 +12660,9 @@ where
     )?;
     // Each of the history's large copies is released as soon as nothing below
     // reads it, so they are not all held while the generated files are built
-    // and written, which lowers the write-back's peak memory. After
-    // here the snapshot is read only for its held identity (verify).
+    // and written (with the other cuts in 06142e8fb897, the write-back's peak
+    // RSS went from 23,850 MB to 15,464 MB on real inputs). After here the
+    // snapshot is read only for its held identity (verify).
     snapshot.rows = Vec::new();
     let before = reconciled_history(false)?;
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;

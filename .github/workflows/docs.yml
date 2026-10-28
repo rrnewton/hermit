@@ -358,8 +358,10 @@ jobs:
         RUSTUP_AUTO_INSTALL: "0"
         PYTHONDONTWRITEBYTECODE: "1"
         # Print one wall/CPU line per build phase to this step's log, so the
-        # step's duration can be split by phase from the log alone (the rebuild
-        # took 43-62 minutes and its slow phase was not visible).
+        # step's duration can be split by phase from the log alone. Before
+        # this, the hosted rebuild step took 3700 s, 3001 s and 2586 s on three
+        # Docs runs (36461693420, 36470493141, 36491135006; recorded in
+        # d3a0a4ae3d16) and its slow phase was not visible.
         COMPATIBILITY_WEBSITE_PHASE_TIMING: "1"
         LEDGER_COMMIT: ${{ steps.website-source.outputs.ledger_commit }}
         VALIDATION_HISTORY_COMMIT: ${{ steps.website-history.outputs.validation_history_commit }}

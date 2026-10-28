@@ -16,8 +16,10 @@
 #
 #   phrasing  "from the checkout at", or "from|in|at our|my checkout|slot|
 #             worktree|lane": where the author worked, not a fact about Hermit.
-#   link      a github.com/rrnewton/dev-hermit URL (issue, blob, tree,
-#             commit): the repository is private.
+#   link      a github.com/rrnewton/dev-hermit or
+#             raw.githubusercontent.com/rrnewton/dev-hermit URL (issue, blob,
+#             tree, commit, raw file), in any letter case: the repository is
+#             private.
 #   path      a path into the private workspace: dev-hermit/..., ~/work/
 #             dev-hermit, worktrees/slots/..., or temp/<agent>-status.md.
 #
@@ -59,10 +61,12 @@ classify() {
             if (lower ~ /from (the|our|my) checkout at/ ||
                 lower ~ /(from|in|at) (our|my) (checkout|slot|worktree|lane)([^[:alnum:]_-]|$)/) {
                 rule = "phrasing"
-            } else if (content ~ /github\.com\/rrnewton\/dev-hermit([^[:alnum:]_.-]|$)/) {
+            } else if (lower ~ /github(usercontent)?\.com\/rrnewton\/dev-hermit([^[:alnum:]_.-]|$)/) {
                 rule = "link"
             } else {
-                probe = content
+                # GitHub owner and repository names are case-insensitive, so
+                # every comparison below is made on the lowercased line.
+                probe = lower
                 gsub(/rrnewton\/dev-hermit/, "", probe)
                 gsub(/vendor\/dev-hermit\//, "vendor/", probe)
                 if (probe ~ /(^|[^[:alnum:]_.<-])dev-hermit\// ||
@@ -175,6 +179,8 @@ expect_clean() {
     fi
 }
 
+# The fixtures are literal text; nothing in them is meant to expand.
+# shellcheck disable=SC2016
 self_test() {
     expect_hit phrasing 'cloned from the checkout at dev-hermit/experiments/gvisor'
     expect_hit phrasing 'Measured From the checkout at /src'
@@ -183,6 +189,10 @@ self_test() {
     expect_hit link '// https://github.com/rrnewton/dev-hermit/issues/549'
     expect_hit link '[doc](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/x.md)'
     expect_hit link 'see github.com/rrnewton/dev-hermit for details'
+    expect_hit link 'https://github.com/rrnewton/Dev-Hermit/issues/549'
+    expect_hit link 'https://GitHub.com/RRNewton/DEV-HERMIT/blob/main/x.md'
+    expect_hit link 'https://raw.githubusercontent.com/rrnewton/dev-hermit/main/ci-hub/x.py'
+    expect_hit path 'cd ~/work/Dev-Hermit/hermit'
     expect_hit path 'cd ~/work/dev-hermit/hermit'
     expect_hit path 'exec $HOME/work/dev-hermit'
     expect_hit path 'provide dev-hermit/bin/safehermit explicitly'
@@ -192,6 +202,8 @@ self_test() {
 
     expect_clean 'repos/rrnewton/dev-hermit/contents/ci-hub/check_outcome.py?ref=abc'
     expect_clean 'repository: rrnewton/dev-hermit'
+    expect_clean 'repos/RRNewton/Dev-Hermit/contents/ci-hub/check_outcome.py'
+    expect_clean 'https://github.com/rrnewton/dev-hermit-demo-suite'
     expect_clean '"parent_repository": "rrnewton/dev-hermit",'
     expect_clean 'ci/vendor/dev-hermit/ci-hub/check_outcome.py'
     expect_clean 'dev-hermit-demo-suite/ignored/demo08-btrfs'
