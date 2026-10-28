@@ -41303,6 +41303,7 @@ fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
         "deep",
         "edge",
         "unaligned",
+        "size73",
     ] {
         let (code, stdout, log, _) = run(&["--strict"], mode);
         assert_eq!(code, Some(122), "{mode}: {stdout}\n{log}");
@@ -41321,6 +41322,7 @@ fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
     for (mode, answer) in [
         ("zombie", "clone3: File exists"),
         ("efault", "clone3: Bad address"),
+        ("nonetail", "clone3: Bad address"),
         ("newpidzero", "clone3: Invalid argument"),
         ("nocap", "clone3: Operation not permitted"),
     ] {
