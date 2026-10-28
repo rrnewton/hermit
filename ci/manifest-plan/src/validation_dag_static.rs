@@ -1219,7 +1219,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
-    ("test.regular_crates", 1929),
+    // And detcore-model's summary::tests::desync_notes_round_trip_through_summary_json
+    // (https://github.com/rrnewton/hermit/issues/4876): 1930.
+    ("test.regular_crates", 1930),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3185,7 +3187,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_a_legacy_recording_notes_its_background_starts
     // and a_recorded_background_start_begins_its_call_where_the_recording_did:
     // 3063, listed.
-    ("test.detcore_unit", 3063),
+    // And scheduler::replayer::tests::untaken_background_starts_name_their_place_in_the_record
+    // and scheduler::test::the_summary_names_each_untaken_background_start
+    // (https://github.com/rrnewton/hermit/issues/4876): 3065.
+    ("test.detcore_unit", 3065),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5607,7 +5612,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seven popped-event readmission units: 3055.
     // And the same two prehook-handoff scheduler units: 3057, listed.
     // And the same six background-start units: 3063, listed.
-    ("test.detcore_unit_on_host", 3063),
+    // And the same two untaken-background-start units: 3065.
+    ("test.detcore_unit_on_host", 3065),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6227,7 +6233,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738: the same nine added cases: 1927 - 14 = 1913.
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
-    ("test.regular_crates_on_host", 1915),
+    // And the same desync-notes round-trip unit: 1916.
+    ("test.regular_crates_on_host", 1916),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
