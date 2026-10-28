@@ -3058,7 +3058,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::files::leading_climb_tests::a_spelling_climbs_by_its_leading_dotdots
     // and syscalls::files::listed_directory_tests::a_listing_is_named_by_the_link_only_where_the_entry_is_the_callers:
     // 2738 + 3 = 2741, listed.
-    ("test.detcore_unit", 2741),
+    // And +6 from 82cbd684: 2747.
+    ("test.detcore_unit", 2747),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4348,7 +4349,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dotdot_from_a_received_descriptor_finds_the_guests_own_files, the ptrace
     // halves of https://github.com/rrnewton/hermit/issues/4541's five run_kvm_
     // tests: 654 + 5 = 659, listed.
-    ("test.cli", 659),
+    // And +1 from 82cbd684: 660.
+    ("test.cli", 660),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4889,7 +4891,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 564.
     // And the same five ptrace working-directory tests, not excluded: 573 +
     // 5 = 578, listed.
-    ("test.cli_on_host", 578),
+    // And +1 from 82cbd684: 579.
+    ("test.cli_on_host", 579),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5358,7 +5361,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same P2b deletion of the anchor device unit: 2694, listed.
     // And the same two directory st_nlink units: 2738, listed.
     // And the same three working-directory units: 2738 + 3 = 2741, listed.
-    ("test.detcore_unit_on_host", 2741),
+    // And +6 from 82cbd684: 2747.
+    ("test.detcore_unit_on_host", 2747),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

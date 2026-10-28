@@ -2417,7 +2417,31 @@ impl GlobalTool for GlobalState {
     ///   and POSIX-timer expiry, child-exit SIGCHLD) are published under the
     ///   scheduler lock at scheduler time into the backend's pending sets or
     ///   dequeue journal, which make a boundary non-empty, so none is lost.
-    /// - Authorization succeeds only for `parked.running`. The only skippable
+    /// - The round trip's permit is read by no other decision. Permits are
+    ///   per thread (<https://github.com/rrnewton/hermit/issues/4899>), and
+    ///   apart from the holder's own authorization and receipt, every reader
+    ///   of `parked.permits` reads one named thread's entry, or only the
+    ///   observation permits of parked waits, which a boundary's permit never
+    ///   is:
+    ///   - another thread's authorization, the exit reservation
+    ///     (`reserve_exit_boundary`) and the parked-request retirements
+    ///     (`retire_parked_requests`, `retire_replaced_parked_request`,
+    ///     `retire_child_wait_signal_request`) read their own thread's entry;
+    ///   - alarm selection (`select_parked_alarm`) skips a process only for an
+    ///     observation permit (one with a `site`) and otherwise reads each
+    ///     recipient's own entry, and a thread at a boundary is no parked-wait
+    ///     recipient;
+    ///   - an observation's finish (`finish_observation`) and another
+    ///     thread's receipt remove only their own thread's entry;
+    ///   - process retirement (`finish_process_retirement`) reads every entry
+    ///     of the process, but only once its leader has joined every thread,
+    ///     never during a live thread's boundary.
+    ///
+    ///   So with or without the round trip, every decision sees the same
+    ///   permits of every other thread, and the boundary's thread holds none
+    ///   once the round trip ends.
+    /// - The round trip runs inside the thread's own serial grant.
+    ///   Authorization succeeds only for `parked.running`. The only skippable
     ///   boundaries follow a completed Tool callback or a backend-owned
     ///   `rt_sigreturn` (thread entry checks only when a signal is eligible).
     ///   Every request is awaited, and every background release
@@ -2428,12 +2452,8 @@ impl GlobalTool for GlobalState {
     ///   then: they wait for quiescence, and `are_all_quiesced` waits on the
     ///   running thread's empty request. The control-intent drain
     ///   (`drain_control_intents`) does run on every pass of the turn loop,
-    ///   but its intents only finish or resume an observed parked wait. A
-    ///   finish runs while that wait's observation permit exists, and in the
-    ///   boundary thread's own process that permit makes authorization
-    ///   refuse; a resume reads no permit. So no other decision can see the
-    ///   short-lived permit, and its release admits no exit: exits wait only
-    ///   behind another permit of the process.
+    ///   but its intents only finish or resume an observed parked wait, and
+    ///   touch only that wait's own permit.
     /// - The receipt's cleanup is redundant there. Every grant settles the
     ///   parked request it answers (`settle_parked_grant`), and every request
     ///   the scheduler substitutes for a filed one retires the replaced
@@ -2450,10 +2470,16 @@ impl GlobalTool for GlobalState {
     ///
     /// Held once before, while a backgrounded KVM `rt_sigsuspend` race was
     /// open (<https://github.com/rrnewton/hermit/issues/4360>). That race is
-    /// fixed: a KVM `rt_sigsuspend` now runs in its caller's turn, and a
-    /// sibling may exit while a thread holds a permit
-    /// (<https://github.com/rrnewton/hermit/issues/4367>). Before those fixes
-    /// the race fired about as often with this opt-in as without it.
+    /// fixed: a KVM `rt_sigsuspend` now runs in its caller's turn. Before that
+    /// fix the race fired about as often with this opt-in as without it.
+    ///
+    /// An earlier form of this proof called an observed wait's permit
+    /// short-lived and unseen by other decisions. It is not short-lived: it
+    /// lasts until the observed thread's return-boundary receipt, across that
+    /// thread's `InboundSignal` turn, during which siblings run. While permits
+    /// were one per process, a sibling's boundary saw it and was refused
+    /// (<https://github.com/rrnewton/hermit/issues/4899>). The argument above
+    /// no longer depends on any permit's lifetime.
     ///
     /// Re-prove or drop this if Detcore ever holds pending signals, or its
     /// own mask copy, that the backend cannot see and delivers them through

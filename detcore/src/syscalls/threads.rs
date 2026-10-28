@@ -2673,12 +2673,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// so none runs guest code before the native delivery (Claude re-check of
     /// https://github.com/rrnewton/hermit/pull/4387).
     ///
-    /// One path can still run a sibling first: an exit parked behind a
-    /// sibling's signal-delivery permit (`Scheduler::exit_awaits_sibling_permit`).
-    /// DynamoRIO reads the action again when it delivers, so after the grant
-    /// the action is read again and, if a sibling changed it, set back to
-    /// `SIG_DFL` in this dying process, and the delivery carries out the
-    /// committed decision (Codex review of
+    /// Should a sibling still run first, its action change must not undo the
+    /// decision. DynamoRIO reads the action again when it delivers, so after
+    /// the grant the action is read again and, if a sibling changed it, set
+    /// back to `SIG_DFL` in this dying process, and the delivery carries out
+    /// the committed decision (Codex review of
     /// https://github.com/rrnewton/hermit/pull/4387, P1).
     ///
     /// The gate is this backend's: DynamoRIO carries out a default action in

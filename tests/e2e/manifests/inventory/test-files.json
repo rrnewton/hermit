@@ -2528,6 +2528,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/signal_permits_per_thread.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/signal_permits_per_thread.c is owned by hermit-cli/tests/cli.rs. Its sixteen modes have threads of one process take signals at the same time (both raise or tgkill themselves, a worker signals a spinning or sigsuspending main thread and then itself), have a worker keep signaling itself while the main thread's parked wait (nanosleep, clock_nanosleep, pause, sigsuspend, read, waitid or a getpid loop) takes a process ITIMER_REAL alarm, have a worker keep signaling itself while another thread exits or the process ends by exit_group, SIGTERM or a default-action SIGALRM, and have a worker call exit_group while that alarm interrupts the main thread's nanosleep. Detcore once held one signal-delivery permit per process and the KVM backend failed the run when a sibling's boundary was refused (https://github.com/rrnewton/hermit/issues/4899). run_kvm_signal_permits_are_per_thread runs all sixteen modes on KVM and run_ptrace_signal_permits_are_per_thread fifteen on ptrace: each must print the line Linux prints and reach bitwise parity under run --strict --verify --verify-strict, and on KVM the retained INFO log of alarm-exit-group must show the worker's group exit committed after the main thread began handling its SIGALRM and before the main thread's InboundSignal turn, while it held its observed wait's permit. alarm-waitid stays an unmet ptrace requirement: there the alarm does not interrupt waitid and the run never ends, at main b82ae16f as well (https://github.com/rrnewton/hermit/issues/4133). A generic manifest cell cannot assert any of this per mode."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/signal_state_kept.c",
       "runner": "hermit-cli/tests/signal_determinism.rs",
       "why": "tests/c/signal_state_kept.c is owned by hermit-cli/tests/signal_determinism.rs: the ptrace_signal_state_kept_* tests run it natively and under run --strict --verify --verify-strict, single-threaded and around a joined thread (glibc's pthread_create blocks every signal around the clone with a call Detcore injects, and Reverie single-steps), and compare SIGTRAP's action, rt_sigprocmask bit and procfs SigBlk/SigIgn/SigCgt with the native run's for an ignored, blocked-ignored, caught, blocked-caught and blocked-default SIGTRAP. Where Reverie keeps its step shield (a blocked-caught SIGTRAP, and every blocked state once a second thread has used the table) only SIGTRAP's SigBlk bit may differ, a pinned limit. A generic manifest cannot compare a guest's output with a native run of it (A5 step 3.0, https://github.com/rrnewton/hermit/issues/4485)."
@@ -2536,7 +2542,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/signal_then_sibling_exit.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/signal_then_sibling_exit.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_sibling_may_exit_while_its_signal_is_taken runs it on the KVM backend, where a worker signals the main thread and exits at once while the main thread takes the signal at a system-call return (spin) or in a sigsuspend loop; the worker's exit must wait for the delivery permit rather than fail the parked signal protocol (https://github.com/rrnewton/hermit/issues/4367). It requires repeated run --strict --verify --verify-strict runs, with chaos seeds for sigsuspend, at bitwise parity, so it remains a guest fixture rather than a manifest cell."
+      "why": "tests/c/signal_then_sibling_exit.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_sibling_may_exit_while_its_signal_is_taken runs it on the KVM backend, where a worker signals the main thread and exits at once while the main thread takes the signal at a system-call return (spin) or in a sigsuspend loop; the worker's exit must not fail the parked signal protocol (https://github.com/rrnewton/hermit/issues/4367), and since delivery permits are per thread it proceeds while the main thread holds its own (https://github.com/rrnewton/hermit/issues/4899). It requires repeated run --strict --verify --verify-strict runs, with chaos seeds for sigsuspend, at bitwise parity, so it remains a guest fixture rather than a manifest cell."
     },
     {
       "disposition": "guest-fixture",

@@ -271,6 +271,7 @@ static PARENT_DEATH_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGNAL_PERMITS_PER_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GROUP_EXIT_SIGNAL_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_WAIT_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_READ_SIGNAL_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3077,6 +3078,32 @@ fn signal_then_sibling_exit_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "signal-then-sibling-exit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn signal_permits_per_thread_guest() -> &'static Path {
+    SIGNAL_PERMITS_PER_THREAD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("signal-permits-per-thread");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the signal-permits-per-thread guest directory");
+        let guest = build_root.join("signal_permits_per_thread");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/signal_permits_per_thread.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the signal-permits-per-thread guest");
+        assert!(
+            output.status.success(),
+            "signal-permits-per-thread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -17083,11 +17110,14 @@ fn run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills() {
 /// tests/c/signal_then_sibling_exit.c on KVM: a worker signals the main thread
 /// and exits at once, while the main thread takes the signal at a system-call
 /// return (`spin`, a getpid loop) or in a `sigsuspend` loop. The waiting
-/// thread holds a delivery permit until its `InboundSignal` turn, and the
-/// protocol allows one boundary per process, so the worker's controlled exit
-/// was refused as a protocol failure ("KVM parked signal protocol failed ...
-/// Identity"), on main 2bf536af for `spin` in 4 of 4 runs. The exit now waits
-/// for the permit's release (https://github.com/rrnewton/hermit/issues/4367).
+/// thread holds a delivery permit until its `InboundSignal` turn. While the
+/// protocol allowed one permit per process, the worker's controlled exit was
+/// refused as a protocol failure ("KVM parked signal protocol failed ...
+/// Identity"), on main 2bf536af for `spin` in 4 of 4 runs
+/// (https://github.com/rrnewton/hermit/issues/4367); the exit then waited for
+/// the permit's release. Permits are now per thread, so the exit proceeds
+/// while the main thread holds its own
+/// (https://github.com/rrnewton/hermit/issues/4899).
 /// `sigsuspend` also runs under three chaos seeds. `spin` runs at the default
 /// schedule: it busy-waits with no blocking call, and under chaos it holds a
 /// new thread off for up to two full slices (200 ms of virtual time each), too
@@ -17156,6 +17186,194 @@ fn run_kvm_a_sibling_may_exit_while_its_signal_is_taken() {
             );
         }
     }
+}
+
+/// The modes of tests/c/signal_permits_per_thread.c and the line Linux
+/// prints for each: threads of one process taking signals at the same time,
+/// beside a parked wait that a process alarm interrupts, and while a sibling
+/// exits or ends the process, also while that alarm interrupts the wait.
+const SIGNAL_PERMIT_MODES: [(&str, &str); 16] = [
+    ("raise", "raise: ok\n"),
+    ("tgkill", "tgkill: ok\n"),
+    ("spin", "spin: ok\n"),
+    ("sigsuspend", "sigsuspend: ok\n"),
+    ("alarm-spin", "alarm-spin: ok\n"),
+    ("alarm-nanosleep", "alarm-nanosleep: ok\n"),
+    ("alarm-clock_nanosleep", "alarm-clock_nanosleep: ok\n"),
+    ("alarm-pause", "alarm-pause: ok\n"),
+    ("alarm-sigsuspend", "alarm-sigsuspend: ok\n"),
+    ("alarm-read", "alarm-read: ok\n"),
+    ("alarm-waitid", "alarm-waitid: ok\n"),
+    ("thread-exit", "thread-exit: ok\n"),
+    ("exit-group", "exit-group: exited 3\n"),
+    ("fatal", "fatal: killed by signal 15\n"),
+    ("fatal-alarm", "fatal-alarm: killed by signal 14\n"),
+    ("alarm-exit-group", "alarm-exit-group: exited 3\n"),
+];
+
+/// Runs each of `modes` of tests/c/signal_permits_per_thread.c under strict
+/// verification on `backend`, and requires the line Linux prints and bitwise
+/// parity with INFO messages compared. `check_log` then reads each mode's
+/// retained first-run INFO log, the one the verification compared.
+fn assert_signal_permit_modes<'a>(
+    backend: &str,
+    modes: impl IntoIterator<Item = (&'a str, &'a str)>,
+    check_log: impl Fn(&str, &str),
+) {
+    let guest = signal_permits_per_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for (mode, expected) in modes {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let logs = directory.path().join("logs");
+        let logs_arg = logs.to_str().expect("log directory path should be UTF-8");
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--keep-logs",
+            "--verify-log-dir",
+            logs_arg,
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend} {mode}");
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(
+            verdict["bitwise_parity"], true,
+            "{backend} {mode}: {verdict}"
+        );
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{backend} {mode}: no INFO messages compared: {verdict}"
+            );
+        }
+        let first_run_log = fs::read_dir(&logs)
+            .expect("--keep-logs retained no log directory")
+            .map(|entry| entry.expect("unreadable retained log entry").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("run1"))
+            })
+            .unwrap_or_else(|| panic!("{backend} {mode}: --keep-logs retained no first-run log"));
+        let log = fs::read_to_string(&first_run_log).expect("retained log is not UTF-8 text");
+        check_log(mode, &log);
+    }
+}
+
+/// In tests/c/signal_permits_per_thread.c's alarm-exit-group mode, requires
+/// the INFO `log` to show the worker's group exit committed while the main
+/// thread held its observed wait's permit: after the main thread began
+/// handling its SIGALRM ("handling inbound signal ... SIGALRM", logged once
+/// the observation took the alarm) and before that thread's InboundSignal
+/// turn for it, which releases the permit at the return boundary. Where the
+/// exit lands depends on the schedule: the worker's default count of 1100
+/// self-signals lands it in this window on KVM, which ran from 975 to 1250
+/// self-signals when this test was written, for guests built against glibc
+/// 2.34 and 2.42 alike. A failure here means the window moved; find it again
+/// with the guest's optional count argument.
+fn assert_group_exit_beside_an_observed_wait(log: &str) {
+    let lines: Vec<&str> = log.lines().collect();
+    let (handling, main) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(index, line)| {
+            if !(line.contains("handling inbound signal (#") && line.contains(") SIGALRM")) {
+                return None;
+            }
+            let after = line.split("[dtid ").nth(1)?;
+            let tid = after.split(']').next()?;
+            Some((index, tid.to_owned()))
+        })
+        .unwrap_or_else(|| {
+            panic!("alarm-exit-group: the main thread never handled its SIGALRM: the group exit came first")
+        });
+    let exit_resource = format!("Exit {{ group: true, process: DetPid({main})");
+    let main_commit = format!("dettid {main} using resources");
+    let main_alarm_turn = |line: &&str| {
+        line.contains("COMMIT turn")
+            && line.contains(&main_commit)
+            && line.contains("InboundSignal(SigWrapper(14))")
+    };
+    let exit = lines[handling..]
+        .iter()
+        .position(|line| {
+            line.contains("COMMIT turn")
+                && line.contains(&exit_resource)
+                && !line.contains(&main_commit)
+        })
+        .map(|offset| handling + offset)
+        .unwrap_or_else(|| {
+            panic!("alarm-exit-group: no sibling committed the group exit after dtid {main} handled SIGALRM (line {})", handling + 1)
+        });
+    if let Some(offset) = lines[handling..exit].iter().position(main_alarm_turn) {
+        panic!(
+            "alarm-exit-group: dtid {main}'s InboundSignal turn (line {}) came before the group exit (line {}), so the exit did not meet its observed wait's permit",
+            handling + offset + 1,
+            exit + 1
+        );
+    }
+}
+
+/// tests/c/signal_permits_per_thread.c on KVM: Detcore held one
+/// signal-delivery permit per process, so a thread that reached a signal
+/// boundary while a sibling waited for its turn to deliver was refused, and
+/// reverie-kvm failed the run after 64 refusals ("KVM signal hook exhausted
+/// one return boundary without selecting delivery"). On main b82ae16f every
+/// mode but `thread-exit` and `exit-group` failed that way; those two passed
+/// only because the exit waited for the sibling's permit. Permits are now
+/// per thread (https://github.com/rrnewton/hermit/issues/4899): each mode
+/// prints the line Linux prints and reaches bitwise parity, and in the
+/// `alarm-*` modes the sibling's boundaries come while the main thread's
+/// observed parked wait holds its permit. In `alarm-exit-group` the sibling's
+/// group exit comes then, which the retained INFO log must show; on main
+/// b82ae16f that exit waited for the permit's release instead.
+#[test]
+fn run_kvm_signal_permits_are_per_thread() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM per-thread signal permit cases: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    assert_signal_permit_modes("--backend=kvm", SIGNAL_PERMIT_MODES, |mode, log| {
+        if mode == "alarm-exit-group" {
+            assert_group_exit_beside_an_observed_wait(log);
+        }
+    });
+}
+
+/// The same guest on ptrace, where the kernel delivers each thread's signals
+/// and Detcore holds no permits: fifteen of the sixteen modes print the same
+/// line as on Linux and KVM and reach bitwise parity. `alarm-waitid` is left
+/// out: on ptrace its waitid is not interrupted by the alarm and the run
+/// never ends, on main b82ae16f as here
+/// (https://github.com/rrnewton/hermit/issues/4133).
+#[test]
+fn run_ptrace_signal_permits_are_per_thread() {
+    let _guard = hermit_run_guard();
+    assert_signal_permit_modes(
+        "--backend=ptrace",
+        SIGNAL_PERMIT_MODES
+            .into_iter()
+            .filter(|(mode, _)| *mode != "alarm-waitid"),
+        |_, _| {},
+    );
 }
 
 /// tests/c/parked_wait_then_exec.c on KVM: a parked wait that a real-timer
