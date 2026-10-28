@@ -157,6 +157,9 @@ pub(crate) fn run_verification(
     use reverie_inguest::launcher::exec_stop::CleanupConfirmation;
     use reverie_inguest::launcher::exec_stop::CleanupOwner;
 
+    // Refuse before even rewinding the shared verification stdin snapshot.
+    // The inner owner repeats admission for direct, uncaptured callers.
+    super::super::check_mapped_command(&run.command)?;
     let (limits, deadline) = run.policy.parts();
     check(deadline)?;
     run.command

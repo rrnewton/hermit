@@ -13510,6 +13510,44 @@ mod tests {
         drop(original);
         let retained_fds = image.pair_fds().map(|fd| fd.as_raw_fd());
 
+        // Exercise the real capture entry with the actual retained package.
+        // Requested-PID refusal must precede both the expired qualification
+        // deadline and any rewind of the shared verification stdin snapshot.
+        // This negative control creates no guest and never enters the image.
+        {
+            use crate::mapped_first_admission::CapturePolicy;
+            use crate::mapped_first_admission::VerificationCapture;
+            use crate::mapped_first_admission::capture_verification_in_container;
+
+            let mut command = Command::new("/not-an-executable/mapped-command-control");
+            command.pid(reverie::process::Pid::from_raw(123));
+            let mut forwarded = ForwardedDetlogPlan::Socket { opened: false };
+            let error = capture_verification_in_container(VerificationCapture {
+                command,
+                config: detcore::Config::default(),
+                retained: &image,
+                records: Box::new(|_| panic!("refused command must emit no guest records")),
+                print_summary: false,
+                summary_json: &None,
+                policy: CapturePolicy::Qualification {
+                    deadline: tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+                },
+                forwarded: &mut forwarded,
+            })
+            .unwrap_err();
+            let error = error.downcast_ref::<std::io::Error>().unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(
+                error.to_string(),
+                "mapped-command-requested-pid-unsupported"
+            );
+            assert!(matches!(
+                forwarded,
+                ForwardedDetlogPlan::Socket { opened: false }
+            ));
+            image.verify().unwrap();
+        }
+
         let mut options = run_opts_for(&[
             "hermit",
             "--backend=in-guest-trap",
