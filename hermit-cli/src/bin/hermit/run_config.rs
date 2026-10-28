@@ -1062,6 +1062,10 @@ mod tests {
                 "--rewrite-exclusives-also=/tmp/liblse.so",
             ],
         ),
+        (
+            "rewrite-exclusives-mode",
+            &["--rewrite-exclusives", "--rewrite-exclusives-mode=memory"],
+        ),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
         ("cap-preemption-charge", &["--cap-preemption-charge"]),
         ("virtual-timeout", &["--virtual-timeout=1000"]),

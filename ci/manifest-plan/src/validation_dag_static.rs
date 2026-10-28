@@ -1222,7 +1222,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-derived with the node's own selection at the head of the aarch64
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 1931, listed.
-    ("test.regular_crates", 1931),
+    // And detcore-model's config::tests::
+    // rewrite_exclusives_in_memory_never_enters_the_legacy_form: 1932.
+    ("test.regular_crates", 1932),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -6219,7 +6221,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-derived with the node's own selection at the head of the aarch64
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 1917, listed.
-    ("test.regular_crates_on_host", 1917),
+    // And the same legacy-form unit: 1918.
+    ("test.regular_crates_on_host", 1918),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
