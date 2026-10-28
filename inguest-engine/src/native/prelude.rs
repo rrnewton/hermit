@@ -7,21 +7,31 @@
 use std::ffi::c_void;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use detcore::Detcore;
 use rand::RngExt as _;
-use reverie::{Error, Guest};
+use reverie::Error;
+use reverie::Guest;
 use reverie::syscalls::Errno;
 use reverie_inguest::guest::host::InGuest;
-use reverie_inguest::guest::native_services::{MemoryReader, NativeServices};
-use reverie_inguest::tool_host::{NativeCallbackOutcome, TailResult, drive_native_ready};
+use reverie_inguest::guest::native_services::MemoryReader;
+use reverie_inguest::guest::native_services::NativeServices;
+use reverie_inguest::tool_host::NativeCallbackOutcome;
+use reverie_inguest::tool_host::TailResult;
+use reverie_inguest::tool_host::drive_native_ready;
 
-use crate::runtime::EngineRuntime;
-use super::abi::{Callback, Identity, Mechanisms};
-use super::entry::{event, status};
-use super::owner::{self, Engine, Thread};
+use super::abi::Callback;
+use super::abi::Identity;
+use super::abi::Mechanisms;
+use super::entry::event;
+use super::entry::status;
+use super::owner::Engine;
+use super::owner::Thread;
+use super::owner::{self};
 use super::policy::*;
+use crate::runtime::EngineRuntime;
 
 type ConcreteGuest<'a> = InGuest<'a, Detcore, EngineRuntime>;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -44,8 +54,12 @@ pub(super) struct PreparedExec {
 
 impl PreparedExec {
     fn new(callback: &Callback) -> Self {
-        Self { identity: callback.identity, context: callback.context,
-            mechanisms: callback.mechanisms as usize, branches: callback.branches }
+        Self {
+            identity: callback.identity,
+            context: callback.context,
+            mechanisms: callback.mechanisms as usize,
+            branches: callback.branches,
+        }
     }
     fn validate(&self, callback: &Callback) -> io::Result<()> {
         callback.validate(self.identity)?;
@@ -63,14 +77,26 @@ pub(super) struct PreparedCall {
     first: bool,
 }
 
-pub(super) fn branches(value: u64) { TOTAL_BRANCHES.store(value, Ordering::Relaxed); }
-pub(super) fn is_native_lifecycle(number: i64) -> bool { requires_native_lifecycle(number) }
-pub(super) fn rewritten() { TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed); }
+pub(super) fn branches(value: u64) {
+    TOTAL_BRANCHES.store(value, Ordering::Relaxed);
+}
+pub(super) fn is_native_lifecycle(number: i64) -> bool {
+    requires_native_lifecycle(number)
+}
+pub(super) fn rewritten() {
+    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+}
 
-pub(super) fn prepare(callback: &Callback, raw: &Mechanisms, number: i64,
-    arguments: [u64; 6]) -> Result<PreparedCall, Errno> {
+pub(super) fn prepare(
+    callback: &Callback,
+    raw: &Mechanisms,
+    number: i64,
+    arguments: [u64; 6],
+) -> Result<PreparedCall, Errno> {
     let first = TOTAL_SYSCALLS.fetch_add(1, Ordering::Relaxed) == 0;
-    if first { super::diagnostics::emit(b"detcore-dynamorio: entered Rust syscall callback\n"); }
+    if first {
+        super::diagnostics::emit(b"detcore-dynamorio: entered Rust syscall callback\n");
+    }
     let read = raw.read_memory.ok_or(Errno::EIO)?;
     let write = raw.write_memory.ok_or(Errno::EIO)?;
     let mut selected = arguments;
@@ -83,21 +109,33 @@ pub(super) fn prepare(callback: &Callback, raw: &Mechanisms, number: i64,
         read(address, bytes.as_mut_ptr(), bytes.len()) != 0
     }) || !multiplexed_io_inputs_are_readable(number, &arguments, |address, bytes| unsafe {
         read(address, bytes.as_mut_ptr(), bytes.len()) != 0
-    }) { return Err(Errno::EFAULT); }
+    }) {
+        return Err(Errno::EFAULT);
+    }
     let probe = if number == libc::SYS_getrandom {
         match getrandom_writable_prefix(&arguments, |address, bytes| unsafe {
             Ok(write(address, bytes.as_ptr(), bytes.len()))
         }) {
-            Some(Ok(probe)) => { selected[1] = probe.writable as u64; Some(probe) }
+            Some(Ok(probe)) => {
+                selected[1] = probe.writable as u64;
+                Some(probe)
+            }
             Some(Err(error)) => return Err(error),
             None => None,
         }
-    } else { None };
+    } else {
+        None
+    };
     branches(callback.branches);
     let clones = process_clone_properties(number, &arguments, |address, bytes| unsafe {
         read(address, bytes.as_mut_ptr(), bytes.len()) != 0
     });
-    Ok(PreparedCall { arguments: selected, probe, clones, first })
+    Ok(PreparedCall {
+        arguments: selected,
+        probe,
+        clones,
+        first,
+    })
 }
 
 fn failure(message: &'static [u8]) -> NativeCallbackOutcome<Result<i64, Error>> {
@@ -105,15 +143,34 @@ fn failure(message: &'static [u8]) -> NativeCallbackOutcome<Result<i64, Error>> 
     NativeCallbackOutcome::Ready(Err(io::Error::other("native lifecycle refused").into()))
 }
 
+/// Immutable inputs borrowed from the same admitted native callback.
+pub(super) struct DispatchCall<'a> {
+    pub engine: &'a Engine,
+    pub callback: &'a Callback,
+    pub number: i64,
+    pub original: [u64; 6],
+    pub prepared: &'a PreparedCall,
+}
+
 /// Concrete work inside the already admitted common Guest. The outer entry
 /// alone retains/completes its native lease; this function cannot reenter it.
 /// # Safety
 /// All borrowed arguments belong to the same with_native_guest callback.
-pub(super) unsafe fn dispatch(engine: &Engine, callback: &Callback,
-    number: i64, original: [u64; 6], prepared: &PreparedCall,
-    pending_exec: &mut Option<PreparedExec>, tool: &Detcore,
-    guest: &mut ConcreteGuest<'_>, tail: &TailResult,
-    services: &NativeServices<'_>) -> NativeCallbackOutcome<Result<i64, Error>> {
+pub(super) unsafe fn dispatch(
+    call: DispatchCall<'_>,
+    pending_exec: &mut Option<PreparedExec>,
+    tool: &Detcore,
+    guest: &mut ConcreteGuest<'_>,
+    tail: &TailResult,
+    services: &NativeServices<'_>,
+) -> NativeCallbackOutcome<Result<i64, Error>> {
+    let DispatchCall {
+        engine,
+        callback,
+        number,
+        original,
+        prepared,
+    } = call;
     if number == libc::SYS_execveat {
         return NativeCallbackOutcome::Ready(Ok(-i64::from(Errno::ENOSYS.into_raw())));
     }
@@ -130,45 +187,72 @@ pub(super) unsafe fn dispatch(engine: &Engine, callback: &Callback,
         return failure(b"detcore-dynamorio: refusing vfork/CLONE_VFORK while an open file description may hold an OFD lock\n");
     }
     if requires_native_lifecycle(number) {
-        if engine.config.sequentialize_threads && super::bootstrap::coordinated()
+        if engine.config.sequentialize_threads
+            && super::bootstrap::coordinated()
             && (number == libc::SYS_execve || prepared.clones.copies_process)
         {
-            guest.thread_state().promote_shared_open_files()
+            guest
+                .thread_state()
+                .promote_shared_open_files()
                 .expect("could not publish shared OFDs before native lifecycle");
         }
         if number == libc::SYS_execve {
             if pending_exec.is_some() {
-                return NativeCallbackOutcome::Ready(Err(io::Error::from_raw_os_error(libc::EBUSY).into()));
+                return NativeCallbackOutcome::Ready(Err(io::Error::from_raw_os_error(
+                    libc::EBUSY,
+                )
+                .into()));
             }
             let mm = guest.thread_state().mm_id;
             let blocking = guest.thread_state().exec_blocking_overrides();
             let robust = drive_native_ready(tool.exec_robust_list_wakes(guest));
-            let read = callback.validate(callback.identity).expect("admitted native callback")
-                .read_memory.expect("admitted native reader");
+            let read = callback
+                .validate(callback.identity)
+                .expect("admitted native callback")
+                .read_memory
+                .expect("admitted native reader");
             let image = read_guest_path(original[0], read)
                 .and_then(|path| tool.exec_image_at(guest, libc::AT_FDCWD, &path));
             drive_native_ready(detcore::prepare_exec(guest, mm, blocking, robust, image));
             *pending_exec = Some(PreparedExec::new(callback));
             if super::bootstrap::owns_background(callback.identity.physical_pid) {
                 super::image::request_pause();
-                assert_eq!(super::image::generation(), callback.identity.image,
-                    "native image generation changed while pausing for exec");
+                assert_eq!(
+                    super::image::generation(),
+                    callback.identity.image,
+                    "native image generation changed while pausing for exec"
+                );
             }
         }
         // This affine continuation is still active through the entire real C
         // post body. Scalar action3 preserves the old execute-original route,
         // rather than selecting action2's rewritten-operation path.
-        return NativeCallbackOutcome::Deferred { number, args: original };
+        return NativeCallbackOutcome::Deferred {
+            number,
+            args: original,
+        };
     }
-    let read = callback.validate(callback.identity).expect("admitted native callback")
-        .read_memory.expect("admitted native reader");
+    let read = callback
+        .validate(callback.identity)
+        .expect("admitted native callback")
+        .read_memory
+        .expect("admitted native reader");
     update_memory_hash(number, &original, read);
-    if prepared.first { super::diagnostics::emit(b"detcore-dynamorio: dispatching first syscall through Detcore\n"); }
-    let saved = prepared.probe.filter(|probe| probe.writable < probe.requested)
+    if prepared.first {
+        super::diagnostics::emit(b"detcore-dynamorio: dispatching first syscall through Detcore\n");
+    }
+    let saved = prepared
+        .probe
+        .filter(|probe| probe.writable < probe.requested)
         .map(|probe| (probe, guest.thread_state().prng.clone()));
     unsafe {
-        engine.host.dispatch_native_syscall_in_guest_with(tool, guest, tail,
-            services, &engine.rpc, move |guest, mut outcome| {
+        engine.host.dispatch_native_syscall_in_guest_with(
+            tool,
+            guest,
+            tail,
+            services,
+            &engine.rpc,
+            move |guest, mut outcome| {
                 if let Some((probe, original_prng)) = saved {
                     guest.thread_state_mut().prng = original_prng;
                     advance_getrandom_prng(&mut guest.thread_state_mut().prng, probe.consumed());
@@ -178,12 +262,15 @@ pub(super) unsafe fn dispatch(engine: &Engine, callback: &Callback,
                     if matches!(outcome, NativeCallbackOutcome::Ready(Ok(_))) {
                         let value = if probe.writable == 0 {
                             -i64::from(Errno::EFAULT.into_raw())
-                        } else { probe.writable as i64 };
+                        } else {
+                            probe.writable as i64
+                        };
                         outcome = NativeCallbackOutcome::Ready(Ok(value));
                     }
                 }
                 outcome
-            })
+            },
+        )
     }
 }
 
@@ -206,44 +293,73 @@ pub struct ClonePost {
 /// owner and completes all post bookkeeping before final Deferred completion.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hermit_engine_native_process_clone_result_v1(
-    opaque: *mut c_void, callback: *const Callback, facts: *const ClonePost,
+    opaque: *mut c_void,
+    callback: *const Callback,
+    facts: *const ClonePost,
 ) -> i32 {
     status((|| {
         if opaque.is_null() || callback.is_null() || facts.is_null() {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
-        let callback = unsafe { &*callback }; let facts = unsafe { facts.read() };
-        let thread = unsafe { &*opaque.cast::<Thread>() }; let mut entry = thread.enter(callback)?;
+        let callback = unsafe { &*callback };
+        let facts = unsafe { facts.read() };
+        let thread = unsafe { &*opaque.cast::<Thread>() };
+        let mut entry = thread.enter(callback)?;
         let engine = owner::installed()?;
         let table = callback.validate(callback.identity)?.selected()?;
         let auxv = unsafe { callback.copy_auxv()? };
         let services = unsafe { callback.select(&table, &auxv)? };
-        let pending = entry.state_mut().pending.as_mut()
+        let pending = entry
+            .state_mut()
+            .pending
+            .as_mut()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?;
         let mut post = event(callback, facts.number, [0; 6], 0);
         unsafe {
-            engine.host.with_native_post_step(pending, &services, &engine.rpc, &mut post,
+            engine.host.with_native_post_step(
+                pending,
+                &services,
+                &engine.rpc,
+                &mut post,
                 |tool, guest, _tail| {
                     if successful_process_clone_result(facts.number, facts.result) {
                         guest.thread_state().forget_flock_modes();
                     }
-                    if facts.result > 0 && facts.tool_child_tid > 0
-                        && matches!(facts.number, libc::SYS_fork | libc::SYS_clone | libc::SYS_clone3)
+                    if facts.result > 0
+                        && facts.tool_child_tid > 0
+                        && matches!(
+                            facts.number,
+                            libc::SYS_fork | libc::SYS_clone | libc::SYS_clone3
+                        )
                         && facts.flags & (libc::CLONE_THREAD | libc::CLONE_VFORK) as u64 == 0
                         && facts.exit_signal < 0
                     {
-                        return NativeCallbackOutcome::Ready(Err(io::Error::other("invalid native child exit signal").into()));
+                        return NativeCallbackOutcome::Ready(Err(io::Error::other(
+                            "invalid native child exit signal",
+                        )
+                        .into()));
                     }
                     if let Some((tid, flags, signal)) = process_child_registration(
-                        facts.number, facts.result, facts.tool_child_tid, facts.flags, facts.exit_signal)
-                    {
-                        drive_native_ready(tool.register_external_child(guest, tid,
-                            facts.child_tid_address as usize, flags, signal,
-                            Some((facts.result as i32, facts.result as i32))));
+                        facts.number,
+                        facts.result,
+                        facts.tool_child_tid,
+                        facts.flags,
+                        facts.exit_signal,
+                    ) {
+                        drive_native_ready(tool.register_external_child(
+                            guest,
+                            tid,
+                            facts.child_tid_address as usize,
+                            flags,
+                            signal,
+                            Some((facts.result as i32, facts.result as i32)),
+                        ));
                     }
                     NativeCallbackOutcome::Ready(Ok(()))
-                })
-        }.map_err(io::Error::other)
+                },
+            )
+        }
+        .map_err(io::Error::other)
     })())
 }
 
@@ -252,37 +368,61 @@ pub unsafe extern "C" fn hermit_engine_native_process_clone_result_v1(
 /// PreparedExec and original Deferred are consumed/borrowed exactly once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hermit_engine_native_exec_failed_v1(
-    opaque: *mut c_void, callback: *const Callback,
+    opaque: *mut c_void,
+    callback: *const Callback,
 ) -> i32 {
     // Same maintained ordering: scheduler progress is restored BEFORE the
     // CancelExec RPC, including the uninitialized/no-preparation path.
     super::image::resume();
-    if opaque.is_null() { return 0; }
+    if opaque.is_null() {
+        return 0;
+    }
     status((|| {
-        if callback.is_null() { return Err(io::Error::from_raw_os_error(libc::EINVAL)); }
-        let actual = unsafe { &*callback }; let thread = unsafe { &*opaque.cast::<Thread>() };
+        if callback.is_null() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let actual = unsafe { &*callback };
+        let thread = unsafe { &*opaque.cast::<Thread>() };
         let mut entry = thread.enter(actual)?;
-        let Some(prepared) = entry.state().prepared_exec.as_ref() else { return Ok(()); };
+        let Some(prepared) = entry.state().prepared_exec.as_ref() else {
+            return Ok(());
+        };
         prepared.validate(actual)?;
         let branches = prepared.branches;
         // Only the scalar branch observation is retained from the original
         // pre-event. All pointed-to current facts are borrowed afresh now.
-        let callback = Callback { branches, ..*actual };
+        let callback = Callback {
+            branches,
+            ..*actual
+        };
         let engine = owner::installed()?;
         let table = callback.validate(callback.identity)?.selected()?;
         let auxv = unsafe { callback.copy_auxv()? };
         let services = unsafe { callback.select(&table, &auxv)? };
-        let _prepared = entry.state_mut().prepared_exec.take().expect("checked prepared exec");
-        let pending = entry.state_mut().pending.as_mut()
+        let _prepared = entry
+            .state_mut()
+            .prepared_exec
+            .take()
+            .expect("checked prepared exec");
+        let pending = entry
+            .state_mut()
+            .pending
+            .as_mut()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?;
         let mut post = event(&callback, libc::SYS_execve, [0; 6], 0);
         unsafe {
-            engine.host.with_native_post_step(pending, &services, &engine.rpc, &mut post,
+            engine.host.with_native_post_step(
+                pending,
+                &services,
+                &engine.rpc,
+                &mut post,
                 |_tool, guest, _tail| {
                     drive_native_ready(detcore::cancel_exec(guest));
                     NativeCallbackOutcome::Ready(Ok(()))
-                })
-        }.map_err(io::Error::other)
+                },
+            )
+        }
+        .map_err(io::Error::other)
     })())
 }
 
@@ -291,7 +431,10 @@ pub unsafe extern "C" fn hermit_engine_native_exec_failed_v1(
 /// Each output is aligned/writable for one u64 and owned by this native call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hermit_engine_native_totals_v1(
-    branches: *mut u64, syscalls: *mut u64, rewritten: *mut u64, memory_hash: *mut u64,
+    branches: *mut u64,
+    syscalls: *mut u64,
+    rewritten: *mut u64,
+    memory_hash: *mut u64,
 ) -> i32 {
     if branches.is_null() || syscalls.is_null() || rewritten.is_null() || memory_hash.is_null() {
         return -libc::EINVAL;

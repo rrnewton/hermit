@@ -8,18 +8,27 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::io;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use detcore::{Config, Detcore, GlobalState};
+use detcore::Config;
+use detcore::Detcore;
+use detcore::GlobalState;
 use reverie::Pid;
 use reverie_inguest::guest::host::ToolHost;
-use reverie_inguest::guest::host::native_state::{DeferredNative, NativeThreadHandle, NativeThreadIdentity, PostCompletedCopiedNativeParent};
+use reverie_inguest::guest::host::native_state::DeferredNative;
+use reverie_inguest::guest::host::native_state::NativeThreadHandle;
+use reverie_inguest::guest::host::native_state::NativeThreadIdentity;
+use reverie_inguest::guest::host::native_state::PostCompletedCopiedNativeParent;
 use reverie_inguest::guest::native_rpc::NativeRpc;
 
+use super::abi::Callback;
+use super::abi::Identity;
 use crate::runtime::EngineRuntime;
-
-use super::abi::{Callback, Identity};
 
 pub(super) type Host = ToolHost<Detcore, EngineRuntime>;
 pub(super) type State = <Detcore as reverie::Tool>::ThreadState;
@@ -51,7 +60,8 @@ struct Publication {
     _owner: PhantomData<&'static Engine>,
 }
 static ENGINE: Publication = Publication {
-    pointer: AtomicPtr::new(std::ptr::null_mut()), _owner: PhantomData,
+    pointer: AtomicPtr::new(std::ptr::null_mut()),
+    _owner: PhantomData,
 };
 
 pub(super) struct CopiedInitialization {
@@ -70,7 +80,8 @@ pub(super) struct ThreadState {
 
 impl ThreadState {
     pub(super) fn handle(&self) -> io::Result<NativeThreadHandle> {
-        self.handle.ok_or_else(|| io::Error::from_raw_os_error(libc::EAGAIN))
+        self.handle
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EAGAIN))
     }
 }
 
@@ -82,20 +93,43 @@ pub(super) struct Thread {
 }
 
 impl Thread {
-    pub(super) fn new(identity: Identity, native_identity: NativeThreadIdentity, handle: NativeThreadHandle) -> Self {
+    pub(super) fn new(
+        identity: Identity,
+        native_identity: NativeThreadIdentity,
+        handle: NativeThreadHandle,
+    ) -> Self {
         Self {
-            identity, native_identity, entered: AtomicBool::new(false),
-            state: UnsafeCell::new(ThreadState { handle: Some(handle), pending: None, copied: None, prepared_exec: None, retired: false, failed: false }),
+            identity,
+            native_identity,
+            entered: AtomicBool::new(false),
+            state: UnsafeCell::new(ThreadState {
+                handle: Some(handle),
+                pending: None,
+                copied: None,
+                prepared_exec: None,
+                retired: false,
+                failed: false,
+            }),
         }
     }
 
-    pub(super) fn copied(identity: Identity, native_identity: NativeThreadIdentity, parent: PostCompletedCopiedNativeParent<Detcore>, flags: reverie::syscalls::CloneFlags) -> Self {
+    pub(super) fn copied(
+        identity: Identity,
+        native_identity: NativeThreadIdentity,
+        parent: PostCompletedCopiedNativeParent<Detcore>,
+        flags: reverie::syscalls::CloneFlags,
+    ) -> Self {
         Self {
-            identity, native_identity, entered: AtomicBool::new(false),
+            identity,
+            native_identity,
+            entered: AtomicBool::new(false),
             state: UnsafeCell::new(ThreadState {
-                handle: None, pending: None,
-                copied: Some(CopiedInitialization { parent, flags }), prepared_exec: None,
-                retired: false, failed: false,
+                handle: None,
+                pending: None,
+                copied: Some(CopiedInitialization { parent, flags }),
+                prepared_exec: None,
+                retired: false,
+                failed: false,
             }),
         }
     }
@@ -104,7 +138,11 @@ impl Thread {
     /// Wrong-thread checks precede the exclusive mutable-state borrow.
     pub(super) fn enter(&self, callback: &Callback) -> io::Result<Entry<'_>> {
         self.validate(callback)?;
-        if self.entered.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if self
+            .entered
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         let entry = Entry(self);
@@ -133,20 +171,28 @@ impl Thread {
         {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
-        if self.entered.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if self
+            .entered
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         let entry = Entry(self);
-        if entry.state().retired || entry.state().failed || entry.state().copied.is_some()
-            || entry.state().handle.is_none() || entry.state().pending.is_none()
+        if entry.state().retired
+            || entry.state().failed
+            || entry.state().copied.is_some()
+            || entry.state().handle.is_none()
+            || entry.state().pending.is_none()
         {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
         Ok(entry)
     }
 
-    pub(super) fn scalar_identity(&self) -> Identity { self.identity }
-    pub(super) fn identity(&self) -> NativeThreadIdentity { self.native_identity }
+    pub(super) fn scalar_identity(&self) -> Identity {
+        self.identity
+    }
 }
 
 pub(super) struct Entry<'thread>(&'thread Thread);
@@ -160,7 +206,9 @@ impl Entry<'_> {
         // SAFETY: the claim is exclusive, and cannot be moved to another task.
         unsafe { &mut *self.0.state.get() }
     }
-    pub(super) fn identity(&self) -> NativeThreadIdentity { self.0.native_identity }
+    pub(super) fn identity(&self) -> NativeThreadIdentity {
+        self.0.native_identity
+    }
     pub(super) fn fail(&mut self) {
         self.state_mut().failed = true;
         // A failed post step must not publish the original active state.
@@ -170,12 +218,16 @@ impl Entry<'_> {
 }
 
 impl Drop for Entry<'_> {
-    fn drop(&mut self) { self.0.entered.store(false, Ordering::Release); }
+    fn drop(&mut self) {
+        self.0.entered.store(false, Ordering::Release);
+    }
 }
 
 pub(super) fn installed() -> io::Result<&'static Engine> {
     let pointer = ENGINE.pointer.load(Ordering::Acquire);
-    if pointer.is_null() { return Err(io::Error::from_raw_os_error(libc::ENXIO)); }
+    if pointer.is_null() {
+        return Err(io::Error::from_raw_os_error(libc::ENXIO));
+    }
     // SAFETY: published owners are never freed or mutably aliased.
     let engine = unsafe { &*pointer };
     if engine.physical_owner != unsafe { libc::syscall(libc::SYS_getpid) as i32 }
@@ -190,9 +242,20 @@ pub(super) fn installed() -> io::Result<&'static Engine> {
 /// The caller has already constructed the authentic config/RPC/Tool closure.
 pub(super) fn publish(engine: Engine) -> io::Result<&'static Engine> {
     let pointer = Box::into_raw(Box::new(engine));
-    if ENGINE.pointer.compare_exchange(std::ptr::null_mut(), pointer, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if ENGINE
+        .pointer
+        .compare_exchange(
+            std::ptr::null_mut(),
+            pointer,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
         // A duplicate fresh-image owner has no copied parent Record.
-        unsafe { drop(Box::from_raw(pointer)); }
+        unsafe {
+            drop(Box::from_raw(pointer));
+        }
         return Err(io::Error::from_raw_os_error(libc::EALREADY));
     }
     installed()
@@ -201,14 +264,20 @@ pub(super) fn publish(engine: Engine) -> io::Result<&'static Engine> {
 /// # Safety
 /// Only the original returning COW child's post owner may borrow immutable
 /// inherited fields. No inherited lock may be entered or destructor run.
-pub(super) unsafe fn inherited(callback: &Callback, parent: Identity) -> io::Result<&'static Engine> {
+pub(super) unsafe fn inherited(
+    callback: &Callback,
+    parent: Identity,
+) -> io::Result<&'static Engine> {
     callback.validate(callback.identity)?;
     let pointer = ENGINE.pointer.load(Ordering::Acquire);
-    if pointer.is_null() { return Err(io::Error::from_raw_os_error(libc::ENXIO)); }
+    if pointer.is_null() {
+        return Err(io::Error::from_raw_os_error(libc::ENXIO));
+    }
     let engine = unsafe { &*pointer };
     if engine.physical_owner != parent.physical_pid
         || engine.physical_owner == callback.identity.physical_pid
-        || engine.image != parent.image || engine.image != callback.identity.image
+        || engine.image != parent.image
+        || engine.image != callback.identity.image
         || engine.image != super::image::generation()
     {
         return Err(io::Error::from_raw_os_error(libc::ESTALE));
@@ -219,11 +288,19 @@ pub(super) unsafe fn inherited(callback: &Callback, parent: Identity) -> io::Res
 /// Publish only the checked fresh COW storage. Both owners retain process
 /// lifetime; even a fatal duplicate publication must not destroy an inherited
 /// parent Record or try to retire it through a copied registry.
-pub(super) unsafe fn publish_copied(inherited: &'static Engine, engine: Engine) -> io::Result<&'static Engine> {
+pub(super) unsafe fn publish_copied(
+    inherited: &'static Engine,
+    engine: Engine,
+) -> io::Result<&'static Engine> {
     let pointer = Box::into_raw(Box::new(engine));
-    ENGINE.pointer.compare_exchange(
-        std::ptr::from_ref(inherited).cast_mut(), pointer,
-        Ordering::AcqRel, Ordering::Acquire,
-    ).map_err(|_| io::Error::from_raw_os_error(libc::ESTALE))?;
+    ENGINE
+        .pointer
+        .compare_exchange(
+            std::ptr::from_ref(inherited).cast_mut(),
+            pointer,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| io::Error::from_raw_os_error(libc::ESTALE))?;
     installed()
 }
