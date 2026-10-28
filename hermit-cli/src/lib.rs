@@ -7892,7 +7892,6 @@ mod tests {
             CapabilityCase::Sabre,
             CapabilityCase::Liteinst,
             CapabilityCase::InGuestTrap,
-            CapabilityCase::E9patch,
         ] {
             let config = prepare_capability_case(super::DetConfig::default(), backend);
             assert!(
@@ -7900,11 +7899,13 @@ mod tests {
                 "unexpected terminal record for {backend:?}"
             );
         }
-        let config = prepare_capability_case(super::DetConfig::default(), CapabilityCase::Ptrace);
-        assert_eq!(
-            config.guest_may_inherit_a_terminal,
-            super::launcher_may_pass_a_terminal()
-        );
+        for backend in [CapabilityCase::Ptrace, CapabilityCase::E9patch] {
+            let config = prepare_capability_case(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.guest_may_inherit_a_terminal,
+                super::launcher_may_pass_a_terminal()
+            );
+        }
     }
 
     #[test]
