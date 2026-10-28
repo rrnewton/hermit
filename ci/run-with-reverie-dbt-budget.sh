@@ -3051,7 +3051,25 @@ fi
 # and 1050 effective-job-second limits carry without recalibration. Rust
 # runtime changes require current artifacts and validation; this carries the
 # SDK budget only, not runtime equivalence or a new cold-SDK timing sample.
-expected_pin=a39a5ca1de64cd49cc44ce7c292c91dacafbfe20
+# CARRY TO 82482ba80a1638d36ebf50d9518dfdfc6bb91185 (2026-10-27): from
+# a39a5ca1de64cd49cc44ce7c292c91dacafbfe20. Three commits, each replayed
+# with an identical patch-id: a9884be8 (kvm lane, timer slice T1b-1: the
+# dormant KVM timer delivers imprecise timer events to the Tool, in
+# reverie-kvm, reverie-kvm-core/src/error.rs and one line of
+# reverie-linuxemu; the capability stays false), then 14f9d632 and
+# 82482ba8 (dbt lane: the Counter1 example runs through the caller-owned
+# DBT Tool, in reverie-examples, .github/workflows/ci.yml, one new root
+# workspace member and the root Cargo.toml source-catalog row, and
+# reverie-dbt/scripts/CALLER_ARTIFACTS.md). No reverie-dbt file is added or
+# removed, so the inventory stays 1037; the root Cargo.lock,
+# rust-toolchain.toml and third-party/ are unchanged, and the repository
+# inputs to the DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+#     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
+# so the SDK and native inputs, calibrated budget, job width and limits
+# carry unchanged from the a39a5ca1 entry.
+expected_pin=82482ba80a1638d36ebf50d9518dfdfc6bb91185
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
