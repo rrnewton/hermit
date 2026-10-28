@@ -3067,7 +3067,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::test::a_chaos_slice_is_spent_after_a_timeslice_of_turn_charges: 2789.
     // And scheduler::test::a_due_sleep_is_one_whose_deadline_has_come and
     // scheduler::test::a_new_thread_overdue_for_its_first_turn_ends_every_grants_slice: 2791.
-    ("test.detcore_unit", 2791),
+    // And scheduler::test::a_grant_notes_a_due_sleep_and_a_new_threads_lost_grant and
+    // syscalls::time::sleep_request_tests::only_a_relative_sleep_of_zero_is_a_zero_length_sleep:
+    // 2793.
+    ("test.detcore_unit", 2793),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4367,7 +4370,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second
     // and a_thread_that_has_run_still_waits_behind_a_short_sleep_loop: 669.
     // And a_worker_is_not_held_off_by_futex_waits_that_time_out: 670.
-    ("test.cli", 670),
+    // Those four need the PMU timer, which the hosted runner lacks, so they
+    // are skipped by exact name here and run in privileged-test.pmu_cli_cases
+    // with a_thread_that_has_run_does_not_wait_behind_a_zero_length_sleep_loop:
+    // 641 - 4 = 637, listed.
+    ("test.cli", 666),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4449,7 +4456,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_schedule_replay_ends_check_in_slices_where_the_record_did, whose
     // replay needs a PMU stop on a branch count to go wrong, joins them: 17,
     // listed.
-    ("privileged-test.pmu_cli_cases", 18),
+    // The five chaos turn-count cases of
+    // https://github.com/rrnewton/hermit/pull/4658, which need the PMU timer
+    // and a counter strict mode accepts, join them: 16 + 5 = 23, listed.
+    ("privileged-test.pmu_cli_cases", 23),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -4917,7 +4927,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // which are not among them either: 588.
     // And a_worker_is_not_held_off_by_futex_waits_that_time_out, which is
     // not among them either: 589.
-    ("test.cli_on_host", 589),
+    // The same four PMU chaos cases, skipped by exact name here as in
+    // test.cli: 560 - 4 = 556, listed.
+    ("test.cli_on_host", 585),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5390,7 +5402,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // And the same chaos turn-charge unit: 2789.
     // And the same two chaos first-turn units: 2791.
-    ("test.detcore_unit_on_host", 2791),
+    // And the same grant-note and zero-length-sleep units: 2793.
+    ("test.detcore_unit_on_host", 2793),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -9599,7 +9612,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         ],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 75.0,
+            est_duration_s: 183.0,
             rss_baseline_bytes: Some(4294967296),
             hard_mem_max_bytes: Some(8589934592),
             classification: StepClass::CpuBound,

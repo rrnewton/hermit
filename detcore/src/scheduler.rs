@@ -4277,7 +4277,7 @@ const MIN_CHAOS_TURNS_PER_SLICE: u64 = 400;
 /// zero-length sleep is a yield idiom: `Resources::zero_length_sleep`). Its
 /// grant does not count toward a chaos slice
 /// (`Scheduler::chaos_due_sleep_grant`).
-fn ends_a_due_sleep(request: &Resources, now: LogicalTime) -> bool {
+pub(crate) fn ends_a_due_sleep(request: &Resources, now: LogicalTime) -> bool {
     !request.zero_length_sleep
         && request.resources.len() == 1
         && request.resources.keys().any(|resource| {
@@ -16108,13 +16108,15 @@ impl Scheduler {
     /// behind a 200 us sleep loop while a pipeline restarts. Counting those
     /// turns cut the holding to about 0.2 s and the repro from 4 of 12 seeds
     /// to 0. A thread that has not yet run is still bounded
-    /// (`chaos_first_turn_overdue`). A zero-length sleep (`nanosleep` of
-    /// zero, `poll` of nothing with a zero timeout) is a yield idiom and
-    /// counts. So does a futex wait that timed out: its thread waits for
-    /// another thread, and a loop of them holding the CPU starves the thread
-    /// they wait for. Sixteen pollers on a 10 us `wait_for` held a
-    /// bundle-adjustment solver off for minutes when their timeouts did not
-    /// count.
+    /// (`chaos_first_turn_overdue`). A zero-length sleep (`nanosleep` or
+    /// `clock_nanosleep` of zero, `usleep(0)`: `Resources::zero_length_sleep`) is
+    /// a yield idiom and counts. So does a zero-timeout `poll`, which with
+    /// sequentialized threads is not a sleep at all
+    /// (`zero_timeout_poll_request`). So does a futex wait that timed out: its
+    /// thread waits for another thread, and a loop of them holding the CPU
+    /// starves the thread they wait for. Sixteen pollers on a 10 us `wait_for`
+    /// held a bundle-adjustment solver off for minutes when their timeouts did
+    /// not count.
     /// The count is of turns, not of virtual time, so it keeps counting
     /// across a sleep. The threshold uses the maximum timeslice, the bound
     /// on a slice, not the mean a chaos slice is drawn with
@@ -16124,14 +16126,21 @@ impl Scheduler {
     /// with timer preemption and the default heuristic, not replaying
     /// preemptions), and neither under a schedule replay nor under `hermit
     /// record`/`hermit replay` (`recordreplay_modes`), as for every deadline
-    /// hint. The count is of committed turns, host-timed polling retries
-    /// aside, as for `previous_turn_tid`: background calls and skipped turns
-    /// do not commit, and host-timed admissions and signals change only which
-    /// pass a turn falls in, not how many turns a thread has taken. Both runs
-    /// of --verify therefore end the same slices. A preemption recording
-    /// records the slice end it causes like any other change point, and a
-    /// preemption or schedule replay follows its recorded slice ends and
-    /// applies no hint (`cap_timeslice_at_deadline`), so a replay needs none.
+    /// hint. A schedule replay's live tail, once its trace has run out, is still
+    /// a schedule replay (`has_schedule_replay`): it runs without this count and
+    /// without the first-turn bound, as it runs without the starvation bound
+    /// (`bound_chaos_starvation`) and without any deadline hint (the guest side
+    /// reads `replay_schedule_from` for the whole run in
+    /// `cap_timeslice_at_deadline`). The tail is deterministic, and the
+    /// starvation these rules end can come back there.
+    /// The count is of committed turns, host-timed polling retries aside, as for
+    /// `previous_turn_tid`: background calls and skipped turns do not commit, and
+    /// host-timed admissions and signals change only which pass a turn falls in,
+    /// not how many turns a thread has taken. Both runs of --verify therefore end
+    /// the same slices. A preemption recording records the slice end it causes
+    /// like any other change point, and a preemption or schedule replay follows
+    /// its recorded slice ends and applies no hint (`cap_timeslice_at_deadline`),
+    /// so a replay needs none.
     /// Such a slice ends at a syscall check-in, and a preemption replay ends
     /// a slice recorded there at the same branch count, which can fall just
     /// before the syscall rather than after it; until
@@ -21550,6 +21559,64 @@ mod test {
             plain.note_chaos_first_turn_waits(runner);
         }
         assert!(!plain.chaos_first_turn_overdue(), "without chaos");
+    }
+
+    /// What a grant notes for the two chaos rules, through `unblock_guest`
+    /// itself under bounded chaos. A lone sleep whose deadline has come is a
+    /// due sleep (`chaos_due_sleep_grant`), so its turn does not count toward
+    /// the thread's slice. A zero-length sleep at the same deadline is not, nor
+    /// is a futex wait that timed out (`timed_out_futex_waiters`), so their
+    /// turns count. Each of these grants also counts one lost grant for a
+    /// queued thread of worse priority that has never run
+    /// (`chaos_first_turn_waits`), but not without chaos.
+    #[test]
+    fn a_grant_notes_a_due_sleep_and_a_new_threads_lost_grant() {
+        let granted = DetTid::from_raw(3);
+        let newcomer = DetTid::from_raw(5);
+        let chaos = Config {
+            chaos: true,
+            ..Config::default()
+        };
+        let grant = |config: &Config, request: Resources, timed_out: bool| {
+            let mut scheduler = Scheduler::new(config);
+            scheduler.committed_time = at(0);
+            queue_request(&mut scheduler, newcomer, Resources::new(newcomer));
+            queue_request(&mut scheduler, granted, request);
+            scheduler.priorities.insert(granted, 1000);
+            scheduler.priorities.insert(newcomer, 9000);
+            if timed_out {
+                scheduler.blocked.timed_out_futex_waiters.insert(granted);
+            }
+            let response = scheduler.next_turns[&granted].resp.clone();
+            assert!(scheduler.unblock_guest(granted, &response).is_ok());
+            scheduler
+        };
+        let due = sleep_request(granted, at(0));
+        let mut zero_length = due.clone();
+        zero_length.zero_length_sleep = true;
+        let mut futex = Resources::new(granted);
+        futex.insert(ResourceID::FutexWait, Permission::R);
+
+        for (case, request, timed_out, due_sleep) in [
+            ("a due sleep", due.clone(), false, true),
+            ("a zero-length sleep", zero_length, false, false),
+            ("a futex wait that timed out", futex, true, false),
+        ] {
+            let scheduler = grant(&chaos, request, timed_out);
+            assert_eq!(
+                scheduler.chaos_due_sleep_grant,
+                due_sleep.then_some(granted),
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.chaos_first_turn_waits.get(&newcomer),
+                Some(&1),
+                "{case}: the new thread lost one grant on priority"
+            );
+        }
+
+        let plain = grant(&Config::default(), due, false);
+        assert!(plain.chaos_first_turn_waits.is_empty(), "without chaos");
     }
 
     /// F8 (non-committing fizzle must not advance virtual time): both sides of
