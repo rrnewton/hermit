@@ -926,6 +926,10 @@ mod tests {
         ("sequentialize-threads", &["--sequentialize-threads"]),
         ("runs-post-fork", &["--runs-post-fork=parent"]),
         ("passthru-opt", &["--passthru-opt"]),
+        (
+            "untrap-passthrough-syscalls",
+            &["--untrap-passthrough-syscalls"],
+        ),
         ("imprecise-timers", &["--imprecise-timers"]),
         ("no-signal-state-copy", &["--no-signal-state-copy"]),
         ("chaos", &["--chaos"]),

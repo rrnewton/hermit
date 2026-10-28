@@ -2309,6 +2309,9 @@ impl GlobalState {
             if self.cfg.passthru_opt {
                 gaps.insert(SyscallObservationGap::PassthruOpt);
             }
+            if self.cfg.untrap_passthrough_syscalls {
+                gaps.insert(SyscallObservationGap::UntrappedPassthrough);
+            }
             histogram.observation_scope = SyscallObservationScope::from_gaps(gaps);
         }
 
