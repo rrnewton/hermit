@@ -365,7 +365,21 @@ pub(crate) enum PidNamespace {
 /// entry means the kernel has no PID namespaces only when the `mnt` entry,
 /// which every kernel lists, is there.
 pub(crate) fn open_pid_namespace() -> std::io::Result<(PidNamespace, Option<File>)> {
-    let directory = File::open("/proc/self/ns")?;
+    // A path handle (`O_PATH`), which needs only search permission: reading
+    // the directory needs the right to inspect its process, which a thread
+    // whose thread group leader has exited no longer has over the leader.
+    // SAFETY: the path is a C string, and a returned descriptor is owned here.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/ns".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened and nothing else owns it.
+    let directory = unsafe { File::from_raw_fd(fd) };
     match open_entry(&directory, c"pid") {
         Ok(file) => {
             let meta = file.metadata()?;
