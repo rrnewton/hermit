@@ -10335,7 +10335,11 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
 /// and, in both kinds of run, a `CLONE_NEWPID` call with a one-entry
 /// `set_tid` and an unknown flag gets `EINVAL` from the rewrite that adds
 /// Hermit's entry, and a vfork every kernel refuses (`CLONE_PIDFD` with
-/// `CLONE_DETACHED`) gets `EINVAL` as made, with no host ID reported.
+/// `CLONE_DETACHED`) gets `EINVAL` as made, with no host ID reported, as does
+/// a 32-byte clone3 struct on a page mapped writable but not readable. An
+/// unmapped `set_tid` array keeps its `EFAULT` when the thread group's leader
+/// has exited too (a thread's own maps are read, not the leader's empty
+/// ones).
 #[test]
 fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
     for (base, call, expected) in [
@@ -10373,6 +10377,21 @@ fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
             "--summary",
             &["vfork-detached"],
             "clone vfork-detached: Invalid argument",
+        ),
+        (
+            "--pid-base=5000",
+            &["wronly-short"],
+            "clone3 wronly-short: Invalid argument",
+        ),
+        (
+            "--summary",
+            &["wronly-short"],
+            "clone3 wronly-short: Invalid argument",
+        ),
+        (
+            "--pid-base=5000",
+            &["leader-gone", "bad-tid"],
+            "clone3 bad-tid: Bad address",
         ),
     ] {
         let output = no_namespace_in_own_pid_namespace(&[base], call);
@@ -10588,6 +10607,36 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
                 && (call != "wronly-vfork"
                     || stderr(&tolerant).contains("reported before the call")),
             "{call}: stdout:\n{}\nstderr:\n{}",
+            stdout(&tolerant),
+            stderr(&tolerant)
+        );
+    }
+    // The same for a set_tid array on such a page, and for both when the
+    // thread group's leader has exited (its maps are then empty, so a
+    // thread's own are read).
+    for call in [
+        &["wronly-tid"][..],
+        &["leader-gone", "wronly-args"],
+        &["leader-gone", "wronly-tid"],
+    ] {
+        let refused = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], call);
+        assert_eq!(
+            refused.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{call:?}: stdout:\n{}\nstderr:\n{}",
+            stdout(&refused),
+            stderr(&refused)
+        );
+        assert!(
+            stderr(&refused).contains("Detcore could not read its"),
+            "{call:?}: {}",
+            stderr(&refused)
+        );
+        let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], call);
+        assert_success(&tolerant, call);
+        assert!(
+            stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+            "{call:?}: stdout:\n{}\nstderr:\n{}",
             stdout(&tolerant),
             stderr(&tolerant)
         );
