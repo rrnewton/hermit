@@ -686,6 +686,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                             Err(error) => break Err(error),
                         }
                     }
+                    // Provenance as it is now, before each attempt
+                    // (`Resources::waits_on_guest_held_only`).
+                    resources.waits_on_guest_held_only = descriptor_is_guest_held(guest, call.fd());
                     let status = resource_request(guest, resources.clone()).await;
                     let turn = if checks_at_turn {
                         // A named signal counts if the guest's own mask leaves
@@ -986,6 +989,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the bytes written so far are returned, or the restart errno if
             // there are none.
             let status = if resources.poll_attempt > 0 {
+                // Provenance as it is now, before each attempt
+                // (`Resources::waits_on_guest_held_only`).
+                resources.waits_on_guest_held_only = descriptor_is_guest_held(guest, current.fd());
                 Some(resource_request(guest, resources.clone()).await)
             } else {
                 None
@@ -1534,6 +1540,52 @@ pub(crate) fn poll_targets_guest_held<G: Guest<Detcore<T>>, T: RecordOrReplay>(
                 .with_detfd(fd, |detfd| detfd.is_guest_held())
                 .unwrap_or(false)
         })
+}
+
+/// Whether every descriptor `call` waits on is guest-held right now
+/// (`DetFd::is_guest_held`): every non-negative entry of a `poll` or `ppoll`
+/// array (`poll_targets_guest_held`, read from guest memory now), or the one
+/// descriptor of a read, write, receive or send
+/// (`syscall_targets_guest_held_fd`). Anything else, a call with no
+/// descriptor Detcore names, `select`, `epoll_wait`, a signal wait or an
+/// unreadable array, is not, so the answer fails closed. It feeds only
+/// `Resources::waits_on_guest_held_only`, which the retry loops compute again
+/// before every attempt, and never `polls_guest_state_only`'s routing.
+///
+/// This is provenance, not routing: a pipe end the guest did not create (an
+/// inherited write end, whose reader may be a host process) and a datagram
+/// socketpair end, which can be bound and receive from anyone, take internal
+/// polling but carry no guest-held mark (Codex review of
+/// https://github.com/rrnewton/hermit/pull/4892).
+pub(crate) fn waits_on_guest_held_only<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    call: Syscall,
+) -> bool {
+    match call {
+        Syscall::Poll(poll) => poll_targets_guest_held(
+            guest,
+            poll.fds().map(|fds| fds.as_raw()),
+            poll.nfds() as usize,
+        ),
+        Syscall::Ppoll(ppoll) => poll_targets_guest_held(
+            guest,
+            ppoll.fds().map(|fds| fds.as_raw()),
+            ppoll.nfds() as usize,
+        ),
+        _ => syscall_targets_guest_held_fd(guest, call),
+    }
+}
+
+/// Whether descriptor `fd` is guest-held right now (`DetFd::is_guest_held`);
+/// a descriptor Detcore does not know is not.
+fn descriptor_is_guest_held<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    fd: i32,
+) -> bool {
+    guest
+        .thread_state()
+        .with_detfd(fd, |detfd| detfd.is_guest_held())
+        .unwrap_or(false)
 }
 
 /// The descriptors Linux polls in a `pollfd` array's bytes: each entry's
@@ -3009,6 +3061,12 @@ where
     let mut published = PublishedWaitMask::default();
 
     let result: Result<i64, Error> = loop {
+        // Provenance as it is now: a sibling may have replaced a descriptor or
+        // rewritten the `pollfd` array since the last attempt
+        // (`Resources::waits_on_guest_held_only`).
+        // `call0` is the guest's own call, whose descriptors (or `pollfd`
+        // array) every attempt waits on.
+        rsrc.waits_on_guest_held_only = waits_on_guest_held_only(guest, call0.into());
         let resumed = match call.into() {
             Syscall::Read(read) if maybe_timeout.is_none() && maybe_stackguard.is_none() => {
                 crate::tool_global::polled_read_request(guest, read, rsrc.clone()).await
@@ -4333,6 +4391,10 @@ where
 
     let result = loop {
         interrupt_after_probe = false;
+        // Provenance as it is now (`Resources::waits_on_guest_held_only`):
+        // `call0` is the guest's own call, whose descriptors (or `pollfd`
+        // array) every attempt waits on.
+        rsrc.waits_on_guest_held_only = waits_on_guest_held_only(guest, call0.into());
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
         let resumed = resource_request(guest, rsrc.clone()).await;
@@ -7278,6 +7340,169 @@ mod kernel_signal_wait_failures {
             assert_eq!(with_dontwait, once, "{name} with MSG_DONTWAIT, O_NONBLOCK");
             assert_eq!(without, once, "{name} without MSG_DONTWAIT, O_NONBLOCK");
         }
+    }
+
+    /// A `poll` is guest state only when every descriptor it polls is
+    /// guest-held (`poll_targets_guest_held`): beside a descriptor a host
+    /// can make ready, a guest-held pipe end does not make the poll guest
+    /// state, so its retries are host-timed and do not count toward a poll
+    /// upgrade (`Scheduler::retry_follows_guest_actions`, PR 4892). Linux
+    /// ignores a negative descriptor, so such an entry decides nothing.
+    #[test]
+    fn a_poll_of_a_guest_held_and_a_host_backed_descriptor_is_not_guest_state() {
+        use std::os::fd::AsRawFd;
+        let (mut guest, _) = WaitGuest::live(guest_mask());
+        let (reader, _writer) = nix::unistd::pipe().unwrap();
+        let held = reader.as_raw_fd();
+        guest
+            .thread
+            .add_fd(held, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        guest
+            .thread
+            .with_detfd(held, |detfd| detfd.set_guest_held())
+            .unwrap();
+        let host_file = tempfile::tempfile().unwrap();
+        let host = host_file.as_raw_fd();
+        guest
+            .thread
+            .add_fd(host, nix::fcntl::OFlag::O_RDONLY, FdType::Regular, None)
+            .unwrap();
+        let entry = |fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let polled = |guest: &mut WaitGuest, entries: &[libc::pollfd]| {
+            poll_targets_guest_held(guest, Some(entries.as_ptr() as usize), entries.len())
+        };
+        assert!(polled(&mut guest, &[entry(held)]));
+        assert!(polled(&mut guest, &[entry(held), entry(-1)]));
+        assert!(!polled(&mut guest, &[entry(held), entry(host)]), "mixed");
+        assert!(!polled(&mut guest, &[entry(host), entry(held)]), "mixed");
+        assert!(!polled(&mut guest, &[entry(host)]));
+        assert!(!polled(&mut guest, &[entry(-1)]), "nothing polled");
+    }
+
+    /// The poll upgrade counts a retry only on provenance
+    /// (`waits_on_guest_held_only`), never on how the call is executed
+    /// (`syscall_targets_internal_fd`): an inherited pipe write end, whose
+    /// reader may be a host process, and a datagram socketpair end whose
+    /// guest-held mark a `connect(AF_UNSPEC)` and `bind` withdrew both take
+    /// internal polling, and neither is guest-held. Provenance is read as it
+    /// is now, so a descriptor the guest replaced, or a `pollfd` entry it
+    /// rewrote, since the last attempt is judged afresh (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4892, blocking 1).
+    #[test]
+    fn a_retry_counts_on_guest_held_provenance_not_on_internal_routing() {
+        use std::os::fd::AsRawFd;
+        let (mut guest, _) = WaitGuest::live(guest_mask());
+        let write = |fd| Syscall::from(syscalls::Write::new().with_fd(fd));
+        let read = |fd| Syscall::from(syscalls::Read::new().with_fd(fd));
+        let recvmsg = |fd| Syscall::from(syscalls::Recvmsg::new().with_sockfd(fd));
+
+        // An inherited host pipe's write end: internal routing, no mark.
+        let (_host_reader, inherited) = nix::unistd::pipe().unwrap();
+        let inherited = inherited.as_raw_fd();
+        guest
+            .thread
+            .add_fd(inherited, nix::fcntl::OFlag::O_WRONLY, FdType::Pipe, None)
+            .unwrap();
+        assert!(syscall_targets_internal_fd(&mut guest, write(inherited)));
+        assert!(!waits_on_guest_held_only(&mut guest, write(inherited)));
+
+        // A datagram socketpair end, disconnected and bound: still a
+        // socketpair endpoint for routing, its mark withdrawn.
+        let (dgram, _peer) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Datagram,
+            None,
+            nix::sys::socket::SockFlag::empty(),
+        )
+        .unwrap();
+        let dgram = dgram.as_raw_fd();
+        guest
+            .thread
+            .add_fd(dgram, nix::fcntl::OFlag::O_RDWR, FdType::Socket, None)
+            .unwrap();
+        guest
+            .thread
+            .with_detfd(dgram, |detfd| {
+                detfd.set_socketpair_endpoint();
+                detfd.set_guest_held();
+                detfd.clear_guest_held();
+            })
+            .unwrap();
+        assert!(syscall_targets_internal_fd(&mut guest, recvmsg(dgram)));
+        assert!(!waits_on_guest_held_only(&mut guest, recvmsg(dgram)));
+
+        // A guest-created pipe's read end is guest-held, until the guest
+        // replaces the descriptor at that number with one a host can ready.
+        let (reader, _writer) = nix::unistd::pipe().unwrap();
+        let held = reader.as_raw_fd();
+        guest
+            .thread
+            .add_fd(held, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        guest
+            .thread
+            .with_detfd(held, |detfd| detfd.set_guest_held())
+            .unwrap();
+        assert!(waits_on_guest_held_only(&mut guest, read(held)));
+        let entries = [libc::pollfd {
+            fd: held,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let poll = Syscall::from(
+            syscalls::Poll::new()
+                .with_fds(AddrMut::from_raw(entries.as_ptr() as usize))
+                .with_nfds(1),
+        );
+        assert!(waits_on_guest_held_only(&mut guest, poll));
+        guest.thread.remove_fd(held);
+        guest
+            .thread
+            .add_fd(held, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        assert!(
+            !waits_on_guest_held_only(&mut guest, read(held)),
+            "replaced"
+        );
+        assert!(!waits_on_guest_held_only(&mut guest, poll), "replaced");
+
+        // A `pollfd` entry rewritten between attempts is read as it is now.
+        let (reader, _writer) = nix::unistd::pipe().unwrap();
+        let other = reader.as_raw_fd();
+        guest
+            .thread
+            .add_fd(other, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        guest
+            .thread
+            .with_detfd(other, |detfd| detfd.set_guest_held())
+            .unwrap();
+        let mut rewritten = [libc::pollfd {
+            fd: other,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let at = rewritten.as_mut_ptr();
+        let poll = Syscall::from(
+            syscalls::Poll::new()
+                .with_fds(AddrMut::from_raw(at as usize))
+                .with_nfds(1),
+        );
+        assert!(waits_on_guest_held_only(&mut guest, poll));
+        // As a sibling thread would rewrite the guest's array between attempts.
+        // SAFETY: `at` points at `rewritten`, which lives to the end of the test.
+        unsafe { (*at).fd = inherited };
+        assert!(!waits_on_guest_held_only(&mut guest, poll), "rewritten");
+        std::hint::black_box(&rewritten);
+
+        // A call with no descriptor Detcore names fails closed.
+        let sigwait = Syscall::from(syscalls::RtSigtimedwait::new());
+        assert!(!waits_on_guest_held_only(&mut guest, sigwait));
     }
 
     #[test]

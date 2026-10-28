@@ -90,6 +90,7 @@ pub use runqueue::Priority;
 use runqueue::REPLAY_DEFERRED_PRIORITY;
 use runqueue::REPLAY_FOREGROUND_PRIORITY;
 use runqueue::RunQueue;
+use runqueue::UpgradeProgress;
 pub use runqueue::entropy_to_priority;
 use serde::Deserialize;
 use serde::Serialize;
@@ -1269,9 +1270,19 @@ impl BackgroundReadSignals {
 /// (`Scheduler::upgrade_pollers_on_time`), whatever the maximum timeslice: a
 /// period near one turn charge would ready every filed retry at every pass
 /// and switch the pollers' backoff off. The period is also at least
-/// `POLLING_UPGRADE_INTERVAL` turn charges, so a round of readied retries,
-/// one turn per poller, cannot use it up before the queueing-operation
-/// interval would have upgraded anyway.
+/// `POLLING_UPGRADE_INTERVAL` turn charges. Each retry a timed upgrade readies
+/// costs one turn charge when it runs. The retry of a poll a host can decide
+/// does not count toward the queueing-operation interval
+/// (`Scheduler::upgrade_progress_of`), so the interval does not upgrade those
+/// pollers sooner: with fewer of them live than the period holds turn charges
+/// (400 at the defaults: 200 ms of 0.5 ms charges), one round of readied
+/// retries leaves part of the period to the other threads, and from about
+/// that many on one round uses the whole period, the next timed upgrade is
+/// due when it ends, and they retry about once a round, as if not backed off.
+/// The retry of a poll only guest actions decide counts, as before the
+/// fix-forward of <https://github.com/rrnewton/hermit/pull/4605>, when every
+/// retry did, so from 200 such pollers on the interval itself upgrades every
+/// 200 retries.
 const MIN_POLL_UPGRADE_PERIOD_NS: u64 = 200_000_000;
 
 /// The state for the deterministic scheduler.
@@ -1507,6 +1518,11 @@ pub struct Scheduler {
     /// virtual bound (`a_thread_can_still_be_granted`) and the idle-poller
     /// deadlock check (`Scheduler::only_idle_guest_pollers_remain`).
     fatal_signal_doomed: BTreeSet<DetPid>,
+    /// Processes a delivered signal with a fatal default action has doomed,
+    /// recorded in every mode and forgotten at the reap
+    /// (`note_fatal_signal_delivery`, `consume_child_wait`), for the poll
+    /// upgrade's count (`a_committed_doom_is_outstanding`).
+    fatal_signals_unreaped: BTreeSet<DetPid>,
     /// Whether the `--pipe-wake-latency` hand-off has logged that it is inert.
     pipe_wake_inert_logged: bool,
 
@@ -1740,6 +1756,10 @@ pub struct Scheduler {
 
     /// How the backend runs the guest. See [`Config::backend`].
     backend: BackendCapabilities,
+    /// `Config::thread_exits_finish_before_the_next_turn`: whether a
+    /// polling retry may count toward a poll upgrade on this run's backend
+    /// (`retry_follows_guest_actions`).
+    thread_exits_finish_before_the_next_turn: bool,
     /// Whether a parent-death signal Detcore holds but cannot send ends the
     /// run when it would fire (`parent_death_firing_refusal`): an in-guest
     /// run's default route (`Config::in_guest_refuses_host_timed_producers`).
@@ -4413,7 +4433,8 @@ pub(crate) async fn finish_selected_turn(
     mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
     mg.note_granted_turn(&rsrcs, &global_time);
     let requeue = mg.requeue_after(&rsrcs);
-    mg.step6_reenquue(next_dtid, requeue);
+    let progress = mg.upgrade_progress_of(&rsrcs);
+    mg.step6_reenquue(next_dtid, requeue, progress);
     if let Some(call) = rsrcs.as_exit_syscall() {
         mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
     }
@@ -4427,7 +4448,7 @@ enum Requeue {
     /// At the back of its band.
     Back,
     /// At the back of its band, excluded from the next selection
-    /// ([`RunQueue::push_yielded`]).
+    /// ([`RunQueue::push_yielded_with`]).
     OneTurnYield,
     /// At the back of its band, in the yield epoch
     /// ([`RunQueue::push_yielded_into_epoch`]).
@@ -5035,6 +5056,7 @@ impl Scheduler {
             unresolved_sigkill: false,
             pipe_handoff_pending: Default::default(),
             fatal_signal_doomed: Default::default(),
+            fatal_signals_unreaped: Default::default(),
             pipe_wake_inert_logged: false,
             pending_run_queue_admissions: Default::default(),
             progress_epoch: 0,
@@ -5074,6 +5096,7 @@ impl Scheduler {
             backend_failure_sender: Some(backend_failure_sender),
             backend_failure_wake: backend_failure_wake.shared(),
             backend: cfg.backend,
+            thread_exits_finish_before_the_next_turn: cfg.thread_exits_finish_before_the_next_turn,
             refuses_parent_death_firing: cfg.in_guest_refuses_host_timed_producers,
             signaled_background_since: None,
             signaled_background_refusal: None,
@@ -5899,6 +5922,17 @@ impl Scheduler {
                 rs.tid
             );
             self.guest_held_marks_revoked = true;
+        }
+        // A doom is judged when the request is filed, in the turn of the
+        // attempt whose outcome created it, as its provenance is
+        // (`Resources::waits_on_guest_held_only`): that attempt may have
+        // failed only because a doomed process's descriptors were still open,
+        // so a reap before the retry is selected must not let it count
+        // (Claude review of https://github.com/rrnewton/hermit/pull/4892,
+        // round 4b). Every copy of the request carries the cleared proof.
+        let mut rs = rs;
+        if rs.waits_on_guest_held_only && self.a_committed_doom_is_outstanding() {
+            rs.waits_on_guest_held_only = false;
         }
         let continuation =
             (rs.continues_sigreturn && Self::is_inbound_signal_turn(&rs)).then_some(rs.tid);
@@ -10147,14 +10181,22 @@ impl Scheduler {
     /// not in time. A thread that runs whole timeslices without taking a turn,
     /// a spin loop, adds about two queueing operations per slice, so a socket
     /// or pipe reader whose data had arrived waited about 100 of the
-    /// spinner's slices, 10 to 20 s of virtual time, for its next retry. Now, at the end of the
-    /// slice in which the period runs out, such a poller is runnable at its
-    /// normal priority. Without chaos it retries next. Under chaos it competes
-    /// by priority, and once passed over at two change points the starvation
-    /// bound puts the changing thread behind it (`bound_chaos_starvation`).
+    /// spinner's slices, 10 to 20 s of virtual time, for its next retry. Now,
+    /// at the end of the slice in which the period runs out, such a poller is
+    /// runnable at its normal priority. Without chaos it retries next. Under
+    /// chaos it competes by priority, and once passed over at two change
+    /// points the starvation bound puts the changing thread behind it
+    /// (`bound_chaos_starvation`).
     /// A program whose queueing operations already upgrade within the period
-    /// sees no extra upgrade. When one runs, each queued poller costs at most
-    /// a skipped and a committed turn.
+    /// sees no extra upgrade. When one runs, each queued live poller costs at
+    /// most a skipped turn, which is not charged, and one committed turn
+    /// charge: from about 400 live pollers at the defaults, one round fills
+    /// the period (`MIN_POLL_UPGRADE_PERIOD_NS`). A timed upgrade also sets
+    /// PR 4605's mark on a backed-off poller in the last band
+    /// (`QueueValue::upgraded_in_place`), as an interval upgrade does, so under
+    /// chaos the change-point bound counts it from then on
+    /// (`bound_chaos_starvation`): virtual time, not only queueing operations,
+    /// decides when.
     ///
     /// Nothing is upgraded here under a schedule replayer, whose trace sets
     /// the run queue (as for `ready_channel`); under `hermit record` and
@@ -10163,16 +10205,27 @@ impl Scheduler {
     /// picks threads regardless of priority, where a poller cannot starve.
     ///
     /// Determinism: the inputs are committed time, the run queue, its upgrade
-    /// count and the filed requests at the first scheduler pass that sees a
-    /// new committed time, after all threads have quiesced, so every run
-    /// upgrades at the same pass. Later passes at the same committed time,
-    /// whose number can depend on host timing (a skipped pass, the KVM loop's
-    /// refreshes), do not look again: an operation-count upgrade one of them
-    /// runs is seen at the next committed time, in every run alike. A thread a
-    /// committed decision doomed (`thread_is_doomed`) may still be queued or
-    /// not, at host-timed moments: its retry is not readied and it is not
-    /// counted in the INFO line, and once a SIGKILL's victim could not be
-    /// named no retry is readied at all, as for `ready_channel`.
+    /// count (`RunQueue::poll_upgrade_count`) and the filed requests at the
+    /// first scheduler pass that sees a new committed time, after all threads
+    /// have quiesced. The upgrade count moves only at counted queueing
+    /// operations (`RunQueue::upgrade_progress`) and at this function's own
+    /// upgrades, which it records after its own call: a requeue whose number
+    /// depends on host timing (the retry of a poll a host can decide, a
+    /// loopback poll's yield) moves neither, so the period restarts at the
+    /// same pass in every run that agrees on the counted operations. Before the fix-forward of
+    /// <https://github.com/rrnewton/hermit/pull/4605> every push counted, and
+    /// the period inherited the host-timed phase of those requeues (Codex
+    /// review of <https://github.com/rrnewton/hermit/pull/4652>). Committed
+    /// time itself still carries every polling turn's charge, so where retries
+    /// are host-timed, so is the time this compares. Later passes at the
+    /// same committed time, whose number can depend on host timing (a skipped
+    /// pass, the KVM loop's refreshes), do not look again: an operation-count
+    /// upgrade one of them runs is seen at the next committed time, in every
+    /// run alike. A thread a committed decision doomed (`thread_is_doomed`)
+    /// may still be queued or not, at host-timed moments: its retry is not
+    /// readied and it is not counted in the INFO line, and once a SIGKILL's
+    /// victim could not be named no retry is readied at all, as for
+    /// `ready_channel`.
     fn upgrade_pollers_on_time(&mut self) {
         if self.has_schedule_replay()
             || self.recordreplay_modes
@@ -11564,6 +11617,7 @@ impl Scheduler {
         self.sigkilled_processes.remove(&child);
         self.pi_doomed_processes.remove(&child);
         self.fatal_signal_doomed.remove(&child);
+        self.fatal_signals_unreaped.remove(&child);
         self.thread_tree.process_parent.remove(&child);
         self.thread_tree.process_wait.remove(&child);
         self.thread_tree.child_subreapers.remove(&child);
@@ -15641,9 +15695,11 @@ impl Scheduler {
                 "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} polling resource {:?}",
                 self.turn, dettid, rs
             );
-            // Requeue the thread as a poller
+            // Requeue the thread as a poller. A retry's requeue does not count
+            // toward the next poll upgrade (`upgrade_progress_of`).
             let popped = self.run_queue.commit_tentative_pop();
             assert_eq!(dettid, popped);
+            let progress = self.upgrade_progress_of(rs);
             let priority = self.get_priority(dettid);
             // The replayed schedule's next event is this retry: a poll backoff
             // would hand the turn to another thread and leave the schedule. A
@@ -15673,10 +15729,10 @@ impl Scheduler {
                     && replayer.keep_retry_turn(dettid)
             });
             if keeps_turn {
-                self.run_queue.push_back(dettid, priority);
+                self.run_queue.push_back_with(dettid, priority, progress);
             } else {
                 self.run_queue
-                    .push_poller(dettid, priority, rs.poll_attempt);
+                    .push_poller_with(dettid, priority, rs.poll_attempt, progress);
             }
             // Before the count reset below hides that this is a retry.
             self.note_sigalrm_polling_wait(dettid, rs);
@@ -16484,18 +16540,38 @@ impl Scheduler {
     /// priority is the last band, which the upgrade reaches but cannot move:
     /// before it counted, two threads sleeping in turns at better priorities
     /// kept such a poller from its next retry forever, so it never saw a pipe
-    /// write it was polling for. In the last band the lead is by round-robin
-    /// turn alone, and a thread woken from a timed wait is pushed to the front
-    /// of its band (`wake_timed_event`). At the change point itself, though,
-    /// the changing thread is requeued behind the passed-over one, and every
-    /// other thread that keeps running ahead of it is demoted the same way at
-    /// its own next change point, so the passed-over thread runs eventually.
+    /// write it was polling for. Poll upgrades follow their own count of the
+    /// queueing operations that do not depend on host timing
+    /// (`RunQueue::upgrade_progress`), so whether one has reached a poller at
+    /// a change point is the same in every run of a seed.
     ///
-    /// Deterministic: it reads only the priority map and run-queue membership
-    /// at this change point, in thread-ID order, and counts change only at
-    /// change points and committed turns; run-queue membership is the same
-    /// input turn selection reads. The priority it returns is the one recorded
-    /// for `dettid`, so a preemption replay restores it as a fixed priority.
+    /// What the bound guarantees is counted in change points, not turns. In
+    /// a band the lead is by round-robin turn alone, and a thread woken from
+    /// a timed wait is pushed to the front of its band (`wake_timed_event`),
+    /// as are a clone child's start and a signal's wake
+    /// (`runqueue_push_front`). At the change point that takes the bound,
+    /// the changing thread is requeued behind the passed-over thread, and so
+    /// is each other thread that keeps running ahead of it, at its own next
+    /// change point. So the passed-over thread is selected at the first
+    /// selection at which no thread at a better priority is runnable and none
+    /// was put at the front of its band since. Threads that sleep in turns,
+    /// in its band or at a better priority, keep it waiting for as long as
+    /// one of them wakes before that selection, and the bound does not see
+    /// them: no change point passes it over. Putting a woken thread behind a
+    /// thread at the bound instead was tried in the first revisions of
+    /// https://github.com/rrnewton/hermit/pull/4892 and taken out: it hid
+    /// the sleep-ordered races chaos searches for, a closed-source timer race
+    /// found at 10 of 11 seeds being found at none. A thread at a better
+    /// priority that runs in short bursts between sleeps keeps that priority
+    /// until it reaches a change point, which it may seldom do; while it
+    /// sleeps, the passed-over thread can run.
+    ///
+    /// Deterministic: it reads only the priority map, run-queue membership
+    /// and the poll upgrade's marks at this change point, in thread-ID order,
+    /// and counts change only at change points and committed turns;
+    /// run-queue membership is the same input turn selection reads. The
+    /// priority it returns is the one recorded for `dettid`, so a preemption
+    /// replay restores it as a fixed priority.
     fn bound_chaos_starvation(&mut self, dettid: DetTid, drawn: Priority) -> Priority {
         if !self.chaos_bounds_starvation || self.has_schedule_replay() {
             return drawn;
@@ -16524,15 +16600,9 @@ impl Scheduler {
         }
         if priority != drawn {
             // A poller the bound counts only because a poll upgrade reached it
-            // in the last band (`RunQueue::can_be_passed_over`) is named, so
-            // that a log shows when the bound, and nothing else, retried it.
-            let last_band_poller = starving_threads
-                .iter()
-                .find(|(tid, prio)| {
-                    Some(*prio) == starving && !self.run_queue.contains_non_polling_tid(*tid)
-                })
-                .map(|(tid, _)| *tid);
-            if let Some(poller) = last_band_poller {
+            // in the last band is named, so that a log shows when the bound
+            // retried it and nothing else would have.
+            if let Some(poller) = self.poller_the_bound_retries(&starving_threads, starving) {
                 info!(
                     "[scheduler] chaos change point of dettid {}: priority {} drawn, {} taken, behind poller dettid {}, passed over at {} change points after a poll upgrade reached it in the last band",
                     dettid, drawn, priority, poller, CHAOS_PASSOVER_BOUND
@@ -16545,6 +16615,33 @@ impl Scheduler {
             }
         }
         priority
+    }
+
+    /// The poller the bound's INFO line names among `starving_threads`, the
+    /// threads at the passover bound that the change point's draw beat: one
+    /// at the priority the bound moved behind (`starving`) that the bound
+    /// counts only because a poll upgrade reached it in the last band
+    /// (`RunQueue::can_be_passed_over`). None when a non-polling thread
+    /// starves at that priority too: it would have given the same priority on
+    /// its own, so the poller was not the reason (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4605, finding 2).
+    fn poller_the_bound_retries(
+        &self,
+        starving_threads: &[(DetTid, Priority)],
+        starving: Option<Priority>,
+    ) -> Option<DetTid> {
+        let mut at_starving = starving_threads
+            .iter()
+            .filter(|(_, prio)| Some(*prio) == starving)
+            .map(|(tid, _)| *tid);
+        if at_starving
+            .clone()
+            .any(|tid| self.run_queue.contains_non_polling_tid(tid))
+        {
+            None
+        } else {
+            at_starving.next()
+        }
     }
 
     /// Helper for priority changepoint logic
@@ -17088,6 +17185,165 @@ impl Scheduler {
     /// loopback connection. Its count is kernel-readiness timing, not guest-visible progress.
     fn is_loopback_poll_yield_turn(&self, rsrcs: &Resources) -> bool {
         rsrcs.fyi == LOOPBACK_POLL_YIELD_FYI
+    }
+
+    /// Whether requeueing the thread that made `rs` counts toward the next
+    /// poll upgrade ([`UpgradeProgress`]). A call's first attempt and every
+    /// other turn count: the guest made them. A loopback poll's yield does
+    /// not, and nor does a polling retry, skipped (`poll_attempt > 0`, the
+    /// backed-off requeue in `step4_resource_block`) or run
+    /// (`upgraded_from_attempt > 0`, its requeue in `step6_reenquue`), unless
+    /// it provably waits on guest actions alone
+    /// (`retry_follows_guest_actions`). How many retries a thread makes on a
+    /// descriptor a host can change depends on when the host makes it ready,
+    /// which two runs of one seed need not share. Counted, those retries moved
+    /// every later poll upgrade, and with it the poll upgrade's mark on a
+    /// last-band poller that the chaos change-point bound reads (Codex review
+    /// of <https://github.com/rrnewton/hermit/pull/4605>).
+    ///
+    /// A retry that waits on guest actions alone counts, as every retry did
+    /// before: under sequentialized execution only another guest thread's
+    /// turn can make its descriptor ready, and the scheduler orders those
+    /// turns, so every run of a seed makes as many such retries. That keeps
+    /// the upgrade cadence of programs whose threads poll each other, which
+    /// chaos's race search depends on: leaving those retries out as well hid a
+    /// closed-source IPC shutdown race, found at 3 of 8 seeds before and at
+    /// none after (<https://github.com/rrnewton/hermit/pull/4892>, revision 4).
+    ///
+    /// Under record/replay every requeue counts, as before: a recording must
+    /// replay with the schedule it was made with, without a RECORD_VERSION
+    /// bump (as for `note_poll_deadline`). There, a polled attempt on a
+    /// container-internal descriptor goes through the recorder
+    /// (`retry_nonblocking_syscall`'s subtool), so a replay makes the retries
+    /// its recording made, and a call on another descriptor runs blocking in
+    /// the background, its readmission turn in the rejoin log.
+    fn upgrade_progress_of(&self, rs: &Resources) -> UpgradeProgress {
+        if self.recordreplay_modes {
+            return UpgradeProgress::Counts;
+        }
+        let host_timed = self.is_loopback_poll_yield_turn(rs)
+            || (Self::is_polling_turn(rs)
+                && Self::retry_number(rs) > 0
+                && !self.retry_follows_guest_actions(rs));
+        if host_timed {
+            UpgradeProgress::HostTimed
+        } else {
+            UpgradeProgress::Counts
+        }
+    }
+
+    /// Whether polling request `rs` can become ready only through a guest
+    /// action, as far as the scheduler can prove it, so that its retries
+    /// count toward the next poll upgrade (`upgrade_progress_of`). It fails
+    /// closed, and every condition must hold:
+    ///
+    /// - provenance: every descriptor the attempt waits on was guest-held
+    ///   when the request was filed (`Resources::waits_on_guest_held_only`,
+    ///   computed again before every attempt by `helpers::waits_on_guest_held_only`
+    ///   from #4862's marks). How the call is executed
+    ///   (`polls_guest_state_only`, set for every internal pipe, and for a
+    ///   socketpair end only while it is guest-held, `single_fd_poll_readiness`)
+    ///   is not proof: an inherited pipe write end can have a host reader and
+    ///   carries no mark. A request no loop computed provenance for, of
+    ///   whatever kind, does not count;
+    /// - the guest-state classification still stands (`polls_only_guest_state`),
+    ///   and no thread may have passed descriptors out of the guest since
+    ///   (`guest_held_marks_revoked`): a passed descriptor may be one a poller
+    ///   waits on, and a mark set before the pass no longer proves anything;
+    /// - no finite deadline (`poll_deadline`): such a poll also ends when
+    ///   virtual time reaches its deadline, and virtual time advances with
+    ///   every polling turn, host-timed ones included, so how many of its
+    ///   retries come before the timeout can follow host timing. #4692's
+    ///   idle-poller check leaves such a poll out for the same reason
+    ///   (`is_idle_guest_poller`);
+    /// - not a named FIFO (`polls_a_named_fifo`), whose path any process may
+    ///   open, and not a FIFO open waiting for a peer
+    ///   (`waits_until_nothing_else_can_run`), for the same reason;
+    /// - no doomed process awaiting its reap (`a_committed_doom_is_outstanding`),
+    ///   neither when the request was filed (`request_put` then clears its
+    ///   provenance) nor at its requeue;
+    /// - not a run whose backend delivers signals in two phases
+    ///   (`in_guest_signal_delivery`). There a predicted fatal delivery
+    ///   holds the turn and files its group's Exit, whose grant records the
+    ///   doom (`Tool::exit_for_predicted_death`, which refuses, ending the
+    ///   run, outside that gate), so no window is known; the gate fails
+    ///   closed regardless, as no gate case measured such a backend;
+    /// - only on a backend whose host stated that a thread's native exit,
+    ///   which closes a descriptor table the thread holds alone
+    ///   (`exit_files`), finishes before the scheduler can select another turn
+    ///   (`Config::thread_exits_finish_before_the_next_turn`, false unless the
+    ///   host proved it for that backend): a thread that is not its process's
+    ///   last dooms no process, so that close would be a host-timed wake no
+    ///   committed decision covers (Codex reviews of
+    ///   https://github.com/rrnewton/hermit/pull/4892, rounds 4c to 4e). On
+    ///   ptrace Reverie reports a thread's exit with the final wait status the
+    ///   kernel gave it, after the whole native exit, and Detcore retires the
+    ///   thread only then (`may_retire_before_the_kernel`); on DBT step 2
+    ///   commits no turn while an exited thread's barrier is pending
+    ///   (`ExitedThreadBarrier`).
+    ///
+    /// A `poll` or `ppoll` that mixes guest-held and other descriptors is not
+    /// guest-held (`helpers::poll_targets_guest_held` asks every entry), nor
+    /// is any `select`, `epoll_wait` or signal wait.
+    fn retry_follows_guest_actions(&self, rs: &Resources) -> bool {
+        !self.in_guest_signal_delivery
+            && self.thread_exits_finish_before_the_next_turn
+            && rs.waits_on_guest_held_only
+            && self.polls_only_guest_state(rs)
+            && !self.guest_held_marks_revoked
+            && !self.a_committed_doom_is_outstanding()
+            && rs.poll_deadline.is_none()
+            && !rs.polls_a_named_fifo
+            && !rs.waits_until_nothing_else_can_run
+    }
+
+    /// Whether a committed turn has doomed a process that has not been
+    /// reaped since: a granted exit, a committed SIGKILL (or one whose victim
+    /// the scheduler could not name), an exec teardown in flight, or a
+    /// delivered fatal signal. A doomed process's descriptors close in the
+    /// kernel at a host-chosen moment after that decision (Linux's
+    /// `exit_files` in `do_exit`), and the last writer's close wakes a pipe's
+    /// readers (`pipe_release`), so a guest-state poll on a pipe whose other
+    /// end it holds can become ready at a host-timed moment (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4892, blocking). While one is
+    /// outstanding no polling retry counts toward a poll upgrade
+    /// (`retry_follows_guest_actions`).
+    ///
+    /// Every input is a decision some committed turn made, and each is
+    /// forgotten only at a committed point: the reap (`consume_child_wait`)
+    /// or the exec's completion. Never the registration a backend removes at
+    /// a host-timed moment, which #4692's deadlock check also reads
+    /// (`doomed_process_pending`). It is read when a request is filed
+    /// (`request_put`) and when a retry is requeued (`retry_follows_guest_actions`).
+    ///
+    /// A child reaped automatically (`autoreaped_exits`) or never waited
+    /// for is never forgotten, so the count stays off for the rest of the
+    /// run: Linux decides the automatic reap in `exit_notify`, after
+    /// `exit_files`, but the scheduler records it when it retires the
+    /// process's last thread (`logically_kill_thread`), which may come before
+    /// the kernel's teardown, and no later point is committed. A thread with
+    /// a descriptor table of its own (`CLONE_THREAD` without `CLONE_FILES`,
+    /// or `unshare(CLONE_FILES)`) also closes it at its exit, at a host-chosen
+    /// moment; the scheduler does not know which tables are private, so that
+    /// close is not covered.
+    fn a_committed_doom_is_outstanding(&self) -> bool {
+        !self.thread_tree.granted_exits.is_empty()
+            || !self.sigkilled_processes.is_empty()
+            || self.unresolved_sigkill
+            || !self.exec_teardowns.is_empty()
+            || !self.fatal_signals_unreaped.is_empty()
+    }
+
+    /// Whether a committed doom is outstanding, and whether a fatal delivery
+    /// recorded one for `process` for the count alone and for the hand-off
+    /// (test observation of `a_committed_doom_is_outstanding`).
+    #[cfg(test)]
+    pub(crate) fn fatal_doom_recorded(&self, process: DetPid) -> (bool, bool, bool) {
+        (
+            self.a_committed_doom_is_outstanding(),
+            self.fatal_signals_unreaped.contains(&process),
+            self.fatal_signal_doomed.contains(&process),
+        )
     }
 
     /// A turn that commits only `InboundSignal` resources: a thread's signal
@@ -17968,8 +18224,9 @@ impl Scheduler {
         }
     }
 
-    /// Step: reenqueue the thread that just had a turn.
-    fn step6_reenquue(&mut self, next_dtid: DetTid, requeue: Requeue) {
+    /// Step: reenqueue the thread that just had a turn, counting toward the
+    /// next poll upgrade as `progress` says (`upgrade_progress_of`).
+    fn step6_reenquue(&mut self, next_dtid: DetTid, requeue: Requeue, progress: UpgradeProgress) {
         // We delay popping till here, so while holding the lock we "atomically" move the
         // thread from the front to the back of the queue.
         let dt2 = if requeue == Requeue::YieldEpoch {
@@ -17980,14 +18237,16 @@ impl Scheduler {
         assert_eq!(next_dtid, dt2);
         // A yield's queue placement is transient: the thread keeps its persistent priority
         // and its band.
+        let priority = self.get_priority(next_dtid);
         let pos = match requeue {
-            Requeue::Back => self.runqueue_push_back(next_dtid),
-            Requeue::OneTurnYield => {
-                let priority = self.get_priority(next_dtid);
-                self.run_queue.push_yielded(next_dtid, priority)
-            }
+            Requeue::Back => self.run_queue.push_back_with(next_dtid, priority, progress),
+            Requeue::OneTurnYield => self
+                .run_queue
+                .push_yielded_with(next_dtid, priority, progress),
+            // Only a guest's own `sched_yield` joins the epoch, never a
+            // loopback poll's yield (`requeue_after`): it always counts.
             Requeue::YieldEpoch => {
-                let priority = self.get_priority(next_dtid);
+                debug_assert_eq!(progress, UpgradeProgress::Counts);
                 self.run_queue.push_yielded_into_epoch(next_dtid, priority)
             }
         };
@@ -24878,6 +25137,274 @@ mod test {
         assert_eq!(filed.poll_attempt, 3, "not readied");
     }
 
+    /// A skipped polling retry, requeued through step 4 any number of times.
+    /// Each requeue takes a round-robin turn and nothing else
+    /// (`upgrade_progress_of`).
+    fn skip_polling_retries(sched: &mut Scheduler, retrier: DetTid, count: u64) {
+        for attempt in 0..count {
+            let mut request = Resources::new(retrier);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.poll_attempt = 2 + (attempt % 3) as u32;
+            sched.next_turns.get_mut(&retrier).unwrap().req = Ivar::full(Ok(request.clone()));
+            let response = sched.next_turns[&retrier].resp.clone();
+            assert_eq!(sched.run_queue.tentative_pop_tid(retrier), Some(retrier));
+            assert!(
+                sched
+                    .step4_resource_block(retrier, &request, &response)
+                    .is_err()
+            );
+        }
+    }
+
+    /// What a run looks like at one of the scheduler's looks at a committed
+    /// time: the time, the upgrade count, the counted queueing operations,
+    /// the next timed upgrade and the thread that would be selected.
+    type PollUpgradeLook = (
+        LogicalTime,
+        u64,
+        u64,
+        Option<(LogicalTime, u64)>,
+        Option<DetTid>,
+    );
+
+    fn look_for_a_timed_poll_upgrade(
+        sched: &mut Scheduler,
+        at: LogicalTime,
+        looks: &mut Vec<PollUpgradeLook>,
+    ) {
+        sched.committed_time = at;
+        sched.upgrade_pollers_on_time();
+        let next = sched.run_queue.tentative_pop_next();
+        sched.run_queue.undo_tentative_pop();
+        looks.push((
+            at,
+            sched.run_queue.poll_upgrade_count(),
+            sched.run_queue.upgrade_progress(),
+            sched.next_timed_poll_upgrade,
+            next,
+        ));
+    }
+
+    /// The two poll-upgrade triggers stay apart, and host timing moves
+    /// neither (Codex review of https://github.com/rrnewton/hermit/pull/4652,
+    /// blocking). A skipped polling retry's requeue, made through step 4 any
+    /// number of times between two of the scheduler's looks, counts toward
+    /// neither the queueing-operation interval (`upgrade_progress`) nor the
+    /// upgrade count (`poll_upgrade_count`) the timed trigger restarts its
+    /// period from. So for 0 to 600 such requeues around each boundary the
+    /// run takes the same steps: a timed upgrade exactly at start + period;
+    /// an operation upgrade at the 200th counted operation, just before the
+    /// next timed deadline, which restarts the period once, at the next look;
+    /// and the next timed upgrade a whole period after that look. Each
+    /// upgrade advances the count once, the timed trigger records the count
+    /// after its own upgrade, and a timed upgrade leaves the counted
+    /// operations alone.
+    #[test]
+    fn host_timed_requeues_move_neither_poll_upgrade_trigger() {
+        let interval = runqueue::POLLING_UPGRADE_INTERVAL;
+        let poller = DetTid::from_raw(13);
+        let worker = DetTid::from_raw(15);
+        let retrier = DetTid::from_raw(17);
+        let normal = 500;
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        let ns = Duration::from_nanos;
+        let run = |retries: u64| {
+            let mut sched = Scheduler::new(&Config::default());
+            let period = sched.poll_upgrade_period;
+            for tid in [poller, worker, retrier] {
+                register_known_thread(&mut sched, tid);
+            }
+            sched.priorities.insert(poller, normal);
+            sched.priorities.insert(retrier, 9000);
+            sched.run_queue.push_poller(poller, normal, 6);
+            sched.runqueue_push_back(worker);
+            sched.run_queue.push_poller(retrier, 9000, 1);
+            let mut looks = Vec::new();
+            let look = look_for_a_timed_poll_upgrade;
+
+            look(&mut sched, start, &mut looks);
+            skip_polling_retries(&mut sched, retrier, retries);
+            look(&mut sched, start + period / 2, &mut looks);
+            skip_polling_retries(&mut sched, retrier, retries);
+            look(&mut sched, start + (period - ns(1)), &mut looks);
+            let counted = sched.run_queue.upgrade_progress();
+            look(&mut sched, start + period, &mut looks);
+            assert_eq!(
+                sched.run_queue.poll_upgrade_count(),
+                1,
+                "{retries}: the timed upgrade at start + period, counted once"
+            );
+            assert_eq!(
+                sched.run_queue.upgrade_progress(),
+                counted,
+                "{retries}: a timed upgrade is not a queueing operation"
+            );
+            assert_eq!(
+                sched.next_timed_poll_upgrade,
+                Some((start + period * 2, 1)),
+                "{retries}: recorded after its own upgrade"
+            );
+
+            // The poller retries and backs off again, and the worker's turns
+            // bring the counted operations to one short of the interval.
+            assert!(sched.run_queue.remove_tid(poller));
+            sched.run_queue.push_poller(poller, normal, 7);
+            while !(sched.run_queue.upgrade_progress() + 1).is_multiple_of(interval) {
+                assert!(sched.run_queue.remove_tid(worker));
+                sched.runqueue_push_back(worker);
+            }
+            skip_polling_retries(&mut sched, retrier, retries);
+            assert_eq!(sched.run_queue.poll_upgrade_count(), 1, "{retries}");
+            // The 200th counted operation, just before the timed deadline.
+            assert!(sched.run_queue.remove_tid(worker));
+            sched.runqueue_push_back(worker);
+            assert_eq!(
+                sched.run_queue.poll_upgrade_count(),
+                2,
+                "{retries}: the interval upgrade, counted once"
+            );
+            skip_polling_retries(&mut sched, retrier, retries);
+            let seen = start + (period * 2 - ns(1));
+            look(&mut sched, seen, &mut looks);
+            assert_eq!(
+                sched.next_timed_poll_upgrade,
+                Some((seen + period, 2)),
+                "{retries}: the interval upgrade restarted the period once"
+            );
+
+            // Backed off again: the old deadline passes with no upgrade, and
+            // the restarted one brings it.
+            assert!(sched.run_queue.remove_tid(poller));
+            sched.run_queue.push_poller(poller, normal, 8);
+            skip_polling_retries(&mut sched, retrier, retries);
+            look(&mut sched, start + period * 2, &mut looks);
+            look(&mut sched, seen + (period - ns(1)), &mut looks);
+            look(&mut sched, seen + period, &mut looks);
+            assert_eq!(sched.run_queue.poll_upgrade_count(), 3, "{retries}");
+            looks
+        };
+        let base = run(0);
+        let selections: Vec<Option<DetTid>> = base.iter().map(|look| look.4).collect();
+        assert_eq!(
+            selections,
+            [
+                Some(worker),
+                Some(worker),
+                Some(worker),
+                Some(poller),
+                Some(poller),
+                Some(worker),
+                Some(worker),
+                Some(poller),
+            ],
+            "backed off until each upgrade, then ahead of the worker"
+        );
+        for retries in [1, 2, 7, 199, 200, 201, 600] {
+            assert_eq!(run(retries), base, "{retries} host-timed requeues per gap");
+        }
+    }
+
+    /// The retries a timed poll upgrade readies (`ready_filed_retries`) do not
+    /// count toward the queueing-operation interval when they run, through
+    /// steps 4 to 6: like any retry, each is host-timed
+    /// (`upgrade_progress_of`). Counting them would let the number of live
+    /// pollers at a timed upgrade move the next interval upgrade, and with it
+    /// the timed trigger's period.
+    #[test]
+    fn the_retries_a_timed_poll_upgrade_readies_do_not_count_toward_the_interval() {
+        let mut sched = Scheduler::new(&Config::default());
+        let actor = DetTid::from_raw(1);
+        sched.thread_tree.add_child(actor, actor, true);
+        register_known_thread(&mut sched, actor);
+        let pollers: Vec<DetTid> = (0..5).map(|i| DetTid::from_raw(21 + 2 * i)).collect();
+        for &tid in &pollers {
+            sched.thread_tree.add_child(actor, tid, true);
+            register_known_thread(&mut sched, tid);
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.poll_attempt = 3;
+            sched.next_turns[&tid].req.put(Ok(request));
+            sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, 3);
+        }
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        sched.committed_time = start;
+        sched.upgrade_pollers_on_time();
+        sched.committed_time = start + sched.poll_upgrade_period;
+        sched.upgrade_pollers_on_time();
+        let counted = sched.run_queue.upgrade_progress();
+        for &tid in &pollers {
+            let request = sched.next_turns[&tid]
+                .req
+                .try_read()
+                .unwrap()
+                .expect("a filed request");
+            assert_eq!(
+                (request.poll_attempt, request.upgraded_from_attempt),
+                (0, 3),
+                "readied"
+            );
+            assert_eq!(sched.run_queue.tentative_pop_tid(tid), Some(tid));
+            let response = sched.next_turns[&tid].resp.clone();
+            assert!(sched.step4_resource_block(tid, &request, &response).is_ok());
+            assert!(sched.step5_guest_unblock(tid, &request, &response).is_ok());
+            let requeue = sched.requeue_after(&request);
+            let progress = sched.upgrade_progress_of(&request);
+            sched.step6_reenquue(tid, requeue, progress);
+        }
+        assert_eq!(
+            sched.run_queue.upgrade_progress(),
+            counted,
+            "five readied retries ran and none counted"
+        );
+    }
+
+    /// Step 2 runs the timed poll upgrade (`step2_process_blocked`): a
+    /// backed-off poller is restored at the pass that crosses the period and
+    /// not before. The upgrade also gives a backed-off poller in the last band
+    /// PR 4605's mark, so the chaos change-point bound counts it
+    /// (`can_be_passed_over`). The unit tests above call
+    /// `upgrade_pollers_on_time` directly; this one holds the call in step 2
+    /// (Claude and Codex reviews of
+    /// https://github.com/rrnewton/hermit/pull/4652).
+    #[test]
+    fn step2_runs_the_timed_poll_upgrade() {
+        let mut sched = Scheduler::new(&Config::default());
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let period = sched.poll_upgrade_period;
+        let poller = DetTid::from_raw(13);
+        let last_band = DetTid::from_raw(15);
+        for tid in [poller, last_band] {
+            register_known_thread(&mut sched, tid);
+        }
+        sched.priorities.insert(poller, 500);
+        sched.priorities.insert(last_band, runqueue::LAST_PRIORITY);
+        sched.run_queue.push_poller(poller, 500, 6);
+        sched
+            .run_queue
+            .push_poller(last_band, runqueue::LAST_PRIORITY, 5);
+        let backed_off = Some(runqueue::LAST_PRIORITY);
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        for (at, restored) in [
+            (start, false),
+            (start + (period - Duration::from_nanos(1)), false),
+            (start + period, true),
+        ] {
+            sched.committed_time = at;
+            let _ = sched.step2_process_blocked(&global_time);
+            assert_eq!(
+                sched.run_queue.queued_priority(poller),
+                if restored { Some(500) } else { backed_off },
+                "at {at}"
+            );
+            assert_eq!(
+                sched.run_queue.can_be_passed_over(last_band),
+                restored,
+                "the last-band poller's mark, at {at}"
+            );
+        }
+        assert_eq!(sched.run_queue.poll_upgrade_count(), 1);
+    }
+
     /// `--cap-preemption-charge`: a committed turn whose request ends an
     /// expired timeslice is charged the virtual time its thread ran in that
     /// slice, from its previous granted turn to this request, at most the
@@ -30183,7 +30710,7 @@ mod test {
                 assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
                 let requeue = scheduler.requeue_after(&request);
                 assert_eq!(requeue, Requeue::YieldEpoch);
-                scheduler.step6_reenquue(yielder, requeue);
+                scheduler.step6_reenquue(yielder, requeue, UpgradeProgress::Counts);
             }
         }
         (scheduler, tids)
@@ -30262,7 +30789,7 @@ mod test {
         assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
         let requeue = scheduler.requeue_after(&request);
         assert_eq!(requeue, Requeue::Back);
-        scheduler.step6_reenquue(worker, requeue);
+        scheduler.step6_reenquue(worker, requeue, UpgradeProgress::Counts);
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tids[0]));
     }
 
@@ -30293,7 +30820,7 @@ mod test {
             assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
             let requeue = scheduler.requeue_after(&request);
             assert_eq!(requeue, Requeue::YieldEpoch);
-            scheduler.step6_reenquue(last, requeue);
+            scheduler.step6_reenquue(last, requeue, UpgradeProgress::Counts);
         }
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tids[0]));
     }
@@ -30451,7 +30978,7 @@ mod test {
                 let requeue = scheduler.requeue_after(&request);
                 for _ in 0..yields_each {
                     assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
-                    scheduler.step6_reenquue(yielder, requeue);
+                    scheduler.step6_reenquue(yielder, requeue, UpgradeProgress::Counts);
                 }
             }
             let expected = if chaos { awaited } else { first };
@@ -30478,7 +31005,7 @@ mod test {
                 scheduler.run_queue.tentative_pop_tid(yielder),
                 Some(yielder)
             );
-            scheduler.step6_reenquue(yielder, requeue);
+            scheduler.step6_reenquue(yielder, requeue, UpgradeProgress::Counts);
         }
     }
 
@@ -30803,7 +31330,7 @@ mod test {
                 .is_ok()
         );
         let requeue = scheduler.requeue_after(&request);
-        scheduler.step6_reenquue(tid, requeue);
+        scheduler.step6_reenquue(tid, requeue, UpgradeProgress::Counts);
     }
 
     /// Under chaos, a thread that never blocks redraws its priority at each
@@ -30904,6 +31431,654 @@ mod test {
         spinner_changepoint(&mut scheduler, spinner, 4756, 4);
         assert_eq!(scheduler.priorities[&spinner], runqueue::LAST_PRIORITY);
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(waiter));
+    }
+
+    /// A configuration as the host prepares it for the ptrace backend, on
+    /// which polling retries may count toward a poll upgrade
+    /// (`Config::thread_exits_finish_before_the_next_turn`).
+    fn ptrace_config() -> Config {
+        Config {
+            backend: BackendCapabilities::PTRACE,
+            thread_exits_finish_before_the_next_turn: true,
+            ..Config::default()
+        }
+    }
+
+    /// Which polling retries count toward the next poll upgrade, at each
+    /// boundary of the classification (`retry_follows_guest_actions`). A
+    /// retry counts only when its request carries provenance that every
+    /// descriptor it waits on is guest-held (`waits_on_guest_held_only`, set
+    /// by the retry loops in `syscalls::helpers` before each attempt) beside
+    /// the guest-state classification, and no finite deadline. It does not
+    /// count, as host-timed, for:
+    ///
+    /// - (a) a named FIFO that joined internal polling (`polls_a_named_fifo`,
+    ///   set through `is_named_fifo`, PR 4692): any process may open its path;
+    /// - (b) a FIFO open waiting for a guest peer
+    ///   (`waits_until_nothing_else_can_run`, set by the FIFO open in
+    ///   `syscalls::files`), for the same reason;
+    /// - (c) any guest-state poll once a request reports that descriptors may
+    ///   have left the guest (`passes_descriptors_out`, which `request_put`
+    ///   turns into `guest_held_marks_revoked`);
+    /// - (d) a poll the syscall layer did not classify as guest state, as it
+    ///   does not for a set mixing guest-held and host-backed descriptors;
+    /// - (e) a retry of any other or unknown kind (fail closed);
+    /// - (f) the routing bit without provenance: an internal pipe that is not
+    ///   guest-held, such as an inherited pipe write end (a socketpair end
+    ///   without the mark, such as a bound datagram one, already falls under
+    ///   (d), `single_fd_poll_readiness`) (Codex review of
+    ///   https://github.com/rrnewton/hermit/pull/4892, blocking 1);
+    /// - (g) a guest-held poll with a finite deadline, whose timeout virtual
+    ///   time decides (blocking 2).
+    ///
+    /// A first attempt counts whatever its kind, and so does every retry under
+    /// record/replay. Through step 4, a counted retry's skipped requeue
+    /// advances the progress and a host-timed one's does not, and however
+    /// many finite-deadline retries are interleaved with host-timed ones, the
+    /// progress is the same.
+    #[test]
+    fn only_a_retry_that_waits_on_guest_actions_alone_counts_toward_a_poll_upgrade() {
+        let poller = DetTid::from_raw(100);
+        let retry = |configure: &dyn Fn(&mut Resources)| {
+            let mut rs = Resources::new(poller);
+            rs.insert(ResourceID::InternalIOPolling, Permission::W);
+            rs.poll_attempt = 2;
+            configure(&mut rs);
+            rs
+        };
+        let held = |rs: &mut Resources| {
+            rs.polls_guest_state_only = true;
+            rs.waits_on_guest_held_only = true;
+        };
+        let internal = retry(&held);
+        let guest_held = retry(&|rs| {
+            held(rs);
+            rs.relies_on_guest_held_marks = true;
+        });
+        let named_fifo = retry(&|rs| {
+            held(rs);
+            rs.polls_a_named_fifo = true;
+        });
+        let fifo_open = retry(&|rs| {
+            held(rs);
+            rs.waits_until_nothing_else_can_run = true;
+        });
+        let unclassified_poll = retry(&|rs| rs.fyi("poll"));
+        let unknown = retry(&|rs| rs.fyi("an unknown call"));
+        let routing_only = retry(&|rs| rs.polls_guest_state_only = true);
+        let provenance_only = retry(&|rs| rs.waits_on_guest_held_only = true);
+        let finite = retry(&|rs| {
+            held(rs);
+            rs.relies_on_guest_held_marks = true;
+            rs.poll_deadline = Some(LogicalTime::from_nanos(5_000_000));
+        });
+        let counted = |sched: &Scheduler, rs: &Resources| {
+            let skipped = sched.upgrade_progress_of(rs);
+            let run = sched.upgrade_progress_of(&rs.clone().upgraded_to_runnable());
+            assert_eq!(skipped, run, "{rs:?}: the skipped and the run retry agree");
+            skipped == UpgradeProgress::Counts
+        };
+        let config = ptrace_config();
+        let mut sched = Scheduler::new(&config);
+        assert!(counted(&sched, &internal), "guest-held pipe or socketpair");
+        assert!(counted(&sched, &guest_held), "guest-held poll");
+        assert!(!counted(&sched, &named_fifo), "(a) named FIFO");
+        assert!(!counted(&sched, &fifo_open), "(b) FIFO open");
+        assert!(
+            !counted(&sched, &unclassified_poll),
+            "(d) mixed or host-backed"
+        );
+        assert!(!counted(&sched, &unknown), "(e) unknown kind");
+        assert!(!counted(&sched, &routing_only), "(f) routing bit, no mark");
+        assert!(
+            !counted(&sched, &provenance_only),
+            "unclassified, marks alone"
+        );
+        assert!(!counted(&sched, &finite), "(g) finite deadline");
+        // (h) A backend that delivers signals in two phases: nothing counts.
+        let mut two_phase = Scheduler::new(&config);
+        two_phase.in_guest_signal_delivery = true;
+        assert!(!counted(&two_phase, &internal), "(h) two-phase delivery");
+        assert!(!counted(&two_phase, &guest_held), "(h) two-phase delivery");
+        // (i) Only a configuration whose host stated that a thread's native
+        // exit, and with it a private descriptor table's close, finishes
+        // before the next turn counts
+        // (`Config::thread_exits_finish_before_the_next_turn`). The statement
+        // decides, not the capability set: a custom or later backend that
+        // reports ptrace's or DBT's exact capabilities, and leaves the
+        // statement at its default, counts nothing, and so does a
+        // configuration nobody prepared.
+        for (name, backend, stated) in [
+            ("ptrace", BackendCapabilities::PTRACE, true),
+            ("DBT", BackendCapabilities::DBT, true),
+            (
+                "ptrace's capabilities, unstated",
+                BackendCapabilities::PTRACE,
+                false,
+            ),
+            (
+                "DBT's capabilities, unstated",
+                BackendCapabilities::DBT,
+                false,
+            ),
+            (
+                "in-guest LiteInst",
+                BackendCapabilities::LITEINST_IN_GUEST,
+                false,
+            ),
+            ("SaBRe", BackendCapabilities::SABRE, false),
+            ("KVM", BackendCapabilities::KVM, false),
+        ] {
+            let sched = Scheduler::new(&Config {
+                backend,
+                thread_exits_finish_before_the_next_turn: stated,
+                ..config.clone()
+            });
+            assert_eq!(counted(&sched, &internal), stated, "(i) {name}");
+            assert_eq!(counted(&sched, &guest_held), stated, "(i) {name}");
+        }
+        let unprepared = Scheduler::new(&Config::default());
+        assert!(!counted(&unprepared, &internal), "(i) unprepared");
+        assert!(!counted(&unprepared, &guest_held), "(i) unprepared");
+        for rs in [&named_fifo, &fifo_open, &unknown, &routing_only, &finite] {
+            let mut first = rs.clone();
+            first.poll_attempt = 0;
+            assert_eq!(
+                sched.upgrade_progress_of(&first),
+                UpgradeProgress::Counts,
+                "{rs:?}: a first attempt"
+            );
+        }
+
+        // Through step 4: a counted retry's skipped requeue counts, a
+        // host-timed one's does not.
+        register_known_thread(&mut sched, poller);
+        // The progress the skipped requeue of `rs` adds through step 4.
+        let skip = |sched: &mut Scheduler, rs: &Resources| {
+            sched.runqueue_push_back(poller);
+            let before = sched.run_queue.upgrade_progress();
+            sched.next_turns.get_mut(&poller).unwrap().req = Ivar::full(Ok(rs.clone()));
+            let response = sched.next_turns[&poller].resp.clone();
+            assert_eq!(sched.run_queue.tentative_pop_next(), Some(poller));
+            assert!(sched.step4_resource_block(poller, rs, &response).is_err());
+            assert!(sched.run_queue.remove_tid(poller));
+            sched.run_queue.upgrade_progress() - before
+        };
+        for (rs, advance) in [
+            (&internal, 1),
+            (&named_fifo, 0),
+            (&unknown, 0),
+            (&routing_only, 0),
+            (&finite, 0),
+        ] {
+            assert_eq!(skip(&mut sched, rs), advance, "{rs:?} through step 4");
+        }
+        // (g) A finite-deadline poll's retries interleaved with host-timed
+        // ones, in whatever number virtual time allows before its timeout,
+        // leave the progress where it was.
+        let host = retry(&|_| {});
+        for (finite_retries, host_retries) in [(0, 0), (1, 3), (4, 1), (7, 7)] {
+            let mut added = 0;
+            for _ in 0..host_retries {
+                added += skip(&mut sched, &host);
+            }
+            for _ in 0..finite_retries {
+                added += skip(&mut sched, &finite);
+            }
+            assert_eq!(
+                added, 0,
+                "{finite_retries} finite and {host_retries} host-timed retries"
+            );
+        }
+
+        // (c) Once descriptors may have left the guest, no guest-state poll
+        // counts, guest-held or not.
+        let mut export = Resources::new(DetTid::from_raw(7));
+        export.passes_descriptors_out = true;
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        sched.request_put(&Ivar::new(), export, &global_time);
+        assert!(sched.guest_held_marks_revoked);
+        assert!(!counted(&sched, &guest_held), "(c) guest-held, revoked");
+        assert!(!counted(&sched, &internal), "(c) internal, revoked");
+
+        // Record/replay counts every requeue, as before.
+        let mut sched = Scheduler::new(&config);
+        sched.recordreplay_modes = true;
+        for rs in [
+            &named_fifo,
+            &fifo_open,
+            &unclassified_poll,
+            &unknown,
+            &routing_only,
+            &finite,
+        ] {
+            assert!(counted(&sched, rs), "{rs:?} under record/replay");
+        }
+    }
+
+    /// No polling retry counts while a committed decision has doomed a
+    /// process that has not been reaped (`a_committed_doom_is_outstanding`):
+    /// its descriptors close in the kernel at a host-chosen moment, and a
+    /// parent polling a pipe whose writer is that dying child sees the close
+    /// then (Claude review of https://github.com/rrnewton/hermit/pull/4892,
+    /// blocking). A granted exit, a committed SIGKILL and a delivered fatal
+    /// signal each stop the count, and only the reap restarts it; an exec
+    /// teardown stops it until the exec completes; a SIGKILL whose victim
+    /// the scheduler could not name stops it for good.
+    #[test]
+    fn a_retry_does_not_count_while_a_doomed_process_awaits_its_reap() {
+        let reader = DetTid::from_raw(100);
+        let mut retry = Resources::new(reader);
+        retry.insert(ResourceID::InternalIOPolling, Permission::W);
+        retry.poll_attempt = 2;
+        retry.polls_guest_state_only = true;
+        retry.waits_on_guest_held_only = true;
+        let counted =
+            |sched: &Scheduler| sched.upgrade_progress_of(&retry) == UpgradeProgress::Counts;
+        let parent = DetPid::from_raw(100);
+        let writer = DetPid::from_raw(200);
+        type Doom = fn(&mut Scheduler, DetPid);
+        let dooms: [(&str, Doom); 3] = [
+            ("granted exit", |s, writer| {
+                s.thread_tree.granted_exits.insert(writer);
+            }),
+            ("committed SIGKILL", |s, writer| {
+                s.record_committed_sigkill(DetTid::from_raw(writer.as_raw()), Some(writer));
+            }),
+            ("fatal signal", |s, writer| {
+                s.note_fatal_signal_delivery(writer)
+            }),
+        ];
+        for (name, doom) in dooms {
+            let mut sched = Scheduler::new(&ptrace_config());
+            sched.thread_tree.add_child(parent, parent, true);
+            sched.thread_tree.add_child(parent, writer, true);
+            assert!(counted(&sched), "{name}: before");
+            doom(&mut sched, writer);
+            assert!(!counted(&sched), "{name}: doomed, not reaped");
+            sched.logically_exited_processes.insert(writer);
+            assert!(sched.consume_child_wait(parent, writer), "{name}");
+            assert!(counted(&sched), "{name}: reaped");
+        }
+        let mut sched = Scheduler::new(&ptrace_config());
+        let caller = DetTid::from_raw(writer.as_raw());
+        let mm = MmId::initial(writer);
+        sched.exec_teardowns.insert(
+            writer,
+            ExecTeardown {
+                caller,
+                mm,
+                siblings: Default::default(),
+                observed: Default::default(),
+            },
+        );
+        assert!(!counted(&sched), "exec teardown in flight");
+        assert!(
+            sched
+                .finish_exec_teardown(caller, writer, mm, false)
+                .is_empty()
+        );
+        assert!(counted(&sched), "exec complete");
+        let mut sched = Scheduler::new(&ptrace_config());
+        sched.record_unresolved_sigkill(None);
+        assert!(!counted(&sched), "an unnamed SIGKILL victim");
+    }
+
+    /// The doom is judged when a retry is filed, as its provenance is: an
+    /// attempt made while a doomed writer's descriptors were still open may
+    /// have failed only because the kernel had not closed them yet, so its
+    /// retry does not count even when it is selected after the reap, at its
+    /// step-4 skip or as the run retry. A retry filed after the reap counts
+    /// (Claude review of https://github.com/rrnewton/hermit/pull/4892, round
+    /// 4b, blocking).
+    #[test]
+    fn a_retry_filed_while_a_process_was_doomed_does_not_count_after_the_reap() {
+        let config = ptrace_config();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let reader = DetTid::from_raw(100);
+        let parent = DetPid::from_raw(100);
+        let writer = DetPid::from_raw(200);
+        let mut sched = Scheduler::new(&config);
+        sched.thread_tree.add_child(parent, parent, true);
+        sched.thread_tree.add_child(parent, writer, true);
+        register_known_thread(&mut sched, reader);
+        let mut retry = Resources::new(reader);
+        retry.insert(ResourceID::InternalIOPolling, Permission::W);
+        retry.poll_attempt = 2;
+        retry.polls_guest_state_only = true;
+        retry.waits_on_guest_held_only = true;
+        let file = |sched: &mut Scheduler| {
+            let filed = Ivar::new();
+            sched.request_put(&filed, retry.clone(), &global_time);
+            match filed.try_read() {
+                Some(Ok(rs)) => rs,
+                other => panic!("filed {other:?}"),
+            }
+        };
+        // The progress the filed retry's step-4 skip adds, and whether its
+        // run retry would count.
+        let requeue = |sched: &mut Scheduler, rs: &Resources| {
+            sched.runqueue_push_back(reader);
+            let before = sched.run_queue.upgrade_progress();
+            sched.next_turns.get_mut(&reader).unwrap().req = Ivar::full(Ok(rs.clone()));
+            let response = sched.next_turns[&reader].resp.clone();
+            assert_eq!(sched.run_queue.tentative_pop_next(), Some(reader));
+            assert!(sched.step4_resource_block(reader, rs, &response).is_err());
+            assert!(sched.run_queue.remove_tid(reader));
+            let run = sched.upgrade_progress_of(&rs.clone().upgraded_to_runnable());
+            (
+                sched.run_queue.upgrade_progress() - before,
+                run == UpgradeProgress::Counts,
+            )
+        };
+        sched.thread_tree.granted_exits.insert(writer);
+        let during = file(&mut sched);
+        assert!(!during.waits_on_guest_held_only, "filed while doomed");
+        sched.logically_exited_processes.insert(writer);
+        assert!(sched.consume_child_wait(parent, writer));
+        assert_eq!(requeue(&mut sched, &during), (0, false), "after the reap");
+        let after = file(&mut sched);
+        assert!(after.waits_on_guest_held_only, "filed after the reap");
+        assert_eq!(
+            requeue(&mut sched, &after),
+            (1, true),
+            "filed after the reap"
+        );
+    }
+
+    /// A requeue whose number depends on host timing does not count toward
+    /// the next poll upgrade, through the scheduler's own paths: a polling
+    /// retry skipped and backed off in step 4, the same retry run and
+    /// requeued in step 6, and a loopback poll's yield. A call's first
+    /// attempt, an ordinary turn and a guest's own `sched_yield` count, and
+    /// under record/replay every requeue counts, as before (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4605).
+    #[test]
+    fn a_host_timed_requeue_does_not_count_toward_a_poll_upgrade() {
+        let poller = DetTid::from_raw(100);
+        let mut first = Resources::new(poller);
+        first.insert(ResourceID::InternalIOPolling, Permission::W);
+        let mut skipped = first.clone();
+        skipped.poll_attempt = 3;
+        let run = skipped.upgraded_to_runnable();
+        let mut sched_yield = Resources::new(poller);
+        sched_yield.insert(ResourceID::SchedYield, Permission::W);
+        let mut loopback = sched_yield.clone();
+        loopback.fyi(LOOPBACK_POLL_YIELD_FYI);
+        let ordinary = Resources::new(poller);
+        let cases = [
+            ("first attempt", &first, UpgradeProgress::Counts),
+            ("skipped retry", &skipped, UpgradeProgress::HostTimed),
+            ("run retry", &run, UpgradeProgress::HostTimed),
+            (
+                "loopback poll's yield",
+                &loopback,
+                UpgradeProgress::HostTimed,
+            ),
+            ("sched_yield", &sched_yield, UpgradeProgress::Counts),
+            ("ordinary turn", &ordinary, UpgradeProgress::Counts),
+        ];
+        for chaos in [false, true] {
+            let mut scheduler = Scheduler::new(&Config {
+                chaos,
+                ..Config::default()
+            });
+            for (name, rs, expected) in &cases {
+                assert_eq!(
+                    scheduler.upgrade_progress_of(rs),
+                    *expected,
+                    "{name}, chaos={chaos}"
+                );
+            }
+            scheduler.recordreplay_modes = true;
+            for (name, rs, _) in &cases {
+                assert_eq!(
+                    scheduler.upgrade_progress_of(rs),
+                    UpgradeProgress::Counts,
+                    "{name} under record/replay, chaos={chaos}"
+                );
+            }
+        }
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        register_known_thread(&mut scheduler, poller);
+        scheduler.runqueue_push_back(poller);
+        let counted = scheduler.run_queue.upgrade_progress();
+        let next = scheduler.next_turns.get(&poller).unwrap();
+        next.req.put(Ok(skipped.clone()));
+        let response = next.resp.clone();
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
+        assert!(
+            scheduler
+                .step4_resource_block(poller, &skipped, &response)
+                .is_err()
+        );
+        assert_eq!(
+            scheduler.run_queue.queued_priority(poller),
+            Some(8 * DEFAULT_PRIORITY),
+            "skipped and backed off"
+        );
+        assert_eq!(
+            scheduler.run_queue.upgrade_progress(),
+            counted,
+            "the skipped retry's requeue"
+        );
+        let runnable = scheduler.next_turns[&poller]
+            .req
+            .try_read()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scheduler.upgrade_progress_of(&runnable),
+            UpgradeProgress::HostTimed
+        );
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(poller), Some(poller));
+        scheduler.step6_reenquue(
+            poller,
+            scheduler.requeue_after(&runnable),
+            scheduler.upgrade_progress_of(&runnable),
+        );
+        assert_eq!(
+            scheduler.run_queue.upgrade_progress(),
+            counted,
+            "the run retry's requeue"
+        );
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(poller), Some(poller));
+        scheduler.step6_reenquue(
+            poller,
+            scheduler.requeue_after(&loopback),
+            scheduler.upgrade_progress_of(&loopback),
+        );
+        assert_eq!(
+            scheduler.run_queue.upgrade_progress(),
+            counted,
+            "the loopback poll's yield"
+        );
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(poller), Some(poller));
+        scheduler.step6_reenquue(
+            poller,
+            scheduler.requeue_after(&ordinary),
+            scheduler.upgrade_progress_of(&ordinary),
+        );
+        assert_eq!(
+            scheduler.run_queue.upgrade_progress(),
+            counted + 1,
+            "an ordinary turn's requeue"
+        );
+    }
+
+    /// Two runs of one chaos seed that differ only in how many host-timed
+    /// retry requeues they make just before a poll upgrade take the same
+    /// change points. With 197 counted queueing operations made, the retries
+    /// add none, so the two change points that bring the count to 199 find
+    /// the last-band poller not yet upgraded in every run and keep their
+    /// draws; the 200th operation upgrades it in every run, and the bound
+    /// then takes the last band behind it at its second pass, as without
+    /// retries. Counting the retries upgraded it before, or between, those
+    /// change points in some runs only (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4605).
+    #[test]
+    fn host_timed_retries_before_a_poll_upgrade_leave_chaos_change_points_alone() {
+        let interval = runqueue::POLLING_UPGRADE_INTERVAL;
+        let mut decisions = Vec::new();
+        for retries in [0, 1, 2, 5, 3 * interval] {
+            let (mut scheduler, spinner, waiter) = chaos_spinner_and_waiter(
+                Config {
+                    chaos: true,
+                    ..Config::default()
+                },
+                500,
+                runqueue::LAST_PRIORITY,
+            );
+            assert!(scheduler.run_queue.remove_tid(waiter));
+            scheduler
+                .run_queue
+                .push_poller(waiter, runqueue::LAST_PRIORITY, 5);
+            // A thread that polls in every run; only its retry count differs.
+            let retrier = DetTid::from_raw(102);
+            register_known_thread(&mut scheduler, retrier);
+            scheduler
+                .run_queue
+                .push_poller(retrier, DEFAULT_PRIORITY, 1);
+            while scheduler.run_queue.upgrade_progress() < interval - 3 {
+                assert!(scheduler.run_queue.remove_tid(spinner));
+                scheduler.runqueue_push_back(spinner);
+            }
+            for attempt in 0..retries {
+                assert!(scheduler.run_queue.remove_tid(retrier));
+                scheduler.run_queue.push_poller_with(
+                    retrier,
+                    DEFAULT_PRIORITY,
+                    2 + (attempt % 2) as u32,
+                    UpgradeProgress::HostTimed,
+                );
+            }
+            let mut taken = Vec::new();
+            for (at, drawn) in [(1, 136), (2, 7043)] {
+                spinner_changepoint(&mut scheduler, spinner, drawn, at);
+                taken.push(scheduler.priorities[&spinner]);
+            }
+            assert_eq!(
+                scheduler.run_queue.upgrade_progress(),
+                interval - 1,
+                "{retries} retries"
+            );
+            assert!(
+                scheduler.chaos_passed_over.is_empty(),
+                "{retries} retries: no upgrade yet, so no pass is counted"
+            );
+            assert!(scheduler.run_queue.remove_tid(spinner));
+            scheduler.runqueue_push_back(spinner);
+            assert!(
+                scheduler.run_queue.can_be_passed_over(waiter),
+                "{retries} retries: the 200th operation upgrades"
+            );
+            for (at, drawn) in [(3, 136), (4, 4756)] {
+                spinner_changepoint(&mut scheduler, spinner, drawn, at);
+                taken.push(scheduler.priorities[&spinner]);
+            }
+            decisions.push(taken);
+        }
+        assert_eq!(decisions[0], [136, 7043, 136, runqueue::LAST_PRIORITY]);
+        assert!(
+            decisions.iter().all(|taken| *taken == decisions[0]),
+            "{decisions:?}"
+        );
+    }
+
+    /// A thread woken from a timed wait goes to the front of its band under
+    /// chaos too, also ahead of a thread chaos change points have passed over
+    /// once and the bound will let through at the next one. Keeping it behind
+    /// such a thread (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4605, finding 1) hid the
+    /// sleep-ordered races chaos searches for: a closed-source timer race
+    /// found at 10 of 11 seeds was found at none
+    /// (https://github.com/rrnewton/hermit/pull/4892, revision 4). The bound
+    /// still lets the passed-over poller through at the next change point.
+    #[test]
+    fn a_timed_wake_goes_to_the_front_of_its_band_beside_a_thread_at_the_chaos_passover_bound() {
+        let next = |scheduler: &mut Scheduler| {
+            let next = scheduler.run_queue.tentative_pop_next();
+            scheduler.run_queue.undo_tentative_pop();
+            next
+        };
+        let (mut scheduler, spinner, poller) = chaos_spinner_and_waiter(
+            Config {
+                chaos: true,
+                ..Config::default()
+            },
+            500,
+            runqueue::LAST_PRIORITY,
+        );
+        assert!(scheduler.run_queue.remove_tid(poller));
+        scheduler
+            .run_queue
+            .push_poller(poller, runqueue::LAST_PRIORITY, 5);
+        scheduler.run_queue.poll_upgrade_now();
+        let sleepers = [DetTid::from_raw(102), DetTid::from_raw(103)];
+        for sleeper in sleepers {
+            register_known_thread(&mut scheduler, sleeper);
+            scheduler
+                .priorities
+                .insert(sleeper, runqueue::LAST_PRIORITY);
+        }
+        spinner_changepoint(&mut scheduler, spinner, 136, 1);
+        assert_eq!(scheduler.chaos_passed_over.get(&poller), Some(&1));
+        assert!(scheduler.run_queue.remove_tid(spinner));
+        for round in 0..4 {
+            let sleeper = sleepers[round % 2];
+            scheduler.wake_timed_event(LogicalTime::from_nanos(2 + round as u64), sleeper);
+            assert_eq!(
+                next(&mut scheduler),
+                Some(sleeper),
+                "round {round}: ahead of the passed-over poller"
+            );
+            assert!(scheduler.run_queue.remove_tid(sleeper));
+        }
+        scheduler.runqueue_push_back(spinner);
+        spinner_changepoint(&mut scheduler, spinner, 136, 6);
+        assert_eq!(
+            scheduler.priorities[&spinner],
+            runqueue::LAST_PRIORITY,
+            "the bound puts the spinner behind the poller"
+        );
+        assert_eq!(next(&mut scheduler), Some(poller));
+    }
+
+    /// The bound's INFO line names a poller only when it alone explains the
+    /// priority taken: not when a non-polling thread starves at the same
+    /// priority too (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4605, finding 2).
+    #[test]
+    fn the_bound_names_a_poller_only_when_no_other_thread_starves_beside_it() {
+        let (mut scheduler, worker, poller) = chaos_spinner_and_waiter(
+            Config {
+                chaos: true,
+                ..Config::default()
+            },
+            runqueue::LAST_PRIORITY,
+            runqueue::LAST_PRIORITY,
+        );
+        assert!(scheduler.run_queue.remove_tid(poller));
+        scheduler
+            .run_queue
+            .push_poller(poller, runqueue::LAST_PRIORITY, 5);
+        scheduler.run_queue.poll_upgrade_now();
+        let last = Some(runqueue::LAST_PRIORITY);
+        let both = [
+            (worker, runqueue::LAST_PRIORITY),
+            (poller, runqueue::LAST_PRIORITY),
+        ];
+        assert_eq!(
+            scheduler.poller_the_bound_retries(&both[1..], last),
+            Some(poller)
+        );
+        assert_eq!(scheduler.poller_the_bound_retries(&both, last), None);
+        assert_eq!(scheduler.poller_the_bound_retries(&both[..1], last), None);
+        assert_eq!(
+            scheduler.poller_the_bound_retries(&both[1..], Some(9000)),
+            None
+        );
     }
 
     /// The bound counts only a thread the new priority still beats, and only
@@ -31057,7 +32232,7 @@ mod test {
                     .put(Ok(continuation));
             }
             assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
-            scheduler.step6_reenquue(yielder, Requeue::YieldEpoch);
+            scheduler.step6_reenquue(yielder, Requeue::YieldEpoch, UpgradeProgress::Counts);
             assert!(scheduler.step2c_process_io_blockers().is_ok());
             assert_eq!(
                 scheduler.blocked.external_io_blockers.get(&background),
@@ -31116,7 +32291,7 @@ mod test {
         );
         assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
-        scheduler.step6_reenquue(yielder, Requeue::YieldEpoch);
+        scheduler.step6_reenquue(yielder, Requeue::YieldEpoch, UpgradeProgress::Counts);
         scheduler.step2e_process_signal_deferred();
         assert!(
             scheduler.blocked.sigchld_deferred.contains(&signaled),

@@ -1322,6 +1322,13 @@ mod event_tests {
         passes_out: Mutex<Vec<bool>>,
         /// What a `connect`'s second attempt returns.
         connect_completes: Result<i64, Errno>,
+        /// `Resources::waits_on_guest_held_only` of each polling request, in
+        /// the order the requests arrive.
+        provenance: Mutex<Vec<bool>>,
+        /// A descriptor table whose `FD` loses its guest-held mark while the
+        /// first polling request is answered, as a sibling's `dup2` between
+        /// two attempts would replace it.
+        unmark_after_first_request: Option<Arc<Mutex<crate::tool_local::FileMetadata>>>,
     }
 
     impl EventGuest {
@@ -1449,6 +1456,15 @@ mod event_tests {
                         Some(&Permission::W)
                     );
                     self.polls.lock().unwrap().push(request.poll_attempt);
+                    self.provenance
+                        .lock()
+                        .unwrap()
+                        .push(request.waits_on_guest_held_only);
+                    if request.poll_attempt == 0
+                        && let Some(table) = &self.unmark_after_first_request
+                    {
+                        table.lock().unwrap().file_handles[&FD].clear_guest_held();
+                    }
                     self.request_marks
                         .lock()
                         .unwrap()
@@ -1744,8 +1760,48 @@ mod event_tests {
             send_attempts: 0,
             passes_out: Mutex::new(Vec::new()),
             connect_completes: Ok(0),
+            provenance: Mutex::new(Vec::new()),
+            unmark_after_first_request: None,
         };
         (tool, guest)
+    }
+
+    /// The real retry loop judges, before every attempt, whether the
+    /// descriptor it waits on is guest-held (`Resources::waits_on_guest_held_only`),
+    /// not once for the call: a sibling that replaces the descriptor between
+    /// two attempts with one no guest-held mark covers takes the proof away
+    /// from the next request, so that retry does not count toward a poll
+    /// upgrade (Codex review of https://github.com/rrnewton/hermit/pull/4892,
+    /// round 4, blocking 1(c)).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retry_loop_judges_guest_held_provenance_before_every_attempt() {
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (tool, mut guest) = event_guest(FdType::Pipe, Some((parked_tx, resume_rx)));
+        guest
+            .thread
+            .with_detfd(FD, |detfd| detfd.set_guest_held())
+            .unwrap();
+        guest.unmark_after_first_request = Some(guest.thread.file_metadata.clone());
+        guest.memory.put_iovec(0, FIRST_DEST, 8);
+
+        let event = tool.handle_syscall_event(&mut guest, readv(1));
+        let resume = async {
+            parked_rx.await.unwrap();
+            resume_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(event, resume)
+        })
+        .await
+        .expect("readv did not cross its retry resource wait");
+        assert_eq!(result.unwrap(), 4);
+        assert_eq!(*guest.polls.lock().unwrap(), [0, 1]);
+        assert_eq!(
+            *guest.provenance.lock().unwrap(),
+            [true, false],
+            "guest-held at the first attempt, replaced before the second"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

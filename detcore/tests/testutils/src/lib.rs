@@ -110,6 +110,9 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        // As `hermit run` prepares it for ptrace
+        // (`hermit::thread_exits_finish_before_the_next_turn`).
+        thread_exits_finish_before_the_next_turn: true,
         annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
@@ -242,6 +245,9 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        // As `hermit run` prepares it for ptrace
+        // (`hermit::thread_exits_finish_before_the_next_turn`).
+        thread_exits_finish_before_the_next_turn: true,
         annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
@@ -374,6 +380,9 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        // As `hermit run` prepares it for ptrace
+        // (`hermit::thread_exits_finish_before_the_next_turn`).
+        thread_exits_finish_before_the_next_turn: true,
         annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),

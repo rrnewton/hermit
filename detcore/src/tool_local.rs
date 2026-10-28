@@ -6671,6 +6671,7 @@ impl<T> ThreadState<T> {
             polls_a_named_fifo: false,
             relies_on_guest_held_marks: false,
             passes_descriptors_out: false,
+            waits_on_guest_held_only: false,
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
             upgraded_from_attempt: 0,

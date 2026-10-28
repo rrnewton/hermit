@@ -554,6 +554,19 @@ struct PriorityCheckin<'a> {
     site: preemptions::callback_history::Site,
 }
 
+/// Whether a delivery whose default action ends its process records the doom
+/// with the scheduler (`GlobalRequest::RecordFatalSignal`), in the delivery's
+/// committed turn: under `--pipe-wake-latency` for the hand-off
+/// (`scheduler::pipe_wake`), and outside record/replay for the poll
+/// upgrade's count (`Scheduler::a_committed_doom_is_outstanding`), on a
+/// path that may file scheduler requests. A two-phase commit files none
+/// (`two_phase_refusal`), which `--pipe-wake-latency` refuses anyway; a
+/// fatal delivery there goes on to `Tool::exit_for_predicted_death`, whose
+/// group Exit grant records the doom instead.
+pub(crate) fn records_fatal_doom(cfg: &Config, may_file_requests: bool) -> bool {
+    cfg.pipe_wake_latency_in_effect().is_some() || (may_file_requests && !cfg.recordreplay_modes)
+}
+
 /// Why this configuration cannot keep the two-phase delivery protocol
 /// (`Tool::announce_signal_event`), if it cannot: a part of the commit would
 /// file a scheduler request, or would read what only exists after the
@@ -1884,7 +1897,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let turn = self
             .inbound_turn(guest, signal, stop, TurnScope::Delivery)
             .await;
-        self.inbound_delivered(guest, signal, turn, timer_entry)
+        self.inbound_delivered(guest, signal, turn, timer_entry, true)
             .await
     }
 
@@ -2224,6 +2237,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         signal: SigWrapper,
         turn: tool_local::InboundTurn,
         timer_entry: bool,
+        may_file_requests: bool,
     ) -> Result<Option<SigWrapper>, Errno> {
         let tool_local::InboundTurn {
             dettid,
@@ -2231,19 +2245,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             boundary_token,
         } = turn;
         // A delivery that ends the process is committed in this turn
-        // (`Scheduler::commit_fatal_delivery`). Under `--pipe-wake-latency`
-        // or `--virtual-timeout` the doom feeds the hand-off scan
-        // (`scheduler::pipe_wake`) and the bound (`thread_is_doomed`). Where the
-        // kernel's signal state is the guest's own (ptrace), the process's
-        // other threads also leave the scheduler now, as Linux kills them at
-        // this delivery, instead of at their host-timed exit reports. That
-        // needs the kernel to carry out the default action when it resumes
-        // this thread, as its signal state says now: the signal is unblocked
+        // (`Scheduler::commit_fatal_delivery`), which records its doom: for
+        // the hand-off scan under `--pipe-wake-latency`
+        // (`scheduler::pipe_wake`), for the bound under `--virtual-timeout`
+        // (`thread_is_doomed`), and outside record/replay for the poll
+        // upgrade's count (`records_fatal_doom`,
+        // `Scheduler::a_committed_doom_is_outstanding`). Where the kernel's
+        // signal state is the guest's own (ptrace), the process's other
+        // threads also leave the scheduler now, as Linux kills them at this
+        // delivery, instead of at their host-timed exit reports. That needs
+        // the kernel to carry out the default action when it resumes this
+        // thread, as its signal state says now: the signal is unblocked
         // (`ptrace_signal` requeues a blocked one) and no gdbserver client
         // can change or cancel it at the resume.
         let may_retire_others = crate::syscalls::retires_others_at_fatal_delivery(&self.cfg);
         let retired_the_others = (may_retire_others
-            || self.cfg.pipe_wake_latency_in_effect().is_some()
+            || records_fatal_doom(&self.cfg, may_file_requests)
             || self.cfg.virtual_timeout.is_some())
             && match crate::syscalls::fatal_default_delivery(guest, signal.raw(), may_retire_others)
             {
@@ -4528,7 +4545,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             mycount,
             boundary_token,
         };
-        self.inbound_delivered(guest, signal, turn, timer_entry)
+        self.inbound_delivered(guest, signal, turn, timer_entry, false)
             .await?;
         if guest.thread_state().scheduler_grants != grants {
             warn!(

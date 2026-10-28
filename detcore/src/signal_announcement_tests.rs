@@ -650,3 +650,44 @@ async fn under_the_gate_an_announcement_for_a_pid_namespace_init_is_refused_befo
     };
     assert_eq!(now, previous, "the test leaves the action it found");
 }
+
+/// A delivery whose default action ends its process records its doom with
+/// the scheduler outside record/replay wherever the delivery may file a
+/// scheduler request, and under `--pipe-wake-latency` always, so that the
+/// poll upgrade's count stops until the reap
+/// (`Scheduler::a_committed_doom_is_outstanding`, Claude review of
+/// https://github.com/rrnewton/hermit/pull/4892). A two-phase commit files
+/// none, and record/replay keeps main's schedule.
+#[test]
+fn a_fatal_delivery_records_its_doom_outside_record_replay() {
+    let plain = Config {
+        sequentialize_threads: true,
+        ..Config::default()
+    };
+    assert!(super::records_fatal_doom(&plain, true), "a ptrace delivery");
+    assert!(
+        !super::records_fatal_doom(&plain, false),
+        "a two-phase commit"
+    );
+    let recording = Config {
+        recordreplay_modes: true,
+        ..plain.clone()
+    };
+    assert!(
+        !super::records_fatal_doom(&recording, true),
+        "record/replay"
+    );
+    let pipe_wake = Config {
+        pipe_wake_latency: Some(1_000),
+        ..plain
+    };
+    assert!(pipe_wake.pipe_wake_latency_in_effect().is_some());
+    assert!(
+        super::records_fatal_doom(&pipe_wake, true),
+        "pipe-wake latency"
+    );
+    assert!(
+        super::records_fatal_doom(&pipe_wake, false),
+        "pipe-wake latency, which refuses two-phase delivery"
+    );
+}

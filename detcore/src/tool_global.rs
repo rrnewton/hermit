@@ -6071,6 +6071,7 @@ impl GlobalState {
                     polls_a_named_fifo: false,
                     relies_on_guest_held_marks: false,
                     passes_descriptors_out: false,
+                    waits_on_guest_held_only: false,
                     waits_until_nothing_else_can_run: false,
                     previous_attempt_made_progress: false,
                     upgraded_from_attempt: 0,
@@ -16652,6 +16653,48 @@ mod tests {
     /// sender makes in its turn: a process named by `kill`, and a SIGKILL with
     /// no named victim; another signal records nothing
     /// (https://github.com/rrnewton/hermit/issues/3904).
+    /// A fatal default-action delivery's `RecordFatalSignal` stops the poll
+    /// upgrade's count until the reap in every mode outside record/replay,
+    /// and dooms the process for the hand-off only under
+    /// `--pipe-wake-latency` (`Scheduler::note_fatal_signal_delivery`,
+    /// `Scheduler::record_committed_fatal_signal`; Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4892).
+    #[tokio::test]
+    async fn a_fatal_delivery_stops_the_poll_upgrade_count_until_the_reap() {
+        let plain = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let mut pipe_wake = plain.clone();
+        pipe_wake.pipe_wake_latency = Some(1_000);
+        for (config, hand_off) in [(plain, false), (pipe_wake, true)] {
+            let (config, state, dettid, detpid) = cancellation_test_state_with_config(config);
+            assert_eq!(
+                state.sched.lock().unwrap().fatal_doom_recorded(detpid),
+                (false, false, false)
+            );
+            assert_eq!(
+                state
+                    .receive_rpc(
+                        reverie::Tid::from_raw(dettid.as_raw()),
+                        (
+                            DetTime::new(&config),
+                            MmId::initial(detpid),
+                            GlobalRequest::RecordFatalSignal,
+                        ),
+                    )
+                    .await
+                    .1,
+                GlobalResponse::RecordFatalSignal(())
+            );
+            assert_eq!(
+                state.sched.lock().unwrap().fatal_doom_recorded(detpid),
+                (true, true, hand_off),
+                "pipe-wake latency {hand_off}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn sigkill_notifications_record_the_doomed_process() {
         let (config, state, dettid, detpid) = cancellation_test_state();

@@ -2927,6 +2927,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut published = PublishedWaitMask::default();
         publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
         let result = loop {
+            // Provenance as it is now (`Resources::waits_on_guest_held_only`).
+            rsrc.waits_on_guest_held_only = poll_targets_guest_held(
+                guest,
+                probe.fds().map(|fds| fds.as_raw()),
+                probe.nfds() as usize,
+            );
             resource_request(guest, rsrc.clone()).await;
             // Virtual timerfds first (`crate::syscalls::timerfd`), in the
             // staged cells' scratch while they hold the stack.
