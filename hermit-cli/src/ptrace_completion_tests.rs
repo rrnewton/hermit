@@ -428,23 +428,32 @@ fn a_masked_ns_directory_is_not_read_as_a_kernel_without_pid_namespaces() {
                         std::ptr::null(),
                     )
                 };
+                if result == 0 {
+                    return true;
+                }
+                let error = std::io::Error::last_os_error();
+                // A host whose user namespaces may not mount over procfs
+                // cannot mask the entry this way either.
                 assert_eq!(
-                    result,
-                    0,
-                    "mount over {ns:?}: {}",
-                    std::io::Error::last_os_error()
+                    error.raw_os_error(),
+                    Some(libc::EPERM),
+                    "mount over {ns:?}: {error}"
                 );
+                false
             };
             let unmount = || {
                 assert_eq!(unsafe { libc::umount2(ns.as_ptr(), libc::MNT_DETACH) }, 0);
             };
-            mount(c"tmpfs", Some(c"tmpfs"), 0);
+            if !mount(c"tmpfs", Some(c"tmpfs"), 0) {
+                eprintln!("SKIPPED: this host refuses mounts over procfs in a user namespace");
+                return;
+            }
             assert!(
                 open_pid_namespace().is_err(),
                 "a tmpfs over the ns directory"
             );
             unmount();
-            mount(&fdinfo, None, libc::MS_BIND);
+            assert!(mount(&fdinfo, None, libc::MS_BIND));
             assert!(
                 open_pid_namespace().is_err(),
                 "a procfs directory with no mnt entry over the ns directory"
