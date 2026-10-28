@@ -1192,7 +1192,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (finished threads keep sparse histograms): 1867, listed.
     // --virtual-cpus: config's virtual_cpus_never_enter_the_legacy_form and
     // virtual_cpus_parse_from_1_to_128: 1882.
-    ("test.regular_crates", 1882),
+    // And hermit-verify's split_branches
+    // a_split_timer_stop_keeps_its_rip_on_the_second_half: 1883, listed.
+    ("test.regular_crates", 1883),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5896,7 +5898,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same detcore-dbt fingerprint test: 1852, listed.
     // And the same finished-thread sparse histogram unit: 1853, listed.
     // The same two --virtual-cpus config tests: 1868.
-    ("test.regular_crates_on_host", 1868),
+    // And the same split_branches unit: 1869, listed.
+    ("test.regular_crates_on_host", 1869),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
