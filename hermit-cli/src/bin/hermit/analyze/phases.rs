@@ -58,6 +58,17 @@ fn yellow_msg(msg: &str) {
     eprintln!(":: {}", msg.yellow().bold());
 }
 
+fn prefix_report_banner(report: &Report) -> String {
+    let mut banner =
+        "\n------------------------------ hermit analyze report ------------------------------"
+            .to_owned();
+    if let Some(warning) = &report.branch_counter_warning {
+        banner.push('\n');
+        banner.push_str(warning);
+    }
+    banner
+}
+
 /// What stack1 and stack2 of a `--prefix-search` report are, given the
 /// thread the target schedule runs at the deciding event (`chosen`) and the
 /// one the scheduler runs there without that event (`instead`, `None` when
@@ -497,32 +508,42 @@ impl AnalyzeOpts {
             );
         }
 
+        let report = self.prefix_report(
+            schedule.schedevents(),
+            decision,
+            &continued,
+            [chosen, instead],
+        );
+        println!("{}", prefix_report_banner(&report));
+        println!("{}", report.header);
+        Self::print_stack("stack1", &report.critical_event1.stack);
+        Self::print_stack("stack2", &report.critical_event2.stack);
+        println!("\n{}", report.additional_context);
+        Ok(report)
+    }
+
+    /// Assemble the prefix report from the search and stack-trace results.
+    fn prefix_report(
+        &self,
+        schedule: &[SchedEvent],
+        decision: usize,
+        continued: &[SchedEvent],
+        [chosen, instead]: [Option<PrettyBacktrace>; 2],
+    ) -> Report {
         let mut header = format!(
             "The scheduling decision at event #{decision} of the target schedule decides the \
              outcome.\nReplaying the first {decision} events and then scheduling without chaos \
              does not meet the target criteria; replaying event #{decision} too ({}) does ({}).\n",
-            schedule.schedevents()[decision],
+            schedule[decision],
             self.display_criteria()
         );
         header.push_str(&stack_pair_sentences(
-            schedule.schedevents()[decision].dettid,
+            schedule[decision].dettid,
             continued.get(decision).map(|event| event.dettid),
         ));
-        let context = Self::generate_context(
-            schedule.schedevents(),
-            decision.max(1),
-            self.execution_context,
-        );
+        let context = Self::generate_context(schedule, decision.max(1), self.execution_context);
 
-        println!(
-            "\n------------------------------ hermit analyze report ------------------------------"
-        );
-        println!("{}", header);
-        Self::print_stack("stack1", &chosen);
-        Self::print_stack("stack2", &instead);
-        println!("\n{}", context);
-
-        Ok(Report {
+        Report {
             header,
             additional_context: context,
             baseline_run: false,
@@ -534,7 +555,8 @@ impl AnalyzeOpts {
                 event_index: decision,
                 stack: instead,
             },
-        })
+            branch_counter_warning: self.branch_counter_warning.clone(),
+        }
     }
 
     /// It's weird if no filter is specified.
@@ -1598,6 +1620,49 @@ mod tests {
                 .load_all()
                 .validate()
                 .unwrap();
+        }
+    }
+
+    /// The final prefix report repeats the trial's counter caveat in its
+    /// JSON and immediately below its banner, and omits it for exact counters.
+    #[test]
+    fn a_prefix_report_keeps_the_branch_counter_caveat_in_json_and_under_its_banner() {
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", "--prefix-search", "--", "/bin/true"]).unwrap();
+        let schedule = vec![SchedEvent::branches(
+            detcore::types::DetTid::from_raw(3),
+            10,
+        )];
+        for inexact in [false, true] {
+            options.inexact_branch_counter = if inexact {
+                || Some("SpecLockMap is enabled".to_owned())
+            } else {
+                || None
+            };
+            let mut warnings = Vec::new();
+            options
+                .admit_branch_counter(&mut |line| warnings.push(line.to_owned()))
+                .unwrap();
+            assert_eq!(warnings.len(), usize::from(inexact));
+            let expected = warnings.first().map(|line| line.trim_end());
+            let report = options.prefix_report(&schedule, 0, &schedule, [None, None]);
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(
+                json.get("branch_counter_warning")
+                    .and_then(|value| value.as_str()),
+                expected
+            );
+            let banner = prefix_report_banner(&report);
+            let mut lines = banner.lines();
+            assert_eq!(lines.next(), Some(""));
+            assert_eq!(
+                lines.next(),
+                Some(
+                    "------------------------------ hermit analyze report ------------------------------"
+                )
+            );
+            assert_eq!(lines.next(), expected);
+            assert_eq!(lines.next(), None);
         }
     }
 

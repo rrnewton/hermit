@@ -220,6 +220,14 @@ fn run_analyze(
         warnings.first().copied(),
         "{label}: {report}\n{combined}"
     );
+    if let Some(warning) = warnings.first() {
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!(
+                "------------------------------ hermit analyze report ------------------------------\n{warning}\n"
+            )),
+            "{label}: the report banner must be followed by its branch-counter caveat\n{combined}"
+        );
+    }
     let report = fs::read_to_string(&report_file)
         .unwrap_or_else(|error| panic!("{label}: no report file: {error}\n{combined}"));
     serde_json::from_str(&report)

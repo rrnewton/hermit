@@ -186,7 +186,11 @@ impl PreemptionRecord {
             epoch,
             pipe_wake_latency,
             signal_state_copy,
+            cap_preemption_charge,
             callback_checkpoints,
+            rng_seed,
+            expired_wait_runs_charged_once,
+            host_inputs,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -228,7 +232,11 @@ impl PreemptionRecord {
             epoch: *epoch,
             pipe_wake_latency: *pipe_wake_latency,
             signal_state_copy: *signal_state_copy,
+            cap_preemption_charge: *cap_preemption_charge,
             callback_checkpoints,
+            rng_seed: *rng_seed,
+            expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
+            host_inputs: host_inputs.clone(),
         }
     }
 
@@ -1333,6 +1341,51 @@ mod tests {
 
         pr_with_latest_removed.validate().unwrap();
         self::assert_eq!(pr_with_latest_removed, expected_pr);
+    }
+
+    /// Prefix trials must keep the recording's replay settings and host
+    /// inputs even when none, or only some, of its events are replayed.
+    #[test]
+    fn a_schedule_prefix_keeps_the_recorded_replay_settings_and_host_inputs() {
+        use detcore_model::host_input::HostFileIdentity;
+        use detcore_model::host_input::HostInput;
+
+        let tid = DetTid::from_raw(3);
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_cap_preemption_charge(true)
+        .with_expired_wait_runs_charged_once(true);
+        record.rng_seed = Some(1234567);
+        record.host_inputs = Some(HostInputSet {
+            digest: "ab".repeat(32),
+            files: vec![HostInput {
+                path: "/recorded/input".to_owned(),
+                identity: HostFileIdentity {
+                    dev: 2,
+                    ino: 3,
+                    size: 4,
+                    mtime_sec: 5,
+                    mtime_nsec: 6,
+                },
+                content: Some("cd".repeat(32)),
+            }],
+        });
+        for len in [0, 1, 2, 9] {
+            let prefix = record.schedule_prefix(len);
+            assert_eq!(prefix.global, record.global[..len.min(record.global.len())]);
+            assert_eq!(
+                (
+                    prefix.cap_preemption_charge,
+                    prefix.rng_seed,
+                    prefix.expired_wait_runs_charged_once,
+                    &prefix.host_inputs,
+                ),
+                (true, Some(1234567), true, &record.host_inputs),
+                "prefix of {len} events"
+            );
+        }
     }
 
     /// A replay of a schedule's first events keeps the callback checkpoints
