@@ -338,6 +338,14 @@ fn config(path: &Path) -> Result<Config> {
 }
 
 fn reserve(config: &Config, bytes: usize) -> Result<()> {
+    reserve_with_sync(config, bytes, File::sync_data)
+}
+
+fn reserve_with_sync(
+    config: &Config,
+    bytes: usize,
+    sync_data: impl FnOnce(&File) -> std::io::Result<()>,
+) -> Result<()> {
     let mut quota = OpenOptions::new()
         .read(true)
         .write(true)
@@ -372,8 +380,16 @@ fn reserve(config: &Config, bytes: usize) -> Result<()> {
     counters[8..].copy_from_slice(&(count + 1).to_le_bytes());
     quota.seek(SeekFrom::Start(0))?;
     quota.write_all(&counters)?;
-    quota.sync_data()?;
-    // Dropping the exact descriptor releases its advisory lock on every path.
+    // Serialize the complete monotonic counter write, but do not keep other
+    // reservations waiting on storage flush latency. No capture may be
+    // published until this reservation (or a later larger value) is synced.
+    if unsafe { libc::flock(quota.as_raw_fd(), libc::LOCK_UN) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot release bounded capture quota");
+    }
+    sync_data(&quota)?;
+    // A failed flush consumes the reservation without publishing a capture.
+    // Dropping this exact descriptor still releases the lock on error paths.
     Ok(())
 }
 
@@ -798,6 +814,138 @@ pub fn bundle(config_path: &Path) -> Result<Bundle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct QuotaFixture {
+        root: PathBuf,
+        config: Config,
+    }
+
+    impl QuotaFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "hermit-rustc-quota-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let path = prepare(&root.join("capture"), &root.join("target")).unwrap();
+            let config = config(&path).unwrap();
+            Self { root, config }
+        }
+
+        fn counters(&self) -> [u64; 2] {
+            let bytes = std::fs::read(self.config.directory.join("quota")).unwrap();
+            assert_eq!(bytes.len(), 16);
+            [
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            ]
+        }
+
+        fn set_counters(&self, bytes: u64, commands: u64) {
+            let mut quota = OpenOptions::new()
+                .write(true)
+                .open(self.config.directory.join("quota"))
+                .unwrap();
+            quota.write_all(&bytes.to_le_bytes()).unwrap();
+            quota.write_all(&commands.to_le_bytes()).unwrap();
+            quota.sync_data().unwrap();
+        }
+    }
+
+    impl Drop for QuotaFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn quota_reservation_progresses_while_another_checked_flush_is_held() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+
+        let fixture = QuotaFixture::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_returned = Arc::new(AtomicBool::new(false));
+        let observed_return = Arc::clone(&first_returned);
+        let first_config = fixture.config.clone();
+        let first = std::thread::spawn(move || {
+            let result = reserve_with_sync(&first_config, 101, |quota| {
+                entered_tx.send(()).map_err(std::io::Error::other)?;
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map_err(std::io::Error::other)?;
+                quota.sync_data()
+            });
+            observed_return.store(true, Ordering::SeqCst);
+            result
+        });
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        if let Err(error) = entered {
+            let _ = release_tx.send(());
+            let result = first.join().unwrap();
+            panic!("first reservation did not reach its flush: {error}; {result:?}");
+        }
+
+        let (second_tx, second_rx) = mpsc::channel();
+        let second_config = fixture.config.clone();
+        let second = std::thread::spawn(move || {
+            let result = reserve(&second_config, 203);
+            let _ = second_tx.send(result);
+        });
+        let second_result = second_rx.recv_timeout(Duration::from_secs(5));
+        let returned_before_release = first_returned.load(Ordering::SeqCst);
+        let _ = release_tx.send(());
+        let first_result = first.join().unwrap();
+        second.join().unwrap();
+
+        assert!(
+            !returned_before_release,
+            "reservation returned before checked flush"
+        );
+        second_result
+            .expect("second real reservation must finish while the first flush is held")
+            .expect("second real reservation must retain the unchanged acquisition bound");
+        first_result.expect("first checked flush must complete before reserve returns");
+        assert_eq!(fixture.counters(), [304, 2]);
+    }
+
+    #[test]
+    fn quota_refuses_existing_limits_and_keeps_failed_flush_reserved() {
+        let fixture = QuotaFixture::new();
+        fixture.set_counters(MAX_CAPTURE_BYTES as u64 - 1, 0);
+        reserve(&fixture.config, 1).unwrap();
+        assert_eq!(fixture.counters(), [MAX_CAPTURE_BYTES as u64, 1]);
+        let error = reserve(&fixture.config, 1).unwrap_err();
+        assert!(error.to_string().contains("finite byte/command bound"));
+        assert_eq!(fixture.counters(), [MAX_CAPTURE_BYTES as u64, 1]);
+
+        fixture.set_counters(0, MAX_COMMANDS as u64 - 1);
+        reserve(&fixture.config, 1).unwrap();
+        assert_eq!(fixture.counters(), [1, MAX_COMMANDS as u64]);
+        let error = reserve(&fixture.config, 0).unwrap_err();
+        assert!(error.to_string().contains("finite byte/command bound"));
+        assert_eq!(fixture.counters(), [1, MAX_COMMANDS as u64]);
+
+        fixture.set_counters(u64::MAX, 0);
+        let error = reserve(&fixture.config, 1).unwrap_err();
+        assert!(error.to_string().contains("capture quota overflow"));
+        assert_eq!(fixture.counters(), [u64::MAX, 0]);
+
+        fixture.set_counters(0, 0);
+        let error = reserve_with_sync(&fixture.config, 17, |_| {
+            Err(std::io::Error::other("deliberate quota flush refusal"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("deliberate quota flush refusal"));
+        assert_eq!(fixture.counters(), [17, 1]);
+    }
 
     #[test]
     fn compiler_stdin_replay_is_exact_and_sealed() {
