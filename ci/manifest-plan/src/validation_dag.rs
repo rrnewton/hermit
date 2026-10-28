@@ -5251,7 +5251,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     attach_result_ownership(&mut refreshed, &cells);
     assert_invariants(&refreshed, &cells)?;
     for step in &refreshed.steps {
-        for result in step.effective_result_manifests() {
+        for result in step.effective_result_manifests().iter() {
             if let ResultManifest::ManifestCell(cell) = result {
                 if matches!(cell.backend.as_deref(), Some("dbt" | "sabre")) {
                     return Err(format!(

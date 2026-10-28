@@ -168,7 +168,7 @@ pub fn assert_producer_resources(
     let actual = serde_json::json!({"timeout": step.timeout, "cpu_timeout": step.cpu_timeout,
         "resources": step.hint.resources, "est_duration_s": step.hint.est_duration_s,
         "rss_baseline_bytes": step.hint.rss_baseline_bytes, "rss_baseline_inner_jobs": step.hint.rss_baseline_inner_jobs,
-        "hard_mem_max_bytes": step.hint.hard_mem_max_bytes, "classification": step.hint.classification,
+        "hard_mem_max_bytes": step.hint.hard_mem_max_bytes, "classification": step.hint.classification.value(),
         "preferred_inner_jobs": step.hint.preferred_inner_jobs, "measured_effective_cores": step.hint.measured_effective_cores,
         "measured_cpu_utilization": step.hint.measured_cpu_utilization, "jobs_flag": step.jobs_flag, "jobs_env": step.jobs_env});
     if &actual != expected {
@@ -384,7 +384,7 @@ pub fn select_core(cfg: &mut dagrun::model::DagConfig) -> Result<(), String> {
         {
             return Err(format!("core command still owns an external recipe: {tag}"));
         }
-        for result in step.effective_result_manifests() {
+        for result in step.effective_result_manifests().iter() {
             if let ResultManifest::ManifestCell(cell) = result {
                 if matches!(cell.backend.as_deref(), Some("dbt" | "sabre")) {
                     return Err(format!("core source still claims external cell: {tag}"));
