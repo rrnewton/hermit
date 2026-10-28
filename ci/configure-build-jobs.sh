@@ -3017,8 +3017,18 @@ fi
 # The artifact source catalog only updates its existing root Cargo.toml tuple
 # for the Counter1 fixture exclusion (73 rows). DBT inventory is now 1038.
 # This carries SDK cost only, not native byte equivalence or cold-build timing.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 272411f47319bb0b47c57f560cb7e0d2e19eccb4 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 272411f47319bb0b47c57f560cb7e0d2e19eccb4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# BUDGET TO 39a18b9cb8462b8d31ab48f0af3ce34f3d92bf78: from 272411f47319bb0b47c57f560cb7e0d2e19eccb4.
+# The explicit executable frontend and attested drrun digest change build.rs
+# and the vendored frontend; this is not an SDK byte-equality carry. The new
+# SDK recipe 2047197043f8f22b7be0ad1ecfbf80876f9b5ab075f2d819c4b748093e45f410
+# completed its source build in 56.55 seconds at two jobs (113.10 job-seconds)
+# in the bounded Reverie gc1319 sample. This does not recalibrate hosted-runner
+# budgets or prove Hermit native behavior; numeric limits and job width stay.
+# Four test files move without changing the 1038-file source inventory. The
+# source catalog remains 73 rows (74 with its qualifier); no Tool code changes.
+# H env-shebang preprocessing is a separate follow-up, not covered by this pin.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 39a18b9cb8462b8d31ab48f0af3ce34f3d92bf78 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 39a18b9cb8462b8d31ab48f0af3ce34f3d92bf78 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
