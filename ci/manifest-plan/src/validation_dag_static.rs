@@ -3256,7 +3256,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3096.
     // And a_jump_past_its_records_stream_is_refused and
     // a_boundary_recordings_jumps_lie_within_its_records: 3098.
-    ("test.detcore_unit", 3098),
+    // And this change's two unit tests: 2758.
+    ("test.detcore_unit", 3100),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5722,7 +5723,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two units from the port onto #4892: 3095, listed.
     // And the same driven-against-legacy unit: 3096.
     // And the same two position units: 3098.
-    ("test.detcore_unit_on_host", 3098),
+    // And the same tests: 2758.
+    ("test.detcore_unit_on_host", 3100),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
