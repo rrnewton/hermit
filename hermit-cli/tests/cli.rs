@@ -10557,7 +10557,7 @@ fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
 /// before its task exists, even where Linux would refuse it too: a raw clone
 /// with exit signal 65, which clone accepts and clone3 does not (also with
 /// `CLONE_VFORK`, whose host ID a default run reports before the call); a
-/// clone3 whose struct clone_args Detcore cannot read (on a page mapped
+/// clone3 whose `set_tid` array Detcore cannot read (on a page mapped
 /// writable, not readable), which the kernel reads all the same; one with new
 /// stack pointer 1, which clone3 cannot express; and a fork by a task inside
 /// a PID namespace the guest made (a `CLONE_NEWPID` child), whose new task's
@@ -10567,23 +10567,15 @@ fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
 /// kinds of run by the refusal of `set_tid` in a nested namespace (#4155). A
 /// guest cannot reach the seccomp class, nor make a PID namespace for its
 /// children other than with `CLONE_NEWPID`: Detcore refuses seccomp with
-/// ENOSYS, and unshare and setns with EPERM.
+/// ENOSYS, and unshare and setns with EPERM. A clone3 whose struct
+/// clone_args itself Detcore cannot read is refused by name in every kind of
+/// run, since it could carry a `set_tid` Detcore cannot check (#4370).
 #[test]
 fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
     let newpid_child = "newpid child: own ID 1\n";
     for (call, reason, before) in [
         ("signal65", "its exit signal 65 is not a signal number", ""),
         ("vfork65", "its exit signal 65 is not a signal number", ""),
-        (
-            "wronly-args",
-            "Detcore could not read its struct clone_args",
-            "",
-        ),
-        (
-            "wronly-vfork",
-            "Detcore could not read its struct clone_args",
-            "",
-        ),
         ("sp1", "its new stack pointer 0x1 has no clone3 form", ""),
         (
             "newpid-fork",
@@ -10630,29 +10622,38 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         );
     }
     // A struct the kernel reads but Detcore cannot (a page mapped writable,
-    // not readable) is issued as made by a default run, its task's host ID
-    // reported (a vfork's before the call).
-    for call in ["wronly-args", "wronly-vfork"] {
-        let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &[call]);
-        assert_success(&tolerant, &[call]);
-        assert!(
-            stdout(&tolerant).starts_with(&format!("clone3 {call}: child "))
-                && stderr(&tolerant).contains("1 task(s) got a host ID instead")
-                && (call != "wronly-vfork"
-                    || stderr(&tolerant).contains("reported before the call")),
-            "{call}: stdout:\n{}\nstderr:\n{}",
-            stdout(&tolerant),
-            stderr(&tolerant)
-        );
-    }
-    // The same for a set_tid array on such a page, and for both when the
-    // thread group's leader has exited (its maps are then empty, so a
-    // thread's own are read).
+    // not readable), which could carry a set_tid Detcore cannot check
+    // against the run's earlier tasks, is refused by name in every kind of
+    // run, also when the thread group's leader has exited (its maps are then
+    // empty, so a thread's own are read).
     for call in [
-        &["wronly-tid"][..],
+        &["wronly-args"][..],
+        &["wronly-vfork"],
         &["leader-gone", "wronly-args"],
-        &["leader-gone", "wronly-tid"],
     ] {
+        for base in ["--pid-base=5000", "--summary"] {
+            let refused = no_namespace_in_own_pid_namespace(&[base], call);
+            assert_eq!(
+                refused.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{base} {call:?}: stdout:\n{}\nstderr:\n{}",
+                stdout(&refused),
+                stderr(&refused)
+            );
+            assert!(
+                stderr(&refused)
+                    .contains("struct clone_args cannot be read with the guest's own access")
+                    && stdout(&refused).is_empty(),
+                "{base} {call:?}: {}",
+                stderr(&refused)
+            );
+        }
+    }
+    // A set_tid array on such a page (a CLONE_NEWPID one, naming no ID in
+    // Hermit's namespace) cannot carry a chosen ID: refused by an explicit
+    // base, issued as made with its host ID reported by default, also after
+    // the leader exited.
+    for call in [&["wronly-tid"][..], &["leader-gone", "wronly-tid"]] {
         let refused = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], call);
         assert_eq!(
             refused.status.code(),
@@ -10662,7 +10663,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
             stderr(&refused)
         );
         assert!(
-            stderr(&refused).contains("Detcore could not read its"),
+            stderr(&refused).contains("Detcore could not read its set_tid array"),
             "{call:?}: {}",
             stderr(&refused)
         );
@@ -41822,7 +41823,8 @@ fn a_namespace_only_run_on_a_terminal_keeps_its_terminal_behaviour() {
 /// policy exit 122, or, with --allow-unsupported-syscalls, the call fails with
 /// EEXIST (also for a one-entry array at a page's end before an unmapped
 /// page, or at an unaligned address). An array on a page mapped writable but
-/// not readable, which Detcore cannot check, is refused by name, or fails
+/// not readable, or a struct clone_args there, which Detcore cannot check,
+/// is refused by name, or fails
 /// with EFAULT under --allow-unsupported-syscalls. The pid of the caller's
 /// own zombie child, a `set_tid` array the
 /// kernel cannot read, one it rejects, and a caller without the capability to
@@ -41905,15 +41907,26 @@ fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
     // An array on a page mapped writable but not readable, which the kernel
     // reads but Detcore cannot check, is refused by name; with
     // --allow-unsupported-syscalls the call fails with EFAULT.
-    let (code, stdout, log, _) = run(&["--strict"], "wronly");
-    assert_eq!(code, Some(122), "wronly: {stdout}\n{log}");
-    assert!(
-        log.contains("clone3 set_tid's array cannot be read with the guest's own access"),
-        "wronly: the refusal must say why:\n{log}"
-    );
-    let (code, stdout, log, _) = run(&["--allow-unsupported-syscalls"], "wronly");
-    assert_eq!(code, Some(1), "wronly: {stdout}\n{log}");
-    assert!(log.contains("clone3: Bad address"), "wronly: {log}");
+    for (mode, what) in [
+        (
+            "wronly",
+            "clone3 set_tid's array cannot be read with the guest's own access",
+        ),
+        (
+            "wronlyargs",
+            "clone3's struct clone_args cannot be read with the guest's own access",
+        ),
+    ] {
+        let (code, stdout, log, _) = run(&["--strict"], mode);
+        assert_eq!(code, Some(122), "{mode}: {stdout}\n{log}");
+        assert!(
+            log.contains(what),
+            "{mode}: the refusal must say why:\n{log}"
+        );
+        let (code, stdout, log, _) = run(&["--allow-unsupported-syscalls"], mode);
+        assert_eq!(code, Some(1), "{mode}: {stdout}\n{log}");
+        assert!(log.contains("clone3: Bad address"), "{mode}: {log}");
+    }
     let (code, stdout, log, parity) = run(&["--strict", "--verify", "--verify-strict"], "fresh");
     assert_eq!(code, Some(0), "fresh: {stdout}\n{log}");
     assert_eq!(stdout, "got the requested pid: 1\n", "fresh: {log}");
