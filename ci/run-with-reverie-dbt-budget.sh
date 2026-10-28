@@ -3109,7 +3109,17 @@ fi
 # src/launcher/tests without changing the 1038-file inventory, and the
 # LiteInst source catalog stays 73 rows. This is not native byte
 # equivalence or proof of Hermit native behavior.
-expected_pin=a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b
+# CARRY TO 688a542d75af8310c4ddd97eadbf2434abb067ff (2026-10-28): from
+# a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b. One commit, 688a542d, reverts the
+# dbt lane's executable selection (44f1f4f5, a4a654ac): its attested-frontend
+# refusal failed four Hermit DBT tests. Its tree is the T1c tree e7847776, so
+# the SDK inputs return to the e9c54de9 objects:
+#     reverie-dbt/vendor/dynamorio  2cc9d19b9a35 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          3f2abba1b74a -> ff1eeb32b140
+# and reverie-dbt/native stays c1f267db81c8. The calibrated SDK budget, job
+# width and limits carry unchanged from the e9c54de9 entry; inventory stays
+# 1038 and the LiteInst source catalog 73 rows.
+expected_pin=688a542d75af8310c4ddd97eadbf2434abb067ff
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
