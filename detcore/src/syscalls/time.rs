@@ -1116,7 +1116,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         trace!("Not sequentializing threads, letting nanosleep through...");
         if call.flags() & libc::TIMER_ABSTIME == 0 {
-            return Ok(guest.inject(Syscall::from(call)).await?);
+            // A kernel-run relative sleep keeps the kernel's restart
+            // block, as in the handlers this change converted.
+            return crate::syscalls::helpers::inject_keeping_kernel_restart(
+                guest,
+                Syscall::from(call),
+            )
+            .await;
         }
         let mut stack = guest.stack().await;
         let req = stack.push(Timespec {
@@ -1129,7 +1135,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_flags(0)
             .with_req(Some(req))
             .with_rem(None);
-        Ok(guest.inject(relative).await?)
+        // The converted relative sleep keeps the kernel's restart block
+        // too: restarting the absolute call would wait the whole interval
+        // again while logical time stands still.
+        crate::syscalls::helpers::inject_keeping_kernel_restart(guest, relative).await
     }
 
     /// Linux's CPU-clock sleep (`posix_cpu_nsleep`,
