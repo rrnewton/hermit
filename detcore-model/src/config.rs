@@ -665,8 +665,8 @@ pub struct Config {
     /// the scales in it. The draws come from the scheduler seed's chaos stream, so a seed
     /// reproduces them, and a preemption record pins every slice end as usual. Sets the run's
     /// `--max-timeslice` to MAX: requires `--chaos` and PMU-backed preemption, and conflicts
-    /// with an explicit `--max-timeslice` and with `--target-timeslice`. A small MIN makes runs
-    /// slower. Example: `1000..200000000`.
+    /// with an explicit `--max-timeslice`, with `--target-timeslice` and with `hermit run
+    /// --chaos-seeded-timeslice`. A small MIN makes runs slower. Example: `1000..200000000`.
     #[serde(default)]
     #[clap(
         long,
