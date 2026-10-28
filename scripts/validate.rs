@@ -22770,7 +22770,7 @@ fn implied_single_ledger_attempt(gate: &serde_json::Value) -> Option<serde_json:
 ///
 /// Most gates run once, so the list repeated the gate's own fields in about
 /// 36 KB of every validate ledger event
-/// (https://github.com/rrnewton/dev-hermit/issues/540). A retried gate, an
+/// (cut by the ledger slimming change). A retried gate, an
 /// environmental or infrastructure attempt, or any attempt that differs from
 /// the rebuild in one field keeps its list unchanged.
 /// [`ledger_gate_attempts`] reads either form.
@@ -26277,8 +26277,8 @@ fn run_owned_cache_bracket() -> Result<(), String> {
         .map_err(|error| format!("run-owned cache: cannot write probe: {error}"))?;
     // create_safe_cache's fallback is the directory above the OUTERMOST Cargo workspace, so a
     // fixture under a TMPDIR inside a checkout would select a cache beside that checkout:
-    // for a checkout at worktrees/slots/<slot>, worktrees/slots/ignored/validate/cache, shared by
-    // every slot. The self-test must only ever write inside its own fixture.
+    // an ignored/validate/cache directory in the directory that holds the checkout, shared by
+    // every sibling checkout there. The self-test must only ever write inside its own fixture.
     let boundary = cargo_manifest_boundary(&workspace);
     if boundary != workspace {
         return Err(format!(
@@ -33248,7 +33248,8 @@ mod refusal_detail_tests {
 
     /// The real refusal that stranded seven hours of validation on 2026-09-17,
     /// taken verbatim from run 1838's log rather than invented, so the bound
-    /// and the shape are sized against the thing they exist for.
+    /// and the shape are sized against the thing they exist for. Only the
+    /// private workspace prefix of its path is replaced by `<dev-hermit>/`.
     const REAL: &str = include_str!("../tests/fixtures/scorecard-writeback/refusal.txt");
 
     #[test]

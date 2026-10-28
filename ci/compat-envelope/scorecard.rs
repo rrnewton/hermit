@@ -103,7 +103,7 @@ const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_le
 /// and the compatibility website read. See
 /// <https://github.com/rrnewton/hermit/issues/3301>. Version 2 adds each
 /// row's source tree state, and only a run from a clean source tree can be a
-/// headline (<https://github.com/rrnewton/dev-hermit/issues/463>). Version 3
+/// headline (part of <https://github.com/rrnewton/hermit/issues/3301>). Version 3
 /// floors dbt's cells like every other backend's, now that dbt is compared;
 /// the website still reads version 2, whose dbt cells are in no floor.
 /// Version 4 drops the rows a `parity.retraction` withdraws and counts them
@@ -572,9 +572,10 @@ fn default_measurement() -> MeasurementState {
 
 /// The part of a cell's evidence that outlives its capped observations.
 ///
-/// The document keeps only each provenance's LATEST observation (cap 1,
-/// <https://github.com/rrnewton/dev-hermit/issues/563>); the full history lives
-/// in the series and the validation history. Before older observations are
+/// The document keeps only each provenance's LATEST observation (cap 1: the
+/// document holds each cell's latest state, and cut 1.56 GB to about 41 MB on
+/// the ledger of the day it landed); the full history lives in the series and
+/// the validation history. Before older observations are
 /// dropped, what they said is folded in here, so [`derive_measurement`] keeps
 /// its meaning: a cell that ever diverged still reads `diverged`.
 ///
@@ -660,8 +661,8 @@ impl CellAggregate {
 }
 
 /// Keep each cell's latest observation per provenance and comparison domain,
-/// and fold the rest into its [`CellAggregate`] (cap 1,
-/// <https://github.com/rrnewton/dev-hermit/issues/563>).
+/// and fold the rest into its [`CellAggregate`] (cap 1: the document holds each
+/// cell's latest state, and the full history lives in the series).
 ///
 /// The two domains are an observation that carries canonical comparisons and
 /// one that carries none (a below-L2 stripped pass, or a projected series
@@ -889,8 +890,9 @@ impl ObservationProvenance {
 /// `measured-and-passed`, while `measurement_state` requires every row to be
 /// `passed` (series.py:730) and otherwise says `measured-no-verdict`. Until
 /// series.py changes, do not treat its state as a second copy of this one.
-/// Aligning the two definitions is tracked in
-/// <https://github.com/rrnewton/dev-hermit/issues/469>.
+/// The two definitions disagree for a cell with a pass beside a parity
+/// failure; aligning them is undecided, with two options: count a parity
+/// failure as a divergence here too, or stop counting it in series.py.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum MeasurementState {
@@ -7235,7 +7237,7 @@ fn attribute_refused_parity_row(
 
 /// A parity row's source tree state, by the rule of section 7 of the parity
 /// summary format, version 3
-/// (<https://github.com/rrnewton/dev-hermit/issues/463>).
+/// (part of <https://github.com/rrnewton/hermit/issues/3301>).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParityRowTree {
     /// `"source_tree_dirty": false`.
@@ -7289,7 +7291,7 @@ fn with_source_tree_state_added(text: &str) -> Option<String> {
 }
 
 /// Classify one line of the store (section 7 of the parity summary format,
-/// version 3, <https://github.com/rrnewton/dev-hermit/issues/463>):
+/// version 3, part of <https://github.com/rrnewton/hermit/issues/3301>):
 ///
 /// - it passes [`parity_row_check`] with `"source_tree_dirty": false`: clean;
 /// - it passes with `true`: dirty;
@@ -7435,7 +7437,7 @@ impl ParityRunAccumulator {
 /// ([`classify_parity_row`]), by the rule of section 7 of the parity summary
 /// format, version 3 (sha256
 /// 2cf28f143ff8d4a45b8cfc4d69b6fcb35454a8a8f61501c0d9babf0bb8bfb6f8,
-/// <https://github.com/rrnewton/dev-hermit/issues/463>). The rule is stated
+/// part of <https://github.com/rrnewton/hermit/issues/3301>). The rule is stated
 /// per row, because the value is stored on each row and the summary reads
 /// only rows: `source_tree_dirty_rows` and `source_tree_unreported_rows`
 /// count every classified line, duplicates and rows a conflicting commit
@@ -7865,7 +7867,7 @@ Credit pools clean credit (inputs equalized) with unequalized credit only under 
     // Each producer with runs in the store leads with its headline, which is
     // always a run from a clean source tree, or says that it has none
     // (section 7 of the parity summary format, version 3,
-    // https://github.com/rrnewton/dev-hermit/issues/463).
+    // part of https://github.com/rrnewton/hermit/issues/3301).
     let producers_with_runs = summary
         .runs
         .iter()
@@ -9762,8 +9764,8 @@ fn render_provenance_disagreements(tracked: &TrackedCells) -> Result<String, Str
 /// prints it. A receipt (a canonical or backend-parity comparison) is one
 /// run. An invocation is one run unless it is the plain copy of a receipt
 /// ([`receipt_covers_plain_invocation`]): writers stored that copy beside
-/// every canonical pass until
-/// https://github.com/rrnewton/dev-hermit/issues/540, and still store it
+/// every canonical pass until the ledger slimming change dropped that copy,
+/// and still store it
 /// beside a canonical divergence and a parity row. So a canonical pass is
 /// one run in either storage form, and any other invocation counts once, as
 /// it did when the report printed the invocation count.
@@ -10635,7 +10637,7 @@ fn apply_validate_results_from(
             // skip a plain invocation that a receipt covers, and a pass has no
             // divergence position to sample. The plain copy cost about 8 MB of
             // cells.json per full run and nothing read it
-            // (https://github.com/rrnewton/dev-hermit/issues/540). Its argv,
+            // (so the ledger slimming change stopped writing it). Its argv,
             // environment and attempt records stay in the retained run named by
             // run_id. Divergences, stripped passes and no-verdict rows keep
             // their invocations.
@@ -11728,9 +11730,9 @@ fn verify_combined_write_state(
     }
     // Compared in chunks, not by reading the files: cells.json is 1.27 GB, and
     // a whole copy of it per check, beside the original and the generated
-    // bytes, set the write-back's peak
-    // (https://github.com/rrnewton/dev-hermit/issues/554). The parity file is
-    // still read, as before, so an unreadable one still refuses.
+    // bytes, set the write-back's peak (the publication step that runs it was
+    // measured at 13.5 GB resident). The parity file is still read, as before,
+    // so an unreadable one still refuses.
     let (scorecard, cells) = history_files(root, false)?;
     let parity = history_parity_file(root, false)?;
     if !file_holds_exactly(&scorecard, expected_scorecard)? {
@@ -12451,7 +12453,7 @@ where
 
     // The reconciled history as read, rebuilt from the held bytes whenever a
     // fresh copy of it is needed, instead of keeping a 2.7 GB clone (`before`)
-    // from here to the end (https://github.com/rrnewton/dev-hermit/issues/554).
+    // from here to the end (that clone raised the write-back's peak memory).
     // Parsing and reconciling the same bytes against the same checkout gives
     // the same history; only the first reconciliation checks the committed
     // document and announces retirements.
@@ -12657,7 +12659,7 @@ where
     )?;
     // Each of the history's large copies is released as soon as nothing below
     // reads it, so they are not all held while the generated files are built
-    // and written (https://github.com/rrnewton/dev-hermit/issues/554). After
+    // and written, which lowers the write-back's peak memory. After
     // here the snapshot is read only for its held identity (verify).
     snapshot.rows = Vec::new();
     let before = reconciled_history(false)?;
@@ -26362,9 +26364,9 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         .iter()
                         .any(|cell| cell.id.category == retired_import_id.category) =>
             {
-                // Every writer caps the document it writes back (cap 1,
-                // https://github.com/rrnewton/dev-hermit/issues/563), so the
-                // live cell holds only what the cap keeps of the resolved cell.
+                // Every writer caps the document it writes back (cap 1: each
+                // cell keeps only its latest state), so the live cell holds
+                // only what the cap keeps of the resolved cell.
                 let mut capped = TrackedCells {
                     schema: SCHEMA,
                     projection: None,
@@ -26439,7 +26441,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         display_id(&import_id)
                     )
                 })?;
-            // Cap 1 (https://github.com/rrnewton/dev-hermit/issues/563) keeps
+            // Cap 1 (each cell keeps only its latest state) keeps
             // each provenance's latest observation and folds the rest into the
             // cell's aggregate; a folded observation is carried only if the
             // aggregate already says everything it said (cell_accounts_for).
@@ -27680,7 +27682,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
     let fold_fixture_row = |row: ResultRow| fold_fixture_rows(vec![row]);
 
     // A canonical PASS is stored once, as its receipt, with no plain
-    // invocation beside it (https://github.com/rrnewton/dev-hermit/issues/540).
+    // invocation beside it (since the ledger slimming change).
     // Its readers still get the run's result, pass count, measurement and
     // direct evidence key, through the stored form and a repeated import. A
     // canonical divergence keeps its plain invocation.
@@ -27783,8 +27785,8 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
     // Counting invocations made a receipt-only canonical pass read as zero
     // runs (post-facto review of d3c63548055e946eacf5c3fc1dd123ee1b5bfe94).
     // A canonical pass is one run whether it is stored as its receipt alone or
-    // beside the plain invocation copy that cells written before
-    // https://github.com/rrnewton/dev-hermit/issues/540 hold, and the legacy
+    // beside the plain invocation copy that cells written before the ledger
+    // slimming change hold, and the legacy
     // form prints what the invocation count printed.
     for runs in [1usize, 3] {
         let mut receipt_only = TrackedCells {
@@ -30168,7 +30170,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         // Their omitted outer-attempt and evidence identities collapse to the same
         // compact run/result key even though the invocation payloads differ.
         //
-        // Cells written before https://github.com/rrnewton/dev-hermit/issues/540
+        // Cells written before the ledger slimming change
         // hold that plain invocation beside each canonical receipt. The
         // fixture's replay row is a canonical pass, so the current writer
         // stores only its receipt; the legacy invocation is rebuilt from the
@@ -33978,7 +33980,7 @@ mod post_verdict_transaction_tests {
 
         // The supported current-only ingest route also emits authority. The
         // document keeps only the latest observation of each provenance and
-        // domain (cap 1, https://github.com/rrnewton/dev-hermit/issues/563),
+        // domain (cap 1: each cell keeps only its latest state),
         // so when the receiving head differs, the two previous heads'
         // observations are capped and their bindings leave with them: only
         // the current run's binding stays, and the writer boundary accepts
@@ -37058,7 +37060,7 @@ mod post_verdict_transaction_tests {
                 "{label}"
             );
             // A canonical pass stores its receipt and no invocation
-            // (https://github.com/rrnewton/dev-hermit/issues/540), so the green
+            // (since the ledger slimming change), so the green
             // sibling holds no attempt that could carry a failure record, and
             // its one receipt is the pass.
             assert_eq!(
@@ -37146,7 +37148,7 @@ mod post_verdict_transaction_tests {
     /// runner could not have failed that way.
     ///
     /// A canonical pass stores only its receipt
-    /// (https://github.com/rrnewton/dev-hermit/issues/540), so the record is
+    /// (since the ledger slimming change), so the record is
     /// also forged onto a stripped pass, which still stores its attempts.
     #[test]
     fn an_expected_output_failure_the_runner_could_not_have_found_is_not_published() {
@@ -38412,7 +38414,7 @@ mod post_verdict_transaction_tests {
         // A later invocation of an older measured tree preserves that newer
         // stamp. Its older observation is not the latest of its provenance, so
         // the cap folds it into the cell's aggregate rather than keeping it
-        // (https://github.com/rrnewton/dev-hermit/issues/563); the stamped
+        // (cap 1: each cell keeps only its latest state); the stamped
         // observation stays.
         fixture.row["hermit_sha"] = measured.clone().into();
         fixture.row["run_id"] = "later-old-source-run".into();
@@ -45597,7 +45599,7 @@ mod parity_summary_tests {
 
 /// Series rows for a verify cell that declares `comparator: stripped` carry
 /// `series.comparison = {"strictness": "stripped", "bitwise_parity": false}`
-/// (<https://github.com/rrnewton/dev-hermit/issues/476>). The snapshot reader
+/// (a stripped pass is admitted, below bitwise parity). The snapshot reader
 /// must accept exactly that object, refuse anything else inside it, and count
 /// the row exactly as it counted the same row before the field existed.
 #[cfg(test)]

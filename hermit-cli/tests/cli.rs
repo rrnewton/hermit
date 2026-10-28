@@ -2200,8 +2200,7 @@ fn detcore_warns_from_inside_the_guest_once_per_run_on_every_backend() {
                 eprintln!(
                     "{test}: NOT YET: sabre: it has no blocking coordinator call inside a Tool \
                      callback until it converges onto reverie-inguest, and it does not intercept \
-                     CPUID (https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/issue-drafts/\
-                     2026-10-17-sabre-in-guest-detcore-warnings.md, to be filed as an issue)"
+                     CPUID"
                 );
             }
             !sabre
@@ -15773,7 +15772,7 @@ fn no_namespace_runs_without_container_setup() {
 }
 
 #[test]
-#[ignore = "known failure: https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/issue-drafts/2026-10-22-procfs-inode-no-namespace.md (under --no-namespace PIDs are host PIDs, and the inode of /proc/self/cgroup, which nproc reads, encodes the PID, so the two runs' fstat records differ)"]
+#[ignore = "known failure: PIDs are not virtualized under --no-namespace (they are host PIDs, and the inode of /proc/self/cgroup, which nproc reads, encodes the PID, so the two runs' fstat records differ)"]
 fn no_namespace_preserves_affinity_for_run_and_verify() {
     let _guard = hermit_run_guard();
 
