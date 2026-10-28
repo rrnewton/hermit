@@ -4627,7 +4627,9 @@ fn a_chaos_timeslice_range_caps_the_run_at_its_max() {
 /// scheduler seed and keeps it for the run's record. A replay of a record that
 /// states a drawn timeslice runs under it, from a range or in place of the
 /// default maximum, and refuses another explicit `--max-timeslice`. A range
-/// with an explicit `--max-timeslice` is refused.
+/// with an explicit `--max-timeslice` is refused, and so is
+/// `--chaos-seeded-timeslice` beside a run draw or on a replay of a drawn
+/// timeslice.
 #[test]
 fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
     let resolve = |argv: &[&str]| {
@@ -4694,6 +4696,26 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
         .unwrap_err()
     );
     assert!(error.contains("give one of them, not both"), "{error}");
+    let mut seeded = run_opts_for(&[
+        "hermit",
+        "run",
+        "--chaos",
+        "--chaos-seeded-timeslice",
+        "--seed=7",
+        range,
+        run,
+        "prog",
+    ]);
+    let error = format!(
+        "{:#}",
+        seeded.validate_args_with_perf_support(true).unwrap_err()
+    );
+    assert!(
+        error.contains("--chaos-seeded-timeslice draws --max-timeslice")
+            && error.contains("give one of them, not both"),
+        "{error}"
+    );
+    assert_eq!(seeded.det_opts.det_config.chaos_timeslice, None);
 
     let dir = tempfile::tempdir().unwrap();
     let marked = dir.path().join("marked.json");
@@ -4730,8 +4752,22 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
         resolve(&["hermit", "run", "--max-timeslice=5000", &marked_arg, "prog"]).unwrap_err()
     );
     assert!(error.contains("pass --max-timeslice=4321"), "{error}");
+    let seeded_replay = ["hermit", "run", "--chaos", "--chaos-seeded-timeslice"];
+    let error = format!(
+        "{:#}",
+        resolve(&[&seeded_replay[..], &[&marked_arg, "prog"]].concat()).unwrap_err()
+    );
+    assert!(
+        error.contains("recorded under a --max-timeslice of 4321 ns")
+            && error.contains("Omit --chaos-seeded-timeslice"),
+        "{error}"
+    );
     // A record without a drawn timeslice changes nothing.
     let unmarked_arg = replay(&unmarked);
+    // That includes a seeded replay, which keeps the seeded flag's own
+    // replay fallback.
+    let seeded = resolve(&[&seeded_replay[..], &[&unmarked_arg, "prog"]].concat()).unwrap();
+    assert_eq!(seeded.det_opts.det_config.chaos_timeslice, None);
     let plain = resolve(&["hermit", "run", &unmarked_arg, "prog"]).unwrap();
     assert_eq!(
         plain.det_opts.det_config.max_timeslice,
@@ -12711,8 +12747,9 @@ impl RunOpts {
     /// respect, and `Config::chaos_timeslice` keeps it for the run's own record
     /// (and turns the per-slice draw off). An explicit `--max-timeslice` or
     /// `--chaos-seeded-timeslice` with a range is refused rather than letting
-    /// one silently win. Repeating this (analyze revalidates its trials'
-    /// options) gives the same result.
+    /// one silently win, and so is `--chaos-seeded-timeslice` on a replay of a
+    /// record that states a drawn timeslice. Repeating this (analyze
+    /// revalidates its trials' options) gives the same result.
     fn resolve_chaos_timeslice_range(&mut self) -> Result<(), Error> {
         let config = &self.det_opts.det_config;
         let mut recorded = None;
@@ -12753,6 +12790,19 @@ impl RunOpts {
         }
         let timeslice = match (recorded, config.chaos_timeslice_range) {
             (Some((recorded, source)), _) => {
+                // `--chaos-seeded-timeslice` draws nothing on a replay and
+                // gives it the flag's fallback maximum instead, which would
+                // replace the recorded one.
+                if self.chaos_seeded_timeslice {
+                    return Err(Error::new(PolicyRefusal).context(format!(
+                        "{source} was recorded under a --max-timeslice of {recorded} ns, drawn \
+                         by --chaos-timeslice-draw=run, and --chaos-seeded-timeslice would \
+                         replay it under that flag's fallback maximum instead. Chaos slices and \
+                         the PMU maximum follow the timeslice, so the replay cannot reproduce \
+                         the run. Omit --chaos-seeded-timeslice to replay under the recorded \
+                         one."
+                    )));
+                }
                 if self.max_timeslice_explicit
                     && config.max_timeslice.map(std::num::NonZeroU64::get) != Some(recorded)
                 {
