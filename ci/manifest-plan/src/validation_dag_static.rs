@@ -1278,7 +1278,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And host_input::tests::host_file_identities_without_and_with_contents
     // (a property snapshot copy is identified by its contents, PR #4791):
     // 1957 + 1 = 1958.
-    ("test.regular_crates", 1958),
+    // And host_input::tests::a_flattened_identity_does_not_clash_with_a_records_own_content
+    // (the snapshot hash's JSON key is not a record's own `content`):
+    // 1958 + 1 = 1959.
+    ("test.regular_crates", 1959),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5399,7 +5402,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
     // And the same host_input identity unit (PR #4791): 1943 + 1 = 1944.
-    ("test.regular_crates_on_host", 1944),
+    // And the same flattened-identity unit: 1944 + 1 = 1945.
+    ("test.regular_crates_on_host", 1945),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6650,7 +6654,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
     // And the same host_input identity unit (PR #4791): 1943 + 1 = 1944.
-    ("test.regular_crates_on_host", 1944),
+    // And the same flattened-identity unit: 1944 + 1 = 1945.
+    ("test.regular_crates_on_host", 1945),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
