@@ -1268,8 +1268,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (a property snapshot copy is identified by its contents): 1973 + 1 = 1974, listed.
     // Rebased onto main ffe313b16: 1944 + 1 = 1945.
     // Rebased onto main fbf9d5f0c: 1946 + 1 = 1947.
-    // Rebased onto main fcd62385f: 1951 + 1 = 1952.
-    ("test.regular_crates", 1952),
+    // (a property snapshot copy is identified by its contents): 1959, listed.
+    // And host_input::tests::a_flattened_identity_does_not_clash_with_a_records_own_content
+    // (the snapshot hash's JSON key is not a record's own `content`): 1960,
+    // listed.
+    // This change: 1974 + 1 = 1975.
+    // Rebased onto main ffe313b16: 1945 + 1 = 1946.
+    // Rebased onto main fbf9d5f0c: 1947 + 1 = 1948.
+    // Rebased onto main fcd62385f: 1951 + 2 = 1953.
+    ("test.regular_crates", 1953),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5327,8 +5334,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And this change's tests, as at this node's second entry below: 1959 + 1 = 1960.
     // Rebased onto main ffe313b16: 1930 + 1 = 1931.
     // Rebased onto main fbf9d5f0c: 1932 + 1 = 1933.
-    // Rebased onto main fcd62385f: 1937 + 1 = 1938.
-    ("test.regular_crates_on_host", 1938),
+    // And this change's tests, as at this node's second entry below: 1960 + 1 = 1961.
+    // Rebased onto main ffe313b16: 1931 + 1 = 1932.
+    // Rebased onto main fbf9d5f0c: 1933 + 1 = 1934.
+    // Rebased onto main fcd62385f: 1937 + 2 = 1939.
+    ("test.regular_crates_on_host", 1939),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6566,8 +6576,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same host_input identity unit: 1959 + 1 = 1960.
     // Rebased onto main ffe313b16: 1930 + 1 = 1931.
     // Rebased onto main fbf9d5f0c: 1932 + 1 = 1933.
-    // Rebased onto main fcd62385f: 1937 + 1 = 1938.
-    ("test.regular_crates_on_host", 1938),
+    // And the same host_input identity unit: 1945.
+    // And the same flattened-identity unit: 1960 + 1 = 1961.
+    // Rebased onto main ffe313b16: 1931 + 1 = 1932.
+    // Rebased onto main fbf9d5f0c: 1933 + 1 = 1934.
+    // Rebased onto main fcd62385f: 1937 + 2 = 1939.
+    ("test.regular_crates_on_host", 1939),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
