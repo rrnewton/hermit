@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Test-only launch observation. The wrapper forwards the real launch unchanged.
+//! Test-only startup observation inside the genuine, attested frontend.
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -16,6 +16,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+pub(crate) const OBSERVER_ENV: &str = "HERMIT_TEST_DBT_PLACEMENT_OBSERVER";
+
 pub(crate) struct Probe {
     _directory: tempfile::TempDir,
     root: PathBuf,
@@ -24,6 +26,7 @@ pub(crate) struct Probe {
     guest_bind: Option<PathBuf>,
     real_library: PathBuf,
     staged_library: PathBuf,
+    observer: PathBuf,
 }
 
 fn c_bytes(path: &Path) -> String {
@@ -46,6 +49,14 @@ impl Probe {
     pub(crate) fn new(contained_cli: bool) -> Self {
         let (drrun, client) =
             detcore_dbt::prepare_native_client().expect("real DBT launch artifacts");
+        let refused = reverie_dbt::DbtRunner::new("/bin/true", &client)
+            .expect_err("an unrelated frontend must remain refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            refused
+                .to_string()
+                .contains("incompatible DynamoRIO frontend")
+        );
         let runtime = detcore_dbt::runtime_library_path().expect("real Detcore DBT runtime");
         let genuine_drrun = fs::canonicalize(drrun).unwrap();
         let sdk = genuine_drrun
@@ -62,7 +73,7 @@ impl Probe {
         let root = fs::canonicalize(directory.path()).unwrap();
         assert!(
             !root.starts_with("/tmp"),
-            "the wrapper must remain visible outside the CLI's private /tmp"
+            "the frontend must remain visible outside the CLI's private /tmp"
         );
         let install = root.join("install");
         let resources = install.join("rsrcs");
@@ -88,6 +99,14 @@ impl Probe {
         let real_library = fs::canonicalize(sdk.join("lib64/release/libdynamorio.so")).unwrap();
         let staged_library = staged_sdk.join("lib64/release/libdynamorio.so");
         same_file(&real_library, &staged_library);
+        let staged_frontend = staged_sdk.join("bin64/drrun");
+        fs::copy(&genuine_drrun, &staged_frontend).unwrap();
+        assert_eq!(
+            fs::read(&staged_frontend).unwrap(),
+            fs::read(&genuine_drrun).unwrap(),
+            "the selected frontend must retain its attested bytes"
+        );
+        let frontend = fs::metadata(&staged_frontend).unwrap();
         let record = root.join("argv-record");
         fs::OpenOptions::new()
             .create_new(true)
@@ -98,34 +117,42 @@ impl Probe {
         let visible_record = guest_bind
             .as_ref()
             .map_or_else(|| record.clone(), |p| p.join("argv-record"));
-        let source = root.join("wrapper.c");
+        let observer_file = root.join("observer.so");
+        let observer = guest_bind
+            .as_ref()
+            .map_or_else(|| observer_file.clone(), |p| p.join("observer.so"));
+        let source = root.join("observer.c");
         fs::write(
             root.join("artifacts.txt"),
             format!(
-                "drrun={}\nclient={}\nruntime={}\n",
+                "drrun={}\nclient={}\nruntime={}\nfrontend-device={}\nfrontend-inode={}\n",
                 genuine_drrun.display(),
                 fs::canonicalize(&client).unwrap().display(),
-                fs::canonicalize(&runtime).unwrap().display()
+                fs::canonicalize(&runtime).unwrap().display(),
+                frontend.dev(),
+                frontend.ino(),
             ),
         )
         .unwrap();
         fs::write(
             &source,
             format!(
-                "static const char runner[] = {{{}}};\nstatic const char record[] = {{{}}};\n{}",
-                c_bytes(&genuine_drrun),
+                "static const char observer[] = {{{}}};\nstatic const char record[] = {{{}}};\nstatic const unsigned long long frontend_device = {};\nstatic const unsigned long long frontend_inode = {};\n{}",
+                c_bytes(&observer),
                 c_bytes(&visible_record),
-                WRAPPER,
+                frontend.dev(),
+                frontend.ino(),
+                OBSERVER,
             ),
         )
         .unwrap();
         let output = Command::new("cc")
-            .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+            .args(["-O2", "-Wall", "-Wextra", "-Werror", "-fPIC", "-shared"])
             .arg(&source)
             .arg("-o")
-            .arg(staged_sdk.join("bin64/drrun"))
+            .arg(&observer_file)
             .output()
-            .expect("compile observation wrapper");
+            .expect("compile frontend startup observer");
         assert!(
             output.status.success(),
             "{}",
@@ -140,6 +167,7 @@ impl Probe {
             guest_bind,
             real_library,
             staged_library,
+            observer,
         }
     }
 
@@ -150,6 +178,10 @@ impl Probe {
                 .as_ref()
                 .map(|bind| format!("--bind={}:{}", self.root.display(), bind.display())),
         )
+    }
+
+    pub(crate) fn observer(&self) -> &Path {
+        &self.observer
     }
 
     pub(crate) fn assert_zero(&self, launches: usize, protected: bool) {
@@ -165,7 +197,7 @@ impl Probe {
             fs::create_dir(&destination).expect("fresh evidence directory");
             for (name, limit) in [
                 ("argv-record", 1_048_576),
-                ("wrapper.c", 65_536),
+                ("observer.c", 65_536),
                 ("artifacts.txt", 16_384),
             ] {
                 let path = self.root.join(name);
@@ -183,6 +215,7 @@ impl Probe {
         let mut records = Vec::new();
         let mut current = None;
         let mut incoming = None;
+        let mut identity = None;
         for line in text.lines() {
             match line {
                 "BEGIN" => {
@@ -191,6 +224,7 @@ impl Probe {
                 }
                 "END" => records.push((
                     incoming.take().expect("incoming argv0"),
+                    identity.take().expect("actual frontend identity"),
                     current.take().expect("record start"),
                 )),
                 "TOKEN64" | "SOCKET32" => {
@@ -200,6 +234,20 @@ impl Probe {
                         .push(line.as_bytes().to_vec());
                 }
                 _ => {
+                    if let Some(value) = line.strip_prefix("IDENTITY ") {
+                        let (device, inode) = value.split_once(' ').expect("device and inode");
+                        assert!(current.as_ref().expect("record start").is_empty());
+                        assert!(
+                            identity
+                                .replace((
+                                    device.parse::<u64>().unwrap(),
+                                    inode.parse::<u64>().unwrap()
+                                ))
+                                .is_none(),
+                            "one frontend identity"
+                        );
+                        continue;
+                    }
                     let is_incoming = line.starts_with('I');
                     let hex = line
                         .strip_prefix(if is_incoming { 'I' } else { 'A' })
@@ -232,15 +280,18 @@ impl Probe {
             launches,
             "exact real launch observation count"
         );
-        for (incoming, args) in records {
+        let frontend = fs::metadata(self.install.join("rsrcs/dynamorio/bin64/drrun")).unwrap();
+        for (incoming, identity, args) in records {
+            assert_eq!(identity, (frontend.dev(), frontend.ino()));
             assert_eq!(
                 incoming,
                 self.install
                     .join("rsrcs/dynamorio/bin64/drrun")
                     .as_os_str()
                     .as_bytes(),
-                "actual incoming wrapper argv0"
+                "actual frontend argv0"
             );
+            assert_eq!(args.first(), Some(&incoming), "unchanged frontend argv0");
             let client = args
                 .iter()
                 .position(|a| a == b"-c")
@@ -290,13 +341,14 @@ impl Probe {
 
 // No argv or environment is printed on failure. Credentials are recognized
 // only inside the real client region and replaced before any record is written.
-const WRAPPER: &str = r#"
+const OBSERVER: &str = r#"
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static void fail(void) {
@@ -317,7 +369,20 @@ static void opaque(FILE *file, const char *value, size_t length, const char *tag
               (value[i] >= 'a' && value[i] <= 'f'))) fail();
     if (fprintf(file, "%s\n", tag) < 0) fail();
 }
-int main(int argc, char **argv) {
+/* Exported only so the additive guest control can detect accidental preload. */
+int hermit_dbt_placement_observer_marker = 1;
+
+__attribute__((constructor))
+static void observe_frontend(int argc, char **argv, char **envp) {
+    (void)envp;
+    struct stat actual;
+    const char *preload = getenv("LD_PRELOAD");
+    if (stat("/proc/self/exe", &actual) != 0 ||
+        (unsigned long long)actual.st_dev != frontend_device ||
+        (unsigned long long)actual.st_ino != frontend_inode ||
+        preload == NULL || strcmp(preload, observer) != 0 ||
+        unsetenv("LD_PRELOAD") != 0)
+        fail();
     int client = -1, guest = -1;
     for (int i = 1; i < argc; ++i) {
         if (client < 0 && strcmp(argv[i], "-c") == 0) client = i;
@@ -331,8 +396,11 @@ int main(int argc, char **argv) {
     if (fd < 0 || flock(fd, LOCK_EX) != 0) fail();
     FILE *file = fdopen(fd, "a");
     if (!file || fputs("BEGIN\n", file) == EOF) fail();
+    if (fprintf(file, "IDENTITY %llu %llu\n",
+                (unsigned long long)actual.st_dev,
+                (unsigned long long)actual.st_ino) < 0) fail();
     hex_arg(file, 'I', argv[0]);
-    hex_arg(file, 'A', runner);
+    hex_arg(file, 'A', argv[0]);
     for (int i = 1; i < argc; ++i) {
         hex_arg(file, 'A', argv[i]);
         if (i >= client + 2 && i < guest &&
@@ -344,8 +412,5 @@ int main(int argc, char **argv) {
         }
     }
     if (fputs("END\n", file) == EOF || fclose(file) != 0) fail();
-    argv[0] = (char *)runner;
-    execv(runner, argv);
-    fail();
 }
 "#;
