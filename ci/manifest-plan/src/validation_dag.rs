@@ -6822,31 +6822,17 @@ sys.exit(37)
             .labels
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
+        let source_direct =
+            crate::dag_source_ownership::source_profile(HOSTED_PORTABLE_LABEL, true, false)
+                .unwrap();
+        let mut missing_direct = source_direct.clone();
+        assert!(missing_direct.remove("check.dagrun_naming"));
+        let expected_error = format!(
+            "{HOSTED_PORTABLE_LABEL} core direct source owners changed: expected={source_direct:?}, actual={missing_direct:?}"
+        );
         assert!(
-            // 66 = the 67 hosted-portable direct steps since
-            // test.liteinst_strict_on_host was retired with the LiteInst host
-            // hybrid (https://github.com/rrnewton/hermit/issues/3520), minus
-            // the one planted loss;
-            // 67 = the 68 hosted-portable direct steps since
-            // test.detcore_time_on_host was enrolled, minus the one planted loss;
-            // 66 = the 67 hosted-portable direct steps since
-            // check.backend_parity_suites_on_host was retired with
-            // tests/backend-parity in slice S13 of
-            // https://github.com/rrnewton/hermit/issues/3301 (68 before,
-            // since check.e9patch_corpus was added, also in slice S13), minus
-            // the one planted loss;
-            // 66 = the 67 hosted-portable direct steps since the 189
-            // compat.<label>_on_host nodes became e2e.manifest_compat_on_host
-            // (fold 1 of https://github.com/rrnewton/hermit/issues/3448),
-            // minus the one planted loss; 254 = the 255 hosted-portable direct
-            // steps before that, since
-            // check.script_unit_tests left check.lint_checks (254 after the
-            // one-build change of 2026-09-30; 256 before it, since the five
-            // selftest.<name> nodes left gate.manifest and
-            // selftest.scorecard_commands split from selftest.scorecard,
-            // https://github.com/rrnewton/hermit/issues/3381), minus the one
-            // planted loss.
-            error.contains("hosted-portable label has 66 direct steps"),
+            // Losing one declared core owner must report the exact changed owner sets.
+            error == expected_error,
             "{error}"
         );
     }
@@ -7161,17 +7147,30 @@ sys.exit(37)
         // 99 again since that check runs in Reverie's own validate and CI
         // (102 full nodes), and 100 with build.liteinst_runtime_in_pinned_root
         // (103 full nodes).
-        crate::dag_source_ownership::assert_profile_population(
-            FULL_BUCK_E2E_LABEL,
-            100,
-            buck_e2e_selection(&committed)
-                .unwrap()
-                .steps
-                .iter()
-                .map(Step::tag)
-                .collect(),
-        )
-        .unwrap();
+        // The Buck profile composes the full profile with Cargo owners replaced,
+        // rather than selecting the Buck label alone.
+        let original_full =
+            crate::dag_source_ownership::source_profile("full", false, true).unwrap();
+        let original_buck =
+            crate::dag_source_ownership::source_profile(FULL_BUCK_E2E_LABEL, false, true).unwrap();
+        let replaced = buck_replaced_tags(&committed).unwrap();
+        let original = original_full
+            .difference(&replaced)
+            .cloned()
+            .chain(original_buck)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(original.len(), 100);
+        let expected = original
+            .into_iter()
+            .filter(|tag| crate::dag_source_ownership::is_core(tag))
+            .collect::<BTreeSet<_>>();
+        let actual = buck_e2e_selection(&committed)
+            .unwrap()
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

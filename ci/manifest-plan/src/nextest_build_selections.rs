@@ -1123,15 +1123,15 @@ mod tests {
             narrowed.contains("must end with its unified workspace build"),
             "{narrowed}"
         );
-        // The CLI opt-in alone does not enable the installer package's full
-        // bundle. A producer that drops only that opt-in is not the union.
-        let core_installer = mutated(&|cmd| cmd.replace("hermit-install/liteinst,", ""));
+        // The core producer must keep the CLI's LiteInst opt-in from the
+        // declared selection union, even if all other features remain.
+        let core_installer = mutated(&|cmd| cmd.replace(",hermit-run/liteinst", ""));
         assert!(
             core_installer.contains("must end with its unified workspace build"),
             "{core_installer}"
         );
 
-        // A union that no longer carries the third-party backends: every
+        // A union that no longer carries the core LiteInst backend: every
         // selection drops the feature, and the producer follows the union, so
         // only the backend requirement refuses it.
         let mut stripped = graph.clone();
@@ -1160,7 +1160,6 @@ mod tests {
                 crate::nextest_binaries::unified_prebuild_command(&graph, profile).unwrap();
             let after =
                 crate::nextest_binaries::unified_prebuild_command(&stripped, profile).unwrap();
-            assert!(!after.contains("liteinst"), "{after}");
             // The pinned compile half carries only the Cargo build, the text
             // of the union before its `prepare` tail, so it follows that part.
             let cargo_half = |union: &str| {
@@ -1171,6 +1170,12 @@ mod tests {
                     .to_owned()
             };
             let (before_cargo, after_cargo) = (cargo_half(&before), cargo_half(&after));
+            assert!(!after_cargo.contains("liteinst"), "{after_cargo}");
+            // Removing the Cargo opt-in must retain exact preparation and staging.
+            assert_eq!(
+                before.strip_prefix(before_cargo.as_str()).unwrap(),
+                after.strip_prefix(after_cargo.as_str()).unwrap(),
+            );
             for step in &mut stripped.steps {
                 step.cmd = if step.cmd.contains(&before) {
                     step.cmd.replace(&before, &after)
