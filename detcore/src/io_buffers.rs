@@ -43,6 +43,10 @@
 //! MiB heap. This is `O(bytes the syscalls actually returned)`: 139.1 MB per
 //! boot, measured by summing real return values.
 
+use detcore_model::access_trace::ByteRange;
+use detcore_model::access_trace::MemoryOp;
+use detcore_model::access_trace::OUT_BYTES_CAP;
+use detcore_model::access_trace::ReturnedBytes;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
@@ -129,6 +133,93 @@ fn observed_extents(
         return Ok(observed);
     }
     extents(memory, call, ret)
+}
+
+/// What the access trace keeps of the bytes a completed syscall moved
+/// through guest buffers (`crate::access_trace`).
+pub(crate) struct MovedBytes {
+    /// Each buffer, and whether the kernel read it or wrote it.
+    pub(crate) buffers: Vec<(MemoryOp, ByteRange)>,
+    /// The bytes the kernel wrote into the guest, summarized.
+    pub(crate) returned: Option<ReturnedBytes>,
+    /// The first bytes a write to fd 1 or 2 carried.
+    pub(crate) out_bytes: Option<Vec<u8>>,
+}
+
+/// The buffers of a completed call that returned `ret`, found and read as
+/// [`detlog_io_buffers`] finds and reads them. A buffer the guest cannot read
+/// leaves the summary out; the trace never changes the call's result.
+pub(crate) fn access_trace_buffers<M: MemoryAccess>(
+    memory: &M,
+    call: &Syscall,
+    ret: i64,
+    rng_output: Option<&[BufferExtent]>,
+) -> MovedBytes {
+    let Ok(extents) = observed_extents(memory, call, ret, rng_output) else {
+        return MovedBytes {
+            buffers: Vec::new(),
+            returned: None,
+            out_bytes: None,
+        };
+    };
+    let mut ranges: Vec<ByteRange> = extents
+        .iter()
+        .filter(|extent| extent.len > 0)
+        .map(|extent| ByteRange {
+            start: extent.addr,
+            end: extent.addr.saturating_add(extent.len),
+        })
+        .collect();
+    // Clock and timer reads, which the --detlog-io-buffers extents leave
+    // out, return the time through their result or small structures.
+    let (sysno, args) = call.into_parts();
+    let (value, time_buffers) = crate::access_trace::time_outputs(
+        sysno,
+        [
+            args.arg0 as u64,
+            args.arg1 as u64,
+            args.arg2 as u64,
+            args.arg3 as u64,
+            args.arg4 as u64,
+            args.arg5 as u64,
+        ],
+        ret,
+    );
+    ranges.extend(time_buffers);
+    let read = |addr: u64, want: usize| -> Result<Vec<u8>, Errno> {
+        let mut buf = vec![0u8; want];
+        let start = AddrMut::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
+        read_written(memory, start, &mut buf).map(|()| buf)
+    };
+    let direction = direction(call);
+    let returned = match direction {
+        Direction::In => crate::access_trace::summarize_output(value, &ranges, read),
+        Direction::Out => None,
+    };
+    let to_terminal = matches!(crate::syscalls::helpers::get_fd(*call), Some(1 | 2));
+    let out_bytes = (direction == Direction::Out && to_terminal && ret > 0)
+        .then(|| {
+            let mut bytes = Vec::new();
+            for range in &ranges {
+                let left = OUT_BYTES_CAP - bytes.len();
+                if left == 0 {
+                    break;
+                }
+                let want = ((range.end - range.start) as usize).min(left);
+                bytes.extend(read(range.start, want).ok()?);
+            }
+            Some(bytes)
+        })
+        .flatten();
+    let op = match direction {
+        Direction::In => MemoryOp::SyscallWrite,
+        Direction::Out => MemoryOp::SyscallRead,
+    };
+    MovedBytes {
+        buffers: ranges.into_iter().map(|range| (op, range)).collect(),
+        returned,
+        out_bytes,
+    }
 }
 
 /// Direction of travel, recorded so a reader can tell a value the kernel

@@ -1513,6 +1513,10 @@ mod tests {
                 "--preemption-stacktrace-log-file=requested.log",
                 "--preemption-stacktrace-log-file",
             ),
+            (
+                "--record-access-trace-to=requested.access",
+                "--record-access-trace-to",
+            ),
         ] {
             let error = options(&[run_arg])
                 .refuse_outputs_trials_overwrite()

@@ -1195,7 +1195,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // capability_clear_image_readiness_preserves_legacy_conditions: 1883, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1894.
     // Train 6 recount (measured on 21f770f6 base): 1899.
-    ("test.regular_crates", 1899),
+    // And detcore-model's six access_trace::tests (record round trip, on-disk
+    // spelling, out_bytes hex, returned_digest, reader refusals, conflict
+    // rules), the access trace's record types: 1905.
+    // config::tests::access_trace_never_enters_the_legacy_form_and_round_trips
+    // (--record-access-trace-to): 1906.
+    ("test.regular_crates", 1906),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1848,7 +1853,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
     // Train 6 recount (measured on 21f770f6 base): 1187.
-    ("test.hermit_unit", 1187),
+    // And run::access_trace_is_refused_where_its_records_would_name_nothing
+    // and run::a_manifest_leaves_out_the_access_trace: 1189.
+    ("test.hermit_unit", 1189),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3064,7 +3071,29 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit", 2788),
+    // And fourteen access_trace::tests of the access trace's writer and
+    // resource extraction, tool_local's
+    // traced_call_tests::a_traced_call_notes_the_slots_it_changes, and
+    // access_trace's clock_and_timer_reads_carry_what_they_returned and
+    // a_capped_trace_stops_without_its_end_line
+    // (--record-access-trace-to): 2805, listed.
+    // And the access trace's synchronization edges: access_trace's
+    // a_clone_starts_its_child_whichever_runs_first,
+    // an_exit_wake_ends_at_the_joiners_wait_return,
+    // a_reaped_childs_exit_orders_the_wait,
+    // a_failed_send_orders_no_delivery,
+    // two_sends_from_one_sender_order_two_deliveries_in_send_order,
+    // a_process_send_and_a_thread_send_each_order_one_delivery,
+    // overlapping_sends_from_two_threads_order_nothing,
+    // realtime_signal_deliveries_take_their_sends_in_order,
+    // a_timer_expiry_takes_its_oldest_live_arm,
+    // the_cap_evicts_sends_before_a_live_timers_arm,
+    // a_group_send_reaches_each_member_once and
+    // reaping_forgets_the_sends_waiting_for_the_child, and scheduler's
+    // a_futex_wake_edge_names_the_waiter_the_wake_took,
+    // a_requeue_edge_waits_for_the_moved_waiters_return and
+    // a_clear_child_tid_wake_is_a_join_edge: 2820, listed.
+    ("test.detcore_unit", 2820),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4360,7 +4389,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 666),
+    // And access_trace's an_access_trace_leaves_a_replayed_run_unchanged,
+    // access_trace_indices_name_the_runs_own_events and
+    // access_trace_from_leaves_out_only_earlier_records: 669.
+    // And access_trace's a_futex_ping_pong_yields_alternating_wake_edges and
+    // signal_child_exit_and_join_edges_name_their_events: 671.
+    ("test.cli", 671),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4903,7 +4937,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 585),
+    // And the same three access trace tests, not excluded: 588.
+    // And the same two synchronization edge tests, not excluded: 590.
+    ("test.cli_on_host", 590),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5374,7 +5410,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three working-directory units: 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit_on_host", 2788),
+    // And the same seventeen access-trace tests as test.detcore_unit: 2805.
+    // And the same fifteen sync-edge tests as test.detcore_unit: 2820.
+    ("test.detcore_unit_on_host", 2820),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5745,7 +5783,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
-    ("test.hermit_unit_on_host", 1181),
+    // And the same two access-trace run:: tests as test.hermit_unit: 1183.
+    ("test.hermit_unit_on_host", 1183),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5955,7 +5994,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hosted exclusions unchanged: 1869, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1880.
     // Train 6 recount (measured on 21f770f6 base): 1885.
-    ("test.regular_crates_on_host", 1885),
+    // And the same access-trace tests as test.regular_crates: 1892.
+    ("test.regular_crates_on_host", 1892),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
