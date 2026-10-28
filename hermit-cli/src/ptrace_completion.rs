@@ -318,19 +318,16 @@ impl std::error::Error for RecoveryRefusal {}
 struct OriginNumbers {
     thread: ThreadId,
     pid: u32,
-    namespace_dev: u64,
-    namespace_ino: u64,
+    namespace: PidNamespace,
 }
 impl OriginNumbers {
-    fn current() -> Result<(Self, File), RecoveryRefusal> {
-        let file = File::open("/proc/self/ns/pid").map_err(RecoveryRefusal::Identity)?;
-        let meta = file.metadata().map_err(RecoveryRefusal::Identity)?;
+    fn current() -> Result<(Self, Option<File>), RecoveryRefusal> {
+        let (namespace, file) = open_pid_namespace().map_err(RecoveryRefusal::Identity)?;
         Ok((
             Self {
                 thread: std::thread::current().id(),
                 pid: std::process::id(),
-                namespace_dev: meta.dev(),
-                namespace_ino: meta.ino(),
+                namespace,
             },
             file,
         ))
@@ -343,6 +340,68 @@ impl OriginNumbers {
             Err(RecoveryRefusal::WrongIdentity)
         }
     }
+}
+
+/// The PID namespace a process is in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PidNamespace {
+    /// The device and inode of its `/proc/<pid>/ns/pid` file.
+    Inode(u64, u64),
+    /// The only one: a kernel built without PID namespaces (`CONFIG_PID_NS`
+    /// unset, as Android's kernels are) has one, which every process shares,
+    /// and its procfs lists no `ns/pid` entry.
+    Only,
+}
+
+/// The calling process's PID namespace, with its `ns/pid` file opened, which
+/// a caller holds while it records the namespace's identity so that no later
+/// namespace can take that identity (none where the kernel has only the one).
+/// An error when `/proc` cannot say, as when it is not this process's procfs.
+pub(crate) fn open_pid_namespace() -> std::io::Result<(PidNamespace, Option<File>)> {
+    match File::open("/proc/self/ns/pid") {
+        Ok(file) => {
+            let meta = file.metadata()?;
+            Ok((PidNamespace::Inode(meta.dev(), meta.ino()), Some(file)))
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && missing_ns_pid_means_one_namespace(
+                    proc_is_procfs(),
+                    proc_self_pid(),
+                    std::process::id(),
+                ) =>
+        {
+            Ok((PidNamespace::Only, None))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a missing `/proc/self/ns/pid` means the kernel has no PID
+/// namespaces: only when `/proc` is procfs (`procfs`) and its `self` names
+/// this process (`proc_self` is `own`). Otherwise `/proc` is not this
+/// process's procfs (another filesystem mounted over it, or the procfs of
+/// another PID namespace), which proves nothing about the kernel.
+fn missing_ns_pid_means_one_namespace(procfs: bool, proc_self: Option<u32>, own: u32) -> bool {
+    procfs && proc_self == Some(own)
+}
+
+/// Whether `/proc` is a procfs mount.
+fn proc_is_procfs() -> bool {
+    // SAFETY: an all-zero `statfs` is a valid value, and `statfs` writes only
+    // the struct it is given.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    let found = unsafe { libc::statfs(c"/proc".as_ptr(), &mut fs) } == 0;
+    found && fs.f_type == libc::PROC_SUPER_MAGIC
+}
+
+/// The process ID `/proc/self` names, if it names one.
+fn proc_self_pid() -> Option<u32> {
+    std::fs::read_link("/proc/self")
+        .ok()?
+        .to_str()?
+        .parse()
+        .ok()
 }
 
 // A numeric PID, Rust ThreadId and namespace can all be copied across fork.
@@ -477,7 +536,7 @@ struct Driver {
 struct Entry {
     key: u64,
     origin: OriginNumbers,
-    _namespace: File,
+    _namespace: Option<File>,
     original_process: OriginalProcess,
     result_type: TypeId,
     driver: RefCell<ManuallyDrop<Driver>>,

@@ -395,6 +395,22 @@ fn a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer() {
     );
 }
 
+/// A missing `/proc/self/ns/pid` means a kernel without PID namespaces only
+/// when `/proc` is this process's procfs; anything else over `/proc`, or the
+/// procfs of another PID namespace, keeps the refusal.
+#[test]
+fn a_missing_ns_pid_means_one_namespace_only_on_this_process_procfs() {
+    assert!(missing_ns_pid_means_one_namespace(true, Some(7), 7));
+    assert!(!missing_ns_pid_means_one_namespace(false, Some(7), 7));
+    assert!(!missing_ns_pid_means_one_namespace(true, Some(8), 7));
+    assert!(!missing_ns_pid_means_one_namespace(true, None, 7));
+    // This host's kernel has PID namespaces: the entry is there and held.
+    let (namespace, file) = open_pid_namespace().unwrap();
+    assert!(matches!(namespace, PidNamespace::Inode(..)) && file.is_some());
+    assert!(proc_is_procfs());
+    assert_eq!(proc_self_pid(), Some(std::process::id()));
+}
+
 /// Without a readable PID namespace (here a tmpfs over `/proc`), a process
 /// cannot tell its own tracer handle from an inherited one, so launches run on
 /// the calling thread, as before the tracer thread, and refuse there
