@@ -198,7 +198,7 @@ fn resolved_build(
     }
     let mut source_hashes = BTreeSet::new();
     for (root, expected) in roots {
-        let measured = source(&root, true)?;
+        let measured = super::compatibility_source::cargo_git_source(&root, &expected, true)?;
         if measured.get("commit").and_then(serde_json::Value::as_str) != Some(expected.as_str()) {
             return Err(
                 "built Reverie package directory is not its resolved source commit".to_owned(),

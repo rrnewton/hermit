@@ -4,9 +4,11 @@
 //! top-level producer. Native/export/registry identity is not inferred.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -268,6 +270,197 @@ pub fn source(root: &Path, track: bool) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({"kind":"git", "commit":commit, "tree":tree, "sha256":sha256}))
 }
 
+/// Cargo materializes each Git repository with an empty completion marker.
+/// This is a separate policy from `source`: core checkouts remain strict.
+/// Metadata must first bind the canonical Reverie URL and exact resolved OID.
+pub fn cargo_git_source(
+    root: &Path,
+    expected: &str,
+    track: bool,
+) -> Result<serde_json::Value, String> {
+    let home = std::env::var_os("CARGO_HOME")
+        .ok_or_else(|| "Cargo Git source has no actual CARGO_HOME".to_owned())?;
+    let cache = std::fs::canonicalize(Path::new(&home).join("git/checkouts"))
+        .map_err(|error| format!("cannot resolve actual Cargo Git cache: {error}"))?;
+    cargo_git_source_in(root, expected, &cache, track, unsafe { libc::geteuid() })
+}
+
+fn cargo_git_source_in(
+    root: &Path,
+    expected: &str,
+    cache: &Path,
+    track: bool,
+    owner: u32,
+) -> Result<serde_json::Value, String> {
+    if !matches!(root.strip_prefix(cache), Ok(relative) if relative.components().count() == 2) {
+        return Err("resolved Reverie root is not an actual Cargo Git checkout".to_owned());
+    }
+    cargo_repository(root, expected, track, owner, &mut BTreeSet::new())
+}
+
+fn cargo_marker(root: &Path, owner: u32) -> Result<serde_json::Value, String> {
+    let path = root.join(".cargo-ok");
+    let before = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("Cargo Git checkout has no completion marker: {error}"))?;
+    if !before.is_file()
+        || before.uid() != owner
+        || before.mode() & 0o7777 != 0o644
+        || before.len() != 0
+    {
+        return Err("Cargo completion marker is not an empty owned regular 0644 file".to_owned());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| format!("cannot open Cargo completion marker: {error}"))?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    let mut bytes = [0u8; 1];
+    if metadata_identity(&before) != metadata_identity(&opened)
+        || opened.uid() != owner
+        || file.read(&mut bytes).map_err(|error| error.to_string())? != 0
+    {
+        return Err("Cargo completion marker changed while opening/reading".to_owned());
+    }
+    let after = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+    if metadata_identity(&before) != metadata_identity(&after) || after.uid() != owner {
+        return Err("Cargo completion marker changed during measurement".to_owned());
+    }
+    Ok(
+        serde_json::json!({"type":"regular", "mode":"100644", "uid":owner,
+        "bytes_hex":"", "sha256":format!("{:x}", Sha256::digest(b""))}),
+    )
+}
+
+fn cargo_state(root: &Path) -> Result<serde_json::Value, String> {
+    let flags = git(root, &["ls-files", "-v", "-z"])?;
+    if flags
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| !entry.starts_with("H "))
+    {
+        return Err(
+            "Cargo Git source has sparse/assume-unchanged/unmerged index entries".to_owned(),
+        );
+    }
+    let index = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?;
+    let index = Path::new(&index);
+    let before = std::fs::symlink_metadata(index).map_err(|error| error.to_string())?;
+    if !before.is_file() {
+        return Err("Cargo Git source index is not a regular file".to_owned());
+    }
+    let bytes = std::fs::read(index).map_err(|error| error.to_string())?;
+    let after = std::fs::symlink_metadata(index).map_err(|error| error.to_string())?;
+    if metadata_identity(&before) != metadata_identity(&after) {
+        return Err("Cargo Git source index changed while measuring".to_owned());
+    }
+    Ok(serde_json::json!({
+        "commit":git(root, &["rev-parse", "--verify", "HEAD^{commit}"])?,
+        "tree":git(root, &["rev-parse", "--verify", "HEAD^{tree}"])?,
+        "raw_status":git(root, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"])?,
+        "index_sha256":format!("{:x}", Sha256::digest(bytes)),
+        "index_flags_sha256":format!("{:x}", Sha256::digest(flags.as_bytes()))
+    }))
+}
+
+fn cargo_repository(
+    root: &Path,
+    expected: &str,
+    track: bool,
+    owner: u32,
+    seen: &mut BTreeSet<std::path::PathBuf>,
+) -> Result<serde_json::Value, String> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || metadata.uid() != owner
+        || std::fs::canonicalize(root).map_err(|error| error.to_string())? != root
+        || std::fs::canonicalize(git(root, &["rev-parse", "--show-toplevel"])?)
+            .map_err(|error| error.to_string())?
+            != root
+        || !full_oid(expected)
+        || !seen.insert(root.to_owned())
+        || seen.len() > 128
+    {
+        return Err(
+            "Cargo Git source root is missing, aliased, unowned or noncanonical".to_owned(),
+        );
+    }
+    let before = cargo_state(root)?;
+    if before["commit"].as_str() != Some(expected) || !before["tree"].as_str().is_some_and(full_oid)
+    {
+        return Err("Cargo Git source HEAD differs from its exact declared gitlink/pin".to_owned());
+    }
+    let marker = cargo_marker(root, owner)?;
+    let mut links = BTreeMap::new();
+    for entry in git(root, &["ls-tree", "-r", "--full-tree", "-z", "HEAD"])?
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+    {
+        let (header, name) = entry
+            .split_once('\t')
+            .ok_or_else(|| "malformed Cargo Git tree entry".to_owned())?;
+        if let Some(oid) = header.strip_prefix("160000 commit ") {
+            if !full_oid(oid) || name.contains('\n') || name.contains('\r') {
+                return Err("noncanonical Cargo Git source gitlink".to_owned());
+            }
+            links.insert(name.to_owned(), oid.to_owned());
+        }
+    }
+    let status = before["raw_status"]
+        .as_str()
+        .ok_or("missing Cargo Git status")?;
+    let mut marker_count = 0;
+    for entry in status.split('\0').filter(|entry| !entry.is_empty()) {
+        if entry == "?? .cargo-ok" {
+            marker_count += 1;
+        } else if !entry
+            .strip_prefix(" M ")
+            .is_some_and(|name| links.contains_key(name))
+        {
+            return Err(format!(
+                "Cargo Git source has an unapproved source/index/untracked change: {entry:?}"
+            ));
+        }
+    }
+    if marker_count != 1 || !git(root, &["ls-files", "--", ".cargo-ok"])?.is_empty() {
+        return Err("Cargo completion marker is missing, tracked, hidden or duplicated".to_owned());
+    }
+    let mut children = Vec::new();
+    let mut hash = Sha256::new();
+    hash.update(b"hermit-cargo-git-materialization/v1\0");
+    hash_field(&mut hash, expected.as_bytes());
+    let content = source_digest(root, track)?;
+    hash_field(&mut hash, content.as_bytes());
+    for (name, oid) in links {
+        let child = cargo_repository(&root.join(&name), &oid, track, owner, seen)?;
+        hash_field(&mut hash, name.as_bytes());
+        hash_field(
+            &mut hash,
+            child["sha256"]
+                .as_str()
+                .ok_or("missing child source digest")?
+                .as_bytes(),
+        );
+        children.push(serde_json::json!({"path":name,"identity":child}));
+    }
+    let after = cargo_state(root)?;
+    let marker_after = cargo_marker(root, owner)?;
+    if before != after || marker_after != marker || source_digest(root, false)? != content {
+        return Err(
+            "Cargo Git refs/index/status/marker changed during source measurement".to_owned(),
+        );
+    }
+    Ok(
+        serde_json::json!({"kind":"git", "commit":expected, "tree":before["tree"],
+        "sha256":format!("{:x}",hash.finalize()), "cargo_marker_before":marker,
+        "cargo_marker_after":marker_after,
+        "before":before, "after":after, "gitlinks":children}),
+    )
+}
+
 /// The producer checks these complete source measurements around each build;
 /// the final build script independently checks the same pre-build snapshot.
 /// Paths are evidence locators, not cross-executable compatibility dimensions.
@@ -334,7 +527,7 @@ pub fn snapshot(metadata: &InputFile, track: bool) -> Result<serde_json::Value, 
     }
     let mut reverie = Vec::new();
     for (root, expected) in roots {
-        let identity = source(&root, track)?;
+        let identity = cargo_git_source(&root, &expected, track)?;
         if identity["commit"].as_str() != Some(expected.as_str()) {
             return Err(
                 "source snapshot actual Reverie checkout differs from its metadata source"
@@ -346,4 +539,267 @@ pub fn snapshot(metadata: &InputFile, track: bool) -> Result<serde_json::Value, 
     Ok(
         serde_json::json!({"schema":"hermit-compatibility-source-snapshot/v1","core":core,"reverie":reverie}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture {
+        directory: PathBuf,
+        cache: PathBuf,
+        root: PathBuf,
+        oid: String,
+    }
+
+    fn command(root: &Path, args: &[&str]) -> String {
+        // These are new, disposable local source fixtures, not product commits.
+        let output = Command::new("/usr/bin/git")
+            .args([
+                "--no-optional-locks",
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "user.name=source-fixture",
+                "-c",
+                "user.email=source-fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-C",
+            ])
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("run local source fixture Git");
+        assert!(
+            output.status.success(),
+            "fixture Git {args:?}: {:?}",
+            output
+        );
+        String::from_utf8(output.stdout)
+            .expect("fixture Git UTF8")
+            .trim()
+            .to_owned()
+    }
+
+    fn initialize(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        command(root, &["init", "--quiet"]);
+        std::fs::write(root.join("source.rs"), b"original source\n").unwrap();
+        command(root, &["add", "--", "source.rs"]);
+        command(root, &["commit", "--quiet", "-m", "canonical fixture"]);
+    }
+
+    fn marker(root: &Path) {
+        let path = root.join(".cargo-ok");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "hermit-cargo-source-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let cache = directory.join("git/checkouts");
+            let root = cache.join("reverie-fixture/revision");
+            initialize(&root);
+            let child = directory.join("child-source");
+            initialize(&child);
+            command(
+                &root,
+                &[
+                    "submodule",
+                    "add",
+                    "--quiet",
+                    child.to_str().unwrap(),
+                    "child",
+                ],
+            );
+            command(&root, &["commit", "--quiet", "-m", "canonical child"]);
+            marker(&root);
+            marker(&root.join("child"));
+            let oid = command(&root, &["rev-parse", "HEAD"]);
+            Self {
+                directory,
+                cache,
+                root,
+                oid,
+            }
+        }
+
+        fn measure(&self) -> Result<serde_json::Value, String> {
+            cargo_git_source_in(&self.root, &self.oid, &self.cache, false, unsafe {
+                libc::geteuid()
+            })
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.directory)
+                .expect("remove only owned local source fixture");
+        }
+    }
+
+    #[test]
+    fn cargo_materialization_measures_children_and_keeps_core_strict() {
+        let fixture = Fixture::new();
+        let measured = fixture.measure().expect("exact Cargo materialization");
+        assert_eq!(measured["commit"], fixture.oid);
+        assert_eq!(measured["gitlinks"].as_array().unwrap().len(), 1);
+        assert_eq!(measured["cargo_marker_before"]["bytes_hex"], "");
+        assert_eq!(
+            measured["cargo_marker_before"],
+            measured["cargo_marker_after"]
+        );
+        assert_eq!(measured["before"], measured["after"]);
+        assert_eq!(fixture.measure().unwrap(), measured);
+        assert!(
+            source(&fixture.root, false).is_err(),
+            "core policy must still reject markers"
+        );
+        assert!(
+            cargo_git_source_in(
+                &fixture.root,
+                &fixture.oid,
+                &fixture.directory,
+                false,
+                unsafe { libc::geteuid() }
+            )
+            .is_err(),
+            "non-Cargo checkout shape must refuse"
+        );
+    }
+
+    #[test]
+    fn cargo_materialization_refuses_unowned_wrong_markers_and_unknown_files() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join(".cargo-ok");
+        std::fs::write(&path, b"not bookkeeping").unwrap();
+        assert!(fixture.measure().is_err());
+        marker(&fixture.root);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(fixture.measure().is_err());
+        marker(&fixture.root);
+        assert!(
+            cargo_git_source_in(
+                &fixture.root,
+                &fixture.oid,
+                &fixture.cache,
+                false,
+                unsafe { libc::geteuid() }.wrapping_add(1)
+            )
+            .is_err()
+        );
+        assert!(cargo_marker(&fixture.root, unsafe { libc::geteuid() }.wrapping_add(1)).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            fixture.measure().is_err(),
+            "missing completion marker must refuse"
+        );
+        std::os::unix::fs::symlink("source.rs", &path).unwrap();
+        assert!(fixture.measure().is_err());
+        std::fs::remove_file(&path).unwrap();
+        marker(&fixture.root);
+        let unknown = fixture.root.join("unknown-input");
+        std::fs::write(&unknown, b"").unwrap();
+        assert!(fixture.measure().is_err());
+        std::fs::remove_file(unknown).unwrap();
+        let nested_unknown = fixture.root.join("child/unknown-input");
+        std::fs::write(&nested_unknown, b"").unwrap();
+        assert!(
+            fixture.measure().is_err(),
+            "nested unknown input must refuse"
+        );
+        std::fs::remove_file(nested_unknown).unwrap();
+        command(&fixture.root, &["add", "--", ".cargo-ok"]);
+        assert!(
+            fixture.measure().is_err(),
+            "tracked marker is not Cargo bookkeeping"
+        );
+    }
+
+    #[test]
+    fn cargo_materialization_refuses_changed_sources_refs_flags_and_missing_children() {
+        let fixture = Fixture::new();
+        let child = fixture.root.join("child");
+        std::fs::write(child.join("source.rs"), b"changed source\n").unwrap();
+        assert!(
+            fixture.measure().is_err(),
+            "nested tracked mutation must refuse"
+        );
+        assert!(
+            source_digest(&child, false).is_err(),
+            "canonical byte check must refuse actual changed blob"
+        );
+        std::fs::write(child.join("source.rs"), b"original source\n").unwrap();
+        std::fs::write(fixture.root.join("source.rs"), b"staged source\n").unwrap();
+        command(&fixture.root, &["add", "--", "source.rs"]);
+        assert!(
+            fixture.measure().is_err(),
+            "staged source mutation must refuse"
+        );
+        command(&fixture.root, &["restore", "--staged", "--", "source.rs"]);
+        std::fs::write(fixture.root.join("source.rs"), b"original source\n").unwrap();
+        command(
+            &fixture.root,
+            &["update-index", "--assume-unchanged", "source.rs"],
+        );
+        assert!(fixture.measure().is_err(), "index masking must refuse");
+        command(
+            &fixture.root,
+            &["update-index", "--no-assume-unchanged", "source.rs"],
+        );
+        let moved = fixture.directory.join("missing-child");
+        std::fs::rename(&child, &moved).unwrap();
+        assert!(
+            fixture.measure().is_err(),
+            "required materialized child must exist"
+        );
+        std::os::unix::fs::symlink(&moved, &child).unwrap();
+        assert!(
+            fixture.measure().is_err(),
+            "symlinked materialized child must refuse"
+        );
+        std::fs::remove_file(&child).unwrap();
+        std::fs::rename(&moved, &child).unwrap();
+        std::fs::write(child.join("source.rs"), b"another committed child\n").unwrap();
+        command(&child, &["add", "--", "source.rs"]);
+        command(&child, &["commit", "--quiet", "-m", "different child"]);
+        assert!(
+            fixture.measure().is_err(),
+            "changed gitlink HEAD must refuse"
+        );
+        assert!(
+            cargo_git_source_in(
+                &fixture.root,
+                &"0".repeat(40),
+                &fixture.cache,
+                false,
+                unsafe { libc::geteuid() }
+            )
+            .is_err(),
+            "wrong metadata revision must refuse"
+        );
+        command(&fixture.root, &["add", "--", "child"]);
+        command(
+            &fixture.root,
+            &["commit", "--quiet", "-m", "different root"],
+        );
+        assert!(
+            fixture.measure().is_err(),
+            "changed root reference must refuse"
+        );
+    }
 }

@@ -96,6 +96,7 @@ rust_library(
                     "reverie-sabre-stats": {"optional": True},
                 },
                 "build-dependencies": {
+                    "libc": {"version": "0.2.186"},
                     "sha1_smol": {"version": "1.0.1"},
                     "serde": {"version": "1.0.219", "features": ["derive"]},
                     "serde_json": {"version": "1.0.140"},
