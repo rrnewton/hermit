@@ -1199,7 +1199,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // interpolate_refuses_schedules_recorded_under_different_sleep_registrations
     // and detcore-model's config::tests::
     // the_sleep_registration_is_printed_when_set_and_never_enters_the_legacy_form: 1907.
-    ("test.regular_crates", 1907),
+    // And detcore-model's
+    // config::tests::first_pass_sleep_registration_is_the_default_only_where_signal_state_is_read
+    // (https://github.com/rrnewton/hermit/pull/4682): 1908.
+    ("test.regular_crates", 1908),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3081,7 +3084,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::test::a_replay_registers_queued_sleeps_as_its_record_says and
     // preemptions::tests::the_sleep_registration_rule_round_trips (--sleep-registration;
     // race search keeps registering sleeps when chosen): 2822.
-    ("test.detcore_unit", 2822),
+    // And scheduler::test::{a_scheduler_signal_after_a_parked_nanosleep_deadline_leaves_it_to_complete,
+    // a_sleep_the_drain_admits_registers_in_the_same_pass} and
+    // scheduler::parked_tests::{the_controlled_loop_refresh_registers_a_sleep_filed_during_maintenance,
+    // the_controlled_loop_registers_a_sleep_its_drain_admits}
+    // (https://github.com/rrnewton/hermit/pull/4682): 2826.
+    ("test.detcore_unit", 2826),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4377,7 +4385,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 676),
+    // And a_signal_after_a_sleeps_deadline_does_not_interrupt_it and
+    // an_ignored_or_blocked_sigchld_does_not_end_a_sleep
+    // (https://github.com/rrnewton/hermit/pull/4682): 678.
+    ("test.cli", 678),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4920,7 +4931,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 595),
+    // And the same two sleep-signal guest tests, not excluded: 597.
+    ("test.cli_on_host", 597),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5395,7 +5407,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // replayer test and keeps the population at 2787.
     // And the same three queued-sleep registration units: 2820, listed.
     // And the same two registration-rule units: 2822.
-    ("test.detcore_unit_on_host", 2822),
+    // And the same four sleep-registration units: 2826.
+    ("test.detcore_unit_on_host", 2826),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5979,7 +5992,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1880.
     // Train 6 recount (measured on 21f770f6 base): 1885.
     // And the same sleep-registration interpolation and config tests: 1893.
-    ("test.regular_crates_on_host", 1893),
+    // And the same default-rule unit: 1894.
+    ("test.regular_crates_on_host", 1894),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
