@@ -37348,9 +37348,9 @@ fn a_signal_to_the_senders_own_process_waits_for_the_sender_beside_a_runnable_si
 /// the main thread's previous syscall and its `kill`'s entry, and hold that
 /// `kill` until the worker's next syscall. So the `kill` starts with `n`
 /// pending on the main thread's private queue, which Linux dequeues before the
-/// shared SIGUSR1. Both the same signal (SIGUSR1) and another (SIGUSR2) must
-/// refuse by name; with `--allow-unsupported-syscalls` the `kill` returns
-/// ENOSYS.
+/// shared SIGUSR1. Both the same signal (SIGUSR1) and another (SIGUSR2) are
+/// forwarded: the forced run, under `--strict --verify --verify-strict` at
+/// bitwise parity, refuses nothing and the `kill` returns 0.
 #[test]
 fn a_signal_pending_on_the_sender_no_longer_refuses_its_send_to_its_own_process() {
     let guest = own_process_signal_guest().to_str().unwrap().to_owned();
@@ -37362,12 +37362,20 @@ fn a_signal_pending_on_the_sender_no_longer_refuses_its_send_to_its_own_process(
     )
     .unwrap();
     for signal in ["10", "12"] {
-        let run = |spec: &Path| {
-            hermit(&[
-                "--log",
-                "info",
-                "run",
-                "--allow-unsupported-syscalls",
+        // The forced run is the canonical L2 check, so it may refuse nothing.
+        let run = |spec: &Path, verdict: Option<&Path>| {
+            let mut args = vec!["--log", "info", "run"];
+            match verdict {
+                Some(verdict) => args.extend([
+                    "--strict",
+                    "--verify",
+                    "--verify-strict",
+                    "--verify-json",
+                    verdict.to_str().unwrap(),
+                ]),
+                None => args.push("--allow-unsupported-syscalls"),
+            }
+            args.extend([
                 "--happens-before",
                 spec.to_str().unwrap(),
                 "--timeout",
@@ -37376,9 +37384,10 @@ fn a_signal_pending_on_the_sender_no_longer_refuses_its_send_to_its_own_process(
                 guest.as_str(),
                 "pending",
                 signal,
-            ])
+            ]);
+            hermit(&args)
         };
-        let calibration = run(&inert);
+        let calibration = run(&inert, None);
         let log = stderr(&calibration);
         // `[syscall][detcore, dtid T] finish syscall #N: NAME(`
         let count = |name: &str| {
@@ -37411,7 +37420,10 @@ fn a_signal_pending_on_the_sender_no_longer_refuses_its_send_to_its_own_process(
             ),
         )
         .unwrap();
-        let forced = run(&spec);
+        let verdict = directory
+            .path()
+            .join(format!("pending-{signal}-verify.json"));
+        let forced = run(&spec, Some(&verdict));
         let log = stderr(&forced);
         assert!(forced.status.success(), "signal {signal}:\n{log}");
         assert_eq!(
@@ -37423,6 +37435,10 @@ fn a_signal_pending_on_the_sender_no_longer_refuses_its_send_to_its_own_process(
             !log.contains("is not supported"),
             "signal {signal}: the send must not be refused:\n{log}"
         );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "signal {signal}: {report}");
     }
 }
 
@@ -37438,7 +37454,8 @@ fn a_signal_pending_on_the_sender_no_longer_refuses_its_send_to_its_own_process(
 /// sleep, so the timer's copy (the scheduler's) is still in the shared queue
 /// and Linux dequeues it before SIGTERM. The send is forwarded, so that order
 /// is the kernel's own; before, Hermit refused it rather than reproduce the
-/// order itself.
+/// order itself. The forced run is checked under `--strict --verify
+/// --verify-strict` at bitwise parity.
 #[test]
 fn a_scheduler_signal_left_in_the_shared_queue_no_longer_refuses_a_later_send() {
     let guest = own_process_signal_guest().to_str().unwrap().to_owned();
@@ -37449,12 +37466,20 @@ fn a_scheduler_signal_left_in_the_shared_queue_no_longer_refuses_a_later_send() 
         r#"{"version": 1, "events": {"inert": {"thread": "3", "syscalls": 1000000000}}, "edges": []}"#,
     )
     .unwrap();
-    let run = |spec: &Path| {
-        hermit(&[
-            "--log",
-            "info",
-            "run",
-            "--allow-unsupported-syscalls",
+    // The forced run is the canonical L2 check, so it may refuse nothing.
+    let run = |spec: &Path, verdict: Option<&Path>| {
+        let mut args = vec!["--log", "info", "run"];
+        match verdict {
+            Some(verdict) => args.extend([
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+            ]),
+            None => args.push("--allow-unsupported-syscalls"),
+        }
+        args.extend([
             "--happens-before",
             spec.to_str().unwrap(),
             "--timeout",
@@ -37462,9 +37487,10 @@ fn a_scheduler_signal_left_in_the_shared_queue_no_longer_refuses_a_later_send() 
             "--",
             guest.as_str(),
             "stolen",
-        ])
+        ]);
+        hermit(&args)
     };
-    let calibration = run(&inert);
+    let calibration = run(&inert, None);
     let log = stderr(&calibration);
     // `[syscall][detcore, dtid T] finish syscall #N: NAME(`, the first on
     // `thread` if given.
@@ -37494,7 +37520,8 @@ fn a_scheduler_signal_left_in_the_shared_queue_no_longer_refuses_a_later_send() 
         ),
     )
     .unwrap();
-    let forced = run(&spec);
+    let verdict = directory.path().join("stolen-verify.json");
+    let forced = run(&spec, Some(&verdict));
     let log = stderr(&forced);
     assert!(forced.status.success(), "{log}");
     assert_eq!(
@@ -37506,6 +37533,10 @@ fn a_scheduler_signal_left_in_the_shared_queue_no_longer_refuses_a_later_send() 
         !log.contains("is not supported"),
         "the send must not be refused:\n{log}"
     );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
 }
 
 /// A process-directed signal to the sender's own multi-threaded process whose
