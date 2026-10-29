@@ -37764,7 +37764,13 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
 /// was taken in the recording and not in the replay, which diverged (Claude
 /// review of https://github.com/rrnewton/hermit/pull/4510). Keyed to the
 /// thread's own scheduling points it is the same in both; each guest prints
-/// its native line and runs to its normal exit under gdb.
+/// its native line and runs to its normal exit under gdb. Since Reverie
+/// 3b0715351 the gdbserver reports a guest's signals to gdb as stops, as a
+/// native gdbserver does, so the batch `continue` would stop at the guest's
+/// SIGUSR1 and gdb would kill the guest when its command list ran out; the
+/// test therefore passes the guest's signals silently (`handle ... nostop
+/// noprint pass` for SIGUSR1 and SIGUSR2, which `repeat-join-two` also
+/// sends), which is how a user who wants the run to finish drives it.
 #[test]
 fn the_4505_signal_guests_replay_under_gdb() {
     let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
@@ -37777,7 +37783,7 @@ fn the_4505_signal_guests_replay_under_gdb() {
             "record",
             "start",
             "--verify-with-gdbex",
-            "continue",
+            "handle SIGUSR1 nostop noprint pass;handle SIGUSR2 nostop noprint pass;continue",
             "--",
             guest.as_str(),
             mode,
