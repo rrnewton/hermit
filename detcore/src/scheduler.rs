@@ -19575,15 +19575,6 @@ impl Scheduler {
     /// (`Scheduler::is_polling_turn`). Under `--replay-continue-fairly` the
     /// threads of each band are then ordered by their run time
     /// ([`Self::order_continuation_fairly`]).
-    /// The slice length a thread uses instead of `--max-timeslice` while it
-    /// replays a record whose slices ran without that bound
-    /// (`uncapped_replay_backstop`): `None` once the record has run out, so
-    /// the run goes on under the bound, and for every other run.
-    pub(crate) fn uncapped_backstop(&self) -> Option<LogicalTime> {
-        self.uncapped_replay_backstop
-            .filter(|_| self.replay_has_records_left())
-    }
-
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()
@@ -19604,6 +19595,15 @@ impl Scheduler {
         for dettid in threads {
             self.requeue_with_new_priority(dettid, DEFAULT_PRIORITY);
         }
+    }
+
+    /// The slice length a thread uses instead of `--max-timeslice` while it
+    /// replays a record whose slices ran without that bound
+    /// (`uncapped_replay_backstop`): `None` once the record has run out, so
+    /// the run goes on under the bound, and for every other run.
+    pub(crate) fn uncapped_backstop(&self) -> Option<LogicalTime> {
+        self.uncapped_replay_backstop
+            .filter(|_| self.replay_has_records_left())
     }
 
     /// Whether the replay dropped the rest of its schedule after a long run of
