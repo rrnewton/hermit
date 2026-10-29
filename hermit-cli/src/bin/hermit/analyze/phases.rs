@@ -2252,8 +2252,18 @@ impl AnalyzeOpts {
         // the analysis, which then removes what it created like any other
         // ending, and the process dies of the signal (`raise_or_exit`).
         let stop_signals = StopSignals::install()?;
-        let workspace = self.phase0_initialize(self.workspace_retention())?;
+        let mut workspace = self.phase0_initialize(self.workspace_retention())?;
         let result = self.analyze(global);
+        // An analysis that ends with an error keeps its workspace: the error
+        // can name trial files and diagnostics in it (`incomplete_trial`, and
+        // the checks that the final replays repeat the search's outcomes).
+        // One a stop signal ended removes what it created, as before.
+        if let Err(error) = &result
+            && error.downcast_ref::<Stopped>().is_none()
+            && stop::check().is_ok()
+        {
+            workspace.keep("the error above can name files in it");
+        }
         drop(workspace);
         // Restored before the last check, so a signal from here on has its
         // default action rather than being recorded too late to act on.
