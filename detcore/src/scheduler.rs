@@ -17555,8 +17555,18 @@ impl Scheduler {
     ///   as a schedule replay, though, so this count, the first-turn bound and
     ///   the starvation bound (`bound_chaos_starvation`) stay off.
     ///
-    /// That tail is deterministic, and the starvation these rules end can
-    /// come back there.
+    /// In each phase these rules are functions of scheduler state. Where the
+    /// tail begins need not be. A tail that begins at the consumption of the
+    /// last recorded event begins at the same event in every run. A release,
+    /// though, also depends on how many recorded polling retries the replay
+    /// matched, since a matched retry ends the run of unmatched events
+    /// (`Replayer::release_schedule`). That count can be host-timed even
+    /// inside Hermit's stable-filesystem and no-network boundary: a guest call
+    /// on the background path finishes at a host-timed moment, and an actor
+    /// outside the container can make a descriptor ready
+    /// (`Scheduler::is_polling_turn`). So a released tail can begin at another
+    /// event, or not at all. The starvation these rules end can come back in
+    /// the tail.
     ///
     /// The count is of committed turns, host-timed polling retries aside, as for
     /// `previous_turn_tid`: background calls and skipped turns do not commit, and
