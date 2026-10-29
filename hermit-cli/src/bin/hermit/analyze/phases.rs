@@ -115,8 +115,10 @@ struct CompletedScheduleTrial {
 /// schedule nor a captured stack establishes a completed program outcome.
 fn incomplete_trial(error: Error, root: &Path) -> Error {
     let remedy = if error.downcast_ref::<RunTimeoutMarker>().is_some() {
-        "If the guest should terminate, retry with a larger --timeout in the run arguments; \
-         otherwise investigate why the replay does not finish."
+        "If the guest should terminate, raise the applicable bound named in the error: \
+         for hermit analyze's trial bound, increase --trial-timeout; for a run timeout, \
+         use a larger --timeout in the run arguments. The smaller configured bound still \
+         applies. Otherwise investigate why the replay does not finish."
     } else {
         "Resolve the reported run error before retrying analysis."
     };
@@ -1821,6 +1823,19 @@ mod tests {
             );
             if kind == "timeout" {
                 assert!(message.contains("larger --timeout"), "{message}");
+                let remedy = error.to_string();
+                assert!(
+                    remedy.contains("for hermit analyze's trial bound, increase --trial-timeout"),
+                    "{remedy}"
+                );
+                assert!(
+                    remedy.contains("larger --timeout in the run arguments"),
+                    "{remedy}"
+                );
+                assert!(
+                    remedy.contains("The smaller configured bound still applies"),
+                    "{remedy}"
+                );
             }
             assert_eq!(
                 std::fs::read_to_string(dir.path().join("final.stack2")).unwrap(),
