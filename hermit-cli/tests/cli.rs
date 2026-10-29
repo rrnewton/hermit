@@ -38205,9 +38205,11 @@ fn each_signal_to_the_senders_own_process_detcore_cannot_route_is_refused_by_nam
 /// tracing event, and only the policy-refusal status leaves the container, so
 /// under `--verify` the reason is only in run 1's log. The refused run used to
 /// return before the echo: stderr said "the refusal reason is above", and it
-/// was not. The guest's `sender_blocks` send is refused as in
-/// [`each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name`],
+/// was not. The guest's `sender_is_not_sole` send is refused as in
+/// [`each_signal_to_the_senders_own_process_detcore_cannot_route_is_refused_by_name`],
 /// here fail-closed, so run 1 stops with the policy-refusal status.
+/// (`sender_blocks` no longer serves: process-directed sends to a sender
+/// that blocks the signal are now delivered to the thread Linux chooses.)
 ///
 /// - With the flag, the reason is on stderr exactly once, and the
 ///   `--verify-json` record is run 1's `run_failed` policy refusal,
@@ -38219,8 +38221,7 @@ fn each_signal_to_the_senders_own_process_detcore_cannot_route_is_refused_by_nam
 #[test]
 fn verify_print_verify_logs_echoes_a_refused_first_runs_log() {
     let guest = own_process_signal_guest().to_str().unwrap().to_owned();
-    let reason = "by kill is not supported: the sending thread blocks the signal \
-                  (https://github.com/rrnewton/hermit/issues/4034)";
+    let reason = "the sending thread does not block the signal";
     let run = |label: &str, flags: &[&str]| {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let verdict = directory.path().join("verify.json");
@@ -38235,7 +38236,7 @@ fn verify_print_verify_logs_echoes_a_refused_first_runs_log() {
             "60",
         ];
         args.extend_from_slice(flags);
-        args.extend(["--", guest.as_str(), "sender_blocks"]);
+        args.extend(["--", guest.as_str(), "sender_is_not_sole"]);
         // --verify buffers a non-seekable stdin to its end for both runs, so
         // an inherited open pipe would hold the run until the deadline.
         let mut command = hermit_command(&args);
