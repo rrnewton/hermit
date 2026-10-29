@@ -7019,13 +7019,16 @@ impl<T> ThreadState<T> {
     /// the thread's time did not move (the adjacent zero-RCB slices of
     /// `end_timeslice_with_checkpoint`). Filed, such a change point was never
     /// granted, and the replay stalled until `--timeout`. Outside a
-    /// preemption replay nothing is checked or kept.
+    /// preemption replay nothing is checked or kept, and nor is it for an
+    /// edited record (`--replay-edited-preemptions`), which keeps a slice
+    /// whose RCB target is the thread's count and ends it at once
+    /// (`next_edited_slice`): its change points need not advance.
     pub(crate) fn file_replay_change_point(
         &mut self,
         cfg: &Config,
         time: LogicalTime,
     ) -> Result<(), LogicalTime> {
-        if cfg.replay_preemptions_from.is_none() {
+        if cfg.replay_preemptions_from.is_none() || cfg.replay_edited_preemptions {
             return Ok(());
         }
         if let Some(last) = self.last_replay_change_point.filter(|last| time <= *last) {
@@ -7220,11 +7223,17 @@ impl<T> ThreadState<T> {
                         // already behind it, report the overshoot once (the
                         // run then ends in the skid-overshoot policy refusal)
                         // and follow the first recorded end still ahead, so no
-                        // slice ends twice at the same point.
+                        // slice ends twice at the same point. Not for an edited
+                        // record (`--replay-edited-preemptions`): its ended
+                        // slices were skipped above (`next_edited_slice`), and
+                        // the slice kept there is followed as is, even one at
+                        // exactly the thread's branch count, which ends at once.
                         let mut next = Some((end_time, prio, replay_rcb_end));
                         let mut overshoot = None;
                         let mut passed = 0_u64;
-                        while let Some((time, _, rcbs)) = next {
+                        while !cfg.replay_edited_preemptions
+                            && let Some((time, _, rcbs)) = next
+                        {
                             if let Some(behind) =
                                 replay_slice_overshoot(time, rcbs, current_ns, current_rcbs)
                                     .or_else(|| {
@@ -8741,44 +8750,131 @@ mod timeslice_tests {
         }
     }
 
-    /// Without --replay-edited-preemptions, a replay that reaches a recorded
-    /// slice end already passed stops: a faithful replay never does, so the
-    /// replay diverged.
-    #[test]
-    #[should_panic(expected = "needs --replay-edited-preemptions")]
-    fn a_faithful_replay_past_a_recorded_end_stops() {
+    /// The report a faithful replay (no --replay-edited-preemptions) of
+    /// `history` makes from 500 ns ([`replay_from_500ns`]), under
+    /// `--panic-on-rcb-overshoot`, which raises it at the detection point.
+    /// Without that option the run instead counts it and ends in the
+    /// skid-overshoot policy refusal (exit 122).
+    fn faithful_replay_report(history: ThreadHistory) -> String {
         let config = Config {
             replay_edited_preemptions: false,
+            panic_on_rcb_overshoot: true,
             ..edited_replay_config()
         };
-        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            replay_from_500ns(&config, history)
+        }))
+        .expect_err("a faithful replay past a recorded end reports it");
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .expect("the report is a formatted message")
+    }
+
+    /// Without --replay-edited-preemptions, a replay that reaches a recorded
+    /// slice end already passed stops: a faithful replay never does, so the
+    /// replay diverged. It is reported as a skid overshoot (the run ends in
+    /// that refusal), and the report says that an edited record needs
+    /// --replay-edited-preemptions.
+    #[test]
+    fn a_faithful_replay_past_a_recorded_end_stops() {
+        let start = ThreadState::new(DetPid::from_raw(5), &edited_replay_config(), ())
             .thread_logical_time
             .as_nanos();
-        let history = ThreadHistory::new().with_prio_changes(vec![
+        let report = faithful_replay_report(ThreadHistory::new().with_prio_changes(vec![
             (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
             (start + Duration::from_nanos(900), DEFAULT_PRIORITY),
-        ]);
-        replay_from_500ns(&config, history);
+        ]));
+        assert!(
+            report.starts_with(&format!(
+                "{} preemption replay: thread 5 is already at",
+                reverie::SKID_OVERSHOOT_MARKER
+            )),
+            "{report}"
+        );
+        assert!(
+            report.contains("when slice T1 is recorded to end at"),
+            "{report}"
+        );
+        assert!(report.ends_with(EDITED_RECORD_HINT), "{report}");
+        assert!(
+            report.contains("needs --replay-edited-preemptions"),
+            "{report}"
+        );
     }
 
     /// The same for a recorded RCB deadline the PMU count has passed.
     #[test]
-    #[should_panic(expected = "count is already 10. An edited record")]
     fn a_faithful_replay_past_a_recorded_rcb_end_stops() {
+        let start = ThreadState::new(DetPid::from_raw(5), &edited_replay_config(), ())
+            .thread_logical_time
+            .as_nanos();
+        let report = faithful_replay_report(
+            ThreadHistory::new()
+                .with_prio_changes(vec![
+                    (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+                    (start + Duration::from_nanos(900), DEFAULT_PRIORITY),
+                ])
+                .with_preemption_rcbs(vec![4, 90]),
+        );
+        assert!(
+            report.starts_with(reverie::SKID_OVERSHOOT_MARKER),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "(recorded at 4 retired conditional branches, the thread is at 10, 6 past it)"
+            ),
+            "{report}"
+        );
+        assert!(report.ends_with(EDITED_RECORD_HINT), "{report}");
+    }
+
+    /// An edited record keeps #4672's semantics: none of a faithful
+    /// replay's departure reports applies to it. A slice whose RCB target is
+    /// the thread's count while its end has passed is kept and ends at once
+    /// (a faithful replay passes it, `closes_at_last_end`), a slice whose end
+    /// governs is kept, and the change points such slices file need not
+    /// advance. Under `--panic-on-rcb-overshoot` any report would panic.
+    #[test]
+    fn an_edited_record_reports_no_departure() {
         let config = Config {
-            replay_edited_preemptions: false,
+            panic_on_rcb_overshoot: true,
+            replay_preemptions_from: Some(std::path::PathBuf::from("history.json")),
             ..edited_replay_config()
         };
         let start = ThreadState::new(DetPid::from_raw(5), &config, ())
             .thread_logical_time
             .as_nanos();
-        let history = ThreadHistory::new()
-            .with_prio_changes(vec![
-                (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
-                (start + Duration::from_nanos(900), DEFAULT_PRIORITY),
-            ])
-            .with_preemption_rcbs(vec![4, 90]);
-        replay_from_500ns(&config, history);
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        let history = |end: u64, rcbs: u64| {
+            ThreadHistory::new()
+                .with_prio_changes(vec![
+                    (at(end), DEFAULT_PRIORITY + 7),
+                    (at(5000), DEFAULT_PRIORITY),
+                ])
+                .with_preemption_rcbs(vec![rcbs, 500])
+        };
+        let (mut state, prio, now) = replay_from_500ns(&config, history(100, 10));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(
+            (state.end_of_timeslice, state.replay_rcb_end),
+            (Some(at(100)), Some(10))
+        );
+        assert!(state.timeslice_expired());
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+        assert_eq!(state.file_replay_change_point(&config, at(100)), Ok(()));
+        let (state, prio, _) = replay_from_500ns(&config, history(800, 4));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(
+            (state.end_of_timeslice, state.replay_rcb_end),
+            (Some(at(800)), None)
+        );
+        // The same exact-count slice in a faithful replay is passed, and
+        // reported with the hint.
+        let report = faithful_replay_report(history(100, 10));
+        assert!(report.ends_with(EDITED_RECORD_HINT), "{report}");
     }
 
     /// A thread past a recorded slice end, by branch count or (when the
@@ -10311,6 +10407,15 @@ fn closes_at_last_end(
     })
 }
 
+/// The hint every report of a preemption replay that left its record ends
+/// with: a faithful replay never leaves it, but a record edited after it was
+/// recorded (preemptions knocked out, as `hermit analyze` does) does by
+/// design, and is replayed with `--replay-edited-preemptions`, which skips the
+/// slices that already ended instead (`next_edited_slice`) and reports none
+/// of these.
+pub(crate) const EDITED_RECORD_HINT: &str = "An edited record, not the recording of this run's \
+     schedule, needs --replay-edited-preemptions.";
+
 /// Reports a preemption replay's thread about to file a change point at
 /// `time`, not after its last one at `last`
 /// ([`ThreadState::file_replay_change_point`]): a skid overshoot, counted
@@ -10330,12 +10435,13 @@ pub(crate) fn report_stale_replay_filing(
         "{} preemption replay: thread {} would end slice T{} with a change point at {}, not \
          after its last change point at {}: the slice closed with no time in it, which the \
          replayed record never does. The thread files no change point here and runs on as \
-         its final slice; the rest of this run does not replay the record exactly.",
+         its final slice; the rest of this run does not replay the record exactly. {}",
         reverie::SKID_OVERSHOOT_MARKER,
         dettid,
         slice,
         time,
         last,
+        EDITED_RECORD_HINT,
     );
     if panic_on_rcb_overshoot {
         panic!("{message}");
@@ -10376,7 +10482,7 @@ fn report_replay_slice_overshoot(
          The replay goes on from the first recorded end still ahead, or its final slice past \
          every one; the rest of this run does not replay the record exactly. \
          If the record was made under another virtual-time epoch, replay it with that --epoch \
-         (https://github.com/rrnewton/hermit/issues/3413).",
+         (https://github.com/rrnewton/hermit/issues/3413). {}",
         reverie::SKID_OVERSHOOT_MARKER,
         dettid,
         overshoot.now,
@@ -10384,6 +10490,7 @@ fn report_replay_slice_overshoot(
         overshoot.end_time,
         rcbs,
         later,
+        EDITED_RECORD_HINT,
     );
     if panic_on_rcb_overshoot {
         panic!("{message}");

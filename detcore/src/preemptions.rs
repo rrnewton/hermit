@@ -75,6 +75,18 @@ pub struct PreemptionRecord {
     /// before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     cap_preemption_charge: bool,
+    /// Set in a record written by a preemption replay that left a change point
+    /// (and its slowdown-epoch transitions) out of it because it would not
+    /// have come after the thread's last one: the global event count where it
+    /// first did. A record's rows must increase (`Self::validate`), so such a
+    /// change point cannot be written, and the record no longer holds the
+    /// priority the thread had at that instant: it is not an exact record of
+    /// the run, and replaying it warns. That happens to a replay that left the
+    /// record it replays, and to a replay of an edited record
+    /// (`--replay-edited-preemptions`), which keeps a slice that ends at once.
+    /// Absent in every record with nothing left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_departed_at: Option<u64>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -160,6 +172,7 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             cap_preemption_charge: false,
+            replay_departed_at: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -226,6 +239,7 @@ impl PreemptionRecord {
             expired_wait_runs_charged_once,
             host_inputs,
             store_exclusive_failures: _,
+            replay_departed_at,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -274,6 +288,8 @@ impl PreemptionRecord {
             host_inputs: host_inputs.clone(),
             // A count of this run's host, not part of the preemptions.
             store_exclusive_failures: HostObservedCount::default(),
+            // A prefix of an inexact record is inexact too.
+            replay_departed_at: *replay_departed_at,
         }
     }
 
@@ -322,6 +338,12 @@ impl PreemptionRecord {
     /// (zero where none were counted).
     pub fn store_exclusive_failures(&self) -> u64 {
         self.store_exclusive_failures.0
+    }
+
+    /// Where the preemption replay that wrote this record first left a change
+    /// point out of it (a global event count), if it did. See the field.
+    pub fn replay_departed_at(&self) -> Option<u64> {
+        self.replay_departed_at
     }
 
     /// The same record, stating whether the copy was on in the trials it
@@ -412,6 +434,8 @@ impl PreemptionRecord {
             pipe_wake_latency: self.pipe_wake_latency,
             signal_state_copy: self.signal_state_copy,
             cap_preemption_charge: self.cap_preemption_charge,
+            // A record derived from an inexact one is inexact too.
+            replay_departed_at: self.replay_departed_at,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
@@ -478,6 +502,7 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             cap_preemption_charge: false,
+            replay_departed_at: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -942,6 +967,28 @@ mod tests {
 
     use super::*;
     use crate::types::RcbTimeMultiplier;
+
+    /// A record written by a replay that left a change point out of it says
+    /// so, with the global event count where it first did; records derived
+    /// from it keep the mark; a record with nothing left out has none.
+    #[test]
+    fn a_departed_replays_record_says_it_is_not_exact() {
+        let mut writer = PreemptionWriter::new(None);
+        writer.mark_replay_departed(7);
+        writer.mark_replay_departed(9);
+        let written = writer.into_string();
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.replay_departed_at(), Some(7), "the first departure");
+        assert_eq!(back.clone_preemptions_only().replay_departed_at(), Some(7));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, &written).unwrap();
+        assert_eq!(read_recorded_replay_departure(&path), Ok(Some(7)));
+        let exact = PreemptionWriter::new(None).into_string();
+        assert!(!exact.contains("replay_departed_at"), "{exact}");
+        std::fs::write(&path, &exact).unwrap();
+        assert_eq!(read_recorded_replay_departure(&path), Ok(None));
+    }
 
     /// `--pipe-wake-latency` rides in a preemption record as the epoch does:
     /// omitted when off, kept through JSON and through every record a run or
@@ -1902,6 +1949,26 @@ impl PreemptionWriter {
         history.final_prio = next_prio;
     }
 
+    /// Mark this record as written by a preemption replay that left a change
+    /// point out of it, first at global event count `event`
+    /// ([`PreemptionRecord::replay_departed_at`]). Warns once, naming the
+    /// file, so nobody replays it as an exact record.
+    pub fn mark_replay_departed(&mut self, event: u64) {
+        if self.inner.replay_departed_at.is_some() {
+            return;
+        }
+        self.inner.replay_departed_at = Some(event);
+        if let Some(dest) = &self.dest {
+            tracing::warn!(
+                "the preemption record {} is written by a replay that left a change point out of it \
+                 (first at global event {}): it would not have come after its thread's last one, so \
+                 the record is not an exact record of this run, and it says so (replay_departed_at)",
+                dest.display(),
+                event
+            );
+        }
+    }
+
     /// The time of the last change point recorded for `tid`, if any. A new one
     /// must be strictly later ([`Self::insert_reprioritization`]).
     pub fn last_reprioritization_time(&self, tid: DetTid) -> Option<LogicalTime> {
@@ -2066,6 +2133,17 @@ impl Drop for PreemptionWriter {
             panic!("Error while dropping PreemptionWriter: {}", e);
         }
     }
+}
+
+/// Read only whether a preemption record was written by a replay that left a
+/// change point out of it ([`PreemptionRecord::replay_departed_at`]).
+pub fn read_recorded_replay_departure(path: &Path) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct DepartureOnly {
+        #[serde(default)]
+        replay_departed_at: Option<u64>,
+    }
+    Ok(boundary_recording::read_settings::<DepartureOnly>(path)?.replay_departed_at)
 }
 
 /// A reader for a stream of preemption events.

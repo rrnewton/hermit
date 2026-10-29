@@ -3078,7 +3078,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_recording_change_point_at_the_last_ones_instant_still_asserts: 2887, listed.
     // And tool_local's
     // a_replay_change_point_at_the_last_ones_instant_is_caught_before_filing: 2888, listed.
-    ("test.detcore_unit", 2888),
+    // And tool_local's an_edited_record_reports_no_departure, the
+    // scheduler's an_edited_replay_change_point_at_the_last_ones_instant_is_left_out
+    // (an edited record keeps #4672's semantics), and preemptions'
+    // a_departed_replays_record_says_it_is_not_exact (a record that left a
+    // change point out says so): 2891, listed.
+    ("test.detcore_unit", 2891),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5397,7 +5402,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four replay-overshoot units: 2881, listed.
     // And the same six replay end and change-point units: 2887, listed.
     // And the same filing-time change-point unit: 2888, listed.
-    ("test.detcore_unit_on_host", 2888),
+    // And the same two edited-record units and the not-exact record unit:
+    // 2891, listed.
+    ("test.detcore_unit_on_host", 2891),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -2283,6 +2283,10 @@ pub struct Scheduler {
     /// Whether the run replays a preemption record (`--replay-preemptions-from`),
     /// whose threads can diverge from it ([`Scheduler::perform_priority_changepoint`]).
     replays_preemptions: bool,
+    /// Whether that record is an edited one (`--replay-edited-preemptions`),
+    /// whose change points need not advance
+    /// ([`Scheduler::perform_priority_changepoint`]).
+    replays_edited_preemptions: bool,
     /// Fixed by recording configuration or the loaded legacy annotations,
     /// never by whether the mutable per-thread checkpoint queues are empty.
     pub(crate) callback_history_active: bool,
@@ -4394,6 +4398,14 @@ enum ThreadStatus {
     NotRunning,
 }
 
+// The calls of `report_stale_replay_change_point` on this thread, which unit
+// tests read: the process-wide overshoot count is shared with tests running
+// beside them.
+#[cfg(test)]
+thread_local! {
+    static STALE_CHANGE_POINT_REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Reports a preemption replay's change point for `dettid` at `time`, not
 /// after its last recorded one at `last` ([`Scheduler::perform_priority_changepoint`]):
 /// a skid overshoot, counted where every overshoot is
@@ -4405,17 +4417,46 @@ enum ThreadStatus {
 /// own overshoot check, not of distinct departures.
 #[cold]
 fn report_stale_replay_change_point(dettid: DetTid, time: LogicalTime, last: LogicalTime) {
+    #[cfg(test)]
+    STALE_CHANGE_POINT_REPORTS.with(|reports| reports.set(reports.get() + 1));
     reverie::record_skid_overshoot();
     tracing::error!(
         "{} preemption replay: thread {} changed priority at {}, not after its last change \
          point at {}: a slice closed at the instant the last one did, which the replayed \
          record never does. The change point is left out of the new record; the rest of this \
-         run does not replay the record exactly.",
+         run does not replay the record exactly. {}",
         reverie::SKID_OVERSHOOT_MARKER,
         dettid,
         time,
         last,
+        crate::tool_local::EDITED_RECORD_HINT,
     );
+}
+
+/// Warns, once per process (`--verify` builds two schedulers), when the record
+/// a run replays was written by a replay that left change points out of it
+/// ([`crate::preemptions::PreemptionRecord::replay_departed_at`]): it is not a
+/// complete record of any run, so this replay cannot reproduce one.
+fn warn_if_replaying_an_inexact_record(cfg: &Config) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if WARNED.is_completed() {
+        return;
+    }
+    for path in [&cfg.replay_preemptions_from, &cfg.replay_schedule_from]
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(Some(event)) = crate::preemptions::read_recorded_replay_departure(path) {
+            WARNED.call_once(|| ());
+            tracing::warn!(
+                "{} was written by a preemption replay that left change points out of it (first at \
+                 global event {}); it is not an exact record of any run, so this replay does not \
+                 reproduce one",
+                path.display(),
+                event
+            );
+        }
+    }
 }
 
 fn validate_strict_boundary_config(cfg: &Config) -> Result<(), &'static str> {
@@ -4584,7 +4625,12 @@ impl Scheduler {
             priority_rows: BTreeMap::new(),
             priority_births: BTreeSet::new(),
             replayer,
-            replays_preemptions: cfg.replay_preemptions_from.is_some(),
+            replays_preemptions: {
+                warn_if_replaying_an_inexact_record(cfg);
+                cfg.replay_preemptions_from.is_some()
+            },
+            replays_edited_preemptions: cfg.replay_preemptions_from.is_some()
+                && cfg.replay_edited_preemptions,
             boundary_replayer,
             boundary_stacktrace_events,
             recorded_host_inputs,
@@ -15969,6 +16015,9 @@ impl Scheduler {
         // Alter the threads priority and requeue.
         let old_priority = self.priorities.insert(dettid, new_priority);
 
+        // The global event this change point comes at, for a record that has
+        // to leave it out (`PreemptionWriter::mark_replay_departed`).
+        let event = self.recorded_event_count;
         // Do not attempt to record preemptions/priorities when we're dictated by a raw schedule replay.
         if !self.has_schedule_replay()
             && let Some(pw) = &mut self.preemption_writer
@@ -15991,12 +16040,32 @@ impl Scheduler {
             // already describes a run that did not replay exactly. A
             // recording that is not a preemption replay keeps the writer's
             // assertions. A schedule replay writes no rows at all (above).
+            // An edited record (`--replay-edited-preemptions`) keeps a slice
+            // whose RCB target is the thread's count and ends it at once, so
+            // its change points need not advance and that is no departure:
+            // nothing is counted. The change point is still left out of the
+            // new record, whose rows must increase (its writer asserts it,
+            // and a loaded record is refused otherwise), so that record is
+            // not an exact record of this run: a later replay of it skips
+            // the priority the thread held at that instant, which can have
+            // decided which peer ran next. The record says so
+            // (`replay_departed_at`, which warns when written and when
+            // replayed), as when a faithful replay's change point is left
+            // out.
             match pw
                 .last_reprioritization_time(dettid)
                 .filter(|last| guest_time <= *last)
             {
+                Some(last) if self.replays_edited_preemptions => {
+                    debug!(
+                        "[dtid {}] edited record: change point at {} not after the last one at {}, left out of the new record",
+                        dettid, guest_time, last
+                    );
+                    pw.mark_replay_departed(event);
+                }
                 Some(last) if self.replays_preemptions => {
                     report_stale_replay_change_point(dettid, guest_time, last);
+                    pw.mark_replay_departed(event);
                 }
                 _ => {
                     for transition in chaos_epochs {
@@ -29078,6 +29147,58 @@ mod test {
                 .reprioritization_count(spinner),
             2
         );
+    }
+
+    /// In a replay of an edited record (`--replay-edited-preemptions`),
+    /// change points need not advance: the record keeps a slice whose RCB
+    /// target is the thread's count and ends it at once. The second change
+    /// point at one instant is no departure and is not reported, and it is
+    /// still left out of the new record, whose writer asserts increasing
+    /// rows. The thread's priority still changes.
+    #[test]
+    fn an_edited_replay_change_point_at_the_last_ones_instant_is_left_out() {
+        let cfg = Config {
+            chaos: true,
+            record_preemptions: true,
+            replay_preemptions_from: Some(PathBuf::from("history.json")),
+            replay_edited_preemptions: true,
+            ..Config::default()
+        };
+        let (mut scheduler, spinner, _waiter) =
+            chaos_spinner_and_waiter(cfg, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+        scheduler
+            .preemption_writer
+            .as_mut()
+            .unwrap()
+            .register_thread(spinner, DEFAULT_PRIORITY);
+        assert!(scheduler.replays_edited_preemptions);
+        let reports = || STALE_CHANGE_POINT_REPORTS.with(std::cell::Cell::get);
+        let before = reports();
+
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 1, 500);
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 2, 500);
+
+        assert_eq!(reports(), before);
+        let writer = scheduler.preemption_writer.as_ref().unwrap();
+        assert_eq!(writer.reprioritization_count(spinner), 1);
+        assert_eq!(scheduler.priorities[&spinner], DEFAULT_PRIORITY + 2);
+        // The record says it left a change point out (`replay_departed_at`):
+        // it is not an exact record of the run.
+        let event = scheduler.recorded_event_count;
+        let written = scheduler.preemption_writer.take().unwrap().into_string();
+        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(record.replay_departed_at(), Some(event));
+        // The same in a faithful replay is reported, and marks its record too.
+        let (mut faithful, spinner) = replaying_and_recording_spinner(true);
+        spinner_changepoint(&mut faithful, spinner, DEFAULT_PRIORITY + 1, 500);
+        spinner_changepoint(&mut faithful, spinner, DEFAULT_PRIORITY + 2, 500);
+        assert_eq!(reports(), before + 1);
+        let written = faithful.preemption_writer.take().unwrap().into_string();
+        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert!(record.replay_departed_at().is_some());
+        // Only a replay's record can be edited.
+        let (scheduler, _) = replaying_and_recording_spinner(false);
+        assert!(!scheduler.replays_edited_preemptions);
     }
 
     /// A stale change point that carries a slowdown-epoch transition writes
