@@ -230,6 +230,7 @@ impl PreemptionRecord {
             pipe_wake_latency,
             signal_state_copy,
             cap_preemption_charge,
+            guest_ids,
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
@@ -277,6 +278,9 @@ impl PreemptionRecord {
             pipe_wake_latency: *pipe_wake_latency,
             signal_state_copy: *signal_state_copy,
             cap_preemption_charge: *cap_preemption_charge,
+            // How the recorded run numbered its guest: a setting of the run,
+            // which a replay must share (`guest_ids_mismatch`).
+            guest_ids: *guest_ids,
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
@@ -1535,6 +1539,36 @@ mod tests {
                 (true, Some(1234567), true, &record.host_inputs),
                 "prefix of {len} events"
             );
+        }
+    }
+
+    /// How the recorded run numbered its guest is a setting a replay of the
+    /// record must share (`guest_ids_mismatch`), so a prefix record keeps it,
+    /// for any length, as `clone_preemptions_only` does.
+    #[test]
+    fn a_schedule_prefix_keeps_the_guest_numbering() {
+        use detcore_model::pid::GuestIds;
+        let tid = DetTid::from_raw(3);
+        for ids in [
+            None,
+            Some(GuestIds::Host),
+            Some(GuestIds::Chosen {
+                base: 4000,
+                refuse_host_ids: true,
+            }),
+        ] {
+            let mut record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ]);
+            record.guest_ids = ids;
+            for len in [0, 1, 2, 9] {
+                assert_eq!(
+                    record.schedule_prefix(len).guest_ids(),
+                    ids,
+                    "prefix of {len} events"
+                );
+            }
         }
     }
 
