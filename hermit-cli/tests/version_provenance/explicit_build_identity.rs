@@ -20,6 +20,35 @@ fn source_manifest() -> Value {
     toml::from_str(SOURCE_MANIFEST).expect("parse the actual CLI source manifest")
 }
 
+// Identity classification must remain independent of a backend projection.
+// Plant the former aggregate only in these test fixtures: the core manifest
+// must not regain third-party features or dependencies to exercise this case.
+fn source_manifest_with_backend_fixture() -> Value {
+    let mut manifest = source_manifest();
+    let backend_fixture: Value = toml::from_str(
+        r#"[features]
+dbt = ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"]
+third-party-backends = ["dbt"]
+
+[dependencies]
+detcore-dbt = { version = "0.0.0", optional = true }
+reverie-dbt = { version = "0.0.0", optional = true }
+hermit-test-workdir = { version = "0.0.0", optional = true }
+"#,
+    )
+    .expect("parse the synthetic backend projection fixture");
+    for table in ["features", "dependencies"] {
+        let actual = manifest[table].as_table_mut().unwrap();
+        for (name, value) in backend_fixture[table].as_table().unwrap() {
+            assert!(
+                actual.insert(name.clone(), value.clone()).is_none(),
+                "core source unexpectedly declares synthetic backend member {name}"
+            );
+        }
+    }
+    manifest
+}
+
 fn fixture(text: &str) -> TempDir {
     // Join this binary's existing startup Once before tempfile reads its
     // environment, preserving the provenance tests' Git-environment contract.
@@ -51,7 +80,7 @@ fn a_core_source_manifest_without_backend_features_is_still_source() {
 
 #[test]
 fn registry_projection_survives_manifest_serialization_without_dbt() {
-    let mut registry = source_manifest();
+    let mut registry = source_manifest_with_backend_fixture();
     let features = registry["features"].as_table_mut().unwrap();
     features.remove("dbt");
     features["third-party-backends"]
@@ -79,7 +108,7 @@ fn registry_projection_survives_manifest_serialization_without_dbt() {
 
 #[test]
 fn identity_is_independent_of_declared_backend_features() {
-    let mut manifest = source_manifest();
+    let mut manifest = source_manifest_with_backend_fixture();
     assert!(manifest["features"].get("dbt").is_some());
     manifest["package"]["metadata"]["hermit"]["build-identity"] = Value::String("registry".into());
     assert!(classified(&manifest));
