@@ -19057,20 +19057,15 @@ impl Scheduler {
     /// for ever behind a foreground thread that never blocks, a thread the
     /// schedule readmitted at the deferred priority included
     /// (https://github.com/rrnewton/hermit/issues/4472). The point is the
-    /// consumption of the last recorded event, or the replayer's release of
-    /// the rest of the schedule after a long run of events that match none of
-    /// it (`Replayer::release_schedule`). Consumption of the last recorded
-    /// event is a scheduled event of a running thread, so it is the same in
-    /// every run. A release is not: matching polling retries reset the
-    /// mismatch streak, and retry membership can depend on host readiness,
-    /// so when the release fires can depend on host timing. The release's
-    /// reported event number excludes polling retries and is a stable
-    /// diagnostic coordinate; it does not make the release decision itself
-    /// host-timing independent.
-    /// it (`Replayer::release_schedule`). Either is a scheduled event of a
-    /// running thread, so it is the same in every run. Under
-    /// `--replay-continue-fairly` the threads of each band are then ordered
-    /// by their run time ([`Self::order_continuation_fairly`]).
+    /// consumption of the last recorded event, at the schedule's fixed final
+    /// position, or the replayer's release of the rest of the schedule after a
+    /// long run of events that match none of it (`Replayer::release_schedule`).
+    /// A release can come at another event, or not at all, in another run: a
+    /// polling retry that matches a recorded one ends that run, and how many
+    /// retries the replay matches can be host-timed
+    /// (`Scheduler::is_polling_turn`). Under `--replay-continue-fairly` the
+    /// threads of each band are then ordered by their run time
+    /// ([`Self::order_continuation_fairly`]).
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()

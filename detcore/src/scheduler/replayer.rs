@@ -586,9 +586,7 @@ impl Replayer {
     /// one ends the run, as every matched event does, and how many retries the
     /// replay matches can be host-timed too (`Scheduler::is_polling_turn`). So
     /// the release can come at another event, or not at all, in another run.
-    /// Its number (`Release::event`) leaves every polling retry out, so an
-    /// unmatched retry cannot change it.
-    fn release_schedule(&mut self, event: u64) -> ReplayAction {
+    fn release_schedule(&mut self, current_ix: u64) -> ReplayAction {
         let dropped = self.cursor.by_ref().count();
         self.release = Some(Release {
             event,
