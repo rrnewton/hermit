@@ -2792,6 +2792,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/sleep_deadline_signal.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sleep_deadline_signal.c is owned by hermit-cli/tests/cli.rs: a_signal_after_a_sleeps_deadline_and_an_ignored_sigchld_leave_it_to_finish runs its timer-after-deadline and ignored-sigchld modes under run --strict and requires the exact lines: a timer that lands after a nanosleep's deadline does not end it (first nanosleep 0, no handler), one that lands before does (second nanosleep EINTR, one handler), and a default-ignored SIGCHLD never wakes a sleep. It stays a fixture because the test pins Hermit's first-pass sleep-registration behavior, not a native comparison."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/sleep_restart.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/sleep_restart.c is owned by hermit-cli/tests/cli.rs: kernel_run_sleeps_and_futex_waits_restart_as_on_linux runs its nanosleep, clock_nanosleep, abs, futex and alrm modes natively, under ptrace with --strict, plain and with --no-sequentialize-threads, and (but for abs) under record start --verify --verify-strict, and requires native's lines: a 100 ms nanosleep, relative or absolute clock_nanosleep or FUTEX_WAIT that 40 ignored SIGWINCH end over and over outlasts the third and still ends before they stop, and a SIGALRM handler gets EINTR and the time left. It stays a fixture because the test compares native and Hermit output."
