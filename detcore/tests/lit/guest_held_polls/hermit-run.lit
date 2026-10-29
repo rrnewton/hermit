@@ -46,3 +46,11 @@ RUN: %hermit --log info run -- %me unspec-pair |& awk '/^unspec-pair:/ {print} /
 UNSPEC: unspec-pair: revents 0x1
 UNSPEC-NEXT: classified polls: none
 UNSPEC-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me self-listener |& awk '/^self-listener:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=SELFLISTEN %s
+SELFLISTEN: self-listener: revents 0x1
+SELFLISTEN-NEXT: classified polls: none
+SELFLISTEN-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me joined-listener |& awk '/^joined-listener:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=JOINLISTEN %s
+JOINLISTEN: joined-listener: revents 0x1 0x1
+JOINLISTEN-NEXT: classified polls: none
+JOINLISTEN-NEXT: marks revoked: no

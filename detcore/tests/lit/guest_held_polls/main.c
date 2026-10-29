@@ -47,6 +47,13 @@
 //   unspec-pair a datagram socketpair end that disconnects (connect with
 //               AF_UNSPEC), which its old peer still reaches: its mark is
 //               withdrawn, so its poll is never classified.
+//   self-listener a listener this process passes to itself over a
+//               connection it made, closing the original before it receives
+//               it, so the received copy is a description of its own: its
+//               credentials name this process, but any process may connect
+//               to it, so its poll is never classified.
+//   joined-listener the same, with the original kept open, so the received
+//               copy joins it: neither copy's poll is classified.
 //
 // Use a bogus 'RUN' directive so this test isn't disabled:
 // RUN: true
@@ -204,6 +211,30 @@ static void pass_a_descriptor_mmsg(int fd) {
   memcpy(CMSG_DATA(header), &passed, sizeof(int));
   assert(sendmmsg(fd, &entry, 1, 0) == 1);
   assert(close(passed) == 0);
+}
+
+// Connects to `at` after a pause, so the listener's poller retries meanwhile.
+struct delayed_connect {
+  const struct sockaddr_un* at;
+  socklen_t at_length;
+};
+
+static void* connect_later(void* arg) {
+  struct delayed_connect* target = arg;
+  sleep_ms(20);
+  int fd = connect_to(target->at, target->at_length);
+  (void)fd;
+  return NULL;
+}
+
+// Polls listener `fd` until a thread connects to `at`, then accepts.
+static short poll_listener(int fd, struct delayed_connect* target) {
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, connect_later, target) == 0);
+  short revents = poll_one(fd);
+  assert(pthread_join(thread, NULL) == 0);
+  assert(accept(fd, NULL, NULL) >= 0);
+  return revents;
 }
 
 // Receives one descriptor passed over SCM_RIGHTS on `fd`.
@@ -413,6 +444,27 @@ int main(int argc, char** argv) {
     assert(pthread_create(&thread, NULL, act_later, &writer) == 0);
     printf("unspec-pair: revents %#x\n", poll_one(ends[1]));
     assert(pthread_join(thread, NULL) == 0);
+  } else if (strcmp(mode, "self-listener") == 0) {
+    struct delayed_connect target;
+    struct sockaddr_un second_address;
+    target.at = &second_address;
+    int second = listen_on("hermit-guest-held-polls-3", &second_address, &target.at_length);
+    struct pair channel = same_process_pair(0);
+    pass_descriptor(channel.connecting.fd, second);
+    assert(close(second) == 0);
+    int received = receive_descriptor(channel.accepted);
+    printf("self-listener: revents %#x\n", poll_listener(received, &target));
+  } else if (strcmp(mode, "joined-listener") == 0) {
+    struct delayed_connect target;
+    struct sockaddr_un second_address;
+    target.at = &second_address;
+    int second = listen_on("hermit-guest-held-polls-4", &second_address, &target.at_length);
+    struct pair channel = same_process_pair(0);
+    pass_descriptor(channel.connecting.fd, second);
+    int received = receive_descriptor(channel.accepted);
+    short first = poll_listener(received, &target);
+    short original = poll_listener(second, &target);
+    printf("joined-listener: revents %#x %#x\n", first, original);
   } else {
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;
