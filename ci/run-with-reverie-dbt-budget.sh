@@ -3069,12 +3069,12 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 2f5eea30da16e3eec145fba33063de24a6dc3c69 (2026-10-28): from 33b35d5b16f9ac2c9ee6f8bb7c3be54ec55f1fea.
+# CARRY TO 522a2f314e3f7310f90a44ea7f18e4706f2f69dc (2026-10-28): from 2f5eea30da16e3eec145fba33063de24a6dc3c69.
 # Interval: Counter2 lifecycle reports in the global owner (96a9ddb5),
 # generic command cases through actual DBT Tools (958575f9), the shared
 # ChromeTrace caller with inherited stdin (e1ef57aa) and ChunkyPrint caller
 # convergence (d300bc30) and the reviewed LiteInst catalog refresh
-# (2f5eea30). The reverie-dbt tree changed and the committed
+# (522a2f31). The reverie-dbt tree changed and the committed
 # inventory is 1043. The existing SDK budget carries, not runtime
 # equivalence.
 # CARRY TO 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 (2026-10-28): from 688a542d75af8310c4ddd97eadbf2434abb067ff.
@@ -3084,7 +3084,7 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=2f5eea30da16e3eec145fba33063de24a6dc3c69
+expected_pin=522a2f314e3f7310f90a44ea7f18e4706f2f69dc
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
