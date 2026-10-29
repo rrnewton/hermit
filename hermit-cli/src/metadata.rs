@@ -887,7 +887,6 @@ impl RecordVersion {
 // succeeded at once also took a polling turn that this build no longer
 // takes, so its schedule differs. Both are refused here.
 pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x191);
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
