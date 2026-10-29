@@ -112,7 +112,7 @@ mod tests {
         (11, "8bb87305b1bd45a3", "dafaa96d8b8cb3ad"),
         // Adds `GlobalRequest::CommitFatalDelivery`; removes `GlobalRequest::RecordFatalSignal`; adds `GlobalResponse::CommitFatalDelivery`; removes `GlobalResponse::RecordFatalSignal`
         // (https://github.com/rrnewton/hermit/pull/4676, renumbered to 12 at landing).
-        (12, "ab01c6abb5daa6d7", "dafaa96d8b8cb3ad"),        // Adds `GlobalRequest::NextGuestId`, `GlobalRequest::GaveHostId`; adds `GlobalResponse::NextGuestId`, `GlobalResponse::GaveHostId`
+        (12, "ab01c6abb5daa6d7", "dafaa96d8b8cb3ad"), // Adds `GlobalRequest::NextGuestId`, `GlobalRequest::GaveHostId`; adds `GlobalResponse::NextGuestId`, `GlobalResponse::GaveHostId`
         // (https://github.com/rrnewton/hermit/pull/4725, renumbered to 13 at integration).
         (13, "e90aa06d6d08d5fc", "dafaa96d8b8cb3ad"),
     ];
