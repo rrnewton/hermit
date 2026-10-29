@@ -34,6 +34,7 @@ use crate::analyze::types::AnalyzeOpts;
 use crate::analyze::types::ExitStatusConstraint;
 use crate::analyze::types::Report;
 use crate::analyze::types::ReportCriticalEvent;
+use crate::analyze::types::TrialTimeout;
 use crate::container::RunTimeoutMarker;
 use crate::global_opts::GlobalOpts;
 use crate::logdiff::LogDiffCLIOpts;
@@ -681,7 +682,7 @@ impl AnalyzeOpts {
 
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Returns the results of the target run.
-    fn phase1_establish_target_run(&self) -> Result<RunData, Error> {
+    fn phase1_establish_target_run(&mut self) -> Result<RunData, Error> {
         let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
             // `to_repro` is already a complete `hermit ... run ...` command.
@@ -694,6 +695,13 @@ impl AnalyzeOpts {
             let preempts_path = run1data.preempts_path_out();
             // Copy preempts to the output location as though they were recorded by this run:
             std::fs::copy(p, preempts_path).expect("copy file to succeed");
+            if self.trial_timeout == TrialTimeout::Auto {
+                eprintln!(
+                    ":: --run1-preemptions runs no target run to measure, so runs are not \
+                     bounded until analyze replays the record to verify it (not every search \
+                     does); pass --trial-timeout=SECONDS to bound every trial."
+                );
+            }
             // Careful, returning a NON-launched RunData just to contain the output path.
             return Ok(run1data);
         }
@@ -701,6 +709,7 @@ impl AnalyzeOpts {
         // Translate the seed into a set of preemptions we can work from.
         let mut run1data = run1data.with_preemption_recording();
         run1data.launch()?;
+        self.record_endpoint(&run1data);
 
         if !run1data.is_a_match() {
             if self.search {
@@ -710,7 +719,9 @@ impl AnalyzeOpts {
                         .red()
                         .bold()
                 );
-                self.do_search()
+                let target = self.do_search()?;
+                self.record_endpoint(&target);
+                Ok(target)
             } else {
                 bail!("FAILED. The run did not match the target criteria. Try --search.");
             }
@@ -853,7 +864,7 @@ impl AnalyzeOpts {
     ///
     /// Returns a path to a file containing recorded schedule events for the baseline run.
     pub fn phase4_choose_baseline_sched_events(
-        &self,
+        &mut self,
         matching_pr: PreemptionRecord,
     ) -> anyhow::Result<RunData> {
         if self.minimize {
@@ -875,6 +886,7 @@ impl AnalyzeOpts {
                     pr = newrun.preempts_out().clone();
                     ix += 1;
                 } else {
+                    self.record_endpoint(&newrun);
                     return Ok(newrun);
                 }
             }
@@ -909,6 +921,7 @@ impl AnalyzeOpts {
                 ro.det_opts.det_config.chaos = false;
             }
             newrun.launch()?;
+            self.record_endpoint(&newrun);
             eprintln!(
                 ":: Recorded schedule from {} as baseline run ({})",
                 from_where,
@@ -1202,12 +1215,25 @@ impl AnalyzeOpts {
         critical_event_index: usize,
         expected_match: bool,
     ) -> Result<(Option<PrettyBacktrace>, Option<PrettyBacktrace>), Error> {
-        let (rundata, stack1_path, stack2_path) = self.launch_for_stacktraces(
+        self.run_and_retrieve_stacks_with(
             runname,
-            &final_path,
-            critical_event_index as u64,
+            final_path,
+            critical_event_index,
+            expected_match,
             RunData::launch,
-        )?;
+        )
+    }
+
+    pub(super) fn run_and_retrieve_stacks_with(
+        &self,
+        runname: &str,
+        final_path: PathBuf,
+        critical_event_index: usize,
+        expected_match: bool,
+        launch: impl FnOnce(&mut RunData) -> anyhow::Result<()>,
+    ) -> Result<(Option<PrettyBacktrace>, Option<PrettyBacktrace>), Error> {
+        let (rundata, stack1_path, stack2_path) =
+            self.launch_for_stacktraces(runname, &final_path, critical_event_index as u64, launch)?;
         let res = rundata.is_a_match();
         eprintln!(
             "\n:: {}",
@@ -1243,6 +1269,7 @@ impl AnalyzeOpts {
         self.refuse_options_trials_do_not_apply()?;
         self.refuse_outputs_trials_overwrite()?;
         self.refuse_unqualified_trial_timeout()?;
+        self.refuse_unenforceable_trial_timeout()?;
         self.install_trial_pmu_config()?;
         self.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
         if let Some(notice) =
@@ -1426,7 +1453,7 @@ impl AnalyzeOpts {
     /// would be unnecessary if we recorded that each time as we minimize.
     ///
     /// Argument: the last on-target run that was preemption based.
-    fn save_final_target_sched_events(&self, mut last_run: RunData) -> anyhow::Result<RunData> {
+    fn save_final_target_sched_events(&mut self, mut last_run: RunData) -> anyhow::Result<RunData> {
         let pr = last_run.preempts_out();
         if pr.contains_schedevents() {
             let path = last_run.preempts_path_out();
@@ -1435,6 +1462,7 @@ impl AnalyzeOpts {
                 "Using the last run as the target endpoint ({} contains sched events)",
                 path.file_name().unwrap().to_string_lossy()
             ));
+            self.record_endpoint(&last_run);
             Ok(last_run)
         } else {
             // Verify that the new preemption record does in fact now cause a matching execution,
@@ -1448,6 +1476,7 @@ impl AnalyzeOpts {
                 .replaying_the_target_record(newrun, last_run.preempts_path_out().to_path_buf())
                 .with_schedule_recording();
             newrun.launch()?;
+            self.record_endpoint(&newrun);
             eprintln!("    {}", newrun.to_repro());
             if !newrun.is_a_match() {
                 bail!("Final preemption record still does not match target criteria");
@@ -1592,6 +1621,60 @@ mod tests {
     use super::*;
     use crate::container::LogCapExceeded;
     use crate::container::PolicyRefusal;
+
+    /// Capturing both stacks is not proof that the candidate completed. This
+    /// drives the final adapter used by production reporting, including its
+    /// expected-outcome comparator, rather than only the stack launcher.
+    #[test]
+    fn a_timed_out_final_replay_cannot_validate_the_expected_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(dir.path().to_path_buf());
+        let stack: PrettyBacktrace = serde_json::from_value(serde_json::json!({
+            "thread_id": 3,
+            "thread_name": "guest",
+            "frames": [{
+                "frame": { "ip": 4096, "is_signal": false },
+                "symbol": null,
+                "locations": []
+            }]
+        }))
+        .unwrap();
+        let bytes = serde_json::to_vec(&stack).unwrap();
+        for expected_match in [false, true] {
+            let result = options.run_and_retrieve_stacks_with(
+                "unfinished_final",
+                dir.path().join("candidate.json"),
+                1,
+                expected_match,
+                |run| {
+                    assert!(!run.has_launched());
+                    for extension in ["stack1", "stack2"] {
+                        std::fs::write(run.root_path().with_extension(extension), &bytes)?;
+                    }
+                    Err(Error::new(RunTimeoutMarker))
+                },
+            );
+            let error =
+                result.expect_err("captured stacks must not certify an unfinished candidate");
+            assert!(
+                error.downcast_ref::<RunTimeoutMarker>().is_some(),
+                "{error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains("no program outcome was established"),
+                "{error:#}"
+            );
+            for extension in ["stack1", "stack2"] {
+                assert_eq!(
+                    std::fs::read(dir.path().join(format!("unfinished_final.{extension}")))
+                        .unwrap(),
+                    bytes,
+                    "retain captured diagnostics"
+                );
+            }
+        }
+    }
 
     /// Exercise analyze's production adapter, not an error supplied directly
     /// to schedule_search: an unfinished midpoint must not replace a completed

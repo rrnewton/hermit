@@ -13318,6 +13318,30 @@ impl RunOpts {
             .map(|seconds| Duration::from_secs(seconds.get()))
     }
 
+    /// Whether this run's backend enforces `--timeout` (see
+    /// [`Self::ensure_timeout_supported`]). in-guest-trap runs the in-guest
+    /// LiteInst runtime, so it takes liteinst's answer here; both are refused
+    /// `--timeout` earlier by `refuse_unqualified_liteinst_in_guest_options`.
+    pub(crate) fn backend_enforces_timeout(&self) -> bool {
+        matches!(
+            self.runtime_backend(),
+            Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap
+        )
+    }
+
+    /// Whether `hermit analyze` can bound this run with a `--timeout`: its
+    /// backend enforces one, and it does not run the in-guest runtime, which
+    /// refuses one (`refuse_unqualified_liteinst_in_guest_options`).
+    pub(crate) fn accepts_run_timeout(&self) -> bool {
+        self.backend_enforces_timeout() && !self.uses_in_guest_liteinst()
+    }
+
+    /// Bound the run at `seconds` of wall-clock time, or at its own
+    /// `--timeout` where that is shorter: `hermit analyze`'s per-trial bound.
+    pub(crate) fn bound_run_timeout(&mut self, seconds: NonZeroU64) {
+        self.timeout = Some(self.timeout.map_or(seconds, |own| own.min(seconds)));
+    }
+
     /// `--strict` promises a deterministic run, and on the ptrace and e9patch
     /// backends the virtual clock and the preemption points are the guest's
     /// retired conditional branches, read from a performance counter. Where
@@ -13571,19 +13595,10 @@ impl RunOpts {
     /// Fail-closed, so a NEW backend must be qualified deliberately rather than
     /// inheriting a guarantee nobody measured for it.
     pub(crate) fn ensure_timeout_supported(&self) -> Result<(), Error> {
-        if self.timeout.is_none() {
+        if self.timeout.is_none() || self.backend_enforces_timeout() {
             return Ok(());
         }
         let backend = self.runtime_backend();
-        // in-guest-trap runs the in-guest LiteInst runtime, so it takes
-        // liteinst's answer here; both are refused `--timeout` earlier by
-        // `refuse_unqualified_liteinst_in_guest_options`.
-        if matches!(
-            backend,
-            Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap
-        ) {
-            return Ok(());
-        }
         Err(Error::new(PolicyRefusal).context(format!(
             "--timeout is not qualified on the `{backend:?}` backend and hermit will not \
              accept a bound it cannot enforce. Measured 2026-08-26 with `--timeout 3` on a \

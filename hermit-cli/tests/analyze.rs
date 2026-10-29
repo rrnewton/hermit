@@ -49,6 +49,7 @@ struct AnalyzeWorkloads {
     hello_race: PathBuf,
     racewrite_nostdlib: PathBuf,
     nanosleep_nocrash: PathBuf,
+    race_then: PathBuf,
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
@@ -145,10 +146,17 @@ fn workloads() -> &'static AnalyzeWorkloads {
             &nanosleep_nocrash,
         );
 
+        let race_then = build_root.join("analyze_race_then");
+        compile_c_pthread(
+            &repository.join("hermit-cli/tests/fixtures/analyze_race_then.c"),
+            &race_then,
+        );
+
         AnalyzeWorkloads {
             hello_race,
             racewrite_nostdlib,
             nanosleep_nocrash,
+            race_then,
         }
     })
 }
@@ -192,6 +200,31 @@ fn run_analyze(
     assert!(
         combined.contains("Stack trace for thread"),
         "{label}: hermit analyze did not print a guest stack trace\n{combined}"
+    );
+    // Automatic bounds grow with completed endpoint measurements. The exact
+    // formula is unit-tested; a slow host may legitimately announce more than 60.
+    let bounds: Vec<u64> = combined
+        .lines()
+        .filter_map(|line| line.split_once("Runs from here on are bounded at "))
+        .map(|(_, rest)| {
+            rest.split_once(" s of wall-clock time")
+                .expect("the announcement must name seconds")
+                .0
+                .parse()
+                .expect("the announced bound must be an integer")
+        })
+        .collect();
+    assert!(
+        !bounds.is_empty(),
+        "{label}: no automatic trial bound\n{combined}"
+    );
+    assert!(
+        bounds.iter().all(|bound| *bound >= 60),
+        "{label}: {bounds:?}"
+    );
+    assert!(
+        bounds.windows(2).all(|pair| pair[0] < pair[1]),
+        "{label}: {bounds:?}"
     );
     if !expected_output.is_empty() {
         assert!(
@@ -413,4 +446,116 @@ fn bisect_rejects_a_timed_out_replay() {
             "{unsupported_claim}: {combined}"
         );
     }
+}
+
+/// Find a b-first seed using the fixture's terminating mode. The race is the
+/// same with `spin`; only the behavior after a wins changes. This keeps seed
+/// discovery bounded without waiting for every losing seed to time out.
+fn race_then_target_seed() -> u64 {
+    let guest = &workloads().race_then;
+    for seed in 0..40 {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--signal=KILL", "30s"])
+            .arg(hermit_test::hermit_binary())
+            .args(["run", "--chaos", "--timeout=2"])
+            .arg(format!("--seed={seed}"));
+        if let Some(margin) = std::env::var_os(ANALYZE_SKID_MARGIN_ENV) {
+            command.arg(format!("--skid-margin={}", margin.to_string_lossy()));
+        }
+        command.arg("--").arg(guest);
+        let output = hermit_test::hermit_output("terminating race seed discovery", &mut command);
+        match output.status.code() {
+            Some(0) => {
+                assert_eq!(output.stdout, b"b-first\n");
+                return seed;
+            }
+            Some(1) => assert_eq!(output.stdout, b"a-first\n"),
+            _ => panic!("seed discovery did not complete: {output:?}"),
+        }
+    }
+    panic!("no chaos seed in 0..40 lets thread b win the race");
+}
+
+fn assert_spin_trial_stops_analysis(analyze_opts: &[&str], expected_run: &str) {
+    let _guard = analyze_lock();
+    let seed = race_then_target_seed();
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report.json");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=KILL", "30s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "analyze",
+            "--target-stdout=b-first",
+            "--target-exit-code=0",
+            "--trial-timeout=3",
+        ])
+        .args(analyze_opts)
+        .arg(format!("--run1-seed={seed}"))
+        .arg(format!("--report-file={}", report.display()));
+    add_calibrated_skid_margin(&mut command, expected_run);
+    command
+        .args(["--", "--chaos", "--"])
+        .arg(&workloads().race_then)
+        .arg("spin");
+    let output = hermit_test::hermit_output("analyze bounded spin trial", &mut command);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(output.status.code(), Some(124), "{combined}");
+    assert!(
+        combined.contains("HERMIT_RUN_TIMEOUT class=run-timeout"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("First run matched target criteria"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains(&format!(
+            "{expected_run} reached hermit analyze's bound of 3 s per run"
+        )),
+        "the intended later run must hit the bound: {combined}"
+    );
+    assert!(
+        combined.contains("no program outcome was established"),
+        "{combined}"
+    );
+    assert!(
+        !report.exists(),
+        "an unfinished trial wrote a report: {combined}"
+    );
+    for unsupported_claim in [
+        "counted as the baseline condition",
+        "Completed analysis successfully",
+        "reproduces the good outcome",
+        "determines the program outcome",
+        "decides the outcome",
+        "hermit analyze report",
+        "Searching within the target schedule instead",
+    ] {
+        assert!(
+            !combined.contains(unsupported_claim),
+            "{unsupported_claim}: {combined}"
+        );
+    }
+}
+
+/// A prefix continued without chaos spins forever. Its timeout must stop the
+/// search rather than become a completed non-target outcome.
+#[test]
+#[ignore = "requires PMU and mount namespaces; selected by the calibrated analyze validation node"]
+fn analyze_bounds_trials_that_never_end() {
+    assert_spin_trial_stops_analysis(&["--prefix-search"], "prefix_round_001");
+}
+
+/// A timed-out default baseline cannot become an endpoint or justify a report.
+#[test]
+#[ignore = "requires PMU and mount namespaces; selected by the calibrated analyze validation node"]
+fn analyze_rejects_a_baseline_that_never_ends() {
+    assert_spin_trial_stops_analysis(&[], "run2_baseline");
 }

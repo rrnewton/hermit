@@ -488,7 +488,7 @@
       "synthetic": "calibrated_analyze_tests",
       "argv": [
         "-E",
-        "test(=analyze_hello_race) | test(=bisect_rejects_a_timed_out_replay)",
+        "test(=analyze_hello_race) | test(=bisect_rejects_a_timed_out_replay) | test(=analyze_bounds_trials_that_never_end) | test(=analyze_rejects_a_baseline_that_never_ends)",
         "--",
         "--ignored",
         "--test-threads=1"
