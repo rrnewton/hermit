@@ -1225,7 +1225,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // moved from hermit-cli into Detcore and grew there: 1934, listed.
     // And detcore-model's config::tests::
     // rewrite_exclusives_in_memory_never_enters_the_legacy_form: 1935.
-    ("test.regular_crates", 1935),
+    // Less #4740's tests, which main counts since train 10: 1934.
+    ("test.regular_crates", 1934),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3175,7 +3176,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // moved from hermit-cli into Detcore and grew there: 3286, listed.
     // And a_schedule_prefix_keeps_the_in_memory_exclusive_rewrite_setting,
     // for main's prefix records: 3287.
-    ("test.detcore_unit", 3287),
+    // Less #4740's tests, which main counts since train 10: 3275.
+    ("test.detcore_unit", 3275),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4514,7 +4516,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 749, listed.
     // And this branch's CLI tests: 748.
-    ("test.cli", 748),
+    // Less #4740's tests, which main counts since train 10: 747.
+    ("test.cli", 747),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5092,11 +5095,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 668, listed.
     // And the same tests: 667.
-    ("test.cli_on_host", 667),
+    // Less #4740's tests, which main counts since train 10: 666.
+    ("test.cli_on_host", 666),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
-    // Kept equal to the second test.regular_crates_on_host entry below: 1921.
-    ("test.regular_crates_on_host", 1921),
+    // Kept equal to the second test.regular_crates_on_host entry below: 1920.
+    ("test.regular_crates_on_host", 1920),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5608,7 +5612,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 3286, listed.
     // And the same prefix-record unit: 3287.
-    ("test.detcore_unit_on_host", 3287),
+    // Less #4740's tests, which main counts since train 10: 3275.
+    ("test.detcore_unit_on_host", 3275),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6239,7 +6244,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 1920, listed.
     // And the same legacy-form unit: 1921.
-    ("test.regular_crates_on_host", 1921),
+    // Less #4740's tests, which main counts since train 10: 1920.
+    ("test.regular_crates_on_host", 1920),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
