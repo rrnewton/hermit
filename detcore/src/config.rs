@@ -113,6 +113,8 @@ mod tests {
         // Adds `GlobalRequest::CommitFatalDelivery`; removes `GlobalRequest::RecordFatalSignal`; adds `GlobalResponse::CommitFatalDelivery`; removes `GlobalResponse::RecordFatalSignal`
         // (https://github.com/rrnewton/hermit/pull/4676, renumbered to 12 at landing).
         (12, "ab01c6abb5daa6d7", "dafaa96d8b8cb3ad"),
+        // Retypes `GlobalRequest::TraceSchedEvent` (#4738).
+        (13, "32dde58263c46619", "dafaa96d8b8cb3ad"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
