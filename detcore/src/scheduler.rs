@@ -9801,6 +9801,10 @@ impl Scheduler {
         // one, is how the recording got there, and a FIFO open's jump waits
         // for the replay's own poll to find nothing else can run; moving time
         // here would pass it first. So the replay leaves time to that jump.
+        // A replay that has drifted and never reaches the jump's event now
+        // waits on it instead of on this fast-forward; it is off its
+        // recording then, and main's drift limits still apply
+        // (`replayer::REPLAY_KEPT_RETRY_LIMIT` and desync detection).
         if let TimeSkipMode::Driven(expected) = &self.time_skip_mode
             && expected.front().is_some_and(|skip| skip.target <= deadline)
         {

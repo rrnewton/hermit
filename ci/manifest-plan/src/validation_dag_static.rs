@@ -1910,7 +1910,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same unit on main 16a66895f, and on main 32f85d391 (1202): 1203.
     // The same unit on main dc85ec16a (1289): 1290, listed.
     // And this change's Hermit unit tests: 1175.
-    // The same six on main 32f85d391 (1202): 1208, listed.
+    // The same six on main 32f85d391 (1202): 1208.
+    // The same six on main dc85ec16a (1289): 1295, listed.
     ("test.hermit_unit", 1296),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
@@ -3237,9 +3238,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_replay_leaves_time_to_a_recorded_jump_it_has_not_made, from the
     // rebase onto main 0e7fd4bdc: 2830, listed.
     // On main 16a66895f with #4862 (2871), this change's sixteen units and
-    // preemptions' a_schedule_prefix_keeps_the_jumps_its_events_reach: 2888, listed.
     // preemptions' a_schedule_prefix_keeps_the_jumps_its_events_reach: 2888.
-    // On main 32f85d391 with #4862 (2889), the same seventeen units: 2906, listed.
+    // On main 32f85d391 with #4862 (2889), the same seventeen units: 2906.
+    // On main bc60c6a37 with #4862 (3012), the same seventeen units: 3029, listed.
     ("test.detcore_unit", 3091),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
@@ -3590,8 +3591,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // without moving this pin; the shard executed 292, all passing, in
     // the full validate at that head.
     // And this change's lit_fifo_jump_replay_main and
-    // lit_fifo_jump_replay_hermit_run: 294, listed, on main 32f85d391 with
-    // #4862 (292).
+    // lit_fifo_jump_replay_hermit_run: 294, listed, on main dc85ec16a
+    // (292).
     ("test.hermit_integration_2", 294),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
@@ -5698,9 +5699,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3074, listed.
     // And the same tests: 2756.
     // And the same recorded-jump unit: 2830, listed.
-    // The same units on main 16a66895f: 2888, listed.
     // The same units on main 16a66895f: 2888.
-    // The same units on main 32f85d391 (2889): 2906, listed.
+    // The same units on main 32f85d391 (2889): 2906.
+    // The same units on main bc60c6a37 (3012): 3029, listed.
     ("test.detcore_unit_on_host", 3091),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
@@ -5822,7 +5823,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at 360e99b2e24: shard 2 grew to 292 (see its pin), so the
     // whole-node twin executes 61 + 292 + 349 = 702.
     // And scheduler_deadlock's poll-deadlock report: 703, listed.
-    // And the same two lit cases: 702, listed, on main 32f85d391 with #4862 (700).
+    // And the same two lit cases: 704, listed, on main dc85ec16a (702).
     ("test.hermit_integration_on_host", 705),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
@@ -6100,7 +6101,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same unit on main 16a66895f, and on main 32f85d391 (1196): 1197.
     // The same unit on main dc85ec16a (1283): 1284, listed.
     // And the same tests: 1169.
-    // The same six on main 32f85d391 (1196): 1202, listed.
+    // The same six on main 32f85d391 (1196): 1202.
+    // The same six on main dc85ec16a (1283): 1289, listed.
     ("test.hermit_unit_on_host", 1290),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
