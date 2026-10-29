@@ -2860,6 +2860,28 @@ mod tests {
         }
     }
 
+    /// A prefix keeps its source's events, instruction offsets included, so
+    /// it states its source's record format, whether it replays some, all or
+    /// more than all of the schedule's events.
+    #[test]
+    fn a_schedule_prefix_keeps_its_sources_record_format() {
+        let tid = DetTid::from_raw(3);
+        for format in [None, Some(PREEMPTION_RECORD_FORMAT)] {
+            let mut record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ]);
+            record.format_version = format;
+            for len in [0, 1, 2, 9] {
+                assert_eq!(
+                    record.schedule_prefix(len).format_version,
+                    format,
+                    "format {format:?}, prefix of {len} events"
+                );
+            }
+        }
+    }
+
     /// A replay of a schedule's first events keeps the callback checkpoints
     /// of the slices those events end, for the threads they run, and no later
     /// ones: the slice end at the prefix's own end belongs to the event after
