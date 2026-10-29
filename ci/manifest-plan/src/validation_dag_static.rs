@@ -1201,11 +1201,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and forked_child_takes_over_an_inherited_session_serializer_installation_lock:
     // 1906 + 2 = 1908.
     // Trains since then add four (measured with `cargo nextest list` at
-    // 11c35a504a6; the full validate at 24fbff99c7a also saw 1912):
-    // 1908 + 4 = 1912. The pin itself was left at 1910 by that recount;
-    // the full validate at c00dc58e0cd executed 1912 in this selection,
-    // so the pin now records the measured 1912.
-    ("test.regular_crates", 1912),
+    // 11c35a504a6): 1908 + 4 = 1912 was the pre-exclusion listing in that
+    // recount, but the tuple stayed at the executed 1910. Re-measured
+    // with `cargo nextest list --workspace --exclude hermit-detcore
+    // --exclude hermit-detcore-tests --exclude hermit-run --exclude
+    // hermetic_infra_hermit_flaky-tests` at 2436823aeb9: 1910 listed,
+    // matching the full validate at c00dc58e0cd, which ran 1910 in this
+    // selection (1909 passed; the one failure was the hosted-pin
+    // assertion for the twin below, not a count refusal on this node).
+    ("test.regular_crates", 1910),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -6012,7 +6016,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1892 + 2 = 1894 (the local twin's fourteen hosted exclusions are
     // unchanged, so 1894 + 14 = 1908).
     // And the same four since: 1898.
-    ("test.regular_crates_on_host", 1898),
+    // Recount at 2436823aeb9 (bisect dh-mtrkq): the local selection lists
+    // 1910 and all fourteen hosted exclusions are present exactly once,
+    // so the hosted twin executes 1910 - 14 = 1896. Two of the four added
+    // since 1894 are themselves hosted-excluded, so this twin gains only
+    // two, not four: 1894 + 2 = 1896.
+    ("test.regular_crates_on_host", 1896),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
