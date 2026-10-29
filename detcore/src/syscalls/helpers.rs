@@ -4495,15 +4495,24 @@ impl IgnoredSignalShield {
 /// A shield is dropped with its mask still to put back only when the
 /// backend cancelled the handler around it, which it does when the thread
 /// dies during the wait or an injection (a sibling's `exit_group` or
-/// `execve`, a SIGKILL), or when a backend error is ending the run: either
-/// way the mask no longer matters, so there is nothing to put back.
+/// `execve`, a SIGKILL), or when a backend error is ending the run. Drop
+/// cannot tell those apart, so its log claims neither: it says only that
+/// the handler ended with the mask unrestored.
+/// The log line for a shield dropped with its mask still to put back.
+/// It must not claim the thread is gone: Drop cannot prove that (the
+/// handler may also be cancelled by a backend error ending the run).
+fn shield_drop_message(guest_mask: u64) -> String {
+    format!(
+        "an ignored-signal shield ended with its handler, leaving the guest's mask \
+         {guest_mask:#x} unrestored; the handler ended before the mask could be put \
+         back (the thread may have died, or the run may be ending)"
+    )
+}
+
 impl Drop for IgnoredSignalShield {
     fn drop(&mut self) {
         if let Some(guest_mask) = self.guest_mask {
-            tracing::debug!(
-                "an ignored-signal shield ended with its handler, leaving the guest's mask \
-                 {guest_mask:#x} unrestored on a thread that is gone"
-            );
+            tracing::debug!("{}", shield_drop_message(guest_mask));
         }
     }
 }
@@ -6182,6 +6191,18 @@ mod tests {
         drop(IgnoredSignalShield::none());
     }
 
+    /// The drop log must not assert the thread is gone: Drop runs when
+    /// the backend cancels the handler, which also happens when a
+    /// backend error ends the run while the thread still exists.
+    #[test]
+    fn a_dropped_shield_log_does_not_claim_the_thread_is_gone() {
+        let message = shield_drop_message(0x2a);
+        assert!(message.contains("ended with its handler"), "{message}");
+        assert!(message.contains("unrestored"), "{message}");
+        assert!(!message.contains("is gone"), "{message}");
+        assert!(!message.contains("are gone"), "{message}");
+    }
+
     #[test]
     fn an_ignored_signal_shield_blocks_only_what_the_guest_ignores() {
         use crate::syscalls::threads::kernel_sigset_bit as bit;
@@ -7448,6 +7469,23 @@ mod kernel_signal_wait_failures {
             not_restored
         );
         assert!(kernel.lock().unwrap().requested.is_empty());
+    }
+
+    /// A thread gone when an ignored-signal shield is lowered needs no
+    /// restore: `lower` succeeds on `MaskChangeRefused::Gone`.
+    #[tokio::test]
+    async fn a_shield_lowered_for_a_gone_thread_succeeds() {
+        let (mut guest, kernel) = WaitGuest::live(guest_mask());
+        kernel
+            .lock()
+            .unwrap()
+            .setter
+            .push_back(Some(MaskChangeRefused::Gone));
+        let shield = IgnoredSignalShield {
+            guest_mask: Some(guest_mask()),
+        };
+        shield.lower(&mut guest).await.unwrap();
+        assert_eq!(kernel.lock().unwrap().set_calls.len(), 1);
     }
 
     /// A thread that is gone when the mask goes back has nothing to restore.
