@@ -1519,9 +1519,11 @@ pub struct Scheduler {
     /// deadlock check (`Scheduler::only_idle_guest_pollers_remain`).
     fatal_signal_doomed: BTreeSet<DetPid>,
     /// Processes a delivered signal with a fatal default action has doomed,
-    /// recorded at the delivery's commit and forgotten at the reap
-    /// (`record_committed_fatal_signal`, `consume_child_wait`), for the poll
-    /// upgrade's count (`a_committed_doom_is_outstanding`).
+    /// recorded at the delivery's commit, or where it is not committed, and
+    /// forgotten at the reap (`note_fatal_signal_delivery`,
+    /// `consume_child_wait`), for the poll upgrade's count
+    /// (`a_committed_doom_is_outstanding`). Unlike `fatal_signal_doomed` it
+    /// dooms no thread.
     fatal_signals_unreaped: BTreeSet<DetPid>,
     /// Whether the `--pipe-wake-latency` hand-off has logged that it is inert.
     pipe_wake_inert_logged: bool,
@@ -5565,7 +5567,7 @@ impl Scheduler {
         // exceptions below included, until the process's reap: it fails
         // closed where the scheduler cannot tell that the kernel ends the
         // process at a committed point (`a_committed_doom_is_outstanding`).
-        self.fatal_signals_unreaped.insert(process);
+        self.note_fatal_signal_delivery(process);
         if self.thread_tree.is_pid_namespace_init(process)
             || self.exec_teardowns.contains_key(&process)
         {
@@ -17027,14 +17029,13 @@ impl Scheduler {
     /// ends the process, wherever the backend may retire the process's other
     /// threads at that delivery (serialized threads, the guest's own kernel
     /// signal state, no gdbserver: ptrace), `--pipe-wake-latency` or
-    /// `--virtual-timeout` is on, or the run is outside record/replay on a
-    /// delivery path that may file scheduler requests (`records_fatal_doom`),
-    /// except for a PID namespace's init and a process with an exec in
-    /// flight. Elsewhere this sees an unrecorded one once its first victim
-    /// has gone, and the dying thread's removal is ordered, since the
-    /// scheduler waits for a running thread to quiesce. Siblings an exec tore
-    /// down also left without a committed exit, so such a process counts as
-    /// going down too.
+    /// `--virtual-timeout` is on, except for a PID namespace's init and a
+    /// process with an exec in flight; a delivery noted for the poll
+    /// upgrade's count alone dooms nothing (`crate::fatal_delivery_report`).
+    /// Elsewhere this sees an unrecorded one once its first victim has gone,
+    /// and the dying thread's removal is ordered, since the scheduler waits
+    /// for a running thread to quiesce. Siblings an exec tore down also left
+    /// without a committed exit, so such a process counts as going down too.
     fn process_is_going_down(&self, tid: DetTid) -> bool {
         let Some(process) = self.thread_tree.thread_to_leader.get(&tid).copied() else {
             return true;
@@ -31667,6 +31668,29 @@ mod test {
         }
     }
 
+    /// A delivery noted for the poll upgrade's count alone
+    /// (`note_fatal_signal_delivery`, where the delivery is not committed, as
+    /// in a gdbserver session whose client may cancel the signal) stops the
+    /// count until the reap but dooms no thread: the hand-off, the timed and
+    /// filed-retry upgrades and the idle-poller verdict still see its process
+    /// alive. A committed delivery (`record_committed_fatal_signal`) dooms it
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4892 at
+    /// 67ace93b1).
+    #[test]
+    fn a_fatal_delivery_noted_for_the_count_alone_dooms_no_thread() {
+        let mut sched = Scheduler::new(&ptrace_config());
+        let parent = DetPid::from_raw(100);
+        let writer = DetPid::from_raw(200);
+        sched.thread_tree.add_child(parent, parent, true);
+        sched.thread_tree.add_child(parent, writer, true);
+        let thread = DetTid::from_raw(writer.as_raw());
+        sched.note_fatal_signal_delivery(writer);
+        assert!(sched.a_committed_doom_is_outstanding(), "the count stops");
+        assert!(!sched.thread_is_doomed(thread), "noted: not doomed");
+        sched.record_committed_fatal_signal(writer);
+        assert!(sched.thread_is_doomed(thread), "committed: doomed");
+    }
+
     /// No polling retry counts while a committed decision has doomed a
     /// process that has not been reaped (`a_committed_doom_is_outstanding`):
     /// its descriptors close in the kernel at a host-chosen moment, and a
@@ -31697,7 +31721,7 @@ mod test {
                 s.record_committed_sigkill(DetTid::from_raw(writer.as_raw()), Some(writer));
             }),
             ("fatal signal", |s, writer| {
-                s.record_committed_fatal_signal(writer)
+                s.note_fatal_signal_delivery(writer)
             }),
         ];
         for (name, doom) in dooms {

@@ -651,43 +651,102 @@ async fn under_the_gate_an_announcement_for_a_pid_namespace_init_is_refused_befo
     assert_eq!(now, previous, "the test leaves the action it found");
 }
 
-/// A delivery whose default action ends its process records its doom with
-/// the scheduler outside record/replay wherever the delivery may file a
-/// scheduler request, and under `--pipe-wake-latency` always, so that the
-/// poll upgrade's count stops until the reap
+/// A delivery whose default action ends its process is committed, as main
+/// commits it, where its process's other threads may be retired at the
+/// delivery, under `--pipe-wake-latency` and under `--virtual-timeout`;
+/// outside record/replay, wherever
+/// the delivery may file a scheduler request, it is otherwise noted for the
+/// poll upgrade's count alone, so that the count stops until the reap
 /// (`Scheduler::a_committed_doom_is_outstanding`, Claude review of
-/// https://github.com/rrnewton/hermit/pull/4892). A two-phase commit files
-/// none, and record/replay keeps main's schedule.
+/// https://github.com/rrnewton/hermit/pull/4892) without dooming a process a
+/// gdbserver client may still save (Codex review of
+/// https://github.com/rrnewton/hermit/pull/4892 at 67ace93b1). A two-phase
+/// commit files no request, and record/replay keeps main's schedule.
 #[test]
-fn a_fatal_delivery_records_its_doom_outside_record_replay() {
-    let plain = Config {
+fn a_fatal_delivery_is_committed_or_noted_for_the_count_alone() {
+    use super::FatalDeliveryReport::*;
+    let ptrace = Config {
         sequentialize_threads: true,
         ..Config::default()
+    }
+    .with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE);
+    let committed = Committed {
+        may_retire_others: true,
     };
-    assert!(super::records_fatal_doom(&plain, true), "a ptrace delivery");
-    assert!(
-        !super::records_fatal_doom(&plain, false),
-        "a two-phase commit"
+    assert_eq!(super::fatal_delivery_report(&ptrace, true), committed);
+    assert_eq!(
+        super::fatal_delivery_report(&ptrace, false),
+        committed,
+        "main commits whether or not the path may file requests"
     );
-    let recording = Config {
-        recordreplay_modes: true,
-        ..plain.clone()
+    let gdbserver = Config {
+        gdbserver: true,
+        ..ptrace.clone()
     };
-    assert!(
-        !super::records_fatal_doom(&recording, true),
-        "record/replay"
-    );
+    let unserialized = Config {
+        sequentialize_threads: false,
+        ..ptrace.clone()
+    };
+    let dbt = ptrace
+        .clone()
+        .with_backend(|backend| *backend = reverie::BackendCapabilities::DBT);
+    for (case, cfg) in [
+        ("gdbserver", &gdbserver),
+        ("unserialized", &unserialized),
+        ("DBT", &dbt),
+    ] {
+        assert_eq!(super::fatal_delivery_report(cfg, true), CountOnly, "{case}");
+        assert_eq!(
+            super::fatal_delivery_report(cfg, false),
+            Unreported,
+            "{case}, a two-phase commit"
+        );
+        let recording = Config {
+            recordreplay_modes: true,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            super::fatal_delivery_report(&recording, true),
+            Unreported,
+            "{case}, record/replay"
+        );
+    }
+    let virtual_timeout = Config {
+        virtual_timeout: std::num::NonZeroU64::new(1_000_000_000),
+        ..gdbserver.clone()
+    };
+    for (case, cfg) in [
+        ("virtual timeout", virtual_timeout.clone()),
+        (
+            "virtual timeout, record/replay",
+            Config {
+                recordreplay_modes: true,
+                ..virtual_timeout
+            },
+        ),
+    ] {
+        for may_file_requests in [true, false] {
+            assert_eq!(
+                super::fatal_delivery_report(&cfg, may_file_requests),
+                Committed {
+                    may_retire_others: false
+                },
+                "{case}, main's bound alone"
+            );
+        }
+    }
     let pipe_wake = Config {
         pipe_wake_latency: Some(1_000),
-        ..plain
+        ..gdbserver
     };
     assert!(pipe_wake.pipe_wake_latency_in_effect().is_some());
-    assert!(
-        super::records_fatal_doom(&pipe_wake, true),
-        "pipe-wake latency"
-    );
-    assert!(
-        super::records_fatal_doom(&pipe_wake, false),
-        "pipe-wake latency, which refuses two-phase delivery"
-    );
+    for may_file_requests in [true, false] {
+        assert_eq!(
+            super::fatal_delivery_report(&pipe_wake, may_file_requests),
+            Committed {
+                may_retire_others: false
+            },
+            "pipe-wake latency"
+        );
+    }
 }

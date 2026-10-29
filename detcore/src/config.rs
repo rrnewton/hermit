@@ -142,9 +142,11 @@ mod tests {
         (16, "182b80da8855a429", "846052997d97693f"),
         // Adds `Resources.polls_a_named_fifo` (#4692).
         (17, "182b80da8855a429", "f013e36743d8d9e6"),
-        // Adds `Resources.waits_on_guest_held_only`
+        // Adds `Resources.waits_on_guest_held_only`; adds
+        // `GlobalRequest::NoteFatalDelivery` and
+        // `GlobalResponse::NoteFatalDelivery`
         // (https://github.com/rrnewton/hermit/pull/4892).
-        (18, "182b80da8855a429", "f8641fc93e7be026"),
+        (18, "795bea68654fbff1", "f8641fc93e7be026"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
