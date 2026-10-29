@@ -1202,8 +1202,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1906 + 2 = 1908.
     // Trains since then add four (measured with `cargo nextest list` at
     // 11c35a504a6; the full validate at 24fbff99c7a also saw 1912):
-    // 1908 + 4 = 1912.
-    ("test.regular_crates", 1910),
+    // 1908 + 4 = 1912. The pin itself was left at 1910 by that recount;
+    // the full validate at c00dc58e0cd executed 1912 in this selection,
+    // so the pin now records the measured 1912.
+    ("test.regular_crates", 1912),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3083,7 +3085,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // MSG_DONTWAIT): 2883 + 14 = 2897, measured with `cargo nextest list`
     // at 16fb7fbec04 and re-measured at this head.
     // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
-    ("test.detcore_unit", 2898),
+    // The P0 revert of PR 4682's first-pass sleep registration
+    // (7322689fae2) removes seven of train 12's sleep-registration units:
+    // 2898 - 7 = 2891, re-measured with `cargo nextest list
+    // -p hermit-detcore --lib --bins` at c00dc58e0cd (2891 listed) and
+    // confirmed by the full validate at that tip (2891 executed, all passed).
+    ("test.detcore_unit", 2891),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5416,7 +5423,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same fourteen train-12 detcore units: 2883 + 14 = 2897,
     // measured with `cargo nextest list` at this head.
     // And the same TracerPid unit: 2898.
-    ("test.detcore_unit_on_host", 2898),
+    // The same P0 revert (7322689fae2) removes the same seven units here:
+    // 2898 - 7 = 2891, matching the local twin's recount at c00dc58e0cd.
+    ("test.detcore_unit_on_host", 2891),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -16247,6 +16247,10 @@ fn run_explicit_env_replaces_the_minimal_user_and_home() {
     ];
     let output = hermit(&args);
 
+    // The guest exits 1 when the `--env` values disagree with its user
+    // database (the `disagrees:` lines asserted below), and hermit
+    // propagates that status rather than choosing 1 itself.
+    // EXIT-CLASS: guest
     assert_eq!(
         output.status.code(),
         Some(1),
