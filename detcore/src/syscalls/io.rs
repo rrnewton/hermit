@@ -1073,7 +1073,9 @@ fn kernel_poll_result(
 /// any other held signal above. A resumed poll's `restart_syscall` still finds
 /// its record; a poll that never ran starts its timeout again, which loses
 /// nothing under record and replay and, under `--no-sequentialize-threads`,
-/// drops the end time Detcore read for it as described above.
+/// drops the end time Detcore read for it as described above. For a stop,
+/// the guest's poll runs again only once the stop ends, so its end moves by
+/// the whole length of the stop, not by a delivery's latency.
 #[cfg(target_arch = "x86_64")]
 fn kernel_poll_restart_code(kept: Result<i64, Error>, before_run: bool) -> Result<i64, Error> {
     match kept {
