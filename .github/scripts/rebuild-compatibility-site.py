@@ -372,20 +372,31 @@ def fetch_ledger(ledger, ledger_commit):
         # needs the detached old tip the snapshot trailer names. Fetch it,
         # bounded like the deepening above, so the proof can be checked
         # locally instead of the summary being refused for a missing object.
-        tip = _snapshot_trailer_tip(ledger, ledger_commit)
-        if tip is not None:
+        # Follow successive snapshot trailers: each fetched tip's own root
+        # may be an earlier snapshot naming the next tip. The chain walk is
+        # bounded (64 links, the ledger snapshot chain limit), and each
+        # tip's fetch deepens only within the same overall limit.
+        proof_commit = ledger_commit
+        for _ in range(64):
+            tip = _snapshot_trailer_tip(ledger, proof_commit)
+            if tip is None:
+                break
             try:
                 run([*fetch, "--depth", "1", "origin", tip], timeout=LEDGER_FETCH_TIMEOUT)
                 proof_depth = 1
                 while (
                     not _is_ancestor(ledger, summarized, tip)
                     and proof_depth < LEDGER_DEEPEN_LIMIT
+                    and not _history_complete(ledger, tip, proof_depth)
                 ):
                     proof_depth += LEDGER_DEEPEN_STEP
                     run([*fetch, "--depth", str(proof_depth), "origin", tip],
                         timeout=LEDGER_FETCH_TIMEOUT)
             except subprocess.CalledProcessError:
-                pass  # the builder refuses a summary it cannot place
+                break  # the builder refuses a summary it cannot place
+            if _is_ancestor(ledger, summarized, tip):
+                break
+            proof_commit = tip
     # The workflow caches this repository; the next run's fetch offers this
     # commit as already present and downloads only what changed since.
     run(["git", "-C", ledger, "update-ref", LEDGER_CACHE_REF, ledger_commit])
