@@ -3103,7 +3103,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2891 + 2 = 2893, re-measured with `cargo nextest list
     // -p hermit-detcore --lib --bins` at this integration head (the PR's
     // own 2899 was measured on its pre-revert base and does not apply here).
-    ("test.detcore_unit", 2898),
+    // PR 4760 rebase recount: 2898 + 6 = 2904 (sigkill robust-list units).
+    ("test.detcore_unit", 2904),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5439,7 +5440,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same P0 revert (7322689fae2) removes the same seven units here:
     // 2898 - 7 = 2891, matching the local twin's recount at c00dc58e0cd.
     // And the same two PR 4942 units: 2891 + 2 = 2893.
-    ("test.detcore_unit_on_host", 2898),
+    // And the same six: 2898 + 6 = 2904.
+    ("test.detcore_unit_on_host", 2904),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

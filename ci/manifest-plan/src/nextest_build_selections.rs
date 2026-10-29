@@ -948,8 +948,10 @@ mod tests {
             // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable
             // (+1): 695.
             // And robust_futex_owner_death's native and ptrace SIGKILL
-            // owner-death tests (+2 on the current 698): 700.
-            assert_eq!(population, 700);
+            // owner-death tests: the population measures 698 at this
+            // integration head (the PR's +2 on its stale base of 694,
+            // re-measured here rather than carried over).
+            assert_eq!(population, 698);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
