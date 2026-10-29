@@ -142,7 +142,8 @@ mod tests {
         (16, "182b80da8855a429", "846052997d97693f"),
         // Adds `Resources.polls_a_named_fifo` (#4692).
         (17, "182b80da8855a429", "f013e36743d8d9e6"),
-        // Adds `Resources.waits_on_guest_held_only` (#4892).
+        // Adds `Resources.waits_on_guest_held_only`
+        // (https://github.com/rrnewton/hermit/pull/4892).
         (18, "182b80da8855a429", "f8641fc93e7be026"),
     ];
 

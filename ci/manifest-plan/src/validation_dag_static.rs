@@ -3215,6 +3215,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2766 + 3 = 2769.
     // And io_buffers' a_retry_loop_judges_guest_held_provenance_before_every_attempt:
     // 2770, listed.
+    // 2770 on main 2033f299f.
+    // The same eighteen units on #4692's rebased head (2825): 2843, listed.
     ("test.detcore_unit", 3073),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
@@ -5661,6 +5663,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three provenance, merge and doom units: 2766.
     // And the same three filing-time doom and fatal-delivery units: 2769.
     // And the same retry-loop provenance unit: 2770, listed.
+    // And the same retry-loop provenance unit: 2770 on main 2033f299f.
+    // The same eighteen units on #4692's rebased head (2825): 2843, listed.
     ("test.detcore_unit_on_host", 3073),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
