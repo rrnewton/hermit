@@ -2568,7 +2568,12 @@ where
     G: Guest<Detcore<T>>,
 {
     // Bogus 99 return value is dead code below:
-    retry_nonblocking_syscall_helper(guest, call, rsrc, None, subtool).await
+    // Boxed: the polling loop's state stays out of every caller's future
+    // (`syscall_hot_path_tests::hot_path_futures_stay_small`).
+    Box::pin(retry_nonblocking_syscall_helper(
+        guest, call, rsrc, None, subtool,
+    ))
+    .await
 }
 
 /// What a wait that ended with `ERESTART_RESTARTBLOCK` keeps for the
@@ -2886,7 +2891,11 @@ where
     // poll/epoll_wait/futex/rt_sigtimedwait keep their existing execution (raw
     // inject_with_retry): their record/replay handling is out of scope for the internal
     // pipe data-ordering fix, and their fds are not necessarily internal pipes.
-    retry_nonblocking_syscall_helper(guest, call, rsrc, maybe_tup, None).await
+    // Boxed, as in `retry_nonblocking_syscall`.
+    Box::pin(retry_nonblocking_syscall_helper(
+        guest, call, rsrc, maybe_tup, None,
+    ))
+    .await
 }
 
 /// The task whose kernel signal state the scheduler may read to decide which
