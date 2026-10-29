@@ -6248,7 +6248,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // And the same desync-notes round-trip unit: 1916.
-    ("test.regular_crates_on_host", 1916),
+    // And the same summary-JSON unit as test.regular_crates (#4878): 1917.
+    ("test.regular_crates_on_host", 1917),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
