@@ -1834,10 +1834,13 @@ impl Config {
     /// state at each end), no slice-boundary protocol, no stack traces at
     /// preemptions or events, no turn-numbered triggers (`--stop-after-turn`,
     /// `--stop-after-iter`, `--signal-at`), no happens-before program, no
-    /// manual interrupt points and no syscall-boundary deadline
-    /// (`--target-timeslice`). Never with a gdbserver either: a debugger is
-    /// served at the stops, and between skipped ends it would see Detcore's
-    /// slice bookkeeping lag the guest's program counter.
+    /// manual interrupt points, no syscall-boundary deadline
+    /// (`--target-timeslice`) and no instruction offsets
+    /// ([`Config::slice_ends_need_a_stop`]: an offset is stepped from a real
+    /// stop at its branch target, and processing a skipped end can draw one).
+    /// Never with a gdbserver either: a debugger is served at the stops, and
+    /// between skipped ends it would see Detcore's slice bookkeeping lag the
+    /// guest's program counter.
     pub fn replays_lone_preemptions(&self) -> bool {
         !self.eager_lone_preemptions
             && self.use_preemption_timer()
@@ -1857,6 +1860,7 @@ impl Config {
             && self.signal_at.is_none()
             && self.happens_before.is_none()
             && self.interrupt_at.is_empty()
+            && !self.slice_ends_need_a_stop()
             && !self.gdbserver
     }
 
@@ -1872,9 +1876,10 @@ impl Config {
     /// its PMU branch target: `--chaos-instruction-offset` single-steps from
     /// that stop to where the timeslice ends. Any optimization that takes a
     /// slice end without stopping the guest there (for example a lone
-    /// runnable thread's slice end processed at its branch count) must be
-    /// off while this holds, or the offset is lost and a replay of the
-    /// record no longer stops where the recorded run did.
+    /// runnable thread's slice end processed at its branch count, which
+    /// [`Config::replays_lone_preemptions`] turns off) must be off while this
+    /// holds, or the offset is lost and a replay of the record no longer
+    /// stops where the recorded run did.
     pub fn slice_ends_need_a_stop(&self) -> bool {
         self.chaos && self.chaos_instruction_offset > 0
     }
@@ -7143,6 +7148,14 @@ mod tests {
                 },
             ),
             (
+                "--chaos --chaos-instruction-offset=8",
+                Config {
+                    chaos: true,
+                    chaos_instruction_offset: 8,
+                    ..base.clone()
+                },
+            ),
+            (
                 "--gdbserver",
                 Config {
                     gdbserver: true,
@@ -7153,6 +7166,14 @@ mod tests {
         for (option, config) in off {
             assert!(!config.replays_lone_preemptions(), "{option}");
         }
+        // Chaos alone draws no offsets: its slice ends need no stop.
+        assert!(
+            Config {
+                chaos: true,
+                ..base.clone()
+            }
+            .replays_lone_preemptions()
+        );
     }
 
     #[test]
