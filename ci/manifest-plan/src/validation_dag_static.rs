@@ -3232,7 +3232,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same nineteen units on #4692's head with its receipt unit (3055):
     // 3074, listed.
     // And this change's Detcore unit tests: 2756.
-    ("test.detcore_unit", 3089),
+    // And scheduler's
+    // a_replay_leaves_time_to_a_recorded_jump_it_has_not_made, from the
+    // rebase onto main 0e7fd4bdc: 2830, listed.
+    ("test.detcore_unit", 3090),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3581,7 +3584,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at 360e99b2e24: a81e8a3fbfd (PR 4862) added two lit tests
     // without moving this pin; the shard executed 292, all passing, in
     // the full validate at that head.
-    ("test.hermit_integration_2", 292),
+    // And this change's lit_fifo_jump_replay_main and
+    // lit_fifo_jump_replay_hermit_run: 294, listed.
+    ("test.hermit_integration_2", 294),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5686,7 +5691,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same nineteen units on #4692's head with its receipt unit (3055):
     // 3074, listed.
     // And the same tests: 2756.
-    ("test.detcore_unit_on_host", 3089),
+    // And the same recorded-jump unit: 2830, listed.
+    ("test.detcore_unit_on_host", 3090),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5807,7 +5813,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at 360e99b2e24: shard 2 grew to 292 (see its pin), so the
     // whole-node twin executes 61 + 292 + 349 = 702.
     // And scheduler_deadlock's poll-deadlock report: 703, listed.
-    ("test.hermit_integration_on_host", 703),
+    // And the same two lit cases: 704, listed.
+    ("test.hermit_integration_on_host", 705),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

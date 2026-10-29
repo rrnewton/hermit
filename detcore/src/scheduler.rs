@@ -9795,6 +9795,17 @@ impl Scheduler {
         if deadline.is_indefinite() {
             return false;
         }
+        // A record that lists its jumps of global time moves time itself,
+        // where the recording did (`drive_recorded_time_skips`). A recorded
+        // jump the replay has not made yet, to this deadline or an earlier
+        // one, is how the recording got there, and a FIFO open's jump waits
+        // for the replay's own poll to find nothing else can run; moving time
+        // here would pass it first. So the replay leaves time to that jump.
+        if let TimeSkipMode::Driven(expected) = &self.time_skip_mode
+            && expected.front().is_some_and(|skip| skip.target <= deadline)
+        {
+            return false;
+        }
         // Another timed event pops ahead of the replayed thread's wake: one
         // with an earlier deadline, or with the same deadline ordered first
         // (`TimedEvent`'s order: timer signals, then threads by id).
@@ -29536,6 +29547,41 @@ mod test {
             "the replayed wake pops next, so the pass runs"
         );
         assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+    }
+
+    /// A schedule replay of a record that lists its jumps of global time
+    /// leaves time to a recorded jump it has not made yet, to the replayed
+    /// sleeper's deadline or an earlier one, instead of moving time to the
+    /// deadline itself: the jump is made where the recording made it, and a
+    /// FIFO open's jump only after the replay's own poll found nothing else
+    /// could run (`drive_recorded_time_skips`). A recorded jump to a later
+    /// target leaves the replayed wake's fast-forward as before.
+    #[test]
+    fn a_replay_leaves_time_to_a_recorded_jump_it_has_not_made() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(5);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        let before = global_time.lock().unwrap().as_nanos();
+        let wake = SchedEvent::syscall(sleeper, Sysno::clock_nanosleep, SyscallPhase::Posthook);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![wake]));
+        let jump = |target| TimeSkip {
+            event: 1,
+            target,
+            reason: TimeSkipReason::FifoOpenAlone,
+        };
+        for target in [deadline, deadline - LogicalTime::from_nanos(10)] {
+            scheduler.time_skip_mode = TimeSkipMode::Driven(VecDeque::from([jump(target)]));
+            assert!(
+                !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+                "a recorded jump to {target} is still to be made"
+            );
+            assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+        }
+        scheduler.time_skip_mode = TimeSkipMode::Driven(VecDeque::from([jump(
+            deadline + LogicalTime::from_nanos(10),
+        )]));
+        assert!(scheduler.replay_fast_forward_to_recorded_wake(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
     }
 
     /// A scheduler pass under a schedule replay whose next recorded event
