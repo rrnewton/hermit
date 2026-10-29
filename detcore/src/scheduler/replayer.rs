@@ -36,8 +36,10 @@ pub(super) const UNMATCHED_EVENTS_BEFORE_RELEASE: u64 = 1000;
 /// (`Replayer::release_schedule`), for the run summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Release {
-    /// The observed event, by its number in the run, that the release
-    /// happened at.
+    /// The observed event the release happened at, by its number among the
+    /// run's observed events that are not polling retries: how many retries
+    /// a blocked call makes can depend on host timing, so a number that
+    /// counted them would not name the same event in every run.
     pub(super) event: u64,
     /// How many recorded events the release left unreplayed.
     pub(super) unreplayed: usize,
@@ -58,6 +60,10 @@ pub struct Replayer {
     /// How many observed events in a row have left the schedule's next event
     /// unmatched (`UNMATCHED_EVENTS_BEFORE_RELEASE`).
     unmatched_run: u64,
+
+    /// How many observed events were not polling retries: the numbering of
+    /// `Release::event`.
+    observed_non_polling: u64,
 
     /// Where the replay dropped the rest of the schedule, if it did
     /// (`Replayer::release_schedule`).
@@ -264,6 +270,7 @@ impl Replayer {
             traced_event_count: 0,
             events_popped: 0,
             unmatched_run: 0,
+            observed_non_polling: 0,
             release: None,
         }
     }
@@ -420,6 +427,11 @@ impl Replayer {
         let mytid = observed.dettid;
         let current_ix = self.traced_event_count;
         self.traced_event_count += 1;
+        let polling = matches!(observed.op, Op::Syscall(_, SyscallPhase::Polling));
+        let non_polling_ix = self.observed_non_polling;
+        if !polling {
+            self.observed_non_polling += 1;
+        }
         self.note_syscall_in_flight(observed);
 
         if let Some(expected) = self.peek_next() {
@@ -484,10 +496,10 @@ impl Replayer {
                 // the container makes its descriptor ready
                 // (`Scheduler::is_polling_turn`), and the count decides the
                 // event the release happens at.
-                if !matches!(observed.op, Op::Syscall(_, SyscallPhase::Polling)) {
+                if !polling {
                     self.unmatched_run += 1;
                     if self.unmatched_run >= UNMATCHED_EVENTS_BEFORE_RELEASE {
-                        return self.release_schedule(current_ix);
+                        return self.release_schedule(non_polling_ix);
                     }
                 }
             } else {
@@ -552,8 +564,8 @@ impl Replayer {
     }
 
     /// Stop following the schedule: `UNMATCHED_EVENTS_BEFORE_RELEASE`
-    /// observed events in a row, through event `current_ix`, matched none of
-    /// its next event.
+    /// observed events in a row, through event `event` (numbered without
+    /// polling retries, `Release::event`), matched none of its next event.
     ///
     /// The replay runs the thread the schedule names next and holds every
     /// other thread back. When that thread cannot produce the recorded event,
@@ -568,25 +580,30 @@ impl Replayer {
     ///
     /// The count is a liveness backstop, and a heuristic: a detour longer than
     /// the threshold that would have rejoined the schedule loses the rest of
-    /// it too. It is a function of the observed events in turn order alone,
-    /// polling retries left out, so the release happens at the same event in
-    /// every run.
-    fn release_schedule(&mut self, current_ix: u64) -> ReplayAction {
+    /// it too. It is a function of the observed events in turn order. An
+    /// unmatched polling retry neither counts nor ends the run, since how many
+    /// a blocked call makes can be host-timed. A retry that matches a recorded
+    /// one ends the run, as every matched event does, and how many retries the
+    /// replay matches can be host-timed too (`Scheduler::is_polling_turn`). So
+    /// the release can come at another event, or not at all, in another run.
+    /// Its number (`Release::event`) leaves every polling retry out, so an
+    /// unmatched retry cannot change it.
+    fn release_schedule(&mut self, event: u64) -> ReplayAction {
         let dropped = self.cursor.by_ref().count();
         self.release = Some(Release {
-            event: current_ix,
+            event,
             unreplayed: dropped,
         });
         tracing::warn!(
-            "[tracereplay] {} observed events in a row, through event #{}, matched none of the replayed schedule's next event; the replay no longer follows the schedule ({} recorded events left unreplayed)",
+            "[tracereplay] {} observed events in a row matched none of the replayed schedule's next event, through event #{} (events are numbered, and unmatched ones counted, without polling retries); the replay no longer follows the schedule ({} recorded events left unreplayed)",
             UNMATCHED_EVENTS_BEFORE_RELEASE,
-            current_ix,
+            event,
             dropped
         );
         if self.replay_exhausted_panic {
             eprintln!(
-                "[detcore] The replay left its schedule at event #{} with {} recorded events left; stopping (--replay-exhausted-panic)",
-                current_ix, dropped
+                "[detcore] The replay left its schedule at event #{} (numbered without polling retries) with {} recorded events left; stopping (--replay-exhausted-panic)",
+                event, dropped
             );
             return ReplayAction::Stop(StopReason::ReplayExausted);
         }
@@ -827,11 +844,21 @@ mod tests {
         );
         assert!(!replayer.has_events_left());
         assert!(replayer.released());
+        // The last of the second run, after the matched event.
+        assert_eq!(
+            replayer.release(),
+            Some(&Release {
+                event: 2 * UNMATCHED_EVENTS_BEFORE_RELEASE - 1,
+                unreplayed: 2,
+            })
+        );
     }
 
     /// Unmatched polling retries do not count toward the release, nor end the
-    /// run of unmatched events: how many a blocked call makes can depend on
-    /// host timing, and the count decides the event the release happens at.
+    /// run of unmatched events, nor number the event it happens at: how many
+    /// a blocked call makes can depend on host timing. The release, its
+    /// number included, is the same with any number of them interleaved,
+    /// none included.
     #[test]
     fn unmatched_polling_retries_do_not_count_toward_a_release() {
         let mut b = builder::SchedTestBuilder::new();
@@ -841,26 +868,29 @@ mod tests {
             op: Op::Syscall(Sysno::read, SyscallPhase::Polling),
             ..spinner.clone()
         };
-        let mut replayer = Replayer::new([recorded.clone(), recorded.clone(), recorded]);
         let held = ReplayAction::ContextSwitch(true, tid(3), None);
-        for _ in 1..UNMATCHED_EVENTS_BEFORE_RELEASE {
-            assert_eq!(replayer.observe_event(&spinner), held);
-        }
-        for _ in 0..2 * UNMATCHED_EVENTS_BEFORE_RELEASE {
-            assert_eq!(replayer.observe_event(&retry), held);
-        }
-        assert!(!replayer.released());
-        assert_eq!(
-            replayer.observe_event(&spinner),
-            ReplayAction::Continue(None)
-        );
-        assert_eq!(
-            replayer.release(),
-            Some(&Release {
-                event: 3 * UNMATCHED_EVENTS_BEFORE_RELEASE - 1,
-                unreplayed: 3,
-            })
-        );
+        let release_after = |retries: u64| {
+            let mut replayer =
+                Replayer::new([recorded.clone(), recorded.clone(), recorded.clone()]);
+            for _ in 1..UNMATCHED_EVENTS_BEFORE_RELEASE {
+                assert_eq!(replayer.observe_event(&spinner), held);
+            }
+            for _ in 0..retries {
+                assert_eq!(replayer.observe_event(&retry), held);
+            }
+            assert!(!replayer.released());
+            assert_eq!(
+                replayer.observe_event(&spinner),
+                ReplayAction::Continue(None)
+            );
+            *replayer.release().unwrap()
+        };
+        let expected = Release {
+            event: UNMATCHED_EVENTS_BEFORE_RELEASE - 1,
+            unreplayed: 3,
+        };
+        assert_eq!(release_after(0), expected);
+        assert_eq!(release_after(2 * UNMATCHED_EVENTS_BEFORE_RELEASE), expected);
     }
 
     /// A fatal desync names the fields that differed: an event that matches

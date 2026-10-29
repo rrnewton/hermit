@@ -24803,7 +24803,9 @@ fn a_desynced_schedule_replay_admits_a_non_root_process_child() {
 /// worker back, so the spinner took every turn and the run never finished
 /// (it ran into `--timeout`, exit 124; the fixed run takes under a second). After a thousand unmatched events the
 /// replay now drops the rest of the schedule and gives every thread the
-/// default priority, as when a schedule runs out.
+/// default priority, as when a schedule runs out. A stack trace requested
+/// for a traced index past where the run ends is reported at its end rather
+/// than dropped silently.
 #[test]
 fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
     let _guard = hermit_run_guard();
@@ -24827,12 +24829,15 @@ fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
     let replay_from = format!("--replay-schedule-from={}", schedule.display());
     let summary = directory.path().join("replay.summary");
     let summary_to = format!("--summary-json={}", summary.display());
+    let unreached = 1_000_000;
+    let unreached_stack = format!("--stacktrace-event={unreached}");
     let mut replay_args = vec!["--log=warn"];
     replay_args.extend(common);
     replay_args.extend([
         "--timeout=20",
         replay_from.as_str(),
         summary_to.as_str(),
+        unreached_stack.as_str(),
         "--",
         guest,
         "spin",
@@ -24858,13 +24863,23 @@ fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
         desyncs.contains("RELEASED replayed schedule at event #"),
         "the summary does not record the release:\n{desyncs}"
     );
+    assert!(
+        log.lines().any(|line| line
+            == format!(
+                "Missed stack trace for scheduled event #{unreached} (requested for stderr): the \
+                 run ended before reaching it"
+            )),
+        "index #{unreached}, past the run's end, is not reported:\n{log}"
+    );
 }
 
 /// Under `--replay-exhausted-panic` a replay that leaves its schedule stops
 /// there, as one that runs out of it does, instead of running on unguided:
 /// the container exits with status 1 (`immediate_fatal_exit`), which hermit
 /// reports as its internal-failure exit, with the reason on stderr, and the
-/// guest never finishes.
+/// guest never finishes. Every stack trace still requested is reported at the
+/// stop, which skips the run's end, as at the stop under `--die-on-desync`, at
+/// the replay's first hard desync.
 #[test]
 fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
     let _guard = hermit_run_guard();
@@ -24886,12 +24901,17 @@ fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
     assert_success(&record, &record_args);
 
     let replay_from = format!("--replay-schedule-from={}", schedule.display());
+    // Traced indices past either stop.
+    let pending = [1_000_000, 1_000_001];
+    let pending_stacks = pending.map(|index| format!("--stacktrace-event={index}"));
     let mut replay_args = vec!["--log=warn"];
     replay_args.extend(common);
     replay_args.extend([
         "--timeout=20",
         "--replay-exhausted-panic",
         replay_from.as_str(),
+        pending_stacks[0].as_str(),
+        pending_stacks[1].as_str(),
         "--",
         guest,
         "spin",
@@ -24911,6 +24931,51 @@ fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
         "the replay did not stop where it left its schedule:\n{log}"
     );
     assert_eq!(stdout(&replay), "", "the guest ran on past the release");
+    let reported_at_stop = |log: &str, index: u64, flag: &str| {
+        log.lines().any(|line| {
+            line == format!(
+                "Missed stack trace for scheduled event #{index} (requested for stderr): the \
+                 replay stopped ({flag}) before reaching it"
+            )
+        })
+    };
+    for index in pending {
+        assert!(
+            reported_at_stop(&log, index, "--replay-exhausted-panic"),
+            "index #{index} is not reported at the stop:\n{log}"
+        );
+    }
+
+    let mut desync_args = vec!["--log=warn"];
+    desync_args.extend(common);
+    desync_args.extend([
+        "--timeout=20",
+        "--die-on-desync",
+        replay_from.as_str(),
+        pending_stacks[0].as_str(),
+        pending_stacks[1].as_str(),
+        "--",
+        guest,
+        "spin",
+    ]);
+    let desynced = hermit(&desync_args);
+    let log = stderr(&desynced);
+    assert_eq!(
+        desynced.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{desync_args:?}:\n{}",
+        log.lines().take(40).collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        log.contains("Replay mode desynchronized from trace, bailing out"),
+        "the replay did not stop at its desync:\n{log}"
+    );
+    for index in pending {
+        assert!(
+            reported_at_stop(&log, index, "--die-on-desync"),
+            "index #{index} is not reported at the --die-on-desync stop:\n{log}"
+        );
+    }
 }
 
 /// A schedule replay hands the CPU to the next recorded thread when it traces

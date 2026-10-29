@@ -2467,6 +2467,11 @@ pub struct Scheduler {
     /// the (original) replay_cursor trace.
     pub stacktrace_events: Option<StacktraceEventsIter>,
 
+    /// Whether the run counts `stacktrace_events` indices at all: it records
+    /// or replays a schedule. Otherwise `--stacktrace-event` has no effect,
+    /// as the configuration warns, and nothing reports them.
+    stacktrace_events_counted: bool,
+
     /// PRNG to drive any fuzzing of OS semantics (other than scheduling).
     fuzz_prng: Pcg64Mcg,
 
@@ -5106,6 +5111,7 @@ impl Scheduler {
             released_callback_checkpoints: BTreeMap::new(),
             recorded_event_count: 0,
             stacktrace_events,
+            stacktrace_events_counted: cfg.record_preemptions || cfg.replay_schedule_from.is_some(),
             stop_after_turn: cfg.stop_after_turn,
             signal_at: cfg.signal_at,
             last_committed_turn: None,
@@ -6199,6 +6205,66 @@ impl Scheduler {
         result
     }
 
+    /// Report as missed, and discard, every requested stack trace index still
+    /// pending, with `reason` saying why each cannot print. As for an index the
+    /// run passed (`try_pop_stacktrace_event`), an index that will never print
+    /// is reported rather than dropped silently.
+    fn report_unprintable_stacktrace_events(&mut self, reason: impl Fn(u64) -> String) {
+        let Some(iter) = &mut self.stacktrace_events else {
+            return;
+        };
+        for (index, _, m_path) in iter.by_ref() {
+            let destination = m_path
+                .as_ref()
+                .map_or_else(|| "stderr".to_string(), |p| p.display().to_string());
+            let reason = reason(index);
+            tracing::warn!(
+                "No stack trace for scheduled event #{} (requested for {}): {}",
+                index,
+                destination,
+                reason,
+            );
+            crate::util::capped_eprintln!(
+                "\nMissed stack trace for scheduled event #{} (requested for {}): {}",
+                index,
+                destination,
+                reason,
+            );
+        }
+    }
+
+    /// Before a replay stops the run (`--replay-exhausted-panic`,
+    /// `--die-on-desync`), report every requested stack trace index still
+    /// pending: no later event will reach one, and the stop skips the run's
+    /// end, where they would be reported. The stopping event's own index,
+    /// `stopping_ix`, is reported too rather than printed, since the stop
+    /// comes before the thread could print its stack.
+    fn report_stacktrace_events_at_stop(&mut self, stopping_ix: Option<u64>, flag: &str) {
+        self.report_unprintable_stacktrace_events(|index| {
+            if Some(index) == stopping_ix {
+                format!("the replay stopped at that event ({flag}) before its stack could print")
+            } else {
+                format!("the replay stopped ({flag}) before reaching it")
+            }
+        });
+    }
+
+    /// At the end of a run that records or replays a schedule, report every
+    /// requested stack trace index it never reached. Idempotent: the indices
+    /// are discarded as they are reported. Called at the run summary; a run
+    /// that ends without one (a non-ptrace backend's `--timeout`, a backend
+    /// failure, another immediate exit) does not report them.
+    fn report_stacktrace_events_the_run_did_not_reach(&mut self) {
+        if !self.stacktrace_events_counted {
+            // `--stacktrace-event` without a recorded or replayed schedule,
+            // which counts nothing, as the configuration warned.
+            return;
+        }
+        self.report_unprintable_stacktrace_events(|_| {
+            "the run ended before reaching it".to_string()
+        });
+    }
+
     /// Under `--replay-schedule-from`, wake the thread the trace switches to
     /// now if it is still in a timed wait whose deadline has passed, so it is
     /// runnable when the next turn is chosen.
@@ -6257,7 +6323,19 @@ impl Scheduler {
             let action = r.observe_event(observed);
             (current_ix, action)
         }) {
-            let print_stack = self.try_pop_stacktrace_event(ix, observed);
+            let stop_flag = match action {
+                replayer::ReplayAction::Stop(StopReason::FatalDesync) => Some("--die-on-desync"),
+                replayer::ReplayAction::Stop(StopReason::ReplayExausted) => {
+                    Some("--replay-exhausted-panic")
+                }
+                _ => None,
+            };
+            let print_stack = if let Some(flag) = stop_flag {
+                self.report_stacktrace_events_at_stop(Some(ix), flag);
+                None
+            } else {
+                self.try_pop_stacktrace_event(ix, observed)
+            };
             debug!("Next ReplayAction = {:?}", action);
             self.release_replay_priorities_if_exhausted();
 
@@ -19645,6 +19723,7 @@ impl Scheduler {
                 .as_ref()
                 .is_some_and(|replayer| replayer.die_on_desync)
         {
+            self.report_stacktrace_events_at_stop(None, "--die-on-desync");
             immediate_fatal_exit();
         }
     }
@@ -19672,6 +19751,7 @@ impl Scheduler {
         if let Some(replayer) = &self.boundary_replayer {
             replayer.finish().map_err(crate::TerminalReplayRefusal)?;
         }
+        self.report_stacktrace_events_the_run_did_not_reach();
         let schedevent_replayed = if let Some(replayer) = &self.boundary_replayer {
             replayer.stored_index() as u64
         } else {
@@ -19727,8 +19807,9 @@ impl Scheduler {
         // `hermit analyze`, which keeps each trial's) can tell.
         if let Some(release) = self.replayer.as_ref().and_then(Replayer::release) {
             let mut message = format!(
-                "RELEASED replayed schedule at event #{}: {} observed events in a row matched \
-                 none of it; {} recorded events left unreplayed",
+                "RELEASED replayed schedule at event #{}: {} observed events in a row matched none \
+                 of it (events are numbered, and unmatched ones counted, without polling \
+                 retries); {} recorded events left unreplayed",
                 release.event,
                 replayer::UNMATCHED_EVENTS_BEFORE_RELEASE,
                 release.unreplayed,
@@ -23517,6 +23598,75 @@ mod test {
             "the skipped index #1 was reported and discarded"
         );
         assert_eq!(sched.consume_schedevent(&schedule[3]).print_stack, None);
+    }
+
+    /// A requested index the run never reaches is reported at the run's end,
+    /// once, instead of being dropped silently, and an index a release passes
+    /// is not dropped by it: traced indices go on counting after a release.
+    #[test]
+    fn a_stacktrace_index_the_run_never_reaches_is_reported_at_its_end() {
+        let mut sched = Scheduler::new(&Config::default());
+        // As `--replay-schedule-from` sets it (`Scheduler::new`).
+        sched.stacktrace_events_counted = true;
+        let tid = DetTid::from_raw(3);
+        let spinner = DetTid::from_raw(5);
+        let at = LogicalTime::from_nanos;
+        let schedule: Vec<SchedEvent> = [Sysno::getpid, Sysno::getppid]
+            .into_iter()
+            .zip(1..)
+            .map(|(sysno, n)| {
+                SchedEvent::syscall(tid, sysno, SyscallPhase::Prehook).with_time(at(n * 10_000))
+            })
+            .collect();
+        sched.replayer = Some(Replayer::new(schedule.clone()));
+        let after_release = replayer::UNMATCHED_EVENTS_BEFORE_RELEASE + 1;
+        sched.stacktrace_events = Some(
+            vec![(after_release, None, None), (1_000_000, None, None)]
+                .into_iter()
+                .peekable(),
+        );
+        let pending = |sched: &Scheduler| -> Vec<u64> {
+            sched
+                .stacktrace_events
+                .as_ref()
+                .unwrap()
+                .clone()
+                .map(|(index, _, _)| index)
+                .collect()
+        };
+        assert_eq!(sched.consume_schedevent(&schedule[0]).print_stack, None);
+        let other = SchedEvent::syscall(spinner, Sysno::sched_yield, SyscallPhase::Prehook)
+            .with_time(at(15_000));
+        for _ in 0..replayer::UNMATCHED_EVENTS_BEFORE_RELEASE {
+            let _ = sched.consume_schedevent(&other);
+        }
+        assert!(sched.schedule_released());
+        assert_eq!(pending(&sched), vec![after_release, 1_000_000]);
+        assert_eq!(
+            sched.consume_schedevent(&other).print_stack,
+            Some(None),
+            "the index after the release prints at its traced index"
+        );
+        let _ = sched.generate_partial_run_summary(None).unwrap();
+        assert!(
+            pending(&sched).is_empty(),
+            "the index past the run's end was reported at its end"
+        );
+    }
+
+    /// A replay that stops the run reports every pending stack trace index,
+    /// the stopping event's own included: the stop skips the run's end, and
+    /// comes before that event's stack could print.
+    #[test]
+    fn a_replay_stop_reports_every_pending_stacktrace_index() {
+        let mut sched = Scheduler::new(&Config::default());
+        sched.stacktrace_events = Some(
+            vec![(3, None, None), (4, None, None), (1_000, None, None)]
+                .into_iter()
+                .peekable(),
+        );
+        sched.report_stacktrace_events_at_stop(Some(3), "--replay-exhausted-panic");
+        assert!(sched.stacktrace_events.as_mut().unwrap().peek().is_none());
     }
 
     /// A thread queued at the deferred replay priority when the recording
@@ -31722,9 +31872,10 @@ mod test {
             .unwrap();
         assert!(
             text.contains(&format!(
-                "RELEASED replayed schedule at event #{}: {} observed events in a row matched \
-                 none of it; 2 recorded events left unreplayed; callback checkpoints dropped \
-                 with it: dtid 3: 1\n",
+                "RELEASED replayed schedule at event #{}: {} observed events in a row matched none \
+                 of it (events are numbered, and unmatched ones counted, without polling \
+                 retries); 2 recorded events left unreplayed; callback checkpoints dropped with \
+                 it: dtid 3: 1\n",
                 replayer::UNMATCHED_EVENTS_BEFORE_RELEASE - 1,
                 replayer::UNMATCHED_EVENTS_BEFORE_RELEASE,
             )),
