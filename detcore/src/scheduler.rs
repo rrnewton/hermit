@@ -18635,25 +18635,29 @@ impl Scheduler {
     ///
     /// Only where change points are bounded (`chaos_bounds_starvation`: chaos
     /// with timer preemption and the default heuristic, not replaying
-    /// preemptions), and neither under a schedule replay nor under `hermit
-    /// record`/`hermit replay` (`recordreplay_modes`), as for every deadline
-    /// hint. A schedule replay's live tail, once its trace has run out
-    /// (`schedule_replay_over`), is still a schedule replay to the scheduler
-    /// (`has_schedule_replay`): it runs without this count and without the
-    /// first-turn bound, as it runs without the starvation bound
-    /// (`bound_chaos_starvation`). Its threads, though, end slices there as in
-    /// a run without a schedule (`ThreadState::follows_replayed_schedule`), so
-    /// the tail does take deadline hints (`cap_timeslice_at_deadline`), only
-    /// not these two. The tail is deterministic, and the starvation these
-    /// rules end can come back there.
+    /// preemptions), and not under `hermit record`/`hermit replay`
+    /// (`recordreplay_modes`), as for every deadline hint. Not under a schedule
+    /// replay either, in both of its phases (`has_schedule_replay`):
+    /// - While it follows recorded schedule events, the recorded slice ends
+    ///   apply and no live deadline hint does (`cap_timeslice_at_deadline`).
+    /// - Once the schedule is over, its last event consumed or the rest
+    ///   released (`schedule_replay_over`), each thread ends slices as in a
+    ///   run without a schedule (`ThreadState::follows_replayed_schedule`),
+    ///   so ordinary deadline hints apply. The scheduler still counts the run
+    ///   as a schedule replay, though, so this count, the first-turn bound and
+    ///   the starvation bound (`bound_chaos_starvation`) stay off.
+    ///
+    /// That tail is deterministic, and the starvation these rules end can
+    /// come back there.
+    ///
     /// The count is of committed turns, host-timed polling retries aside, as for
     /// `previous_turn_tid`: background calls and skipped turns do not commit, and
     /// host-timed admissions and signals change only which pass a turn falls in,
     /// not how many turns a thread has taken. Both runs of --verify therefore end
     /// the same slices. A preemption recording records the slice end it causes
-    /// like any other change point, and a preemption or schedule replay follows
-    /// its recorded slice ends and applies no hint (`cap_timeslice_at_deadline`),
-    /// so a replay needs none.
+    /// like any other change point, and a preemption or schedule replay, while
+    /// it follows its recorded slice ends, applies no hint
+    /// (`cap_timeslice_at_deadline`), so it needs none there.
     /// Such a slice ends at a syscall check-in, and a preemption replay ends
     /// a slice recorded there at the same branch count, which can fall just
     /// before the syscall rather than after it; until
