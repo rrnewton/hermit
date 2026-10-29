@@ -116,6 +116,15 @@ const TRACKED_CELLS_SCHEMA: u64 = 9;
 const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 5;
 const RUNNER_STEP_OUTPUT_DIR: &str = "runner-profile";
+/// Resume-time durable completion map, persisted beside the filtered DAG
+/// so a standalone summarize after the resumed jobs finish still knows
+/// which repetitions were already durable at resume time (recomputing
+/// from rows present then would include the new rows and mismatch).
+const RESUME_COMPLETED_FILE: &str = "resume-completed.json";
+/// Per-attempt record, inside `resume-attempts/attempt-NNNN/`, of the
+/// repetitions a resume scheduled for rerun because their final harness
+/// status was missing after publication (resume-final-status-missing).
+const RESUME_RERUNS_FILE: &str = "resume-reruns.json";
 const PROMOTION_REPETITIONS: usize = 10;
 /// The one-build closure: `build.workspace` builds Hermit once in the Cargo
 /// `validate` profile (and stages the LiteInst runtime), and
@@ -286,6 +295,7 @@ Commands:
       [--green --backend BACKEND --repetitions COUNT] [--no-retry] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
       [--parity-all --repetitions COUNT] [--reuse-fresh-checkout]
+      [--resume DIR]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
       labelled exploratory and cannot promote the scorecard. Batch runs require
@@ -311,9 +321,80 @@ Commands:
       [--probe-disabled --backend BACKEND]
       Generate the same safe-ci execution plan without running it. The default
       output is DIR/dag.json.
-  summarize --results DIR
+  summarize --results DIR [--merge DIR ...]
       Re-read a completed run, print its per-backend outcome table, and rewrite
       DIR/summary.json. This never edits or promotes the checked-in scorecard.
+      With one or more --merge DIR, instead merge the per-cell
+      cells/<slug>-repetition-NNNN/results.jsonl files across every attempt
+      directory (for example a killed w1 and its w2 successor), print the
+      merged per-cell verdicts, and write DIR/summary-merged.json. Merged
+      verdicts are rows-only evidence, like `verdicts`: the runner evidence
+      and verify logs a full summarize checks are not re-read.
+  plan --resume DIR [same selection options as the retained run]
+  run --resume DIR [same selection options as the retained run]
+      Resume the retained run in DIR: read DIR/run.json and every durable
+      cells/<slug>-repetition-NNNN/results.jsonl, skip each repetition whose
+      file holds complete valid rows for that exact cell, and plan or run
+      only the missing repetitions in the same directory. A repetition with
+      no results.jsonl, or with only results.in-progress.jsonl, is missing.
+      A corrupt or partial (unterminated) line in a durable results.jsonl is
+      refused with the file and line named: delete that repetition's cell
+      directory and rerun --resume, or restore the complete file. Giving a
+      selection that conflicts with the retained run is refused; drop the
+      conflicting option or use a fresh --results directory. Resume also
+      verifies executable identity before combining old and new rows: a
+      missing selected binary (target/ci/hermit) is rebuilt first, then
+      every durable row's recorded binary_sha256 must equal the selected
+      binary's SHA-256 and its test_sha256 must equal the test's current
+      digest; any mismatch (or a row recording no hash) refuses with the
+      expected and actual digests named. For `run --resume`, the selected
+      binary is the execution checkout's binary (the fresh checkout in
+      batch mode, the working tree for one exact cell), and the check
+      runs before any cell executes. For `plan --resume`, an exact cell
+      checks that same working-tree binary, while a batch plan is dry,
+      creates no execution checkout, and therefore hashes no execution
+      binary: it checks only test digests and states that the binary
+      check is deferred to `run --resume`. A standalone summarize that
+      detects the resumed shape likewise refuses durable rows that record
+      more than one binary (or more than one digest for a test) before
+      judging them. A HOST-INAPPLICABLE row records no binary because it
+      executed none, so it alone may combine without a binary identity;
+      every other row must record one. Merge applies the same rule
+      across attempt directories. Before a resume replans in place, the
+      retained run.json, dag.json, and runner-outcomes.json are archived
+      immutably under DIR/resume-attempts/attempt-NNNN/ (never
+      overwritten), together with resume-reruns.json naming every
+      repetition that attempt scheduled for rerun and its reason (for a
+      final status missing after publication, the named limit
+      resume-final-status-missing), and a failed replan restores the
+      retained plan.
+      The repetitions durable at resume time are persisted durably in
+      DIR/resume-completed.json beside the filtered DAG, so a standalone
+      summarize after the resumed jobs finish judges the run with that
+      resume-time map (and full-plan memory/cap validation reconstructed
+      from it) instead of recomputing the map from rows present then; a
+      persisted map that no longer matches the filtered DAG, or a legacy
+      filtered DAG whose resume-time map cannot be reconstructed,
+      refuses by name (resume-completed-mismatch /
+      resume-completed-unreconstructable). A repetition published but
+      whose final harness status was never written (the marker 125
+      remains) is not credited from its row alone: resume schedules it
+      as missing and reruns it, and a summary refuses it by name
+      (resume-final-status-missing). A resumed summary runs the
+      full-plan memory-requirement and maximum-safe-cap checks on the
+      reconstructed full graph; when the retained budget/requirement/
+      cap evidence needed to run them is missing, it refuses by name
+      (resume-memory-evidence-missing) instead of skipping them.
+      Runner-owned
+      durable writes (run.json, dag.json, summary.json, summary-merged.json)
+      are fsynced (file and parent directory); per-cell results.jsonl files
+      are likewise durable: the harness-written results.in-progress.jsonl
+      is fsynced before its rename to results.jsonl and the cell directory
+      is fsynced after, which resume verifies on read. A publication whose
+      directory fsync fails is unpublished and stays missing/rerunnable.
+      The plain-rename publication exemption applies only to retained
+      runs whose run.json carries no durable-format marker (genuinely old
+      campaigns); marked runs are audited strict.
   emit-series --results DIR
       Re-read a completed run and append its per-cell results to the parent
       series store. Requires DEV_HERMIT_PARENT and does not run a guest.
@@ -1038,6 +1119,14 @@ struct CellSelection {
     /// sorted. They add no cell to the plan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parity_select: Vec<String>,
+    /// `--resume DIR`: resume the retained run in DIR, planning only the
+    /// repetitions whose durable results.jsonl is missing or incomplete.
+    #[serde(skip)]
+    resume_dir: Option<PathBuf>,
+    /// `summarize --merge DIR` (repeatable): attempt directories whose
+    /// per-cell results.jsonl files merge into one summary.
+    #[serde(skip)]
+    merge_dirs: Vec<PathBuf>,
     /// Exact cells retained in run.json are sufficient to revalidate an old
     /// run without depending on the continued existence of its source file.
     #[serde(skip)]
@@ -2202,9 +2291,1436 @@ fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
     Ok(rows)
 }
 
+/// Fsync the parent directory of `path`, so a rename into it is durable.
+fn fsync_parent_dir(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent)
+            .map_err(|e| format!("cannot open {} for fsync: {e}", parent.display()))?;
+        dir.sync_all()
+            .map_err(|e| format!("cannot fsync directory {}: {e}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path` and fsync the file and its parent directory, so a
+/// runner-owned durable record survives process death and power loss.
+fn write_file_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut file =
+        fs::File::create(path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("cannot fsync {}: {e}", path.display()))?;
+    fsync_parent_dir(path)
+}
+
+/// Publish `in_progress` as `destination` durably: fsync the file before
+/// the rename and fsync the parent directory after it, so a published
+/// per-cell results file survives process death and power loss.
+fn publish_file_durable(in_progress: &Path, destination: &Path) -> Result<(), String> {
+    let file = fs::File::open(in_progress)
+        .map_err(|e| format!("cannot open {} for fsync: {e}", in_progress.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("cannot fsync {}: {e}", in_progress.display()))?;
+    fs::rename(in_progress, destination).map_err(|e| {
+        format!(
+            "cannot publish {} as {}: {e}",
+            in_progress.display(),
+            destination.display()
+        )
+    })?;
+    if let Err(error) = fsync_parent_dir(destination) {
+        // The rename already happened, but the publication is not durable:
+        // unpublish so resume never credits an unsynced file, then refuse.
+        if fs::rename(destination, in_progress).is_err() {
+            let _ = fs::remove_file(destination);
+        }
+        return Err(format!(
+            "{error}; {} was unpublished because its directory fsync failed, so the repetition stays missing and rerunnable",
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Shell form of [`publish_file_durable`] for generated cell commands,
+/// which run under `bash` in a cell directory: GNU `sync -- FILE` fsyncs
+/// that file and `sync -- DIR` fsyncs that directory. A failed sync or
+/// rename is captured into the caller's `status` variable.
+fn durable_publish_shell(in_progress: &Path, destination: &Path) -> String {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    // A failed fsync must not publish: capture its status and rename only
+    // when the sync succeeded, so resume never counts an unsynced file.
+    // The parent-directory sync must run after every successful rename,
+    // even when the harness already failed (`status` nonzero): tracking
+    // the rename in its own variable, not the harness `status`, is what
+    // keeps a FAIL/ERROR publication durable. Publish failures replace
+    // `status`; a successful publish preserves the harness status.
+    format!(
+        "if test -e {in_progress}; then sync -- {in_progress}; sync_status=$?; if test \"$sync_status\" -eq 0; then mv -- {in_progress} {destination}; mv_status=$?; if test \"$mv_status\" -eq 0; then sync -- {parent}; parent_status=$?; if test \"$parent_status\" -ne 0; then mv -- {destination} {in_progress} || rm -f -- {destination}; status=$parent_status; fi; else status=$mv_status; fi; else status=$sync_status; fi; fi; ",
+        in_progress = shell_quote(&in_progress.to_string_lossy()),
+        destination = shell_quote(&destination.to_string_lossy()),
+        parent = shell_quote(&parent.to_string_lossy()),
+    )
+}
+
+/// Reset a rerun cell's in-progress files before the harness starts: a
+/// killed attempt left rows in `results.in-progress.jsonl`, and the
+/// harness appends, so reusing the file would duplicate attempt 1 and
+/// fail the sequential-attempt check. The published `results.jsonl` is
+/// never touched here.
+fn reset_in_progress_shell(result_in_progress: &Path, junit_in_progress: &Path) -> String {
+    format!(
+        "rm -f -- {} {}; ",
+        shell_quote(&result_in_progress.to_string_lossy()),
+        shell_quote(&junit_in_progress.to_string_lossy())
+    )
+}
+
+/// Shell guard for a generated cell/preparation step: skip only when a
+/// terminal status was recorded. The incomplete marker (125) written
+/// before the harness starts survives a kill and must rerun, not skip.
+fn incomplete_status_rerun_guard(status_file: &Path) -> String {
+    format!(
+        "if test -f {status}; then case \"$(cat {status} 2>/dev/null)\" in ''|{incomplete}) ;; *) exit 0;; esac; fi; ",
+        status = shell_quote(&status_file.to_string_lossy()),
+        incomplete = INCOMPLETE_ATTEMPT_STATUS,
+    )
+}
+
+/// True when `cmd` renames its in-progress results without any fsync (the
+/// pre-durable-publish generated form retained by old campaigns).
+fn plain_result_rename_present(cmd: &str) -> bool {
+    cmd.contains("mv --")
+        && cmd.contains("results.in-progress.jsonl")
+        && cmd.contains("results.jsonl")
+        && !durable_result_publish_present(cmd)
+}
+
+/// True when `cmd` publishes its per-cell results durably: an fsync of
+/// `results.in-progress.jsonl` before the rename and another fsync after.
+fn durable_result_publish_present(cmd: &str) -> bool {
+    let Some(mv) = cmd.find("mv --") else {
+        return false;
+    };
+    let before = &cmd[..mv];
+    let Some(sync) = before.rfind("sync --") else {
+        return false;
+    };
+    before[sync..].contains("results.in-progress.jsonl") && cmd[mv..].contains("sync --")
+}
+
+fn load_run_metadata(results: &Path) -> Result<RunMetadata, String> {
+    let path = results.join("run.json");
+    if !path.is_file() {
+        return Err(format!(
+            "--resume {} has no run.json; it is not a retained pressure run. Point --resume at a previous run's results directory (containing run.json and cells/), or drop --resume and use a fresh --results directory",
+            results.display()
+        ));
+    }
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let metadata: RunMetadata = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "invalid {}: {e}; fix or remove the retained run, or use a fresh --results directory",
+            path.display()
+        )
+    })?;
+    if metadata.schema != RUN_SCHEMA {
+        return Err(format!(
+            "unsupported run schema {} in {}; resume a run written by this pressure-test version, or use a fresh --results directory",
+            metadata.schema,
+            path.display()
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Read one durable per-cell results file strictly: the file must end with a
+/// newline (a partial trailing line is a torn write) and every line must be a
+/// valid row for `cell`. Corrupt input is refused, never counted.
+fn read_durable_result_rows(
+    path: &Path,
+    cell: &CellId,
+    metadata: &RunMetadata,
+    repetition: Option<usize>,
+) -> Result<Vec<CellResult>, String> {
+    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.is_empty() {
+        return Err(format!(
+            "{} is empty and records no durable repetition; delete its cell directory and rerun --resume so the repetition is planned again",
+            path.display()
+        ));
+    }
+    if bytes.last() != Some(&b'\n') {
+        return Err(format!(
+            "{}: final line is incomplete (missing terminating newline, likely a torn write); it was not counted. Delete the repetition's cell directory and rerun --resume, or restore the complete file, then rerun",
+            path.display()
+        ));
+    }
+    let rows = read_result_rows(path).map_err(|error| {
+        format!(
+            "{error}; the corrupt repetition was not counted. Delete the repetition's cell directory and rerun --resume, or restore the complete file, then rerun"
+        )
+    })?;
+    for row in &rows {
+        let row_cell = CellId {
+            lane: row.lane.clone(),
+            category: row.category.clone(),
+            test: row.test.clone(),
+            mode: row.mode.clone(),
+            backend: row.backend.clone().unwrap_or_else(|| "native".to_string()),
+        };
+        if row_cell != *cell {
+            return Err(format!(
+                "{} holds rows for {}, not for its directory's cell {}; it was not counted. Delete the repetition's cell directory and rerun --resume, or restore the correct file, then rerun",
+                path.display(),
+                display_id(&row_cell),
+                display_id(cell)
+            ));
+        }
+        // Bind the rows to this retained campaign and repetition: a file
+        // copied from another commit or repetition must not be trusted.
+        let expected_run_id =
+            cell_evidence_run_id(cell, repetition, metadata.run_id_prefix.as_deref());
+        if row.hermit_sha != metadata.hermit_sha
+            || row.source_tree_dirty != metadata.source_tree_dirty
+            || row.run_id != expected_run_id
+        {
+            return Err(format!(
+                "{} holds rows for run {} at commit {}, not for this retained run's repetition {} at commit {}; it was not counted. Delete the repetition's cell directory and rerun --resume, or restore the correct file, then rerun",
+                path.display(),
+                row.run_id,
+                row.hermit_sha,
+                expected_run_id,
+                metadata.hermit_sha
+            ));
+        }
+    }
+    // A published file whose harness exit contradicts its terminal row
+    // (for example a directory fsync failed after the rename, leaving a
+    // nonzero status beside PASS rows) is not a completed repetition.
+    let status_path = path.with_file_name("harness-status");
+    if status_path.is_file() {
+        let text = fs::read_to_string(&status_path)
+            .map_err(|e| format!("cannot read {}: {e}", status_path.display()))?;
+        let status: i32 = text.trim().parse().map_err(|_| {
+            format!(
+                "{} contains nonnumeric harness exit {:?}; the repetition was not counted. Delete the repetition's cell directory and rerun --resume, or restore the correct files, then rerun",
+                status_path.display(),
+                text.trim()
+            )
+        })?;
+        let terminal =
+            cell_result_after_retries(&rows).map_err(|e| format!("{}: {e}", path.display()))?;
+        // The cell command writes the incomplete marker (125) before the
+        // harness starts, publishes `results.jsonl` durably (file fsync,
+        // rename, parent-directory fsync), and only then writes the final
+        // harness status. A kill in that last window leaves published
+        // rows beside the marker: the final status was never written, so
+        // the row alone must not be credited. Refuse this repetition by
+        // name (resume-final-status-missing); resume schedules it as
+        // missing and reruns it, and a summary refuses it by that name.
+        if status == INCOMPLETE_ATTEMPT_STATUS {
+            return Err(format!(
+                "{} records terminal outcome {}, but {} still holds the incomplete marker {status}, so its final harness status is missing after publication; the repetition was not counted and was refused by name (resume-final-status-missing). Rerun `run --resume` so the repetition is scheduled and rerun, or delete the repetition's cell directory and rerun --resume",
+                path.display(),
+                terminal.outcome,
+                status_path.display()
+            ));
+        }
+        let consistent = match terminal.outcome.as_str() {
+            "PASS" => status == 0,
+            _ => status != 0,
+        };
+        if !consistent {
+            return Err(format!(
+                "{} records terminal outcome {}, but {} records harness exit {status}; the repetition was not counted (its publication may have failed). Delete the repetition's cell directory and rerun --resume, or restore the correct files, then rerun",
+                path.display(),
+                terminal.outcome,
+                status_path.display()
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+/// Repetitions of each planned cell whose durable results.jsonl is complete.
+/// Verified from the retained files, never from in-memory state. A missing
+/// file (or only results.in-progress.jsonl) means the repetition is missing.
+fn durable_completed_repetitions(
+    results: &Path,
+    metadata: &RunMetadata,
+) -> Result<BTreeMap<CellId, BTreeSet<usize>>, String> {
+    let mut completed: BTreeMap<CellId, BTreeSet<usize>> = BTreeMap::new();
+    let planned: Vec<&CellId> = metadata
+        .cells
+        .iter()
+        .chain(metadata.reference_cells.iter())
+        .collect();
+    for cell in planned {
+        for repetition in repetition_numbers(metadata.repetitions) {
+            let slug = cell_run_slug(cell, repetition);
+            let file = results.join("cells").join(&slug).join("results.jsonl");
+            if !file.is_file() {
+                continue;
+            }
+            // A repetition whose final status is missing after
+            // publication (resume-final-status-missing) is not credited
+            // from its row alone: it stays missing, so resume schedules
+            // and reruns it instead of aborting the whole resume.
+            match read_durable_result_rows(&file, cell, metadata, repetition) {
+                Ok(_) => {}
+                Err(error) if error.contains("resume-final-status-missing") => continue,
+                Err(error) => return Err(error),
+            }
+            completed
+                .entry(cell.clone())
+                .or_default()
+                .insert(repetition.unwrap_or(1));
+        }
+    }
+    Ok(completed)
+}
+
+/// Planned repetitions whose durable row was published but whose final
+/// harness status was never written (the incomplete marker remains).
+/// Resume does not credit these: it schedules and reruns them, and the
+/// rerun decision is recorded in the resume attempt archive by this
+/// name (resume-final-status-missing). Any other durable-read failure
+/// propagates, so a rerun is never recorded for a different defect.
+fn final_status_missing_repetitions(
+    results: &Path,
+    metadata: &RunMetadata,
+) -> Result<Vec<(CellId, usize)>, String> {
+    let mut missing = Vec::new();
+    let planned: Vec<&CellId> = metadata
+        .cells
+        .iter()
+        .chain(metadata.reference_cells.iter())
+        .collect();
+    for cell in planned {
+        for repetition in repetition_numbers(metadata.repetitions) {
+            let slug = cell_run_slug(cell, repetition);
+            let file = results.join("cells").join(&slug).join("results.jsonl");
+            if !file.is_file() {
+                continue;
+            }
+            match read_durable_result_rows(&file, cell, metadata, repetition) {
+                Ok(_) => {}
+                Err(error) if error.contains("resume-final-status-missing") => {
+                    missing.push((cell.clone(), repetition.unwrap_or(1)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(missing)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ResumeRerunEntry {
+    cell: CellId,
+    repetition: usize,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ResumeRerunsFile {
+    schema: u32,
+    reruns: Vec<ResumeRerunEntry>,
+}
+
+/// Write the rerun record for one archived resume attempt. Every entry
+/// names its repetition and the named limit that is the reason for the
+/// rerun (resume-final-status-missing); an attempt with no such
+/// repetition records an empty list, so the absence is explicit.
+fn write_resume_reruns(archive: &Path, reruns: &[(CellId, usize)]) -> Result<(), String> {
+    let document = ResumeRerunsFile {
+        schema: 1,
+        reruns: reruns
+            .iter()
+            .map(|(cell, repetition)| ResumeRerunEntry {
+                cell: cell.clone(),
+                repetition: *repetition,
+                reason: "resume-final-status-missing".to_string(),
+            })
+            .collect(),
+    };
+    let mut text = serde_json::to_string_pretty(&document)
+        .map_err(|e| format!("cannot serialize {RESUME_RERUNS_FILE}: {e}"))?;
+    text.push('\n');
+    write_file_durable(&archive.join(RESUME_RERUNS_FILE), text.as_bytes())
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ResumeCompletedEntry {
+    cell: CellId,
+    repetitions: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ResumeCompletedFile {
+    schema: u32,
+    completed: Vec<ResumeCompletedEntry>,
+}
+
+/// Persist the resume-time completion map durably beside the filtered
+/// DAG. A standalone summarize must not recompute this map from rows
+/// present at summarize time: once the resumed jobs finish, their new
+/// rows would be counted as resume-time durable and the reconstructed
+/// filtered set would no longer match the retained DAG.
+fn write_resume_completed(
+    results: &Path,
+    completed: &BTreeMap<CellId, BTreeSet<usize>>,
+) -> Result<(), String> {
+    let document = ResumeCompletedFile {
+        schema: 1,
+        completed: completed
+            .iter()
+            .filter(|(_, repetitions)| !repetitions.is_empty())
+            .map(|(cell, repetitions)| ResumeCompletedEntry {
+                cell: cell.clone(),
+                repetitions: repetitions.iter().copied().collect(),
+            })
+            .collect(),
+    };
+    let mut text = serde_json::to_string_pretty(&document)
+        .map_err(|e| format!("cannot serialize {RESUME_COMPLETED_FILE}: {e}"))?;
+    text.push('\n');
+    write_file_durable(&results.join(RESUME_COMPLETED_FILE), text.as_bytes())
+}
+
+/// Load the persisted resume-time completion map, when present. Every
+/// entry must name a planned cell and a planned repetition, with no
+/// duplicate cell or repetition; a malformed map refuses by name rather
+/// than being silently ignored.
+fn load_resume_completed(
+    results: &Path,
+    metadata: &RunMetadata,
+) -> Result<Option<BTreeMap<CellId, BTreeSet<usize>>>, String> {
+    let path = results.join(RESUME_COMPLETED_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let document: ResumeCompletedFile = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "invalid {}: {e}; the persisted resume completion map was not trusted. Rerun `run --resume` to rewrite it, or use a fresh --results directory",
+            path.display()
+        )
+    })?;
+    if document.schema != 1 {
+        return Err(format!(
+            "unsupported {} schema {}; the persisted resume completion map was not trusted. Rerun `run --resume` to rewrite it, or use a fresh --results directory",
+            path.display(),
+            document.schema
+        ));
+    }
+    let planned: BTreeSet<&CellId> = metadata
+        .cells
+        .iter()
+        .chain(metadata.reference_cells.iter())
+        .collect();
+    let valid_repetitions: BTreeSet<usize> = repetition_numbers(metadata.repetitions)
+        .map(|repetition| repetition.unwrap_or(1))
+        .collect();
+    let mut completed: BTreeMap<CellId, BTreeSet<usize>> = BTreeMap::new();
+    for entry in document.completed {
+        if !planned.contains(&entry.cell) {
+            return Err(format!(
+                "{} records unplanned cell {}; the persisted resume completion map was not trusted. Rerun `run --resume` to rewrite it, or use a fresh --results directory",
+                path.display(),
+                display_id(&entry.cell)
+            ));
+        }
+        if completed.contains_key(&entry.cell) {
+            return Err(format!(
+                "{} records cell {} twice; the persisted resume completion map was not trusted. Rerun `run --resume` to rewrite it, or use a fresh --results directory",
+                path.display(),
+                display_id(&entry.cell)
+            ));
+        }
+        let mut repetitions = BTreeSet::new();
+        for repetition in entry.repetitions {
+            if !valid_repetitions.contains(&repetition) || !repetitions.insert(repetition) {
+                return Err(format!(
+                    "{} records invalid or duplicate repetition {repetition} for {}; the persisted resume completion map was not trusted. Rerun `run --resume` to rewrite it, or use a fresh --results directory",
+                    path.display(),
+                    display_id(&entry.cell)
+                ));
+            }
+        }
+        if !repetitions.is_empty() {
+            completed.insert(entry.cell, repetitions);
+        }
+    }
+    Ok(Some(completed))
+}
+
+/// Whether a row executed no Hermit binary by design, and so records no
+/// binary identity to check. The harness writes exactly one such row kind:
+/// `host_inapplicable_result` records `binary_sha256: None` with outcome
+/// `HOST-INAPPLICABLE` because the cell did not run (no argv or binary
+/// identity is invented for it). Such a row combines with rows of any one
+/// binary; it is evidence about the host, not about a binary.
+fn row_executed_no_binary(row: &CellResult) -> bool {
+    row.outcome == "HOST-INAPPLICABLE"
+        && row
+            .binary_sha256
+            .as_deref()
+            .is_none_or(|digest| digest.is_empty())
+}
+
+/// A durable row must record the Hermit binary and test digests it was
+/// produced with. A row without them cannot be identity-checked, so resume
+/// and merge refuse it rather than silently trusting it. The one exception
+/// is a host-inapplicable row (see [`row_executed_no_binary`]): it records
+/// no binary because none ran, but it must still record its test digest.
+fn check_row_identity_hashes(row: &CellResult, source: &Path) -> Result<(), String> {
+    let binary_ok = row
+        .binary_sha256
+        .as_deref()
+        .is_some_and(|digest| !digest.is_empty());
+    if row.test_sha256.is_empty() {
+        return Err(format!(
+            "{} records no test identity (test_sha256={:?}, outcome={}); it was not counted. Resume and merge require rows that record test_sha256; restore rows written by the current harness, or use a fresh --results directory and rerun",
+            source.display(),
+            row.test_sha256,
+            row.outcome
+        ));
+    }
+    if !binary_ok && !row_executed_no_binary(row) {
+        return Err(format!(
+            "{} records no Hermit binary identity (binary_sha256={:?}, outcome={}); it was not counted. Only a HOST-INAPPLICABLE row may record no binary, because it executed none; this row's outcome is not HOST-INAPPLICABLE, so resume and merge require a recorded binary_sha256. Restore rows written by the current harness, or use a fresh --results directory and rerun",
+            source.display(),
+            row.binary_sha256,
+            row.outcome
+        ));
+    }
+    Ok(())
+}
+
+/// Every durable row currently under `results`, read strictly, except a
+/// repetition refused by name as resume-final-status-missing: its row is
+/// not credited or identity-combined, and resume reruns it, so its stale
+/// row must not abort the preflight that schedules the rerun. A summary
+/// still refuses that repetition by name (see the summarize loop).
+fn all_durable_result_rows(
+    results: &Path,
+    metadata: &RunMetadata,
+) -> Result<Vec<CellResult>, String> {
+    let mut rows = Vec::new();
+    let planned: Vec<&CellId> = metadata
+        .cells
+        .iter()
+        .chain(metadata.reference_cells.iter())
+        .collect();
+    for cell in planned {
+        for repetition in repetition_numbers(metadata.repetitions) {
+            let slug = cell_run_slug(cell, repetition);
+            let file = results.join("cells").join(&slug).join("results.jsonl");
+            if !file.is_file() {
+                continue;
+            }
+            match read_durable_result_rows(&file, cell, metadata, repetition) {
+                Ok(found) => rows.extend(found),
+                Err(error) if error.contains("resume-final-status-missing") => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// The Hermit binary every pressure cell runs in `checkout`.
+fn selected_hermit_binary(checkout: &Path) -> PathBuf {
+    checkout.join("target/ci/hermit")
+}
+
+/// Rebuild the selected Hermit binary in `checkout` when it is missing, so
+/// an identity comparison hashes a binary built from this checkout rather
+/// than failing on an absent file. A present binary is used as-is; a stale
+/// one is caught by the hash comparison that follows.
+fn ensure_selected_binary_built(checkout: &Path) -> Result<PathBuf, String> {
+    let binary = selected_hermit_binary(checkout);
+    if executable_file(&binary) {
+        return Ok(binary);
+    }
+    let build = Command::new("cargo")
+        .args([
+            "build",
+            "--locked",
+            "--profile",
+            "validate",
+            "-p",
+            "hermit-run",
+            "--bin",
+            "hermit",
+        ])
+        .current_dir(checkout)
+        .output()
+        .map_err(|e| {
+            format!(
+                "cannot rebuild the selected Hermit binary in {}: {e}; build target/ci/hermit and rerun --resume",
+                checkout.display()
+            )
+        })?;
+    if !build.status.success() {
+        return Err(format!(
+            "rebuilding the selected Hermit binary in {} failed: {}; build target/ci/hermit and rerun --resume",
+            checkout.display(),
+            String::from_utf8_lossy(&build.stderr).trim()
+        ));
+    }
+    let built = checkout.join("target/validate/hermit");
+    if let Some(parent) = binary.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    fs::copy(&built, &binary).map_err(|e| {
+        format!(
+            "cannot install rebuilt Hermit binary as {}: {e}",
+            binary.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&binary, fs::Permissions::from_mode(0o755));
+    }
+    if !executable_file(&binary) {
+        return Err(format!(
+            "rebuilt Hermit binary {} is missing or not executable; build target/ci/hermit and rerun --resume",
+            binary.display()
+        ));
+    }
+    Ok(binary)
+}
+
+/// Current test digests by test ID, from the same manifest set and digest
+/// the harness records in each row (`test_digest` hashes program-source
+/// bytes or the direct-command representation).
+fn current_test_digests(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    use hermit_manifest_plan::runner::Population;
+    use hermit_manifest_plan::runner::Selection;
+    let manifests = ManifestSet::load(root)?;
+    let mut digests = BTreeMap::new();
+    for population in [Population::Enabled, Population::Disabled] {
+        let cells = manifests.select(&Selection {
+            population: Some(population),
+            include_occasional: true,
+            include_manual: true,
+            all_run_types: true,
+            ..Selection::default()
+        })?;
+        for cell in cells {
+            let digest = hermit_manifest_plan::runner::test_digest(root, &cell.test)?;
+            match digests.get(&cell.id.test) {
+                None => {
+                    digests.insert(cell.id.test.clone(), digest);
+                }
+                Some(existing) if *existing != digest => {
+                    return Err(format!(
+                        "manifest test {} has conflicting current digests; refusing to identity-check resume rows against an ambiguous digest",
+                        cell.id.test
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(digests)
+}
+
+fn check_test_identity(
+    row: &CellResult,
+    test_digests: &BTreeMap<String, String>,
+    source: &Path,
+) -> Result<(), String> {
+    let current = test_digests.get(&row.test).ok_or_else(|| {
+        format!(
+            "{} records test {}, which the current manifest set does not contain; it was not counted. Restore the retained manifest/test or use a fresh --results directory",
+            source.display(),
+            row.test
+        )
+    })?;
+    if *current != row.test_sha256 {
+        return Err(format!(
+            "{} records test {} sha256 {}, but the current test digest is {current}; the durable rows were not combined. Restore the retained test source and rerun --resume, or use a fresh --results directory",
+            source.display(),
+            row.test,
+            row.test_sha256
+        ));
+    }
+    Ok(())
+}
+
+/// Compare recorded row identities against the selected binary and the
+/// current test digests. Any mismatch or missing identity refuses.
+fn check_identities_against_current(
+    rows: &[CellResult],
+    binary_sha256: &str,
+    binary_path: &Path,
+    test_digests: &BTreeMap<String, String>,
+    source: &Path,
+) -> Result<(), String> {
+    for row in rows {
+        check_row_identity_hashes(row, source)?;
+        // A host-inapplicable row executed no binary, so it has no binary
+        // identity to compare; every other row must record the selected
+        // binary. Its test digest is still checked below.
+        if !row_executed_no_binary(row) && row.binary_sha256.as_deref() != Some(binary_sha256) {
+            return Err(format!(
+                "{} records Hermit binary sha256 {}, but the selected binary {} hashes to {binary_sha256}; the durable rows were not combined. Rebuild the selected Hermit binary from the retained commit (resume rebuilds a missing target/ci/hermit first) and rerun --resume, or use a fresh --results directory",
+                source.display(),
+                row.binary_sha256.as_deref().unwrap_or("<none>"),
+                binary_path.display()
+            ));
+        }
+        check_test_identity(row, test_digests, source)?;
+    }
+    Ok(())
+}
+
+/// One-binary / one-test-digest-per-test consistency across durable rows
+/// themselves, with no live binary to compare against. A standalone
+/// summarize of a resumed run has no execution checkout left (a batch
+/// run's fresh checkout is cleaned up), so it cannot hash the binary that
+/// executed; what it must still refuse is combining rows that record
+/// different binaries, or different digests for one test. Host-inapplicable
+/// rows record no binary and do not set the campaign binary.
+fn check_resume_rows_one_identity(rows: &[CellResult], source: &Path) -> Result<(), String> {
+    let mut campaign_binary: Option<&str> = None;
+    let mut test_digests: BTreeMap<&str, &str> = BTreeMap::new();
+    for row in rows {
+        check_row_identity_hashes(row, source)?;
+        if let Some(binary) = row
+            .binary_sha256
+            .as_deref()
+            .filter(|digest| !digest.is_empty())
+        {
+            match campaign_binary {
+                None => campaign_binary = Some(binary),
+                Some(existing) if existing != binary => {
+                    return Err(format!(
+                        "{} records Hermit binary sha256 {binary}, but another durable row records {existing}; mixed-binary durable rows were not combined. Summarize or resume only rows produced by one Hermit binary, or use a fresh --results directory",
+                        source.display()
+                    ));
+                }
+                _ => {}
+            }
+        }
+        match test_digests.get(row.test.as_str()) {
+            None => {
+                test_digests.insert(row.test.as_str(), row.test_sha256.as_str());
+            }
+            Some(existing) if *existing != row.test_sha256 => {
+                return Err(format!(
+                    "{} records test {} sha256 {}, but another durable row records {existing} for that test; mixed-test-digest durable rows were not combined. Summarize or resume only rows produced from one test source, or use a fresh --results directory",
+                    source.display(),
+                    row.test,
+                    row.test_sha256
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The identity gate a standalone summarize applies when it detects the
+/// resumed (filtered-DAG) shape: every durable row under `results` must
+/// belong to one binary and one digest per test.
+fn verify_standalone_resume_identities(
+    results: &Path,
+    metadata: &RunMetadata,
+) -> Result<(), String> {
+    let rows = all_durable_result_rows(results, metadata)?;
+    check_resume_rows_one_identity(&rows, results)
+}
+
+/// Test-digest-only resume check, for a dry `plan --resume` in batch mode:
+/// the plan creates no execution checkout, so there is no execution binary
+/// to hash yet. Manifests at the retained commit are the same in the caller
+/// and in the fresh checkout a later `run` creates (batch plans refuse a
+/// dirty tree), so test digests checked here are the execution test
+/// digests; the binary identity is deferred to `run`, truthfully.
+fn verify_resume_test_identities(
+    root: &Path,
+    results: &Path,
+    rows: &[CellResult],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let test_digests = current_test_digests(root)?;
+    for row in rows {
+        check_row_identity_hashes(row, results)?;
+        check_test_identity(row, &test_digests, results)?;
+    }
+    Ok(())
+}
+
+/// Build (when missing) and hash the selected binary in `checkout`.
+fn selected_binary_digest(checkout: &Path) -> Result<(PathBuf, String), String> {
+    let binary = ensure_selected_binary_built(checkout)?;
+    let binary_sha256 = hermit_manifest_plan::bundle_record::binary_digest(&binary)
+        .ok_or_else(|| {
+            format!(
+                "cannot hash the selected Hermit binary {}; rebuild target/ci/hermit and rerun --resume",
+                binary.display()
+            )
+        })?;
+    Ok((binary, binary_sha256))
+}
+
+/// Which checkout's binary a resume preflight must hash. Batch execution
+/// runs in a fresh checkout (`execution`), whose `target/ci/hermit` is the
+/// binary every cell runs (`HERMIT_BIN="$PWD/target/ci/hermit"` with the
+/// execution root as working directory); the caller tree's binary may
+/// differ byte-for-byte, so hashing it would falsely refuse a resumable
+/// run, or falsely accept rows the execution binary cannot combine with.
+/// Exact-cell execution uses the caller tree itself, so callers pass
+/// `execution == caller` (or `None`, meaning the caller).
+fn resume_identity_root<'a>(caller: &'a Path, execution: Option<&'a Path>) -> &'a Path {
+    execution.unwrap_or(caller)
+}
+
+/// Resume preflight against the binary that will actually execute, with
+/// caller-supplied test digests (the self-test's fake checkouts have no
+/// manifest set to load digests from).
+fn verify_resume_preflight_with_digests(
+    caller: &Path,
+    execution: Option<&Path>,
+    rows: &[CellResult],
+    test_digests: &BTreeMap<String, String>,
+    source: &Path,
+) -> Result<(PathBuf, String), String> {
+    let identity_root = resume_identity_root(caller, execution);
+    let (binary, binary_sha256) = selected_binary_digest(identity_root)?;
+    check_identities_against_current(rows, &binary_sha256, &binary, test_digests, source)?;
+    Ok((binary, binary_sha256))
+}
+
+/// Resume preflight against the binary that will actually execute: the
+/// execution checkout's binary in batch mode, the working-tree binary for
+/// an exact cell. Must run before any cell executes.
+fn verify_resume_preflight(
+    caller: &Path,
+    execution: Option<&Path>,
+    results: &Path,
+    rows: &[CellResult],
+) -> Result<(PathBuf, String), String> {
+    let identity_root = resume_identity_root(caller, execution);
+    verify_resume_identities(identity_root, results, rows)
+}
+
+/// Resume identity gate: rebuild a missing selected binary first, then
+/// refuse any durable row whose recorded binary/test digests differ from
+/// the selected binary's SHA-256 and each test's current digest. Returns
+/// the binary that was hashed and its digest; with no durable rows there
+/// is nothing to combine, so no binary is built and the digest is empty.
+fn verify_resume_identities(
+    root: &Path,
+    results: &Path,
+    rows: &[CellResult],
+) -> Result<(PathBuf, String), String> {
+    if rows.is_empty() {
+        return Ok((selected_hermit_binary(root), String::new()));
+    }
+    let test_digests = current_test_digests(root)?;
+    verify_resume_preflight_with_digests(root, None, rows, &test_digests, results)
+}
+
+/// (cell, repetition) pairs still owed, in plan order.
+fn resume_missing_repetitions(
+    metadata: &RunMetadata,
+    completed: &BTreeMap<CellId, BTreeSet<usize>>,
+) -> Vec<(CellId, Option<usize>)> {
+    let mut missing = Vec::new();
+    let planned: Vec<&CellId> = metadata
+        .cells
+        .iter()
+        .chain(metadata.reference_cells.iter())
+        .collect();
+    for cell in planned {
+        for repetition in repetition_numbers(metadata.repetitions) {
+            let number = repetition.unwrap_or(1);
+            if !completed
+                .get(cell)
+                .is_some_and(|done| done.contains(&number))
+            {
+                missing.push((cell.clone(), repetition));
+            }
+        }
+    }
+    missing
+}
+
+fn inherit_resume_selection(
+    retained: &RunMetadata,
+    requested: &CellSelection,
+) -> Result<CellSelection, String> {
+    let conflict = |name: &str| -> String {
+        format!(
+            "--resume selection conflicts with the retained run on {name}; drop the conflicting option so the retained run's selection is reused, or use a fresh --results directory for a different selection"
+        )
+    };
+    let mut selection = CellSelection {
+        mode: retained.mode.clone(),
+        test: retained.test.clone(),
+        backend: retained.backend.clone(),
+        cell_timeout_seconds: retained.cell_timeout_seconds,
+        sample: retained.sample,
+        seed: retained.seed,
+        run_timeout_seconds: Some(retained.run_timeout_seconds),
+        repetitions: retained.repetitions,
+        run_id_prefix: retained.run_id_prefix.clone(),
+        green: retained.green,
+        probe_disabled: retained.probe_disabled,
+        parity_all: retained.parity_all,
+        no_retry: retained.no_retry,
+        jobs: requested.jobs,
+        manifest_guest_cap: retained
+            .manifest_guest_cap_explicit
+            .then_some(retained.manifest_guest_cap),
+        kvm_guest_cap: retained
+            .kvm_guest_cap_explicit
+            .then_some(retained.kvm_guest_cap),
+        cells_file: retained.cells_file.as_ref().map(|path| PathBuf::from(path)),
+        parity_select: retained.parity_select.clone(),
+        resume_dir: requested.resume_dir.clone(),
+        ..CellSelection::default()
+    };
+    if requested.mode.is_some() && requested.mode != retained.mode {
+        return Err(conflict("--mode"));
+    }
+    if requested.test.is_some() && requested.test != retained.test {
+        return Err(conflict("--test"));
+    }
+    if requested.backend.is_some() && requested.backend != retained.backend {
+        return Err(conflict("--backend"));
+    }
+    if requested.repetitions.is_some() && requested.repetitions != retained.repetitions {
+        return Err(conflict("--repetitions"));
+    }
+    if requested.sample.is_some() && requested.sample != retained.sample {
+        return Err(conflict("--sample"));
+    }
+    if requested.seed.is_some() && requested.seed != retained.seed {
+        return Err(conflict("--seed"));
+    }
+    if requested.cell_timeout_seconds.is_some()
+        && requested.cell_timeout_seconds != retained.cell_timeout_seconds
+    {
+        return Err(conflict("--cell-timeout"));
+    }
+    if requested.run_timeout_seconds.is_some()
+        && requested.run_timeout_seconds != Some(retained.run_timeout_seconds)
+    {
+        return Err(conflict("--run-timeout"));
+    }
+    if requested.run_id_prefix.is_some() && requested.run_id_prefix != retained.run_id_prefix {
+        return Err(conflict("--run-id-prefix"));
+    }
+    if requested.jobs.is_some() && requested.jobs != Some(retained.jobs) {
+        return Err(conflict("--jobs"));
+    }
+    if requested.manifest_guest_cap.is_some()
+        && requested.manifest_guest_cap != Some(retained.manifest_guest_cap)
+    {
+        return Err(conflict("--manifest-guest-cap"));
+    }
+    if requested.kvm_guest_cap.is_some() && requested.kvm_guest_cap != Some(retained.kvm_guest_cap)
+    {
+        return Err(conflict("--kvm-guest-cap"));
+    }
+    if requested.parity_all && !retained.parity_all {
+        return Err(conflict("--parity-all"));
+    }
+    if !requested.parity_select.is_empty() && requested.parity_select != retained.parity_select {
+        return Err(conflict("--parity-select"));
+    }
+    if let Some(path) = &requested.cells_file {
+        let requested_path = path.to_string_lossy();
+        if retained.cells_file.as_deref() != Some(requested_path.as_ref()) {
+            return Err(conflict("--cells-file"));
+        }
+    }
+    if requested.green && !retained.green {
+        return Err(conflict("--green"));
+    }
+    if requested.no_retry && !retained.no_retry {
+        return Err(conflict("--no-retry"));
+    }
+    if requested.probe_disabled && !retained.probe_disabled {
+        return Err(conflict("the cell selection"));
+    }
+    if selection.jobs.is_none() {
+        selection.jobs = Some(retained.jobs);
+    }
+    Ok(selection)
+}
+
+/// Drop planned cell steps whose repetition is already durable; rewire the
+/// pressure.summarize step to wait only for the remaining cell steps.
+fn filter_dag_for_resume(
+    dag: &mut DagConfig,
+    metadata: &RunMetadata,
+    completed: &BTreeMap<CellId, BTreeSet<usize>>,
+) {
+    let mut done_tags = BTreeSet::new();
+    let planned: Vec<&CellId> = metadata
+        .cells
+        .iter()
+        .chain(metadata.reference_cells.iter())
+        .collect();
+    for cell in planned {
+        for repetition in repetition_numbers(metadata.repetitions) {
+            let number = repetition.unwrap_or(1);
+            if completed
+                .get(cell)
+                .is_some_and(|done| done.contains(&number))
+            {
+                done_tags.insert(format!("cell.{}", cell_run_slug(cell, repetition)));
+            }
+        }
+    }
+    dag.steps.retain(|step| !done_tags.contains(&step.tag()));
+    // The summarize node must wait for every remaining node (its memory
+    // phase is audited that way). With cell nodes it inherited the builds
+    // transitively; when every repetition is durable no cell remains, so
+    // name the remaining nodes directly.
+    let remaining: Vec<String> = dag
+        .steps
+        .iter()
+        .map(|step| step.tag())
+        .filter(|tag| tag != "pressure.summarize")
+        .collect();
+    for step in &mut dag.steps {
+        if step.tag() == "pressure.summarize" {
+            step.deps.retain(|dep| !done_tags.contains(dep));
+            for tag in &remaining {
+                if !step.deps.contains(tag) {
+                    step.deps.push(tag.clone());
+                }
+            }
+        }
+    }
+}
+
+/// One contributing record of a merged verdict: which attempt directory,
+/// repetition, terminal outcome, and source file supplied the evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MergedContribution {
+    directory: String,
+    repetition: usize,
+    outcome: String,
+    run_id: String,
+    hermit_sha: String,
+    binary_sha256: Option<String>,
+    test_sha256: String,
+    attempts: usize,
+    source: String,
+}
+
+/// One cell's merged verdict across attempt directories.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MergedCellVerdict {
+    cell: CellId,
+    required: usize,
+    present: usize,
+    passing: usize,
+    verdict: &'static str,
+    contributions: Vec<MergedContribution>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MergedRepetition {
+    clean_pass: bool,
+    terminal_pass: bool,
+    failed_or_recovered: bool,
+}
+
+fn merged_verdict(
+    required: usize,
+    present: usize,
+    clean_passing: usize,
+    terminal_passing: usize,
+    any_failed_or_recovered: bool,
+) -> &'static str {
+    if present == 0 {
+        "INCOMPLETE"
+    } else if any_failed_or_recovered {
+        if terminal_passing > 0 {
+            "FLAKY"
+        } else {
+            "FAILING"
+        }
+    } else if present >= required && clean_passing == present {
+        "CLEAN"
+    } else {
+        "INCOMPLETE"
+    }
+}
+
+/// Merge per-cell results across attempt directories (w1 + w2): every
+/// directory's record for a (cell, repetition) is retained as a
+/// contribution; conflicting records and failed retry histories make the
+/// cell FLAKY rather than being hidden by whichever directory came first.
+/// A corrupt file in any directory is refused, never silently skipped.
+fn merge_attempt_directories(dirs: &[PathBuf]) -> Result<(usize, Vec<MergedCellVerdict>), String> {
+    let mut required: Option<usize> = None;
+    let mut planned_cells: Option<Vec<CellId>> = None;
+    let mut campaign_sha: Option<String> = None;
+    let mut metadatas: Vec<Option<RunMetadata>> = Vec::new();
+    for dir in dirs {
+        let run_json = dir.join("run.json");
+        let metadata = if run_json.is_file() {
+            let metadata = load_run_metadata(dir)?;
+            let reps = metadata.repetitions.unwrap_or(1);
+            match required {
+                None => required = Some(reps),
+                Some(existing) if existing != reps => {
+                    return Err(format!(
+                        "cannot merge {} ({} repetitions) with the earlier directories ({} repetitions); merge only attempt directories of one campaign with the same --repetitions, or summarize each directory separately",
+                        dir.display(),
+                        reps,
+                        existing
+                    ));
+                }
+                _ => {}
+            }
+            match &campaign_sha {
+                None => campaign_sha = Some(metadata.hermit_sha.clone()),
+                Some(existing) if *existing != metadata.hermit_sha => {
+                    return Err(format!(
+                        "cannot merge {} (commit {}) with the earlier directories (commit {}); merge only attempt directories of one campaign at one commit, or summarize each directory separately",
+                        dir.display(),
+                        metadata.hermit_sha,
+                        existing
+                    ));
+                }
+                _ => {}
+            }
+            let mut planned = metadata.cells.clone();
+            planned.extend(metadata.reference_cells.iter().cloned());
+            match &planned_cells {
+                None => planned_cells = Some(planned),
+                Some(existing) if *existing != planned => {
+                    return Err(format!(
+                        "cannot merge {} whose planned cells differ from the earlier directories; merge only attempt directories of one campaign, or summarize each directory separately",
+                        dir.display()
+                    ));
+                }
+                _ => {}
+            }
+            Some(metadata)
+        } else {
+            None
+        };
+        metadatas.push(metadata);
+    }
+    // (cell, repetition) -> merged observation across every directory.
+    let mut observed: BTreeMap<CellId, BTreeMap<usize, MergedRepetition>> = BTreeMap::new();
+    let mut contributions: BTreeMap<CellId, Vec<MergedContribution>> = BTreeMap::new();
+    let mut row_campaign: Option<(String, bool)> = None;
+    let mut campaign_binary: Option<String> = None;
+    let mut campaign_test_hashes: BTreeMap<String, String> = BTreeMap::new();
+    for (dir_index, dir) in dirs.iter().enumerate() {
+        let cells_dir = dir.join("cells");
+        if !cells_dir.is_dir() {
+            return Err(format!(
+                "{} has no cells/ directory; merge only retained pressure attempt directories, or check the path and rerun",
+                dir.display()
+            ));
+        }
+        let mut entries: Vec<_> = fs::read_dir(&cells_dir)
+            .map_err(|e| format!("cannot read {}: {e}", cells_dir.display()))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("cannot read {}: {e}", cells_dir.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some((slug, number)) = name
+                .rsplit_once("-repetition-")
+                .and_then(|(slug, n)| Some((slug.to_string(), n.parse::<usize>().ok()?)))
+                .filter(|(_, n)| *n >= 1)
+            else {
+                continue;
+            };
+            let _ = slug;
+            let file = entry.path().join("results.jsonl");
+            if !file.is_file() {
+                continue;
+            }
+            // Cell identity comes from the rows; the directory only locates it.
+            let bytes =
+                fs::read(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+            if bytes.last() != Some(&b'\n') {
+                return Err(format!(
+                    "{}: final line is incomplete (missing terminating newline, likely a torn write); it was not counted. Delete that repetition's cell directory in its attempt directory and rerun, or restore the complete file, then rerun the merge",
+                    file.display()
+                ));
+            }
+            let rows = read_result_rows(&file).map_err(|error| {
+                format!("{error}; the corrupt repetition was not counted. Delete that repetition's cell directory in its attempt directory and rerun, or restore the complete file, then rerun the merge")
+            })?;
+            let first = &rows[0];
+            let cell = CellId {
+                lane: first.lane.clone(),
+                category: first.category.clone(),
+                test: first.test.clone(),
+                mode: first.mode.clone(),
+                backend: first
+                    .backend
+                    .clone()
+                    .unwrap_or_else(|| "native".to_string()),
+            };
+            if let Some(limit) = required {
+                if number == 0 || number > limit {
+                    return Err(format!(
+                        "{} is repetition {number}, outside the merged campaign's 1..={limit} repetitions; it was not counted. Merge only attempt directories of one campaign, or restore the correct directory, then rerun",
+                        file.display()
+                    ));
+                }
+            }
+            // Bind the rows to one campaign, and to this directory's
+            // retained run and repetition when run.json is present.
+            for row in &rows {
+                check_row_identity_hashes(row, &file)?;
+                if let Some(binary) = &row.binary_sha256 {
+                    match &campaign_binary {
+                        None => campaign_binary = Some(binary.clone()),
+                        Some(existing) if existing != binary => {
+                            return Err(format!(
+                                "{} records Hermit binary sha256 {binary}, not the merged campaign binary {existing}; it was not counted. Merge only attempt directories of one campaign whose rows record one binary and one test digest per test, or summarize each directory separately",
+                                file.display()
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                match campaign_test_hashes.get(&row.test) {
+                    None => {
+                        campaign_test_hashes.insert(row.test.clone(), row.test_sha256.clone());
+                    }
+                    Some(existing) if *existing != row.test_sha256 => {
+                        return Err(format!(
+                            "{} records test {} sha256 {}, not the merged campaign digest {existing} for that test; it was not counted. Merge only attempt directories of one campaign whose rows record one binary and one test digest per test, or summarize each directory separately",
+                            file.display(),
+                            row.test,
+                            row.test_sha256
+                        ));
+                    }
+                    _ => {}
+                }
+                match &row_campaign {
+                    None => row_campaign = Some((row.hermit_sha.clone(), row.source_tree_dirty)),
+                    Some((sha, dirty))
+                        if *sha != row.hermit_sha || *dirty != row.source_tree_dirty =>
+                    {
+                        return Err(format!(
+                            "{} holds rows at commit {} (dirty={}), not the merged campaign at commit {} (dirty={}); it was not counted. Merge only attempt directories of one campaign, or summarize each directory separately",
+                            file.display(),
+                            row.hermit_sha,
+                            row.source_tree_dirty,
+                            sha,
+                            dirty
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(metadata) = &metadatas[dir_index] {
+                let expected_run_id =
+                    cell_evidence_run_id(&cell, Some(number), metadata.run_id_prefix.as_deref());
+                if first.hermit_sha != metadata.hermit_sha
+                    || first.source_tree_dirty != metadata.source_tree_dirty
+                    || first.run_id != expected_run_id
+                    || !metadata
+                        .cells
+                        .iter()
+                        .chain(&metadata.reference_cells)
+                        .any(|planned| *planned == cell)
+                {
+                    return Err(format!(
+                        "{} holds rows for run {} at commit {}, not for retained run {} repetition {} at commit {}; it was not counted. Merge only attempt directories of one campaign, or restore the correct file, then rerun",
+                        file.display(),
+                        first.run_id,
+                        first.hermit_sha,
+                        metadata.run_id,
+                        expected_run_id,
+                        metadata.hermit_sha
+                    ));
+                }
+            } else if first.run_id != cell_run_slug(&cell, Some(number)) {
+                return Err(format!(
+                    "{} holds rows for run {}, not for its directory's repetition {}; it was not counted. Merge only retained pressure attempt directories, or restore the correct file, then rerun",
+                    file.display(),
+                    first.run_id,
+                    cell_run_slug(&cell, Some(number))
+                ));
+            }
+            let terminal =
+                cell_result_after_retries(&rows).map_err(|e| format!("{}: {e}", file.display()))?;
+            let terminal_pass = terminal.outcome == "PASS";
+            // Any non-PASS observation (FAIL, ERROR, or any other adverse
+            // outcome) in any directory keeps the repetition adverse: an
+            // ERROR/PASS conflict must never become CLEAN.
+            let failed_or_recovered =
+                rows.iter().any(|row| row.outcome != "PASS") || terminal.outcome != "PASS";
+            let clean_pass = terminal_pass && rows.iter().all(|row| row.outcome == "PASS");
+            contributions
+                .entry(cell.clone())
+                .or_default()
+                .push(MergedContribution {
+                    directory: dir.display().to_string(),
+                    repetition: number,
+                    outcome: terminal.outcome.clone(),
+                    run_id: first.run_id.clone(),
+                    hermit_sha: first.hermit_sha.clone(),
+                    binary_sha256: first.binary_sha256.clone(),
+                    test_sha256: first.test_sha256.clone(),
+                    attempts: rows.len(),
+                    source: file.display().to_string(),
+                });
+            let entry = observed.entry(cell).or_default().entry(number).or_default();
+            // Every directory's record counts: a clean pass in one and a
+            // failure in another is a conflict, not a first-directory win.
+            entry.clean_pass = (entry.clean_pass || clean_pass)
+                && !(entry.failed_or_recovered || failed_or_recovered);
+            entry.terminal_pass = entry.terminal_pass || terminal_pass;
+            entry.failed_or_recovered = entry.failed_or_recovered || failed_or_recovered;
+            if entry.failed_or_recovered {
+                entry.clean_pass = false;
+            }
+        }
+    }
+    let required = required.unwrap_or_else(|| {
+        observed
+            .values()
+            .map(|reps| reps.keys().max().copied().unwrap_or(1))
+            .max()
+            .unwrap_or(1)
+    });
+    // Enumerate the planned population when run.json names it, so a cell
+    // with no rows in any directory reports INCOMPLETE instead of vanishing.
+    if let Some(planned) = &planned_cells {
+        for cell in planned {
+            observed.entry(cell.clone()).or_default();
+        }
+    }
+    let mut verdicts = Vec::new();
+    for (cell, reps) in &observed {
+        let present = reps.len();
+        let passing = reps.values().filter(|rep| rep.clean_pass).count();
+        let terminal_passing = reps.values().filter(|rep| rep.terminal_pass).count();
+        let any_failed = reps.values().any(|rep| rep.failed_or_recovered);
+        let verdict = merged_verdict(required, present, passing, terminal_passing, any_failed);
+        verdicts.push(MergedCellVerdict {
+            cell: cell.clone(),
+            required,
+            present,
+            passing,
+            verdict,
+            contributions: contributions.get(cell).cloned().unwrap_or_default(),
+        });
+    }
+    Ok((required, verdicts))
+}
+
+fn summarize_merged(results: &Path, merge_dirs: &[PathBuf]) -> Result<(), String> {
+    if merge_dirs.is_empty() {
+        return Err("summarize --merge requires at least one attempt directory; give --merge DIR for each attempt (for example --merge w1 --merge w2)".into());
+    }
+    for dir in merge_dirs {
+        if !dir.is_dir() {
+            return Err(format!(
+                "--merge {} is not a directory; point --merge at a retained pressure attempt directory containing cells/, or check the path and rerun",
+                dir.display()
+            ));
+        }
+    }
+    let (required, verdicts) = merge_attempt_directories(merge_dirs)?;
+    if verdicts.is_empty() {
+        return Err(format!(
+            "no durable per-cell results.jsonl found under {}; there is nothing to merge. Check the --merge paths name attempt directories with cells/<slug>-repetition-NNNN/results.jsonl",
+            merge_dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for verdict in &verdicts {
+        *counts.entry(verdict.verdict).or_default() += 1;
+        println!(
+            "{}: {} ({}/{} repetitions present, {} passing)",
+            display_id(&verdict.cell),
+            verdict.verdict,
+            verdict.present,
+            verdict.required,
+            verdict.passing
+        );
+    }
+    let summary = json!({
+        "schema": 1,
+        "kind": "pressure-merged-summary",
+        "evidence": "rows-only: per-cell results.jsonl merged across attempt directories; runner evidence and verify logs were not re-read",
+        "required_repetitions": required,
+        "attempt_directories": merge_dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+        "counts": counts,
+        "cells": verdicts.iter().map(|v| json!({
+            "cell": display_id(&v.cell),
+            "verdict": v.verdict,
+            "present": v.present,
+            "required": v.required,
+            "passing": v.passing,
+            "contributions": v.contributions.iter().map(|c| json!({
+                "directory": c.directory,
+                "repetition": c.repetition,
+                "outcome": c.outcome,
+                "run_id": c.run_id,
+                "hermit_sha": c.hermit_sha,
+                "binary_sha256": c.binary_sha256,
+                "test_sha256": c.test_sha256,
+                "attempts": c.attempts,
+                "source": c.source,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    let mut text = serde_json::to_string_pretty(&summary)
+        .map_err(|e| format!("cannot serialize merged summary: {e}"))?;
+    text.push('\n');
+    let path = results.join("summary-merged.json");
+    write_file_durable(&path, text.as_bytes())?;
+    println!("Merged summary: {}", path.display());
+    let not_clean = verdicts.iter().filter(|v| v.verdict != "CLEAN").count();
+    if not_clean > 0 {
+        return Err(format!(
+            "merged summary: {not_clean} of {} cell(s) are not CLEAN (see {}); flaky and failing cells are red, as in summarize",
+            verdicts.len(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RunMetadata {
     schema: u64,
+    /// True only for runs planned after durable per-cell publication
+    /// (fsync before/after rename) became the generated form. A retained
+    /// run without this marker predates that format and keeps the legacy
+    /// plain-rename publication exemption; a marked run is held strict.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    durable_publication: bool,
     #[serde(default)]
     run_id: String,
     hermit_sha: String,
@@ -2731,6 +4247,54 @@ fn require_runner_outcomes_for_planned_cells(
     Ok(())
 }
 
+/// Cell-run tags for the repetitions verified durable from their
+/// retained `results.jsonl` files (the `completed` map of a resume scan).
+fn durable_cell_run_tags(
+    metadata: &RunMetadata,
+    completed: &BTreeMap<CellId, BTreeSet<usize>>,
+) -> BTreeSet<String> {
+    let mut tags = BTreeSet::new();
+    for cell in metadata.cells.iter().chain(&metadata.reference_cells) {
+        if let Some(done) = completed.get(cell) {
+            for repetition in repetition_numbers(metadata.repetitions) {
+                if done.contains(&repetition.unwrap_or(1)) {
+                    tags.insert(format!("cell.{}", cell_run_slug(cell, repetition)));
+                }
+            }
+        }
+    }
+    tags
+}
+
+/// Resume form of [`require_runner_outcomes_for_planned_cells`]: a durable
+/// repetition's `results.jsonl` (verified by the resume scan) satisfies the
+/// outcome requirement without a runner outcome, because a killed run may
+/// never have written `runner-outcomes.json`. Only the newly planned cell
+/// runs require runner outcomes; foreign outcomes are still refused.
+fn require_runner_outcomes_for_resume(
+    metadata: &RunMetadata,
+    runner_evidence: &BTreeMap<String, RunnerEvidence>,
+    completed: &BTreeMap<CellId, BTreeSet<usize>>,
+) -> Result<(), String> {
+    let planned = planned_cell_run_tags(metadata);
+    let durable = durable_cell_run_tags(metadata, completed);
+    let required: BTreeSet<String> = planned.difference(&durable).cloned().collect();
+    let actual: BTreeSet<String> = runner_evidence.keys().cloned().collect();
+    let missing = required.difference(&actual).next().cloned();
+    let foreign = actual.difference(&planned).next().cloned();
+    if missing.is_some() || foreign.is_some() {
+        return Err(format!(
+            "typed scheduler cell identities do not match the newly planned runs on resume: expected_new={} actual={} durable_verified={} first_missing={} first_foreign={}",
+            required.len(),
+            actual.len(),
+            durable.len(),
+            missing.unwrap_or_else(|| "none".into()),
+            foreign.unwrap_or_else(|| "none".into())
+        ));
+    }
+    Ok(())
+}
+
 fn retain_execution_evidence(
     results: &Path,
     execution: &ExecutionEvidence,
@@ -3013,9 +4577,80 @@ fn run() -> Result<(), String> {
                         .into(),
                 );
             }
-            require_empty_result_dir(&results)?;
+            let resume = if selection.resume_dir.is_some() {
+                let prepared = prepare_resume(&root, &results, &selection)?;
+                Some(prepared)
+            } else {
+                require_empty_result_dir(&results)?;
+                None
+            };
+            let selection = resume
+                .as_ref()
+                .map_or(&selection, |(effective, _, _)| effective);
+            // Resume identity preflight, truthfully scoped for a dry plan.
+            // An exact cell executes in this working tree, so its binary is
+            // the execution binary and is hashed here. A batch plan creates
+            // no execution checkout, so no execution binary exists to hash:
+            // only test digests are checked (identical at the retained
+            // commit), and the binary check is deferred to `run --resume`,
+            // which builds the fresh checkout's binary and refuses a
+            // mismatch before any cell executes.
+            if let Some((_, retained, _)) = &resume {
+                let durable_rows = all_durable_result_rows(&results, retained)?;
+                if selection.allows_dirty_source() {
+                    let (binary, digest) =
+                        verify_resume_preflight(&root, Some(&root), &results, &durable_rows)?;
+                    if !durable_rows.is_empty() {
+                        println!(
+                            "Resume identity preflight (plan): checked working-tree execution binary {} (sha256 {digest}) against {} durable row(s); an exact-cell run executes this same binary",
+                            binary.display(),
+                            durable_rows.len()
+                        );
+                    }
+                } else {
+                    verify_resume_test_identities(&root, &results, &durable_rows)?;
+                    println!(
+                        "Resume identity preflight (plan): plan is dry and creates no execution checkout, so no execution binary was hashed and the caller-tree binary {} was not used as the execution identity; checked only test digests for {} durable row(s). `run --resume` will build the fresh execution checkout's target/ci/hermit and refuse mismatched durable rows before any cell executes",
+                        selected_hermit_binary(&root).display(),
+                        durable_rows.len()
+                    );
+                }
+            }
             let output = results.join("dag.json");
-            let (metadata, dag) = write_plan(&root, &results, &output, &selection)?;
+            // Rollback and immutable archive are prepared BEFORE write_plan
+            // overwrites anything: a write_plan failure restores the
+            // retained plan instead of destroying it.
+            let retained_snapshot = resume.as_ref().map(|_| snapshot_retained_plan(&results));
+            if let Some((_, retained, _)) = &resume {
+                let reruns = final_status_missing_repetitions(&results, retained)?;
+                archive_resume_attempt(&results, &reruns)?;
+            }
+            let (metadata, mut dag) = match write_plan(&root, &results, &output, selection) {
+                Ok(planned) => planned,
+                Err(error) => {
+                    if let Some(snapshot) = &retained_snapshot {
+                        let _ = restore_retained_plan(&results, snapshot);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some((_, retained, completed)) = &resume {
+                if metadata.cells != retained.cells
+                    || metadata.reference_cells != retained.reference_cells
+                    || metadata.repetitions != retained.repetitions
+                {
+                    if let Some(snapshot) = &retained_snapshot {
+                        restore_retained_plan(&results, snapshot)?;
+                    }
+                    return Err("--resume replanned a different cell set than the retained run; the retained run.json and dag.json were restored, or use a fresh --results directory for a different selection".into());
+                }
+                print_resume_state(&metadata, completed);
+                filter_dag_for_resume(&mut dag, &metadata, completed);
+                let mut dag_text = dagrun::io::dag_to_json(&dag);
+                dag_text.push('\n');
+                write_file_durable(&output, dag_text.as_bytes())?;
+                write_resume_completed(&results, completed)?;
+            }
             println!("DAG: {}", output.display());
             println!("Results: {}", results.display());
             println!("Cell runs: {}", planned_cell_run_tags(&metadata).len());
@@ -3023,7 +4658,14 @@ fn run() -> Result<(), String> {
             println!("Whole-run bound: {}s", metadata.run_timeout_seconds);
             print_sample(&metadata);
             if selection.is_exact() {
-                print_exact_manifest_command(&dag, &metadata)?;
+                if resume.is_some() && !dag.steps.iter().any(|step| step.tag().starts_with("cell."))
+                {
+                    println!(
+                        "Exact cell: every repetition is already durable; no cell node remains."
+                    );
+                } else {
+                    print_exact_manifest_command(&dag, &metadata)?;
+                }
             }
             println!(
                 "Inspection only: `run` builds the same typed graph in memory; dag.json is never execution authority."
@@ -3041,6 +4683,14 @@ fn run() -> Result<(), String> {
                     "run does not accept --output; its plan is always RESULTS/dag.json".into(),
                 );
             }
+            let resume = if selection.resume_dir.is_some() {
+                Some(prepare_resume(&root, &results, &selection)?)
+            } else {
+                None
+            };
+            let selection = resume
+                .as_ref()
+                .map_or(selection, |(effective, _, _)| effective.clone());
             let exact_cell = selection.is_exact();
             if !selection.allows_dirty_source() && worktree_dirty(&root)? {
                 return Err("run refuses a dirty checkout; commit first so every row binds to reproducible source".into());
@@ -3055,7 +4705,9 @@ fn run() -> Result<(), String> {
             // process or starts its signal thread.
             env::remove_var(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV);
             let cgroups = establish_pressure_cgroups(run_timeout_seconds)?;
-            require_empty_result_dir(&results)?;
+            if resume.is_none() {
+                require_empty_result_dir(&results)?;
+            }
             let started = Instant::now();
             let sha = git_output(&root, &["rev-parse", "HEAD"])?;
             if reuse_fresh && selection.allows_dirty_source() {
@@ -3080,11 +4732,75 @@ fn run() -> Result<(), String> {
                 .unwrap_or(root.as_path());
             let output = results.join("dag.json");
             let run_result = (|| {
-                let (metadata, dag) = write_plan(execution_root, &results, &output, &selection)?;
+                // Resume identity preflight against the execution binary,
+                // before any planning overwrite and before any cell
+                // executes. The fresh checkout exists by now, and
+                // verify_resume_preflight builds its missing
+                // target/ci/hermit first (exact-cell mode: the working
+                // tree, unchanged). A mismatch refuses here, not after
+                // the full execution at the post-run gate below.
+                if let Some((_, retained, _)) = &resume {
+                    let durable_rows = all_durable_result_rows(&results, retained)?;
+                    let (binary, digest) = verify_resume_preflight(
+                        &root,
+                        Some(execution_root),
+                        &results,
+                        &durable_rows,
+                    )?;
+                    if !durable_rows.is_empty() {
+                        println!(
+                            "Resume identity preflight: checked execution binary {} (sha256 {digest}) against {} durable row(s) before any cell executes",
+                            binary.display(),
+                            durable_rows.len()
+                        );
+                    }
+                }
+                // Rollback and immutable archive are prepared BEFORE
+                // write_plan overwrites anything (M6/M5).
+                let retained_snapshot = resume.as_ref().map(|_| snapshot_retained_plan(&results));
+                if let Some((_, retained, _)) = &resume {
+                    let reruns = final_status_missing_repetitions(&results, retained)?;
+                    archive_resume_attempt(&results, &reruns)?;
+                }
+                let (metadata, mut dag) =
+                    match write_plan(execution_root, &results, &output, &selection) {
+                        Ok(planned) => planned,
+                        Err(error) => {
+                            if let Some(snapshot) = &retained_snapshot {
+                                let _ = restore_retained_plan(&results, snapshot);
+                            }
+                            return Err(error);
+                        }
+                    };
+                if let Some((_, retained, completed)) = &resume {
+                    if metadata.cells != retained.cells
+                        || metadata.reference_cells != retained.reference_cells
+                        || metadata.repetitions != retained.repetitions
+                    {
+                        if let Some(snapshot) = &retained_snapshot {
+                            restore_retained_plan(&results, snapshot)?;
+                        }
+                        return Err("--resume replanned a different cell set than the retained run; the retained run.json and dag.json were restored, or use a fresh --results directory for a different selection".into());
+                    }
+                    print_resume_state(&metadata, completed);
+                    filter_dag_for_resume(&mut dag, &metadata, completed);
+                    let mut dag_text = dagrun::io::dag_to_json(&dag);
+                    dag_text.push('\n');
+                    write_file_durable(&output, dag_text.as_bytes())?;
+                    write_resume_completed(&results, completed)?;
+                }
                 print_unavailable(&metadata);
                 print_sample(&metadata);
                 if exact_cell {
-                    print_exact_manifest_command(&dag, &metadata)?;
+                    if resume.is_some()
+                        && !dag.steps.iter().any(|step| step.tag().starts_with("cell."))
+                    {
+                        println!(
+                            "Exact cell: every repetition is already durable; no cell node remains."
+                        );
+                    } else {
+                        print_exact_manifest_command(&dag, &metadata)?;
+                    }
                 }
                 // --log-tail-bytes: bound and sample every cell run beside the scheduler.
                 let warden = log_tail_options
@@ -3105,18 +4821,90 @@ fn run() -> Result<(), String> {
                     warden.finish();
                 }
                 let execution = execution?;
-                let runner_evidence = retain_execution_evidence(&results, &execution)?;
-                require_runner_outcomes_for_planned_cells(&metadata, &runner_evidence)?;
+                let old_outcomes_text = if resume.is_some() {
+                    fs::read_to_string(results.join("runner-outcomes.json")).ok()
+                } else {
+                    None
+                };
+                let old_evidence = if resume.is_some() {
+                    load_retained_runner_evidence(&results)?.unwrap_or_default()
+                } else {
+                    BTreeMap::new()
+                };
+                let new_evidence = retain_execution_evidence(&results, &execution)?;
+                if let Some(old_text) = &old_outcomes_text {
+                    // Keep both attempts' outcomes durable for a later
+                    // standalone summarize: new outcomes win per tag.
+                    let old_doc: JsonValue = serde_json::from_str(old_text)
+                        .map_err(|e| format!("invalid retained runner-outcomes.json: {e}"))?;
+                    let new_path = results.join("runner-outcomes.json");
+                    let new_doc: JsonValue = serde_json::from_str(
+                        &fs::read_to_string(&new_path)
+                            .map_err(|e| format!("cannot read {}: {e}", new_path.display()))?,
+                    )
+                    .map_err(|e| format!("invalid {}: {e}", new_path.display()))?;
+                    let mut by_tag: BTreeMap<String, JsonValue> = BTreeMap::new();
+                    for outcome in old_doc
+                        .get("outcomes")
+                        .and_then(JsonValue::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        if let Some(tag) = outcome.get("tag").and_then(JsonValue::as_str) {
+                            by_tag.insert(tag.to_string(), outcome);
+                        }
+                    }
+                    for outcome in new_doc
+                        .get("outcomes")
+                        .and_then(JsonValue::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        if let Some(tag) = outcome.get("tag").and_then(JsonValue::as_str) {
+                            by_tag.insert(tag.to_string(), outcome);
+                        }
+                    }
+                    let merged_doc = json!({
+                        "schema": 3,
+                        "scheduler_passes": new_doc.get("scheduler_passes").cloned().unwrap_or(json!(0)),
+                        "outcomes": by_tag.into_values().collect::<Vec<_>>(),
+                    });
+                    let mut text = serde_json::to_string_pretty(&merged_doc)
+                        .map_err(|e| format!("cannot serialize merged runner outcomes: {e}"))?;
+                    text.push('\n');
+                    write_file_durable(&new_path, text.as_bytes())?;
+                }
+                let runner_evidence = if resume.is_some() {
+                    // Merge retained w1 evidence with this attempt's, so the
+                    // summary judges every planned cell across both attempts.
+                    let mut merged = old_evidence;
+                    merged.extend(new_evidence);
+                    merged
+                } else {
+                    new_evidence
+                };
+                if let Some((_, _, completed)) = &resume {
+                    require_runner_outcomes_for_resume(&metadata, &runner_evidence, completed)?;
+                } else {
+                    require_runner_outcomes_for_planned_cells(&metadata, &runner_evidence)?;
+                }
                 println!(
                     "Scheduler: {} pass(es), fixed -j {}, {:.3}s scheduler wall",
                     execution.passes, metadata.jobs, execution.scheduler_wall_s
                 );
-                summarize(
+                if resume.is_some() {
+                    // Old and new rows may only combine when they record
+                    // the binary this execution actually selected.
+                    let all_rows = all_durable_result_rows(&results, &metadata)?;
+                    verify_resume_identities(execution_root, &results, &all_rows)?;
+                }
+                summarize_with_resume_durable(
                     execution_root,
                     &results,
                     selection.allows_dirty_source(),
                     Some(&runner_evidence),
                     true,
+                    resume.as_ref().map(|(_, _, completed)| completed),
                 )?;
                 Ok(())
             })();
@@ -3149,9 +4937,15 @@ fn run() -> Result<(), String> {
             }
         }
         "summarize" => {
-            let (results, output, _) = result_options(&root, &mut args, false, false)?;
+            let (results, output, selection) = result_options(&root, &mut args, false, false)?;
             if output.is_some() {
                 return Err("summarize does not accept --output".into());
+            }
+            if selection.resume_dir.is_some() {
+                return Err("summarize does not accept --resume; resume a run with `run --resume DIR` or `plan --resume DIR`, or merge attempts with `summarize --results DIR --merge ATTEMPT ...`".into());
+            }
+            if !selection.merge_dirs.is_empty() {
+                return summarize_merged(&results, &selection.merge_dirs);
             }
             // Dirty retained results are admissible only when their own
             // metadata proves they came from one exact cell; summarize()
@@ -3159,9 +4953,12 @@ fn run() -> Result<(), String> {
             summarize(&root, &results, true, None, false)?;
         }
         "emit-series" => {
-            let (results, output, _) = result_options(&root, &mut args, false, false)?;
+            let (results, output, selection) = result_options(&root, &mut args, false, false)?;
             if output.is_some() {
                 return Err("emit-series does not accept --output".into());
+            }
+            if selection.resume_dir.is_some() || !selection.merge_dirs.is_empty() {
+                return Err("emit-series does not accept --resume or --merge; use `run --resume DIR` to resume or `summarize --merge DIR` to merge".into());
             }
             emit_series(&results, &root, false, false)?;
         }
@@ -3185,6 +4982,133 @@ fn run() -> Result<(), String> {
         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
     }
     Ok(())
+}
+
+/// Validate a --resume request against the retained run before any planning
+/// overwrites run.json/dag.json, and scan the durable per-cell files. This
+/// deliberately does not hash any Hermit binary: the execution checkout
+/// may not exist yet. See `verify_resume_preflight`.
+fn prepare_resume(
+    root: &Path,
+    results: &Path,
+    selection: &CellSelection,
+) -> Result<
+    (
+        CellSelection,
+        RunMetadata,
+        BTreeMap<CellId, BTreeSet<usize>>,
+    ),
+    String,
+> {
+    let retained = load_run_metadata(results)?;
+    let head = git_output(root, &["rev-parse", "HEAD"])?;
+    if head != retained.hermit_sha {
+        return Err(format!(
+            "--resume {} belongs to commit {}, but checkout HEAD is {}; checkout the retained commit and rerun --resume, or use a fresh --results directory for this commit",
+            results.display(),
+            retained.hermit_sha,
+            head
+        ));
+    }
+    let effective = inherit_resume_selection(&retained, selection)?;
+    // Validate the retained --cells-file selection before any planning
+    // writes: its file must still hash to the retained digest.
+    if let Some(expected) = &retained.cells_file_sha256 {
+        let path = effective.cells_file.as_ref().ok_or_else(|| {
+            "--resume retained a --cells-file selection but no file; restore the retained cells file or use a fresh --results directory".to_string()
+        })?;
+        let (_, digest) = load_cells_file(path).map_err(|error| {
+            format!("--resume cannot reuse the retained --cells-file selection: {error}; restore the retained cells file or use a fresh --results directory")
+        })?;
+        if digest != *expected {
+            return Err(format!(
+                "--resume --cells-file {} now hashes to {digest}, but the retained run recorded {expected}; restore the retained cells file or use a fresh --results directory",
+                path.display()
+            ));
+        }
+    }
+    let completed = durable_completed_repetitions(results, &retained)?;
+    // No binary identity gate here: in batch mode the binary that will
+    // execute lives in a fresh checkout that does not exist yet, so hashing
+    // this caller tree's binary would check the wrong file. Callers verify
+    // identities against the execution checkout once it exists (run), or
+    // defer the binary check truthfully (dry plan).
+    Ok((effective, retained, completed))
+}
+
+/// Snapshot of retained plan files taken before a resume replan, so a
+/// replanned cell set that does not match the retained run restores the
+/// originals instead of destroying them.
+fn snapshot_retained_plan(results: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    (
+        fs::read(results.join("run.json")).ok(),
+        fs::read(results.join("dag.json")).ok(),
+    )
+}
+
+fn restore_retained_plan(
+    results: &Path,
+    snapshot: &(Option<Vec<u8>>, Option<Vec<u8>>),
+) -> Result<(), String> {
+    if let Some(bytes) = &snapshot.0 {
+        write_file_durable(&results.join("run.json"), bytes)?;
+    }
+    if let Some(bytes) = &snapshot.1 {
+        write_file_durable(&results.join("dag.json"), bytes)?;
+    }
+    Ok(())
+}
+
+/// Archive the retained attempt's records immutably before a resume
+/// replans in place: the previous run.json, dag.json, and
+/// runner-outcomes.json are copied to the next free
+/// `resume-attempts/attempt-NNNN/` directory, which is never overwritten,
+/// and `resume-reruns.json` there records every repetition this resume
+/// scheduled for rerun with its reason (resume-final-status-missing).
+/// A later resume therefore never destroys an earlier attempt's metadata
+/// or outcome records; the live files remain the latest attempt's.
+fn archive_resume_attempt(
+    results: &Path,
+    reruns: &[(CellId, usize)],
+) -> Result<Option<PathBuf>, String> {
+    if !results.join("run.json").is_file() {
+        return Ok(None);
+    }
+    let archive_root = results.join("resume-attempts");
+    fs::create_dir_all(&archive_root)
+        .map_err(|e| format!("cannot create {}: {e}", archive_root.display()))?;
+    let mut number = 1usize;
+    let archive = loop {
+        let candidate = archive_root.join(format!("attempt-{number:04}"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        number += 1;
+    };
+    fs::create_dir_all(&archive)
+        .map_err(|e| format!("cannot create {}: {e}", archive.display()))?;
+    for name in ["run.json", "dag.json", "runner-outcomes.json"] {
+        let source = results.join(name);
+        if let Ok(bytes) = fs::read(&source) {
+            write_file_durable(&archive.join(name), &bytes)?;
+        }
+    }
+    write_resume_reruns(&archive, reruns)?;
+    Ok(Some(archive))
+}
+
+fn print_resume_state(metadata: &RunMetadata, completed: &BTreeMap<CellId, BTreeSet<usize>>) {
+    let missing = resume_missing_repetitions(metadata, completed);
+    let total: usize = metadata
+        .cells
+        .len()
+        .saturating_add(metadata.reference_cells.len())
+        .saturating_mul(metadata.repetitions.unwrap_or(1));
+    let done = total.saturating_sub(missing.len());
+    println!(
+        "Resume: {done} of {total} repetitions already durable; planning {} missing repetition(s)",
+        missing.len()
+    );
 }
 
 fn verdicts_options(
@@ -3897,6 +5821,22 @@ fn result_options(
                 }
                 selection.parity_select = parse_parity_select_option(root, &raw)?;
             }
+            "--resume" => {
+                let raw = args.next().ok_or("--resume requires a directory")?;
+                if raw.is_empty() {
+                    return Err("--resume requires a nonempty directory".into());
+                }
+                if selection.resume_dir.replace(PathBuf::from(raw)).is_some() {
+                    return Err("--resume may be specified only once".into());
+                }
+            }
+            "--merge" => {
+                let raw = args.next().ok_or("--merge requires a directory")?;
+                if raw.is_empty() {
+                    return Err("--merge requires a nonempty directory".into());
+                }
+                selection.merge_dirs.push(PathBuf::from(raw));
+            }
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
     }
@@ -3930,10 +5870,44 @@ fn result_options(
                 .as_nanos() as u64,
         );
     }
+    if selection.resume_dir.is_some() && !selection.merge_dirs.is_empty() {
+        return Err("--resume and --merge cannot be combined; resume one run with --resume, or merge attempt directories with summarize --merge".into());
+    }
+    if !selection.merge_dirs.is_empty() && selection.resume_dir.is_none() && allow_selection {
+        return Err("--merge is only valid with summarize; use `summarize --results DIR --merge ATTEMPT ...`".into());
+    }
+    selection.merge_dirs = selection
+        .merge_dirs
+        .iter()
+        .map(|path| absolute_from(root, path.clone()))
+        .collect();
+    let explicit_results = results.is_some();
     let results = match (results, default_results) {
         (Some(path), _) => absolute_from(root, path),
+        // --resume DIR alone implies DIR is the results directory.
+        (None, _) if selection.resume_dir.is_some() => absolute_from(
+            root,
+            selection
+                .resume_dir
+                .clone()
+                .expect("resume directory checked above"),
+        ),
         (None, true) => default_result_root(root)?,
         (None, false) => return Err("command requires --results DIR".into()),
+    };
+    let results = if let Some(resume) = &selection.resume_dir {
+        let resume = absolute_from(root, resume.clone());
+        if explicit_results && results != resume {
+            return Err(format!(
+                "--resume {} and --results {} name different directories; give only --resume DIR (it is the retained results directory) or make them identical",
+                resume.display(),
+                results.display()
+            ));
+        }
+        selection.resume_dir = Some(resume.clone());
+        resume
+    } else {
+        results
     };
     let output = output.map(|path| absolute_from(root, path));
     Ok((results, output, selection))
@@ -3973,13 +5947,29 @@ fn exact_manifest_command_description(
     if !metadata.is_exact() || metadata.repetitions == Some(0) {
         return Err("exact command display requires a valid exact-cell selection".into());
     }
-    let repetition = metadata.repetitions.map(|_| 1);
-    let tag = format!("cell.{}", cell_run_slug(cell, repetition));
-    let matches: Vec<_> = dag.steps.iter().filter(|step| step.tag() == tag).collect();
-    let [step] = matches.as_slice() else {
+    // On --resume, durable repetitions are filtered out of the DAG, so
+    // repetition 1 may be absent; display the first remaining repetition.
+    let mut chosen = None;
+    for repetition in repetition_numbers(metadata.repetitions) {
+        let tag = format!("cell.{}", cell_run_slug(cell, repetition));
+        let matches: Vec<_> = dag.steps.iter().filter(|step| step.tag() == tag).collect();
+        if matches.is_empty() {
+            continue;
+        }
+        let [step] = matches.as_slice() else {
+            return Err(format!(
+                "exact command display found {} nodes for {tag}; expected exactly one",
+                matches.len()
+            ));
+        };
+        chosen = Some((repetition, tag, *step));
+        break;
+    }
+    let Some((repetition, tag, step)) = chosen else {
+        let first = metadata.repetitions.map(|_| 1);
+        let tag = format!("cell.{}", cell_run_slug(cell, first));
         return Err(format!(
-            "exact command display found {} nodes for {tag}; expected exactly one",
-            matches.len()
+            "exact command display found 0 nodes for {tag}; expected exactly one"
         ));
     };
     let policy = metadata
@@ -3991,7 +5981,10 @@ fn exact_manifest_command_description(
         cell.test, cell.mode, cell.backend
     );
     if let Some(total) = metadata.repetitions {
-        text.push_str(&format!(" (repetition 1 of {total})"));
+        text.push_str(&format!(
+            " (repetition {} of {total})",
+            repetition.unwrap_or(1)
+        ));
     }
     text.push_str(&format!(
         "\nWall bound: {}s\nCPU bound: {}s\nNode environment:\n",
@@ -5892,6 +7885,67 @@ fn required_build_tags(exact_cell: Option<(&str, &str)>) -> BTreeSet<&'static st
     REQUIRED_BUILD_TAGS.into_iter().collect()
 }
 
+/// Executables a build tag must leave in the *current* checkout for its
+/// retained marker to mean the build is done. Markers live in the retained
+/// results directory, which survives a rebuilt fresh checkout that has no
+/// binaries at all: a marker-only skip there left cells invoking a missing
+/// `target/debug/test-harness` / Hermit binary (exit 127). Tags with no
+/// single product executable keep the marker-only rule.
+fn build_product_executables(tag: &str) -> &'static [&'static str] {
+    match tag {
+        "setup.manifest_plan" | "gate.manifest" => &["target/debug/test-harness"],
+        "build.workspace" => &["target/validate/hermit"],
+        "build.e2e_artifact" => &["target/ci/hermit"],
+        _ => &[],
+    }
+}
+
+fn executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// Whether a retained build marker may skip `tag`'s build in `checkout`:
+/// the marker must exist and every product executable must exist and be
+/// executable in this checkout. A marker without its binary rebuilds.
+fn build_step_may_skip(results: &Path, tag: &str, checkout: &Path) -> bool {
+    build_marker(results, tag).is_file()
+        && build_product_executables(tag)
+            .iter()
+            .all(|product| executable_file(&checkout.join(product)))
+}
+
+/// Shell form of [`build_step_may_skip`]'s condition, for the generated
+/// build steps (which run with the current checkout as working directory).
+fn build_skip_condition(marker: &Path, tag: &str) -> String {
+    let mut condition = format!("test -f {}", shell_quote(&marker.to_string_lossy()));
+    for product in build_product_executables(tag) {
+        condition.push_str(&format!(" && test -x {}", shell_quote(product)));
+    }
+    condition
+}
+
+fn required_builds_complete_in_checkout(
+    results: &Path,
+    metadata: &RunMetadata,
+    checkout: &Path,
+) -> bool {
+    let exact_cell = (metadata.test.is_some()
+        && metadata.mode.is_some()
+        && metadata.backend.is_some()
+        && metadata.cells.len() == 1)
+        .then(|| {
+            (
+                metadata.mode.as_deref().expect("checked exact mode"),
+                metadata.backend.as_deref().expect("checked exact backend"),
+            )
+        });
+    required_build_tags(exact_cell)
+        .iter()
+        .all(|tag| build_step_may_skip(results, tag, checkout))
+}
+
 fn required_builds_complete(results: &Path, metadata: &RunMetadata) -> bool {
     let exact_cell = (metadata.test.is_some()
         && metadata.mode.is_some()
@@ -6467,8 +8521,9 @@ fn write_plan_after_scorecard_check(
                 step.cmd.clone()
             };
             step.cmd = format!(
-                "mkdir -p {state}; if test -f {marker}; then exit 0; fi; ( {command} ) && printf 'ok\\n' > {marker}",
+                "mkdir -p {state}; if {skip}; then exit 0; fi; ( {command} ) && printf 'ok\\n' > {marker}",
                 state = shell_quote(&marker.parent().unwrap().to_string_lossy()),
+                skip = build_skip_condition(&marker, &tag),
                 marker = shell_quote(&marker.to_string_lossy()),
             );
             // Preserve every canonical dependency. An unknown future
@@ -6542,7 +8597,7 @@ fn write_plan_after_scorecard_check(
         let pressure_seconds = preparation_timeout(budget)?;
         let run_types = run_types_of(&cell)?;
         let cmd = format!(
-            "mkdir -p {status_dir}; if test -f {status}; then exit 0; fi; \
+            "mkdir -p {status_dir}; {rerun_guard}\
              printf '{incomplete}\\n' > {status}; status=0; \
              timeout --kill-after=10s {pressure_seconds}s env \
              E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} \
@@ -6559,6 +8614,7 @@ fn write_plan_after_scorecard_check(
             backend = backend,
             run_types = run_types,
             status = shell_quote(&status_path.to_string_lossy()),
+            rerun_guard = incomplete_status_rerun_guard(&status_path),
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
         );
         let wall = preparation_node_timeout(budget)?;
@@ -6710,16 +8766,18 @@ fn write_plan_after_scorecard_check(
                 )
             };
             let run_index = repetition.unwrap_or(0);
+            let publish_results = durable_publish_shell(&result_in_progress, &result_file);
             let cmd = format!(
-                "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
+                "mkdir -p {cell_dir}; {rerun_guard}\
+             {reset_in_progress}\
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
              env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} \
              VALIDATE_RUN_STATE={run_state} E2E_RUN_ID={run_id} \
              {run_index_env}={run_index} HERMIT_EPOCH={hermit_epoch} E2E_KEEP_VERIFY_LOGS=1 \
              {post_pass_env}=0 {harness} \
              || status=$?; \
-             if test -e {result_in_progress}; then mv -- {result_in_progress} {result_file} || status=$?; fi; \
-             if test -e {junit_in_progress}; then mv -- {junit_in_progress} {junit} || status=$?; fi; \
+             {publish_results}\
+             if test -e {junit_in_progress}; then mv -- {junit_in_progress} {junit}; junit_status=$?; if test \"$junit_status\" -eq 0; then sync -- {cell_dir}; junit_status=$?; fi; if test \"$junit_status\" -ne 0; then status=$junit_status; fi; fi; \
              printf '%s\\n' \"$status\" > {status_file}; exit \"$status\"",
                 cell_dir = shell_quote(&cell_dir.to_string_lossy()),
                 results = shell_quote(&results.to_string_lossy()),
@@ -6731,11 +8789,13 @@ fn write_plan_after_scorecard_check(
                 hermit_epoch = shell_quote(&hermit_epoch),
                 post_pass_env = parity::PARITY_POST_PASS_ENV,
                 harness = harness,
-                result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
-                result_file = shell_quote(&result_file.to_string_lossy()),
+                publish_results = publish_results,
+                reset_in_progress =
+                    reset_in_progress_shell(&result_in_progress, &junit_in_progress),
                 junit_in_progress = shell_quote(&junit_in_progress.to_string_lossy()),
                 junit = shell_quote(&junit.to_string_lossy()),
                 status_file = shell_quote(&status_file.to_string_lossy()),
+                rerun_guard = incomplete_status_rerun_guard(&status_file),
                 incomplete = INCOMPLETE_ATTEMPT_STATUS,
                 preparation_guard = preparation_guard,
             );
@@ -6962,8 +9022,7 @@ fn write_plan_after_scorecard_check(
         &cell_timeouts,
     )?;
     let retained_output = results.join("dag.json");
-    fs::write(&retained_output, &dag_text)
-        .map_err(|e| format!("cannot write {}: {e}", retained_output.display()))?;
+    write_file_durable(&retained_output, dag_text.as_bytes())?;
     if output != retained_output {
         return Err(format!(
             "pressure plan must be retained and executed at {}; refusing alternate output {}",
@@ -6981,6 +9040,7 @@ fn write_plan_after_scorecard_check(
         .transpose()?;
     let metadata = RunMetadata {
         schema: RUN_SCHEMA,
+        durable_publication: true,
         run_id: results
             .file_name()
             .and_then(|name| name.to_str())
@@ -7034,8 +9094,7 @@ fn write_plan_after_scorecard_check(
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
         .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
     metadata_text.push('\n');
-    fs::write(results.join("run.json"), metadata_text)
-        .map_err(|e| format!("cannot write run metadata: {e}"))?;
+    write_file_durable(&results.join("run.json"), metadata_text.as_bytes())?;
     Ok((metadata, dag))
 }
 
@@ -7044,6 +9103,50 @@ fn audit_dag(
     expected_cells: usize,
     run_timeout: i64,
     expected_cell_timeouts: &BTreeMap<String, i64>,
+) -> Result<(), String> {
+    audit_dag_impl(
+        dag,
+        expected_cells,
+        run_timeout,
+        expected_cell_timeouts,
+        false,
+    )
+}
+
+/// Whether a retained run genuinely predates durable publication: its
+/// run.json carries no durable-format marker. Only such a campaign keeps
+/// the legacy plain-rename publication exemption; every marked (current
+/// format) retained DAG is audited strict, exactly like a new plan.
+fn legacy_publication_exempt(metadata: &RunMetadata) -> bool {
+    !metadata.durable_publication
+}
+
+/// Audit a retained DAG read back for summarize. Old campaigns generated
+/// before durable publication used a plain rename; reading their history
+/// must not refuse solely for that, while every other check stays strict.
+/// Newly generated DAGs keep the strict form via [`audit_dag`].
+fn audit_dag_retained(
+    dag: &DagConfig,
+    expected_cells: usize,
+    run_timeout: i64,
+    expected_cell_timeouts: &BTreeMap<String, i64>,
+    allow_plain_rename: bool,
+) -> Result<(), String> {
+    audit_dag_impl(
+        dag,
+        expected_cells,
+        run_timeout,
+        expected_cell_timeouts,
+        allow_plain_rename,
+    )
+}
+
+fn audit_dag_impl(
+    dag: &DagConfig,
+    expected_cells: usize,
+    run_timeout: i64,
+    expected_cell_timeouts: &BTreeMap<String, i64>,
+    allow_plain_rename: bool,
 ) -> Result<(), String> {
     let mut tags = BTreeSet::new();
     let mut deps = Vec::new();
@@ -7099,7 +9202,8 @@ fn audit_dag(
                 || !cmd.contains("printf '125")
                 || !cmd.contains("exit \"$status\"")
                 || !cmd.contains("results.in-progress.jsonl")
-                || !cmd.contains("mv --")
+                || !(durable_result_publish_present(cmd)
+                    || (allow_plain_rename && plain_result_rename_present(cmd)))
                 || enabled_selector == disabled_selector
                 || !prepared_input
                 || cmd.contains("target/release/hermit")
@@ -7198,11 +9302,179 @@ fn assert_plan_round_trip(expected: &DagConfig, actual: &DagConfig) -> Result<()
     Ok(())
 }
 
+/// Cell-run jobs (`cells/<slug>` directory names) a retained DAG must
+/// hold: every planned repetition, minus -- on a resume -- the repetitions
+/// verified durable, whose DAG nodes `filter_dag_for_resume` removed.
+fn expected_dag_cell_jobs(
+    metadata: &RunMetadata,
+    resume_completed: Option<&BTreeMap<CellId, BTreeSet<usize>>>,
+) -> BTreeSet<String> {
+    let mut jobs: BTreeSet<String> = metadata
+        .cells
+        .iter()
+        .chain(&metadata.reference_cells)
+        .flat_map(|cell| {
+            repetition_numbers(metadata.repetitions)
+                .map(move |repetition| cell_run_slug(cell, repetition))
+        })
+        .collect();
+    if let Some(completed) = resume_completed {
+        let durable = durable_cell_run_tags(metadata, completed);
+        jobs.retain(|job| !durable.contains(&format!("cell.{job}")));
+    }
+    jobs
+}
+
+/// Rebuild the full-plan DAG for memory validation on a resume: the
+/// retained DAG holds only the still-missing cell steps, so the recorded
+/// full-plan memory requirement and maximum-safe caps cannot be checked
+/// against it directly (checking the filtered graph, or skipping the
+/// checks, would widen the tolerance). Each resume-durable repetition
+/// re-enters as a synthetic cell step carrying exactly the resource
+/// demand and hard memory cap the planner assigned it
+/// (`cell_memory_bytes`, unit `manifest_guest`, plus unit `kvm_guest`
+/// for a KVM cell), waiting for the same initial nodes as every cell,
+/// and the summarize node waits for it. Only the memory functions read
+/// this reconstruction; the retained DAG stays the execution/audit DAG.
+fn full_memory_dag(
+    dag: &DagConfig,
+    metadata: &RunMetadata,
+    completed: &BTreeMap<CellId, BTreeSet<usize>>,
+) -> DagConfig {
+    let mut full = dag.clone();
+    let existing: BTreeSet<String> = full.steps.iter().map(|step| step.tag()).collect();
+    let early_deps: Vec<String> = full
+        .steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.group.as_str(),
+                "pre" | "gate" | "setup" | "build" | "compatprep"
+            )
+        })
+        .map(|step| step.tag())
+        .collect();
+    let template = full.steps.iter().find(|step| step.group == "cell").cloned();
+    let mut synthetic_tags = Vec::new();
+    for cell in metadata.cells.iter().chain(metadata.reference_cells.iter()) {
+        let Some(done) = completed.get(cell) else {
+            continue;
+        };
+        for repetition in repetition_numbers(metadata.repetitions) {
+            if !done.contains(&repetition.unwrap_or(1)) {
+                continue;
+            }
+            let slug = cell_run_slug(cell, repetition);
+            if existing.contains(&format!("cell.{slug}")) {
+                continue;
+            }
+            let mut step = template.clone().unwrap_or_else(|| Step {
+                group: "cell".into(),
+                job: slug.clone(),
+                desc: String::new(),
+                description: String::new(),
+                labels: Vec::new(),
+                cmd: String::new(),
+                cmdtype: CmdType::Unknown,
+                manifest: None,
+                integration_test_binaries: None,
+                result_manifests: None,
+                deps: Vec::new(),
+                env: BTreeMap::new(),
+                hint: ResourceHint::default(),
+                networkonly: false,
+                engine_only: false,
+                delegated_children: false,
+                timeout: 0,
+                cpu_timeout: 0,
+                jobs_flag: None,
+                jobs_env: None,
+                skip_reason: None,
+                write_domains: None,
+                write_domain_guarantee: None,
+                explains: Vec::new(),
+                fail_fast_family: None,
+            });
+            step.group = "cell".into();
+            step.job = slug;
+            step.deps = early_deps.clone();
+            step.hint.resources = BTreeMap::from([("manifest_guest".into(), 1)]);
+            if cell.backend == "kvm" {
+                step.hint.resources.insert("kvm_guest".into(), 1);
+            }
+            step.hint.hard_mem_max_bytes = Some(cell_memory_bytes(cell));
+            synthetic_tags.push(step.tag());
+            full.steps.push(step);
+        }
+    }
+    for step in &mut full.steps {
+        if step.tag() == "pressure.summarize" {
+            for tag in &synthetic_tags {
+                if !step.deps.contains(tag) {
+                    step.deps.push(tag.clone());
+                }
+            }
+        }
+    }
+    full
+}
+
+/// Retained evidence a resumed summary needs to run (not skip) the
+/// full-plan memory-requirement and maximum-safe-cap checks. Any missing
+/// piece refuses the resumed summary by name.
+fn require_resume_memory_evidence(metadata: &RunMetadata) -> Result<(), String> {
+    let missing: Vec<&str> = [
+        (
+            "manifest_guest_memory_budget_bytes",
+            metadata.manifest_guest_memory_budget_bytes.is_none(),
+        ),
+        (
+            "manifest_guest_memory_required_bytes",
+            metadata.manifest_guest_memory_required_bytes.is_none(),
+        ),
+        (
+            "manifest_guest_max_safe_cap",
+            metadata.manifest_guest_max_safe_cap.is_none(),
+        ),
+        (
+            "kvm_guest_max_safe_cap",
+            metadata.kvm_guest_max_safe_cap.is_none(),
+        ),
+        (
+            "manifest_guest_control_plane_headroom_bytes",
+            metadata.manifest_guest_control_plane_headroom_bytes
+                != Some(CONTROL_PLANE_HEADROOM_BYTES),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, missing)| *missing)
+    .map(|(name, _)| name)
+    .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "retained run lacks {} for the full-plan memory and maximum-safe-cap checks, so the resumed summary cannot run them; it was refused by name (resume-memory-evidence-missing). Rerun with `run --resume` from a plan that records the observed memory budget, or use a fresh --results directory",
+            missing.join(", ")
+        ))
+    }
+}
+
 fn validate_run_contract(
     root: &Path,
     results: &Path,
     metadata: &RunMetadata,
     allow_dirty_exact_cell: bool,
+) -> Result<BTreeMap<CellId, bool>, String> {
+    validate_run_contract_with_resume(root, results, metadata, allow_dirty_exact_cell, None)
+}
+
+fn validate_run_contract_with_resume(
+    root: &Path,
+    results: &Path,
+    metadata: &RunMetadata,
+    allow_dirty_exact_cell: bool,
+    resume_completed: Option<&BTreeMap<CellId, BTreeSet<usize>>>,
 ) -> Result<BTreeMap<CellId, bool>, String> {
     let cells_file_fields = [
         metadata.cells_file.is_some(),
@@ -7287,6 +9559,8 @@ fn validate_run_contract(
             .kvm_guest_cap_explicit
             .then_some(metadata.kvm_guest_cap),
         cells_file: None,
+        resume_dir: None,
+        merge_dirs: Vec::new(),
         parity_select: metadata.parity_select.clone(),
         retained_cells_file_cells: metadata.cells_file.as_ref().map(|_| metadata.cells.clone()),
         timeout_policy: metadata.timeout_policy,
@@ -7510,8 +9784,26 @@ fn validate_run_contract(
     if metadata.kvm_guest_cap != DEFAULT_KVM_GUEST_CAP && !metadata.kvm_guest_cap_explicit {
         return Err("non-default retained KVM guest cap is not marked explicit".into());
     }
+    // On a resume the retained DAG holds only the still-missing cells,
+    // so memory must be recomputed on the reconstructed full graph
+    // (`full_memory_dag`), never on the filtered graph and never skipped:
+    // the recorded requirement and maximum-safe caps are full-plan
+    // values, and comparing them against a filtered graph (or not at
+    // all) would widen the tolerance for exactly the runs resume makes.
+    // A resumed summary must be able to run the full-plan memory and
+    // maximum-safe-cap checks below on the reconstructed graph. When
+    // the retained evidence needed for those checks is absent, the
+    // checks cannot run, so the resumed summary refuses by name
+    // (resume-memory-evidence-missing) instead of skipping them.
+    if resume_completed.is_some() {
+        require_resume_memory_evidence(metadata)?;
+    }
+    let memory_dag = match resume_completed {
+        Some(completed) => full_memory_dag(&dag, metadata, completed),
+        None => dag.clone(),
+    };
     let recomputed_memory = declared_memory_at_manifest_guest_cap(
-        &dag,
+        &memory_dag,
         metadata.jobs,
         metadata.manifest_guest_cap,
         metadata.kvm_guest_cap,
@@ -7547,13 +9839,17 @@ fn validate_run_contract(
     }
     if let Some(budget) = metadata.manifest_guest_memory_budget_bytes {
         let recomputed_max = max_safe_manifest_guest_effective_width(
-            &dag,
+            &memory_dag,
             metadata.jobs,
             metadata.kvm_guest_cap,
             budget,
         )?;
-        let recomputed_kvm_max =
-            max_safe_kvm_guest_cap(&dag, metadata.jobs, metadata.manifest_guest_cap, budget)?;
+        let recomputed_kvm_max = max_safe_kvm_guest_cap(
+            &memory_dag,
+            metadata.jobs,
+            metadata.manifest_guest_cap,
+            budget,
+        )?;
         if metadata
             .manifest_guest_max_safe_cap
             .is_some_and(|recorded| recorded != recomputed_max)
@@ -7618,26 +9914,29 @@ fn validate_run_contract(
             );
         }
     }
-    audit_dag(
+    let expected_jobs = expected_dag_cell_jobs(metadata, resume_completed);
+    let dag_cell_timeouts: BTreeMap<String, i64> = if resume_completed.is_some() {
+        expected_cell_timeouts
+            .into_iter()
+            .filter(|(tag, _)| {
+                expected_jobs.contains(tag.strip_prefix("cell.").unwrap_or(tag.as_str()))
+            })
+            .collect()
+    } else {
+        expected_cell_timeouts
+    };
+    audit_dag_retained(
         &dag,
-        expected
-            .len()
-            .saturating_mul(metadata.repetitions.unwrap_or(1)),
+        expected_jobs.len(),
         metadata.run_timeout_seconds,
-        &expected_cell_timeouts,
+        &dag_cell_timeouts,
+        legacy_publication_exempt(metadata),
     )?;
     let dag_cells: BTreeSet<_> = dag
         .steps
         .iter()
         .filter(|step| step.group == "cell")
         .map(|step| step.job.clone())
-        .collect();
-    let expected_jobs: BTreeSet<_> = expected
-        .keys()
-        .flat_map(|cell| {
-            repetition_numbers(metadata.repetitions)
-                .map(move |repetition| cell_run_slug(cell, repetition))
-        })
         .collect();
     if dag_cells != expected_jobs {
         return Err("generated DAG cell identities do not match run metadata".into());
@@ -7840,6 +10139,28 @@ fn is_proven_oom_attempt(runner: RunnerEvidence, harness_status: Option<i32>) ->
         && runner.oom
         && !runner.timed_out
         && harness_status.is_some_and(|status| !matches!(status, 0 | PREPARATION_FAILED_STATUS))
+}
+
+/// Runner evidence for one repetition in a summary. A repetition verified
+/// durable on resume has no runner outcome (the killed run may never have
+/// written one), so its retained terminal harness exit is the runner
+/// observation: `seen`, with `ok` exactly when that exit is 0. Any other
+/// repetition keeps the retained runner evidence (or its absence) as-is.
+fn runner_evidence_for_repetition(
+    runner: RunnerEvidence,
+    durable_verified: bool,
+    harness_status: Option<i32>,
+) -> RunnerEvidence {
+    if durable_verified && !runner.seen {
+        if let Some(status) = harness_status {
+            return RunnerEvidence {
+                seen: true,
+                ok: status == 0,
+                ..RunnerEvidence::default()
+            };
+        }
+    }
+    runner
 }
 
 fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Option<i32>) -> bool {
@@ -10099,6 +12420,120 @@ fn summarize(
     typed_runner_evidence: Option<&BTreeMap<String, RunnerEvidence>>,
     fresh: bool,
 ) -> Result<(), String> {
+    // A standalone summarize of a resumed run reads a filtered DAG (only
+    // the repetitions resume still owed). Detect exactly that shape and
+    // judge it with the resume completion map; a full DAG stays strict.
+    let resume_completed = standalone_resume_completed(results)?;
+    if resume_completed.is_some() {
+        // The resumed shape combines durable rows from more than one
+        // attempt, and the post-run gate in `run` is not here to stop a
+        // mixed set (it refused, or the rows were produced across
+        // attempts): refuse mixed-binary / mixed-test-digest rows before
+        // judging them as one run.
+        let metadata = load_run_metadata(results)?;
+        verify_standalone_resume_identities(results, &metadata)?;
+    }
+    summarize_with_resume_durable(
+        root,
+        results,
+        allow_dirty_exact_cell,
+        typed_runner_evidence,
+        fresh,
+        resume_completed.as_ref(),
+    )
+}
+
+/// The resume completion map when `results/dag.json` is exactly the
+/// filtered DAG a resume persists (full planned jobs minus the durable
+/// ones, and strictly smaller than the full set). `None` for a full DAG.
+///
+/// The map is the one persisted at resume time
+/// ([`write_resume_completed`]): after the resumed jobs finish, rows
+/// present at summarize time include their new repetitions, so a map
+/// recomputed from current rows would no longer reproduce the retained
+/// filtered DAG. A persisted map must still reproduce that DAG and name
+/// only repetitions that are still durable; either mismatch refuses by
+/// name instead of silently falling back to the strict full-DAG path.
+/// Legacy resumed runs without a persisted map may use the recomputed
+/// map only while it still reproduces the filtered DAG (that is, before
+/// the resumed jobs have added rows); after that they refuse by name.
+fn standalone_resume_completed(
+    results: &Path,
+) -> Result<Option<BTreeMap<CellId, BTreeSet<usize>>>, String> {
+    let metadata_path = results.join("run.json");
+    if !metadata_path.is_file() {
+        return Ok(None);
+    }
+    let metadata = load_run_metadata(results)?;
+    let dag_path = results.join("dag.json");
+    if !dag_path.is_file() {
+        return Ok(None);
+    }
+    let dag_text = fs::read_to_string(&dag_path)
+        .map_err(|e| format!("cannot read {}: {e}", dag_path.display()))?;
+    let dag =
+        dag_from_json(&dag_text).map_err(|e| format!("invalid {}: {e}", dag_path.display()))?;
+    let dag_jobs: BTreeSet<String> = dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .map(|step| step.job.clone())
+        .collect();
+    let full_jobs = expected_dag_cell_jobs(&metadata, None);
+    if dag_jobs == full_jobs {
+        return Ok(None);
+    }
+    if let Some(persisted) = load_resume_completed(results, &metadata)? {
+        let filtered_jobs = expected_dag_cell_jobs(&metadata, Some(&persisted));
+        if dag_jobs != filtered_jobs {
+            return Err(format!(
+                "persisted resume completion map {} does not reproduce the retained filtered DAG ({} cell job(s) retained, {} expected from the map); the resumed summary was refused by name (resume-completed-mismatch). Rerun `run --resume` against {} to rewrite the filtered DAG and its completion map together, or use a fresh --results directory",
+                results.join(RESUME_COMPLETED_FILE).display(),
+                dag_jobs.len(),
+                filtered_jobs.len(),
+                results.display()
+            ));
+        }
+        let current = durable_completed_repetitions(results, &metadata)?;
+        for (cell, repetitions) in &persisted {
+            for repetition in repetitions {
+                if !current
+                    .get(cell)
+                    .is_some_and(|done| done.contains(repetition))
+                {
+                    return Err(format!(
+                        "persisted resume completion map records {} repetition {repetition} as durable at resume time, but its durable results are no longer present; the resumed summary was refused by name (resume-completed-mismatch). Restore the repetition's cells/ directory or rerun `run --resume`, or use a fresh --results directory",
+                        display_id(cell)
+                    ));
+                }
+            }
+        }
+        return Ok(Some(persisted));
+    }
+    let completed = durable_completed_repetitions(results, &metadata)?;
+    let filtered_jobs = expected_dag_cell_jobs(&metadata, Some(&completed));
+    if dag_jobs == filtered_jobs {
+        return Ok(Some(completed));
+    }
+    Err(format!(
+        "retained DAG is a filtered (resumed) DAG but no persisted resume completion map ({}) exists and the {} durable repetition(s) now present do not reproduce it, so the resume-time completion set cannot be reconstructed; the resumed summary was refused by name (resume-completed-unreconstructable). Rerun `run --resume` against {} to persist the completion map, or use a fresh --results directory",
+        results.join(RESUME_COMPLETED_FILE).display(),
+        completed.values().map(BTreeSet::len).sum::<usize>(),
+        results.display()
+    ))
+}
+
+/// [`summarize`] for a resumed run: `resume_completed` is the resume scan's
+/// durable-repetition map, and those repetitions need no runner outcome.
+/// A standalone (non-resume) summarize passes `None` and stays strict.
+fn summarize_with_resume_durable(
+    root: &Path,
+    results: &Path,
+    allow_dirty_exact_cell: bool,
+    typed_runner_evidence: Option<&BTreeMap<String, RunnerEvidence>>,
+    fresh: bool,
+    resume_completed: Option<&BTreeMap<CellId, BTreeSet<usize>>>,
+) -> Result<(), String> {
     let metadata_path = results.join("run.json");
     let metadata: RunMetadata = serde_json::from_str(
         &fs::read_to_string(&metadata_path)
@@ -10116,7 +12551,13 @@ fn summarize(
             metadata.hermit_sha, current
         ));
     }
-    let expected = validate_run_contract(root, results, &metadata, allow_dirty_exact_cell)?;
+    let expected = validate_run_contract_with_resume(
+        root,
+        results,
+        &metadata,
+        allow_dirty_exact_cell,
+        resume_completed,
+    )?;
     let loaded_runner_evidence = if typed_runner_evidence.is_some() {
         None
     } else if let Some(evidence) = load_retained_runner_evidence(results)? {
@@ -10129,7 +12570,11 @@ fn summarize(
             .as_ref()
             .expect("standalone summary loaded runner evidence")
     });
-    require_runner_outcomes_for_planned_cells(&metadata, runner_evidence)?;
+    if let Some(completed) = resume_completed {
+        require_runner_outcomes_for_resume(&metadata, runner_evidence, completed)?;
+    } else {
+        require_runner_outcomes_for_planned_cells(&metadata, runner_evidence)?;
+    }
 
     let mut by_backend: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     let mut repeated = BTreeMap::<CellId, RepeatedCellTally>::new();
@@ -10183,7 +12628,12 @@ fn summarize(
                 cell_evidence_run_id(cell, repetition, metadata.run_id_prefix.as_deref());
             let cell_dir = results.join("cells").join(&slug);
             let step_tag = format!("cell.{slug}");
-            let runner = runner_evidence.get(&step_tag).copied().unwrap_or_default();
+            let mut runner = runner_evidence.get(&step_tag).copied().unwrap_or_default();
+            let durable_verified = resume_completed.is_some_and(|completed| {
+                completed
+                    .get(cell)
+                    .is_some_and(|done| done.contains(&repetition.unwrap_or(1)))
+            });
             let runner_output_log = runner_output_log(&step_tag, runner.output_log_available);
             let mut evidence_errors = Vec::new();
             let status_file = cell_dir.join("harness-status");
@@ -10217,6 +12667,19 @@ fn summarize(
                 ));
                 None
             };
+            // A repetition killed after publication but before the
+            // final status write still carries the incomplete marker:
+            // its final status is missing, so the summary refuses it
+            // by name (resume-final-status-missing) instead of guessing
+            // an exit from its row. Resume reruns such a repetition.
+            if harness_status == Some(INCOMPLETE_ATTEMPT_STATUS) {
+                evidence_errors.push(format!(
+                    "{} still holds the incomplete marker {}, so its final harness status is missing after publication; the repetition was refused by name (resume-final-status-missing). Rerun `run --resume` so it is scheduled and rerun",
+                    status_file.display(),
+                    INCOMPLETE_ATTEMPT_STATUS
+                ));
+            }
+            runner = runner_evidence_for_repetition(runner, durable_verified, harness_status);
             let proven_oom = is_proven_oom_attempt(runner, harness_status);
             let proven_timeout = is_proven_timeout_attempt(runner, harness_status);
             let result_file = cell_dir.join("results.jsonl");
@@ -11172,8 +13635,7 @@ fn summarize(
     let mut text = serde_json::to_string_pretty(&summary)
         .map_err(|e| format!("cannot serialize summary: {e}"))?;
     text.push('\n');
-    fs::write(results.join("summary.json"), text)
-        .map_err(|e| format!("cannot write summary.json: {e}"))?;
+    write_file_durable(&results.join("summary.json"), text.as_bytes())?;
     println!("Summary: {}", results.join("summary.json").display());
     // After summary.json and before the verdict below: the parity report can
     // neither change the summary nor the exit status.
@@ -15320,6 +17782,1729 @@ fn log_tail_self_test() -> Result<(), String> {
     outcome
 }
 
+fn durable_publish_self_test() -> Result<(), String> {
+    let scratch =
+        std::env::temp_dir().join(format!("pressure-durable-publish-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let result = durable_publish_self_test_at(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+fn durable_publish_self_test_at(scratch: &Path) -> Result<(), String> {
+    // Rust helper: fsync file, rename, fsync parent directory.
+    let cell = scratch.join("rust");
+    fs::create_dir_all(&cell).map_err(|e| format!("cannot create {}: {e}", cell.display()))?;
+    let in_progress = cell.join("results.in-progress.jsonl");
+    let destination = cell.join("results.jsonl");
+    fs::write(&in_progress, "{\"row\":1}\n")
+        .map_err(|e| format!("cannot write in-progress fixture: {e}"))?;
+    publish_file_durable(&in_progress, &destination)?;
+    if in_progress.exists() {
+        return Err("durable publish left the in-progress file behind".into());
+    }
+    let text = fs::read_to_string(&destination)
+        .map_err(|e| format!("cannot read published fixture: {e}"))?;
+    if text != "{\"row\":1}\n" {
+        return Err(format!("durable publish changed the rows: {text:?}"));
+    }
+    if publish_file_durable(&in_progress, &destination).is_ok() {
+        return Err("durable publish of a missing in-progress file was accepted".into());
+    }
+
+    // Shell helper, as generated into cell commands: same ordering, run
+    // for real under bash so the sync/mv/sync sequence itself is exercised.
+    let shell_cell = scratch.join("shell");
+    fs::create_dir_all(&shell_cell)
+        .map_err(|e| format!("cannot create {}: {e}", shell_cell.display()))?;
+    let shell_in_progress = shell_cell.join("results.in-progress.jsonl");
+    let shell_destination = shell_cell.join("results.jsonl");
+    fs::write(&shell_in_progress, "{\"row\":2}\n")
+        .map_err(|e| format!("cannot write shell in-progress fixture: {e}"))?;
+    let snippet = durable_publish_shell(&shell_in_progress, &shell_destination);
+    if !durable_result_publish_present(&snippet) {
+        return Err(format!(
+            "generated publish snippet is not durable: {snippet}"
+        ));
+    }
+    let bare = "mv -- results.in-progress.jsonl results.jsonl";
+    if durable_result_publish_present(bare) {
+        return Err("bare rename was accepted as a durable publish".into());
+    }
+    let output = Command::new("bash")
+        .args(["-c", &format!("status=0; {snippet}exit \"$status\"")])
+        .output()
+        .map_err(|e| format!("cannot run durable publish snippet: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "durable publish snippet failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    if shell_in_progress.exists() || !shell_destination.is_file() {
+        return Err("shell durable publish did not rename the in-progress file".into());
+    }
+
+    // (H9) A failed fsync must not publish: with a `sync` that always
+    // fails, the rename must not happen and the status must be nonzero.
+    use std::os::unix::fs::PermissionsExt;
+    let fail_cell = scratch.join("shell-fsync-fails");
+    fs::create_dir_all(&fail_cell)
+        .map_err(|e| format!("cannot create {}: {e}", fail_cell.display()))?;
+    let fail_in_progress = fail_cell.join("results.in-progress.jsonl");
+    let fail_destination = fail_cell.join("results.jsonl");
+    fs::write(&fail_in_progress, "{\"row\":3}\n")
+        .map_err(|e| format!("cannot write failing-sync fixture: {e}"))?;
+    let fake_bin = scratch.join("fake-bin");
+    fs::create_dir_all(&fake_bin)
+        .map_err(|e| format!("cannot create {}: {e}", fake_bin.display()))?;
+    let fake_sync = fake_bin.join("sync");
+    fs::write(&fake_sync, "#!/bin/sh\nexit 1\n")
+        .map_err(|e| format!("cannot write fake sync: {e}"))?;
+    fs::set_permissions(&fake_sync, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("cannot chmod fake sync: {e}"))?;
+    let fail_snippet = durable_publish_shell(&fail_in_progress, &fail_destination);
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "export PATH={}:$PATH; status=0; {fail_snippet}exit \"$status\"",
+                fake_bin.display()
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("cannot run failing-sync publish snippet: {e}"))?;
+    if output.status.success() {
+        return Err("durable publish with a failing fsync reported success".into());
+    }
+    if fail_destination.exists() || !fail_in_progress.is_file() {
+        return Err(
+            "durable publish renamed the results file after a failed fsync, so resume would count an unsynced file".into(),
+        );
+    }
+    Ok(())
+}
+
+fn incomplete_rerun_guard_self_test() -> Result<(), String> {
+    let scratch = std::env::temp_dir().join(format!("pressure-rerun-guard-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).map_err(|e| {
+        format!(
+            "cannot create rerun-guard fixture {}: {e}",
+            scratch.display()
+        )
+    })?;
+    let result = incomplete_rerun_guard_self_test_at(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+fn incomplete_rerun_guard_self_test_at(scratch: &Path) -> Result<(), String> {
+    // (H1) A killed repetition left status 125: the generated guard must
+    // let the step rerun. A terminal status must still skip, and a missing
+    // status must run.
+    for (name, status, must_continue) in [
+        ("killed", Some("125\n"), true),
+        ("terminal", Some("0\n"), false),
+        ("failed", Some("1\n"), false),
+        ("missing", None, true),
+    ] {
+        let dir = scratch.join(name);
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let status_file = dir.join("harness-status");
+        if let Some(text) = status {
+            fs::write(&status_file, text)
+                .map_err(|e| format!("cannot write guard fixture: {e}"))?;
+        }
+        let guard = incomplete_status_rerun_guard(&status_file);
+        let output = Command::new("bash")
+            .args(["-c", &format!("{guard}echo continued")])
+            .output()
+            .map_err(|e| format!("cannot run rerun guard: {e}"))?;
+        let continued = String::from_utf8_lossy(&output.stdout).contains("continued");
+        if continued != must_continue {
+            return Err(format!(
+                "rerun guard for {name} status must {}continue; stdout={:?}",
+                if must_continue { "" } else { "not " },
+                String::from_utf8_lossy(&output.stdout)
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_marker_checkout_self_test() -> Result<(), String> {
+    let scratch =
+        std::env::temp_dir().join(format!("pressure-build-marker-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).map_err(|e| {
+        format!(
+            "cannot create build-marker fixture {}: {e}",
+            scratch.display()
+        )
+    })?;
+    let result = build_marker_checkout_self_test_at(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+fn build_marker_checkout_self_test_at(scratch: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    // Exact ptrace metadata: its required builds are the manifest-plan
+    // test-harness and the direct Hermit binary (see required_build_tags).
+    let metadata: RunMetadata = serde_json::from_value(json!({
+        "schema": RUN_SCHEMA,
+        "hermit_sha": "s",
+        "detcore_tree": "d",
+        "source_tree_dirty": false,
+        "run_timeout_seconds": 60,
+        "mode": "verify",
+        "test": "t",
+        "backend": "ptrace",
+        "repetitions": 2,
+        "cells": [{"lane": "l", "category": "c", "test": "t", "mode": "verify", "backend": "ptrace"}],
+    }))
+    .map_err(|e| format!("cannot build build-marker fixture metadata: {e}"))?;
+    let results = scratch.join("results");
+    for tag in required_build_tags(Some(("verify", "ptrace"))) {
+        let marker = build_marker(&results, tag);
+        fs::create_dir_all(marker.parent().expect("build marker has parent"))
+            .map_err(|e| format!("cannot create build-marker fixture: {e}"))?;
+        fs::write(&marker, "ok\n").map_err(|e| format!("cannot write marker {tag}: {e}"))?;
+    }
+    // Marker-only completeness (the old decision) is satisfied, but a
+    // rebuilt fresh checkout holding no binaries must not skip the builds.
+    let checkout = scratch.join("fresh-checkout");
+    fs::create_dir_all(&checkout)
+        .map_err(|e| format!("cannot create fresh checkout fixture: {e}"))?;
+    if !required_builds_complete(&results, &metadata) {
+        return Err("marker-only build completeness must see every retained marker".into());
+    }
+    if required_builds_complete_in_checkout(&results, &metadata, &checkout) {
+        return Err("retained markers without hermit/test-harness binaries were accepted as a completed build in a fresh checkout".into());
+    }
+    if build_step_may_skip(&results, "setup.manifest_plan", &checkout) {
+        return Err("setup marker without target/debug/test-harness was allowed to skip".into());
+    }
+    let condition = build_skip_condition(
+        &build_marker(&results, "setup.manifest_plan"),
+        "setup.manifest_plan",
+    );
+    if !condition.contains("test -x 'target/debug/test-harness'") {
+        return Err(format!(
+            "generated build skip must test the test-harness executable; got: {condition}"
+        ));
+    }
+    // A non-executable product file still triggers the build.
+    let harness = checkout.join("target/debug/test-harness");
+    fs::create_dir_all(harness.parent().expect("harness has parent"))
+        .map_err(|e| format!("cannot create harness fixture dir: {e}"))?;
+    fs::write(&harness, "x").map_err(|e| format!("cannot write harness fixture: {e}"))?;
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("cannot chmod harness fixture: {e}"))?;
+    if build_step_may_skip(&results, "setup.manifest_plan", &checkout) {
+        return Err("a non-executable test-harness was allowed to skip its build".into());
+    }
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("cannot chmod harness fixture: {e}"))?;
+    if !build_step_may_skip(&results, "setup.manifest_plan", &checkout) {
+        return Err("marker plus executable test-harness must allow skipping setup".into());
+    }
+    // Hermit is still missing, so the whole set is not complete.
+    if required_builds_complete_in_checkout(&results, &metadata, &checkout) {
+        return Err("build set without target/ci/hermit was accepted as complete".into());
+    }
+    let hermit = checkout.join("target/ci/hermit");
+    fs::create_dir_all(hermit.parent().expect("hermit has parent"))
+        .map_err(|e| format!("cannot create hermit fixture dir: {e}"))?;
+    fs::write(&hermit, "x").map_err(|e| format!("cannot write hermit fixture: {e}"))?;
+    fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("cannot chmod hermit fixture: {e}"))?;
+    if !required_builds_complete_in_checkout(&results, &metadata, &checkout) {
+        return Err(
+            "markers plus executable hermit/test-harness must complete the build set".into(),
+        );
+    }
+    Ok(())
+}
+
+fn resume_merge_self_test() -> Result<(), String> {
+    let scratch =
+        std::env::temp_dir().join(format!("pressure-resume-merge-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch)
+        .map_err(|e| format!("cannot create resume fixture {}: {e}", scratch.display()))?;
+    let result = resume_merge_self_test_at(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+fn resume_merge_self_test_at(scratch: &Path) -> Result<(), String> {
+    let pass_row = |test: &str, run_id: &str, artifact: &str| -> String {
+        format!(
+            "{{\"schema\":4,\"attempt\":1,\"run_id\":\"{run_id}\",\"hermit_sha\":\"s\",\"source_tree_dirty\":false,\"binary_sha256\":\"fixture-binary\",\"test_sha256\":\"fixture-test-{test}\",\"test\":\"{test}\",\"category\":\"c\",\"lane\":\"l\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"classification\":\"required\",\"outcome\":\"PASS\",\"first_divergent_record\":null,\"first_divergent_syscall\":null,\"first_divergent_scheduler_turn\":null,\"first_divergent_virtual_nanoseconds\":null,\"first_divergent_left_message\":null,\"first_divergent_right_message\":null,\"timeout_seconds\":15,\"duration_ms\":100,\"argv\":[\"a\"],\"guest_argv\":[\"g\"],\"env\":{{}},\"cwd\":\"/\",\"shell_command\":\"x\",\"attempts\":[],\"reason\":null,\"error_kind\":null,\"artifact_dir\":\"{artifact}\"}}"
+        )
+    };
+    let fail_row = |test: &str, run_id: &str, artifact: &str| -> String {
+        pass_row(test, run_id, artifact)
+            .replace("\"outcome\":\"PASS\"", "\"outcome\":\"FAIL\"")
+            .replace(
+                "\"first_divergent_record\":null",
+                "\"first_divergent_record\":93",
+            )
+    };
+    let cell = |test: &str| CellId {
+        lane: "l".into(),
+        category: "c".into(),
+        test: test.into(),
+        mode: "verify".into(),
+        backend: "ptrace".into(),
+    };
+    let write_rep = |base: &Path, cell: &CellId, rep: usize, text: &str| -> Result<(), String> {
+        let dir = base.join("cells").join(cell_run_slug(cell, Some(rep)));
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        fs::write(dir.join("results.jsonl"), text)
+            .map_err(|e| format!("cannot write fixture results: {e}"))
+    };
+    let metadata = |cells: Vec<CellId>| -> Result<RunMetadata, String> {
+        serde_json::from_value(json!({
+            "schema": RUN_SCHEMA,
+            "hermit_sha": "s",
+            "detcore_tree": "d",
+            "source_tree_dirty": false,
+            "run_timeout_seconds": 60,
+            "repetitions": 2,
+            "cells": cells.iter().map(|c| json!({
+                "lane": c.lane, "category": c.category, "test": c.test,
+                "mode": c.mode, "backend": c.backend,
+            })).collect::<Vec<_>>(),
+        }))
+        .map_err(|e| format!("cannot build resume fixture metadata: {e}"))
+    };
+
+    // (1) Killed run: cell A finished both repetitions, cell B only the
+    // first; resume must owe exactly B repetition 2.
+    let run_dir = scratch.join("w1");
+    let (a, b) = (cell("t"), cell("u"));
+    write_rep(
+        &run_dir,
+        &a,
+        1,
+        &format!("{}\n", pass_row("t", &cell_run_slug(&a, Some(1)), "/r/a1")),
+    )?;
+    write_rep(
+        &run_dir,
+        &a,
+        2,
+        &format!("{}\n", pass_row("t", &cell_run_slug(&a, Some(2)), "/r/a2")),
+    )?;
+    write_rep(
+        &run_dir,
+        &b,
+        1,
+        &format!("{}\n", pass_row("u", &cell_run_slug(&b, Some(1)), "/r/b1")),
+    )?;
+    // B repetition 2 was in flight when the run was killed: only the
+    // in-progress file exists, so it is missing, not durable.
+    let b2 = run_dir.join("cells").join(cell_run_slug(&b, Some(2)));
+    fs::create_dir_all(&b2).map_err(|e| format!("cannot create {}: {e}", b2.display()))?;
+    fs::write(b2.join("results.in-progress.jsonl"), "{}\n")
+        .map_err(|e| format!("cannot write in-progress fixture: {e}"))?;
+    let meta = metadata(vec![a.clone(), b.clone()])?;
+    let completed = durable_completed_repetitions(&run_dir, &meta)?;
+    let missing = resume_missing_repetitions(&meta, &completed);
+    if missing != vec![(b.clone(), Some(2))] {
+        return Err(format!(
+            "killed-run resume must owe only cell u repetition 2; got {missing:?}"
+        ));
+    }
+
+    // (1b) Runner-outcome requirement on resume: the three durable
+    // repetitions need no runner outcome (a killed run wrote none); only
+    // the newly planned repetition 2 of cell u does. Accept durable+new,
+    // reject a missing new outcome and a foreign outcome, and keep the
+    // strict non-resume check refusing the same partial evidence.
+    let evidence = |tags: &[String]| -> BTreeMap<String, RunnerEvidence> {
+        tags.iter()
+            .map(|tag| (tag.clone(), RunnerEvidence::default()))
+            .collect()
+    };
+    let new_tag = format!("cell.{}", cell_run_slug(&b, Some(2)));
+    require_runner_outcomes_for_resume(&meta, &evidence(&[new_tag.clone()]), &completed)
+        .map_err(|e| format!("resume outcome check must accept durable+new outcomes: {e}"))?;
+    if require_runner_outcomes_for_resume(&meta, &evidence(&[]), &completed).is_ok() {
+        return Err("resume outcome check accepted a missing newly planned outcome".into());
+    }
+    let foreign = vec![new_tag.clone(), "cell.foreign-repetition".to_string()];
+    if require_runner_outcomes_for_resume(&meta, &evidence(&foreign), &completed).is_ok() {
+        return Err("resume outcome check accepted a foreign outcome".into());
+    }
+    if require_runner_outcomes_for_planned_cells(&meta, &evidence(&[new_tag])).is_ok() {
+        return Err(
+            "strict non-resume outcome check accepted durable repetitions without runner outcomes"
+                .into(),
+        );
+    }
+    // A durable repetition's retained harness exit is its runner
+    // observation in a resume summary; a non-durable repetition without a
+    // runner outcome stays unseen (strict).
+    let durable_runner = runner_evidence_for_repetition(RunnerEvidence::default(), true, Some(0));
+    if !durable_runner.seen
+        || !durable_runner.ok
+        || !runner_observed_terminal_attempt(durable_runner, Some(0))
+    {
+        return Err(
+            "durable repetition with harness exit 0 was not a seen passing runner observation"
+                .into(),
+        );
+    }
+    let durable_failed = runner_evidence_for_repetition(RunnerEvidence::default(), true, Some(3));
+    if !durable_failed.seen
+        || durable_failed.ok
+        || !runner_observed_terminal_attempt(durable_failed, Some(3))
+    {
+        return Err(
+            "durable repetition with nonzero harness exit was not a seen failed runner observation"
+                .into(),
+        );
+    }
+    if runner_evidence_for_repetition(RunnerEvidence::default(), false, Some(0)).seen {
+        return Err("non-durable repetition without a runner outcome was marked seen".into());
+    }
+
+    // The retained DAG a resume writes holds only the newly planned nodes:
+    // contract validation must expect exactly those jobs on resume, and
+    // every planned job without a resume scan.
+    let resume_jobs = expected_dag_cell_jobs(&meta, Some(&completed));
+    if resume_jobs != BTreeSet::from([cell_run_slug(&b, Some(2))]) {
+        return Err(format!(
+            "resume DAG jobs must be only the missing repetition; got {resume_jobs:?}"
+        ));
+    }
+    if expected_dag_cell_jobs(&meta, None).len() != 4 {
+        return Err("non-resume DAG jobs must be every planned repetition".into());
+    }
+    // When every repetition is durable, filtering leaves no cell node; the
+    // summarize node must then wait for the remaining (build) nodes
+    // directly, or its memory phase can overlap an unfinished build.
+    let b2_slug = cell_run_slug(&b, Some(2));
+    let mut all_done_dag = dag_from_json(
+        &json!({
+            "steps": [
+                {"group": "build", "job": "workspace", "cmd": "build", "timeout": 10, "cpu_timeout": 20, "deps": []},
+                {"group": "cell", "job": b2_slug, "cmd": "cell", "timeout": 10, "cpu_timeout": 20, "deps": ["build.workspace"]},
+                {"group": "pressure", "job": "summarize", "cmd": "true", "timeout": 10, "cpu_timeout": 20,
+                 "deps": [format!("cell.{b2_slug}")]},
+            ],
+        })
+        .to_string(),
+    )
+    .map_err(|e| format!("cannot build all-durable resume DAG fixture: {e}"))?;
+    let completed_all = BTreeMap::from([
+        (a.clone(), BTreeSet::from([1usize, 2])),
+        (b.clone(), BTreeSet::from([1usize, 2])),
+    ]);
+    filter_dag_for_resume(&mut all_done_dag, &meta, &completed_all);
+    let summarize_step = all_done_dag
+        .steps
+        .iter()
+        .find(|step| step.tag() == "pressure.summarize")
+        .ok_or("all-durable resume DAG lost its summarize node")?;
+    if all_done_dag
+        .steps
+        .iter()
+        .any(|step| step.tag().starts_with("cell."))
+        || summarize_step.deps != vec!["build.workspace".to_string()]
+    {
+        return Err(format!(
+            "all-durable resume must leave summarize waiting only for remaining builds; got steps={:?} deps={:?}",
+            all_done_dag
+                .steps
+                .iter()
+                .map(|step| step.tag())
+                .collect::<Vec<_>>(),
+            summarize_step.deps
+        ));
+    }
+
+    // (2a) Partial trailing line: refused, never counted.
+    let partial_dir = scratch.join("partial");
+    write_rep(
+        &partial_dir,
+        &a,
+        1,
+        &format!(
+            "{}\n{{\"schema\":4,\"attem",
+            pass_row("t", &cell_run_slug(&a, Some(1)), "/r/a1")
+        ),
+    )?;
+    let error = durable_completed_repetitions(&partial_dir, &metadata(vec![a.clone()])?)
+        .err()
+        .ok_or("partial trailing line must be refused")?;
+    if !error.contains("final line is incomplete") || !error.contains("rerun --resume") {
+        return Err(format!(
+            "partial-line error must name the condition and remedy; got: {error}"
+        ));
+    }
+
+    // (2b) Corrupt complete line: refused with its line named.
+    let corrupt_dir = scratch.join("corrupt");
+    write_rep(&corrupt_dir, &a, 1, "not json\n")?;
+    let error = durable_completed_repetitions(&corrupt_dir, &metadata(vec![a.clone()])?)
+        .err()
+        .ok_or("corrupt line must be refused")?;
+    if !error.contains("not counted") || !error.contains("rerun --resume") {
+        return Err(format!(
+            "corrupt-line error must name the condition and remedy; got: {error}"
+        ));
+    }
+
+    // (3) Merge w1 + w2: A completes in w2 (CLEAN), B gains a failing
+    // second repetition (FLAKY).
+    let w2 = scratch.join("w2");
+    write_rep(
+        &w2,
+        &b,
+        2,
+        &format!("{}\n", fail_row("u", &cell_run_slug(&b, Some(2)), "/r/b2")),
+    )?;
+    let (required, verdicts) = merge_attempt_directories(&[run_dir.clone(), w2])?;
+    if required != 2 || verdicts.len() != 2 {
+        return Err(format!(
+            "merge must report 2 cells at 2 repetitions; got required={required} cells={verdicts:?}"
+        ));
+    }
+    let verdict_of = |test: &str| {
+        verdicts
+            .iter()
+            .find(|v| v.cell.test == test)
+            .map(|v| v.verdict)
+    };
+    if verdict_of("t") != Some("CLEAN") || verdict_of("u") != Some("FLAKY") {
+        return Err(format!(
+            "merged verdicts must be t=CLEAN u=FLAKY; got {verdicts:?}"
+        ));
+    }
+
+    // (4) Exact-cell resume: repetition 1 is durable, so filtering removes
+    // its node; the exact command display must use the first remaining
+    // repetition instead of failing to find repetition 1.
+    let exact_meta: RunMetadata = serde_json::from_value(json!({
+        "schema": RUN_SCHEMA,
+        "hermit_sha": "s",
+        "detcore_tree": "d",
+        "source_tree_dirty": false,
+        "run_timeout_seconds": 60,
+        "timeout_policy": {"version": 1, "cpu_multiplier": 1.0, "wall_multiplier": 1.0},
+        "mode": "verify",
+        "test": "t",
+        "backend": "ptrace",
+        "repetitions": 2,
+        "cells": [{"lane": "l", "category": "c", "test": "t", "mode": "verify", "backend": "ptrace"}],
+    }))
+    .map_err(|e| format!("cannot build exact resume fixture metadata: {e}"))?;
+    let slug1 = cell_run_slug(&a, Some(1));
+    let slug2 = cell_run_slug(&a, Some(2));
+    let mut exact_dag = dag_from_json(
+        &json!({
+            "steps": [
+                {"group": "cell", "job": slug1, "cmd": "cmd-rep1", "timeout": 10, "cpu_timeout": 20, "deps": []},
+                {"group": "cell", "job": slug2, "cmd": "cmd-rep2", "timeout": 10, "cpu_timeout": 20, "deps": []},
+                {"group": "pressure", "job": "summarize", "cmd": "summarize", "timeout": 10, "cpu_timeout": 20,
+                 "deps": [format!("cell.{slug1}"), format!("cell.{slug2}")]},
+            ],
+        })
+        .to_string(),
+    )
+    .map_err(|e| format!("cannot build exact resume fixture DAG: {e}"))?;
+    let completed_exact = BTreeMap::from([(a.clone(), BTreeSet::from([1usize]))]);
+    filter_dag_for_resume(&mut exact_dag, &exact_meta, &completed_exact);
+    let display = exact_manifest_command_description(&exact_dag, &exact_meta).map_err(|e| {
+        format!("exact resume display must use the first remaining repetition: {e}")
+    })?;
+    if !display.contains(&format!("Node: cell.{slug2} (repetition 2 of 2)"))
+        || !display.contains("Command:\ncmd-rep2\n")
+    {
+        return Err(format!(
+            "exact resume display must name repetition 2 and its command; got: {display}"
+        ));
+    }
+
+    // (5) H3: durable rows from another commit, or copied into the wrong
+    // repetition, are refused and never counted as durable.
+    let foreign_dir = scratch.join("foreign");
+    let foreign_row = format!(
+        "{}\n",
+        pass_row("t", &cell_run_slug(&a, Some(1)), "/r/a1")
+            .replace("\"hermit_sha\":\"s\"", "\"hermit_sha\":\"other\"")
+    );
+    write_rep(&foreign_dir, &a, 1, &foreign_row)?;
+    let error = durable_completed_repetitions(&foreign_dir, &metadata(vec![a.clone()])?)
+        .err()
+        .ok_or("foreign-commit durable rows must be refused")?;
+    if !error.contains("not counted") {
+        return Err(format!(
+            "foreign durable-row error must say it was not counted; got: {error}"
+        ));
+    }
+    let wrong_rep_dir = scratch.join("wrong-repetition");
+    write_rep(
+        &wrong_rep_dir,
+        &a,
+        2,
+        &format!("{}\n", pass_row("t", &cell_run_slug(&a, Some(1)), "/r/a1")),
+    )?;
+    if durable_completed_repetitions(&wrong_rep_dir, &metadata(vec![a.clone()])?).is_ok() {
+        return Err("durable rows copied into the wrong repetition were counted".into());
+    }
+
+    // (6) H4: a PASS in one directory and a FAIL for the same repetition
+    // in another is FLAKY in either directory order, with all contributions.
+    let pass_dir = scratch.join("order-pass");
+    let fail_dir = scratch.join("order-fail");
+    for (dir, first_is_pass) in [(&pass_dir, true), (&fail_dir, false)] {
+        let rep1 = if first_is_pass {
+            pass_row("t", &cell_run_slug(&a, Some(1)), "/r/a1")
+        } else {
+            fail_row("t", &cell_run_slug(&a, Some(1)), "/r/a1")
+        };
+        write_rep(dir, &a, 1, &format!("{rep1}\n"))?;
+        write_rep(
+            dir,
+            &a,
+            2,
+            &format!("{}\n", pass_row("t", &cell_run_slug(&a, Some(2)), "/r/a2")),
+        )?;
+    }
+    for dirs in [
+        vec![pass_dir.clone(), fail_dir.clone()],
+        vec![fail_dir.clone(), pass_dir.clone()],
+    ] {
+        let (_, verdicts) = merge_attempt_directories(&dirs)?;
+        let verdict = verdicts
+            .iter()
+            .find(|v| v.cell.test == "t")
+            .ok_or("order merge lost cell t")?;
+        if verdict.verdict != "FLAKY" || verdict.contributions.len() != 4 {
+            return Err(format!(
+                "conflicting merge must be FLAKY with 4 contributions in either order; got {verdict:?}"
+            ));
+        }
+    }
+
+    // (7) H4: a terminal PASS after a failed retry is not a clean pass.
+    let retry_dir = scratch.join("order-retry");
+    let recovered = format!(
+        "{}\n{}\n",
+        fail_row("t", &cell_run_slug(&a, Some(1)), "/r/a1"),
+        pass_row("t", &cell_run_slug(&a, Some(1)), "/r/a1-attempt-2").replacen(
+            "\"attempt\":1",
+            "\"attempt\":2",
+            1
+        )
+    );
+    write_rep(&retry_dir, &a, 1, &recovered)?;
+    write_rep(
+        &retry_dir,
+        &a,
+        2,
+        &format!("{}\n", pass_row("t", &cell_run_slug(&a, Some(2)), "/r/a2")),
+    )?;
+    let (_, verdicts) = merge_attempt_directories(&[retry_dir])?;
+    if verdicts[0].verdict != "FLAKY" {
+        return Err(format!(
+            "failed-then-passed merge must be FLAKY, not CLEAN; got {verdicts:?}"
+        ));
+    }
+
+    // (8) H4/M5: a planned cell with no rows reports INCOMPLETE, and a
+    // merged cell retains its per-directory contributions.
+    let planned_dir = scratch.join("planned");
+    let planned_meta = metadata(vec![a.clone(), b.clone()])?;
+    fs::create_dir_all(&planned_dir)
+        .map_err(|e| format!("cannot create {}: {e}", planned_dir.display()))?;
+    fs::write(
+        planned_dir.join("run.json"),
+        serde_json::to_string(&planned_meta)
+            .map_err(|e| format!("cannot serialize planned fixture: {e}"))?,
+    )
+    .map_err(|e| format!("cannot write planned fixture: {e}"))?;
+    write_rep(
+        &planned_dir,
+        &a,
+        1,
+        &format!("{}\n", pass_row("t", &cell_run_slug(&a, Some(1)), "/r/a1")),
+    )?;
+    write_rep(
+        &planned_dir,
+        &a,
+        2,
+        &format!("{}\n", pass_row("t", &cell_run_slug(&a, Some(2)), "/r/a2")),
+    )?;
+    let (_, verdicts) = merge_attempt_directories(&[planned_dir])?;
+    let b_verdict = verdicts
+        .iter()
+        .find(|v| v.cell.test == "u")
+        .ok_or("row-less planned cell vanished from the merge")?;
+    if b_verdict.verdict != "INCOMPLETE" || b_verdict.present != 0 {
+        return Err(format!(
+            "row-less planned cell must be INCOMPLETE with 0 present; got {b_verdict:?}"
+        ));
+    }
+    let a_verdict = verdicts
+        .iter()
+        .find(|v| v.cell.test == "t")
+        .ok_or("planned merge lost cell t")?;
+    if a_verdict.verdict != "CLEAN" || a_verdict.contributions.len() != 2 {
+        return Err(format!(
+            "planned merge must retain 2 contributions for cell t; got {a_verdict:?}"
+        ));
+    }
+
+    // (9) H3: merging rows from another commit is refused.
+    let other_commit_dir = scratch.join("other-commit");
+    write_rep(&other_commit_dir, &a, 1, &foreign_row)?;
+    if merge_attempt_directories(&[run_dir.clone(), other_commit_dir]).is_ok() {
+        return Err("merge accepted rows from another commit".into());
+    }
+
+    // (10) M6: omitted guest caps, jobs, and the cells file are inherited
+    // from the retained run; conflicting values are refused.
+    let mut retained_caps = metadata(vec![a.clone()])?;
+    retained_caps.manifest_guest_cap = 2;
+    retained_caps.manifest_guest_cap_explicit = true;
+    retained_caps.kvm_guest_cap = 1;
+    retained_caps.kvm_guest_cap_explicit = true;
+    retained_caps.jobs = 4;
+    retained_caps.cells_file = Some("/tmp/retained-cells.jsonl".to_string());
+    retained_caps.cells_file_sha256 = Some("a".repeat(64));
+    retained_caps.selected_population_sha256 = Some("b".repeat(64));
+    let inherited = inherit_resume_selection(&retained_caps, &CellSelection::default())?;
+    if inherited.manifest_guest_cap != Some(2)
+        || inherited.kvm_guest_cap != Some(1)
+        || inherited.jobs != Some(4)
+        || inherited.cells_file.as_deref() != Some(Path::new("/tmp/retained-cells.jsonl"))
+    {
+        return Err(format!(
+            "resume must inherit retained caps, jobs, and cells file; got caps={:?}/{:?} jobs={:?} cells_file={:?}",
+            inherited.manifest_guest_cap,
+            inherited.kvm_guest_cap,
+            inherited.jobs,
+            inherited.cells_file
+        ));
+    }
+    let mut conflicting = CellSelection::default();
+    conflicting.manifest_guest_cap = Some(3);
+    let error = inherit_resume_selection(&retained_caps, &conflicting)
+        .err()
+        .ok_or("conflicting --manifest-guest-cap on resume must be refused")?;
+    if !error.contains("--manifest-guest-cap") {
+        return Err(format!("cap conflict must name the option; got: {error}"));
+    }
+
+    // (11) M7: --resume DIR alone implies DIR is the results directory,
+    // including for plan (which otherwise requires --results).
+    let resume_only_dir = scratch.join("resume-only");
+    let mut resume_args = vec![
+        "--resume".to_string(),
+        resume_only_dir.display().to_string(),
+    ]
+    .into_iter();
+    let (results, _, selection) = result_options(scratch, &mut resume_args, false, true)?;
+    if results != resume_only_dir
+        || selection.resume_dir.as_deref() != Some(resume_only_dir.as_path())
+    {
+        return Err(format!(
+            "--resume alone must imply its results directory; got results={} resume={:?}",
+            results.display(),
+            selection.resume_dir
+        ));
+    }
+
+    // (12) M6: restoring a retained-plan snapshot puts the original
+    // run.json and dag.json bytes back.
+    let restore_dir = scratch.join("restore");
+    fs::create_dir_all(&restore_dir)
+        .map_err(|e| format!("cannot create {}: {e}", restore_dir.display()))?;
+    fs::write(restore_dir.join("run.json"), "old-run\n")
+        .map_err(|e| format!("cannot write restore fixture: {e}"))?;
+    fs::write(restore_dir.join("dag.json"), "old-dag\n")
+        .map_err(|e| format!("cannot write restore fixture: {e}"))?;
+    let snapshot = snapshot_retained_plan(&restore_dir);
+    fs::write(restore_dir.join("run.json"), "new-run\n")
+        .map_err(|e| format!("cannot overwrite restore fixture: {e}"))?;
+    fs::write(restore_dir.join("dag.json"), "new-dag\n")
+        .map_err(|e| format!("cannot overwrite restore fixture: {e}"))?;
+    restore_retained_plan(&restore_dir, &snapshot)?;
+    let restored = fs::read_to_string(restore_dir.join("run.json"))
+        .map_err(|e| format!("cannot read restored fixture: {e}"))?;
+    if restored != "old-run\n" {
+        return Err(format!(
+            "retained-plan restore must put the original run.json back; got {restored:?}"
+        ));
+    }
+
+    // (13) H8: a retained DAG with the old plain rename audits as
+    // retained history, while a newly generated DAG still refuses it.
+    let plain_cmd = "printf '125\\n' > harness-status; status=0; env HERMIT_BIN=\"$PWD/target/ci/hermit\" target/debug/test-harness run --include-manual --test fixture --mode verify --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; mv -- results.in-progress.jsonl results.jsonl || status=$?; printf '%s\\n' \"$status\" > harness-status; exit \"$status\"";
+    let plain_dag = dag_from_json(
+        &json!({
+            "resource_caps": {"manifest_guest": 1},
+            "steps": [
+                {"group": "cell", "job": "fixture", "cmd": plain_cmd, "deps": [], "timeout": 20, "cpu_timeout": 40,
+                 "hint": {"resources": {"manifest_guest": 1}, "hard_mem_max_bytes": 1024}},
+                {"group": "pressure", "job": "summarize", "cmd": "true", "deps": ["cell.fixture"], "timeout": 10, "cpu_timeout": 10,
+                 "hint": {"hard_mem_max_bytes": 1024}},
+            ],
+        })
+        .to_string(),
+    )
+    .map_err(|e| format!("cannot build plain-rename DAG fixture: {e}"))?;
+    let plain_times = BTreeMap::from([("cell.fixture".to_string(), 20)]);
+    if audit_dag(&plain_dag, 1, 100, &plain_times).is_ok() {
+        return Err("newly generated DAG audit accepted a plain rename".into());
+    }
+    audit_dag_retained(&plain_dag, 1, 100, &plain_times, true)
+        .map_err(|e| format!("retained plain-rename DAG must audit for summarize: {e}"))?;
+    // (13b) The plain-rename exemption is scoped to genuinely old
+    // campaigns: a run.json without the durable-format marker is exempt,
+    // a marked (current-format) run with a plain-rename DAG is refused.
+    let mut legacy_meta = metadata(vec![a.clone()])?;
+    if !legacy_publication_exempt(&legacy_meta) {
+        return Err("unmarked retained run must be legacy-publication exempt".into());
+    }
+    legacy_meta.durable_publication = true;
+    if legacy_publication_exempt(&legacy_meta) {
+        return Err("durable-marked retained run must not be legacy exempt".into());
+    }
+    if audit_dag_retained(
+        &plain_dag,
+        1,
+        100,
+        &plain_times,
+        legacy_publication_exempt(&legacy_meta),
+    )
+    .is_ok()
+    {
+        return Err("new-format retained DAG with a plain rename was accepted".into());
+    }
+    Ok(())
+}
+
+fn resume_round2_self_test() -> Result<(), String> {
+    let scratch = std::env::temp_dir().join(format!("pressure-resume-r2-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch)
+        .map_err(|e| format!("cannot create round2 fixture {}: {e}", scratch.display()))?;
+    let result = resume_round2_self_test_at(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+fn resume_round2_self_test_at(scratch: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let row = |test: &str,
+               run_id: &str,
+               outcome: &str,
+               binary: Option<&str>,
+               test_sha: &str|
+     -> String {
+        let binary_json = binary.map_or("null".to_string(), |b| format!("\"{b}\""));
+        format!(
+            "{{\"schema\":4,\"attempt\":1,\"run_id\":\"{run_id}\",\"hermit_sha\":\"s\",\"source_tree_dirty\":false,\"binary_sha256\":{binary_json},\"test_sha256\":\"{test_sha}\",\"test\":\"{test}\",\"category\":\"c\",\"lane\":\"l\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"classification\":\"required\",\"outcome\":\"{outcome}\",\"first_divergent_record\":null,\"first_divergent_syscall\":null,\"first_divergent_scheduler_turn\":null,\"first_divergent_virtual_nanoseconds\":null,\"first_divergent_left_message\":null,\"first_divergent_right_message\":null,\"timeout_seconds\":15,\"duration_ms\":100,\"argv\":[\"a\"],\"guest_argv\":[\"g\"],\"env\":{{}},\"cwd\":\"/\",\"shell_command\":\"x\",\"attempts\":[],\"reason\":null,\"error_kind\":null,\"artifact_dir\":\"/r/{run_id}\"}}"
+        )
+    };
+    let cell = |test: &str| CellId {
+        lane: "l".into(),
+        category: "c".into(),
+        test: test.into(),
+        mode: "verify".into(),
+        backend: "ptrace".into(),
+    };
+    let write_rep = |base: &Path, c: &CellId, rep: usize, text: &str| -> Result<(), String> {
+        let dir = base.join("cells").join(cell_run_slug(c, Some(rep)));
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        fs::write(dir.join("results.jsonl"), text)
+            .map_err(|e| format!("cannot write fixture results: {e}"))
+    };
+    let (a, b) = (cell("t"), cell("u"));
+    let pass = |test: &str, run_id: &str| {
+        row(
+            test,
+            run_id,
+            "PASS",
+            Some("fixture-binary"),
+            &format!("fixture-test-{test}"),
+        )
+    };
+
+    // H4: ERROR/PASS conflict is never CLEAN, in either directory order.
+    let err_dir = scratch.join("err-dir");
+    let ok_dir = scratch.join("ok-dir");
+    write_rep(
+        &err_dir,
+        &a,
+        1,
+        &format!(
+            "{}\n",
+            row(
+                "t",
+                &cell_run_slug(&a, Some(1)),
+                "ERROR",
+                Some("fixture-binary"),
+                "fixture-test-t"
+            )
+        ),
+    )?;
+    write_rep(
+        &ok_dir,
+        &a,
+        1,
+        &format!("{}\n", pass("t", &cell_run_slug(&a, Some(1)))),
+    )?;
+    write_rep(
+        &ok_dir,
+        &a,
+        2,
+        &format!("{}\n", pass("t", &cell_run_slug(&a, Some(2)))),
+    )?;
+    for dirs in [
+        vec![err_dir.clone(), ok_dir.clone()],
+        vec![ok_dir.clone(), err_dir.clone()],
+    ] {
+        let (_, verdicts) = merge_attempt_directories(&dirs)?;
+        let verdict = verdicts
+            .iter()
+            .find(|v| v.cell.test == "t")
+            .ok_or("ERROR merge lost cell t")?;
+        if verdict.verdict == "CLEAN" {
+            return Err("ERROR/PASS merge became CLEAN".into());
+        }
+        if verdict.verdict != "FLAKY" {
+            return Err(format!("ERROR/PASS merge must be FLAKY; got {verdict:?}"));
+        }
+        // M5: merge contributions are immutable records carrying identity.
+        if verdict.contributions.iter().any(|c| {
+            c.binary_sha256.as_deref() != Some("fixture-binary")
+                || c.test_sha256 != "fixture-test-t"
+        }) {
+            return Err(format!(
+                "merge contributions lost binary/test identity: {verdict:?}"
+            ));
+        }
+    }
+
+    // H3 merge: rows without identity hashes, or with a different binary
+    // or test digest, are refused.
+    let nohash_dir = scratch.join("nohash-dir");
+    write_rep(
+        &nohash_dir,
+        &a,
+        1,
+        &format!(
+            "{}\n",
+            row(
+                "t",
+                &cell_run_slug(&a, Some(1)),
+                "PASS",
+                None,
+                "fixture-test-t"
+            )
+        ),
+    )?;
+    if merge_attempt_directories(&[nohash_dir]).is_ok() {
+        return Err("merge accepted rows with no binary identity".into());
+    }
+    let otherbin_dir = scratch.join("otherbin-dir");
+    write_rep(
+        &otherbin_dir,
+        &a,
+        1,
+        &format!(
+            "{}\n",
+            row(
+                "t",
+                &cell_run_slug(&a, Some(1)),
+                "PASS",
+                Some("other-binary"),
+                "fixture-test-t"
+            )
+        ),
+    )?;
+    if merge_attempt_directories(&[ok_dir.clone(), otherbin_dir]).is_ok() {
+        return Err("merge accepted rows from a different Hermit binary".into());
+    }
+
+    // H4: an out-of-range repetition directory is refused, and a rowless
+    // reference cell reports INCOMPLETE instead of vanishing.
+    let meta_json = |cells: &[CellId], refs: &[CellId], reps: usize| -> String {
+        let cell_json = |c: &CellId| json!({"lane": c.lane, "category": c.category, "test": c.test, "mode": c.mode, "backend": c.backend});
+        json!({
+            "schema": RUN_SCHEMA, "hermit_sha": "s", "detcore_tree": "d",
+            "source_tree_dirty": false, "run_timeout_seconds": 60,
+            "repetitions": reps,
+            "cells": cells.iter().map(cell_json).collect::<Vec<_>>(),
+            "reference_cells": refs.iter().map(cell_json).collect::<Vec<_>>(),
+        })
+        .to_string()
+    };
+    let range_dir = scratch.join("range-dir");
+    fs::create_dir_all(&range_dir)
+        .map_err(|e| format!("cannot create {}: {e}", range_dir.display()))?;
+    fs::write(range_dir.join("run.json"), meta_json(&[a.clone()], &[], 1))
+        .map_err(|e| format!("cannot write range fixture: {e}"))?;
+    write_rep(
+        &range_dir,
+        &a,
+        2,
+        &format!("{}\n", pass("t", &cell_run_slug(&a, Some(2)))),
+    )?;
+    if merge_attempt_directories(&[range_dir]).is_ok() {
+        return Err("merge counted an out-of-range repetition".into());
+    }
+    let ref_dir = scratch.join("ref-dir");
+    fs::create_dir_all(&ref_dir)
+        .map_err(|e| format!("cannot create {}: {e}", ref_dir.display()))?;
+    fs::write(
+        ref_dir.join("run.json"),
+        meta_json(&[a.clone()], &[b.clone()], 1),
+    )
+    .map_err(|e| format!("cannot write reference fixture: {e}"))?;
+    write_rep(
+        &ref_dir,
+        &a,
+        1,
+        &format!("{}\n", pass("t", &cell_run_slug(&a, Some(1)))),
+    )?;
+    let (_, verdicts) = merge_attempt_directories(&[ref_dir])?;
+    let ref_verdict = verdicts
+        .iter()
+        .find(|v| v.cell.test == "u")
+        .ok_or("rowless reference cell vanished from merge")?;
+    if ref_verdict.verdict != "INCOMPLETE" || ref_verdict.present != 0 {
+        return Err(format!(
+            "rowless reference cell must be INCOMPLETE/0; got {ref_verdict:?}"
+        ));
+    }
+
+    // H3 resume: after rebuilding a missing selected binary, a mismatch
+    // against the durable rows' hashes refuses; a match passes.
+    let checkout = scratch.join("checkout");
+    fs::create_dir_all(&checkout)
+        .map_err(|e| format!("cannot create {}: {e}", checkout.display()))?;
+    let fake_bin = scratch.join("fake-cargo-bin");
+    fs::create_dir_all(&fake_bin)
+        .map_err(|e| format!("cannot create {}: {e}", fake_bin.display()))?;
+    let fake_cargo = fake_bin.join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nmkdir -p target/validate\nprintf 'rebuilt-fixture' > target/validate/hermit\n",
+    )
+    .map_err(|e| format!("cannot write fake cargo: {e}"))?;
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("cannot chmod fake cargo: {e}"))?;
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{old_path}", fake_bin.display()));
+    let rebuilt = ensure_selected_binary_built(&checkout);
+    std::env::set_var("PATH", old_path);
+    let rebuilt = rebuilt?;
+    if !rebuilt.is_file() {
+        return Err("missing selected binary was not rebuilt before identity comparison".into());
+    }
+    let rebuilt_sha = hermit_manifest_plan::bundle_record::binary_digest(&rebuilt)
+        .ok_or("rebuilt binary has no digest")?;
+    let parse_row = |text: &str| -> Result<CellResult, String> {
+        serde_json::from_str(text).map_err(|e| format!("cannot parse identity fixture row: {e}"))
+    };
+    let matching = vec![parse_row(&row(
+        "t",
+        "r",
+        "PASS",
+        Some(&rebuilt_sha),
+        "digest-t",
+    ))?];
+    let digests = BTreeMap::from([("t".to_string(), "digest-t".to_string())]);
+    check_identities_against_current(&matching, &rebuilt_sha, &rebuilt, &digests, &checkout)?;
+    let mismatched = vec![parse_row(&row(
+        "t",
+        "r",
+        "PASS",
+        Some("stale-binary"),
+        "digest-t",
+    ))?];
+    let error =
+        check_identities_against_current(&mismatched, &rebuilt_sha, &rebuilt, &digests, &checkout)
+            .err()
+            .ok_or("binary mismatch after rebuild was accepted")?;
+    if !error.contains("not combined") || !error.contains("fresh --results") {
+        return Err(format!(
+            "binary-mismatch error must refuse actionably; got: {error}"
+        ));
+    }
+    let test_mismatch = vec![parse_row(&row(
+        "t",
+        "r",
+        "PASS",
+        Some(&rebuilt_sha),
+        "other-digest",
+    ))?];
+    if check_identities_against_current(&test_mismatch, &rebuilt_sha, &rebuilt, &digests, &checkout)
+        .is_ok()
+    {
+        return Err("test-digest mismatch after rebuild was accepted".into());
+    }
+
+    // H1: resetting in-progress files makes a rerun's fresh attempt 1
+    // sequential again; without the reset the appended duplicate fails.
+    let h1_dir = scratch.join("h1-cell");
+    fs::create_dir_all(&h1_dir).map_err(|e| format!("cannot create {}: {e}", h1_dir.display()))?;
+    let in_progress = h1_dir.join("results.in-progress.jsonl");
+    let junit_in_progress = h1_dir.join("junit.in-progress.xml");
+    let one_row = format!("{}\n", pass("t", &cell_run_slug(&a, Some(1))));
+    fs::write(&in_progress, format!("{one_row}{one_row}"))
+        .map_err(|e| format!("cannot write H1 fixture: {e}"))?;
+    if read_result_rows(&in_progress).is_ok() {
+        return Err("duplicated attempt-1 history must fail the sequential check".into());
+    }
+    let reset = reset_in_progress_shell(&in_progress, &junit_in_progress);
+    let output = Command::new("bash")
+        .args(["-c", &reset])
+        .output()
+        .map_err(|e| format!("cannot run reset snippet: {e}"))?;
+    if !output.status.success() || in_progress.exists() {
+        return Err("generated reset did not remove the stale in-progress file".into());
+    }
+    fs::write(&in_progress, &one_row).map_err(|e| format!("cannot rewrite H1 fixture: {e}"))?;
+    if read_result_rows(&in_progress)?.len() != 1 {
+        return Err("fresh attempt after reset must be a single sequential row".into());
+    }
+
+    // M9: a failed parent-directory fsync unpublishes in shell form too.
+    let m9_dir = scratch.join("m9-cell");
+    fs::create_dir_all(&m9_dir).map_err(|e| format!("cannot create {}: {e}", m9_dir.display()))?;
+    let m9_in = m9_dir.join("results.in-progress.jsonl");
+    let m9_dest = m9_dir.join("results.jsonl");
+    fs::write(&m9_in, "{}\n").map_err(|e| format!("cannot write M9 fixture: {e}"))?;
+    let sync_bin = scratch.join("sync-bin");
+    fs::create_dir_all(&sync_bin)
+        .map_err(|e| format!("cannot create {}: {e}", sync_bin.display()))?;
+    let fake_sync = sync_bin.join("sync");
+    fs::write(
+        &fake_sync,
+        "#!/bin/sh\ncase \"$2\" in *in-progress*) exit 0;; *) exit 1;; esac\n",
+    )
+    .map_err(|e| format!("cannot write fake sync: {e}"))?;
+    fs::set_permissions(&fake_sync, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("cannot chmod fake sync: {e}"))?;
+    let snippet = durable_publish_shell(&m9_in, &m9_dest);
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "export PATH={}:$PATH; status=0; {snippet}exit \"$status\"",
+                sync_bin.display()
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("cannot run M9 snippet: {e}"))?;
+    if output.status.success() || m9_dest.exists() || !m9_in.is_file() {
+        return Err("failed parent fsync left results.jsonl published in shell form".into());
+    }
+
+    // M5/M6: the pre-write archive is immutable and the snapshot rollback
+    // restores the retained plan after a failed replan.
+    let arch_dir = scratch.join("arch");
+    fs::create_dir_all(&arch_dir)
+        .map_err(|e| format!("cannot create {}: {e}", arch_dir.display()))?;
+    fs::write(arch_dir.join("run.json"), "run-v1\n")
+        .map_err(|e| format!("cannot write arch fixture: {e}"))?;
+    fs::write(arch_dir.join("dag.json"), "dag-v1\n")
+        .map_err(|e| format!("cannot write arch fixture: {e}"))?;
+    fs::write(arch_dir.join("runner-outcomes.json"), "outcomes-v1\n")
+        .map_err(|e| format!("cannot write arch fixture: {e}"))?;
+    let first = archive_resume_attempt(&arch_dir, &[])?.ok_or("first archive missing")?;
+    fs::write(arch_dir.join("run.json"), "run-v2\n")
+        .map_err(|e| format!("cannot overwrite arch fixture: {e}"))?;
+    let second = archive_resume_attempt(&arch_dir, &[])?.ok_or("second archive missing")?;
+    if first == second {
+        return Err("second resume overwrote the first attempt archive".into());
+    }
+    let archived = fs::read_to_string(first.join("run.json"))
+        .map_err(|e| format!("cannot read archive: {e}"))?;
+    if archived != "run-v1\n" {
+        return Err(format!(
+            "first attempt archive changed after second resume; got {archived:?}"
+        ));
+    }
+    let snapshot = snapshot_retained_plan(&arch_dir);
+    fs::write(arch_dir.join("run.json"), "broken\n")
+        .map_err(|e| format!("cannot break arch fixture: {e}"))?;
+    restore_retained_plan(&arch_dir, &snapshot)?;
+    let restored = fs::read_to_string(arch_dir.join("run.json"))
+        .map_err(|e| format!("cannot read restored: {e}"))?;
+    if restored != "run-v2\n" {
+        return Err(format!(
+            "rollback after failed replan must restore run-v2; got {restored:?}"
+        ));
+    }
+
+    // H2: standalone summarize detection accepts exactly the filtered
+    // (resumed) DAG shape and stays strict (None) for a full DAG.
+    let sum_dir = scratch.join("sum");
+    fs::create_dir_all(&sum_dir)
+        .map_err(|e| format!("cannot create {}: {e}", sum_dir.display()))?;
+    let sum_meta: RunMetadata =
+        serde_json::from_str(&meta_json(&[a.clone(), b.clone()], &[], 2))
+            .map_err(|e| format!("cannot build summarize fixture metadata: {e}"))?;
+    fs::write(
+        sum_dir.join("run.json"),
+        serde_json::to_string(&sum_meta).map_err(|e| format!("cannot serialize: {e}"))?,
+    )
+    .map_err(|e| format!("cannot write summarize fixture: {e}"))?;
+    write_rep(
+        &sum_dir,
+        &a,
+        1,
+        &format!("{}\n", pass("t", &cell_run_slug(&a, Some(1)))),
+    )?;
+    write_rep(
+        &sum_dir,
+        &a,
+        2,
+        &format!("{}\n", pass("t", &cell_run_slug(&a, Some(2)))),
+    )?;
+    write_rep(
+        &sum_dir,
+        &b,
+        1,
+        &format!("{}\n", pass("u", &cell_run_slug(&b, Some(1)))),
+    )?;
+    let b2_slug = cell_run_slug(&b, Some(2));
+    let filtered_dag = json!({"steps": [
+        {"group": "build", "job": "workspace", "cmd": "build", "timeout": 10, "cpu_timeout": 20, "deps": []},
+        {"group": "cell", "job": b2_slug, "cmd": "cell", "timeout": 10, "cpu_timeout": 20, "deps": ["build.workspace"]},
+        {"group": "pressure", "job": "summarize", "cmd": "true", "timeout": 10, "cpu_timeout": 20, "deps": [format!("cell.{b2_slug}")]}]});
+    fs::write(sum_dir.join("dag.json"), filtered_dag.to_string())
+        .map_err(|e| format!("cannot write filtered dag: {e}"))?;
+    let detected = standalone_resume_completed(&sum_dir)?
+        .ok_or("filtered resumed DAG not detected for standalone summarize")?;
+    if detected.get(&a) != Some(&BTreeSet::from([1usize, 2]))
+        || detected.get(&b) != Some(&BTreeSet::from([1usize]))
+    {
+        return Err(format!("standalone resume map mismatch: {detected:?}"));
+    }
+    let full_dag = json!({"steps": [
+        {"group": "cell", "job": cell_run_slug(&a, Some(1)), "cmd": "c", "timeout": 10, "cpu_timeout": 20, "deps": []},
+        {"group": "cell", "job": cell_run_slug(&a, Some(2)), "cmd": "c", "timeout": 10, "cpu_timeout": 20, "deps": []},
+        {"group": "cell", "job": cell_run_slug(&b, Some(1)), "cmd": "c", "timeout": 10, "cpu_timeout": 20, "deps": []},
+        {"group": "cell", "job": b2_slug, "cmd": "c", "timeout": 10, "cpu_timeout": 20, "deps": []},
+        {"group": "pressure", "job": "summarize", "cmd": "true", "timeout": 10, "cpu_timeout": 20, "deps": []}]});
+    fs::write(sum_dir.join("dag.json"), full_dag.to_string())
+        .map_err(|e| format!("cannot write full dag: {e}"))?;
+    if standalone_resume_completed(&sum_dir)?.is_some() {
+        return Err("full DAG must stay on the strict standalone summarize path".into());
+    }
+    Ok(())
+}
+
+/// H3 preflight: a batch resume must identity-check the execution
+/// checkout's binary, not the caller tree's. Fake caller/execution
+/// checkouts hold different binaries; rows matching the execution binary
+/// are accepted at preflight even though the caller binary differs, and
+/// rows matching only the caller binary are refused. No live campaign is
+/// needed: the production preflight helper is exercised directly, with
+/// synthetic test digests because the fake checkouts have no manifests.
+fn resume_execution_identity_self_test() -> Result<(), String> {
+    let scratch =
+        std::env::temp_dir().join(format!("pressure-resume-exec-id-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch)
+        .map_err(|e| format!("cannot create exec-id fixture {}: {e}", scratch.display()))?;
+    let result = resume_execution_identity_self_test_at(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+fn resume_execution_identity_self_test_at(scratch: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let write_binary = |checkout: &Path, contents: &str| -> Result<PathBuf, String> {
+        let binary = checkout.join("target/ci/hermit");
+        fs::create_dir_all(binary.parent().ok_or("binary has no parent")?)
+            .map_err(|e| format!("cannot create {}: {e}", binary.display()))?;
+        fs::write(&binary, contents).map_err(|e| format!("cannot write binary: {e}"))?;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("cannot chmod binary: {e}"))?;
+        Ok(binary)
+    };
+    let caller = scratch.join("caller");
+    let execution = scratch.join("execution");
+    let caller_binary = write_binary(&caller, "caller-binary")?;
+    let execution_binary = write_binary(&execution, "execution-binary")?;
+    let caller_sha = hermit_manifest_plan::bundle_record::binary_digest(&caller_binary)
+        .ok_or("caller binary has no digest")?;
+    let execution_sha = hermit_manifest_plan::bundle_record::binary_digest(&execution_binary)
+        .ok_or("execution binary has no digest")?;
+    if caller_sha == execution_sha {
+        return Err("fake caller/execution binaries must hash differently".into());
+    }
+    let row = |binary: &str| -> Result<CellResult, String> {
+        let text = format!(
+            "{{\"schema\":4,\"attempt\":1,\"run_id\":\"r\",\"hermit_sha\":\"s\",\"source_tree_dirty\":false,\"binary_sha256\":\"{binary}\",\"test_sha256\":\"digest-t\",\"test\":\"t\",\"category\":\"c\",\"lane\":\"l\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"classification\":\"required\",\"outcome\":\"PASS\",\"first_divergent_record\":null,\"first_divergent_syscall\":null,\"first_divergent_scheduler_turn\":null,\"first_divergent_virtual_nanoseconds\":null,\"first_divergent_left_message\":null,\"first_divergent_right_message\":null,\"timeout_seconds\":15,\"duration_ms\":100,\"argv\":[\"a\"],\"guest_argv\":[\"g\"],\"env\":{{}},\"cwd\":\"/\",\"shell_command\":\"x\",\"attempts\":[],\"reason\":null,\"error_kind\":null,\"artifact_dir\":\"/r/r\"}}"
+        );
+        serde_json::from_str(&text).map_err(|e| format!("cannot parse exec-id row: {e}"))
+    };
+    let digests = BTreeMap::from([("t".to_string(), "digest-t".to_string())]);
+    if resume_identity_root(&caller, Some(&execution)) != execution.as_path() {
+        return Err("batch resume identity root must be the execution checkout".into());
+    }
+    if resume_identity_root(&caller, None) != caller.as_path()
+        || resume_identity_root(&caller, Some(&caller)) != caller.as_path()
+    {
+        return Err("exact-cell resume identity root must be the caller/working tree".into());
+    }
+    // Rows match the execution binary, not the caller's: accepted, and
+    // the binary hashed is the execution checkout's.
+    let execution_rows = vec![row(&execution_sha)?];
+    let (checked_binary, checked_sha) = verify_resume_preflight_with_digests(
+        &caller,
+        Some(&execution),
+        &execution_rows,
+        &digests,
+        scratch,
+    )?;
+    if checked_binary != execution_binary || checked_sha != execution_sha {
+        return Err(format!(
+            "batch preflight hashed {} ({checked_sha}), expected execution binary {} ({execution_sha})",
+            checked_binary.display(),
+            execution_binary.display()
+        ));
+    }
+    // Rows match only the caller binary: refused at preflight (the
+    // production run calls this before write_plan/execute, so no cell
+    // executes on a mismatch).
+    let caller_rows = vec![row(&caller_sha)?];
+    let error = verify_resume_preflight_with_digests(
+        &caller,
+        Some(&execution),
+        &caller_rows,
+        &digests,
+        scratch,
+    )
+    .err()
+    .ok_or("rows matching only the caller binary were accepted for batch resume")?;
+    if !error.contains("not combined") {
+        return Err(format!("caller-only mismatch must refuse; got: {error}"));
+    }
+
+    // None-hash rows: a HOST-INAPPLICABLE row records no binary because
+    // none ran, so it resumes beside matching PASS rows; a PASS row with
+    // no binary still refuses, naming the rule accurately.
+    let mut inapplicable = row(&execution_sha)?;
+    inapplicable.binary_sha256 = None;
+    inapplicable.outcome = "HOST-INAPPLICABLE".into();
+    inapplicable.test = "u".into();
+    let digests_u = BTreeMap::from([
+        ("t".to_string(), "digest-t".to_string()),
+        ("u".to_string(), "digest-t".to_string()),
+    ]);
+    let mut inapplicable_t = inapplicable.clone();
+    inapplicable_t.test = "t".into();
+    verify_resume_preflight_with_digests(
+        &caller,
+        Some(&execution),
+        &[row(&execution_sha)?, inapplicable_t],
+        &digests_u,
+        scratch,
+    )?;
+    check_resume_rows_one_identity(&[row(&execution_sha)?, inapplicable.clone()], scratch)?;
+    let mut no_binary_pass = row(&execution_sha)?;
+    no_binary_pass.binary_sha256 = None;
+    let error = check_resume_rows_one_identity(&[no_binary_pass], scratch)
+        .err()
+        .ok_or("PASS row with no binary identity was accepted")?;
+    if !error.contains("HOST-INAPPLICABLE") {
+        return Err(format!(
+            "no-binary PASS refusal must name the host-inapplicable rule; got: {error}"
+        ));
+    }
+
+    // Standalone summarize gate: durable rows under a results directory
+    // must share one binary; mixed PASS binaries refuse, a consistent
+    // set (plus a host-inapplicable row) passes.
+    let cell = CellId {
+        lane: "l".into(),
+        category: "c".into(),
+        test: "t".into(),
+        mode: "verify".into(),
+        backend: "ptrace".into(),
+    };
+    let meta: RunMetadata = serde_json::from_str(
+        &json!({
+            "schema": RUN_SCHEMA, "hermit_sha": "s", "detcore_tree": "d",
+            "source_tree_dirty": false, "run_timeout_seconds": 60,
+            "repetitions": 2,
+            "cells": [{"lane": "l", "category": "c", "test": "t", "mode": "verify", "backend": "ptrace"}],
+            "reference_cells": [],
+        })
+        .to_string(),
+    )
+    .map_err(|e| format!("cannot build standalone fixture metadata: {e}"))?;
+    let write_row = |base: &Path, rep: usize, value: &CellResult| -> Result<(), String> {
+        let dir = base.join("cells").join(cell_run_slug(&cell, Some(rep)));
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let mut value = value.clone();
+        value.run_id = cell_evidence_run_id(&cell, Some(rep), None);
+        let text = serde_json::to_string(&value)
+            .map_err(|e| format!("cannot serialize standalone row: {e}"))?;
+        fs::write(dir.join("results.jsonl"), format!("{text}\n"))
+            .map_err(|e| format!("cannot write standalone row: {e}"))
+    };
+    let mixed_dir = scratch.join("standalone-mixed");
+    write_row(&mixed_dir, 1, &row(&execution_sha)?)?;
+    write_row(&mixed_dir, 2, &row(&caller_sha)?)?;
+    let error = verify_standalone_resume_identities(&mixed_dir, &meta)
+        .err()
+        .ok_or("standalone summarize accepted mixed-binary durable rows")?;
+    if !error.contains("mixed-binary") {
+        return Err(format!(
+            "mixed standalone refusal must name it; got: {error}"
+        ));
+    }
+    let consistent_dir = scratch.join("standalone-consistent");
+    write_row(&consistent_dir, 1, &row(&execution_sha)?)?;
+    write_row(&consistent_dir, 2, &row(&execution_sha)?)?;
+    verify_standalone_resume_identities(&consistent_dir, &meta)?;
+    Ok(())
+}
+
+/// Round-3 fixes: (H1) a PASS durably published before a kill that
+/// prevented the final harness-status write is credited on resume, not
+/// aborted; (H2) the resume-time completion map persisted in
+/// `resume-completed.json` survives the resumed jobs finishing, with
+/// named refusals for a mismatched or unreconstructable map, and the
+/// full-plan memory graph is reconstructed from it; (M9) a generated
+/// publish syncs the parent directory after every successful rename,
+/// including after a failed harness run.
+fn resume_round3_self_test() -> Result<(), String> {
+    let scratch =
+        std::env::temp_dir().join(format!("pressure-resume-round3-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch)
+        .map_err(|e| format!("cannot create round3 fixture {}: {e}", scratch.display()))?;
+    let result = resume_round3_self_test_at(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+fn resume_round3_self_test_at(scratch: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let cell = |test: &str| CellId {
+        lane: "l".into(),
+        category: "c".into(),
+        test: test.into(),
+        mode: "verify".into(),
+        backend: "ptrace".into(),
+    };
+    let (a, b) = (cell("t"), cell("u"));
+    let metadata = |cells: Vec<CellId>| -> Result<RunMetadata, String> {
+        serde_json::from_value(json!({
+            "schema": RUN_SCHEMA, "hermit_sha": "s", "detcore_tree": "d",
+            "source_tree_dirty": false, "run_timeout_seconds": 60,
+            "repetitions": 2,
+            "cells": cells.iter().map(|c| json!({
+                "lane": c.lane, "category": c.category, "test": c.test,
+                "mode": c.mode, "backend": c.backend,
+            })).collect::<Vec<_>>(),
+            "reference_cells": [],
+        }))
+        .map_err(|e| format!("cannot build round3 fixture metadata: {e}"))
+    };
+    let row = |c: &CellId, rep: usize, outcome: &str| -> String {
+        format!(
+            "{{\"schema\":4,\"attempt\":1,\"run_id\":\"{}\",\"hermit_sha\":\"s\",\"source_tree_dirty\":false,\"binary_sha256\":\"fixture-binary\",\"test_sha256\":\"fixture-test-{}\",\"test\":\"{}\",\"category\":\"c\",\"lane\":\"l\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"classification\":\"required\",\"outcome\":\"{outcome}\",\"first_divergent_record\":null,\"first_divergent_syscall\":null,\"first_divergent_scheduler_turn\":null,\"first_divergent_virtual_nanoseconds\":null,\"first_divergent_left_message\":null,\"first_divergent_right_message\":null,\"timeout_seconds\":15,\"duration_ms\":100,\"argv\":[\"a\"],\"guest_argv\":[\"g\"],\"env\":{{}},\"cwd\":\"/\",\"shell_command\":\"x\",\"attempts\":[],\"reason\":null,\"error_kind\":null,\"artifact_dir\":\"/r/x\"}}\n",
+            cell_evidence_run_id(c, Some(rep), None),
+            c.test,
+            c.test
+        )
+    };
+    let write_rep = |base: &Path,
+                     c: &CellId,
+                     rep: usize,
+                     outcome: &str,
+                     status: Option<&str>|
+     -> Result<PathBuf, String> {
+        let dir = base.join("cells").join(cell_run_slug(c, Some(rep)));
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        fs::write(dir.join("results.jsonl"), row(c, rep, outcome))
+            .map_err(|e| format!("cannot write round3 row: {e}"))?;
+        if let Some(status) = status {
+            fs::write(dir.join("harness-status"), status)
+                .map_err(|e| format!("cannot write round3 status: {e}"))?;
+        }
+        Ok(dir.join("results.jsonl"))
+    };
+
+    // H1 (final scope): a repetition published but whose final status
+    // was never written (status still 125) is not credited from its row
+    // alone. Resume schedules it as missing (reruns it), a strict read
+    // refuses it by name (resume-final-status-missing), and a PASS
+    // beside a real nonzero final status still refuses outright.
+    let h1_dir = scratch.join("h1");
+    let h1_file = write_rep(&h1_dir, &a, 1, "PASS", Some("125\n"))?;
+    write_rep(&h1_dir, &a, 2, "FAIL", Some("125\n"))?;
+    let h1_meta = metadata(vec![a.clone()])?;
+    let h1_completed = durable_completed_repetitions(&h1_dir, &h1_meta)?;
+    if h1_completed.get(&a).is_some_and(|done| !done.is_empty()) {
+        return Err(format!(
+            "killed-after-publish repetitions must be rerun, not credited; got {h1_completed:?}"
+        ));
+    }
+    if resume_missing_repetitions(&h1_meta, &h1_completed)
+        != vec![(a.clone(), Some(1)), (a.clone(), Some(2))]
+    {
+        return Err(format!(
+            "final-status-missing repetitions must be scheduled missing; got {:?}",
+            resume_missing_repetitions(&h1_meta, &h1_completed)
+        ));
+    }
+    let h1_error = read_durable_result_rows(&h1_file, &a, &h1_meta, Some(1))
+        .err()
+        .ok_or("final-status-missing repetition was read as durable")?;
+    if !h1_error.contains("resume-final-status-missing") {
+        return Err(format!(
+            "final-status-missing read must refuse by name; got: {h1_error}"
+        ));
+    }
+    // The rerun decision is recorded in the resume attempt archive:
+    // resume-reruns.json names each such repetition and the named limit
+    // resume-final-status-missing as the reason for its rerun.
+    let h1_reruns = final_status_missing_repetitions(&h1_dir, &h1_meta)?;
+    if h1_reruns != vec![(a.clone(), 1usize), (a.clone(), 2usize)] {
+        return Err(format!(
+            "final-status-missing scan must name both repetitions; got {h1_reruns:?}"
+        ));
+    }
+    fs::write(
+        h1_dir.join("run.json"),
+        serde_json::to_string(&h1_meta).map_err(|e| format!("cannot serialize: {e}"))?,
+    )
+    .map_err(|e| format!("cannot write h1 run.json: {e}"))?;
+    let h1_archive =
+        archive_resume_attempt(&h1_dir, &h1_reruns)?.ok_or("h1 attempt archive missing")?;
+    let h1_record = fs::read_to_string(h1_archive.join(RESUME_RERUNS_FILE))
+        .map_err(|e| format!("cannot read h1 rerun record: {e}"))?;
+    let h1_document: ResumeRerunsFile =
+        serde_json::from_str(&h1_record).map_err(|e| format!("invalid h1 rerun record: {e}"))?;
+    if h1_document.schema != 1
+        || h1_document.reruns
+            != vec![
+                ResumeRerunEntry {
+                    cell: a.clone(),
+                    repetition: 1,
+                    reason: "resume-final-status-missing".to_string(),
+                },
+                ResumeRerunEntry {
+                    cell: a.clone(),
+                    repetition: 2,
+                    reason: "resume-final-status-missing".to_string(),
+                },
+            ]
+    {
+        return Err(format!(
+            "archive must record both reruns by name with reason resume-final-status-missing; got {h1_record}"
+        ));
+    }
+    // After the rerun completes with a terminal status, the summary
+    // path can credit the new attempt: repetition 1 is durable again,
+    // while the still-unrerun repetition 2 stays missing.
+    write_rep(&h1_dir, &a, 1, "PASS", Some("0\n"))?;
+    let h1_after = durable_completed_repetitions(&h1_dir, &h1_meta)?;
+    if h1_after.get(&a) != Some(&BTreeSet::from([1usize])) {
+        return Err(format!(
+            "rerun with terminal status must be credited, unrerun repetition must stay missing; got {h1_after:?}"
+        ));
+    }
+    if final_status_missing_repetitions(&h1_dir, &h1_meta)? != vec![(a.clone(), 2usize)] {
+        return Err("only the unrerun repetition may remain final-status-missing".into());
+    }
+    // Memory evidence: a resumed summary with no recorded budget /
+    // requirement / max-safe evidence refuses by name instead of
+    // skipping the checks; complete evidence passes the gate.
+    let memory_error = require_resume_memory_evidence(&h1_meta)
+        .err()
+        .ok_or("resumed summary without memory evidence was accepted")?;
+    if !memory_error.contains("resume-memory-evidence-missing") {
+        return Err(format!(
+            "missing memory evidence must refuse by name; got: {memory_error}"
+        ));
+    }
+    let mut memory_ok_meta = h1_meta.clone();
+    memory_ok_meta.manifest_guest_memory_budget_bytes = Some(1 << 30);
+    memory_ok_meta.manifest_guest_memory_required_bytes = Some(1024);
+    memory_ok_meta.manifest_guest_max_safe_cap = Some(1);
+    memory_ok_meta.kvm_guest_max_safe_cap = Some(1);
+    memory_ok_meta.manifest_guest_control_plane_headroom_bytes = Some(CONTROL_PLANE_HEADROOM_BYTES);
+    require_resume_memory_evidence(&memory_ok_meta)?;
+    // A PASS beside a real nonzero final status still refuses.
+    let h1_bad = scratch.join("h1-bad");
+    write_rep(&h1_bad, &a, 1, "PASS", Some("1\n"))?;
+    if durable_completed_repetitions(&h1_bad, &h1_meta).is_ok() {
+        return Err("PASS beside final harness exit 1 was credited".into());
+    }
+
+    // H2: persist the resume-time map, then finish the resumed job; the
+    // standalone detection must still return the resume-time map.
+    let sum_dir = scratch.join("sum");
+    let sum_meta = metadata(vec![a.clone(), b.clone()])?;
+    fs::create_dir_all(&sum_dir)
+        .map_err(|e| format!("cannot create {}: {e}", sum_dir.display()))?;
+    fs::write(
+        sum_dir.join("run.json"),
+        serde_json::to_string(&sum_meta).map_err(|e| format!("cannot serialize: {e}"))?,
+    )
+    .map_err(|e| format!("cannot write round3 run.json: {e}"))?;
+    write_rep(&sum_dir, &a, 1, "PASS", Some("0\n"))?;
+    write_rep(&sum_dir, &a, 2, "PASS", Some("0\n"))?;
+    write_rep(&sum_dir, &b, 1, "PASS", Some("0\n"))?;
+    let resume_time = BTreeMap::from([
+        (a.clone(), BTreeSet::from([1usize, 2])),
+        (b.clone(), BTreeSet::from([1usize])),
+    ]);
+    write_resume_completed(&sum_dir, &resume_time)?;
+    let b2_slug = cell_run_slug(&b, Some(2));
+    let filtered_dag = json!({"steps": [
+        {"group": "build", "job": "workspace", "cmd": "build", "timeout": 10, "cpu_timeout": 20, "deps": []},
+        {"group": "cell", "job": b2_slug, "cmd": "cell", "timeout": 10, "cpu_timeout": 20, "deps": ["build.workspace"]},
+        {"group": "pressure", "job": "summarize", "cmd": "true", "timeout": 10, "cpu_timeout": 20, "deps": [format!("cell.{b2_slug}")]}]});
+    fs::write(sum_dir.join("dag.json"), filtered_dag.to_string())
+        .map_err(|e| format!("cannot write round3 filtered dag: {e}"))?;
+    // The resumed job now finishes, adding the row a recomputed map
+    // would wrongly count as resume-time durable.
+    write_rep(&sum_dir, &b, 2, "PASS", Some("0\n"))?;
+    let detected = standalone_resume_completed(&sum_dir)?
+        .ok_or("persisted resumed DAG not detected for standalone summarize")?;
+    if detected != resume_time {
+        return Err(format!(
+            "standalone summarize must use the persisted resume-time map; got {detected:?}"
+        ));
+    }
+    // A persisted map that no longer reproduces the filtered DAG refuses
+    // by name, never silently.
+    write_resume_completed(
+        &sum_dir,
+        &BTreeMap::from([(a.clone(), BTreeSet::from([1usize]))]),
+    )?;
+    let error = standalone_resume_completed(&sum_dir)
+        .err()
+        .ok_or("mismatched persisted resume map was accepted")?;
+    if !error.contains("resume-completed-mismatch") {
+        return Err(format!(
+            "persisted-map mismatch must refuse by name; got: {error}"
+        ));
+    }
+    // A legacy filtered DAG with no persisted map, after the resumed
+    // jobs finished, refuses by name instead of returning None.
+    fs::remove_file(sum_dir.join(RESUME_COMPLETED_FILE))
+        .map_err(|e| format!("cannot remove persisted map: {e}"))?;
+    let error = standalone_resume_completed(&sum_dir)
+        .err()
+        .ok_or("unreconstructable legacy resume map was silently accepted")?;
+    if !error.contains("resume-completed-unreconstructable") {
+        return Err(format!(
+            "legacy unreconstructable map must refuse by name; got: {error}"
+        ));
+    }
+
+    // H2 memory: the reconstructed full graph re-adds every durable
+    // repetition at its planned cap, so full-plan memory exceeds the
+    // filtered graph's and is what recorded values are checked against.
+    let cap = cell_memory_bytes(&a);
+    let memory_dag = dag_from_json(
+        &json!({
+            "resource_caps": {"manifest_guest": 4, "kvm_guest": 1},
+            "steps": [
+                {"group": "build", "job": "workspace", "cmd": "build", "timeout": 10, "cpu_timeout": 20, "deps": [],
+                 "hint": {"hard_mem_max_bytes": 1024}},
+                {"group": "cell", "job": b2_slug, "cmd": "cell", "timeout": 10, "cpu_timeout": 20, "deps": ["build.workspace"],
+                 "hint": {"resources": {"manifest_guest": 1}, "hard_mem_max_bytes": cap}},
+                {"group": "pressure", "job": "summarize", "cmd": "true", "timeout": 10, "cpu_timeout": 20,
+                 "deps": [format!("cell.{b2_slug}")], "hint": {"hard_mem_max_bytes": 1024}},
+            ],
+        })
+        .to_string(),
+    )
+    .map_err(|e| format!("cannot build round3 memory DAG: {e}"))?;
+    let full = full_memory_dag(&memory_dag, &sum_meta, &resume_time);
+    let full_cells: BTreeSet<String> = full
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .map(|step| step.tag())
+        .collect();
+    if full_cells.len() != 4 {
+        return Err(format!(
+            "full memory graph must hold all 4 repetitions; got {full_cells:?}"
+        ));
+    }
+    let filtered_memory = declared_memory_at_manifest_guest_cap(&memory_dag, 4, 4, 1)?;
+    let full_memory = declared_memory_at_manifest_guest_cap(&full, 4, 4, 1)?;
+    if full_memory <= filtered_memory {
+        return Err(format!(
+            "full-plan memory {full_memory} must exceed filtered-graph memory {filtered_memory}"
+        ));
+    }
+
+    // M9: with the harness already failed (status=3), a parent-directory
+    // sync failure (7) must still unpublish and replace the status; a
+    // successful publish preserves the harness failure and the rename.
+    let m9_dir = scratch.join("m9-cell");
+    fs::create_dir_all(&m9_dir).map_err(|e| format!("cannot create {}: {e}", m9_dir.display()))?;
+    let m9_in = m9_dir.join("results.in-progress.jsonl");
+    let m9_dest = m9_dir.join("results.jsonl");
+    fs::write(&m9_in, "{}\n").map_err(|e| format!("cannot write M9 round3 fixture: {e}"))?;
+    let sync_bin = scratch.join("m9-sync-bin");
+    fs::create_dir_all(&sync_bin)
+        .map_err(|e| format!("cannot create {}: {e}", sync_bin.display()))?;
+    let fake_sync = sync_bin.join("sync");
+    fs::write(
+        &fake_sync,
+        "#!/bin/sh\ncase \"$2\" in *in-progress*) exit 0;; *) exit 7;; esac\n",
+    )
+    .map_err(|e| format!("cannot write M9 round3 fake sync: {e}"))?;
+    fs::set_permissions(&fake_sync, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("cannot chmod M9 round3 fake sync: {e}"))?;
+    let snippet = durable_publish_shell(&m9_in, &m9_dest);
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "export PATH={}:$PATH; status=3; {snippet}exit \"$status\"",
+                sync_bin.display()
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("cannot run M9 round3 snippet: {e}"))?;
+    if output.status.code() != Some(7) || m9_dest.exists() || !m9_in.is_file() {
+        return Err(format!(
+            "failed parent sync after a failed harness run must unpublish and report 7; got exit {:?}, dest exists {}",
+            output.status.code(),
+            m9_dest.exists()
+        ));
+    }
+    let output = Command::new("bash")
+        .args(["-c", &format!("status=3; {snippet}exit \"$status\"")])
+        .output()
+        .map_err(|e| format!("cannot run M9 round3 success snippet: {e}"))?;
+    if output.status.code() != Some(3) || !m9_dest.is_file() || m9_in.exists() {
+        return Err(format!(
+            "successful publish after a failed harness run must rename and preserve exit 3; got exit {:?}, dest exists {}",
+            output.status.code(),
+            m9_dest.is_file()
+        ));
+    }
+    Ok(())
+}
+
 fn self_test(root: &Path) -> Result<(), String> {
     // Read the real checked-in scorecard before building synthetic fixtures.
     // A scorecard schema bump must take this consumer offline immediately and
@@ -15329,6 +19514,13 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("tracked cells are empty".into());
     }
     safe_ci_scope::self_test()?;
+    durable_publish_self_test()?;
+    incomplete_rerun_guard_self_test()?;
+    build_marker_checkout_self_test()?;
+    resume_merge_self_test()?;
+    resume_round2_self_test()?;
+    resume_execution_identity_self_test()?;
+    resume_round3_self_test()?;
     log_tail_self_test()?;
     pressure_timeout_self_test()?;
     // The width-sizing caller (pressure_schedule's `memory_safe_guests`)
@@ -16019,7 +20211,9 @@ fn self_test(root: &Path) -> Result<(), String> {
         --include-manual --test fixture --mode verify \
         --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; \
         if test -e results.in-progress.jsonl; then \
-        mv -- results.in-progress.jsonl results.jsonl || status=$?; fi; \
+        sync -- results.in-progress.jsonl || status=$?; \
+        mv -- results.in-progress.jsonl results.jsonl || status=$?; \
+        sync -- . || status=$?; fi; \
         if test -e junit.in-progress.xml; then \
         mv -- junit.in-progress.xml junit.xml || status=$?; fi; \
         printf '%s\\n' \"$status\" > harness-status; exit \"$status\"";
@@ -16143,7 +20337,9 @@ fn self_test(root: &Path) -> Result<(), String> {
          status=0; env target/debug/test-harness run --include-manual --prebuilt \
          --test fixture --mode verify --results results.in-progress.jsonl \
          --junit junit.in-progress.xml || status=$?; \
+         sync -- results.in-progress.jsonl || status=$?; \
          mv -- results.in-progress.jsonl results.jsonl || status=$?; \
+         sync -- . || status=$?; \
          printf '%s\\n' \"$status\" > harness-status; exit \"$status\""
         .into();
     audit_dag(&prepared_fixture, 1, 100, &fixture_timeouts)
@@ -17472,10 +21668,12 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
+    // Removing only repetition 1 is the --resume shape and must display
+    // repetition 2; a display with no remaining repetition must refuse.
     let mut missing_display = repeated_dag.clone();
     missing_display
         .steps
-        .retain(|step| step.tag() != displayed_tag);
+        .retain(|step| !step.tag().starts_with("cell."));
     let mut duplicate_display = repeated_dag.clone();
     duplicate_display.steps.push(displayed_node.clone());
     if exact_manifest_command_description(&missing_display, &repeated_metadata).is_ok()
@@ -17698,6 +21896,49 @@ fn self_test(root: &Path) -> Result<(), String> {
     repeated_metadata.source_tree_dirty = false;
     validate_run_contract(root, &repeated_results, &repeated_metadata, false)
         .map_err(|e| format!("valid repeated run contract was refused: {e}"))?;
+    // Final scope: a resumed summary runs the full-plan memory and
+    // max-safe checks (no exemption). Violating recorded memory refuses
+    // with the recomputed value, and missing evidence refuses by name.
+    {
+        let resume_completed =
+            BTreeMap::from([(repeated_metadata.cells[0].clone(), BTreeSet::from([1usize]))]);
+        let mut violating = repeated_metadata.clone();
+        violating.manifest_guest_memory_budget_bytes = Some(1_i64 << 40);
+        violating.manifest_guest_memory_required_bytes = Some(1);
+        violating.manifest_guest_max_safe_cap = Some(999_999);
+        violating.kvm_guest_max_safe_cap = Some(999_999);
+        violating.manifest_guest_control_plane_headroom_bytes = Some(CONTROL_PLANE_HEADROOM_BYTES);
+        let error = validate_run_contract_with_resume(
+            root,
+            &repeated_results,
+            &violating,
+            false,
+            Some(&resume_completed),
+        )
+        .err()
+        .ok_or("resumed summary with violating memory was accepted")?;
+        if !error.contains("does not match recomputed") {
+            return Err(format!(
+                "resumed violating-memory summary must run the check and refuse with recomputed value; got: {error}"
+            ));
+        }
+        let mut missing_evidence = repeated_metadata.clone();
+        missing_evidence.manifest_guest_memory_budget_bytes = None;
+        let error = validate_run_contract_with_resume(
+            root,
+            &repeated_results,
+            &missing_evidence,
+            false,
+            Some(&resume_completed),
+        )
+        .err()
+        .ok_or("resumed summary with missing memory evidence was accepted")?;
+        if !error.contains("resume-memory-evidence-missing") {
+            return Err(format!(
+                "resumed missing-memory-evidence summary must refuse by name; got: {error}"
+            ));
+        }
+    }
     for (label, mut invalid) in [
         ("zero repetitions", repeated_metadata.clone()),
         ("partial exact cell", repeated_metadata.clone()),
@@ -18865,6 +23106,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let sample_slug = base_cell_slug(&sample_a);
     let sample_metadata = RunMetadata {
         schema: RUN_SCHEMA,
+        durable_publication: true,
         run_id: "sample-run".into(),
         hermit_sha: "abc".into(),
         detcore_tree: "def".into(),
@@ -28915,7 +33157,7 @@ mod pressure_planning_tests {
 
     #[test]
     fn audit_refuses_every_dbt_host_tmp_grant_that_is_not_one_unit() {
-        let cmd = "printf '125\\n' > harness-status; status=0; env HERMIT_BIN=\"$PWD/target/ci/hermit\" target/debug/test-harness run --include-manual --test fixture --mode verify --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; mv -- results.in-progress.jsonl results.jsonl; exit \"$status\"";
+        let cmd = "printf '125\\n' > harness-status; status=0; env HERMIT_BIN=\"$PWD/target/ci/hermit\" target/debug/test-harness run --include-manual --test fixture --mode verify --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; sync -- results.in-progress.jsonl || status=$?; mv -- results.in-progress.jsonl results.jsonl || status=$?; sync -- . || status=$?; exit \"$status\"";
         let mut dag = dag_from_json(
             &json!({
                 "resource_caps": {"manifest_guest": 1},
@@ -30506,5 +34748,23 @@ mod runner_outcome_tests {
                 "{repetitions:?}: a foreign outcome was accepted in place of a reference"
             );
         }
+    }
+
+    #[test]
+    fn resume_accepts_durable_plus_new_and_rejects_missing_new() {
+        let cells = vec![cell("fixture/a", "ptrace")];
+        let metadata = metadata(cells.clone(), Vec::new(), Some(2));
+        let completed = BTreeMap::from([(cells[0].clone(), BTreeSet::from([1usize]))]);
+        let new_tag = format!("cell.{}", cell_run_slug(&cells[0], Some(2)));
+        require_runner_outcomes_for_resume(&metadata, &outcomes([new_tag.clone()]), &completed)
+            .expect("durable repetition 1 plus new repetition 2 outcome must satisfy resume");
+        assert!(
+            require_runner_outcomes_for_resume(&metadata, &outcomes([]), &completed).is_err(),
+            "resume accepted a missing newly planned outcome"
+        );
+        assert!(
+            require_runner_outcomes_for_planned_cells(&metadata, &outcomes([new_tag])).is_err(),
+            "strict check accepted a durable repetition without a runner outcome"
+        );
     }
 }

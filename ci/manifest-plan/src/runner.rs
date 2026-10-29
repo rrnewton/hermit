@@ -10339,7 +10339,7 @@ fn observation_hash_bytes(
     format!("{:x}", digest.finalize())
 }
 
-pub(crate) fn test_digest(root: &Path, test: &TestRecipe) -> Result<String, String> {
+pub fn test_digest(root: &Path, test: &TestRecipe) -> Result<String, String> {
     let bytes = if let Some(program) = &test.program {
         fs::read(root.join(program)).map_err(|e| e.to_string())?
     } else {
