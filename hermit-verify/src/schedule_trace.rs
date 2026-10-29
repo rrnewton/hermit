@@ -259,6 +259,7 @@ impl InterpolateOpts {
         let next_sched = PreemptionRecord::from_sched_events(requested_schedule)
             .with_pipe_wake_latency(latency)
             .with_signal_state_copy(copy)
+            .with_queued_sleeps_registered_at_first_pass(first_pass)
             .with_expired_wait_runs_charged_once(charged_once);
         next_sched.write_to_disk(&sched_path).unwrap();
 
@@ -566,7 +567,8 @@ mod tests {
         }
     }
 
-fn interpolate_refuses_schedules_recorded_under_different_sleep_registrations() {
+    #[test]
+    fn interpolate_refuses_schedules_recorded_under_different_sleep_registrations() {
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, first_pass: bool| {
             let path = dir.path().join(name);

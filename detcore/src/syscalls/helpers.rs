@@ -6399,8 +6399,6 @@ mod tests {
     /// whatever else its flags carry, and no other flag does: recvmmsg's
     /// `MSG_WAITFORONE` still waits for the first datagram. Calls with no
     /// per-call flags always follow the file.
-    #[test]
-    
     /// The three receive calls read the error queue exactly when their flags
     /// carry `MSG_ERRQUEUE`, which does not by itself keep them from waiting;
     /// a send's flags never read it.
