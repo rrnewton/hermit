@@ -16530,6 +16530,31 @@ mod test {
     use crate::test_pages::PAGE;
     use crate::test_pages::Pages;
 
+    /// Run the test named `case` in an isolated child process, returning
+    /// true when this invocation is the parent and the caller must return
+    /// at once. Tests that close this process's real descriptors and then
+    /// assert the numbers are dead race sibling test threads under plain
+    /// `cargo test`: a sibling can be handed a just-closed number before
+    /// the assertion reads it. A child process has no sibling threads
+    /// allocating descriptors.
+    fn isolated_child(case: &str) -> bool {
+        const CHILD: &str = "HERMIT_FILES_TEST_CHILD";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(case)) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case, "--nocapture", "--test-threads=1"])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        true
+    }
+
     /// A `/proc/self` or `/proc/thread-self` spelling leads to the opener's
     /// task, which a name relative to the descriptor is then looked up below,
     /// whoever looks it up.
@@ -17395,6 +17420,11 @@ mod test {
 
     #[test]
     fn pipe_capacity_failure_closes_both_created_descriptors() {
+        if isolated_child(
+            "syscalls::files::test::pipe_capacity_failure_closes_both_created_descriptors",
+        ) {
+            return;
+        }
         let mut created = [-1; 2];
         assert_eq!(
             unsafe { libc::pipe2(created.as_mut_ptr(), libc::O_CLOEXEC) },

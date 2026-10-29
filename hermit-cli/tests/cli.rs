@@ -43797,6 +43797,31 @@ fn cpu_profile_v3_library_run_with_unqualified_facts_is_refused() {
 /// a guest to completion there.
 #[test]
 fn library_runs_return_on_a_256_kib_thread() {
+    // This is the one cli test that runs Detcore sessions in this process
+    // rather than in a hermit subprocess. In the threaded harness its
+    // tracer shares the process with hundreds of sibling sessions and
+    // guests, and has been seen wedged with its tracee stopped and the
+    // tracer waiting on a pipe; run the body in a fresh process, as
+    // nextest would.
+    const CHILD: &str = "HERMIT_LIBRARY_RUNS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "library_runs_return_on_a_256_kib_thread",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
     // Built here: `DetConfig::default` parses an empty command line with clap,
     // whose debug-build frame alone is about 516 KiB. The command is not
     // `Send`, so it is built on the small thread.

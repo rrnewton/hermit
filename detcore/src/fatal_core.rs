@@ -1223,6 +1223,26 @@ mod tests {
 
     #[test]
     fn the_lock_wait_gives_up_at_the_deadline() {
+        const CHILD: &str = "HERMIT_TEST_DIR_LOCK_DEADLINE_CHILD";
+        const CASE: &str = "fatal_core::tests::the_lock_wait_gives_up_at_the_deadline";
+        if std::env::var_os(CHILD).is_none() {
+            // The last acquisition below allows no wait at all, so it only
+            // succeeds if the dropped lock is really gone. A sibling test in
+            // this binary that forks while this lock is held leaves the
+            // descriptor open in its child and keeps the flock taken, so
+            // the sequence runs in an isolated child process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let held = DirLock::acquire(dir.path(), Instant::now()).unwrap();
         let start = Instant::now();

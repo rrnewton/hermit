@@ -44,6 +44,34 @@ use crate::syscalls::KernelSignalState;
 use crate::syscalls::signal_state_read_seam;
 use crate::wait_signal_end::WaitSignalEnd;
 
+/// Run the test named `case` in an isolated child process, returning true
+/// when this invocation is the parent and the caller must return at once.
+///
+/// These scenarios assert exact RPC sequences against two scheduler latches
+/// (`scheduler::TIMER_COPIES_RECORDED` and `REAL_TIME_EXPIRATION_KEPT_PENDING`)
+/// that are set once and never cleared within a process: any other test in
+/// this binary that arms a POSIX timer or keeps an expiration pending turns
+/// the questions these scenarios rely on never being asked into questions
+/// that are. A child process starts with both latches unset, as the scenario
+/// scripts assume.
+pub(super) fn isolated_child(case: &str) -> bool {
+    const CHILD: &str = "HERMIT_GATED_WAIT_TURN_CHILD";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(case)) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", case, "--nocapture", "--test-threads=1"])
+        .env(CHILD, case)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "{output:?}"
+    );
+    true
+}
+
 /// The guest thread, as the scheduler and `/proc` number it.
 const THREAD: DetTid = DetTid::from_raw(31);
 

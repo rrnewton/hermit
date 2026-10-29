@@ -775,6 +775,20 @@ fn timer_slack_is_mediated_under_passthru_opt() {
 
 #[test]
 fn timer_slack_virtual_state_is_isolated_from_physical_tracee() {
+    // This test drives `spawn_fn_with_config` directly instead of through
+    // detcore-testutils, so it runs on a thread with an explicit stack
+    // here: a debug Detcore session overflows the test thread's default
+    // 2 MiB stack under plain `cargo test`.
+    std::thread::Builder::new()
+        .name("timer_slack_virtual_state_is_isolated_from_physical_tracee".to_owned())
+        .stack_size(16 << 20)
+        .spawn(timer_slack_virtual_state_is_isolated_from_physical_tracee_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn timer_slack_virtual_state_is_isolated_from_physical_tracee_body() {
     const PHYSICAL_SENTINEL_NS: libc::c_int = 7_654_321;
     const VIRTUAL_REQUEST_NS: libc::c_int = 1_000_000_000;
     const VIRTUAL_PROC_REQUEST_NS: libc::c_int = 888_888_888;
