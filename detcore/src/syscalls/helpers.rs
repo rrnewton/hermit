@@ -6480,6 +6480,130 @@ mod kernel_signal_wait_failures {
         }
     }
 
+    /// The decision `ioaction_based_on_fd_status` takes from the call's own
+    /// flags. On a socket the guest left blocking, which Detcore keeps
+    /// physically nonblocking, a send or receive is retried until it stops
+    /// failing with `EAGAIN` (`NonblockizeRetry`), unless its flags carry
+    /// `MSG_DONTWAIT`: then it runs once (`PassThru`), as Linux runs it.
+    /// recvmmsg's `MSG_WAITFORONE` alone still waits for the first datagram.
+    /// On a socket the guest made `O_NONBLOCK`, every call runs once, and on
+    /// one Detcore leaves physically blocking every call takes the blocking
+    /// path.
+    ///
+    /// `ioaction_decision_runs_a_nowait_call_once_on_a_blocking_descriptor`
+    /// checks `ioaction_for_fd_status` alone, with literal states. This test
+    /// drives the whole of `ioaction_based_on_fd_status` through Detcore's
+    /// descriptor model and each call's own `flags_forbid_waiting`, so it
+    /// also fails when the wrapper reads the wrong descriptor state or drops
+    /// the call's flags, and when a call without `MSG_DONTWAIT` on a socket
+    /// Detcore leaves physically blocking loses the blocking path.
+    #[test]
+    fn msg_dontwait_runs_a_call_once_on_a_socket_the_guest_left_blocking() {
+        use std::os::fd::AsRawFd;
+
+        use reverie::syscalls::Recvfrom;
+        use reverie::syscalls::Recvmmsg;
+        use reverie::syscalls::Recvmsg;
+        use reverie::syscalls::Sendmmsg;
+        use reverie::syscalls::Sendmsg;
+        use reverie::syscalls::Sendto;
+
+        let (mut guest, _) = WaitGuest::live(guest_mask());
+        let (socket, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let fd = socket.as_raw_fd();
+        guest
+            .thread
+            .add_fd(fd, nix::fcntl::OFlag::O_RDWR, FdType::Socket, None)
+            .unwrap();
+        let dontwait = libc::MSG_DONTWAIT;
+        let waitforone = libc::MSG_WAITFORONE;
+        let once = Ok(IOAction::PassThru);
+        let retry = Ok(IOAction::NonblockizeRetry);
+        let decisions = |guest: &mut WaitGuest| {
+            [
+                (
+                    "recvfrom",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Recvfrom::new().with_fd(fd).with_flags(dontwait),
+                    ),
+                    ioaction_based_on_fd_status(guest, Recvfrom::new().with_fd(fd)),
+                ),
+                (
+                    "recvmsg",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Recvmsg::new().with_sockfd(fd).with_flags(dontwait),
+                    ),
+                    ioaction_based_on_fd_status(guest, Recvmsg::new().with_sockfd(fd)),
+                ),
+                (
+                    "recvmmsg",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Recvmmsg::new()
+                            .with_fd(fd)
+                            .with_flags((waitforone | dontwait) as u32),
+                    ),
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Recvmmsg::new().with_fd(fd).with_flags(waitforone as u32),
+                    ),
+                ),
+                (
+                    "sendto",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Sendto::new().with_fd(fd).with_flags(dontwait as u32),
+                    ),
+                    ioaction_based_on_fd_status(guest, Sendto::new().with_fd(fd)),
+                ),
+                (
+                    "sendmsg",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Sendmsg::new().with_fd(fd).with_flags(dontwait),
+                    ),
+                    ioaction_based_on_fd_status(guest, Sendmsg::new().with_fd(fd)),
+                ),
+                (
+                    "sendmmsg",
+                    ioaction_based_on_fd_status(
+                        guest,
+                        Sendmmsg::new().with_sockfd(fd).with_flags(dontwait),
+                    ),
+                    ioaction_based_on_fd_status(guest, Sendmmsg::new().with_sockfd(fd)),
+                ),
+            ]
+        };
+        // A socket Detcore leaves physically blocking (an external socket
+        // under record and replay) keeps the blocking path, flag or not.
+        for (name, with_dontwait, without) in decisions(&mut guest) {
+            let blocking = Ok(IOAction::Blocking);
+            assert_eq!(
+                with_dontwait, blocking,
+                "{name} with MSG_DONTWAIT, blocking"
+            );
+            assert_eq!(without, blocking, "{name} without MSG_DONTWAIT, blocking");
+        }
+        guest
+            .thread
+            .with_detfd(fd, |d| d.set_physically_nonblocking())
+            .unwrap();
+        for (name, with_dontwait, without) in decisions(&mut guest) {
+            assert_eq!(with_dontwait, once, "{name} with MSG_DONTWAIT");
+            assert_eq!(without, retry, "{name} without MSG_DONTWAIT");
+        }
+        guest
+            .thread
+            .with_detfd(fd, |d| d.set_nonblocking(true))
+            .unwrap();
+        for (name, with_dontwait, without) in decisions(&mut guest) {
+            assert_eq!(with_dontwait, once, "{name} with MSG_DONTWAIT, O_NONBLOCK");
+            assert_eq!(without, once, "{name} without MSG_DONTWAIT, O_NONBLOCK");
+        }
+    }
+
     #[test]
     fn inherited_input_exempts_only_authenticated_reads_from_the_internal_guard() {
         use std::os::fd::AsRawFd;
