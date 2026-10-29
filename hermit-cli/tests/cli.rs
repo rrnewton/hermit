@@ -5663,7 +5663,7 @@ fn backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest() {
 #[test]
 fn timerless_backends_refuse_explicit_preemption_before_starting_the_guest() {
     let _guard = hermit_run_guard();
-    for backend in ["dbt", "sabre", "kvm", "liteinst", "in-guest-trap"] {
+    for backend in ["dbt", "sabre", "liteinst", "in-guest-trap"] {
         for requested in [
             vec!["--max-timeslice=200000000"],
             vec!["--preemption-timeout=1000"],
@@ -18138,7 +18138,6 @@ fn a_bounded_chaos_schedule_replays_as_recorded() {
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn
 /// either: 90 ms before, 4 ms now.
 #[test]
-#[ignore = "unsupported_preemption: --backend=kvm refuses the helper's explicit --max-timeslice=1000000"]
 fn run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting() {
     if !Path::new("/dev/kvm").exists() {
         eprintln!("skipping the KVM chaos spinner case: /dev/kvm is unavailable");

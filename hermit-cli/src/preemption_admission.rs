@@ -169,12 +169,11 @@ mod tests {
 
     use super::*;
 
-    const TIMERLESS: [Backend; 5] = [
+    const TIMERLESS: [Backend; 4] = [
         Backend::Dbt,
         Backend::Sabre,
         Backend::Liteinst,
         Backend::InGuestTrap,
-        Backend::Kvm,
     ];
 
     #[test]

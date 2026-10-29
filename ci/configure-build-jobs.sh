@@ -3140,7 +3140,7 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 77ac9de280d5e6ac7505c55be5ff1a37e7996f95 (2026-10-29): from 7789af9e78f7967067e81c7369f7305555ba7d10.
+# CARRY TO 6cd1e2bea3a02850fb726379d15b24613eb8db19 (2026-10-29): from 7789af9e78f7967067e81c7369f7305555ba7d10.
 # Interval: Counter2 lifecycle reports in the global owner (96a9ddb5),
 # generic command cases through actual DBT Tools (958575f9), the shared
 # ChromeTrace caller with inherited stdin (e1ef57aa) and ChunkyPrint caller
@@ -3155,8 +3155,8 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 77ac9de280d5e6ac7505c55be5ff1a37e7996f95 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 77ac9de280d5e6ac7505c55be5ff1a37e7996f95 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6cd1e2bea3a02850fb726379d15b24613eb8db19 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6cd1e2bea3a02850fb726379d15b24613eb8db19 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

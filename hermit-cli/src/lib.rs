@@ -2474,12 +2474,10 @@ impl Backend {
         }
     }
 
+    // SCRATCH (T2 dry run): keyed on the capability, so a KVM run whose
+    // precise timer event came late is refused as on ptrace.
     fn uses_ptrace_pmu_timers(self) -> bool {
-        match self {
-            Self::Ptrace | Self::E9patch => true,
-            // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
-            Self::Liteinst | Self::InGuestTrap | Self::Dbt | Self::Sabre | Self::Kvm => false,
-        }
+        crate::backend_delivers_preemption_timer(self)
     }
 
     /// Returns backends whose Hermit integration prerequisites are met.
@@ -7140,10 +7138,10 @@ mod tests {
 
     #[test]
     fn only_ptrace_hosted_backends_consume_skid_overshoot_reports() {
-        for backend in [Backend::Ptrace, Backend::E9patch] {
+        for backend in [Backend::Ptrace, Backend::E9patch, Backend::Kvm] {
             assert!(backend.uses_ptrace_pmu_timers(), "{backend:?}");
         }
-        for backend in [Backend::Dbt, Backend::Sabre, Backend::Kvm] {
+        for backend in [Backend::Dbt, Backend::Sabre] {
             assert!(!backend.uses_ptrace_pmu_timers(), "{backend:?}");
         }
         // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
@@ -9222,13 +9220,15 @@ mod tests {
             "host_timed_signals_are_physical":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "delivers_preemption_timer_events":
-                matches!(backend, Backend::Ptrace | Backend::E9patch),
+                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
             "runs_guest_code_between_injections": sabre || in_guest_liteinst,
             "promotes_open_files_before_native_lifecycle": dbt || in_guest_liteinst,
             // Hermit runs e9patch preprocessing as a ptrace run (empty
             // trampolines keep the original syscall instruction), whose
             // rt_sigreturns reach the seccomp stop that reports them.
             "reports_sigreturns": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // SCRATCH (T2 dry run): the new Reverie capability field.
+            "hardware_watchpoints": if matches!(backend, Backend::Ptrace | Backend::E9patch) { 4 } else { 0 },
         })
     }
 
