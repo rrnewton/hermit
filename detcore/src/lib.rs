@@ -5074,6 +5074,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // The parent reports its own export with its next request.
                     passed_descriptors_out_unreported: false,
                     passed_descriptors_out_reported: false,
+                    nonblocking_result_normalized: false,
                     yield_after_futex_wake: false,
                     pipe_handoff_due: None,
                     own_signal_turn_hold: None,

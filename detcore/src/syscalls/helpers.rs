@@ -3201,9 +3201,12 @@ where
                 record_retry_event(guest, call).await;
             }
         } else {
-            let res = call
-                .normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0)
-                .map_err(|e| e.into());
+            let normalized =
+                call.normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0);
+            if normalized != syscall_result {
+                guest.thread_state_mut().nonblocking_result_normalized = true;
+            }
+            let res = normalized.map_err(|e| e.into());
             if res.is_ok() {
                 completed_observation = attempt_observation;
             }
@@ -4407,9 +4410,12 @@ where
             }
         };
         if !call.syscall_would_have_blocked(syscall_result) {
-            let res = call
-                .normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0)
-                .map_err(|e| e.into());
+            let normalized =
+                call.normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0);
+            if normalized != syscall_result {
+                guest.thread_state_mut().nonblocking_result_normalized = true;
+            }
+            let res = normalized.map_err(|e| e.into());
             tracing::trace!(
                 "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",
                 rsrc.poll_attempt,

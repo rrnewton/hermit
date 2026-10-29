@@ -3910,7 +3910,14 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // Whether the connection completes in this turn.
         let in_turn = self.completes_in_turn(guest, call);
+        guest.thread_state_mut().nonblocking_result_normalized = false;
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        // A retried attempt's `EISCONN`, read as success, saw only that the
+        // open file was connected, by an earlier attempt or another thread's
+        // connect, not to which socket, nor that it read the address now
+        // there (Codex review of https://github.com/rrnewton/hermit/pull/4862).
+        let completed_by_another_attempt =
+            std::mem::take(&mut guest.thread_state_mut().nonblocking_result_normalized);
         // What the address names, as the attempt that connected read it. A
         // connect that completes in its turn made that attempt in this turn,
         // after the last request it filed, so no other thread has rewritten
@@ -3930,6 +3937,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
         );
         if let Ok(0) = &result {
+            // Pair it with nothing, and no name with anything.
+            let in_turn = in_turn && !completed_by_another_attempt;
             self.note_unix_connect(guest, fd, &connected_to, in_turn);
         }
         if self.cfg.backend.loopback_pollers_yield_to_peers
@@ -3998,7 +4007,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .ok();
             let listener = self.listener_named(guest, &connected_to);
             let guest_created = crate::syscalls::scm_rights::both_ends_guest_made(
-                in_turn,
+                in_turn && !completed_by_another_attempt,
                 connecting.as_ref(),
                 listener.as_ref(),
             );
