@@ -10,6 +10,11 @@
 #![doc = include_str!("../README.md")]
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
+// hermit-cli/clippy.toml sends every container clone through
+// bin/hermit/container_clone.rs, which checks that a unit test of the hermit
+// binary clones alone in its process. This library's own unit tests, a test
+// binary of their own, still clone directly.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 // The application and the programmatic API share one library implementation.
 extern crate self as hermit;
@@ -53,6 +58,7 @@ pub mod liteinst_bootstrap;
 mod liteinst_constructor;
 pub mod liteinst_record;
 mod metadata;
+#[cfg(target_arch = "x86_64")]
 pub mod xstate_probe;
 /// Diagnostic writes that never wait for a reader; they live in detcore, whose
 /// own stderr writer reads the same flag.
@@ -60,7 +66,41 @@ pub use detcore::nonwaiting_write;
 pub mod physical_exit_watch;
 pub mod preemption_admission;
 pub mod proc_mount;
+
+/// Re-runs the named test alone in a fresh process of this test binary and
+/// requires it to pass; returns false in that fresh process so the caller
+/// runs its body there. Used by tests that fork, clone or spawn children:
+/// under the threaded harness a child forked from this process can inherit
+/// a malloc arena whose lock another harness thread held at the fork, and
+/// then wait on that lock forever (seen as `__malloc_fork_lock_parent` in
+/// `__fork`). A fresh process has no other allocating threads, so its
+/// children cannot inherit a held arena lock. The fresh process still runs
+/// under libtest with one test thread, so no assertion changes.
+#[cfg(test)]
+pub(crate) fn run_in_fresh_process(name: &str) -> bool {
+    const INNER: &str = "HERMIT_LIB_TEST_FRESH_PROCESS";
+    if std::env::var_os(INNER).is_some_and(|value| value == name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(INNER, name)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "inner run of {name} failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "inner run of {name} did not execute the test:\n{stdout}\n{stderr}"
+    );
+    true
+}
 mod ptrace_completion;
+mod timeout_survivors;
 
 pub use canonical_verdict::Verdict;
 
@@ -396,6 +436,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
+#[cfg(target_arch = "x86_64")]
 use std::time::Instant;
 
 use anyhow::anyhow;
@@ -447,7 +488,16 @@ use serde::Serialize;
 pub use tracer_thread::launch_on_calling_thread;
 
 enum KvmStdinReservation {
-    Open(fs::File),
+    Open(
+        #[cfg_attr(
+            not(target_arch = "x86_64"),
+            allow(
+                dead_code,
+                reason = "only the x86_64 KVM backend reads the reserved stdin"
+            )
+        )]
+        fs::File,
+    ),
     Closed,
 }
 
@@ -499,6 +549,7 @@ fn ensure_kvm_stdin_reserved() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
 fn reserved_kvm_stdin() -> Result<Option<fs::File>, Error> {
     ensure_kvm_stdin_reserved()?;
     let reservation = KVM_STDIN_RESERVATION
@@ -2663,10 +2714,12 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
 // still writes zeros over every page, and node calls it over its 512 MiB
 // reservation, so a node run peaks near 880 MB of host memory until that is
 // made lazy too (https://github.com/rrnewton/hermit/issues/4366).
+#[cfg(target_arch = "x86_64")]
 const KVM_GUEST_MEMORY_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 /// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
 /// `BINPRM_MAX_RECURSION` limit for chained script interpreters.
+#[cfg(target_arch = "x86_64")]
 const MAX_SHEBANG_DEPTH: usize = 4;
 
 /// Resolve `#!` interpreter scripts before the reverie-kvm ELF loader runs.
@@ -2681,6 +2734,7 @@ const MAX_SHEBANG_DEPTH: usize = 4;
 ///
 /// The interpreter line is parsed with hermit's shared [`Shebang`] so the KVM
 /// backend matches how the ptrace backend and recorder treat `#!`-scripts.
+#[cfg(target_arch = "x86_64")]
 fn resolve_kvm_shebang(
     resolved_program: &Path,
     mut argv: Vec<String>,
@@ -2736,6 +2790,7 @@ fn resolve_kvm_shebang(
 /// The container replaces this host directory with a private, empty tmpfs, so
 /// nothing beneath it is visible to the guest. Kept next to the diagnostic that
 /// depends on it; `run.rs` has its own `TMP_DIR` for the mount itself.
+#[cfg(target_arch = "x86_64")]
 const CONTAINER_REPLACED_TMP: &str = "/tmp";
 
 /// Explain why a working directory that plainly exists on the host could not be
@@ -2765,6 +2820,7 @@ const CONTAINER_REPLACED_TMP: &str = "/tmp";
 /// silently fall back to `/`: changing the guest's working directory out from
 /// under a caller who asked for a specific one would trade a loud, correct
 /// failure for a quiet, wrong success.
+#[cfg(target_arch = "x86_64")]
 fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Error {
     let under_replaced_tmp = requested_cwd.starts_with(CONTAINER_REPLACED_TMP)
         && requested_cwd != Path::new(CONTAINER_REPLACED_TMP);
@@ -2821,6 +2877,7 @@ fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Err
 /// (`complete_container_config`). Either way Detcore renders the guest's mount
 /// files from the container mount table. KVM does not permit guest namespace
 /// changes.
+#[cfg(target_arch = "x86_64")]
 fn prepare_kvm_mountinfo_config(
     config: &mut DetConfig,
     namespace: impl FnOnce() -> Result<detcore_model::config::MountNamespaceIdentity, Error>,
@@ -2918,11 +2975,28 @@ fn prepare_kvm_mountinfo_config(
 /// guest thread can read a host file's kernel timestamps before Detcore
 /// rewrites them: the backend reports them either way, and sequentialization
 /// alone closes that window.
+#[cfg(target_arch = "x86_64")]
 fn kvm_reports_stored_metadata_timestamps(config: &DetConfig) -> bool {
     config.virtualize_metadata && config.sequentialize_threads
 }
 
+/// Refuses the KVM backend: reverie-kvm is an x86-64 VMM.
+#[cfg(not(target_arch = "x86_64"))]
+async fn run_kvm(
+    _command: &Command,
+    _config: DetConfig,
+    _print_summary: bool,
+    _print_summary_to_json_file: &Option<PathBuf>,
+    _capture_output: bool,
+) -> Result<Output, Error> {
+    anyhow::bail!(
+        "the KVM backend runs only on x86-64 hosts, and this host is {}",
+        std::env::consts::ARCH
+    )
+}
+
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
+#[cfg(target_arch = "x86_64")]
 async fn run_kvm(
     command: &Command,
     mut config: DetConfig,
@@ -3141,6 +3215,7 @@ async fn run_kvm(
 
 // A runtime error still owns GlobalState. Finish its terminal daemon before
 // returning the typed cause to the CLI's error classifier.
+#[cfg(target_arch = "x86_64")]
 async fn finish_kvm_tool_completion(
     completion: reverie_kvm::ToolRunCompletion<detcore::GlobalState>,
     print_summary: bool,
@@ -3164,6 +3239,7 @@ async fn finish_kvm_tool_completion(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn kvm_execution_error(
     primary: reverie_kvm::Error,
     cleanup: Option<detcore::BackendFailureCleanup>,
@@ -3183,7 +3259,7 @@ fn kvm_execution_error(
     error.context(message)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod kvm_failure_tests;
 
 #[cfg(all(test, feature = "kvm-execution-tests"))]
@@ -3452,6 +3528,10 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
         // used to get two of them turned off by this name.
         Backend::Ptrace => <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
         Backend::Kvm => reverie_kvm::KvmBackend::capabilities(),
+        // reverie-kvm is an x86-64 VMM; elsewhere the backend's declared
+        // capabilities stand in, and `run_kvm` refuses the run.
+        #[cfg(not(target_arch = "x86_64"))]
+        Backend::Kvm => reverie::BackendCapabilities::KVM,
         // Site patching changes how a syscall reaches the Tool, not what the
         // Tool host can do, so in-guest-trap has in-guest LiteInst's capabilities.
         Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,
@@ -3558,6 +3638,12 @@ fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
 pub struct GuestTimedOut {
     /// The bound that was exceeded, as the caller spelled it.
     pub limit: Duration,
+    /// The guest processes still running when the bound fired, in one line
+    /// (`timeout_survivors::traced_processes_now`), where the backend could
+    /// read them. A run lasts until every guest process exits, so this is what
+    /// tells a stuck root apart from a root that exited and left a blocked
+    /// child behind.
+    pub survivors: Option<String>,
 }
 
 impl std::fmt::Display for GuestTimedOut {
@@ -3566,7 +3652,11 @@ impl std::fmt::Display for GuestTimedOut {
             f,
             "Guest exceeded the --timeout bound of {} seconds",
             self.limit.as_secs()
-        )
+        )?;
+        if let Some(survivors) = &self.survivors {
+            write!(f, "; {survivors}")?;
+        }
+        Ok(())
     }
 }
 
@@ -3585,7 +3675,10 @@ where
         None => guest.await,
         Some(limit) => match tokio::time::timeout(limit, guest).await {
             Ok(result) => result,
-            Err(_) => Err(Error::new(GuestTimedOut { limit })),
+            Err(_) => Err(Error::new(GuestTimedOut {
+                limit,
+                survivors: None,
+            })),
         },
     }
 }
@@ -3963,7 +4056,10 @@ async fn run_with_output_backend_inner(
         None => guest.await,
         Some(limit) => match tokio::time::timeout(limit, guest).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+            Err(_elapsed) => Err(Error::new(GuestTimedOut {
+                limit,
+                survivors: None,
+            })),
         },
     }
 }
@@ -7526,6 +7622,16 @@ mod tests {
             // trampolines keep the original syscall instruction), whose
             // rt_sigreturns reach the seccomp stop that reports them.
             "reports_sigreturns": matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
+            // ptrace (and so e9patch) sets DR0-DR3 on x86-64; every other
+            // backend sets no hardware watchpoints.
+            "hardware_watchpoints": if cfg!(target_arch = "x86_64") {
+                match backend {
+                    CapabilityCase::Ptrace | CapabilityCase::E9patch => 4,
+                    _ => 0,
+                }
+            } else {
+                0
+            },
         })
     }
 
@@ -7657,6 +7763,9 @@ mod tests {
             config.backend.supports_blocked_wait_signal_interruption = false;
             config.backend.delivers_preemption_timer_events = false;
             config.backend.runs_guest_code_between_injections = false;
+            // The legacy form carries no width for `hardware_watchpoints`;
+            // it reads back as 0.
+            config.backend.hardware_watchpoints = 0;
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
                 before,
@@ -8012,6 +8121,20 @@ mod tests {
 
     #[test]
     fn kvm_runs_dynamic_echo_through_detcore() {
+        // The KVM backend runs its session on the calling thread (see
+        // `run`), and a debug session overflows the test thread's default
+        // 2 MiB stack under plain `cargo test`, so run the body on a
+        // thread with an explicit stack.
+        std::thread::Builder::new()
+            .name("kvm_runs_dynamic_echo_through_detcore".to_owned())
+            .stack_size(16 << 20)
+            .spawn(kvm_runs_dynamic_echo_through_detcore_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn kvm_runs_dynamic_echo_through_detcore_body() {
         use clap::Parser;
 
         if kvm_device_unavailable_reason(std::path::Path::new("/dev/kvm")).is_some() {

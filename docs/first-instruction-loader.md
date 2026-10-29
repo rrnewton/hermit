@@ -1,25 +1,20 @@
 # First-instruction loader integration
 
-`hermit run --in-guest-exec-stop` runs the guest's first image through the
-shared first-image launcher, which initializes the genuine in-guest Detcore
-runtime, with its own private libc, before releasing the guest's first
-instruction (Hermit 059e069bfae, 2026-10-20). `hermit oci run` applies the same
-rule. A request is admitted only when all of these hold:
+`hermit run --in-guest-exec-stop` explicitly selects the packaged singleton
+first-image launcher on `in-guest-trap`. With the `exec-stop-launcher` and
+`liteinst` features, a private runtime package and supported options, the CLI
+admits direct runs and verification through the existing container and mapped
+execution owner. Unsupported combinations or a missing package retain the typed
+`exec-stop-runtime-not-ready` refusal. A requested verification report is stamped
+with this invocation's NO-RESULT record before fallible admission.
 
-- Hermit was built with the `exec-stop-launcher` and `liteinst` Cargo features,
-  and the private runtime package (its image and data resources) is installed;
-- the backend is `in-guest-trap`;
-- the run uses none of `--verify`, `--verify-run`, `--namespace-only`,
-  `--strace-only`, `--dap-listen`, `--gdbserver`, or network recording, replay
-  or perturbation.
+Omitting the flag preserves the selected backend's ordinary launch path; ptrace
+remains the default backend. Ordinary in-guest preload and native-exec selection
+and diagnostics remain unchanged. This CLI adapter does not change public
+library `Command` working-directory, stdio or `pre_exec` behavior, or the existing
+`try_into_std` refusals.
 
-Only the first image runs this way: guest threads, a later exec and unsupported
-startup events are refused with named reasons when the guest reaches them.
-Every other request fails with the typed policy refusal
-`exec-stop-runtime-not-ready`. That refusal precedes host admission,
-image-store access, stdin capture, container creation and guest execution, and
-a requested verification file is first replaced with this invocation's
-NO-RESULT record. Omitting the flag preserves the existing launch path.
+## Launch ownership
 
 The `exec-stop-launcher` Cargo feature carries the shared launcher. It prepares
 an explicit executable, argv, environment, pinned working directory and
@@ -37,6 +32,31 @@ with an observed terminal wait, releasing no guest instruction.
 Reverie's separate `stage1a-probe` feature keeps the earlier mapping and
 test-runtime handoff probe. Passing it, including its static glibc smoke, is
 not evidence about the production path.
+
+## Singleton verification
+
+The explicit loader supports `run --verify` and a saved `--verify-run` pair under
+the same verification owner and comparators as other supported runs. Verification
+requires the normal namespace owner. A saved pair must supply one explicit epoch
+and the existing `verify-inputs --in-guest-exec-stop` holder. That holder seals the
+shared inputs and transfers the original read-only runtime ELF and descriptor
+file descriptions to both consumers. Inline verification opens the package once
+and retains the same image owner through both executions.
+
+After capture, resource path discovery is not an input to either run. Moving the
+package's parent directory does not select another image. Retained file identity
+and bytes are checked before execution and after owned finalization, including
+error outcomes; changing the original inode remains a refusal. Frozen stdin and
+`ld.so.cache`, complete stdout/stderr/status, forwarded INFO records, loss
+latches and the common comparison/reporting checks remain required. The strict
+comparator retains its canonical host-address treatment; it does not claim raw
+host-address equality.
+
+The adapter uses the original stopped-child generation, mapping, initializer,
+physical wait/cancellation and typed finalization owners. Captured output is not
+published as a completed run merely because its pipes reached EOF. A package
+descriptor describes bytes; it does not supply source qualification, mapping
+ownership or readiness on its own.
 
 ## Qualification status
 
@@ -63,3 +83,10 @@ commit reports only the two hello images, not the whole of it:
   threads and exec re-entry, with full syscall, instruction-count,
   heap/stack-hash and INFO/DETLOG parity. Threads and exec re-entry are still
   refused today.
+
+This singleton slice does not admit fork-family or native-successor verification;
+`--native-exec-inputs` with the loader remains refused. It does not change the
+public-library launch route or make the loader the default. Thread, fork and
+exec-reentry support, broader static/dynamic program coverage, and full runtime
+parity require their own implementation and evidence. This document describes
+source behavior; it asserts no new runtime pass or corpus coverage at this head.

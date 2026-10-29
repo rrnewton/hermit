@@ -21,6 +21,7 @@ pub mod helpers;
 /// Re-exported so `procfs` can report the SAME ceiling that `F_SETPIPE_SZ`
 /// enforces. Two constants that must agree are one constant.
 pub(crate) use files::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+pub(crate) use files::SyscallCwd;
 pub(crate) use files::descriptor_directory::SendInspection;
 pub(crate) use files::may_name_file_or_descriptor;
 pub(crate) use files::procfs_levels::take_proc_device;
@@ -35,6 +36,7 @@ mod namespace;
 pub(crate) use namespace::anonymous_object_devices;
 pub(crate) use namespace::guest_task_procfs;
 mod network_trace;
+pub(crate) mod pi_futex;
 pub(crate) mod robust_list;
 pub(crate) mod scm_rights;
 /// A buffer for an injected syscall, in the stack scratch or a transient page.
@@ -80,6 +82,7 @@ pub(crate) use threads::KernelSignalState;
 /// One of a thread's two queues of pending signals.
 pub(crate) use threads::SignalQueue;
 pub(crate) use threads::default_action_ends_process;
+pub(crate) use threads::fatal_default_delivery;
 pub(crate) use threads::forget_thread_status;
 pub(crate) use threads::host_signal_state_reads_refused;
 pub(crate) use threads::ignored_at_generation;
@@ -89,6 +92,7 @@ pub(crate) use threads::read_kernel_signal_state;
 pub(crate) use threads::read_thread_signal_state;
 pub(crate) use threads::real_uid;
 pub(crate) use threads::refuse_host_signal_state_reads;
+pub(crate) use threads::retires_others_at_fatal_delivery;
 #[cfg(test)]
 pub(crate) use threads::signal_state_read_seam;
 pub(crate) use threads::thread_is_gone;

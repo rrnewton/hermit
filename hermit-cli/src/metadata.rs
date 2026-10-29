@@ -832,12 +832,61 @@ impl RecordVersion {
 // guest procfs bytes and refuses unsupported observation domains. ABI15 and
 // private capture storage can also shift runtime layout. Older recordings must
 // not replay with different values.
-// 0x186 -> 0x187 (HIGHEST_SHIPPED + 1 at this base; the lander re-checks it
-// at land): a recording stores the schedule it ran under (`record start
+// 0x186 -> 0x187: a recording stores the schedule it ran under (`record start
 // --chaos --seed=N`), and replay follows it. An older reader would replay a
 // chaos recording under the default schedule and fall out of step, so it is
 // refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
+// 0x187 -> 0x188 (allocated at land time as HIGHEST_SHIPPED + 1, from the
+// branch's provisional 0x18b): a send or receive with MSG_DONTWAIT on a socketpair end the guest
+// left blocking runs once, as on Linux, where Detcore polled it until it
+// stopped failing with EAGAIN. A recording of such a call that polled until
+// another thread wrote holds those retries and the data, while this build
+// returns the first EAGAIN to the guest and falls out of step. One that
+// succeeded at once also took a polling turn that this build no longer
+// takes, so its schedule differs. Both are refused here.
+// 0x188 -> 0x189 (renumbered at land time from the branch's 0x18e, the next
+// HIGHEST_SHIPPED + 1 in this train): the recorder stores a
+// poll's raw ERESTARTSYS, and this change maps a recorded ERESTARTSYS
+// to ERESTARTNOHAND instead of rerunning the poll, so an old recording
+// can replay a different result.
+// 0x189 -> 0x18a (ledger-assigned for this change): each open file description
+// of a random device reads a stream of its own, named by its opener and its
+// table's count of random-device opens, where every one read the run seed's
+// single stream from its start. An older recording's guest read the old
+// bytes, while this replayer serves the new ones and falls out of step, so it
+// is refused here.
+// 0x18a -> 0x18b (ledger-assigned for this change): an epoll_wait, or an
+// epoll_pwait or epoll_pwait2 without a mask, that Detcore runs in the kernel
+// now waits with the signals the guest ignores blocked, in record and in replay
+// (`IgnoredSignalShield`), so such a signal no longer ends it with EINTR. The
+// scheduler reads that mask when it commits the wait, so an older recording,
+// made under the guest's own mask, could choose another SIGCHLD taker or
+// readmission point in replay; it is refused here.
+// 0x18b -> 0x18c (0x18c reserved for the 4681 change by coord3): a `poll`,
+// `select`, or `ppoll` or `pselect6` naming no mask, that Detcore runs in
+// the kernel, now waits with the signals the guest ignores blocked, in
+// record and in replay, so such a signal no longer ends it with a restart
+// code. An older recording holds the restarts and was made under the
+// guest's own mask; it is refused here.
+// 0x18c -> 0x18f (ledger-assigned for this change; 0x18d is 4676's and 0x18e
+// is reassigned by the ledger): a descriptor received over SCM_RIGHTS joins
+// the open file its send modeled, named without asking the kernel, instead of
+// getting a description of its own. An older recording's table holds other
+// descriptions for those descriptors, so it is refused here.
+// 0x18f -> 0x190 (ledger-assigned for this change in landing order; its
+// reserved 0x18d could not be taken after 0x18f shipped): at a fatal
+// signal's delivery Detcore now retires the process's other threads in that
+// turn, where it left them to the host. An older recording's schedule has
+// those threads running on, so it is refused here.
+// 0x191 -> 0x193 (ledger-assigned 0x193 for this change; 0x192 is reserved
+// for PMU-H): every /proc status file Detcore renders now shows TracerPid 0,
+// by any path to the task, where it showed 1 on a task's own paths
+// (/proc/self, /proc/thread-self). Detcore renders the status file over the
+// recorded procfs bytes during recording and replay, so an older stream
+// replayed under the new rendering would show the guest 0 where it read 1,
+// and a guest that branches on the value, as a death test that looks for a
+// debugger does, would diverge. It is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x193);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -862,7 +911,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x187;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x193;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1243,6 +1292,7 @@ fn record_or_replay_config_with_timer_support(
         pipe_wake_latency: None,
         // Record and replay charge every expired timed wait, whatever the value.
         expired_wait_charge: None,
+        // Record and replay register queued sleeps when chosen, whatever the value.
         // A `hermit run` option; record and replay do not gather it.
         work_span_report: None,
         scheduler_turn_cost: default_config.scheduler_turn_cost,
@@ -1253,6 +1303,9 @@ fn record_or_replay_config_with_timer_support(
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,
+        // Record and replay make the same timeslice decisions either way: a
+        // lone thread's skipped stops are processed at the same branch counts.
+        eager_lone_preemptions: false,
         // Off in record and replay, a constant like the rest: replay rebuilds
         // this configuration and must decide every signal question as the
         // recording did, and recordings made before the copy was on by
@@ -1275,6 +1328,7 @@ fn record_or_replay_config_with_timer_support(
         replay_schedule_from: None,
         replay_exhausted_panic: false,
         die_on_desync: true,
+        replay_edited_preemptions: false,
         stacktrace_event: Vec::new(),
         stacktrace_signal: None,
         preemption_stacktrace: false,
@@ -2313,6 +2367,19 @@ mod tests {
     #[test]
     fn record_version_rejects_path_classified_random_device_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x184)));
+    }
+
+    /// A 0x186 recording polled a MSG_DONTWAIT send or receive on a
+    /// A 0x187 recording polled a MSG_DONTWAIT send or receive on a
+    /// socketpair end until it stopped failing with EAGAIN; this replayer runs
+    /// it once, so the version gate must refuse it.
+    #[test]
+    fn record_version_rejects_polled_dontwait_socketpair_recordings() {
+        // The version current before this change, on the main this branch
+        // was rebased onto, not only the version before the original bump.
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
     }
 
     #[test]

@@ -3531,6 +3531,41 @@ fn record_vfork_child_waiting_for_another_thread() {
     }
 }
 
+/// A thread blocked in poll() on a pipe beside a thread that sleeps 100 us at
+/// a time until the poller has read every byte records and replays at bitwise
+/// parity. Record runs the poll in the background, and the sleeper, whose
+/// sleeps are shorter than one scheduler turn's charge (500 us, fixed under
+/// record), is runnable at every turn. Record readmitted a finished background call
+/// only once nothing but pollers was queued, so it never readmitted the
+/// poller, and the recording ran until `--record-timeout`. Now record
+/// readmits it in the first scheduler pass that finds it finished and logs
+/// that turn for replay to follow.
+#[test]
+fn record_poller_beside_a_short_sleeper() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("poller_beside_short_sleeper");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/poller_beside_short_sleeper.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the poller_beside_short_sleeper guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = canonical_record_replay_command("poller beside a short sleeper", &guest, &[]);
+    let line = "polled 5 of 5 bytes\n";
+    assert!(output.contains(line), "missing {line:?} in:\n{output}");
+}
+
 #[test]
 fn record_poll_partial_revents_copyout() {
     let _guard = hermit_record_lock();
@@ -4731,6 +4766,118 @@ fn record_chaos_schedule_replays_under_its_seed() {
     );
 }
 
+/// Descriptors received over `SCM_RIGHTS` (see
+/// `tests/c/record_replay_scm_rights.c pipe`): pipe ends sent within the
+/// process and a memfd and pipe end sent by a forked child. Detcore records
+/// each received descriptor by probing it through the recording (`F_GETFD`,
+/// `F_GETFL`, `fstat`), and names the open file a self-sent end carries from
+/// the `fstat` each send through the socketpair takes through the recording
+/// too. A probe that ran live in both phases would let replay, which holds
+/// placeholders where the recording held the received files, find no alias
+/// for the write end, take probes the recording did not, and stop with a
+/// desynchronized stream. Both phases
+/// must print what a native run prints: the received write end is blocking and
+/// reaches the pipe, a blocking read through the received read end waits for a
+/// writer that sleeps first, and the child's descriptors read back its bytes.
+#[test]
+fn record_replay_registers_descriptors_received_over_scm_rights() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-pipe",
+        &workload("c_record_replay_scm_rights").path,
+        &["pipe"],
+        "pipe write end: distinct=1 nonblock=0\n\
+         pipe write end: read=through\n\
+         pipe read end: cloexec=1 nonblock=0\n\
+         pipe read end: read=late\n\
+         child memfd: read=memfd\n\
+         child pipe: read=child\n\
+         child: exit=0\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Descriptors received over connections a guest made to its own abstract
+/// `AF_UNIX` listener (see `tests/c/record_replay_scm_rights.c stream`): six
+/// threads wait in blocking `recvmsg` calls while the main thread sends each a
+/// pipe end, in the reverse of their thread order, opening an eventfd after
+/// each send. Record used to run those receives outside the scheduler turn as
+/// external I/O, so the kernel installed each descriptor when its send ran,
+/// while replay reserved it when the receive rejoined the schedule, in thread
+/// order and after other threads' opens; every replay stopped with "replay FD
+/// namespace diverged". A socket whose peer is a guest is now polled in the
+/// caller's turn, as a socketpair end is. The first receiver's infinite poll
+/// on a received pipe end and its socket is a `poll` call, which still runs
+/// as before (polling such a `poll` in the turn is left out). Each replay of
+/// each of three recordings must print what a native run prints.
+#[test]
+fn record_replay_receives_descriptors_over_a_guests_own_unix_listener() {
+    let _guard = hermit_record_lock();
+    let failures: Vec<String> = (1..=3)
+        .flat_map(|round| {
+            record_replay_output_failures(
+                &format!("scm-rights-stream round {round}"),
+                &workload("c_record_replay_scm_rights").path,
+                &["stream"],
+                "stream poll: ready=1 pipe=1 socket=0 read=late\n\
+                 stream socket: recv=bye\n\
+                 stream: received=abcdef\n",
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Eventfds received over `SCM_RIGHTS` (see
+/// `tests/c/record_replay_scm_rights.c eventfd`). Replay applies eventfd reads
+/// and writes in the kernel, and it held an eventfd placeholder, with its own
+/// count, where the recording held each received descriptor: a count written
+/// through a received descriptor never reached the original's reader, whose
+/// blocking read waited until replay refused the run. Replay now makes a
+/// received descriptor that the recording found to alias one in the table a
+/// live duplicate of it, and serves the remaining placeholders' eventfd
+/// operations from the log. Both phases must print what a native run prints
+/// for the aliases. An eventfd whose sender closed its copy, and one from a
+/// child, are anonymous inodes Detcore does not record (its known gap,
+/// `c-programs/scm-rights-received-anon-inodes`): both phases must fail their
+/// reads with the same EBADF.
+#[test]
+fn record_replay_keeps_eventfds_received_over_scm_rights_coherent() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-eventfd",
+        &workload("c_record_replay_scm_rights").path,
+        &["eventfd"],
+        "eventfd alias: original read 5\n\
+         eventfd alias: received read 7\n\
+         eventfd closed sender: received read=-1 errno=EBADF\n\
+         eventfd child: exit=0\n\
+         eventfd child: received read=-1 errno=EBADF\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An inotify instance received over `SCM_RIGHTS` after its sender closed its
+/// copy (see `tests/c/record_replay_scm_rights.c inotify`). `fstat` cannot
+/// tell one anonymous inode from another, so Detcore reads the received
+/// descriptor's link to find an inotify instance, which it records as one.
+/// That link was read live in both phases, and replay, whose slot holds a
+/// stand-in eventfd, read `anon_inode:[eventfd]`, left the descriptor
+/// unrecorded and stopped at the read the recording served. The link is now
+/// read through the recording. Both phases must print what a native run
+/// prints: the one `IN_CREATE` event for the created file.
+#[test]
+fn record_replay_reads_an_inotify_instance_received_over_scm_rights() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-inotify",
+        &workload("c_record_replay_scm_rights").path,
+        &["inotify"],
+        "inotify: events=1 mask=0x100 name=created\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A guest that accepts its own loopback TCP connections (see
 /// `tests/c/record_replay_tcp_accept.c`). Record used to let `accept(2)` and
 /// `accept4(2)` run live and logged nothing, so replay issued them against a
@@ -4972,9 +5119,10 @@ fn replays_of_a_threaded_tcp_accept_recording_agree() {
 }
 
 /// As `replays_of_a_threaded_tcp_accept_recording_agree`, but the guest
-/// accepts through a listener it received over `SCM_RIGHTS`. Detcore does not
-/// track a received descriptor, so replay must hold the scheduler for the
-/// accept because of the call itself, not because it knows the listener.
+/// accepts through a listener it received over `SCM_RIGHTS`. Detcore registers
+/// the received descriptor as an alias of the listener, which the send marked
+/// as exported, so the accept runs outside the turn and replay must hold the
+/// scheduler for it because of the call itself.
 #[test]
 fn replays_of_a_threaded_tcp_accept_recording_agree_for_a_received_listener() {
     assert_threaded_accept_replays_agree(&["scm-rights"]);

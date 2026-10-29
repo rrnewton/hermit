@@ -1293,13 +1293,54 @@ impl LdSoCacheSnapshot {
 pub(super) fn identity_hardening_mounts(
     ld_so_cache: Option<&LdSoCacheSnapshot>,
 ) -> Result<(Vec<Mount>, IdentityGuard), Error> {
-    let group_file = frozen_group_file()?;
-    let mut mountinfo_roots = vec![MountInfoRootSource::new(
-        group_file.path(),
-        Path::new(GROUP_FILE),
-        DETERMINISTIC_GROUP_ROOT,
-    )?];
-    let mut mounts = vec![Mount::bind(group_file.path(), GROUP_FILE).readonly()];
+    identity_hardening_mounts_on(HostLayout::of_host(), ld_so_cache)
+}
+
+/// The parts of the usual Linux layout that Hermit mounts over, and whether
+/// this host has them. Android has no `/tmp` (nor `/run` or `/var`), and its
+/// C library keeps no `/etc/group`, so a mount onto either fails with ENOENT
+/// at container setup, before the guest starts. Where the host has no such
+/// path the guest gets none either: there is nothing to freeze or hide.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HostLayout {
+    /// `/tmp` is a directory, which Hermit's private `/tmp` goes over.
+    pub(super) tmp: bool,
+    /// `/etc/group` exists, which the frozen group database goes over.
+    pub(super) group_file: bool,
+}
+
+impl HostLayout {
+    pub(super) fn of_host() -> Self {
+        Self {
+            tmp: Path::new("/tmp").is_dir(),
+            group_file: Path::new(GROUP_FILE).exists(),
+        }
+    }
+}
+
+/// [`identity_hardening_mounts`] on a host with `layout`.
+pub(super) fn identity_hardening_mounts_on(
+    layout: HostLayout,
+    ld_so_cache: Option<&LdSoCacheSnapshot>,
+) -> Result<(Vec<Mount>, IdentityGuard), Error> {
+    let mut mountinfo_roots = Vec::new();
+    let mut mounts = Vec::new();
+    let group_file = if layout.group_file {
+        let group_file = frozen_group_file()?;
+        mountinfo_roots.push(MountInfoRootSource::new(
+            group_file.path(),
+            Path::new(GROUP_FILE),
+            DETERMINISTIC_GROUP_ROOT,
+        )?);
+        mounts.push(Mount::bind(group_file.path(), GROUP_FILE).readonly());
+        Some(group_file)
+    } else {
+        tracing::info!(
+            "[hermit] this host has no {GROUP_FILE}, so the guest has none either: there is no \
+             group database to freeze"
+        );
+        None
+    };
     let ld_so_cache = frozen_ld_so_cache(ld_so_cache)?;
     if let Some(cache) = &ld_so_cache {
         mountinfo_roots.push(MountInfoRootSource::new(
@@ -1334,7 +1375,7 @@ pub(super) fn identity_hardening_mounts(
     Ok((
         mounts,
         IdentityGuard {
-            _group_file: Some(group_file),
+            _group_file: group_file,
             _ld_so_cache: ld_so_cache,
             _nscd_dir: nscd_dir,
             mountinfo_roots,
@@ -1353,20 +1394,35 @@ fn cpu_ids(affinity: &CpuSet) -> Vec<usize> {
         .collect()
 }
 
-pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
+/// Pin the container to the CPU [`super::pinned_cpu::choose_for_run`] chooses
+/// and reserves, when `pin_threads`. `cpu_profile_source` is the CPU a
+/// `--cpu-profile host-no-rdrand` run verified CPUID faulting on
+/// (`Config::cpu_profile_source`): its launch guard pins the tracer there, so
+/// that CPU is the one chosen and reserved, not another the run never uses.
+pub(super) fn apply_affinity(
+    container: &mut Container,
+    pin_threads: bool,
+    cpu_profile_source: Option<usize>,
+) {
     if pin_threads {
         let affinity = sched_getaffinity(Pid::from_raw(0))
             .expect("failed to query the tracer's allowed CPU affinity mask");
-        let allowed = cpu_ids(&affinity);
-        let (core, basis) = super::pinned_cpu::choose(&allowed)
+        let mut allowed = cpu_ids(&affinity);
+        if let Some(source) = cpu_profile_source.filter(|cpu| allowed.contains(cpu)) {
+            allowed = vec![source];
+        }
+        let choice = super::pinned_cpu::choose_for_run(&allowed)
             .expect("the tracer's allowed CPU affinity mask is empty");
-        tracing::info!("Pinning tracer and guest threads to core {core} ({basis})");
-        container.affinity(core);
+        tracing::info!(
+            "Pinning tracer and guest threads to core {} ({choice})",
+            choice.cpu
+        );
+        container.affinity(choice.cpu);
     }
 }
 
 pub fn default_container(pin_threads: bool) -> Container {
-    let mut container = namespace_container(pin_threads);
+    let mut container = namespace_container(pin_threads, None);
     container.mount(container_proc_mount());
     container
 }
@@ -1374,7 +1430,10 @@ pub fn default_container(pin_threads: bool) -> Container {
 /// [`default_container`] without its `/proc`: the namespaces and the private
 /// `/`, for a container given a mount plan, `/proc` first, which its setup
 /// installs and its init records (`IdentityGuard::set_plan`).
-pub(super) fn namespace_container(pin_threads: bool) -> Container {
+pub(super) fn namespace_container(
+    pin_threads: bool,
+    cpu_profile_source: Option<usize>,
+) -> Container {
     let mut container = Container::new();
     container
         .unshare(Namespace::PID)
@@ -1386,7 +1445,7 @@ pub(super) fn namespace_container(pin_threads: bool) -> Container {
         // guest's mount table during a run. Cut that propagation first.
         .mount(Mount::new("/").rprivate());
 
-    apply_affinity(&mut container, pin_threads);
+    apply_affinity(&mut container, pin_threads, cpu_profile_source);
     container
 }
 
@@ -1418,6 +1477,7 @@ pub(super) fn image_container(
     rootfs: &Path,
     tmpfs: &Path,
     pin_threads: bool,
+    cpu_profile_source: Option<usize>,
     private_tmp: bool,
     placeholder: bool,
 ) -> Result<(Container, IdentityGuard), Error> {
@@ -1513,7 +1573,7 @@ pub(super) fn image_container(
     // (mounts first, then chroot).
     container.chroot(rootfs);
 
-    apply_affinity(&mut container, pin_threads);
+    apply_affinity(&mut container, pin_threads, cpu_profile_source);
     let mut identity_sources = IdentityGuard::empty();
     if private_tmp {
         identity_sources.add_private_tmp(tmpfs)?;
@@ -3322,6 +3382,7 @@ pub(super) mod declared_inputs {
     mod tests {
         use super::super::super::native_exec_inputs::OpenedGuestRoot;
         use super::*;
+        use crate::app::container_clone::CheckedClone;
 
         fn requested_copy(path: &[u8], source: &File, executable: bool) -> RootCopy {
             let source_identity = checked_file_identity(source, executable, true).unwrap();
@@ -3387,6 +3448,9 @@ pub(super) mod declared_inputs {
 
         #[test]
         fn actual_readonly_root_backings_group_aliases_and_refuse_changed_owners() {
+            if crate::app::test_isolation::rerun_alone() {
+                return;
+            }
             let inputs = data_inputs();
             let source =
                 super::super::super::native_exec_inputs::seal_bytes(b"same bytes", InputRole::Data)
@@ -3433,7 +3497,7 @@ pub(super) mod declared_inputs {
             let mut container = super::super::default_container(false);
             plan.configure(&mut container).unwrap();
             let result: Result<(), String> = container
-                .run(|| {
+                .checked_run(|| {
                     let mut work = || -> Result<()> {
                         let prepared = unsafe { plan.materialize()? };
                         let a_path = GuestPath::new(b"/a".to_vec())?;
@@ -3793,6 +3857,9 @@ pub(super) mod declared_inputs {
             use std::os::unix::fs::FileTypeExt;
             use std::os::unix::net::UnixListener;
 
+            if crate::app::test_isolation::rerun_alone() {
+                return;
+            }
             use super::super::super::native_exec_run::NativeEndpoints;
 
             fn socket_view(path: &Path) -> (u64, u64, u32, libc::c_ulong) {
@@ -3883,7 +3950,7 @@ pub(super) mod declared_inputs {
             let mut container = super::super::default_container(false);
             plan.configure(&mut container).unwrap();
             container
-                .run(|| {
+                .checked_run(|| {
                     let namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
                     assert_ne!((namespace.dev(), namespace.ino()), parent_namespace);
                     for (kind, source) in expected {
@@ -3918,7 +3985,9 @@ pub(super) mod declared_inputs {
             let _replacement = UnixListener::bind(&short_rpc).unwrap();
             let mut container = super::super::default_container(false);
             replaced.configure(&mut container).unwrap();
-            match container.run(|| -> () { panic!("replacement endpoint reached workload") }) {
+            match container
+                .checked_run(|| -> () { panic!("replacement endpoint reached workload") })
+            {
                 Err(reverie::process::RunError::Spawn(error)) => {
                     assert_eq!(error.context(), reverie::process::Context::Mount);
                     assert_eq!(
@@ -3933,6 +4002,9 @@ pub(super) mod declared_inputs {
 
         #[test]
         fn actual_common_container_materializes_readonly_data_and_same_task_proc() {
+            if crate::app::test_isolation::rerun_alone() {
+                return;
+            }
             // Filesystem component only: no Tool installation/native filter,
             // InstalledExecDomain or native exec success is represented here.
             // Init builds the graph; a real forked guest child binds its proc.
@@ -3941,7 +4013,7 @@ pub(super) mod declared_inputs {
             let mut container = super::super::default_container(false);
             plan.configure(&mut container).unwrap();
             let result: Result<(i32, i32, [u8; 8]), String> = container
-                .run(|| {
+                .checked_run(|| {
                     let mut work = || -> Result<_> {
                         let mut prepared = unsafe { plan.materialize()? };
                         assert_ne!(prepared.mount_id(), 0);
@@ -4393,7 +4465,9 @@ impl ContainerInitStopSignalBridge {
     /// Call this in the thread that clones the container init, immediately
     /// before the clone. The query and the install are not one atomic step, so
     /// this relies on the requirement Container already places on its caller:
-    /// no other thread is running.
+    /// no other thread is running, or only one that takes no lock, allocates
+    /// nothing and leaves signal dispositions alone, as the memory budget's
+    /// watchdog of analyze and bisect does (`analyze/memory.rs`).
     pub(super) fn install() -> Result<Self, Error> {
         let handler: extern "C" fn(libc::c_int) = bridge_container_init_stop_signal;
         let mut guard = Self {
@@ -5405,6 +5479,7 @@ mod readonly_proc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::container_clone::CheckedClone;
 
     /// A rewrite for a mount the snapshot lacks (a user bind's recursive copy
     /// whose host directory was removed, detaching it) is dropped; every
@@ -5491,7 +5566,7 @@ mod tests {
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
         Container::new()
-            .run(body)
+            .checked_run(body)
             .expect("the isolated test process should run to completion")
             .unwrap_or_else(|error| panic!("{error}"))
     }
@@ -5616,6 +5691,9 @@ mod tests {
     /// init is still running when the budget expires.
     #[test]
     fn a_namespace_init_honours_stop_signals_sent_before_it_arms() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         for signal in CONTAINER_INIT_STOP_SIGNALS {
             let status = in_isolated_process(|| {
                 set_default_stop_dispositions()?;
@@ -5641,6 +5719,9 @@ mod tests {
     /// the wait status `SIG_DFL` would have given it.
     #[test]
     fn the_process_holding_the_bridge_still_dies_from_stop_signals() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         fn hold_the_bridge() -> bool {
             if set_default_stop_dispositions().is_err() {
                 return false;
@@ -5672,6 +5753,9 @@ mod tests {
     /// what was there before.
     #[test]
     fn the_bridge_leaves_ignored_and_handled_signals_alone_and_restores_the_default() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         extern "C" fn someone_elses_handler(_signal: libc::c_int) {}
         let dispositions = in_isolated_process(|| {
             let read = || -> Result<Vec<libc::sighandler_t>, String> {
@@ -5732,6 +5816,9 @@ mod tests {
     /// the way rather than guessing which of the two it is running in.
     #[test]
     fn the_bridge_is_not_installed_by_a_process_that_is_pid_1() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         fn install_as_pid_1() -> bool {
             // SAFETY: getpid(2) has no preconditions.
             if unsafe { libc::getpid() } != 1 || set_default_stop_dispositions().is_err() {
@@ -5913,12 +6000,15 @@ mod tests {
     /// (`mnt_already_visible`).
     #[test]
     fn the_placeholder_directory_mounts_and_leaves_procfs_mountable() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let facts = Container::new()
-            .run(|| {
+            .checked_run(|| {
                 let mut container = default_container(false);
                 container.mount(directory_placeholder_mount(DIRECTORY_PLACEHOLDER));
                 container
-                    .run(placeholder_directory_facts)
+                    .checked_run(placeholder_directory_facts)
                     .map_err(|error| format!("{error:?}"))?
             })
             .unwrap()
@@ -5939,12 +6029,15 @@ mod tests {
 
     #[test]
     fn default_container_uses_readonly_proc_fallback() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         // The outer child confines the irreversible seccomp filter to this test.
         let (mounts, status) = Container::new()
-            .run(|| {
+            .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
                 default_container(false)
-                    .run(namespace_proc_contents)
+                    .checked_run(namespace_proc_contents)
                     .map_err(|error| format!("{error:?}"))?
             })
             .unwrap()
@@ -5954,6 +6047,9 @@ mod tests {
 
     #[test]
     fn image_container_uses_readonly_proc_fallback() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let rootfs = tempfile::tempdir().unwrap();
         let tmpfs = tempfile::tempdir().unwrap();
         for directory in ["proc", "tmp", "dev/pts"] {
@@ -5964,15 +6060,15 @@ mod tests {
         }
 
         let (mounts, status) = Container::new()
-            .run(|| {
+            .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
                 let (mut container, _identity) =
-                    image_container(rootfs.path(), tmpfs.path(), false, true, true)
+                    image_container(rootfs.path(), tmpfs.path(), false, None, true, true)
                         .map_err(|error| error.to_string())?;
                 // This closure is already loaded, so the image needs no executable
                 // or libraries. It reads the proc mount after entering the chroot.
                 container
-                    .run(namespace_proc_contents)
+                    .checked_run(namespace_proc_contents)
                     .map_err(|error| format!("{error:?}"))?
             })
             .unwrap()
@@ -5991,6 +6087,9 @@ mod tests {
     /// with both locked flags still present.
     #[test]
     fn image_container_accepts_a_rootfs_on_a_nosuid_nodev_filesystem() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         fn root_mount_flags() -> Result<(bool, bool, bool), String> {
             let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
             // SAFETY: the path is a valid NUL-terminated string and `stat` is a
@@ -6013,7 +6112,7 @@ mod tests {
         let flags = Container::new()
             .map_root()
             .mount(Mount::tmpfs(&base_path).flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV))
-            .run(move || -> Result<(bool, bool, bool), String> {
+            .checked_run(move || -> Result<(bool, bool, bool), String> {
                 let rootfs = base_path.join("rootfs");
                 let tmpfs = base_path.join("scratch");
                 for directory in ["proc", "tmp", "dev/pts"] {
@@ -6024,10 +6123,10 @@ mod tests {
                 }
                 fs::create_dir(&tmpfs).map_err(|e| e.to_string())?;
                 let (mut container, _identity) =
-                    image_container(&rootfs, &tmpfs, false, true, true)
+                    image_container(&rootfs, &tmpfs, false, None, true, true)
                         .map_err(|error| error.to_string())?;
                 container
-                    .run(root_mount_flags)
+                    .checked_run(root_mount_flags)
                     .map_err(|error| format!("{error:?}"))?
             })
             .expect("run the outer namespace holding the nosuid,nodev filesystem")
@@ -6400,12 +6499,14 @@ mod tests {
     fn image_container_registers_only_an_automatic_private_tmp() {
         let rootfs = tempfile::TempDir::new().expect("create image rootfs");
         let private_tmp = tempfile::TempDir::new().expect("create private tmp");
-        let (_, generated) = image_container(rootfs.path(), private_tmp.path(), false, true, true)
-            .expect("construct image container with generated tmp");
+        let (_, generated) =
+            image_container(rootfs.path(), private_tmp.path(), false, None, true, true)
+                .expect("construct image container with generated tmp");
         assert_eq!(generated.mountinfo_roots.len(), 1);
 
-        let (_, supplied) = image_container(rootfs.path(), private_tmp.path(), false, false, true)
-            .expect("construct image container with user tmp");
+        let (_, supplied) =
+            image_container(rootfs.path(), private_tmp.path(), false, None, false, true)
+                .expect("construct image container with user tmp");
         assert!(supplied.mountinfo_roots.is_empty());
     }
 
@@ -6540,7 +6641,7 @@ mod tests {
                 "selected CPU {selected} ({basis})"
             );
         }
-        assert_eq!(super::super::pinned_cpu::choose(&[]), None);
+        assert_eq!(super::super::pinned_cpu::choose_with(&[], |_| None), None);
     }
 
     /// How the candidate init in [`arm_after_the_parent_crossed`] ended: its
@@ -6673,6 +6774,9 @@ mod tests {
     /// death signal must not go on to start a guest.
     #[test]
     fn log_cap_crossed_before_the_container_init_arms_stops_the_init() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let outcome = arm_after_the_parent_crossed(|| arm_container_init_guards().is_ok());
         assert_stopped_by_the_crossing("arm_container_init_guards", outcome);
     }
@@ -6681,6 +6785,9 @@ mod tests {
     /// arms in `pre_exec` and then execs the guest itself.
     #[test]
     fn log_cap_crossed_before_the_namespace_only_guest_arms_stops_the_exec() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest().is_ok());
         assert_stopped_by_the_crossing("arm_namespace_only_guest", outcome);
     }

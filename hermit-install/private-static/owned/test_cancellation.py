@@ -389,7 +389,7 @@ class MainCleanup(unittest.TestCase):
                 paths = {key: str(root/key) for key in ['H', 'runtime_R', 'tool_R', 'cargo', 'rustc',
                     'host_cargo', 'host_rustc', 'target', 'cargo_home', 'native_inputs_json', 'runner']}
                 config = dict(paths=paths, heads={key: 'a'*40 for key in ['H', 'runtime_R', 'tool_R']},
-                              digests={'native_inputs': 'b'*64, 'runner': 'c'*64})
+                              digests={'native_inputs': 'b'*64, 'runner': 'c'*64}, data_roles=PublishCleanup().roles())
                 bound = root/'binding.json'; bound.write_text(json.dumps(dict(state='PREPARED_NOT_RUN',
                     config=config, sources={}, out=str(root/'out'))))
                 digest = pipeline.sha(bound); real_sha = pipeline.sha; closed = []; saved = []
@@ -402,6 +402,7 @@ class MainCleanup(unittest.TestCase):
                     saved.append(dict(value))
                     raise OSError('final save')
                 stage = types.SimpleNamespace(__file__='/unit/stage.py', main=thrown(raised),
+                    source_owned_roles=publisher.source_owned_roles,
                     runtime_content_preflight=lambda c: None)
                 patches.enter_context(mock.patch.object(sys, 'argv', [pipeline.__file__, 'run',
                     '--binding', str(bound), '--binding-sha256', digest]))

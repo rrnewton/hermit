@@ -202,6 +202,13 @@ struct TvRepairFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(
+        dead_code,
+        reason = "the repair's time(2) probes, which build most of these, are x86_64-only"
+    )
+)]
 enum TvRepairFailureKind {
     /// The backend could not execute the `time(2)` probe. EFAULT is not a
     /// failure: it means Linux stopped before storing this word.
@@ -232,6 +239,9 @@ enum TvRepairFailureKind {
     /// A recorded EFAULT does not prove that this replay execution performed
     /// the original stores, so live probing would mix replayed and host state.
     ReplayMode,
+    /// This architecture has no `time(2)` to probe each word with.
+    #[cfg(not(target_arch = "x86_64"))]
+    NoStoreProbe,
 }
 
 impl std::fmt::Display for TvRepairFailure {
@@ -269,6 +279,10 @@ impl std::fmt::Display for TvRepairFailure {
             TvRepairFailureKind::ReplayMode => {
                 f.write_str("cannot probe a recorded or replayed EFAULT")
             }
+            #[cfg(not(target_arch = "x86_64"))]
+            TvRepairFailureKind::NoStoreProbe => f.write_str(
+                "this architecture has no time(2) to probe which words Linux stored",
+            ),
         }
     }
 }
@@ -279,12 +293,14 @@ fn tv_repair_error(field: &'static str, kind: TvRepairFailureKind) -> Error {
     Error::Tool(anyhow::Error::new(TvRepairFailure { field, kind }))
 }
 
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeStoreProbe {
     Stored,
     Stopped,
 }
 
+#[cfg(target_arch = "x86_64")]
 fn classify_time_store_probe(
     field: &'static str,
     result: Result<i64, Errno>,
@@ -301,6 +317,7 @@ fn classify_time_store_probe(
 
 /// `time(NULL)` stores nothing and cannot fail on Linux, so any error means
 /// the injected `time(2)` never reached the native call.
+#[cfg(target_arch = "x86_64")]
 fn require_native_time_control_probe(
     field: &'static str,
     result: Result<i64, Errno>,
@@ -315,6 +332,7 @@ fn require_native_time_control_probe(
 }
 
 /// How a word that Linux did not store reads after the call.
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoppedWord {
     /// Readable, with the value it held before the call.
@@ -325,6 +343,7 @@ enum StoppedWord {
 }
 
 /// A word Linux did not store keeps both its contents and its readability.
+#[cfg(target_arch = "x86_64")]
 fn require_unchanged_stopped_word(
     field: &'static str,
     before: Result<libc::time_t, Errno>,
@@ -342,6 +361,7 @@ fn require_unchanged_stopped_word(
 
 /// Whether every byte of the `time_t` at `word` lies in one of `ranges`, the
 /// half-open address ranges of the guest's mappings.
+#[cfg(target_arch = "x86_64")]
 fn time_word_is_fully_mapped(mut ranges: Vec<(u64, u64)>, word: u64) -> bool {
     let Some(end) = word.checked_add(std::mem::size_of::<libc::time_t>() as u64) else {
         return false;
@@ -372,6 +392,7 @@ fn time_word_is_fully_mapped(mut ranges: Vec<(u64, u64)>, word: u64) -> bool {
 /// `gettimeofday` whose store faults on any of these ends the run rather than
 /// returning EFAULT. An empty map is refused because a filter that fakes a
 /// successful zero-byte read would otherwise make every word look unmapped.
+#[cfg(target_arch = "x86_64")]
 fn require_unmapped_unreadable_word(
     field: &'static str,
     maps: Result<Vec<(u64, u64)>, Error>,
@@ -439,6 +460,7 @@ fn timeval_word_addr<'a>(
 /// `gettimeofday` left it alone, or `None` when the address is past the end of
 /// the address space. No store can reach such a word, so it needs no check.
 /// (A probe needs a real address, so `timeval_word_addr` fails closed instead.)
+#[cfg(target_arch = "x86_64")]
 fn stopped_timeval_word_addr<'a>(
     tv_addr: AddrMut<'a, Timeval>,
     offset: usize,
@@ -449,6 +471,7 @@ fn stopped_timeval_word_addr<'a>(
         .and_then(AddrMut::<libc::time_t>::from_raw)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn require_complete_time_word_overwrite(
     field: &'static str,
     expected: usize,
@@ -531,6 +554,7 @@ fn require_live_time_store_probe(replay_data_is_some: bool) -> Result<(), Error>
 /// `pid()` is not the guest (KVM). A backend that executes `gettimeofday` and
 /// `time(2)` itself, as KVM does, stores them as Linux does: each word with an
 /// all-or-nothing store to a writable page, in kernel order.
+#[cfg(target_arch = "x86_64")]
 async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
     guest: &mut G,
     tv_addr: AddrMut<'a, Timeval>,
@@ -577,6 +601,22 @@ where
     Ok(())
 }
 
+/// The repair above probes each `tv` word with `time(2)`, which aarch64 does
+/// not have, so there it cannot tell which words Linux stored and refuses.
+#[cfg(not(target_arch = "x86_64"))]
+async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
+    _guest: &mut G,
+    _tv_addr: AddrMut<'a, Timeval>,
+    _tv: &Timeval,
+    _before: &TimevalWordSnapshot,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    Err(tv_repair_error("tv", TvRepairFailureKind::NoStoreProbe))
+}
+
 fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
     if target > now {
         target.duration_since(now)
@@ -587,11 +627,14 @@ fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Convenience function for constructing a sleep request with a nanosecond offset from "now".
+    /// A zero offset marks the request a zero-length sleep (`Resources::zero_length_sleep`).
     pub async fn sleep_request<G: Guest<Self>>(guest: &mut G, ns_delta: Duration) -> Resources {
         let base_time = thread_observe_time(guest).await;
         let target_time = base_time + ns_delta;
         let resource = ResourceID::SleepUntil(target_time);
-        guest.thread_state().mk_request(resource, Permission::W)
+        let mut request = guest.thread_state().mk_request(resource, Permission::W);
+        request.zero_length_sleep = ns_delta.is_zero();
+        request
     }
 
     /// Convenience function for constructing a sleep request with a absolute nanosecond value from the realtime clock.
@@ -679,6 +722,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// time
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_time<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -939,7 +983,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if call.flags() > libc::TIMER_ABSTIME {
             trace!("Unhandled clock_nanosleep flags, letting syscall through...");
-            return Ok(guest.inject(Syscall::from(call)).await?);
+            // Linux reads only TIMER_ABSTIME from the flags, so the kernel runs
+            // this as a relative or absolute sleep and may leave a restart block.
+            return crate::syscalls::helpers::inject_keeping_kernel_restart(
+                guest,
+                Syscall::from(call),
+            )
+            .await;
         }
 
         // The CPU clocks are Detcore's own only where it virtualizes time;
@@ -990,6 +1040,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         match call.flags() {
             0 => {
+                // Main's `sleep_for` is this arm's sequentialized path plus
+                // the kernel run; `sleep_for` keeps the kernel restart
+                // below, which is this change's non-sequentialized arm.
                 let time =
                     Duration::from_secs(t.tv_sec as u64) + Duration::from_nanos(t.tv_nsec as u64);
                 self.sleep_for(guest, call, time).await
@@ -1022,7 +1075,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let req = stack.push(relative_ts);
                     stack.commit()?;
                     let modified_call = syscalls::Nanosleep::new().with_req(Some(req));
-                    Ok(guest.inject(modified_call).await?)
+                    // Linux restarts an absolute sleep by running it again, but
+                    // this relative one keeps the host end the kernel computed,
+                    // so it restarts from the kernel's restart block. Running
+                    // the absolute call again would wait the whole interval
+                    // again: logical time stands still while the thread sleeps
+                    // in the kernel. The block holds no pointer to the request
+                    // on the stack, and no `rem`.
+                    crate::syscalls::helpers::inject_keeping_kernel_restart(guest, modified_call)
+                        .await
                 } else {
                     trace!(
                         "Not sequentializing threads not virtualizing, letting nanosleep through..."
@@ -1055,7 +1116,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         trace!("Not sequentializing threads, letting nanosleep through...");
         if call.flags() & libc::TIMER_ABSTIME == 0 {
-            return Ok(guest.inject(Syscall::from(call)).await?);
+            // A kernel-run relative sleep keeps the kernel's restart
+            // block, as in the handlers this change converted.
+            return crate::syscalls::helpers::inject_keeping_kernel_restart(
+                guest,
+                Syscall::from(call),
+            )
+            .await;
         }
         let mut stack = guest.stack().await;
         let req = stack.push(Timespec {
@@ -1068,7 +1135,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_flags(0)
             .with_req(Some(req))
             .with_rem(None);
-        Ok(guest.inject(relative).await?)
+        // The converted relative sleep keeps the kernel's restart block
+        // too: restarting the absolute call would wait the whole interval
+        // again while logical time stands still.
+        crate::syscalls::helpers::inject_keeping_kernel_restart(guest, relative).await
     }
 
     /// Linux's CPU-clock sleep (`posix_cpu_nsleep`,

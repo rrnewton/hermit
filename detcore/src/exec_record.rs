@@ -196,9 +196,49 @@ impl ExecRecord {
     }
 }
 
-/// The page size Linux aligns the program break to (`ELF_PAGEALIGN`) on
-/// x86_64, where Hermit runs.
-const PAGE_SIZE: u64 = 4096;
+/// The program interpreter (`PT_INTERP`) the ELF64 image at `path` names,
+/// which the kernel opens and maps at the exec (`load_elf_binary`,
+/// fs/binfmt_elf.c), or `None` for any other file, an image without one, and
+/// one the caller cannot read. Like the kernel, this refuses a name shorter
+/// than 2 or longer than `PATH_MAX` bytes or one whose last byte is not NUL,
+/// and the name is the string up to its first NUL, which `open_exec` opens.
+pub fn program_interpreter(path: &Path) -> Option<PathBuf> {
+    let file = crate::util::RawFd::open(path, libc::O_RDONLY).ok()?;
+    let read_exact = |offset: u64, buffer: &mut [u8]| {
+        (file.read_at(buffer, offset).ok()? == buffer.len()).then_some(())
+    };
+    let mut header = [0_u8; 64];
+    read_exact(0, &mut header)?;
+    if header[..4] != *b"\x7fELF" || header[4] != 2 || header[5] != 1 {
+        return None;
+    }
+    let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
+    let phoff = u64::from_le_bytes(header[32..40].try_into().unwrap());
+    let (phentsize, phnum) = (usize::from(u16_at(54)), u16_at(56));
+    if phentsize < 56 {
+        return None;
+    }
+    let mut entry = vec![0_u8; phentsize];
+    for index in 0..u64::from(phnum) {
+        read_exact(phoff.checked_add(index * phentsize as u64)?, &mut entry)?;
+        if u32::from_le_bytes(entry[..4].try_into().unwrap()) != 3 {
+            continue; // not PT_INTERP
+        }
+        let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
+        let (offset, size) = (field(8), field(32));
+        if size < 2 || size > libc::PATH_MAX as u64 {
+            return None;
+        }
+        let mut name = vec![0_u8; size as usize];
+        read_exact(offset, &mut name)?;
+        if name.last() != Some(&0) {
+            return None;
+        }
+        let end = name.iter().position(|byte| *byte == 0)?;
+        return Some(PathBuf::from(std::ffi::OsStr::from_bytes(&name[..end])));
+    }
+    None
+}
 
 /// What decides where Linux starts a process's program break after it execs
 /// an ELF image (`load_elf_binary`, fs/binfmt_elf.c), from the image's file
@@ -227,6 +267,11 @@ pub struct ElfLayout {
     /// segment start, which `RLIMIT_DATA` counts with the heap
     /// (`check_data_rlimit`).
     pub data_span: u64,
+    /// The page size Linux maps the segments with and aligns the program
+    /// break to: `ELF_MIN_ALIGN`, the larger of `ELF_EXEC_PAGESIZE` and
+    /// `PAGE_SIZE` (fs/binfmt_elf.c), which is the host's page size, since
+    /// `ELF_EXEC_PAGESIZE` is `PAGE_SIZE` on arm64 and 4096 on x86_64.
+    pub page: u64,
 }
 
 impl ElfLayout {
@@ -245,14 +290,16 @@ impl ElfLayout {
         };
         let mut header = [0_u8; 64];
         read_exact(0, &mut header)?;
-        Self::parse(&header, read_exact)
+        Self::parse(&header, read_exact, crate::page::page_size())
     }
 
     /// [`Self::read`] of an image whose 64-byte file header is `header`,
-    /// reading its program headers through `read_at(offset, buffer)`.
+    /// reading its program headers through `read_at(offset, buffer)`, on a
+    /// host whose pages are `page` bytes.
     fn parse(
         header: &[u8; 64],
         mut read_at: impl FnMut(u64, &mut [u8]) -> Option<()>,
+        page: u64,
     ) -> Option<Self> {
         let u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
         let u64_at = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
@@ -287,7 +334,7 @@ impl ElfLayout {
             let (offset, vaddr, filesz, memsz) = (field(8), field(16), field(32), field(40));
             // PF_X.
             if text.is_none() && u32::from_le_bytes(entry[4..8].try_into().unwrap()) & 1 != 0 {
-                text = Some((offset & !(PAGE_SIZE - 1), vaddr & !(PAGE_SIZE - 1)));
+                text = Some((offset & !(page - 1), vaddr & !(page - 1)));
             }
             if offset <= phoff && phoff < offset.checked_add(filesz)? {
                 phdr = (phoff - offset).checked_add(vaddr)?;
@@ -304,6 +351,7 @@ impl ElfLayout {
             end: end?,
             text,
             data_span: end_data.saturating_sub(start_data),
+            page,
         })
     }
 
@@ -330,8 +378,8 @@ impl ElfLayout {
             );
         }
         bias.checked_add(self.end)
-            .and_then(|end| end.checked_add(PAGE_SIZE - 1))
-            .map(|end| end & !(PAGE_SIZE - 1))
+            .and_then(|end| end.checked_add(self.page - 1))
+            .map(|end| end & !(self.page - 1))
             .ok_or("an image ending past the address space")
     }
 }
@@ -576,14 +624,15 @@ mod tests {
         assert!(layout.end > layout.phdr);
         // Its text segment is executable and page-aligned in file and memory.
         let (text_offset, text_page) = layout.text.unwrap();
-        assert_eq!((text_offset % 4096, text_page % 4096), (0, 0));
+        assert_eq!((text_offset % layout.page, text_page % layout.page), (0, 0));
+        assert_eq!(layout.page, crate::page::page_size());
         // A non-ELF file and a 32-bit or big-endian header have none.
         assert_eq!(ElfLayout::read(Path::new("/proc/self/status")), None);
         let mut header = [0_u8; 64];
         header[..4].copy_from_slice(b"\x7fELF");
         header[4] = 1;
         header[5] = 1;
-        assert_eq!(ElfLayout::parse(&header, |_, _| None), None);
+        assert_eq!(ElfLayout::parse(&header, |_, _| None, 4096), None);
 
         // A synthetic ET_EXEC image with two loads: text at 0x400000 holding
         // the program headers at file offset 64, and data at 0x403e10 whose
@@ -615,7 +664,7 @@ mod tests {
             buffer.copy_from_slice(entries.get(index)?);
             Some(())
         };
-        let layout = ElfLayout::parse(&header, read_at).unwrap();
+        let layout = ElfLayout::parse(&header, read_at, 4096).unwrap();
         assert_eq!(
             layout,
             ElfLayout {
@@ -627,10 +676,22 @@ mod tests {
                 // segment.
                 text: None,
                 data_span: 0x290,
+                page: 4096,
             }
         );
         assert_eq!(layout.start_brk(0x400040), Ok(0x406000));
         assert!(layout.start_brk(0x400000).is_err());
+        // On a host with 64 KiB pages the same image's break starts at the
+        // next 64 KiB boundary.
+        let large_pages = ElfLayout::parse(&header, read_at, 0x10000).unwrap();
+        assert_eq!(
+            large_pages,
+            ElfLayout {
+                page: 0x10000,
+                ..layout
+            }
+        );
+        assert_eq!(large_pages.start_brk(0x400040), Ok(0x410000));
         // An end already on a page boundary stays there, at any bias.
         let aligned = ElfLayout {
             end: 0x406000,
@@ -672,7 +733,7 @@ mod tests {
             Some(())
         };
         assert_eq!(
-            ElfLayout::parse(&header, read_at).unwrap(),
+            ElfLayout::parse(&header, read_at, 4096).unwrap(),
             ElfLayout {
                 position_independent: true,
                 interpreter: true,
@@ -831,6 +892,7 @@ mod tests {
             end: 0x50b0,
             text: Some((0x1000, 0x1000)),
             data_span: 0x290,
+            page: 4096,
         };
         assert_eq!(layout.start_brk_at_bias(0x555555556000), Ok(0x55555555c000));
     }
@@ -997,5 +1059,20 @@ mod tests {
         fs::rename(root.join("a"), root.join("away")).unwrap();
         std::os::unix::fs::symlink("away", root.join("a")).unwrap();
         assert!(!record.names_path_exactly(&root));
+    }
+
+    /// The test binary, a dynamically linked executable, names its program
+    /// interpreter, which exists where the kernel found it; a file that is
+    /// not ELF names none.
+    #[test]
+    fn an_image_names_its_program_interpreter_as_the_kernel_reads_it() {
+        let interpreter = program_interpreter(Path::new("/proc/self/exe"))
+            .expect("the test binary is dynamically linked");
+        assert!(interpreter.is_absolute(), "{}", interpreter.display());
+        assert!(interpreter.exists(), "{}", interpreter.display());
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("script");
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        assert_eq!(program_interpreter(&script), None);
     }
 }

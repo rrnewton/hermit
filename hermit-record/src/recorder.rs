@@ -28,10 +28,14 @@ use std::sync::Mutex;
 
 use reverie::Errno;
 use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
+#[cfg(target_arch = "x86_64")]
 use reverie::Rdtsc;
+#[cfg(target_arch = "x86_64")]
 use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
@@ -195,6 +199,20 @@ impl ContainerOutputs {
 impl RecorderThreadState {
     fn push_event(&mut self, event: Event) -> Result<(), bincode::error::EncodeError> {
         self.events.push_event(event)
+    }
+
+    /// Writes out and closes the thread's streams as the thread exits
+    /// (`EventWriter::finish`), or says why its recording is incomplete. The
+    /// recorder then marks the recording as one replay refuses
+    /// (`detcore::detlog::record_replay_refusal`, kept in its metadata), rather
+    /// than let replay fail later on the cut stream, far from the cause.
+    fn finish(self) -> Result<(), String> {
+        let stream_id = self.stream_id;
+        self.events.finish().map_err(|error| {
+            format!(
+                "the recording of thread stream {stream_id} could not be written in full: {error}"
+            )
+        })
     }
 
     fn push_debug_event(&mut self, event: DebugEvent) -> Result<(), bincode::error::EncodeError> {
@@ -509,6 +527,20 @@ impl Tool for Recorder {
         hermit_record_format::subscriptions::record_and_replay()
     }
 
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        tid: Tid,
+        _global_state: &G,
+        thread_state: Self::ThreadState,
+        _exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        if let Err(reason) = thread_state.finish() {
+            tracing::error!("[tid {tid}] {reason}");
+            detcore::detlog::record_replay_refusal(&reason);
+        }
+        Ok(())
+    }
+
     async fn handle_syscall_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -521,6 +553,7 @@ impl Tool for Recorder {
             Syscall::Execve(_) | Syscall::Execveat(_) => self.handle_exec(guest, syscall).await,
             Syscall::Brk(_) => self.let_through(guest, syscall).await,
             Syscall::Mprotect(_) => self.let_through(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::ArchPrctl(_) => {
                 // To properly handle arch_prctl, we should prevent calls from
                 // using ARCH_SET_CPUID since we already do that for the
@@ -572,14 +605,21 @@ impl Tool for Recorder {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#3598): faccessat/faccessat2 are pure queries;
             // recording their result keeps replay off the replay chroot's files.
-            Syscall::Access(_) | Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
+            Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
                 self.handle_simple(guest, syscall).await
             }
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Access(_) => self.handle_simple(guest, syscall).await,
             Syscall::Lseek(_) => self.handle_simple(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Lstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Newfstatat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
+            #[cfg(target_arch = "aarch64")]
+            Syscall::Fstatat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Statfs(syscall) => {
                 self.handle_statfs(guest, syscall.into(), syscall.buf())
                     .await
@@ -589,13 +629,16 @@ impl Tool for Recorder {
                     .await
             }
             Syscall::Statx(syscall) => self.handle_statx(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Getdents(syscall) => self.handle_getdents(guest, syscall).await,
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Madvise(syscall) => self.handle_madvise(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
-            Syscall::Open(_) | Syscall::Openat(_) => self.handle_open(guest, syscall).await,
+            Syscall::Openat(_) => self.handle_open(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Open(_) => self.handle_open(guest, syscall).await,
             Syscall::Close(_) => self.handle_fd_table_mutation(guest, syscall).await,
             Syscall::Openat2(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -611,6 +654,7 @@ impl Tool for Recorder {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#3598): legacy path mutations share the *at
             // forms' result-only recording.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Rename(_)
             | Syscall::Link(_)
             | Syscall::Symlink(_)
@@ -656,9 +700,9 @@ impl Tool for Recorder {
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup2(_) | Syscall::Dup3(_) => {
-                self.handle_fd_table_mutation(guest, syscall).await
-            }
+            Syscall::Dup3(_) => self.handle_fd_table_mutation(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Dup2(_) => self.handle_fd_table_mutation(guest, syscall).await,
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -672,6 +716,7 @@ impl Tool for Recorder {
             Syscall::ClockGetres(syscall) => self.handle_clock_getres(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
             Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fcntl(call) if crate::event::fcntl_output(&call).is_some() => {
@@ -695,10 +740,13 @@ impl Tool for Recorder {
             Syscall::Accept4(call) => self.handle_accept4(guest, call).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
             Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Select(syscall) => self.handle_select(guest, syscall).await,
             Syscall::Pselect6(syscall) => self.handle_pselect6(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::EpollPwait(syscall) => self.handle_epoll_pwait(guest, syscall).await,
             Syscall::Other(Sysno::epoll_pwait2, _) => {
@@ -712,9 +760,12 @@ impl Tool for Recorder {
                 self.handle_sockopt_family(guest, syscall.into()).await
             }
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            #[cfg(target_arch = "x86_64")]
             Syscall::Mkdir(_) => self.handle_mkdir(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -755,6 +806,7 @@ impl Tool for Recorder {
         result
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_rdtsc_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -841,6 +893,7 @@ impl Recorder {
         syscall: Syscall,
     ) -> Result<bool, Errno> {
         let result = match syscall {
+            #[cfg(target_arch = "x86_64")]
             Syscall::Mkdir(call) => {
                 let path = call.path().ok_or(Errno::EFAULT)?;
                 guest
@@ -1544,6 +1597,74 @@ mod mkdir_probe_tests {
         assert_eq!(
             require_mkdir_probe_closed(Err(Errno::EINTR)),
             Err(Errno::EINTR)
+        );
+    }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    /// A handle that sends nothing: exiting a thread needs no RPC.
+    struct NoRpc(detcore::Config);
+
+    #[reverie::tool]
+    impl GlobalRPC<detcore::GlobalState> for NoRpc {
+        async fn send_rpc(
+            &self,
+            _message: <detcore::GlobalState as GlobalTool>::Request,
+        ) -> <detcore::GlobalState as GlobalTool>::Response {
+            unreachable!("a thread's exit sends no RPC")
+        }
+
+        fn config(&self) -> &detcore::Config {
+            &self.0
+        }
+    }
+
+    /// A thread whose streams cannot be written out in full when it exits
+    /// leaves its recording marked as one replay must refuse, with the reason.
+    /// Its writer is on `/dev/full`, whose every write fails with ENOSPC, as a
+    /// full disk's would at the stream's last write.
+    #[test]
+    fn a_thread_stream_that_cannot_be_written_in_full_refuses_replay() {
+        let full = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap()
+        };
+        let mut state = RecorderThreadState {
+            events: EventWriter::for_test(full(), full()),
+            stream_id: EventStreamId::root().child(3),
+            child_stream_ids: ChildEventStreamIds::default(),
+            pending_exec: None,
+            bootstrapped: true,
+            outputs: ContainerOutputs::default(),
+            output_descriptions: Default::default(),
+        };
+        state
+            .push_event(Event {
+                event: Ok(SyscallEvent::Return(0)),
+            })
+            .unwrap();
+        assert_eq!(detcore::detlog::replay_refusal(), None);
+        let recorder = Recorder::default();
+        let rpc = NoRpc(detcore::Config::default());
+        let exit = recorder.on_exit_thread(Tid::from_raw(7), &rpc, state, ExitStatus::Exited(0));
+        let mut exit = std::pin::pin!(exit);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(result) = exit.as_mut().poll(&mut context) else {
+            panic!("exiting a thread waited");
+        };
+        result.unwrap();
+        let refusal = detcore::detlog::replay_refusal().expect("no replay refusal recorded");
+        let stream = EventStreamId::root().child(3);
+        assert!(
+            refusal.contains(&format!(
+                "thread stream {stream} could not be written in full"
+            )) && refusal.contains("No space left on device"),
+            "{refusal}"
         );
     }
 }

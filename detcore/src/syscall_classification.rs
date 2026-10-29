@@ -8,17 +8,21 @@
 
 use reverie::syscalls::Sysno;
 
-const EXPECTED_X86_64_SYSNO_COUNT: usize = 373;
+#[cfg(target_arch = "x86_64")]
+const EXPECTED_SYSNO_COUNT: usize = 373;
+#[cfg(target_arch = "aarch64")]
+const EXPECTED_SYSNO_COUNT: usize = 337;
 
 // `Sysno` is externally `#[non_exhaustive]`. These assertions make additions,
 // removals, or a changed table endpoint fail at compile time instead of silently
 // reaching the required final arm.
 const _: () = {
-    assert!(Sysno::count() == EXPECTED_X86_64_SYSNO_COUNT);
+    assert!(Sysno::count() == EXPECTED_SYSNO_COUNT);
     assert!(Sysno::last().id() == 461);
 };
 
-/// Every syscall in the pinned x86_64 table, including the final entry.
+/// Every syscall in the pinned table for the target architecture, including
+/// the final entry.
 ///
 /// `Sysno::iter()` in `syscalls` 0.6.18 stops one short: its loop bound is
 /// strict, so `Sysno::last()` is never yielded. Any policy sweep written as
@@ -48,15 +52,14 @@ pub(crate) enum SyscallClassification {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#275): Review syscall policy categories and fail-closed boundaries.
-/// Classifies every syscall in the pinned x86_64 `Sysno` table.
+/// Classifies every syscall in the pinned `Sysno` table of the target
+/// architecture.
 pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
     match sysno {
         // ===== DETERMINIZED SYSCALLS =====
         // These have a Detcore handler, deterministic replacement, or explicit refusal policy.
         Sysno::accept
         | Sysno::accept4
-        | Sysno::alarm
-        | Sysno::arch_prctl
         | Sysno::bind
         | Sysno::clock_getres
         | Sysno::clock_gettime
@@ -65,14 +68,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::clone3
         | Sysno::close
         | Sysno::connect
-        | Sysno::creat
         | Sysno::dup
-        | Sysno::dup2
         | Sysno::dup3
-        | Sysno::epoll_create
         | Sysno::epoll_create1
         | Sysno::epoll_ctl
-        | Sysno::epoll_ctl_old
         | Sysno::epoll_pwait
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is epoll_pwait with a
@@ -82,9 +81,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // (Syscall::Other) in the pinned Reverie; dispatched by Sysno in lib.rs
         // and handled identically to epoll_pwait.
         | Sysno::epoll_pwait2
-        | Sysno::epoll_wait
-        | Sysno::epoll_wait_old
-        | Sysno::eventfd
         | Sysno::eventfd2
         | Sysno::execve
         | Sysno::execveat
@@ -92,7 +88,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::exit_group
         | Sysno::fadvise64
         | Sysno::fcntl
-        | Sysno::fork
         | Sysno::fstat
         | Sysno::fstatfs
         | Sysno::futex
@@ -105,9 +100,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::futex_waitv
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::futex_wake
-        | Sysno::futimesat
         | Sysno::getcpu
-        | Sysno::getdents
         | Sysno::getdents64
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-892): Query logical interval-timer state.
@@ -120,14 +113,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::gettid
         | Sysno::gettimeofday
         | Sysno::inotify_add_watch
-        | Sysno::inotify_init
         | Sysno::inotify_init1
         | Sysno::inotify_rm_watch
         | Sysno::io_uring_enter
         | Sysno::io_uring_register
         | Sysno::io_uring_setup
         | Sysno::ioctl
-        | Sysno::lstat
         | Sysno::madvise
         | Sysno::membarrier
         | Sysno::memfd_create
@@ -138,20 +129,12 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::mremap
         | Sysno::munmap
         | Sysno::nanosleep
-        | Sysno::newfstatat
-        | Sysno::open
         | Sysno::openat
-        | Sysno::pause
-        | Sysno::pipe
         | Sysno::pipe2
-        | Sysno::poll
         | Sysno::ppoll
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
         | Sysno::pselect6
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
-        | Sysno::select
         | Sysno::prlimit64
         | Sysno::pread64
         | Sysno::lseek
@@ -197,17 +180,14 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::sendto
         | Sysno::setpgid
         | Sysno::setsid
-        | Sysno::signalfd
         | Sysno::signalfd4
         | Sysno::socket
         | Sysno::socketpair
-        | Sysno::stat
         | Sysno::statfs
         | Sysno::statx
         | Sysno::sysinfo
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::times
-        | Sysno::time
         | Sysno::timer_create
         | Sysno::timer_delete
         | Sysno::timer_getoverrun
@@ -218,10 +198,7 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::timerfd_settime
         | Sysno::uname
         | Sysno::userfaultfd
-        | Sysno::utime
         | Sysno::utimensat
-        | Sysno::utimes
-        | Sysno::vfork
         | Sysno::wait4
         | Sysno::waitid
         | Sysno::write
@@ -276,19 +253,8 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
         // deterministic by construction and matches the modern kernel's own return,
         // so guest-visible behavior is unchanged while dropping the host dependency.
-        | Sysno::_sysctl
-        | Sysno::afs_syscall
-        | Sysno::create_module
-        | Sysno::get_kernel_syms
-        | Sysno::getpmsg
         | Sysno::lookup_dcookie
         | Sysno::nfsservctl
-        | Sysno::putpmsg
-        | Sysno::query_module
-        | Sysno::security
-        | Sysno::tuxcall
-        | Sysno::uselib
-        | Sysno::vserver
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
         // system-administration syscalls that mutate global kernel/host state
@@ -309,8 +275,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::reboot
         | Sysno::swapon
         | Sysno::swapoff
-        | Sysno::ioperm
-        | Sysno::iopl
         | Sysno::pivot_root
         | Sysno::sethostname
         | Sysno::setdomainname
@@ -378,15 +342,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // pre-feature ENOSYS result keeps guests on portable /proc fallbacks and
         // avoids leaking changing host namespace state.
         // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::sysfs
-        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::statmount
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::listmount
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(PR-859): Deterministic ENOSYS for obsolete ustat
-        // host-filesystem capacity and free-space introspection.
-        | Sysno::ustat
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
         // asynchronous and message-passing I/O and IPC interfaces Detcore does
@@ -586,10 +544,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::pidfd_send_signal
         | Sysno::pidfd_getfd
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#877): Canonicalize fresh kernel namespace inode
-        // identities while preserving ordinary symlink behavior and errors.
-        | Sysno::readlink
-        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::readlinkat
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
         // These previously fail-closed --strict (aborting real programs such as
@@ -688,9 +642,68 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // for any unmapped uid), and in-process backends have no namespace at
         // all. See is_ownership_change_noop_syscall for the full rationale and
         // the stated semantic boundary. Dispatched by Sysno in lib.rs.
-        | Sysno::chown
         | Sysno::fchown
-        | Sysno::fchownat
+        | Sysno::fchownat => SyscallClassification::Determinized,
+        // The x86_64-only entry points of the groups above. arm64 has only
+        // their generic-table successors (openat, pipe2, ppoll, pselect6,
+        // epoll_pwait, dup3, fchownat, readlinkat, ...), classified above.
+        #[cfg(target_arch = "x86_64")]
+        Sysno::alarm
+        | Sysno::arch_prctl
+        | Sysno::creat
+        | Sysno::dup2
+        | Sysno::epoll_create
+        | Sysno::epoll_ctl_old
+        | Sysno::epoll_wait
+        | Sysno::epoll_wait_old
+        | Sysno::eventfd
+        | Sysno::fork
+        | Sysno::futimesat
+        | Sysno::getdents
+        | Sysno::inotify_init
+        | Sysno::lstat
+        | Sysno::newfstatat
+        | Sysno::open
+        | Sysno::pause
+        | Sysno::pipe
+        | Sysno::poll
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
+        | Sysno::select
+        | Sysno::signalfd
+        | Sysno::stat
+        | Sysno::time
+        | Sysno::utime
+        | Sysno::utimes
+        | Sysno::vfork
+        // Unimplemented on x86_64 (sys_ni_syscall): the ENOSYS group above.
+        | Sysno::_sysctl
+        | Sysno::afs_syscall
+        | Sysno::create_module
+        | Sysno::get_kernel_syms
+        | Sysno::getpmsg
+        | Sysno::putpmsg
+        | Sysno::query_module
+        | Sysno::security
+        | Sysno::tuxcall
+        | Sysno::uselib
+        | Sysno::vserver
+        // Privileged system administration: the EPERM group above.
+        | Sysno::ioperm
+        | Sysno::iopl
+        // Host mount introspection: the ENOSYS group above.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::sysfs
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-859): Deterministic ENOSYS for obsolete ustat
+        // host-filesystem capacity and free-space introspection.
+        | Sysno::ustat
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#877): Canonicalize fresh kernel namespace inode
+        // identities while preserving ordinary symlink behavior and errors.
+        | Sysno::readlink
+        // File-ownership mutation: the virtual-root group above.
+        | Sysno::chown
         | Sysno::lchown => SyscallClassification::Determinized,
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-b3a4c): Process groups and sessions are answered
@@ -698,15 +711,16 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // executor: they differed (DBT's launcher makes the guest a group
         // leader, KVM's executor failed getsid; slice B3a-4c of
         // https://github.com/rrnewton/hermit/issues/4266). Dispatched in lib.rs.
-        Sysno::getpgid | Sysno::getpgrp | Sysno::getsid => SyscallClassification::Determinized,
+        Sysno::getpgid | Sysno::getsid => SyscallClassification::Determinized,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::getpgrp => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
         // Hermit's fixed-container, stable-filesystem, and serialization assumptions.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#503): Confirm the stable-state boundary for these promotions.
-        Sysno::access
-        | Sysno::brk
+        Sysno::brk
         | Sysno::getcwd
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
@@ -732,15 +746,11 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::umask
         // chmod/fchmodat/linkat/mkdir/mkdirat/renameat2/rmdir/symlinkat/unlink/unlinkat
         // repeat given stable guest-visible filesystem state with no external mutation.
-        | Sysno::chmod
         | Sysno::fchmodat
         | Sysno::linkat
-        | Sysno::mkdir
         | Sysno::mkdirat
         | Sysno::renameat2
-        | Sysno::rmdir
         | Sysno::symlinkat
-        | Sysno::unlink
         | Sysno::unlinkat
         // getxattr/lgetxattr/removexattr/setxattr are deterministic for stable objects
         // and do not introduce asynchronous state or new kernel objects.
@@ -767,8 +777,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fallocate
         // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::rename
-        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::renameat
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::truncate
@@ -790,8 +798,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fsetxattr
         // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::link
-        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::listxattr
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::llistxattr
@@ -803,13 +809,23 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::msync
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::readahead
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::symlink
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::sync_file_range
         // Ptrace executes rt_sigreturn directly; DBT has dedicated injected-sigreturn
         // handling, while KVM deterministically reports its current lack of signal support.
         | Sysno::rt_sigreturn => SyscallClassification::PassThrough,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::access
+        | Sysno::chmod
+        | Sysno::mkdir
+        | Sysno::rmdir
+        | Sysno::unlink
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::rename
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::link
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::symlink
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::sync_file_range => SyscallClassification::PassThrough,
         // ===== END PASS-THRU SYSCALLS =====
 
         // ===== ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
@@ -818,23 +834,24 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-643): Review issue-backed pass-through promotions.
         Sysno::chroot
-        | Sysno::get_thread_area
-        | Sysno::mknod
         | Sysno::mknodat
         | Sysno::mlock
         | Sysno::mlock2
         | Sysno::mlockall
-        | Sysno::modify_ldt
         | Sysno::personality
         | Sysno::pkey_alloc
         | Sysno::pkey_free
         | Sysno::pkey_mprotect
         | Sysno::sched_get_priority_max
         | Sysno::sched_get_priority_min
-        | Sysno::set_thread_area
         | Sysno::sync
         | Sysno::syncfs
         => SyscallClassification::PassThrough,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::get_thread_area
+        | Sysno::mknod
+        | Sysno::modify_ldt
+        | Sysno::set_thread_area => SyscallClassification::PassThrough,
         // ===== END ISSUE-REVIEWED PASS-THROUGH SYSCALLS =====
 
         // ===== UNSUPPORTED SYSCALLS =====
@@ -846,6 +863,41 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         Sysno::restart_syscall
         => SyscallClassification::Unsupported,
         // ===== END UNSUPPORTED SYSCALLS =====
+
+        // ===== AARCH64-ONLY TABLE ENTRIES =====
+        // `fstatat` is x86_64's `newfstatat` (number 79 in the generic table)
+        // and `sync_file_range2` is the name the syscalls crate gives the
+        // generic table's number 84, which arm64 wires to plain
+        // `sync_file_range`; each takes its x86_64 twin's classification.
+        #[cfg(target_arch = "aarch64")]
+        Sysno::fstatat => SyscallClassification::Determinized,
+        #[cfg(target_arch = "aarch64")]
+        Sysno::sync_file_range2 => SyscallClassification::PassThrough,
+        // The 32-bit `*_time64` entry points are in the generic table but the
+        // 64-bit arm64 kernel does not wire them up, so Detcore refuses them
+        // with the kernel's own ENOSYS (see is_unimplemented_enosys_syscall).
+        #[cfg(target_arch = "aarch64")]
+        Sysno::clock_adjtime64
+        | Sysno::clock_getres_time64
+        | Sysno::clock_gettime64
+        | Sysno::clock_nanosleep_time64
+        | Sysno::clock_settime64
+        | Sysno::futex_time64
+        | Sysno::io_pgetevents_time64
+        | Sysno::mq_timedreceive_time64
+        | Sysno::mq_timedsend_time64
+        | Sysno::ppoll_time64
+        | Sysno::pselect6_time64
+        | Sysno::recvmmsg_time64
+        | Sysno::rt_sigtimedwait_time64
+        | Sysno::sched_rr_get_interval_time64
+        | Sysno::semtimedop_time64
+        | Sysno::timer_gettime64
+        | Sysno::timer_settime64
+        | Sysno::timerfd_gettime64
+        | Sysno::timerfd_settime64
+        | Sysno::utimensat_time64 => SyscallClassification::Determinized,
+        // ===== END AARCH64-ONLY TABLE ENTRIES =====
 
         // `Sysno` is `#[non_exhaustive]` outside its crate. The const ABI guards above
         // make changes to the pinned table a compile error; this arm only satisfies the
@@ -862,22 +914,45 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
 /// on the host kernel actually being modern; the guest-visible errno is identical
 /// to the legacy pass-through on any current kernel.
 pub(crate) const fn is_unimplemented_enosys_syscall(sysno: Sysno) -> bool {
-    matches!(
-        sysno,
+    match sysno {
+        Sysno::lookup_dcookie | Sysno::nfsservctl => true,
+        #[cfg(target_arch = "x86_64")]
         Sysno::_sysctl
-            | Sysno::afs_syscall
-            | Sysno::create_module
-            | Sysno::get_kernel_syms
-            | Sysno::getpmsg
-            | Sysno::lookup_dcookie
-            | Sysno::nfsservctl
-            | Sysno::putpmsg
-            | Sysno::query_module
-            | Sysno::security
-            | Sysno::tuxcall
-            | Sysno::uselib
-            | Sysno::vserver
-    )
+        | Sysno::afs_syscall
+        | Sysno::create_module
+        | Sysno::get_kernel_syms
+        | Sysno::getpmsg
+        | Sysno::putpmsg
+        | Sysno::query_module
+        | Sysno::security
+        | Sysno::tuxcall
+        | Sysno::uselib
+        | Sysno::vserver => true,
+        // The generic table's 32-bit `*_time64` numbers, which a 64-bit arm64
+        // kernel leaves unwired.
+        #[cfg(target_arch = "aarch64")]
+        Sysno::clock_adjtime64
+        | Sysno::clock_getres_time64
+        | Sysno::clock_gettime64
+        | Sysno::clock_nanosleep_time64
+        | Sysno::clock_settime64
+        | Sysno::futex_time64
+        | Sysno::io_pgetevents_time64
+        | Sysno::mq_timedreceive_time64
+        | Sysno::mq_timedsend_time64
+        | Sysno::ppoll_time64
+        | Sysno::pselect6_time64
+        | Sysno::recvmmsg_time64
+        | Sysno::rt_sigtimedwait_time64
+        | Sysno::sched_rr_get_interval_time64
+        | Sysno::semtimedop_time64
+        | Sysno::timer_gettime64
+        | Sysno::timer_settime64
+        | Sysno::timerfd_gettime64
+        | Sysno::timerfd_settime64
+        | Sysno::utimensat_time64 => true,
+        _ => false,
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -908,25 +983,26 @@ pub(crate) const fn is_futex2_enosys_syscall(sysno: Sysno) -> bool {
 /// configuration. These are untyped (`Syscall::Other`) in the pinned Reverie,
 /// so the dispatcher matches on the `Sysno` before the typed match.
 pub(crate) const fn is_privileged_admin_refused_syscall(sysno: Sysno) -> bool {
-    matches!(
-        sysno,
+    match sysno {
         Sysno::init_module
-            | Sysno::finit_module
-            | Sysno::delete_module
-            | Sysno::kexec_load
-            | Sysno::kexec_file_load
-            | Sysno::reboot
-            | Sysno::swapon
-            | Sysno::swapoff
-            | Sysno::ioperm
-            | Sysno::iopl
-            | Sysno::pivot_root
-            | Sysno::sethostname
-            | Sysno::setdomainname
-            | Sysno::vhangup
-            | Sysno::quotactl
-            | Sysno::quotactl_fd
-    )
+        | Sysno::finit_module
+        | Sysno::delete_module
+        | Sysno::kexec_load
+        | Sysno::kexec_file_load
+        | Sysno::reboot
+        | Sysno::swapon
+        | Sysno::swapoff
+        | Sysno::pivot_root
+        | Sysno::sethostname
+        | Sysno::setdomainname
+        | Sysno::vhangup
+        | Sysno::quotactl
+        | Sysno::quotactl_fd => true,
+        // Raw I/O port access exists only on x86.
+        #[cfg(target_arch = "x86_64")]
+        Sysno::ioperm | Sysno::iopl => true,
+        _ => false,
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1031,10 +1107,12 @@ pub(crate) const fn is_credential_identity_noop_syscall(sysno: Sysno) -> bool {
 /// represent in any case. That divergence is strictly smaller than the status
 /// quo, where the guest believes it is root and yet cannot chown at all.
 pub(crate) const fn is_ownership_change_noop_syscall(sysno: Sysno) -> bool {
-    matches!(
-        sysno,
-        Sysno::chown | Sysno::fchown | Sysno::fchownat | Sysno::lchown
-    )
+    match sysno {
+        Sysno::fchown | Sysno::fchownat => true,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::chown | Sysno::lchown => true,
+        _ => false,
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1196,15 +1274,16 @@ pub(crate) const fn is_perf_event_enosys_syscall(sysno: Sysno) -> bool {
 /// state, so forwarding them would expose changing host data. A fixed `ENOSYS`
 /// directs callers to portable `/proc` or `statfs` fallbacks.
 pub(crate) const fn is_mount_introspection_enosys_syscall(sysno: Sysno) -> bool {
-    matches!(
-        sysno,
-        Sysno::sysfs
-            | Sysno::statmount
-            | Sysno::listmount
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-859): Obsolete host filesystem statistics.
-            | Sysno::ustat
-    )
+    match sysno {
+        Sysno::statmount | Sysno::listmount => true,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::sysfs => true,
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-859): Obsolete host filesystem statistics.
+        #[cfg(target_arch = "x86_64")]
+        Sysno::ustat => true,
+        _ => false,
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1342,18 +1421,18 @@ pub(crate) const fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
         || is_host_security_identity_probe_syscall(sysno)
         || is_optional_memory_feature_syscall(sysno)
         || is_host_kernel_probe_syscall(sysno)
-        || matches!(
-            sysno,
+        || match sysno {
             Sysno::openat2
-                | Sysno::copy_file_range
-                | Sysno::clock_settime
-                | Sysno::futimesat
-                | Sysno::io_uring_setup
-                | Sysno::io_uring_enter
-                | Sysno::io_uring_register
-                | Sysno::name_to_handle_at
-                | Sysno::epoll_ctl_old
-        )
+            | Sysno::copy_file_range
+            | Sysno::clock_settime
+            | Sysno::io_uring_setup
+            | Sysno::io_uring_enter
+            | Sysno::io_uring_register
+            | Sysno::name_to_handle_at => true,
+            #[cfg(target_arch = "x86_64")]
+            Sysno::futimesat | Sysno::epoll_ctl_old => true,
+            _ => false,
+        }
 }
 
 #[cfg(test)]
@@ -1830,18 +1909,18 @@ mod tests {
         );
 
         // The total is COMPUTED from the census, never transcribed.
-        // `EXPECTED_X86_64_SYSNO_COUNT` is itself bracketed against
+        // `EXPECTED_SYSNO_COUNT` is itself bracketed against
         // `Sysno::count()` by the const assertion at the top of this file, so
         // this catches a syscalls-crate table change instead of restating a
         // number the census just produced.
         let counted: usize = buckets.iter().map(Vec::len).sum();
-        assert_eq!(counted, EXPECTED_X86_64_SYSNO_COUNT);
+        assert_eq!(counted, EXPECTED_SYSNO_COUNT);
 
         // And the reviewed lists must themselves cover the whole table, so a
         // syscall cannot be dropped from every list and escape classification.
         let reviewed =
             DETERMINIZED_SYSCALLS.len() + PASSTHROUGH_SYSCALLS.len() + UNSUPPORTED_SYSCALLS.len();
-        assert_eq!(reviewed, EXPECTED_X86_64_SYSNO_COUNT);
+        assert_eq!(reviewed, EXPECTED_SYSNO_COUNT);
     }
 
     #[test]

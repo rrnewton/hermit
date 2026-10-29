@@ -25,11 +25,13 @@ import socket
 import subprocess
 import time
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 
 # tests/debugger/harness.py -> repo root is two levels up.
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GUEST_SRC = Path(__file__).resolve().parent / "guests" / "debuggee.c"
+GUESTS_DIR = Path(__file__).resolve().parent / "guests"
+GUEST_SRC = GUESTS_DIR / "debuggee.c"
 
 # Build guests and recordings under target/ (git-ignored) and, crucially, *not*
 # under host /tmp: Hermit refuses to run a guest whose path is under host /tmp.
@@ -78,15 +80,27 @@ def pick_free_port() -> int:
         return s.getsockname()[1]
 
 
-def compile_guest() -> Path:
-    """Compile the debuggee once (cached across tests). Non-PIE with -O0 -g."""
+def compile_guest(
+    src: Path = GUEST_SRC, name: str = "debuggee", extra_flags: Sequence[str] = ()
+) -> Path:
+    """Compile a guest once (cached across tests). Non-PIE with -O0 -g."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    out = BUILD_DIR / "debuggee"
-    if out.is_file() and out.stat().st_mtime >= GUEST_SRC.stat().st_mtime:
+    out = BUILD_DIR / name
+    if out.is_file() and out.stat().st_mtime >= src.stat().st_mtime:
         return out
     cc = os.environ.get("CC", "cc")
     subprocess.run(
-        [cc, "-g", "-O0", "-no-pie", "-fno-pie", "-o", str(out), str(GUEST_SRC)],
+        [
+            cc,
+            "-g",
+            "-O0",
+            "-no-pie",
+            "-fno-pie",
+            *extra_flags,
+            "-o",
+            str(out),
+            str(src),
+        ],
         check=True,
     )
     return out

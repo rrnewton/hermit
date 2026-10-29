@@ -942,10 +942,11 @@ mod tests {
             // random_determinism's
             // a_schedule_replay_hands_the_guest_the_recorded_random_values (+1):
             // 694.
-            // Seven explicit package-identity cases in version_provenance (+7): 701.
-            // The copied-child TTY case has its own required DynamoRIO owner node.
-            // All other cases remain in this core selection: 700 plus one external.
-            assert_eq!(population, 700);
+            // Incoming first-party inventory: 698. The split retains seven
+            // package-identity cases and transfers the copied-child TTY case
+            // to its required DynamoRIO owner: 698 + 7 - 1 = 704.
+            // This source composition still requires the exact compiled list.
+            assert_eq!(population, 704);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

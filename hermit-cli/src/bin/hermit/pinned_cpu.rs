@@ -31,11 +31,30 @@
 //! A uniformly random CPU lands on such a task as often as there are busy
 //! CPUs. Instead, a run samples the allowed CPUs' busy time from `/proc/stat`
 //! over [`SAMPLE_WINDOW`] and draws uniformly from the ones that were idle, or,
-//! when none was, from the least busy. Runs that sample at the same moment
-//! draw from the same candidates: every idle CPU while there are some, but
+//! when none was, from the least busy.
+//!
+//! A sample alone cannot keep concurrent runs apart. Runs that sample at the
+//! same moment draw from the same candidates: every idle CPU while there are
+//! some (three runs among eight idle CPUs share one 34% of the time), but
 //! often a single CPU when there are none, since at 10 ms ticks the least busy
-//! fraction is rarely tied. Such runs then share that CPU, which costs speed,
-//! never determinism.
+//! fraction is rarely tied. And a run whose guest mostly waits leaves its CPU
+//! looking idle to a later run's sample. Two runs on one CPU take turns at
+//! every ptrace stop: two copies of a 40,000-syscall guest pinned to one core
+//! took 260 s each, against 27 s on two cores. So a run also reserves its CPU
+//! for its lifetime (`reserve`): an abstract Unix socket named after the CPU,
+//! which the kernel lets one socket in a network namespace hold
+//! (`unix_bind_abstract`, net/unix/af_unix.c) and releases when the last
+//! descriptor for it closes: when Hermit and its container init, which holds
+//! a copy and dies with Hermit, have exited, however they exit. A CPU another
+//! run holds is passed over for the next draw from the same sample, and only
+//! when every allowed CPU is held does a run share one: the CPU it drew
+//! first. Sharing costs speed, never determinism. Runs in different network
+//! namespaces do not see each other's reservations.
+//!
+//! A process holds one reservation at a time (`HELD`). Its later runs (the
+//! second run of a `--verify` pair, `analyze` trials) sample again, count the
+//! CPU the process holds as free rather than as another run's, and move the
+//! reservation when they draw a different CPU.
 //!
 //! Among the candidates, a run passes over the CPUs a PMU is bound to while
 //! any other candidate remains. Some PMUs open their events on a few CPUs,
@@ -69,7 +88,12 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::path::Path;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -194,13 +218,11 @@ impl fmt::Display for Basis {
     }
 }
 
-/// Choose the CPU a run is pinned to from `allowed`, the tracer's affinity
-/// mask, and say why. `None` only when `allowed` is empty.
-pub(crate) fn choose(allowed: &[usize]) -> Option<(usize, Basis)> {
-    choose_with(allowed, observe)
-}
-
-/// [`choose`] with the observation made by `observe`, which tests replace.
+/// Choose a CPU from `allowed`, the tracer's affinity mask, with the
+/// observation made by `observe`, which tests replace, and say why. `None`
+/// only when `allowed` is empty. Reserves nothing: runs choose through
+/// [`choose_for_run`], which draws the same way.
+#[cfg(test)]
 pub(crate) fn choose_with(
     allowed: &[usize],
     observe: impl FnOnce(&[usize]) -> Option<Observation>,
@@ -208,13 +230,203 @@ pub(crate) fn choose_with(
     match allowed {
         [] => None,
         [only] => Some((*only, Basis::OnlyAllowed)),
-        _ => {
-            let (candidates, basis) = observe(allowed)
-                .and_then(|observation| candidates(allowed, &observation))
-                .unwrap_or_else(|| (allowed.to_vec(), Basis::Unsampled));
-            Some((candidates[rand::random_range(0..candidates.len())], basis))
+        _ => Some(draw(allowed, observe(allowed).as_ref())),
+    }
+}
+
+/// One draw from `pool`, two or more CPUs: from its candidates under
+/// `observation`, or from all of it without one.
+fn draw(pool: &[usize], observation: Option<&Observation>) -> (usize, Basis) {
+    let (candidates, basis) = observation
+        .and_then(|observation| candidates(pool, observation))
+        .unwrap_or_else(|| (pool.to_vec(), Basis::Unsampled));
+    (candidates[rand::random_range(0..candidates.len())], basis)
+}
+
+/// The prefix of the abstract socket names that reserve a CPU
+/// (`hermit-pinned-core:<cpu>`, [`reserve`]).
+const RESERVATION_PREFIX: &str = "hermit-pinned-core";
+
+/// The lowest descriptor number a reservation is moved to, so that taking one
+/// does not shift the numbers of the descriptors Hermit opens after it, some
+/// of which reach the guest's setup.
+const RESERVATION_FD_FLOOR: libc::c_int = 1000;
+
+/// The reservation this process holds: its CPU and the descriptor that holds
+/// its name. A later run of the same process (a `--verify` pair runs twice)
+/// counts that CPU as free, and replacing the reservation closes the old
+/// descriptor, so a process never holds a CPU it moved away from. Runs one
+/// process makes at the same time (test threads, say) may draw its CPU too.
+static HELD: Mutex<Option<(usize, OwnedFd)>> = Mutex::new(None);
+
+/// How a run holds its CPU against other Hermit runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Hold {
+    /// This process holds the CPU: no other Hermit run in this network
+    /// namespace is pinned to it. `passed_over` CPUs other runs hold were
+    /// passed over first.
+    Reserved { passed_over: usize },
+    /// This process already held the CPU, for an earlier run, and keeps it.
+    Kept,
+    /// Every allowed CPU is held by another Hermit run, so this run shares
+    /// the CPU it drew first with one of them.
+    Shared,
+    /// A reservation could not be made (the error), so the CPU is used
+    /// unreserved, and another run may share it.
+    Unreserved(String),
+}
+
+/// The CPU a run is pinned to, why, and how it holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Choice {
+    pub(crate) cpu: usize,
+    /// How the CPU was drawn, over the allowed CPUs no other run was found to
+    /// hold.
+    pub(crate) basis: Basis,
+    pub(crate) hold: Hold,
+}
+
+impl fmt::Display for Choice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Hold::Reserved { passed_over } = self.hold
+            && passed_over > 0
+        {
+            write!(
+                f,
+                "among the allowed CPUs no other Hermit run holds ({passed_over} held): "
+            )?;
+        }
+        write!(f, "{}; ", self.basis)?;
+        match &self.hold {
+            Hold::Reserved { .. } => write!(f, "reserved"),
+            Hold::Kept => write!(f, "already reserved by this process"),
+            Hold::Shared => write!(
+                f,
+                "every allowed CPU is held by another Hermit run, so this run shares it and \
+                 both run slower"
+            ),
+            Hold::Unreserved(error) => {
+                write!(f, "unreserved, so another Hermit run may share it: {error}")
+            }
         }
     }
+}
+
+/// Choose and reserve the CPU this run is pinned to from `allowed`, the
+/// tracer's affinity mask, over a fresh sample, counting the CPU this process
+/// already holds as free. `None` only when `allowed` is empty.
+pub(crate) fn choose_for_run(allowed: &[usize]) -> Option<Choice> {
+    let mut held = HELD.lock().unwrap_or_else(|poison| poison.into_inner());
+    choose_for_run_with(allowed, observe, &mut held, |cpu| {
+        reserve(RESERVATION_PREFIX, cpu)
+    })
+}
+
+/// [`choose_for_run`] with the observation, the process's reservation and
+/// the reservation call supplied, which tests replace. `reserve` answers the
+/// descriptor that now holds a CPU, or `None` when another run holds it.
+/// A run that reserves a different CPU replaces `held`, closing the old
+/// descriptor; a run that shares or goes unreserved leaves `held` empty, since
+/// the process no longer runs on the CPU it held.
+fn choose_for_run_with(
+    allowed: &[usize],
+    observe: impl FnOnce(&[usize]) -> Option<Observation>,
+    held: &mut Option<(usize, OwnedFd)>,
+    mut reserve: impl FnMut(usize) -> io::Result<Option<OwnedFd>>,
+) -> Option<Choice> {
+    let own = held.as_ref().map(|(cpu, _)| *cpu);
+    let mut taken = None;
+    let mut choice = choose_reserving(allowed, observe, |cpu| {
+        if Some(cpu) == own {
+            return Ok(true);
+        }
+        Ok(reserve(cpu)?.map(|fd| taken = Some((cpu, fd))).is_some())
+    })?;
+    match (&choice.hold, taken) {
+        (Hold::Reserved { .. }, Some(new)) => *held = Some(new),
+        (Hold::Reserved { .. }, None) => choice.hold = Hold::Kept,
+        _ => *held = None,
+    }
+    Some(choice)
+}
+
+/// [`choose_with`], passing over the CPUs other Hermit runs hold. `reserve`
+/// takes a CPU for this run: `Ok(true)` when the run now holds it, `Ok(false)`
+/// when another run does, and an error when reservations cannot be made at
+/// all. Every draw uses the one observation: it is [`choose_with`]'s draw over
+/// the allowed CPUs not yet found held, so a run passes a held idle CPU over
+/// for another idle one, and then for the least busy free one. With every CPU
+/// held, the run shares the CPU it drew first.
+pub(crate) fn choose_reserving(
+    allowed: &[usize],
+    observe: impl FnOnce(&[usize]) -> Option<Observation>,
+    mut reserve: impl FnMut(usize) -> io::Result<bool>,
+) -> Option<Choice> {
+    let observation = match allowed {
+        [] => return None,
+        [_] => None,
+        _ => observe(allowed),
+    };
+    let mut free = allowed.to_vec();
+    let mut first = None;
+    loop {
+        let (cpu, basis) = match allowed {
+            [only] => (*only, Basis::OnlyAllowed),
+            _ => draw(&free, observation.as_ref()),
+        };
+        let first = *first.get_or_insert((cpu, basis));
+        let hold = match reserve(cpu) {
+            Ok(true) => Hold::Reserved {
+                passed_over: allowed.len() - free.len(),
+            },
+            Ok(false) => {
+                free.retain(|other| *other != cpu);
+                if !free.is_empty() {
+                    continue;
+                }
+                return Some(Choice {
+                    cpu: first.0,
+                    basis: first.1,
+                    hold: Hold::Shared,
+                });
+            }
+            Err(error) => Hold::Unreserved(error.to_string()),
+        };
+        return Some(Choice { cpu, basis, hold });
+    }
+}
+
+/// Hold `cpu` while the returned descriptor is open: an abstract Unix socket
+/// named `<prefix>:<cpu>`, bound close-on-exec, which the kernel releases when
+/// its last descriptor closes, at the latest when Hermit exits. Another run
+/// that binds the same name gets `EADDRINUSE`, answered as `Ok(None)`. The
+/// names belong to a network namespace: runs in different ones do not see
+/// each other's CPUs.
+fn reserve(prefix: &str, cpu: usize) -> io::Result<Option<OwnedFd>> {
+    use std::os::linux::net::SocketAddrExt;
+    let name = format!("{prefix}:{cpu}");
+    let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+    let socket = match std::os::unix::net::UnixDatagram::bind_addr(&address) {
+        Ok(socket) => socket,
+        Err(error) if error.raw_os_error() == Some(libc::EADDRINUSE) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // Keep the reservation on a high descriptor and close the low one it was
+    // bound on (`RESERVATION_FD_FLOOR`).
+    // SAFETY: `socket` is an open descriptor this function owns.
+    let moved = unsafe {
+        libc::fcntl(
+            socket.as_raw_fd(),
+            libc::F_DUPFD_CLOEXEC,
+            RESERVATION_FD_FLOOR,
+        )
+    };
+    if moved < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `moved` is a new descriptor nothing else owns; `socket` closes
+    // its own number when it drops.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(moved) }))
 }
 
 /// Two readings of `/proc/stat`, [`SAMPLE_WINDOW`] apart, and the PMU-bound
@@ -801,13 +1013,214 @@ mod tests {
 
     #[test]
     fn choose_returns_a_member_of_the_allowed_set_or_none_when_it_is_empty() {
-        assert_eq!(choose(&[]), None);
-        assert_eq!(choose(&[42]), Some((42, Basis::OnlyAllowed)));
+        assert_eq!(choose_with(&[], observe), None);
+        assert_eq!(choose_with(&[42], observe), Some((42, Basis::OnlyAllowed)));
         let allowed = cpu_ids_from_this_host();
-        let (cpu, basis) = choose(&allowed).expect("this process has allowed CPUs");
+        let (cpu, basis) = choose_with(&allowed, observe).expect("this process has allowed CPUs");
         assert!(
             allowed.contains(&cpu),
             "chose CPU {cpu} from {allowed:?} ({basis})"
+        );
+    }
+
+    /// A reservation stub over `held`, the CPUs other runs hold.
+    fn held_by_others(held: &[usize]) -> impl FnMut(usize) -> io::Result<bool> {
+        let held = set(held);
+        move |cpu| Ok(!held.contains(&cpu))
+    }
+
+    #[test]
+    fn an_idle_cpu_another_run_holds_is_passed_over_for_another_idle_one() {
+        // CPUs 1 and 2 idle, 3 busy throughout; another run holds CPU 1.
+        for _ in 0..32 {
+            let choice = choose_reserving(
+                &[1, 2, 3],
+                |_| Some(busy(&[(1, 0), (2, 0), (3, 5)], &[])),
+                held_by_others(&[1]),
+            )
+            .expect("three CPUs");
+            assert_eq!(choice.cpu, 2, "{choice}");
+            assert!(
+                matches!(choice.hold, Hold::Reserved { passed_over } if passed_over <= 1),
+                "{choice}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_every_idle_cpu_held_the_least_busy_free_cpu_is_reserved() {
+        // CPUs 1 and 2 idle but held; CPU 3 busy throughout; CPU 4 two ticks
+        // in five, so not idle but the least busy of the free ones.
+        let choice = choose_reserving(
+            &[1, 2, 3, 4],
+            |_| Some(busy(&[(1, 0), (2, 0), (3, 5), (4, 2)], &[])),
+            held_by_others(&[1, 2]),
+        )
+        .expect("four CPUs");
+        assert_eq!(
+            choice,
+            Choice {
+                cpu: 4,
+                basis: Basis::LeastBusy {
+                    candidates: 1,
+                    sampled: 2,
+                    pmu: Pmu::NoneBound
+                },
+                hold: Hold::Reserved { passed_over: 2 },
+            }
+        );
+    }
+
+    #[test]
+    fn with_every_cpu_held_a_run_shares_the_cpu_it_drew_first() {
+        // CPU 1 idle, CPU 2 busy: the first draw is CPU 1, and both are held.
+        let choice = choose_reserving(
+            &[1, 2],
+            |_| Some(busy(&[(1, 0), (2, 5)], &[])),
+            held_by_others(&[1, 2]),
+        )
+        .expect("two CPUs");
+        assert_eq!(
+            choice,
+            Choice {
+                cpu: 1,
+                basis: Basis::Idle {
+                    candidates: 1,
+                    sampled: 2,
+                    pmu: Pmu::NoneBound
+                },
+                hold: Hold::Shared,
+            }
+        );
+    }
+
+    #[test]
+    fn where_reservations_cannot_be_made_the_drawn_cpu_is_used_unreserved() {
+        let choice = choose_reserving(
+            &[1, 2, 3],
+            |_| Some(busy(&[(1, 0), (2, 5), (3, 5)], &[])),
+            |_| Err(io::Error::from_raw_os_error(libc::EPERM)),
+        )
+        .expect("three CPUs");
+        assert_eq!(choice.cpu, 1, "{choice}");
+        assert!(matches!(choice.hold, Hold::Unreserved(_)), "{choice}");
+        assert_eq!(
+            choose_reserving(&[], |_| None, |_| Ok(true)),
+            None,
+            "an empty mask has no CPU to reserve"
+        );
+    }
+
+    /// A name prefix private to one test: its process ID alone could repeat
+    /// across PID namespaces that share a network namespace.
+    fn private_prefix() -> String {
+        format!(
+            "hermit-pinned-core-test:{}:{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        )
+    }
+
+    /// Two runs reserving within a two-CPU set never share a CPU while each
+    /// holds its reservation: the second run's bind of the first one's name
+    /// fails, and it takes the other CPU. A third finds both held and shares.
+    #[test]
+    fn runs_reserving_within_two_cpus_never_share_one() {
+        let prefix = private_prefix();
+        let mut holders = Vec::new();
+        let mut run = || {
+            choose_reserving(
+                &[0, 1],
+                |_| None,
+                |cpu| Ok(reserve(&prefix, cpu)?.map(|fd| holders.push(fd)).is_some()),
+            )
+            .expect("two CPUs")
+        };
+        let (first, second, third) = (run(), run(), run());
+        assert!(
+            matches!(first.hold, Hold::Reserved { .. }),
+            "first run: {first}"
+        );
+        assert!(
+            matches!(second.hold, Hold::Reserved { .. }),
+            "second run: {second}"
+        );
+        assert_ne!(first.cpu, second.cpu);
+        assert_eq!(third.hold, Hold::Shared, "third run: {third}");
+    }
+
+    #[test]
+    fn a_reservation_sits_on_a_high_close_on_exec_descriptor_until_it_closes() {
+        let prefix = private_prefix();
+        let fd = reserve(&prefix, 5)
+            .expect("abstract sockets can be bound")
+            .expect("the name is free");
+        assert!(fd.as_raw_fd() >= RESERVATION_FD_FLOOR, "{fd:?}");
+        // SAFETY: F_GETFD on a descriptor this test owns.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(
+            flags & libc::FD_CLOEXEC,
+            libc::FD_CLOEXEC,
+            "flags {flags:#x}"
+        );
+        assert!(
+            reserve(&prefix, 5).expect("bind").is_none(),
+            "a held name is refused"
+        );
+        drop(fd);
+        assert!(
+            reserve(&prefix, 5).expect("bind").is_some(),
+            "closing the descriptor releases the name"
+        );
+    }
+
+    #[test]
+    fn a_later_run_of_the_process_keeps_the_cpu_it_holds() {
+        let prefix = private_prefix();
+        let mut held = reserve(&prefix, 1).expect("bind").map(|fd| (1, fd));
+        // CPU 1 is idle and this process holds it; CPU 2 is busy.
+        let choice = choose_for_run_with(
+            &[1, 2],
+            |_| Some(busy(&[(1, 0), (2, 5)], &[])),
+            &mut held,
+            |cpu| reserve(&prefix, cpu),
+        )
+        .expect("two CPUs");
+        assert_eq!((choice.cpu, &choice.hold), (1, &Hold::Kept), "{choice}");
+        assert_eq!(held.as_ref().map(|(cpu, _)| *cpu), Some(1));
+    }
+
+    #[test]
+    fn a_run_that_moves_releases_the_cpu_the_process_held() {
+        let prefix = private_prefix();
+        let mut held = reserve(&prefix, 1).expect("bind").map(|fd| (1, fd));
+        // The allowed set no longer has CPU 1: the run reserves CPU 2.
+        let choice = choose_for_run_with(
+            &[2, 3],
+            |_| Some(busy(&[(2, 0), (3, 5)], &[])),
+            &mut held,
+            |cpu| reserve(&prefix, cpu),
+        )
+        .expect("two CPUs");
+        assert_eq!(
+            (choice.cpu, &choice.hold),
+            (2, &Hold::Reserved { passed_over: 0 })
+        );
+        assert_eq!(held.as_ref().map(|(cpu, _)| *cpu), Some(2));
+        assert!(
+            reserve(&prefix, 1).expect("bind").is_some(),
+            "the CPU the process moved away from is free again"
+        );
+        // Then a run restricted to CPU 4, which another run holds, shares it
+        // and leaves this process holding nothing.
+        let _other = reserve(&prefix, 4).expect("bind").expect("free");
+        let choice = choose_for_run_with(&[4], |_| None, &mut held, |cpu| reserve(&prefix, cpu))
+            .expect("one CPU");
+        assert_eq!((choice.cpu, &choice.hold), (4, &Hold::Shared));
+        assert!(held.is_none(), "a shared run holds no reservation");
+        assert!(
+            reserve(&prefix, 2).expect("bind").is_some(),
+            "and the CPU the process held before is free again"
         );
     }
 

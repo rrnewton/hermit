@@ -884,18 +884,22 @@ mod tests {
             PreemptionSummary {
                 max_timeslice_ns: None,
                 timer_enabled: Some(false),
+                stopless_slice_ends: None,
             },
             PreemptionSummary {
                 max_timeslice_ns: Some(200_000_000),
                 timer_enabled: Some(false),
+                stopless_slice_ends: None,
             },
             PreemptionSummary {
                 max_timeslice_ns: Some(12_340),
                 timer_enabled: Some(true),
+                stopless_slice_ends: None,
             },
             PreemptionSummary {
                 max_timeslice_ns: Some(200_000_000),
                 timer_enabled: None,
+                stopless_slice_ends: None,
             },
         ] {
             manifest.preemption = Some(preemption);

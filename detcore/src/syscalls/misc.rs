@@ -17,6 +17,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
 use reverie::syscalls::AddrMut;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::ArchPrctlCmd;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
@@ -24,11 +25,11 @@ use reverie::syscalls::Sysno;
 
 use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
-#[cfg(test)]
-use crate::random::GETRANDOM_MAX_BYTES;
+use crate::fd::RandomDeviceStream;
 use crate::random::RANDOM_FILL_CHUNK_BYTES;
 #[cfg(test)]
 use crate::random::getrandom_request_len;
+use crate::random::splitmix64;
 #[cfg(test)]
 use crate::random::validate_getrandom_flags;
 use crate::random::write_random_chunk;
@@ -44,17 +45,28 @@ use crate::tool_global::set_process_group;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
 
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_SUPP: libc::c_int = 0x1021;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_PERM: libc::c_int = 0x1022;
+#[cfg(target_arch = "x86_64")]
 const ARCH_REQ_XCOMP_PERM: libc::c_int = 0x1023;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_GUEST_PERM: libc::c_int = 0x1024;
+#[cfg(target_arch = "x86_64")]
 const ARCH_REQ_XCOMP_GUEST_PERM: libc::c_int = 0x1025;
 
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_ENABLE: libc::c_int = 0x5001;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_DISABLE: libc::c_int = 0x5002;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_LOCK: libc::c_int = 0x5003;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_UNLOCK: libc::c_int = 0x5004;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_STATUS: libc::c_int = 0x5005;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 
 const SECCOMP_SET_MODE_STRICT: u32 = 0;
@@ -217,6 +229,22 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // ENOSYS everywhere else.
             | libc::PR_CAPBSET_DROP
             | libc::PR_CAP_AMBIENT
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-4763)
+            //
+            // PR_SET_PTRACER names which process may ptrace the caller's
+            // process under the Yama LSM's ptrace scope 1, or any process
+            // (PR_SET_PTRACER_ANY), or none (0). It changes only that
+            // per-process exception, and the answer is a function of the
+            // argument and the host kernel: 0 with Yama, EINVAL for a pid
+            // that names no process, and EINVAL without Yama, where the option
+            // reaches prctl's default case. Android's crash handler (bionic's
+            // debuggerd) calls it with PR_SET_PTRACER_ANY on every fatal
+            // signal and treats EINVAL as "no Yama", but any other error as
+            // fatal: with ENOSYS from here, every crashing guest on Android
+            // exited 1 from inside its own signal handler instead of dying of
+            // the signal.
+            | libc::PR_SET_PTRACER
     )
 }
 
@@ -327,10 +355,10 @@ fn write_get_mempolicy_output<M: MemoryAccess>(
     }
 }
 
-fn from_str(s: &str) -> [i8; 65] {
-    let mut ret: [i8; 65] = [0; 65];
+fn from_str(s: &str) -> [libc::c_char; 65] {
+    let mut ret: [libc::c_char; 65] = [0; 65];
     for (i, ch) in s.bytes().take(64).enumerate() {
-        ret[i] = ch as i8;
+        ret[i] = ch as libc::c_char;
     }
     ret
 }
@@ -346,6 +374,16 @@ fn canonical_random_device_byte(seed: u64, index: u64) -> u8 {
         .wrapping_mul(RANDOM_DEVICE_BYTE_STRIDE)
         .wrapping_add(RANDOM_DEVICE_FIRST_BYTE)
         ^ seed_byte
+}
+
+/// The seed of `stream`'s bytes in a run seeded `run_seed`. Distinct streams
+/// of a run, like distinct run seeds, almost surely get distinct seeds, so two
+/// open files of a random device read different bytes
+/// (`crate::fd::RandomDeviceStream`).
+fn random_device_stream_seed(run_seed: u64, stream: RandomDeviceStream) -> u64 {
+    [stream.creator.as_raw() as u32 as u64, stream.sequence]
+        .into_iter()
+        .fold(run_seed, |seed, word| splitmix64(seed ^ splitmix64(word)))
 }
 
 /// Scatter one stream through an already-imported array. Scratch space is
@@ -416,12 +454,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The host xstate facts of an x86-64-v3 run, or `None` under v2.
+    #[cfg(target_arch = "x86_64")]
     fn v3_host_xstate(&self) -> Option<&detcore_model::cpu_profile::HostXstate> {
         (self.cfg.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3)
             .then_some(self.cfg.cpu_profile_host.as_ref())
             .flatten()
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn write_arch_prctl_u64<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -436,6 +476,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#539): Confirm the virtual arch_prctl control policy.
     /// Preserve thread-local bases while hiding host CPU feature controls.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_arch_prctl<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -814,17 +855,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1096): Review the backend-independent random-device stream.
-    /// Fill guest memory from the canonical stream used by every backend's
-    /// `/dev/random` and `/dev/urandom` virtualization.
+    /// Fill guest memory from `stream`, one of the canonical streams that every
+    /// backend's `/dev/random` and `/dev/urandom` virtualization reads.
     pub(super) fn fill_random_device_bytes<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        stream: RandomDeviceStream,
         remote_buf: AddrMut<u8>,
         len: usize,
         stream_offset: u64,
     ) -> Result<usize, Error> {
         self.fill_random_device_iovecs(
             guest,
+            stream,
             &[crate::iovecs::ImportedIovec {
                 base: remote_buf.as_raw(),
                 len,
@@ -836,10 +879,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(super) fn fill_random_device_iovecs<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        stream: RandomDeviceStream,
         iovecs: &[crate::iovecs::ImportedIovec],
         stream_offset: u64,
     ) -> Result<usize, Error> {
-        let seed = guest.config().rng_seed();
+        let seed = random_device_stream_seed(guest.config().rng_seed(), stream);
         let mut hasher = DefaultHasher::new();
         let written = fill_canonical_random_iovecs(
             &mut guest.memory(),
@@ -850,9 +894,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         )?;
         if cfg!(debug_assertions) {
             detlog!(
-                "[dtid {}] USER RAND [/dev/[u]random] Filled guest memory with {} canonical random bytes at offset {}, hash of bytes: {}",
+                "[dtid {}] USER RAND [/dev/[u]random] Filled guest memory with {} canonical random bytes of {:?} at offset {}, hash of bytes: {}",
                 guest.thread_state().dettid,
                 written,
+                stream,
                 stream_offset,
                 hasher.finish()
             );
@@ -960,9 +1005,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
         let (sysno, args) = reverie::syscalls::SyscallInfo::into_parts(call);
+        #[cfg(target_arch = "x86_64")]
         let pid = if sysno == Sysno::getpgrp {
             0
         } else {
+            args.arg0 as libc::pid_t
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pid = {
+            let _ = sysno;
             args.arg0 as libc::pid_t
         };
         let task = match pid {
@@ -1258,13 +1309,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         const MPOL_F_NODE: u64 = 1;
         const MPOL_F_ADDR: u64 = 2;
         const MPOL_F_MEMS_ALLOWED: u64 = 4;
-        const PAGE: u64 = 4096;
+        // `copy_nodes_to_user` refuses a mask longer than a page.
+        let page = crate::page::page_size();
         let mask = call.nodemask();
         if mask.is_some() && call.maxnode() < 1 {
             return Err(Errno::EINVAL.into());
         }
         // The flags argument is an unsigned long; Reverie decodes it as u32.
-        let flags = guest.regs().await.r8;
+        let flags = crate::arch::syscall_arguments(&guest.regs().await)[4];
         if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 {
             return Err(Errno::EINVAL.into());
         }
@@ -1282,7 +1334,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if let Some(mask) = mask {
             let bytes = (call.maxnode() - 1).div_ceil(64) * 8;
-            if bytes > PAGE.max(8) {
+            if bytes > page.max(8) {
                 return Err(Errno::EINVAL.into());
             }
             let mut words = vec![0u8; bytes as usize];
@@ -1952,6 +2004,15 @@ mod tests {
         assert!(!is_supported_prctl_option(libc::PR_SET_SECUREBITS));
     }
 
+    /// PR_SET_PTRACER reaches the kernel, which answers as Linux does: 0 with
+    /// Yama, EINVAL without it. Before, Detcore answered ENOSYS, which
+    /// bionic's crash handler takes as fatal.
+    #[test]
+    fn set_ptracer_reaches_the_kernel() {
+        assert_eq!(libc::PR_SET_PTRACER, 0x5961_6d61);
+        assert!(is_supported_prctl_option(libc::PR_SET_PTRACER));
+    }
+
     #[test]
     fn getrandom_accepts_linux_flags() {
         for flags in [
@@ -1984,7 +2045,10 @@ mod tests {
     #[test]
     fn getrandom_caps_requests_at_linux_max_rw_count() {
         assert_eq!(getrandom_request_len(16), 16);
-        assert_eq!(getrandom_request_len(usize::MAX), GETRANDOM_MAX_BYTES);
+        assert_eq!(
+            getrandom_request_len(usize::MAX),
+            crate::page::max_rw_count()
+        );
     }
 
     #[test]
@@ -2009,6 +2073,51 @@ mod tests {
             ]
         );
         assert_ne!(seeded, [first, continued].concat());
+    }
+
+    /// Distinct random-device open files read distinct bytes, and each one's
+    /// bytes depend only on the run seed and its name. The pinned seeds catch
+    /// an accidental change to the derivation, which would change every
+    /// guest's random-device bytes and stop older recordings replaying.
+    #[test]
+    fn random_device_streams_are_distinct_per_open_file_and_pinned() {
+        let named = |creator, sequence| RandomDeviceStream {
+            creator: DetPid::from_raw(creator),
+            sequence,
+        };
+        assert_eq!(
+            random_device_stream_seed(0, named(3, 0)),
+            0x0581_cd8e_1945_b98c
+        );
+        assert_eq!(
+            random_device_stream_seed(0, named(3, 1)),
+            0xbd1c_08a3_03e1_67c7
+        );
+        assert_eq!(
+            random_device_stream_seed(17, named(3, 0)),
+            0x149b_5f6d_a3c3_0dbc
+        );
+        let first_bytes = |run_seed, stream| -> Vec<u8> {
+            let seed = random_device_stream_seed(run_seed, stream);
+            (0..8)
+                .map(|index| canonical_random_device_byte(seed, index))
+                .collect()
+        };
+        assert_eq!(
+            first_bytes(0, named(3, 0)),
+            [165, 203, 254, 29, 195, 91, 94, 45]
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for run_seed in [0, 1, 17] {
+            for creator in [3, 5, 7] {
+                for sequence in 0..4 {
+                    assert!(
+                        seen.insert(first_bytes(run_seed, named(creator, sequence))),
+                        "seed {run_seed}, creator {creator}, sequence {sequence}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

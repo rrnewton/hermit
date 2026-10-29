@@ -34,27 +34,60 @@ fn test_fn_with_config<T, F>(
 ) -> Result<(reverie::process::Output, T::GlobalState), reverie::Error>
 where
     T: reverie::Tool + 'static,
-    T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
-    F: FnOnce(),
+    T::GlobalState: reverie::GlobalTool<Config = detcore::Config> + Send,
+    F: FnOnce() + Send,
 {
-    reverie_ptrace::testing::test_fn_with_config::<T, F>(
-        f,
-        detcore_testutils::prepare_ptrace_timer_config(config),
-        capture_output,
-    )
+    on_session_stack(move || {
+        // In-process sessions from different tests wedge each other's tracers;
+        // hold the shared per-test serializer for the session (see testutils).
+        let _session = detcore_testutils::serialized_session();
+        reverie_ptrace::testing::test_fn_with_config::<T, F>(
+            f,
+            detcore_testutils::prepare_ptrace_timer_config(config),
+            capture_output,
+        )
+    })
 }
 
 fn check_fn_with_config<T, F>(f: F, config: detcore::Config, capture_output: bool) -> T::GlobalState
 where
     T: reverie::Tool + 'static,
-    T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
-    F: FnOnce(),
+    T::GlobalState: reverie::GlobalTool<Config = detcore::Config> + Send,
+    F: FnOnce() + Send,
 {
-    reverie_ptrace::testing::check_fn_with_config::<T, F>(
-        f,
-        detcore_testutils::prepare_ptrace_timer_config(config),
-        capture_output,
-    )
+    on_session_stack(move || {
+        let _session = detcore_testutils::serialized_session();
+        reverie_ptrace::testing::check_fn_with_config::<T, F>(
+            f,
+            detcore_testutils::prepare_ptrace_timer_config(config),
+            capture_output,
+        )
+    })
+}
+
+/// Run `run` on a thread with an explicit 16 MiB stack, named after the
+/// calling test thread so the session serializer still keys the hold to
+/// this test. A debug Detcore session overflows the test thread's default
+/// 2 MiB stack under plain `cargo test`; the allowance belongs to these
+/// test sessions, so it is set here in the test harness, not exported to
+/// every Cargo process.
+fn on_session_stack<T>(run: impl FnOnce() -> T + Send) -> T
+where
+    T: Send,
+{
+    let name = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string();
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name(name)
+            .stack_size(16 << 20)
+            .spawn_scoped(scope, run)
+            .unwrap()
+            .join()
+            .unwrap()
+    })
 }
 
 // Keep this synchronized with the clock-query category in `syscall_time`.

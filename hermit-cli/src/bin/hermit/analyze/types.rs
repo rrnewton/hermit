@@ -85,6 +85,28 @@ pub struct AnalyzeOpts {
     )]
     pub minimize: bool,
 
+    /// Search within the target run's schedule instead of between it and a baseline run.
+    ///
+    /// Each trial replays the first K events of the target schedule and then lets the
+    /// scheduler continue without chaos. Replaying none of it gives the baseline outcome and
+    /// replaying all of it the target outcome; a binary search finds the K at which the
+    /// outcome flips. Event #K is the scheduling decision that commits the run to the target:
+    /// the report shows the stack of the thread the target schedule runs there and of the
+    /// thread the scheduler would run instead.
+    ///
+    /// Unlike the default search, it needs no baseline schedule, so events that only one of
+    /// two unrelated runs executed (timeslices that end at other points, iterations of a
+    /// polling loop) cannot stop it. It takes about log2(schedule length) trials.
+    #[clap(
+        long,
+        conflicts_with = "minimize",
+        conflicts_with = "run2_seed",
+        conflicts_with = "run2_preemptions",
+        conflicts_with = "run2_schedule",
+        conflicts_with = "run_needleman"
+    )]
+    pub prefix_search: bool,
+
     /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
     /// enabled.
     #[clap(long)]
@@ -175,11 +197,23 @@ pub struct AnalyzeOpts {
     #[clap(long, short, value_name = "EVTCNT", default_value = "5")]
     pub execution_context: usize,
 
-    /// Where the analysis run will store its temporary artifacts.
+    /// Directory under which the analysis creates its workspace of temporary artifacts
+    /// (schedules, logs, reports of every run), created if missing.
     ///
-    /// By default this is a directory in `/tmp`
+    /// By default the workspace is a directory in `/tmp`
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
+
+    /// The most memory analyze's own process may hold (the schedules and the
+    /// search; each trial runs in a child process and is not counted): a size
+    /// such as `16G` or `512M` (K, M, G and T are powers of 1024) or a byte
+    /// count; `auto`, a quarter of the memory it may use (the host's, or its
+    /// cgroup's limit if lower); or `off`. A watchdog thread reads the
+    /// process's own memory, resident or swapped out, ten times a second and
+    /// ends analyze with exit code 122 once it is over the budget, instead of
+    /// letting it grow until the kernel kills it.
+    #[clap(long, value_name = "SIZE|auto|off", default_value = "auto")]
+    pub max_memory: super::MemoryBudget,
 
     /// Specify that analyze itself should return a non-zero exit code on success.
     /// This is needed under esoteric invocation scenarios.

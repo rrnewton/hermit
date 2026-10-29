@@ -131,29 +131,24 @@ pub(crate) fn take_proc_device() {
     let _ = rendered_procfs::proc_device();
 }
 
+/// Whether `sysno` opens a new descriptor for its path.
+fn creates_descriptor(sysno: Sysno) -> bool {
+    match sysno {
+        Sysno::openat => true,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open | Sysno::creat => true,
+        _ => false,
+    }
+}
+
 /// The path operands of a call that looks up paths ([`Lookups::Paths`] of
 /// [`looked_up`]), without allocating; `None` for every other call.
 pub(super) fn path_operands(sysno: Sysno) -> Option<&'static [(Option<usize>, usize)]> {
     let paths: &'static [(Option<usize>, usize)] = match sysno {
-        Sysno::open
-        | Sysno::creat
-        | Sysno::stat
-        | Sysno::lstat
-        | Sysno::access
-        | Sysno::readlink
-        | Sysno::execve
+        Sysno::execve
         | Sysno::chdir
         | Sysno::chroot
-        | Sysno::mkdir
-        | Sysno::mknod
-        | Sysno::rmdir
-        | Sysno::unlink
         | Sysno::truncate
-        | Sysno::chmod
-        | Sysno::chown
-        | Sysno::lchown
-        | Sysno::utime
-        | Sysno::utimes
         | Sysno::getxattr
         | Sysno::lgetxattr
         | Sysno::setxattr
@@ -163,8 +158,23 @@ pub(super) fn path_operands(sysno: Sysno) -> Option<&'static [(Option<usize>, us
         | Sysno::removexattr
         | Sysno::lremovexattr
         | Sysno::statfs => &[(None, 0)],
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open
+        | Sysno::creat
+        | Sysno::stat
+        | Sysno::lstat
+        | Sysno::access
+        | Sysno::readlink
+        | Sysno::mkdir
+        | Sysno::mknod
+        | Sysno::rmdir
+        | Sysno::unlink
+        | Sysno::chmod
+        | Sysno::chown
+        | Sysno::lchown
+        | Sysno::utime
+        | Sysno::utimes => &[(None, 0)],
         Sysno::openat
-        | Sysno::newfstatat
         | Sysno::statx
         | Sysno::faccessat
         | Sysno::faccessat2
@@ -176,11 +186,16 @@ pub(super) fn path_operands(sysno: Sysno) -> Option<&'static [(Option<usize>, us
         | Sysno::fchmodat
         | Sysno::fchmodat2
         | Sysno::fchownat
-        | Sysno::utimensat
-        | Sysno::futimesat => &[(Some(0), 1)],
+        | Sysno::utimensat => &[(Some(0), 1)],
+        #[cfg(target_arch = "x86_64")]
+        Sysno::newfstatat | Sysno::futimesat => &[(Some(0), 1)],
+        #[cfg(target_arch = "aarch64")]
+        Sysno::fstatat => &[(Some(0), 1)],
+        #[cfg(target_arch = "x86_64")]
         Sysno::symlink => &[(None, 1)],
         Sysno::symlinkat => &[(Some(1), 2)],
         Sysno::inotify_add_watch => &[(None, 1)],
+        #[cfg(target_arch = "x86_64")]
         Sysno::rename | Sysno::link => &[(None, 0), (None, 1)],
         Sysno::renameat | Sysno::renameat2 | Sysno::linkat => &[(Some(0), 1), (Some(2), 3)],
         _ => return None,
@@ -454,6 +469,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let numbers = self
             .parent_numbers(guest, &lookups, &values, &recovered_paths)
             .await;
+        // A spelling relative to the working directory is decided from the
+        // guest's working directory, which the tool may first have to read
+        // from the guest (`Detcore::prepare_guest_cwd`: KVM), here, before
+        // the decisions, which do not await.
+        if !crate::procfs_inode::tool_can_read_guest_cwd(&self.cfg.backend) {
+            for (dirfd, spelling) in Self::looked_up_spellings(guest, &lookups, &values) {
+                Self::prepare_guest_cwd(guest, dirfd, &spelling).await;
+            }
+        }
         // Whether a refusal for permission can only be the KVM executor's.
         let mut confined = true;
         let replacements = match lookups {
@@ -601,6 +625,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             .iter()
             .map(|path| (libc::AT_FDCWD, path.clone()))
             .collect::<Vec<_>>();
+        spellings.extend(Self::looked_up_spellings(guest, lookups, values));
+        let named = spellings
+            .iter()
+            .filter_map(|(dirfd, spelling)| Self::observed_path(guest, *dirfd, spelling).ok())
+            .flat_map(|path| crate::procfs::ids::named_ids(&path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if named.is_empty() {
+            return Some(BTreeMap::new());
+        }
+        let kernel = crate::tool_global::procfs_ids(guest, true, named.clone()).await;
+        Some(named.into_iter().zip(kernel).collect())
+    }
+
+    /// The spellings `lookups` names in a call's argument `values`, each with
+    /// the directory descriptor it is looked up from (`AT_FDCWD` for the
+    /// working directory): the path operands, or the pathname a socket
+    /// address names.
+    fn looked_up_spellings<G: Guest<Self>>(
+        guest: &G,
+        lookups: &Lookups,
+        values: &[usize; 6],
+    ) -> Vec<(i32, PathBuf)> {
+        let mut spellings = Vec::new();
         match lookups {
             Lookups::Paths(operands) => {
                 for (dirfd, path) in operands {
@@ -636,18 +685,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
-        let named = spellings
-            .iter()
-            .filter_map(|(dirfd, spelling)| Self::observed_path(guest, *dirfd, spelling).ok())
-            .flat_map(|path| crate::procfs::ids::named_ids(&path))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if named.is_empty() {
-            return Some(BTreeMap::new());
-        }
-        let kernel = crate::tool_global::procfs_ids(guest, true, named.clone()).await;
-        Some(named.into_iter().zip(kernel).collect())
+        spellings
     }
 
     /// What Detcore decides about `spelling`, relative to `dirfd` (`None`
@@ -905,7 +943,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         unmap_transient(guest, page, length).await;
         match result {
             Ok(value) => {
-                if matches!(sysno, Sysno::open | Sysno::openat | Sysno::creat) {
+                if creates_descriptor(sysno) {
                     let _ = self
                         .record_or_replay(guest, syscalls::Close::new().with_fd(value as RawFd))
                         .await;
@@ -1202,12 +1240,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let level = self.cfg.proc_level;
         let Some(resolved) = (match self.guest_root_in_view(guest) {
-            Some(None) => call
-                .path()
-                .and_then(|path| path.read(&guest.memory()).ok())
-                .and_then(|path| Self::observed_path(guest, call.dirfd(), &path).ok())
-                .filter(|observed| observed.is_absolute())
-                .and_then(|observed| resolve_links(&observed)),
+            Some(None) => {
+                let spelling: Option<PathBuf> =
+                    call.path().and_then(|path| path.read(&guest.memory()).ok());
+                match spelling {
+                    Some(path) => {
+                        Self::prepare_guest_cwd(guest, call.dirfd(), &path).await;
+                        Self::observed_path(guest, call.dirfd(), &path)
+                            .ok()
+                            .filter(|observed| observed.is_absolute())
+                            .and_then(|observed| resolve_links(&observed))
+                    }
+                    None => None,
+                }
+            }
             _ => None,
         }) else {
             return false;

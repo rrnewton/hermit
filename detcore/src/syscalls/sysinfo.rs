@@ -269,6 +269,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`Scheduler::set_rss_limit`), which a rendered `/proc/<pid>/stat` shows
     /// whoever reads it (field 25): after a `setrlimit` or `prlimit64` of the
     /// caller's own process changed it from `previous` to `requested`.
+    // The syscall resource argument is unsigned; libc exposes RLIMIT_RSS as
+    // u32 on GNU and i32 on musl, with the same nonnegative Linux value.
+    #[allow(clippy::unnecessary_cast)]
     async fn publish_rss_limit<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -276,7 +279,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         previous: ResourceLimit,
         requested: ResourceLimit,
     ) {
-        if resource == libc::RLIMIT_RSS && requested.current != previous.current {
+        if resource == libc::RLIMIT_RSS as u32 && requested.current != previous.current {
             let process = self.own_detpid(guest);
             crate::tool_global::set_rss_limit(guest, process, requested.current).await;
         }

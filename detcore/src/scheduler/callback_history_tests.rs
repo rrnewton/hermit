@@ -691,4 +691,108 @@ mod callback_history_scheduler_tests {
         let empty = s.next_turns[&a].req.try_read().unwrap().unwrap();
         assert!(empty.resources.is_empty());
     }
+
+    /// A schedule replay whose next recorded event is `a`'s close posthook.
+    fn replay_waiting_for(a: DetTid) -> Scheduler {
+        let mut s = Scheduler::new(&Config::default());
+        let mut a_post = SchedEvent::syscall(a, Sysno::close, SyscallPhase::Posthook);
+        a_post.end_time = Some(LogicalTime::ZERO);
+        s.replayer = Some(crate::scheduler::replayer::Replayer::new([
+            a_post.clone(),
+            a_post,
+        ]));
+        s
+    }
+
+    /// `spinner` takes `UNMATCHED_EVENTS_BEFORE_RELEASE` traced events in a
+    /// row, none of them the schedule's next, and the replay releases the
+    /// schedule at the last (`Replayer::release_schedule`).
+    fn release_by_spinning(s: &mut Scheduler, spinner: DetTid) {
+        let mut spin = SchedEvent::syscall(spinner, Sysno::sched_yield, SyscallPhase::Posthook);
+        spin.end_time = Some(LogicalTime::ZERO);
+        for _ in 1..crate::scheduler::replayer::UNMATCHED_EVENTS_BEFORE_RELEASE {
+            s.consume_schedevent(&spin);
+        }
+        assert!(!s.schedule_released());
+        assert!(s.consume_schedevent(&spin).keep_running);
+        assert!(s.schedule_released());
+    }
+
+    /// A thread the replay holds back files a priority request that carries
+    /// a callback checkpoint, so it has popped its own copy of the checkpoint
+    /// already; the spinner's traced events then release the schedule, and
+    /// only after that is the request selected. The scheduler's copy of the
+    /// checkpoint must still be there for the request to consume: the thread
+    /// has not heard of the release yet. Before, the release emptied every
+    /// thread's scheduler copy at once and the selection panicked ("callback
+    /// request has a recorded origin";
+    /// https://github.com/rrnewton/hermit/pull/4615 review).
+    #[test]
+    fn a_checkpoint_request_filed_before_a_release_is_selected_after_it() {
+        let a = tid(3);
+        let b = tid(4);
+        let mut s = replay_waiting_for(a);
+        let mut a_request = priority(a, false);
+        attach(&mut s, &mut a_request);
+        install(&mut s, a, REPLAY_DEFERRED_PRIORITY, a_request);
+        install(&mut s, b, REPLAY_FOREGROUND_PRIORITY, Resources::new(b));
+        release_by_spinning(&mut s, b);
+        s.logically_kill_thread(&b, &DetPid::from_raw(b.as_raw()), MmId::initial(b));
+        s.drain_pending_run_queue_removals();
+        let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        s.bump_global_time(&global, &Err(SkipTurn));
+        let (selected, request, response) = s.step3_peek().unwrap();
+        assert_eq!(selected, a);
+        let posted = request.try_read().unwrap().unwrap();
+        assert!(posted.callback_checkpoint.is_some());
+        let turn = s.turn;
+        assert!(
+            s.step4_resource_block(a, &posted, &response).is_err(),
+            "the change point is a skipped turn"
+        );
+        assert_eq!(s.turn, turn + 1);
+        assert!(s.callback_checkpoints[&a].is_empty());
+        assert_eq!(
+            s.get_priority(a),
+            crate::scheduler::runqueue::DEFAULT_PRIORITY,
+            "past the release the change point takes the default priority"
+        );
+    }
+
+    /// The other half of the same window: a thread that has not heard of the
+    /// release yet checks its own copy of a checkpoint at a callback and
+    /// reports a mismatch. The scheduler pops its copy of the same checkpoint
+    /// and records the DESYNC line. Before, the release had emptied the
+    /// scheduler's copy and the report hit the custody assertion.
+    #[test]
+    fn a_checkpoint_mismatch_reported_after_a_release_finds_its_checkpoint() {
+        use crate::preemptions::callback_history::Checkpoint;
+        let a = tid(3);
+        let b = tid(4);
+        let mut s = replay_waiting_for(a);
+        let point = Checkpoint {
+            history_index: 0,
+            origin: row_origin(20),
+        };
+        s.callback_checkpoints
+            .insert(a, std::collections::VecDeque::from([point.clone()]));
+        install(&mut s, a, REPLAY_DEFERRED_PRIORITY, Resources::new(a));
+        install(&mut s, b, REPLAY_FOREGROUND_PRIORITY, Resources::new(b));
+        release_by_spinning(&mut s, b);
+        let actual = crate::preemptions::callback_history::Origin {
+            time: LogicalTime::from_nanos(201),
+            ..point.origin.clone()
+        };
+        s.callback_checkpoint_mismatch(a, &point, true, &actual);
+        assert!(s.callback_checkpoints[&a].is_empty());
+        let text = s
+            .generate_partial_run_summary(None)
+            .unwrap()
+            .desync_descrip
+            .unwrap();
+        assert!(
+            text.contains("DESYNC callback checkpoint 0 for 3"),
+            "{text}"
+        );
+    }
 }

@@ -100,6 +100,7 @@ use super::io::Pselect6SigmaskArg;
 use super::io::ppoll_timeout_duration;
 use super::io::pselect6_fd_set_len;
 use super::io::read_pselect6_fd_set;
+#[cfg(target_arch = "x86_64")]
 use super::io::select_timeout_duration;
 use super::io::write_pselect6_fd_set;
 use crate::fd::FdType;
@@ -109,7 +110,9 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::helpers::NonblockableSyscall;
+use crate::syscalls::helpers::PollProbe;
 use crate::syscalls::helpers::get_fd;
+#[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::poll_nfds;
 use crate::syscalls::helpers::record_retry_event;
@@ -303,28 +306,30 @@ fn is_configuration_option(level: i32, name: i32) -> bool {
 /// ignores. Everything else on a channel is answered by the engine or
 /// refused.
 fn channel_call_takes_ordinary_path(call: &Syscall) -> bool {
-    matches!(
-        call,
+    match call {
         Syscall::Close(_)
-            | Syscall::Fcntl(_)
-            | Syscall::Fstat(_)
-            | Syscall::Fstatfs(_)
-            | Syscall::Openat(_)
-            | Syscall::Mkdirat(_)
-            | Syscall::Mknodat(_)
-            | Syscall::Fchownat(_)
-            | Syscall::Futimesat(_)
-            | Syscall::Newfstatat(_)
-            | Syscall::Unlinkat(_)
-            | Syscall::Readlinkat(_)
-            | Syscall::Fchmodat(_)
-            | Syscall::Faccessat(_)
-            | Syscall::NameToHandleAt(_)
-            | Syscall::Execveat(_)
-            | Syscall::Statx(_)
-            | Syscall::Symlinkat(_)
-            | Syscall::Utimensat(_)
-    )
+        | Syscall::Fcntl(_)
+        | Syscall::Fstat(_)
+        | Syscall::Fstatfs(_)
+        | Syscall::Openat(_)
+        | Syscall::Mkdirat(_)
+        | Syscall::Mknodat(_)
+        | Syscall::Fchownat(_)
+        | Syscall::Unlinkat(_)
+        | Syscall::Readlinkat(_)
+        | Syscall::Fchmodat(_)
+        | Syscall::Faccessat(_)
+        | Syscall::NameToHandleAt(_)
+        | Syscall::Execveat(_)
+        | Syscall::Statx(_)
+        | Syscall::Symlinkat(_)
+        | Syscall::Utimensat(_) => true,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Futimesat(_) | Syscall::Newfstatat(_) => true,
+        #[cfg(target_arch = "aarch64")]
+        Syscall::Fstatat(_) => true,
+        _ => false,
+    }
 }
 
 /// Whether `call`, naming an IPv4 or IPv6 socket of `kind` that is not a
@@ -607,11 +612,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call {
             // A connect may create a channel and a poll may name one; each
             // falls back to its ordinary handler otherwise.
-            Syscall::Connect(_) | Syscall::Poll(_) | Syscall::Ppoll(_) => true,
+            Syscall::Connect(_) | Syscall::Ppoll(_) => true,
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Poll(_) => true,
             // A received descriptor may be a socket this module never saw.
             Syscall::Recvmsg(_) | Syscall::Recvmmsg(_) => true,
             // Only AF_UNIX sockets stay out of the host's network namespace.
             Syscall::Socket(c) => c.family() != libc::AF_UNIX,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Select(c) => Self::select_names_channel(
                 guest,
                 c.nfds(),
@@ -757,6 +765,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call {
             Syscall::Socket(c) => return self.network_socket(guest, c).await,
             Syscall::Connect(c) => return self.network_connect(guest, c).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(c) => return self.network_poll(guest, c).await,
             Syscall::Ppoll(c) => return self.network_ppoll(guest, c).await,
             Syscall::Setsockopt(c) => return self.network_setsockopt(guest, c).await,
@@ -797,6 +806,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Select(c) => return self.network_select(guest, c).await,
             Syscall::Pselect6(c) => return self.network_pselect6(guest, c).await,
             Syscall::Sendfile(_)
@@ -1166,6 +1176,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Option<i16>, Error> {
         let mut stack = guest.stack().await;
         let pollfd: AddrMut<libc::pollfd> = stack.reserve();
+        let probe = PollProbe::reserve(&mut stack);
         let _guard = stack.commit()?;
         guest.memory().write_value(
             pollfd,
@@ -1176,10 +1187,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
         )?;
         loop {
-            let call = syscalls::Poll::new()
-                .with_fds(Some(pollfd.cast()))
-                .with_nfds(1)
-                .with_timeout(timeout_millis);
+            let call = probe.call(guest.memory(), pollfd, 1, timeout_millis)?;
             match guest.inject(call).await {
                 Ok(0) => return Ok(None),
                 Ok(_) => {
@@ -1881,6 +1889,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `poll` naming at least one channel.
+    #[cfg(target_arch = "x86_64")]
     async fn network_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1963,6 +1972,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#3804): Review select on a recorded socket.
     // https://github.com/rrnewton/hermit/issues/3804
+    #[cfg(target_arch = "x86_64")]
     async fn network_select<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2145,6 +2155,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let probe_host = probe.iter().any(|pollfd| pollfd.fd >= 0);
         let mut stack = guest.stack().await;
         let scratch: AddrMut<[u8; POLL_PULL_BYTES]> = stack.reserve();
+        let poll_probe = PollProbe::reserve(&mut stack);
         let _guard = stack.commit()?;
         let probe_address = match address {
             Some(address) => address,
@@ -2189,10 +2200,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .memory()
                     .write_values(probe_address, &probe)
                     .map_err(|_| Errno::EFAULT)?;
-                let call = syscalls::Poll::new()
-                    .with_fds(Some(probe_address.cast()))
-                    .with_nfds(probe.len() as libc::nfds_t)
-                    .with_timeout(0);
+                let call = poll_probe.call(
+                    guest.memory(),
+                    probe_address.cast(),
+                    probe.len() as libc::nfds_t,
+                    0,
+                )?;
                 let probed = guest.inject(call).await;
                 let mut after = probe.clone();
                 let read = guest.memory().read_values(probe_address.into(), &mut after);

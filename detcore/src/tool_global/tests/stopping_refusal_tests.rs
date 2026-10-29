@@ -28,6 +28,13 @@
 //! killed first. The mutation it catches: `PolicyRefusal` semantics (the
 //! reason recorded and the request answered), under which the init goes on,
 //! the sentinel writes its file and the run ends normally.
+//!
+//! The forking test runs in a process of its own (`in_own_process`). A
+//! forked child of a multithreaded process may only do what is safe after a
+//! fork, and the init here runs the coordinator's handling of a request,
+//! which takes locks. In the library suite, another test's thread can hold
+//! such a lock when the init is forked, and the init then waits for it for
+//! ever: the whole suite hung on that futex.
 
 use std::os::unix::ffi::OsStrExt;
 
@@ -37,6 +44,44 @@ use super::*;
 
 /// The refusing child's thread, as the scheduler numbers it.
 const CHILD: DetTid = DetTid::from_raw(7);
+
+/// Whether this process runs the test `name` of this module by itself.
+///
+/// In the library suite this re-executes the test binary for exactly that
+/// test and requires that it passed, within two minutes, and returns false.
+/// In the process it starts, where the only other thread is libtest's main
+/// thread waiting for the test, it returns true and the caller runs the test.
+fn in_own_process(name: &str) -> bool {
+    const CHILD_TEST: &str = "HERMIT_STOPPING_REFUSAL_TEST";
+    let test = format!("tool_global::tests::stopping_refusal_tests::{name}");
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test.as_str()) {
+        return true;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .env(CHILD_TEST, &test)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("launch the test in a process of its own");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+        "test {test} in its own process did not pass exactly once within two minutes: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    false
+}
 
 /// `/proc/PID/ns/pid` as a NUL-terminated path in `buffer`, without
 /// allocating (for a forked process).
@@ -109,6 +154,9 @@ fn members(namespace: &std::ffi::OsStr) -> Vec<String> {
 
 #[test]
 fn a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run() {
+    if !in_own_process("a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run") {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let sentinel = dir.path().join("sentinel");
     let sentinel_path = std::ffi::CString::new(sentinel.as_os_str().as_bytes()).unwrap();
@@ -140,6 +188,15 @@ fn a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run() {
     let mut report = [0; 2];
     let mut trigger = [0; 2];
     let mut proceed = [0; 2];
+    // The forks below are safe only with no other thread that could hold a
+    // lock: here libtest's main thread, waiting for this one, is the only one.
+    let mut threads = 0;
+    crate::util::find_in_directory(std::path::Path::new("/proc/self/task"), |_| {
+        threads += 1;
+        None::<()>
+    })
+    .unwrap();
+    assert!(threads <= 2, "{threads} threads at the first fork");
     // SAFETY: plain descriptor and process calls. Each forked process uses
     // only what the parent made before the fork and async-signal-safe calls;
     // the init also runs the coordinator's handling of one request, polled

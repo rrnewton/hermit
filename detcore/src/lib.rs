@@ -36,6 +36,7 @@
 #![deny(missing_docs)]
 #![allow(clippy::uninlined_format_args)]
 
+mod arch;
 mod config;
 mod consts;
 mod cpu_clock;
@@ -48,6 +49,8 @@ pub mod dispatch_observer;
 /// Schedule-alignment and edit-distance algorithms shared by Hermit tools.
 #[allow(missing_docs)]
 pub mod edit_distance;
+#[cfg(test)]
+mod edited_replay_hook_tests;
 pub mod exec_record;
 pub mod exit_dependencies;
 mod fatal_core;
@@ -70,6 +73,7 @@ mod memory;
 pub mod native_exec;
 pub mod netlink_route;
 pub mod nonwaiting_write;
+mod page;
 mod pipe_wake;
 #[cfg(test)]
 mod predicted_death_tests;
@@ -91,6 +95,7 @@ mod signal_state;
 pub mod slice_boundary;
 mod sock_diag;
 mod stat;
+mod store_exclusive;
 mod syscall_classification;
 mod syscall_histogram;
 #[cfg(test)]
@@ -162,7 +167,9 @@ pub use finalization::TerminalReplayRefusal;
 pub use finalization::combine_finalization;
 #[cfg(test)]
 use rand::RngExt as _;
+#[cfg(target_arch = "x86_64")]
 use raw_cpuid::CpuIdResult;
+#[cfg(target_arch = "x86_64")]
 use raw_cpuid::cpuid;
 pub use record_or_replay::RecordOrReplay;
 use reverie::Error;
@@ -170,7 +177,9 @@ use reverie::ExitStatus;
 use reverie::GlobalRPC;
 use reverie::Guest;
 use reverie::Pid;
+#[cfg(target_arch = "x86_64")]
 use reverie::Rdtsc;
+#[cfg(target_arch = "x86_64")]
 use reverie::RdtscResult;
 use reverie::RegDisplay;
 use reverie::Signal;
@@ -181,8 +190,10 @@ use reverie::Tool;
 pub use reverie::process::Namespace;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Displayable;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::EpollCreate1;
 use reverie::syscalls::Errno;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::InotifyInit1;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
@@ -406,6 +417,7 @@ use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscall_classification::is_zero_copy_pipe_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
+#[cfg(target_arch = "x86_64")]
 use crate::syscalls::time::guest_clock_time;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
@@ -444,6 +456,66 @@ fn rcb_timer_overshot(delta_rcbs: u64, last_timer: u64) -> bool {
 /// timer for: `armed` branches past `committed`, that handler's clock value
 /// (`keep_timer_across_dropped_signal`). At least one: a stop at or past the
 /// point fires the event at once, where the backend records any overshoot.
+/// Timeslice ends processed without a stop (`Detcore::catch_up_lone_slice_ends`),
+/// counted for the run summary (`PreemptionSummary::stopless_slice_ends`).
+/// Process-wide: a run reports its growth since it started, so two runs in
+/// one process at the same time would each count both.
+pub(crate) static STOPLESS_SLICE_ENDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How far ahead, in retired conditional branches, the backstop timer of a
+/// thread running alone fires at the earliest (`arm_lone_backstop`): 20 ms of
+/// virtual time at the default clock multiplier. A stop this rare costs
+/// nothing next to the slice ends it replaces at small `--max-timeslice`
+/// values, and it bounds how long a host input waits for a scheduler turn.
+const LONE_BACKSTOP_RCBS: u64 = 2_000_000;
+
+/// Arm the timer of a thread running alone: an imprecise one, at least
+/// [`LONE_BACKSTOP_RCBS`] ahead and never before the pending slice end
+/// (`rcbs_to_end` away), so it adds no stop a stop at every end would not.
+/// It ends no slice. Its event processes the slice ends the thread ran past
+/// (`Detcore::catch_up_lone_slice_ends`) and arms the next timer, so a long
+/// stretch without a syscall still enters Detcore now and then. Where it
+/// lands does not matter: each end is processed at its own branch count.
+fn arm_lone_backstop<G, T>(guest: &mut G, rcbs_to_end: u64)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    guest
+        .set_timer(TimerSchedule::Rcbs(LONE_BACKSTOP_RCBS.max(rcbs_to_end)))
+        .expect("Failed to set timer");
+}
+
+/// Stop skipping the pending slice end of a thread that no longer runs
+/// alone (a reply without `GlobalResponse::WithLoneGrant`): arm the precise
+/// timer for it, as the post-hook arms it for a thread that never ran alone.
+/// The counter has not passed it: every callback first processes the ends
+/// the thread ran past.
+pub(crate) fn stop_skipping_lone_slice_end<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(end) = guest.thread_state_mut().lone_slice_end.take() else {
+        return;
+    };
+    let now = guest.read_clock().expect("Couldn't read clock");
+    assert!(
+        end > now,
+        "a slice end at branch {end} that the counter ({now}) passed was not processed"
+    );
+    {
+        let thread_state = guest.thread_state_mut();
+        let committed = thread_state.committed_clock_value;
+        thread_state.last_rcb_timer = Some(end - committed);
+        thread_state.last_rcb_timer_is_max = true;
+    }
+    guest
+        .set_timer_precise(TimerSchedule::Rcbs(end - now))
+        .expect("Failed to set timer");
+}
+
 fn kept_timer_rcbs(committed: u64, armed: u64, now: u64) -> u64 {
     committed.saturating_add(armed).saturating_sub(now).max(1)
 }
@@ -471,24 +543,6 @@ fn choose_rcb_timer(
 struct PriorityCheckin<'a> {
     token: Option<&'a preemptions::callback_history::Token>,
     site: preemptions::callback_history::Site,
-}
-
-/// The registers a syscall's completion leaves, computed from `entry`, the
-/// context at its entry (`rip` at the `syscall` instruction): `rax` holds the
-/// result, `rip` follows the instruction, and the instruction's own clobbers
-/// hold `rcx` = that `rip` and `r11` = `rflags` (signal phase 1's completed
-/// projection, design section 4). Only read, never written back.
-fn completed_syscall_projection(
-    entry: libc::user_regs_struct,
-    result: i64,
-) -> libc::user_regs_struct {
-    const SYSCALL_INSTRUCTION_LENGTH: u64 = 2;
-    let mut completed = entry;
-    completed.rax = result as u64;
-    completed.rip = entry.rip.wrapping_add(SYSCALL_INSTRUCTION_LENGTH);
-    completed.rcx = completed.rip;
-    completed.r11 = entry.eflags;
-    completed
 }
 
 /// Why this configuration cannot keep the two-phase delivery protocol
@@ -579,7 +633,8 @@ enum CheckIn {
     /// A syscall, signal, timer, exec or thread start: any expired slice ends.
     Event,
     /// A trapped `rdtsc` or `cpuid` in the middle of user code: see
-    /// [`ThreadState::instruction_trap_ends_timeslice`].
+    /// [`ThreadState::instruction_trap_ends_timeslice`]. Only x86 traps them.
+    #[cfg(target_arch = "x86_64")]
     InstructionTrap,
 }
 
@@ -778,7 +833,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(result) = completed {
             let entry = guest.regs().await;
             guest.thread_state_mut().signal_register_projection =
-                Some(completed_syscall_projection(entry, result));
+                Some(arch::completed_syscall_projection(entry, result));
         }
         let pipeline = self.handle_signal_event(guest, Signal::SIGALRM).await;
         guest.thread_state_mut().signal_register_projection = None;
@@ -1213,7 +1268,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// interrupted call's address, and the wait resumes with its original deadline
     /// (https://github.com/rrnewton/hermit/issues/3358). Detcore emulates those
     /// waits, so it resumes them from the record the wait kept
-    /// (`syscalls::helpers::RestartBlock`). Any other `restart_syscall` keeps the
+    /// (`syscalls::helpers::RestartBlock`), as it does a `poll` with a positive
+    /// timeout that it ran in the kernel. Any other `restart_syscall` keeps the
     /// unsupported-syscall policy.
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3361): Review the
     // emulated `restart_syscall` resumption and the record it consumes.
@@ -1225,10 +1281,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         dettid: DetTid,
         panic_on_unsupported_syscalls: bool,
     ) -> Result<i64, Error> {
-        let rip = guest.regs().await.rip;
+        let rip = arch::instruction_pointer(&guest.regs().await);
         let Some(block) = restart_block.and_then(|block| block.resumed_at(rip)) else {
             trace!(
-                "[detcore, dtid {}] restart_syscall at {:#x} restarts no wait Detcore emulated ({:?})",
+                "[detcore, dtid {}] restart_syscall at {:#x} restarts no wait Detcore kept a record for ({:?})",
                 dettid, rip, restart_block
             );
             return self
@@ -1240,9 +1296,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             dettid, block
         );
         match block.call {
+            #[cfg(target_arch = "x86_64")]
             syscalls::helpers::RestartCall::Poll(poll) => {
                 self.handle_internal_poll_until(guest, poll, block.deadline)
                     .await
+            }
+            #[cfg(target_arch = "x86_64")]
+            syscalls::helpers::RestartCall::KernelPoll(poll, deadline) => {
+                self.resume_kernel_poll(guest, poll, deadline).await
             }
             syscalls::helpers::RestartCall::Futex(futex) => {
                 self.handle_futex_from(
@@ -1258,7 +1319,187 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .expect("a claimed nanosleep keeps its absolute deadline");
                 self.resume_nanosleep(guest, call, deadline).await
             }
+            // A wait Detcore ran in the kernel as the guest made it resumes in
+            // the kernel, from the restart block that wait left.
+            syscalls::helpers::RestartCall::InKernel(sysno) => {
+                syscalls::helpers::resume_kernel_wait(guest, call, sysno).await
+            }
         }
+    }
+
+    /// A precise timer event, or a skipped slice end of a lone thread
+    /// processed at its own branch count (`catch_up_lone_slice_ends`, with
+    /// `ThreadState::replaying_lone_slice_end` set): the same code either way.
+    async fn take_timer_event<G: Guest<Self>>(&self, guest: &mut G) {
+        // A preemption stops the guest in user code (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+
+        info!(
+            "[detcore, dtid {}] inbound timer preemption event",
+            guest.thread_state().dettid
+        );
+        if guest.config().preemption_stacktrace {
+            let mut file_writer: Box<dyn Write> =
+                match &guest.config().preemption_stacktrace_log_file {
+                    Some(path) => Box::new(
+                        File::create(path).expect("Failed to open preemption stacktrace log file"),
+                    ),
+                    // Under --max-log-bytes a full stderr must not stop the
+                    // run before the cap; see `util::DroppingStderr`.
+                    None if crate::nonwaiting_write::diagnostics_must_not_wait() => {
+                        Box::new(crate::util::DroppingStderr)
+                    }
+                    None => Box::new(std::io::stderr()),
+                };
+            let ts = guest.thread_state();
+            writeln!(
+                file_writer,
+                "\n>>> Guest tid {} preempted at thread time {} with stack trace:",
+                ts.dettid,
+                ts.thread_logical_time.as_nanos(),
+            )
+            .unwrap();
+            if let Some(backtrace) = guest.backtrace() {
+                if let Ok(pbt) = backtrace.pretty() {
+                    writeln!(file_writer, "{}", pbt).unwrap();
+                } else {
+                    writeln!(file_writer, "{}", backtrace).unwrap();
+                }
+            } else {
+                warn!("Could not read backtrace!");
+            }
+        }
+        // This may LOOK like a noop, but actually all of the logic for ending the timeslice is in
+        // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
+        // to this prehook.
+        let boundary_entry = if guest.config().no_rcb_time {
+            slice_boundary::callbacks::Callback::NoRcbTimer
+        } else {
+            slice_boundary::callbacks::Callback::PmuTimer
+        };
+        let boundary_token = self
+            .pre_handler_hook_observed(guest, true, CheckIn::Event, Some(boundary_entry))
+            .await;
+        if guest.config().no_rcb_time && guest.thread_state().last_rcb_timer_is_max {
+            let max_timeslice_end = guest
+                .thread_state()
+                .max_timeslice_end
+                .expect("PMU maximum timer requires a deadline");
+            guest
+                .thread_state_mut()
+                .thread_logical_time
+                .advance_to(max_timeslice_end);
+            if self.cfg.observes_schedevents() {
+                let dettid = guest.thread_state().dettid;
+                let ev = with_guest_time(
+                    guest,
+                    SchedEvent {
+                        dettid,
+                        op: Op::OtherInstructions,
+                        count: 1,
+                        start_rip: None,
+                        end_rip: None,
+                        end_time: None,
+                    },
+                );
+                let ev = with_guest_rip(guest, ev).await;
+                trace_schedevent(guest, ev, false).await;
+            }
+            if guest.thread_state().follows_replayed_schedule(&self.cfg)
+                && guest.thread_state().slice_boundary.is_none()
+            {
+                let fallback_deadline = max_timeslice_end
+                    + Duration::from_nanos(u64::from(
+                        self.cfg
+                            .max_timeslice
+                            .expect("PMU maximum must be configured"),
+                    ));
+                let thread_state = guest.thread_state_mut();
+                let replay_deadline = thread_state
+                    .end_of_timeslice
+                    .filter(|deadline| *deadline > max_timeslice_end)
+                    .unwrap_or(fallback_deadline);
+                thread_state.end_of_timeslice = Some(replay_deadline);
+                thread_state.max_timeslice_end = Some(replay_deadline);
+                thread_state.last_rcb_timer = None;
+                thread_state.last_rcb_timer_is_max = false;
+                thread_state.stats.reset_timeslice();
+            } else if guest.thread_state().own_signal_turn_hold.is_none() {
+                slice_boundary::no_rcb_maximum(guest.thread_state_mut())
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+                self.end_timeslice(guest).await;
+            }
+        }
+        self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
+            .await;
+    }
+
+    /// Process, in order, every slice end a lone thread ran past without a
+    /// stop (`ThreadState::lone_slice_end`), each at its own branch count and
+    /// through the same code as a timer event there (`take_timer_event`).
+    /// Called first in every callback that sees the guest stopped, before
+    /// that callback changes anything, so these ends come where the stops
+    /// would have put them: before what the guest did next.
+    ///
+    /// Equivalent to the stops: the scheduler marked each grant lone
+    /// (`Scheduler::runs_alone_until_it_enters_detcore`), so until now nothing
+    /// but this thread's own requests could change what any pass decides; a
+    /// slice end reads nothing from the guest but its branch count, which
+    /// the clock update takes from the end itself; and the next end follows
+    /// from the same deadline arithmetic in the post-hook. Afterwards the
+    /// thread keeps running alone, or, if the last grant was not marked
+    /// lone, gets the precise timer for its next end.
+    async fn catch_up_lone_slice_ends<G: Guest<Self>>(&self, guest: &mut G) {
+        let Some(mut end) = guest.thread_state().lone_slice_end else {
+            return;
+        };
+        let reached = guest.read_clock().expect("Couldn't read clock");
+        while end <= reached {
+            {
+                let thread_state = guest.thread_state_mut();
+                thread_state.lone_slice_end = None;
+                thread_state.replaying_lone_slice_end = Some(end);
+            }
+            self.take_timer_event(guest).await;
+            STOPLESS_SLICE_ENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::mem::take(&mut guest.thread_state_mut().lone_replay_unsound) {
+                // Another thread could run at an end this thread had already
+                // run past: the run is no longer the one a stop gives.
+                let reason = format!(
+                    "HERMIT_LONE_SLICE_END_UNSOUND: thread {} was granted at a skipped slice end \
+                     (branch {end}) while another thread could run; that end was processed \
+                     after the thread reached branch {reached}",
+                    guest.thread_state().dettid
+                );
+                tracing::error!("{reason}");
+                crate::detlog::record_determinism_loss(&reason);
+            }
+            let thread_state = guest.thread_state_mut();
+            thread_state.replaying_lone_slice_end = None;
+            end = thread_state
+                .lone_slice_end
+                .expect("a processed slice end notes the next one");
+        }
+        if !guest.thread_state().lone_grant {
+            stop_skipping_lone_slice_end(guest);
+        }
+    }
+
+    /// Whether the post-hook may leave the slice end it is about to arm
+    /// without a stop (`Config::replays_lone_preemptions`): the latest grant
+    /// found the thread alone, the timer is for the maximum (not a manual
+    /// interrupt), and the thread replays nothing, holds no turn for a
+    /// signal to its own process and owes no pipe hand-off.
+    fn skips_lone_slice_end<G: Guest<Self>>(&self, guest: &G, timer_is_max: bool) -> bool {
+        let thread_state = guest.thread_state();
+        self.cfg.replays_lone_preemptions()
+            && thread_state.lone_grant
+            && timer_is_max
+            && thread_state.replay_rcb_end.is_none()
+            && thread_state.preemption_points.is_none()
+            && thread_state.slice_boundary.is_none()
+            && thread_state.own_signal_turn_hold.is_none()
+            && thread_state.pipe_handoff_due.is_none()
     }
 
     /// Update logical thread time with any outstanding ticks of the Reverie clock.  Returns a list
@@ -1276,7 +1517,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             let precise_timers = !guest.config().imprecise_timers;
             // TODO(T86591083): we might need to not always increment as a hack fix
             // for deterministic virtual time without sequentialize threads.
-            let clock_value = guest.read_clock().expect("Couldn't read clock");
+            // A skipped slice end of a lone thread is processed at its own
+            // branch count (`catch_up_lone_slice_ends`), not the counter's.
+            let clock_value = match guest.thread_state().replaying_lone_slice_end {
+                Some(end) => end,
+                None => guest.read_clock().expect("Couldn't read clock"),
+            };
             // N.B. clock_value does not yet include any updates for the inbound
             // syscall/instruction because this function is the very first thing that
             // happens in each type of handler.
@@ -1764,22 +2010,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             mycount,
             boundary_token,
         } = turn;
-        // Under `--pipe-wake-latency`, a delivery that ends the process
-        // dooms its threads at this committed turn, before their
-        // host-timed removal (`scheduler::pipe_wake`).
-        if self.cfg.pipe_wake_latency_in_effect().is_some()
-            && match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal.raw()) {
-                Some(copied) => crate::syscalls::default_action_ends_process(
-                    copied.ignored,
-                    copied.caught,
-                    signal.raw(),
-                ),
-                None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
-                    .is_ok_and(|state| state.default_action_ends_process(signal.raw())),
-            }
-        {
-            tool_global::record_fatal_signal(guest).await;
-        }
+        // A delivery that ends the process is committed in this turn
+        // (`Scheduler::commit_fatal_delivery`). Under `--pipe-wake-latency`
+        // the doom feeds the hand-off scan (`scheduler::pipe_wake`). Where the
+        // kernel's signal state is the guest's own (ptrace), the process's
+        // other threads also leave the scheduler now, as Linux kills them at
+        // this delivery, instead of at their host-timed exit reports. That
+        // needs the kernel to carry out the default action when it resumes
+        // this thread, as its signal state says now: the signal is unblocked
+        // (`ptrace_signal` requeues a blocked one) and no gdbserver client
+        // can change or cancel it at the resume.
+        let may_retire_others = crate::syscalls::retires_others_at_fatal_delivery(&self.cfg);
+        let retired_the_others = (may_retire_others
+            || self.cfg.pipe_wake_latency_in_effect().is_some())
+            && match crate::syscalls::fatal_default_delivery(guest, signal.raw(), may_retire_others)
+            {
+                Some(retire_others) => {
+                    tool_global::commit_fatal_delivery(guest, retire_others).await
+                }
+                None => false,
+            };
         // A timer entry's siginfo, with its overrun counted now that the
         // delivery's turn is granted, where the handler's time begins.
         if timer_entry {
@@ -1828,6 +2078,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             "[dtid {}] finish delivering signal (#{}) {}",
             dettid, mycount, signal
         );
+        if retired_the_others {
+            // As an exit_group does after its grant, file nothing more: turn
+            // selection waits for the retired threads' deaths
+            // (`Scheduler::sigkill_fence_holds`), which only this delivery
+            // causes, so a request filed here would never be granted.
+            return Ok(Some(signal));
+        }
         self.record_handler_restore_mask(guest, signal).await;
 
         self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
@@ -1899,6 +2156,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// stays invisible to the schedule.
     fn keep_timer_across_dropped_signal<G: Guest<Self>>(&self, guest: &mut G) {
         if !self.cfg.use_preemption_timer() {
+            return;
+        }
+        if let Some(end) = guest.thread_state().lone_slice_end {
+            let now = guest.read_clock().expect("Couldn't read clock");
+            arm_lone_backstop(guest, end.saturating_sub(now));
             return;
         }
         let thread_state = guest.thread_state();
@@ -2021,7 +2283,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let dettid = guest.thread_state().dettid;
         let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
 
-        if guest.thread_state().guest_past_first_execve() {
+        if guest.thread_state().replaying_lone_slice_end.is_some() {
+            // The guest is stopped later, not at this end: its registers are
+            // not this end's.
+            detlog_debug!(
+                "(pre) registers [dtid {}][rcbs {}]. not read: slice end taken without a stop",
+                dettid,
+                guest.thread_state().thread_logical_time.rcbs(),
+            );
+        } else if guest.thread_state().guest_past_first_execve() {
             detlog_debug!(
                 "(pre) registers [dtid {}][rcbs {}]. {}",
                 dettid,
@@ -2102,6 +2372,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let ends = match boundary {
             CheckIn::Event => thread_state.timeslice_expired(),
+            #[cfg(target_arch = "x86_64")]
             CheckIn::InstructionTrap => thread_state.instruction_trap_ends_timeslice(&self.cfg),
         };
         if !ends {
@@ -2297,9 +2568,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return false;
         }
         if site == preemptions::callback_history::Site::PosthookPmuEpsilon {
-            let multiplier = guest.config().clock_multiplier.unwrap_or(1.0)
-                * thread.rcb_time_multiplier().as_f64();
-            let epsilon = Duration::from_nanos((NANOS_PER_RCB * multiplier).ceil() as u64);
+            let epsilon = thread.pmu_epsilon(guest.config());
             return thread.replay_rcb_end.is_none()
                 && thread.max_timeslice_end.is_some_and(|maximum| {
                     thread.thread_logical_time.as_nanos() + epsilon > maximum
@@ -2308,6 +2577,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         thread.end_of_timeslice.is_some()
             && match boundary {
                 CheckIn::Event => thread.timeslice_expired(),
+                #[cfg(target_arch = "x86_64")]
                 CheckIn::InstructionTrap => thread.instruction_trap_ends_timeslice(&self.cfg),
             }
     }
@@ -2429,9 +2699,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // TODO: get rid of fractional NANOS_PER_RCB so it's clear that this does not lose precision:
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1151)
-            let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0)
-                * guest.thread_state().rcb_time_multiplier().as_f64();
-            let epsilon = Duration::from_nanos((NANOS_PER_RCB * clock_multiplier).ceil() as u64);
+            let mut clock_multiplier = guest.thread_state().clock_multiplier(guest.config());
+            let mut epsilon = guest.thread_state().pmu_epsilon(guest.config());
 
             if replay_rcb_end.is_none() && current_time + epsilon > max_timeslice_end {
                 if guest.thread_state().own_signal_turn_hold.is_some() {
@@ -2465,6 +2734,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .expect("ending a PMU-backed timeslice must install a new maximum");
                 current_time = guest.thread_state().thread_logical_time.as_nanos();
                 replay_rcb_end = guest.thread_state().replay_rcb_end;
+                if guest.config().replay_edited_preemptions {
+                    // The slice ending path chose the new slice with the
+                    // margin at the chaos slowdown it installed, which can
+                    // differ from the one before; check against that one.
+                    // A faithful replay keeps the earlier values for this
+                    // check and the timer below, as its recording did, so
+                    // that existing records replay unchanged.
+                    clock_multiplier = guest.thread_state().clock_multiplier(guest.config());
+                    epsilon = guest.thread_state().pmu_epsilon(guest.config());
+                }
             }
             if replay_rcb_end.is_none() && current_time + epsilon > max_timeslice_end {
                 panic!(
@@ -2605,20 +2884,36 @@ impl<T: RecordOrReplay> Detcore<T> {
                     rcbs_remaining,
                     guest.thread_state().thread_logical_time.rcbs()
                 );
-                {
+                let replaying = guest.thread_state().replaying_lone_slice_end.is_some();
+                if replaying || self.skips_lone_slice_end(guest, timer_is_max) {
+                    // No stop at this slice end: the thread's next entry into
+                    // Detcore processes it at this branch count. While a
+                    // skipped end is processed, the next one is only noted;
+                    // the counter has already passed it or the caller arms.
                     let thread_state = guest.thread_state_mut();
-                    thread_state.last_rcb_timer = Some(rcbs_remaining);
-                    thread_state.last_rcb_timer_is_max = timer_is_max;
-                }
-
-                if guest.config().imprecise_timers {
-                    guest
-                        .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
-                        .expect("Failed to set timer");
+                    thread_state.lone_slice_end = Some(current_pmu_rcbs + rcbs_remaining);
+                    thread_state.last_rcb_timer = None;
+                    thread_state.last_rcb_timer_is_max = false;
+                    if !replaying {
+                        arm_lone_backstop(guest, rcbs_remaining);
+                    }
                 } else {
-                    guest
-                        .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
-                        .expect("Failed to set timer");
+                    {
+                        let thread_state = guest.thread_state_mut();
+                        thread_state.lone_slice_end = None;
+                        thread_state.last_rcb_timer = Some(rcbs_remaining);
+                        thread_state.last_rcb_timer_is_max = timer_is_max;
+                    }
+
+                    if guest.config().imprecise_timers {
+                        guest
+                            .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
+                            .expect("Failed to set timer");
+                    } else {
+                        guest
+                            .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
+                            .expect("Failed to set timer");
+                    }
                 }
             } else {
                 guest.thread_state_mut().last_rcb_timer = None;
@@ -2630,7 +2925,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.thread_state_mut().last_rcb_timer_is_max = false;
         }
 
-        if guest.thread_state().guest_past_first_execve() {
+        if guest.thread_state().replaying_lone_slice_end.is_some() {
+            detlog_debug!(
+                "(post) registers [dtid {}][rcbs {}]. not read: slice end taken without a stop",
+                guest.thread_state().dettid,
+                guest.thread_state().thread_logical_time.rcbs(),
+            );
+        } else if guest.thread_state().guest_past_first_execve() {
             detlog_debug!(
                 "(post) registers [dtid {}][rcbs {}]. {}",
                 dettid,
@@ -2844,6 +3145,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// * The segment selectors `cs`/`ss`/`ds`/`es`/`fs`/`gs` -- constant for a 64-bit userspace
     ///   guest, so they add no signal; the TLS BASES are what a guest actually observes and those
     ///   are hashed.
+    ///
+    /// That is the x86_64 list. On aarch64 the hash covers `x0`-`x30` except `x7`, then `sp`,
+    /// `pc` and `pstate`; `x7` holds the kernel's ptrace entry/exit marker at a syscall stop, not
+    /// guest state (`arch::detlog_register_words`).
     fn detlog_registers<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2880,28 +3185,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             format!("spot-1/{cadence}")
         };
-        let mut bytes = Vec::with_capacity(19 * 8);
-        for v in [
-            regs.rax,
-            regs.rbx,
-            regs.rdx,
-            regs.rsi,
-            regs.rdi,
-            regs.rbp,
-            regs.rsp,
-            regs.r8,
-            regs.r9,
-            regs.r10,
-            regs.r12,
-            regs.r13,
-            regs.r14,
-            regs.r15,
-            regs.rip,
-            regs.eflags,
-            regs.orig_rax,
-            regs.fs_base,
-            regs.gs_base,
-        ] {
+        let words = arch::detlog_register_words(regs);
+        let mut bytes = Vec::with_capacity(words.len() * 8);
+        for v in words {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         detlog!(
@@ -3078,7 +3364,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         end: u64,
     ) -> Result<(), reverie::Error> {
         // The page brk(2) rounds the break up to.
-        let end = end.checked_add(4095).map_or(end, |end| end & !4095);
+        let page_mask = crate::page::page_size() - 1;
+        let end = end
+            .checked_add(page_mask)
+            .map_or(end, |end| end & !page_mask);
         let pieces = procmaps::from_pid(guest.pid(), |map| {
             matches!(map.pathname, procmaps::MMapPath::Anonymous)
                 && map.address.0 < end
@@ -3176,15 +3465,14 @@ fn display_syscall_finished<'a, M: MemoryAccess>(
 /// `kernel/time/time.c` stores `tv` and then returns `-EFAULT` if copying
 /// `tz` faults, so its rendered output can be kernel-written on failure.
 fn failure_leaves_outputs_unwritten(syscall: &Syscall) -> bool {
-    matches!(
-        syscall,
-        Syscall::Stat(_)
-            | Syscall::Lstat(_)
-            | Syscall::Fstat(_)
-            | Syscall::Newfstatat(_)
-            | Syscall::Statx(_)
-            | Syscall::ClockGettime(_)
-    )
+    match syscall {
+        Syscall::Fstat(_) | Syscall::Statx(_) | Syscall::ClockGettime(_) => true,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Stat(_) | Syscall::Lstat(_) | Syscall::Newfstatat(_) => true,
+        #[cfg(target_arch = "aarch64")]
+        Syscall::Fstatat(_) => true,
+        _ => false,
+    }
 }
 
 /// Whether `result` is a failure that, for a syscall listed in
@@ -3416,13 +3704,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#683)
                 Sysno::pwrite64,
                 Sysno::openat,
-                Sysno::open,
-                Sysno::creat,
                 // Detcore answers access and extended-attribute requests on the
                 // procfs files it renders
                 // (https://github.com/rrnewton/hermit/issues/4213); a backend
                 // keeps no copy of them, so these must not bypass Detcore.
-                Sysno::access,
                 Sysno::faccessat,
                 Sysno::faccessat2,
                 Sysno::getxattr,
@@ -3443,7 +3728,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::munmap,
                 Sysno::mremap,
                 Sysno::fcntl,
-                Sysno::arch_prctl,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-2150): Timer-slack prctl state is
                 // virtual and must not bypass Detcore under passthru_opt.
@@ -3452,8 +3736,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::futex,
                 Sysno::clone,
                 Sysno::clone3,
-                Sysno::fork,
-                Sysno::vfork,
                 Sysno::wait4,
                 Sysno::waitid,
                 Sysno::setsid,
@@ -3471,27 +3753,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // waiters are never woken.
                 Sysno::set_robust_list,
                 Sysno::dup,
-                Sysno::dup2,
                 Sysno::dup3,
-                Sysno::pipe,
                 Sysno::pipe2,
                 Sysno::getrandom,
-                Sysno::utime,
-                Sysno::utimes,
                 Sysno::utimensat,
-                Sysno::futimesat,
                 Sysno::socket,
                 Sysno::socketpair,
-                Sysno::eventfd,
                 Sysno::eventfd2,
                 Sysno::sched_getaffinity,
                 Sysno::sched_setaffinity,
-                Sysno::signalfd,
                 Sysno::signalfd4,
                 Sysno::timerfd_create,
                 Sysno::timerfd_settime,
                 Sysno::timerfd_gettime,
-                Sysno::inotify_init,
                 Sysno::inotify_init1,
                 Sysno::inotify_add_watch,
                 Sysno::inotify_rm_watch,
@@ -3519,16 +3793,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::nanosleep,
                 Sysno::clock_nanosleep,
                 Sysno::sched_yield,
-                Sysno::poll,
                 Sysno::ppoll,
                 Sysno::prlimit64,
-                Sysno::epoll_create,
                 Sysno::epoll_create1,
                 Sysno::epoll_ctl,
                 Sysno::epoll_pwait,
-                Sysno::epoll_wait,
-                Sysno::epoll_wait_old,
-                Sysno::epoll_ctl_old,
                 Sysno::recvfrom,
                 Sysno::rt_sigsuspend,
                 Sysno::rt_sigtimedwait,
@@ -3548,25 +3817,49 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // `select` is included by the Determinized sweep below;
                 // T137258824 tracks improving its implementation.
             ]);
+            // The same calls under their x86_64-only legacy numbers.
+            #[cfg(target_arch = "x86_64")]
+            subscription.syscalls([
+                Sysno::open,
+                Sysno::creat,
+                Sysno::access,
+                Sysno::arch_prctl,
+                Sysno::fork,
+                Sysno::vfork,
+                Sysno::dup2,
+                Sysno::pipe,
+                Sysno::utime,
+                Sysno::utimes,
+                Sysno::futimesat,
+                Sysno::eventfd,
+                Sysno::signalfd,
+                Sysno::inotify_init,
+                Sysno::poll,
+                Sysno::epoll_create,
+                Sysno::epoll_wait,
+                Sysno::epoll_wait_old,
+                Sysno::epoll_ctl_old,
+            ]);
 
+            // TODO: some of the above could probably move to this bucket.
+            // aarch64 has neither `alarm` nor `pause`; its libc builds them
+            // from `setitimer` and `ppoll`, which are listed above.
+            #[cfg(target_arch = "x86_64")]
             if do_sched {
-                subscription.syscalls([
-                    // TODO: some of the above could probably move to this bucket.
-                    Sysno::alarm,
-                    Sysno::pause,
-                ]);
+                subscription.syscalls([Sysno::alarm, Sysno::pause]);
             }
 
             if config.virtualize_metadata {
+                subscription.syscalls([Sysno::getdents64, Sysno::fstat, Sysno::statx]);
+                #[cfg(target_arch = "x86_64")]
                 subscription.syscalls([
                     Sysno::getdents,
-                    Sysno::getdents64,
                     Sysno::stat,
                     Sysno::lstat,
-                    Sysno::fstat,
                     Sysno::newfstatat,
-                    Sysno::statx,
                 ]);
+                #[cfg(target_arch = "aarch64")]
+                subscription.syscall(Sysno::fstatat);
             }
 
             if true
@@ -3591,10 +3884,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 subscription.rdtsc();
                 subscription.syscalls([
                     Sysno::gettimeofday,
-                    Sysno::time,
                     Sysno::clock_gettime,
                     Sysno::clock_getres,
                 ]);
+                #[cfg(target_arch = "x86_64")]
+                subscription.syscall(Sysno::time);
             }
 
             if config.virtualize_cpuid {
@@ -3627,12 +3921,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_cpuid_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
         eax: u32,
         ecx: u32,
     ) -> Result<CpuIdResult, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         trace!("handle_cpuid_event: eax: {}, ecx: {}", eax, ecx);
         // A trapped instruction stops the guest in user code (A5 step 3.2).
         guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
@@ -3700,11 +3996,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         Ok(res)
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_rdtsc_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
         request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         trace!("handle_rdtsc_event: {:?}", request);
         // A trapped instruction stops the guest in user code (A5 step 3.2).
         guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
@@ -3723,6 +4021,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 dettid,
                 guest.thread_state().thread_logical_time
             );
+            // The guest TSC must name the same instant as `clock_gettime`. Both
+            // now read the coordinator's clock through the shared per-process
+            // floor, so a guest comparing the two -- a clocksource watchdog, a
+            // delay loop calibrated against a device timer, a second vCPU
+            // reading the TSC -- sees one time base instead of two.
+            //
+            // The `add_rdtsc()` charge above is folded into global time by the
+            // same RPC that reads it back (`send_and_update_time` updates the
+            // coordinator before dispatching the request), so consecutive reads
+            // from one thread still advance.
+            //
+            // Read it before the event is traced. Under `--replay-schedule-from`
+            // tracing the event is where the replayer hands the CPU to the next
+            // recorded thread when this read was the last event of a slice, so
+            // reading after it would see the time those threads ran. The
+            // recording read the clock here, before its slice ended in the post
+            // hook, and so does the replay now.
+            let tsc = guest_clock_time(guest).await;
             if self.cfg.observes_schedevents() {
                 let ev = with_guest_time(
                     guest,
@@ -3737,17 +4053,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
                 trace_schedevent(guest, ev, true).await;
             }
-            // The guest TSC must name the same instant as `clock_gettime`. Both
-            // now read the coordinator's clock through the shared per-process
-            // floor, so a guest comparing the two -- a clocksource watchdog, a
-            // delay loop calibrated against a device timer, a second vCPU
-            // reading the TSC -- sees one time base instead of two.
-            //
-            // The `add_rdtsc()` charge above is folded into global time by the
-            // same RPC that reads it back (`send_and_update_time` updates the
-            // coordinator before dispatching the request), so consecutive reads
-            // from one thread still advance.
-            let tsc = guest_clock_time(guest).await;
             Ok(RdtscResult {
                 // We treat virtual cycles as equivalent to virtual nanoseconds.
                 tsc: tsc.as_nanos(),
@@ -3769,6 +4074,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         let delivered = self
             .handle_inbound_signal(guest, SigWrapper::from(signal))
             .await?;
@@ -3796,6 +4102,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         signal: i32,
     ) -> Result<Option<i32>, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         let delivered = self
             .handle_inbound_signal(guest, SigWrapper(signal))
             .await?;
@@ -3822,6 +4129,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         signal: i32,
     ) -> Result<Option<reverie::SignalAnnouncement>, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         if !(1..=64).contains(&signal) {
             return Err(Errno::EINVAL);
         }
@@ -3901,6 +4209,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         announcement: reverie::SignalAnnouncement,
     ) -> Result<(), Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         let Some(index) = guest
             .thread_state()
             .signal_announcements
@@ -3997,6 +4306,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         status: ExitStatus,
     ) -> Result<(), Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         if !matches!(
             status,
             ExitStatus::Signaled(..) | ExitStatus::SignaledRaw(..)
@@ -4224,6 +4534,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     pts.1.prepare_child_process_cpu_time(dettid);
                 }
                 let guest_clock = Arc::clone(&pts.1.guest_clock);
+                let unix_connections = Arc::clone(&pts.1.unix_connections);
                 // A pending unreported signal may already have changed the
                 // parent's actions unseen: the child gets no copy then.
                 let child_signal_shadow = pts
@@ -4283,6 +4594,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // never inherit its parent's occurrence/hint ownership.
                     slice_boundary: None,
                     callback_history: Default::default(),
+                    schedule_replay_over: pts.1.schedule_replay_over,
                     detpid: None, // Initialized later.
                     thread_start_entered: false,
                     vfork_origin: if clone_flags.contains(CloneFlags::CLONE_VFORK) {
@@ -4375,6 +4687,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // individual process. Forked processes and cloned threads
                     // therefore retain one monotonic view of raw logical time.
                     guest_clock,
+                    // So do the connections waiting for an accept.
+                    unix_connections,
                     parent_process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         pts.1.parent_process_cpu_time.clone()
                     } else {
@@ -4391,6 +4705,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     // A new thread has made no syscall yet.
                     restart_block: None,
+                    syscall_cwd: None,
                     // A fork child inherits its parent's signal dispositions.
                     sigalrm_handled: pts.1.sigalrm_handled,
                     signal_shadow: child_signal_shadow.clone(),
@@ -4481,6 +4796,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     published_runtime_private_memory: None,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
+                    lone_grant: false,
+                    lone_slice_end: None,
+                    replaying_lone_slice_end: None,
+                    lone_replay_unsound: false,
 
                     record_or_replay,
                     preemption_points: None,
@@ -4606,6 +4925,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        // The exec's own entry processed the ends the old image ran past; the
+        // new image's first slice is installed fresh, by the exec continuation.
+        guest.thread_state_mut().lone_slice_end = None;
         // The new image's first stop is at the exit of the exec Detcore did not
         // finish (A5 step 3.2). The old image's delivery counts are logged
         // under the identity they were taken under, and the new image counts
@@ -4743,6 +5065,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             None
         };
         tool_global::mark_past_first_execve(guest, unprepared_exe).await;
+        // The files the kernel opened for this exec, the image and its
+        // program interpreter, join the run's host inputs (`host_inputs`).
+        if guest.config().record_host_inputs {
+            self.record_exec_host_inputs(guest).await;
+        }
         // The task's name for its rendered `/proc/<pid>/stat` where the tool
         // cannot read the kernel's (`procfs::task_stat`): the one the new
         // image's `AT_EXECFN` (`bprm->filename`) gives, under the leader's
@@ -4776,6 +5103,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // The new image's program-break model, checked against the kernel's
         // once its exec record is in place.
         self.check_brk_model(guest).await;
+        // The new image's exclusive pairs (store-exclusive retry loops).
+        // Boxed, so its scan does not grow the post-exec future either.
+        #[cfg(target_arch = "aarch64")]
+        Box::pin(store_exclusive::report_after_exec(guest)).await;
         // Linux discards every queued POSIX timer signal at exec
         // (`flush_itimer_signals`), and Hermit's are ordinary signals it sent:
         // take them back before the new image runs
@@ -4847,106 +5178,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     /// A timer fires to preempt the guest and give other threads a turn.
     async fn handle_timer_event<G: Guest<Self>>(&self, guest: &mut G) {
-        // A preemption stops the guest in user code (A5 step 3.2).
-        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
-        info!(
-            "[detcore, dtid {}] inbound timer preemption event",
-            guest.thread_state().dettid
-        );
-        if guest.config().preemption_stacktrace {
-            let mut file_writer: Box<dyn Write> =
-                match &guest.config().preemption_stacktrace_log_file {
-                    Some(path) => Box::new(
-                        File::create(path).expect("Failed to open preemption stacktrace log file"),
-                    ),
-                    // Under --max-log-bytes a full stderr must not stop the
-                    // run before the cap; see `util::DroppingStderr`.
-                    None if crate::nonwaiting_write::diagnostics_must_not_wait() => {
-                        Box::new(crate::util::DroppingStderr)
-                    }
-                    None => Box::new(std::io::stderr()),
-                };
-            let ts = guest.thread_state();
-            writeln!(
-                file_writer,
-                "\n>>> Guest tid {} preempted at thread time {} with stack trace:",
-                ts.dettid,
-                ts.thread_logical_time.as_nanos(),
-            )
-            .unwrap();
-            if let Some(backtrace) = guest.backtrace() {
-                if let Ok(pbt) = backtrace.pretty() {
-                    writeln!(file_writer, "{}", pbt).unwrap();
-                } else {
-                    writeln!(file_writer, "{}", backtrace).unwrap();
-                }
-            } else {
-                warn!("Could not read backtrace!");
+        if guest.thread_state().lone_slice_end.is_some() {
+            // While a thread runs alone the only timer armed is the backstop
+            // (`arm_lone_backstop`): no slice ends here. Process the ends it
+            // ran past, and keep running alone or arm the next end.
+            self.catch_up_lone_slice_ends(guest).await;
+            if let Some(end) = guest.thread_state().lone_slice_end {
+                let now = guest.read_clock().expect("Couldn't read clock");
+                arm_lone_backstop(guest, end.saturating_sub(now));
             }
+            return;
         }
-        // This may LOOK like a noop, but actually all of the logic for ending the timeslice is in
-        // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
-        // to this prehook.
-        let boundary_entry = if guest.config().no_rcb_time {
-            slice_boundary::callbacks::Callback::NoRcbTimer
-        } else {
-            slice_boundary::callbacks::Callback::PmuTimer
-        };
-        let boundary_token = self
-            .pre_handler_hook_observed(guest, true, CheckIn::Event, Some(boundary_entry))
-            .await;
-        if guest.config().no_rcb_time && guest.thread_state().last_rcb_timer_is_max {
-            let max_timeslice_end = guest
-                .thread_state()
-                .max_timeslice_end
-                .expect("PMU maximum timer requires a deadline");
-            guest
-                .thread_state_mut()
-                .thread_logical_time
-                .advance_to(max_timeslice_end);
-            if self.cfg.observes_schedevents() {
-                let dettid = guest.thread_state().dettid;
-                let ev = with_guest_time(
-                    guest,
-                    SchedEvent {
-                        dettid,
-                        op: Op::OtherInstructions,
-                        count: 1,
-                        start_rip: None,
-                        end_rip: None,
-                        end_time: None,
-                    },
-                );
-                let ev = with_guest_rip(guest, ev).await;
-                trace_schedevent(guest, ev, false).await;
-            }
-            if self.cfg.replay_schedule_from.is_some()
-                && guest.thread_state().slice_boundary.is_none()
-            {
-                let fallback_deadline = max_timeslice_end
-                    + Duration::from_nanos(u64::from(
-                        self.cfg
-                            .max_timeslice
-                            .expect("PMU maximum must be configured"),
-                    ));
-                let thread_state = guest.thread_state_mut();
-                let replay_deadline = thread_state
-                    .end_of_timeslice
-                    .filter(|deadline| *deadline > max_timeslice_end)
-                    .unwrap_or(fallback_deadline);
-                thread_state.end_of_timeslice = Some(replay_deadline);
-                thread_state.max_timeslice_end = Some(replay_deadline);
-                thread_state.last_rcb_timer = None;
-                thread_state.last_rcb_timer_is_max = false;
-                thread_state.stats.reset_timeslice();
-            } else if guest.thread_state().own_signal_turn_hold.is_none() {
-                slice_boundary::no_rcb_maximum(guest.thread_state_mut())
-                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
-                self.end_timeslice(guest).await;
-            }
-        }
-        self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
-            .await;
+        self.take_timer_event(guest).await;
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(
@@ -4954,6 +5197,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        // Before anything this callback changes: the slice ends a lone thread
+        // ran past came first (`catch_up_lone_slice_ends`).
+        self.catch_up_lone_slice_ends(guest).await;
         #[cfg(feature = "dispatch-observer")]
         if let Some(observer) = dispatch_observer::installed() {
             // This is the genuine incoming event. An entry record does not
@@ -5029,6 +5275,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // so the record a wait kept for it lives only until then
         // (`handle_restart_syscall`).
         let restart_block = guest.thread_state_mut().restart_block.take();
+        // A working directory read for the previous syscall may be stale by
+        // now (`ThreadState::syscall_cwd`).
+        guest.thread_state_mut().syscall_cwd = None;
 
         let dettid = guest.thread_state().dettid;
 
@@ -5492,7 +5741,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         Err(Error::Errno(Errno::EINVAL))
                     }
                 } else {
-                    self.passthrough(guest, call).await
+                    let result = self.passthrough(guest, call).await;
+                    // A forwarded splice from a socket may take a message
+                    // whose descriptors Linux releases unseen.
+                    if let Syscall::Splice(splice) = call {
+                        self.note_receive_without_control(guest, splice.fd_in(), &result);
+                    }
+                    result
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5725,13 +5980,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#547)
                 Syscall::Writev(w) => self.handle_writev(guest, w).await,
                 Syscall::Openat(o) => Box::pin(self.handle_openat(guest, o)).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Open(o) => Box::pin(self.handle_openat(guest, o.into())).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Creat(o) => Box::pin(self.handle_openat(guest, o.into())).await,
                 Syscall::Close(s) => self.handle_close(guest, s).await,
                 Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
                     self.handle_sock_diag_read(guest, s).await
                 }
-                Syscall::Read(s) => self.handle_read(guest, s).await,
+                Syscall::Read(s) => {
+                    let result = self.handle_read(guest, s).await;
+                    self.note_receive_without_control(guest, s.fd(), &result);
+                    result
+                }
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
                 Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5747,8 +6008,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.handle_sock_diag_readv(guest, s).await
                 }
                 Syscall::Readv(s) => {
-                    self.handle_readv_with_output(guest, s, &mut rng_readv_output)
-                        .await
+                    let result = self
+                        .handle_readv_with_output(guest, s, &mut rng_readv_output)
+                        .await;
+                    self.note_receive_without_control(guest, s.fd(), &result);
+                    result
                 }
                 Syscall::Preadv(s) => {
                     self.handle_preadv_with_output(guest, s, &mut rng_readv_output)
@@ -5772,13 +6036,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Mincore(s) => self.handle_mincore(guest, s).await,
                 Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
                 Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Lstat(s) => self.handle_stat_family(guest, s.into()).await,
                 Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
+                #[cfg(target_arch = "aarch64")]
+                Syscall::Fstatat(s) => self.handle_stat_family(guest, s.into()).await,
                 Syscall::Statx(s) => self.handle_statx(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#877)
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
@@ -5795,11 +6065,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
 
                 // Forward vfork as vfork (rather than rewriting to fork) so the
                 // kernel enforces the CLONE_VFORK parent-blocking contract while the
                 // child registers itself and runs to exec/exit.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
                 Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
                 Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
@@ -5807,7 +6079,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Setpgid(s) => self.handle_setpgid(guest, s).await,
                 Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Getpgrp(_) | Syscall::Getpgid(_) | Syscall::Getsid(_) => {
+                #[cfg(target_arch = "x86_64")]
+                Syscall::Getpgrp(_) => self.handle_group_or_session_getter(guest, call).await,
+                Syscall::Getpgid(_) | Syscall::Getsid(_) => {
                     self.handle_group_or_session_getter(guest, call).await
                 }
                 // Without virtual time the guest reads the host clock. Each of these
@@ -5820,6 +6094,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         self.passthrough(guest, call).await
                     }
                 }
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Time(s) => {
                     if virtualize_time {
                         self.handle_time(guest, s).await
@@ -5883,6 +6158,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-857): Empty virtual kernel ring buffer.
                 Syscall::Syslog(s) => self.handle_syslog(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Seccomp(s) => self.handle_seccomp(guest, s).await,
@@ -5900,17 +6176,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Exit(s) => self.handle_exit(guest, s).await,
 
                 Syscall::Dup(w) => self.handle_dup(guest, w).await.map_err(Into::into),
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Dup2(w) => self.handle_dup2(guest, w).await,
                 Syscall::Dup3(w) => self.handle_dup3(guest, w).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await,
                 Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await,
                 Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Utime(s) => self.handle_utime(guest, s).await.map_err(Into::into),
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Utimes(s) => self.handle_utimes(guest, s).await.map_err(Into::into),
                 // NB: lutimes is a libc function not a syscall
                 Syscall::Utimensat(s) => self.handle_utimensat(guest, s).await.map_err(Into::into),
                 // NB: futimes/futimens are libc functions not a syscall,
                 // futimesat is obsolete, return -ENOSYS for simplicity.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Futimesat(_s) => Err(Error::Errno(Errno::ENOSYS)),
                 // io_uring completion and memory-sharing semantics are not deterministic.
                 Syscall::IoUringSetup(_)
@@ -5940,13 +6221,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // socket-family syscall; half-closes a tracked socket and
                 // forwards via record_or_replay (KVM ratchet round 12).
                 Syscall::Shutdown(s) => self.handle_shutdown(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
                 Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
                 Syscall::Signalfd4(s) => self.handle_signalfd4(guest, s).await,
                 Syscall::TimerfdCreate(s) => self.handle_timerfd_create(guest, s).await,
                 Syscall::TimerfdSettime(s) => self.handle_timerfd_settime(guest, s).await,
                 Syscall::TimerfdGettime(s) => self.handle_timerfd_gettime(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::InotifyInit(s) => {
                     self.handle_inotify_init1(guest, InotifyInit1::from(s))
                         .await
@@ -5972,18 +6256,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                 // NB: getdents is not recommended, (g)libc should call getdents64 only
                 // see: sysdeps/unix/sysv/linux/getdents.c.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Getdents(s) => self.handle_getdents(guest, s).await,
                 Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
 
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Poll(s) => self.handle_poll(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
                 Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Select(s) => self.handle_select(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::EpollCreate(s) => {
                     self.handle_epoll_create1(guest, EpollCreate1::from(s))
                         .await
@@ -5991,7 +6279,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::EpollCreate1(s) => self.handle_epoll_create1(guest, s).await,
                 Syscall::EpollCtl(s) => self.handle_epoll_ctl(guest, s).await,
                 Syscall::EpollPwait(s) => self.handle_epoll_pwait(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::EpollWait(s) => self.handle_epoll_wait(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::EpollWaitOld(s) => panic!(
                     "Not handling deprecated syscall: {}",
                     s.display(&guest.memory())
@@ -5999,6 +6289,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#549)
                 // The obsolete x86_64 entry point is absent from modern Linux kernels.
+                #[cfg(target_arch = "x86_64")]
                 Syscall::EpollCtlOld(_) => Err(Error::Errno(Errno::ENOSYS)),
 
                 Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
@@ -6071,7 +6362,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Recvfrom(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
                     self.handle_sock_diag_recvfrom(guest, s).await
                 }
-                Syscall::Recvfrom(s) => self.handle_socket_receive(guest, s, s.fd(), true).await,
+                Syscall::Recvfrom(s) => {
+                    let result = self.handle_socket_receive(guest, s, s.fd(), true).await;
+                    self.note_receive_without_control(guest, s.fd(), &result);
+                    result
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-901)
                 Syscall::Recvmsg(s) => self.handle_recvmsg(guest, s).await,
@@ -6202,7 +6497,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     }
                     result
                 }
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
+                #[cfg(target_arch = "x86_64")]
                 Syscall::Pause(s) => self.handle_pause(guest, s).await,
 
                 Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
@@ -6302,7 +6599,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.passthrough(guest, call).await
             }
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
-            // The kernel's restart of a wait Detcore emulates resumes it; any other
+            // The kernel's restart of a wait Detcore emulates, or ran in the
+            // kernel as the guest made it, resumes it; any other
             // `restart_syscall` keeps the unsupported-syscall policy below.
             // AUTONOMOUS-BOT-IMPLEMENTED
             SyscallClassification::Unsupported if call.number() == Sysno::restart_syscall => {
@@ -6373,6 +6671,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // observes the result (crate::exit_dependencies).
         if let Ok(ret) = res {
             self.refuse_exit_dependencies(guest, &call, ret).await;
+        }
+        // A new executable file mapping's exclusive pairs (store-exclusive
+        // retry loops). Boxed, so this rare path does not grow every
+        // syscall's future.
+        #[cfg(target_arch = "aarch64")]
+        if let Ok(ret) = res
+            && let Some(range) = store_exclusive::range_to_scan(guest, &call, ret)
+        {
+            Box::pin(store_exclusive::report_new_mapping(guest, range)).await;
         }
 
         // The guest resumes with this result in its return register (A5 step
@@ -6615,6 +6922,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             syscall_count: thread_state.stats.syscall_count,
             syscall_histogram: (&thread_state.stats.syscall_histogram).into(),
             chaos_epochs: pending_chaos_epochs,
+            killed_by_group_signal: signal_ends_thread_group(&exit_status),
         };
         if transferred_exec {
             tool_global::retire_exec(
@@ -6651,6 +6959,54 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await?;
 
         Ok(())
+    }
+}
+
+/// Whether a thread that ended with `status` took its whole thread group with
+/// it. A thread reported killed by a signal died in a group exit: Linux ends
+/// every thread of the group when a signal's default action is fatal
+/// (`get_signal` calls `do_group_exit`, which queues SIGKILL to the others and
+/// gives each the same status). The one exception is SIGSYS, which seccomp's
+/// `SECCOMP_RET_KILL_THREAD` uses to end a single thread (`__seccomp_filter`
+/// calls `do_exit(SIGSYS)`), so a SIGSYS death never makes the scheduler wait
+/// for the rest of the group (`Scheduler::note_signal_killed_group`). A
+/// death by a signal nix cannot name (`SignaledRaw`, a real-time signal) is a
+/// group exit too: the test is on the signal's number, whichever form the
+/// status takes.
+fn signal_ends_thread_group(status: &ExitStatus) -> bool {
+    status
+        .signal()
+        .is_some_and(|signal| signal != Signal::SIGSYS as i32)
+}
+
+#[cfg(test)]
+mod group_signal_tests {
+    use super::*;
+
+    #[test]
+    fn a_fatal_signal_ends_the_group_except_seccomps_sigsys() {
+        for signal in [
+            Signal::SIGKILL,
+            Signal::SIGSEGV,
+            Signal::SIGABRT,
+            Signal::SIGTERM,
+        ] {
+            assert!(
+                signal_ends_thread_group(&ExitStatus::Signaled(signal, true)),
+                "{signal:?}"
+            );
+        }
+        assert!(!signal_ends_thread_group(&ExitStatus::Signaled(
+            Signal::SIGSYS,
+            true
+        )));
+        // A real-time signal's default action (terminate) ends the group too.
+        assert!(signal_ends_thread_group(&ExitStatus::SignaledRaw(
+            libc::SIGRTMIN() + 1,
+            false
+        )));
+        assert!(!signal_ends_thread_group(&ExitStatus::Exited(0)));
+        assert!(!signal_ends_thread_group(&ExitStatus::Exited(1)));
     }
 }
 
@@ -7365,34 +7721,6 @@ mod thread_exit_identity_tests {
             select_thread_exit_detpid(None, process_detpid),
             (process_detpid, true)
         );
-    }
-}
-
-#[cfg(test)]
-mod completed_syscall_projection_tests {
-    use super::*;
-
-    /// Signal phase 1: the signal pipeline at a syscall's completion reads
-    /// the result in rax, rip after the two-byte syscall instruction, and the
-    /// instruction's clobbers; every other register is the entry's.
-    #[test]
-    fn a_completed_syscall_shows_its_result_and_return_address() {
-        let mut entry: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        entry.rip = 0x40_1000;
-        entry.rax = libc::SYS_pause as u64;
-        entry.rcx = 0x1111;
-        entry.r11 = 0x2222;
-        entry.eflags = 0x246;
-        entry.rdi = 7;
-        entry.rsp = 0x7ffd_0000;
-        let completed = completed_syscall_projection(entry, -i64::from(libc::EINTR));
-        assert_eq!(completed.rax, (-i64::from(libc::EINTR)) as u64);
-        assert_eq!(completed.rip, 0x40_1002);
-        assert_eq!(completed.rcx, 0x40_1002);
-        assert_eq!(completed.r11, 0x246);
-        assert_eq!(completed.rdi, 7);
-        assert_eq!(completed.rsp, 0x7ffd_0000);
-        assert_eq!(completed.eflags, 0x246);
     }
 }
 

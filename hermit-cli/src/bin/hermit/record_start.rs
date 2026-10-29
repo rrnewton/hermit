@@ -480,7 +480,7 @@ impl StartOpts {
         &self,
         network: NetworkingMode,
     ) -> Result<(Container, IdentityGuard), Error> {
-        let mut container = namespace_container(true);
+        let mut container = namespace_container(true, None);
         network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
         for mount in &self.mount {
@@ -683,6 +683,28 @@ impl StartOpts {
                 );
             }
 
+            // A recording that replay will refuse says so instead of offering
+            // replay commands that would only print the refusal. The recording
+            // ran in the container's process, so its metadata says whether.
+            match hermit
+                .recording_metadata(recording.id)
+                .map(|metadata| metadata.replay_refused)
+            {
+                Ok(Some(reason)) => {
+                    eprintln!(
+                        "\n{}\n",
+                        "RECORDING SAVED, BUT IT CANNOT BE REPLAYED".red().bold()
+                    );
+                    eprintln!(
+                        "hermit record: WARNING: replay will refuse this recording: {reason}"
+                    );
+                    return Ok(recording.exit_status);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "hermit record: WARNING: the recording's metadata could not be read back: {error:#}"
+                ),
+            }
             eprintln!("\n{}\n", "RECORDING COMPLETE!".yellow().bold());
             // A v3 recording replays only to the end: a GDB- or DAP-served
             // replay runs a gdbserver, which v3 refuses.
@@ -1678,6 +1700,15 @@ mod tests {
         assert_eq!(
             env.get(OsStr::new("HOME")).and_then(|value| value.to_str()),
             Some("/root")
+        );
+        assert_eq!(
+            env.get(OsStr::new("USER")).and_then(|value| value.to_str()),
+            Some("root")
+        );
+        assert_eq!(
+            env.get(OsStr::new("LOGNAME"))
+                .and_then(|value| value.to_str()),
+            Some("root")
         );
         assert_eq!(
             env.get(OsStr::new("HOSTNAME"))

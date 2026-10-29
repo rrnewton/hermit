@@ -29,13 +29,94 @@ PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
-RUNTIME_COHORT_SHA256 = 'ea164ac6a7dc7ae44eff7764443559b60b541f84ce3c33b63caadfdf11d28b80'
+RUNTIME_COHORT_SHA256 = 'ca0e99c5e6fa5552fba8f986be5322e2aa5a3ea651470b4db57abaf087b40625'
 REQUIRED_HANDOFF_SOURCE_SHA256 = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
 
 
 def need(ok, why):
     if not ok:
         raise RuntimeError(why)
+
+
+def host_checker_profile(profile, optimized=False):
+    """Check Cargo's actual HOST profile without classifying dependency roles.
+
+    Build dependencies retain Cargo's opt0/debug0 override. The independently
+    selected checker and hashing/parser libraries must report opt2/debug2.
+    Every emitted artifact retains assertions and checked arithmetic.
+    """
+    need(type(profile) is dict and set(profile) == {
+        'opt_level', 'debuginfo', 'debug_assertions', 'overflow_checks', 'test'},
+        'HOST checker profile fields differ')
+    need(type(profile['opt_level']) is str and
+         profile['opt_level'] in ('0', '1', '2', '3', 's', 'z') and
+         type(profile['debuginfo']) is int and profile['debuginfo'] in (0, 1, 2) and
+         profile['debug_assertions'] is True and
+         profile['overflow_checks'] is True and profile['test'] is False,
+         'HOST checker profile types or safety fields differ')
+    if optimized:
+        need(profile['opt_level'] == '2' and profile['debuginfo'] == 2,
+             'selected HOST checker library is not opt2/debug2')
+
+
+def host_checker_dependencies(records, lock, cargo_home, target):
+    """Select four actual locked libraries; never infer roles from profiles."""
+    finished = [q for q in records if q.get('reason') == 'build-finished']
+    need(len(finished) == 1 and finished[0].get('success') is True,
+         'Cargo did not complete one successful build')
+    artifacts = [q for q in records if q.get('reason') == 'compiler-artifact']
+    for row in artifacts:
+        host_checker_profile(row.get('profile'))
+    selected = {}
+    for name in ('serde_json', 'sha2', 'digest', 'goblin'):
+        packages = [q for q in lock['package'] if q.get('name') == name]
+        need(len(packages) == 1 and
+             packages[0].get('source') == 'registry+https://github.com/rust-lang/crates.io-index',
+             'HOST checker locked dependency absent/ambiguous: ' + name)
+        package = packages[0]
+        package_id = package['source'] + '#' + name + '@' + package['version']
+        def is_build_script(row):
+            target_info = row.get('target', {})
+            manifest = Path(row.get('manifest_path', ''))
+            outputs = [Path(q) for q in row.get('filenames', [])]
+            source = manifest.parent / 'build.rs'
+            return (target_info.get('name') == 'build-script-build' and
+                    target_info.get('kind') == ['custom-build'] and
+                    target_info.get('crate_types') == ['bin'] and
+                    target_info.get('src_path') == str(source) and
+                    source.resolve() == source and source.is_file() and
+                    manifest.is_relative_to(Path(cargo_home) / 'registry/src') and
+                    manifest.parent.name == name + '-' + package['version'] and
+                    manifest.name == 'Cargo.toml' and manifest.resolve() == manifest and
+                    manifest.is_file() and row.get('executable') is None and
+                    len(outputs) == 1 and outputs[0].name == 'build-script-build' and
+                    outputs[0].is_relative_to(Path(target) / 'debug/build') and
+                    outputs[0].resolve() == outputs[0] and outputs[0].is_file())
+        # Cargo also emits the package's build script. Select the library by
+        # target role before checking profiles; malformed library duplicates
+        # still count, even when their profile would be refused.
+        candidates = [q for q in artifacts if q.get('target', {}).get('name') == name or
+                      (q.get('package_id') == package_id and not is_build_script(q))]
+        need(len(candidates) == 1, 'HOST checker dependency output absent/ambiguous: ' + name)
+        row = candidates[0]
+        manifest = Path(row['manifest_path'])
+        need(row['package_id'] == package_id and
+             row['target']['name'] == name and row['target']['kind'] == ['lib'] and
+             row['target']['crate_types'] == ['lib'] and row['executable'] is None and
+             manifest.is_relative_to(Path(cargo_home) / 'registry/src') and
+             manifest.name == 'Cargo.toml' and
+             manifest.parent.name == name + '-' + package['version'] and
+             manifest.resolve() == manifest and manifest.is_file() and
+             row['target']['src_path'] == str(manifest.parent / 'src/lib.rs'),
+             'HOST checker dependency identity differs: ' + name)
+        host_checker_profile(row['profile'], optimized=True)
+        outputs = [Path(q) for q in row['filenames']]
+        need(sum(q.suffix == '.rlib' for q in outputs) == 1 and
+             all(q.is_absolute() and q.resolve() == q and q.is_file() and
+                 q.is_relative_to(Path(target) / 'debug') for q in outputs),
+             'HOST checker dependency outputs differ: ' + name)
+        selected[name] = row
+    return selected
 
 
 def cancellation(pending, error):
@@ -319,6 +400,56 @@ def runtime_handoff_preflight(c):
     return identity
 
 
+def publication_module(c):
+    path = D / 'publish.py'
+    need(c['files'].get(str(path)) == sha(path), 'bound package publication reader changed')
+    spec = importlib.util.spec_from_file_location('owned_package_publication', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+
+def bind_package_roles(c, x, prepared):
+    # The fixed marker requests the same Rust owner's additional proof. Neither
+    # an absent marker nor an absent digest can select it implicitly.
+    need((x.package_roles is None) == (x.package_roles_module_sha256 is None),
+         'source-owned package role mode/module digest must be paired')
+    c['files'][str(D / 'publish.py')] = sha(D / 'publish.py')
+    if x.package_roles is None:
+        return
+    reader = publication_module(c)
+    need(x.package_roles == reader.PACKAGE_ROLE_SCHEMA and
+         re.fullmatch('[0-9a-f]{64}', x.package_roles_module_sha256),
+         'independent source-owned package role mode/module digest required')
+    module = Path(c['R']) / 'reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs'
+    need(file_fact(module)['sha256'] == x.package_roles_module_sha256,
+         'actual reviewed package-role module differs')
+    # Reuse the original archive owner's already closed Cargo metadata. The
+    # runtime dependency may live in Cargo's pinned source cache, not H/reverie.
+    metadata = [Path(path) for path,digest in c['files'].items()
+                if digest == prepared['metadata_sha256']]
+    need(len(metadata) == 1 and file_fact(metadata[0])['bytes'] <= 128*1024*1024,
+         'source-owned runtime metadata absent/ambiguous/unbounded')
+    md = json.loads(metadata[0].read_text())
+    packages = [p for p in md['packages'] if p['name'] == 'reverie-inguest']
+    need(len(packages) == 1, 'source-owned runtime package absent/ambiguous')
+    source_root = Path(packages[0]['manifest_path']).parent
+    source_paths = [source_root / 'src/guest/continuation.rs'] + [
+        Path(c['link_paths']['musl_source_authority']) / 'musl-1.2.5-selected/src/env' / name
+        for name in ['__libc_start_main.c','__init_tls.c']]
+    sources = []
+    for path in source_paths:
+        need(path.is_absolute() and path.resolve() == path, 'package role source coordinate differs')
+        fact = file_fact(path)
+        sources.append(dict(path=str(path),sha256=fact['sha256']))
+        c['files'][str(path)] = fact['sha256']
+    c['files'][str(module)] = x.package_roles_module_sha256
+    c['package_roles'] = dict(schema=x.package_roles, module_path=str(module),
+                             module_sha256=x.package_roles_module_sha256, sources=sources)
+
+
+
 def bind_prepared(c, x):
     path = Path(x.prepared_result)
     need(path.is_relative_to(Path(c['evidence_root'])) and path.resolve() == path, 'prepared receipt outside owned evidence')
@@ -353,6 +484,7 @@ def bind_prepared(c, x):
     need(not Path(paths['output_directory']).exists() and
          not Path(paths['output_directory']).with_suffix('.negative-inputs').exists(), 'fresh sole-target link/control directories required')
     c['link_paths'] = paths
+    bind_package_roles(c, x, prepared)
     c['prepared_directory'] = str(path.parent)
     need(re.fullmatch('[0-9a-f]{64}', x.initializer_module_sha256), 'independent actual reviewed module SHA required')
     module = Path(c['R']) / 'reverie-liteinst-artifact/src/private_static/selected_initializers.rs'
@@ -541,6 +673,8 @@ def main():
     a.add_argument('--terminal-module-sha256', required=True)
     a.add_argument('--view-site-module-sha256', required=True)
     a.add_argument('--view-table-module-sha256', required=True)
+    a.add_argument('--package-roles')
+    a.add_argument('--package-roles-module-sha256')
     a.add_argument('--elf')
     a.add_argument('--objdump')
     a.add_argument('--elf-h-head')
@@ -735,12 +869,17 @@ def main():
         package = packages[0]
         targets = [q for q in package['targets'] if q['name'] == 'reverie_liteinst_artifact' and q['kind'] == ['lib'] and q['crate_types'] == ['lib'] and q['src_path'] == str(Path(c['R']) / 'reverie-liteinst-artifact/src/lib.rs')]
         need(len(targets) == 1, 'tool library target ambiguous')
-        raw = command('tool-build', [c['host-cargo'], 'build', '--locked', '--offline', '--manifest-path', manifest, '-p', 'reverie-liteinst-artifact', '--lib', '-j4', '--target-dir', c['target'], '--message-format=json-render-diagnostics'], c['R'], host=True)
+        # Optimize only this HOST qualification tool and its normal dependencies.
+        # The separately built musl runtime keeps its existing codegen profile.
+        raw = command('tool-build', [c['host-cargo'], 'build', '--locked', '--offline', '--manifest-path', manifest, '-p', 'reverie-liteinst-artifact', '--lib', '-j4', '--target-dir', c['target'], '--message-format=json-render-diagnostics', '--config', 'profile.dev.opt-level=2', '--config', 'profile.dev.debug-assertions=true', '--config', 'profile.dev.overflow-checks=true'], c['R'], host=True)
         records = [json.loads(line) for line in raw.splitlines() if line.strip()]
-        need([q['success'] for q in records if q.get('reason') == 'build-finished'] == [True], 'Cargo did not complete one successful build')
+        result['checked_host_dependency_profiles'] = host_checker_dependencies(
+            records, tomllib.loads((Path(c['R']) / 'Cargo.lock').read_text()),
+            c['cargo_home'], c['target'])
         roots = [q for q in records if q.get('reason') == 'compiler-artifact' and (q.get('package_id') == package['id'] or q.get('manifest_path') == manifest)]
         need(len(roots) == 1, 'unexpected/duplicate same-package artifact; no broad build-script exemption')
         selected = roots[0]
+        host_checker_profile(selected['profile'], optimized=True)
         need(selected['target'] == targets[0] and selected['package_id'] == package['id'] and selected['manifest_path'] == manifest, 'complete target/package identity differs')
         need(selected['features'] == [] and selected['profile']['test'] is False and selected['executable'] is None, 'unexpected tool features/test/executable')
         rlibs = [Path(q) for q in selected['filenames'] if q.endswith('.rlib')]
@@ -797,6 +936,9 @@ def main():
                 c['native_leaf_sources']['memset'], c['native_leaf_sources']['set_thread_area'], c['native_leaf_module_sha256'],
                 c['optional_sources']['std_weak'], c['optional_sources']['std_destructors'], c['optional_sources']['musl_dl_iterate'], c['ordinary_gate_module_sha256'],
                 c['view_site_module_sha256'], c['view_table_module_sha256']]
+        if 'package_roles' in c:
+            argv += ['--package-roles',c['package_roles']['schema'],
+                     '--package-roles-module-sha256',c['package_roles']['module_sha256']]
         owned_error = None
         view_leaf_error = None
         diagnostic = ''
@@ -940,6 +1082,8 @@ def main():
                 need(obs['runtime_archive'] == {'path':c['prepared_archive']['path'],'sha256':c['prepared_archive']['sha256']} and
                      obs['explicit_structural']['archive'] == obs['runtime_archive'] and
                      obs['explicit_structural']['artifact'] == obs['artifact'], 'structural actual archive/artifact binding differs')
+                publication_module(c).package_role_receipt(c,receipt,
+                    lambda p: dict(path=str(p),sha256=file_fact(p)['sha256']))
                 produced[str(structural_path)] = file_fact(structural_path)
                 result['explicit_structural_source_closed_receipt'] = receipt
                 result['explicit_structural_receipt_file'] = produced[str(structural_path)]
@@ -1022,8 +1166,14 @@ def main():
                      provider['link_map'] == {'path':expected_map,'sha256':produced[expected_map]['sha256']},
                      'ordinary actual runtime archive/ELF/map identity differs')
                 result['ordinary_gate_physical_members'] = {'identity_policy':provider['identity_policy'], **physical_members}
+                trap_sources = {
+                    'LegacyE3': '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b',
+                    'CheckedHandoff5b3': '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b',
+                    'DedicatedFunction': '91c07be60ab719c9d353991a0230c058b22a457676d05f3866aab943ea55d6eb',
+                }
+                need(provider['cohort'] in trap_sources, 'ordinary unknown source/section cohort')
                 source_roles = [
-                    ('reverie-inguest/src/trap.rs','5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b'),
+                    ('reverie-inguest/src/trap.rs',trap_sources[provider['cohort']]),
                     ('reverie-inguest/src/trap/fixed_gates.rs','ff3f6f6c46e872734ae921e869dbccc0ce1aeefe4bc3af8f29363cf276501e54')]
                 need(len(provider['sources']) == 2, 'ordinary actual source roles incomplete')
                 for value,(suffix,digest) in zip(provider['sources'],source_roles):

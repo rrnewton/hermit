@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering::SeqCst;
@@ -43,6 +44,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::host_input::HostFileIdentity;
 use detcore_model::host_input::HostInputRecord;
+use detcore_model::host_input::HostInputSet;
 use detcore_model::network_engine::NetworkEngine;
 use detcore_model::network_engine::NetworkEngineError;
 use detcore_model::network_engine::NetworkReply;
@@ -112,6 +114,7 @@ use crate::scheduler::Scheduler;
 use crate::scheduler::ThreadNextTurn;
 use crate::scheduler::entropy_to_priority;
 use crate::scheduler::parked::*;
+use crate::scheduler::process_signal_receiver::ProcessSignalReceiver;
 use crate::scheduler::real_timer::DequeueAck;
 use crate::scheduler::real_timer::ItimerSnapshot;
 use crate::scheduler::real_timer::TimerFailure;
@@ -1203,6 +1206,10 @@ pub struct GlobalState {
     /// (`GlobalState::note_syscall_observation_gap`); `--passthru-opt` is
     /// added from the configuration.
     syscall_observation_gaps: Mutex<BTreeSet<SyscallObservationGap>>,
+    /// What the run learned of its store-exclusive sequences, for its
+    /// summary, recording and warnings (`crate::store_exclusive`).
+    #[cfg(target_arch = "aarch64")]
+    store_exclusive: Mutex<crate::store_exclusive::RunTally>,
 
     // Signals whose requested disposition Detcore did not install, already
     // announced in this run (`GlobalRequest::AnnounceSignalHandlerNotInstalled`).
@@ -1227,6 +1234,21 @@ pub struct GlobalState {
     // `detcore_model::host_input::HostMutationRecord`). Written beside
     // `host_inputs`.
     host_mutations: Mutex<BTreeSet<String>>,
+
+    // When this run replays a schedule whose recording names the host files
+    // its run opened, and `Config::record_host_inputs` is set: the comparison
+    // of this run's opens against them (`crate::host_inputs`). Information
+    // only; no scheduling decision reads it.
+    replay_host_inputs: Option<Mutex<crate::host_inputs::ReplayHostInputs>>,
+
+    // For each record in `host_inputs` whose file the run's end may read
+    // (`crate::host_inputs::content_at_end`): its index there and where the
+    // tool found the file at the open. Read once every guest process has
+    // exited, by `settle_host_inputs`, never while the guest runs.
+    host_input_sources: Mutex<Vec<(usize, PathBuf)>>,
+
+    // Whether `settle_host_inputs` has run.
+    host_inputs_settled: AtomicBool,
 
     // The canonical models of open file descriptions that several guest
     // processes share (see `crate::shared_open_files`). Locked after `sched`,
@@ -1313,6 +1335,10 @@ pub struct GlobalState {
 
     /// The start is when we construct the global state.  Close enough.
     realtime_start: SystemTime,
+
+    /// `crate::STOPLESS_SLICE_ENDS` when this run started: the run's own
+    /// count is the counter's growth since.
+    stopless_slice_ends_at_start: u64,
 
     /// External network record or replay state, present only when a network
     /// trace mode is configured. Every operation reads global time under this
@@ -1665,6 +1691,18 @@ impl GlobalState {
         std::mem::take(self.unsupported_syscalls.get_mut().unwrap())
     }
 
+    /// Take a store-exclusive report. It carries no time and touches no
+    /// scheduler state, so where it lands among other requests changes
+    /// nothing a run compares.
+    #[cfg(target_arch = "aarch64")]
+    fn note_store_exclusive(
+        &self,
+        report: &crate::store_exclusive::Report,
+    ) -> (Option<LogicalTime>, GlobalResponse) {
+        self.store_exclusive.lock().unwrap().note(&self.cfg, report);
+        (None, GlobalResponse::StoreExclusive(()))
+    }
+
     /// Ordinary RPC mutation must linearize before terminal publication under
     /// the same mutex as scheduler grants. A losing callback stays pending for
     /// the backend's failure subscription to drop; no normal reply is invented.
@@ -1740,6 +1778,10 @@ impl GlobalState {
                 history
                     .require_legacy_mode()
                     .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+                // A recording whose run retried store-exclusives may not
+                // replay; say so before the replay starts.
+                #[cfg(target_arch = "aarch64")]
+                crate::store_exclusive::warn_at_replay_start(history.store_exclusive_failures());
                 // The scheduler takes the same record's callback checkpoints,
                 // and checks them against the launch decision, before its
                 // loop runs or any thread starts.
@@ -1770,6 +1812,19 @@ impl GlobalState {
             None
         };
 
+        // A replayed recording that names the host files its run opened:
+        // this run's opens are compared against them.
+        let replay_host_inputs = cfg
+            .record_host_inputs
+            .then(|| {
+                preemptions_to_replay
+                    .as_ref()
+                    .and_then(HistoryReader::host_inputs)
+                    .cloned()
+                    .or_else(|| sched.lock().unwrap().recorded_host_inputs.clone())
+            })
+            .flatten()
+            .map(|recorded| Mutex::new(crate::host_inputs::ReplayHostInputs::new(recorded)));
         let range = Self::read_port_range();
         let network = Self::network_engine(cfg).map(Mutex::new);
 
@@ -1805,11 +1860,16 @@ impl GlobalState {
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             syscall_observation_gaps: Mutex::new(BTreeSet::new()),
+            #[cfg(target_arch = "aarch64")]
+            store_exclusive: Mutex::new(Default::default()),
             announced_handlers_not_installed: Mutex::new(BTreeSet::new()),
             announced_refused_signal_controls: Mutex::new((0, false)),
             policy_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
+            replay_host_inputs,
+            host_input_sources: Mutex::new(Vec::new()),
+            host_inputs_settled: AtomicBool::new(false),
             shared_open_files: process_exit_cleanup.shared_open_files,
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
@@ -1847,6 +1907,8 @@ impl GlobalState {
             sched_handle: handle,
             cfg: cfg.clone(),
             realtime_start: SystemTime::now(),
+            stopless_slice_ends_at_start: crate::STOPLESS_SLICE_ENDS
+                .load(std::sync::atomic::Ordering::Relaxed),
             global_time,
             preemptions_to_replay,
             network,
@@ -2136,12 +2198,17 @@ impl GlobalState {
         };
         // A scheduler panic can poison this mutex. Its JoinError is returned
         // below; recovering only to finish output must not replace that error.
-        let writer = self
+        let mut writer = self
             .sched
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .preemption_writer
             .take();
+        if let (Some(writer), true) = (writer.as_mut(), self.cfg.record_preemptions_to.is_some())
+            && let Some(inputs) = self.host_input_set()
+        {
+            writer.set_host_inputs(inputs);
+        }
         let preemption_recording = if self.cfg.record_preemptions_to.is_some() {
             writer.map_or(Ok(()), |writer| writer.flush())
         } else {
@@ -2198,11 +2265,18 @@ impl GlobalState {
         let recording_destination = self.cfg.record_preemptions_to.clone();
         // The run is over: write what it opened for --verify.
         if let Some(log) = &self.cfg.host_input_log {
+            self.settle_host_inputs();
             crate::host_inputs::write(
                 log,
                 &self.host_inputs.lock().unwrap(),
                 &self.host_mutations.lock().unwrap(),
             );
+        }
+        // After the scheduler shut down: every guest task has exited, and its
+        // store-exclusive counts have folded into the run's counters.
+        #[cfg(target_arch = "aarch64")]
+        for warning in self.store_exclusive.lock().unwrap().warnings(&self.cfg) {
+            warn!("{}", warning);
         }
         let summary_result = self
             .finalize_run_summary()
@@ -2285,12 +2359,171 @@ impl GlobalState {
         crate::combine_finalization(summary, flushed)
     }
 
+    /// The host files this run's guest opened (`crate::host_inputs::input_set`),
+    /// when `Config::record_host_inputs` is set.
+    fn host_input_set(&self) -> Option<HostInputSet> {
+        if !self.cfg.record_host_inputs {
+            return None;
+        }
+        self.settle_host_inputs();
+        let mutated = self
+            .host_mutations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // A rebinding Detcore could not place (untraced guest code) rebinds
+        // `/`: every path may have been changed by the guest, so the set
+        // would be empty and look complete. Report none instead.
+        if mutated.contains("/") {
+            return None;
+        }
+        Some(crate::host_inputs::input_set(
+            &self
+                .host_inputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            &mutated,
+        ))
+    }
+
+    /// Read what the run's host-input records need from the files
+    /// themselves, once, when every guest process has exited (the callers
+    /// run after the scheduler has finished): for the first open of each
+    /// path whose file the tool could name, the content
+    /// `crate::host_inputs::content_at_end` reads, and for each exec image,
+    /// its program interpreter, which joins the records as an exec record
+    /// (`crate::host_inputs::interpreter_at_end`). Reading while the guest
+    /// ran would raise inotify events in the guest's watches. A schedule
+    /// replay then decides the opens it left (`ReplayHostInputs::finish`)
+    /// and reports each change it finds, as an open's change is reported.
+    fn settle_host_inputs(&self) {
+        if !self.cfg.record_host_inputs || self.host_inputs_settled.swap(true, SeqCst) {
+            return;
+        }
+        let mutated = self
+            .host_mutations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let sources = std::mem::take(
+            &mut *self
+                .host_input_sources
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let mut records = self
+            .host_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut first: HashMap<String, usize> = HashMap::new();
+        for (index, record) in records.iter().enumerate() {
+            first.entry(record.path.clone()).or_insert(index);
+        }
+        let mut interpreters: Vec<HostInputRecord> = Vec::new();
+        for (index, source) in sources {
+            let record = &mut records[index];
+            if first.get(&record.path) != Some(&index) {
+                continue;
+            }
+            record.content = crate::host_inputs::content_at_end(
+                &source,
+                &record.path,
+                record.identity,
+                &mutated,
+            );
+            if record.exec
+                && let Some((interpreter, host)) =
+                    crate::host_inputs::interpreter_at_end(&record.path, &source, record.identity)
+                // One record per interpreter, which every image of a
+                // dynamically linked run names, read once.
+                && !first.contains_key(&interpreter)
+                && !interpreters.iter().any(|known| known.path == interpreter)
+                && let Ok(stat) = crate::util::raw_stat(&host)
+            {
+                let identity = HostFileIdentity::from_stat(&stat);
+                interpreters.push(HostInputRecord {
+                    content: crate::host_inputs::content_at_end(
+                        &host,
+                        &interpreter,
+                        identity,
+                        &mutated,
+                    ),
+                    path: interpreter,
+                    identity,
+                    exec: true,
+                    kernel_object: false,
+                    ..record.clone()
+                });
+            }
+        }
+        records.extend(interpreters.iter().cloned());
+        let mut contents: HashMap<String, Option<String>> = HashMap::new();
+        for record in records.iter() {
+            contents
+                .entry(record.path.clone())
+                .or_insert_with(|| record.content.clone());
+        }
+        drop(records);
+        let Some(replay) = &self.replay_host_inputs else {
+            return;
+        };
+        let mut replay = replay.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut changes = Vec::new();
+        for interpreter in &interpreters {
+            changes.extend(
+                replay
+                    .observe(
+                        &interpreter.path,
+                        interpreter.identity,
+                        true,
+                        false,
+                        &mutated,
+                    )
+                    .cloned(),
+            );
+        }
+        changes.extend_from_slice(
+            replay.finish(|path| contents.get(path).cloned().flatten(), &mutated),
+        );
+        drop(replay);
+        for change in &changes {
+            report_host_input_change(change);
+        }
+    }
+
     fn run_summary_for_log(&self) -> anyhow::Result<(RunSummary, Option<String>)> {
+        // The host files the guest opened go into the recorded schedule,
+        // which the scheduler flushes below, and into the summary.
+        let host_inputs = self.host_input_set();
         // First, the scheduler can generate part of the summary (and flush once).
         let (mut summary, info_reprio_descrip) = {
             let mut sched = self.sched.lock().unwrap();
+            // Only a schedule written to a file carries the set; an in-memory
+            // record's text goes into the INFO description.
+            if let (Some(writer), Some(inputs), true) = (
+                sched.preemption_writer.as_mut(),
+                &host_inputs,
+                self.cfg.record_preemptions_to.is_some(),
+            ) {
+                writer.set_host_inputs(inputs.clone());
+            }
+            // Every guest task has exited: the recording keeps the run's failed
+            // store-exclusives for a replay to warn about.
+            #[cfg(target_arch = "aarch64")]
+            if let Some(writer) = sched.preemption_writer.as_mut() {
+                writer.record_store_exclusive_failures(
+                    self.store_exclusive
+                        .lock()
+                        .unwrap()
+                        .failures_for_recording(),
+                );
+            }
             sched.generate_partial_run_summary_for_log(self.cfg.record_preemptions_to.as_ref())?
         };
+        #[cfg(target_arch = "aarch64")]
+        self.store_exclusive
+            .lock()
+            .unwrap()
+            .fill_summary(&mut summary);
         // Second, we fill in the rest based on global state.
         // Record configuration and the runtime's timer mechanism, not whether
         // a timer is currently armed or has delivered an event. This metadata
@@ -2298,7 +2531,18 @@ impl GlobalState {
         summary.preemption = Some(PreemptionSummary {
             max_timeslice_ns: self.cfg.max_timeslice.map(|maximum| maximum.get()),
             timer_enabled: Some(self.cfg.use_preemption_timer()),
+            stopless_slice_ends: self.cfg.replays_lone_preemptions().then(|| {
+                crate::STOPLESS_SLICE_ENDS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(self.stopless_slice_ends_at_start)
+            }),
         });
+        // The host files the guest opened, and those a replay found changed
+        // since its recording. Like `preemption`, outside the INFO view.
+        summary.host_inputs = host_inputs;
+        if let Some(replay) = &self.replay_host_inputs {
+            summary.host_inputs_changed = replay.lock().unwrap().changes().to_vec();
+        }
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -2417,7 +2661,31 @@ impl GlobalTool for GlobalState {
     ///   and POSIX-timer expiry, child-exit SIGCHLD) are published under the
     ///   scheduler lock at scheduler time into the backend's pending sets or
     ///   dequeue journal, which make a boundary non-empty, so none is lost.
-    /// - Authorization succeeds only for `parked.running`. The only skippable
+    /// - The round trip's permit is read by no other decision. Permits are
+    ///   per thread (<https://github.com/rrnewton/hermit/issues/4899>), and
+    ///   apart from the holder's own authorization and receipt, every reader
+    ///   of `parked.permits` reads one named thread's entry, or only the
+    ///   observation permits of parked waits, which a boundary's permit never
+    ///   is:
+    ///   - another thread's authorization, the exit reservation
+    ///     (`reserve_exit_boundary`) and the parked-request retirements
+    ///     (`retire_parked_requests`, `retire_replaced_parked_request`,
+    ///     `retire_child_wait_signal_request`) read their own thread's entry;
+    ///   - alarm selection (`select_parked_alarm`) skips a process only for an
+    ///     observation permit (one with a `site`) and otherwise reads each
+    ///     recipient's own entry, and a thread at a boundary is no parked-wait
+    ///     recipient;
+    ///   - an observation's finish (`finish_observation`) and another
+    ///     thread's receipt remove only their own thread's entry;
+    ///   - process retirement (`finish_process_retirement`) reads every entry
+    ///     of the process, but only once its leader has joined every thread,
+    ///     never during a live thread's boundary.
+    ///
+    ///   So with or without the round trip, every decision sees the same
+    ///   permits of every other thread, and the boundary's thread holds none
+    ///   once the round trip ends.
+    /// - The round trip runs inside the thread's own serial grant.
+    ///   Authorization succeeds only for `parked.running`. The only skippable
     ///   boundaries follow a completed Tool callback or a backend-owned
     ///   `rt_sigreturn` (thread entry checks only when a signal is eligible).
     ///   Every request is awaited, and every background release
@@ -2428,12 +2696,8 @@ impl GlobalTool for GlobalState {
     ///   then: they wait for quiescence, and `are_all_quiesced` waits on the
     ///   running thread's empty request. The control-intent drain
     ///   (`drain_control_intents`) does run on every pass of the turn loop,
-    ///   but its intents only finish or resume an observed parked wait. A
-    ///   finish runs while that wait's observation permit exists, and in the
-    ///   boundary thread's own process that permit makes authorization
-    ///   refuse; a resume reads no permit. So no other decision can see the
-    ///   short-lived permit, and its release admits no exit: exits wait only
-    ///   behind another permit of the process.
+    ///   but its intents only finish or resume an observed parked wait, and
+    ///   touch only that wait's own permit.
     /// - The receipt's cleanup is redundant there. Every grant settles the
     ///   parked request it answers (`settle_parked_grant`), and every request
     ///   the scheduler substitutes for a filed one retires the replaced
@@ -2450,10 +2714,16 @@ impl GlobalTool for GlobalState {
     ///
     /// Held once before, while a backgrounded KVM `rt_sigsuspend` race was
     /// open (<https://github.com/rrnewton/hermit/issues/4360>). That race is
-    /// fixed: a KVM `rt_sigsuspend` now runs in its caller's turn, and a
-    /// sibling may exit while a thread holds a permit
-    /// (<https://github.com/rrnewton/hermit/issues/4367>). Before those fixes
-    /// the race fired about as often with this opt-in as without it.
+    /// fixed: a KVM `rt_sigsuspend` now runs in its caller's turn. Before that
+    /// fix the race fired about as often with this opt-in as without it.
+    ///
+    /// An earlier form of this proof called an observed wait's permit
+    /// short-lived and unseen by other decisions. It is not short-lived: it
+    /// lasts until the observed thread's return-boundary receipt, across that
+    /// thread's `InboundSignal` turn, during which siblings run. While permits
+    /// were one per process, a sibling's boundary saw it and was refused
+    /// (<https://github.com/rrnewton/hermit/issues/4899>). The argument above
+    /// no longer depends on any permit's lifetime.
     ///
     /// Re-prove or drop this if Detcore ever holds pending signals, or its
     /// own mask copy, that the backend cannot see and delivers them through
@@ -2576,6 +2846,10 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
+        #[cfg(target_arch = "aarch64")]
+        if let GlobalRequest::StoreExclusive(report) = &gr.2 {
+            return self.note_store_exclusive(report);
+        }
         if let GlobalRequest::MappingCapture(request) = &gr.2 {
             return (
                 None,
@@ -2617,7 +2891,11 @@ impl GlobalTool for GlobalState {
         // existing ParentContinue grant must not initialize callback counters
         // or consume the budget which belongs after the startup reset.
         let self_registration = registers_own_image(dtid, &gr.2);
-        self.sched.lock().unwrap().take_grant(dtid);
+        {
+            let mut scheduler = self.sched.lock().unwrap();
+            scheduler.take_grant(dtid);
+            scheduler.take_lone_grant(dtid);
+        }
         let (time, response) = if !resumes_from_grant(&gr.2) {
             self.dispatch_rpc(from, gr).await
         } else {
@@ -2637,9 +2915,10 @@ impl GlobalTool for GlobalState {
                 _ => (time, response),
             }
         };
-        let (granted, boundary_budget, boundary_owner) = {
+        let (granted, boundary_budget, boundary_owner, lone) = {
             let mut scheduler = self.sched.lock().unwrap();
             let granted = scheduler.take_grant(dtid);
+            let lone = scheduler.take_lone_grant(dtid);
             let terminal =
                 response == GlobalResponse::ThreadExited || response == GlobalResponse::Retired;
             let mut budget = scheduler
@@ -2670,7 +2949,7 @@ impl GlobalTool for GlobalState {
             } else {
                 None
             };
-            (granted, budget, owner)
+            (granted, budget, owner, lone)
         };
         let response = match boundary_budget {
             Some(budget) => GlobalResponse::WithSliceBoundaryBudget(budget, Box::new(response)),
@@ -2684,7 +2963,12 @@ impl GlobalTool for GlobalState {
             && response != GlobalResponse::ThreadExited
             && response != GlobalResponse::Retired
         {
-            (time, GlobalResponse::Granted(Box::new(response)))
+            let response = GlobalResponse::Granted(Box::new(response));
+            if lone {
+                (time, GlobalResponse::WithLoneGrant(Box::new(response)))
+            } else {
+                (time, response)
+            }
         } else {
             (time, response)
         }
@@ -2793,6 +3077,10 @@ impl GlobalState {
                 None,
                 GlobalResponse::MappingCapture(self.mapping_capture_request(from, gr.1, request)),
             );
+        }
+        #[cfg(target_arch = "aarch64")]
+        if let GlobalRequest::StoreExclusive(report) = &gr.2 {
+            return self.note_store_exclusive(report);
         }
         if let GlobalRequest::CheckBrkMappings(check, fact) = &gr.2 {
             return (
@@ -2917,14 +3205,47 @@ impl GlobalState {
             path,
             syscall,
             identity,
+            source,
+            regular,
+            exec,
+            kernel_object,
         } = request
         {
-            self.host_inputs.lock().unwrap().push(HostInputRecord {
+            let change = self.replay_host_inputs.as_ref().and_then(|replay| {
+                let mutated = self
+                    .host_mutations
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                replay
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .observe(&path, identity, regular, kernel_object, &mutated)
+                    .cloned()
+            });
+            if let Some(change) = change {
+                report_host_input_change(&change);
+            }
+            let mut records = self
+                .host_inputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(source) = source {
+                self.host_input_sources
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((records.len(), PathBuf::from(source)));
+            }
+            records.push(HostInputRecord {
                 path,
                 dtid: dtid.as_raw() as u64,
                 syscall,
                 identity,
+                // Read by `settle_host_inputs`, once the guest has exited.
+                content: None,
+                exec,
+                kernel_object,
             });
+            drop(records);
             if early_victim_request {
                 return (None, R::Retired);
             }
@@ -3290,6 +3611,10 @@ impl GlobalState {
             GlobalRequest::CheckBrkMappings(..) => {
                 unreachable!("mapping capture is answered before clock accounting")
             }
+            #[cfg(target_arch = "aarch64")]
+            GlobalRequest::StoreExclusive(_) => {
+                unreachable!("a store-exclusive report is answered before clock accounting")
+            }
             GlobalRequest::Sigalrm(_) => {
                 unreachable!("SIGALRM ledger control answered before clock accounting")
             }
@@ -3591,6 +3916,12 @@ impl GlobalState {
                         return (None, R::ThreadExited);
                     }
                 }
+                // The exec caller's priority-inheritance futexes go to their
+                // waiters, as Linux's `futex_exec_release` releases them after
+                // the robust lists, which the exec's backend delivered first.
+                if self.cfg.sequentialize_threads {
+                    sched.release_pi_futexes_of(dtid);
+                }
                 self.past_first_execve.store(true, SeqCst);
                 let first_image = !self.initial_descriptor_image_complete.swap(true, SeqCst);
                 let mut overrides = self
@@ -3835,6 +4166,9 @@ impl GlobalState {
                         if let Err(refusal) = sched.authenticate_priority_birth(dettid) {
                             crate::scheduler::exit_on_scheduler_refusal(&refusal);
                         }
+                        // A thread born after the replay released its schedule
+                        // starts without the checkpoints, in both copies.
+                        sched.drop_released_callback_checkpoints(dettid);
                         let startup = crate::preemptions::callback_history::Startup {
                             checkpoints: sched
                                 .callback_checkpoints
@@ -3933,6 +4267,13 @@ impl GlobalState {
                     .await
                     .own_process_signal_inputs(dtid),
             ),
+            GlobalRequest::ProcessSignalReceiver(process, named, signo) => {
+                R::ProcessSignalReceiver(
+                    self.lock_rpc_scheduler(false)
+                        .await
+                        .process_signal_receiver(process, named, dtid, signo),
+                )
+            }
             GlobalRequest::SetChildTidAddress(address) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -4008,13 +4349,11 @@ impl GlobalState {
             GlobalRequest::HandOffTurn => {
                 R::HandOffTurn(self.lock_rpc_scheduler(false).await.hand_off_turn(dtid))
             }
-            GlobalRequest::RecordFatalSignal => {
-                let mut scheduler = self.lock_rpc_scheduler(false).await;
-                if let Some(process) = scheduler.registered_process(dtid) {
-                    scheduler.record_committed_fatal_signal(process);
-                }
-                R::RecordFatalSignal(())
-            }
+            GlobalRequest::CommitFatalDelivery(retire_others) => R::CommitFatalDelivery(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .commit_fatal_delivery(dtid, retire_others),
+            ),
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::SetFileMtime(ino, mtime) => {
                 R::SetFileMtime(self.recv_set_file_mtime(from, ino, mtime).await)
@@ -4988,10 +5327,14 @@ impl GlobalState {
 
                 let endtime_update = match schedval {
                     // Only syscalls timeout, and they don't need to update guest timeslice end.
-                    // Nor does a futex requeue's answer, which a resource grant never carries.
-                    SchedValue::TimeOut | SchedValue::Signaled(_) | SchedValue::Requeued { .. } => {
-                        None
-                    }
+                    // Nor does a futex requeue's or a PI futex command's answer,
+                    // which a resource grant never carries.
+                    SchedValue::TimeOut
+                    | SchedValue::Signaled(_)
+                    | SchedValue::Requeued { .. }
+                    | SchedValue::PiFutex(_)
+                    | SchedValue::PiTaken(_)
+                    | SchedValue::PiWaiterReached { .. } => None,
                     SchedValue::Value(timeslice) => Some(LogicalTime::from_nanos(timeslice)),
                 };
                 (
@@ -5385,11 +5728,22 @@ impl GlobalState {
             } else {
                 // In replay mode the schedule decides the thread's priority
                 // (`Scheduler::replay_registration_priority`).
+                // A child registers before the schedule switches to it
+                // whenever its parent runs on after the clone, as recorded
+                // schedules usually have it, so this is a sign that the
+                // replay lost its guide only once it has left the record.
                 if sched.replay_registration_priority(child_dettid, initial_priority) {
-                    warn!(
-                        "[detcore, dtid {}] registered before the replayed schedule switched to it, created by process {}; it takes its starting priority {}",
-                        child_dettid, parent_detpid, initial_priority
-                    );
+                    if sched.replay_left_its_record() {
+                        warn!(
+                            "[detcore, dtid {}] registered before the replayed schedule switched to it, created by process {}; it takes its starting priority {}",
+                            child_dettid, parent_detpid, initial_priority
+                        );
+                    } else {
+                        debug!(
+                            "[detcore, dtid {}] registered before the replayed schedule switched to it, created by process {}; it takes its starting priority {}",
+                            child_dettid, parent_detpid, initial_priority
+                        );
+                    }
                 }
             }
 
@@ -5544,6 +5898,7 @@ impl GlobalState {
                     callback_checkpoint: None,
                     priority_row: None,
                     slice_expired: false,
+                    zero_length_sleep: false,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -5738,6 +6093,7 @@ impl GlobalState {
             syscall_count,
             syscall_histogram,
             chaos_epochs,
+            killed_by_group_signal,
         } = deregistration;
         if !sched.rpc_incarnation_matches(dettid, mm) {
             debug!(
@@ -5774,7 +6130,16 @@ impl GlobalState {
         {
             return;
         }
-        sched.retire_deregistered_thread(dettid, detpid, mm);
+        // The process as the scheduler registered the thread, as the retire
+        // path reads it (`logically_kill_thread`), not the backend's report.
+        let process = sched.registered_process(dettid).unwrap_or(detpid);
+        // A leader retired at its own exit (`retire_exited_leader`) reports
+        // here a death already accounted: whatever killed its group, a guest's
+        // SIGKILL above all, is accounted where it happened, not at this
+        // host-timed moment.
+        if sched.retire_deregistered_thread(dettid, detpid, mm) && killed_by_group_signal {
+            sched.note_signal_killed_group(dettid, process);
+        }
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -5835,20 +6200,26 @@ impl GlobalState {
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
+                    sched.leave_pi_futex_queue(dettid);
                     return None;
                 }
                 FutexAction::WakeRequest(num_threads) => {
-                    let num = sched.wake_futex_waiters(dettid, futexid, num_threads, mask);
+                    let (num, met_pi) =
+                        sched.wake_futex_waiters_until_pi(dettid, futexid, num_threads, mask);
                     if self.cfg.yields_after_futex_wake(num) {
                         sched.requeue_futex_waker(dettid);
                     }
-                    return Some(SchedValue::Value(num));
+                    return Some(if met_pi {
+                        SchedValue::PiWaiterReached { woken: num }
+                    } else {
+                        SchedValue::Value(num)
+                    });
                 }
                 FutexAction::WakeFinished(_num_threads) => {
                     return None;
                 }
                 FutexAction::RequeueRequest(to, nr_wake, nr_requeue) => {
-                    let (woken, moved) = sched.requeue_futex_waiters(
+                    let (woken, moved, met_pi) = sched.requeue_futex_waiters(
                         futexid,
                         to,
                         nr_wake as usize,
@@ -5857,7 +6228,49 @@ impl GlobalState {
                     if self.cfg.yields_after_futex_wake(woken) {
                         sched.requeue_futex_waker(dettid);
                     }
-                    return Some(SchedValue::Requeued { woken, moved });
+                    return Some(if met_pi {
+                        SchedValue::PiWaiterReached { woken }
+                    } else {
+                        SchedValue::Requeued { woken, moved }
+                    });
+                }
+                FutexAction::PiState(named) => {
+                    return Some(SchedValue::PiFutex(
+                        sched.pi_futex_state(futexid, named, dettid),
+                    ));
+                }
+                FutexAction::PiTake => {
+                    return Some(SchedValue::PiTaken(
+                        sched.take_handed_pi_futex(futexid, dettid),
+                    ));
+                }
+                FutexAction::PiHandOff => {
+                    let woken = u64::from(sched.hand_off_pi_futex(futexid).is_some());
+                    if self.cfg.yields_after_futex_wake(woken) {
+                        sched.requeue_futex_waker(dettid);
+                    }
+                    return Some(SchedValue::Value(woken));
+                }
+                FutexAction::PiLockWait(maybe_timeout, signal_watch, owner) => {
+                    if let Err(error) = sched.install_resource_origin(
+                        dettid,
+                        ResourceOrigin {
+                            rpc: RpcOrigin::FutexAction,
+                            mm,
+                            control: ControlCapability::None,
+                        },
+                    ) {
+                        sched.fail_parked(dettid, error);
+                        return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
+                    }
+                    sched.sleep_pi_futex_waiter(
+                        dettid,
+                        futexid,
+                        maybe_timeout,
+                        signal_watch,
+                        owner,
+                    );
+                    // block on ivar, below
                 }
             }
             // Blocking on the FUTEX_WAIT here, remove ourselves:
@@ -6204,9 +6617,20 @@ impl GlobalState {
                 );
             }
 
+            // Read after any wait for the schedule: a release another thread's
+            // event made meanwhile, in an earlier turn, counts too, and so does
+            // the end of the schedule. On a release the scheduler drops its
+            // copy of this thread's callback checkpoints here, and the thread
+            // drops its own when this reply reaches it.
+            let (schedule_released, schedule_over) = self
+                .lock_rpc_scheduler(false)
+                .await
+                .schedule_replay_reply(ev.dettid);
             TraceSchedEventResponse {
                 print_stack_strace: print_stack.or(print_stack2),
                 timeslice: end_of_timeslice,
+                schedule_released,
+                schedule_over,
             }
         } else {
             let print_stack_strace = {
@@ -6225,6 +6649,8 @@ impl GlobalState {
             TraceSchedEventResponse {
                 print_stack_strace,
                 timeslice: None,
+                schedule_released: false,
+                schedule_over: false,
             }
         };
 
@@ -6361,6 +6787,9 @@ pub struct ThreadDeregistration {
     /// total is `syscall_count`.
     pub(crate) syscall_histogram: SparseSyscallHistogram,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
+    /// The thread died of a signal that ends its whole thread group
+    /// (`signal_ends_thread_group`, `Scheduler::note_signal_killed_group`).
+    pub(crate) killed_by_group_signal: bool,
 }
 
 /// A question about, or a record in, the scheduler's ledger of guest-handled
@@ -6460,7 +6889,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 6;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 12;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -6639,6 +7068,11 @@ pub enum GlobalRequest {
     /// own process (`Scheduler::own_process_signal_inputs`).
     OwnProcessSignalInputs,
 
+    /// The thread of a process that takes the process-directed signal the
+    /// calling thread sends naming a task of it
+    /// (`Scheduler::process_signal_receiver`).
+    ProcessSignalReceiver(DetPid, DetTid, i32),
+
     /// The calling thread sends SIGSTKFLT (`Scheduler::record_guest_marker_signal`).
     RecordGuestMarkerSignal,
 
@@ -6692,8 +7126,10 @@ pub enum GlobalRequest {
     /// (`Scheduler::hand_off_turn`).
     HandOffTurn,
     /// The calling thread is delivering a signal whose default action ends
-    /// its process (`Scheduler::record_committed_fatal_signal`).
-    RecordFatalSignal,
+    /// its process (`Scheduler::commit_fatal_delivery`), and whether the
+    /// kernel carries that action out when it resumes the thread, so the
+    /// process's other threads may be retired now.
+    CommitFatalDelivery(bool),
 
     /// Bump mtime
     TouchFile(RawInode),
@@ -6815,6 +7251,19 @@ pub enum GlobalRequest {
         syscall: u64,
         /// Captured actual host file identity.
         identity: HostFileIdentity,
+        /// Where the tool found the file at the open (the kernel's path for
+        /// the guest's descriptor, or for an exec's image), for the run's
+        /// end to read its content (`crate::host_inputs::content_at_end`):
+        /// present for a regular file or a directory the tool could name.
+        source: Option<String>,
+        /// Whether the file is a regular file.
+        regular: bool,
+        /// Whether the kernel opened the file for an exec
+        /// (`detcore_model::host_input::HostInputRecord::exec`).
+        exec: bool,
+        /// Whether the descriptor's own path is a kernel object
+        /// (`detcore_model::host_input::HostInputRecord::kernel_object`).
+        kernel_object: bool,
     },
 
     /// Record that the sending thread rebound `path` in the guest's file
@@ -7167,6 +7616,13 @@ pub enum GlobalRequest {
     /// of the `sched_setaffinity` that set it (`Scheduler::set_cpu_affinity`).
     /// Appended last.
     SetCpuAffinity(DetTid, crate::cpu_set::CpuSet),
+    /// aarch64: a report of the exclusive pairs in executable mappings, or
+    /// the root guest task's first image, where the run's store-exclusive
+    /// counters start (`crate::store_exclusive`). It carries no time and changes no scheduler
+    /// state, so it is answered before any grant or clock accounting.
+    /// Appended last.
+    #[cfg(target_arch = "aarch64")]
+    StoreExclusive(crate::store_exclusive::Report),
 }
 
 /// Responses from the global object
@@ -7215,6 +7671,7 @@ pub enum GlobalResponse {
     PublishedGuestSigmask(Option<u64>),
     SetSigtimedwaitSet(()),
     OwnProcessSignalInputs(OwnProcessSignalInputs),
+    ProcessSignalReceiver(ProcessSignalReceiver),
     RecordGuestMarkerSignal(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
@@ -7230,7 +7687,8 @@ pub enum GlobalResponse {
     DirectorySnapshotMark(SnapshotMark),
     ReadyChannel(crate::pipe_wake::ReadyOutcome),
     HandOffTurn(bool),
-    RecordFatalSignal(()),
+    /// Whether the process's other threads were retired.
+    CommitFatalDelivery(bool),
     TouchFile(()),
     SetFileMtime(()),
     GlobalTimeLowerBound(LogicalTime),
@@ -7472,6 +7930,15 @@ pub enum GlobalResponse {
     /// The answer to `GlobalRequest::CpuAffinity` and
     /// `GlobalRequest::SetCpuAffinity`. Appended last.
     CpuAffinity(crate::cpu_set::TaskAffinity),
+    /// A granted reply whose grant found the thread the only one able to run
+    /// before it next enters Detcore (`Scheduler::take_lone_grant`).
+    /// Outermost; unwrapped first by `send_and_update_time`, which records it
+    /// in `ThreadState::lone_grant`.
+    /// Appended last.
+    WithLoneGrant(Box<GlobalResponse>),
+    /// The answer to `GlobalRequest::StoreExclusive`. Appended last.
+    #[cfg(target_arch = "aarch64")]
+    StoreExclusive(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -7546,6 +8013,28 @@ pub(crate) fn guest_log_reply(
         other => Err(std::io::Error::other(format!(
             "unexpected answer to a guest log record: {other:?}"
         ))),
+    }
+}
+
+/// A store-exclusive report (`crate::store_exclusive`). Like a guest log
+/// record, it carries no time.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn store_exclusive_request(
+    report: crate::store_exclusive::Report,
+) -> (DetTime, MmId, GlobalRequest) {
+    (
+        DetTime::default(),
+        MmId::initial(DetTid::from_raw(0)),
+        GlobalRequest::StoreExclusive(report),
+    )
+}
+
+/// Check the answer to a [`store_exclusive_request`]. A report is
+/// diagnostic, so another answer (a run already failing) is only logged.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn store_exclusive_reply(response: (Option<LogicalTime>, GlobalResponse)) {
+    if response != (None, GlobalResponse::StoreExclusive(())) {
+        debug!("unexpected answer to a store-exclusive report: {response:?}");
     }
 }
 
@@ -7628,6 +8117,7 @@ pub async fn prepare_exec<G, T>(
         },
         channels: Default::default(),
         open_file_namespace: None,
+        random_device_sequence: guest.thread_state().random_device_sequence_for_exec(),
         exe,
     };
     // `--pipe-wake-latency` on a backend that rediscovers its descriptors
@@ -7727,10 +8217,19 @@ pub async fn mark_past_first_execve<G, T>(
 }
 
 /// Report to the global state that this thread, in its current syscall,
-/// opened `path` and found the host file `identity`, for `hermit run
-/// --verify` (see `detcore_model::host_input`). The answer carries no time.
-pub(crate) async fn record_host_input<G, T>(guest: &mut G, path: String, identity: HostFileIdentity)
-where
+/// opened `path` and found the host file `identity` (`regular` for a regular
+/// file), which the tool found at `source` for the run's end to read, for
+/// `hermit run --verify` and the run's host-input set (see
+/// `detcore_model::host_input`). The answer carries no time.
+pub(crate) async fn record_host_input<G, T>(
+    guest: &mut G,
+    path: String,
+    identity: HostFileIdentity,
+    source: Option<String>,
+    regular: bool,
+    exec: bool,
+    kernel_object: bool,
+) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
@@ -7741,6 +8240,10 @@ where
             path,
             syscall,
             identity,
+            source,
+            regular,
+            exec,
+            kernel_object,
         },
     )
     .await;
@@ -7748,6 +8251,22 @@ where
         (time, response),
         (None, GlobalResponse::RecordHostInput(()))
     );
+}
+
+/// Print `change` on Hermit's own stderr, never the guest's output or the
+/// log `--verify` compares, without panicking where the guest made the shared
+/// stderr nonblocking (`crate::util::RetryingStderr`). The caller holds no
+/// lock.
+fn report_host_input_change(change: &detcore_model::host_input::HostInputChange) {
+    let line = format!(
+        "{} {change}\n",
+        detcore_model::host_input::HOST_INPUT_CHANGED_SINCE_RECORDING_MARKER
+    );
+    let _ = if crate::nonwaiting_write::diagnostics_must_not_wait() {
+        std::io::Write::write_all(&mut crate::util::DroppingStderr, line.as_bytes())
+    } else {
+        std::io::Write::write_all(&mut crate::util::RetryingStderr, line.as_bytes())
+    };
 }
 
 /// Report to the global state that this thread rebound `path` in the guest's
@@ -8077,6 +8596,31 @@ where
     }
 }
 
+/// The thread of `process` that takes the process-directed signal `signo`
+/// the calling thread sends naming `named`, decided in its turn
+/// (`Scheduler::process_signal_receiver`).
+pub(crate) async fn process_signal_receiver<G, T>(
+    guest: &mut G,
+    process: DetPid,
+    named: DetTid,
+    signo: i32,
+) -> ProcessSignalReceiver
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(
+        guest,
+        GlobalRequest::ProcessSignalReceiver(process, named, signo),
+    )
+    .await
+    .1
+    {
+        GlobalResponse::ProcessSignalReceiver(receiver) => receiver,
+        response => unreachable!("unexpected response to ProcessSignalReceiver: {response:?}"),
+    }
+}
+
 pub(crate) async fn set_child_tid_address<G, T>(guest: &mut G, address: usize)
 where
     G: Guest<Detcore<T>>,
@@ -8189,6 +8733,26 @@ where
     let continues_sigreturn = request_continues_sigreturn(&request);
     let starts_thread = matches!(request, GlobalRequest::StartNewThread(..));
     let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    let lone_grant = if let GlobalResponse::WithLoneGrant(response) = resp.1 {
+        resp.1 = *response;
+        true
+    } else {
+        false
+    };
+    guest.thread_state_mut().lone_grant = lone_grant;
+    if guest.thread_state().replaying_lone_slice_end.is_some() {
+        // A grant while a skipped slice end is processed must find the
+        // thread alone again: nothing but its own requests could have
+        // changed that (`Detcore::catch_up_lone_slice_ends` reports it).
+        if !lone_grant && matches!(resp.1, GlobalResponse::Granted(_)) {
+            guest.thread_state_mut().lone_replay_unsound = true;
+        }
+    } else if !lone_grant {
+        // Another thread may run before this one next enters Detcore: its
+        // pending slice end needs its stop again, whatever this callback
+        // does next.
+        crate::stop_skipping_lone_slice_end(guest);
+    }
     // A grant while the request was pending is a hand-off to the scheduler,
     // the one place every hand-off is noted (`ThreadState::note_scheduler_handoff`).
     if let GlobalResponse::Granted(response) = resp.1 {
@@ -8505,7 +9069,9 @@ where
         return;
     };
     let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0);
-    let schedule_replay = guest.config().replay_schedule_from.is_some();
+    let schedule_replay = guest
+        .thread_state()
+        .follows_replayed_schedule(guest.config());
     // A configuration with an invalid turn cost is refused before any guest
     // runs; zero here only drops the floor.
     let min_slice = Duration::from_nanos(guest.config().scheduler_turn_charge().unwrap_or(0));
@@ -9000,6 +9566,21 @@ pub enum FutexAction {
     /// FUTEX_CMP_REQUEUE. Answers with the number woken plus the number moved,
     /// and is followed by a `WakeFinished`, as a wake is.
     RequeueRequest(FutexID, u32, u32),
+    /// Ask what the scheduler holds for a priority-inheritance futex whose word
+    /// names the given TID, and whether the caller queueing would deadlock
+    /// (`Scheduler::pi_futex_state`). Changes nothing the guest can observe: it
+    /// answers in the caller's turn.
+    PiState(u32),
+    /// Park as a FUTEX_LOCK_PI waiter behind the given owner, found in this
+    /// turn by `PiState`, with an optional deadline and signal watch as
+    /// `WaitRequest` has (`Scheduler::sleep_pi_futex_waiter`).
+    PiLockWait(Option<LogicalTime>, Option<FutexSignalWatch>, DetTid),
+    /// A woken FUTEX_LOCK_PI waiter takes the lock if it was handed it, and
+    /// learns how (`Scheduler::take_handed_pi_futex`).
+    PiTake,
+    /// FUTEX_UNLOCK_PI hands the futex to its longest PI waiter
+    /// (`Scheduler::hand_off_pi_futex`); answers with the number woken.
+    PiHandOff,
 }
 
 /// Ask scheduler for permission to proceed before/after futex operation.
@@ -9242,14 +9823,21 @@ where
     }
 }
 
-/// Record that the calling thread is delivering a signal whose default action
-/// ends its process (`Scheduler::record_committed_fatal_signal`).
-pub async fn record_fatal_signal<G, T>(guest: &mut G)
+/// Commit that the calling thread is delivering a signal whose default action
+/// ends its process (`Scheduler::commit_fatal_delivery`), retiring the
+/// process's other threads when `retire_others`. Returns whether any was
+/// retired.
+pub async fn commit_fatal_delivery<G, T>(guest: &mut G, retire_others: bool) -> bool
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let _ = send_and_update_time(guest, GlobalRequest::RecordFatalSignal).await;
+    matches!(
+        send_and_update_time(guest, GlobalRequest::CommitFatalDelivery(retire_others))
+            .await
+            .1,
+        GlobalResponse::CommitFatalDelivery(true)
+    )
 }
 
 /// [`determinize_inode`] for an entry of a directory snapshot taken at
@@ -9365,6 +9953,12 @@ where
 pub struct TraceSchedEventResponse {
     print_stack_strace: MaybePrintStack,
     timeslice: Option<LogicalTime>,
+    /// Whether the replay has dropped the rest of its schedule
+    /// (`Scheduler::schedule_released`).
+    schedule_released: bool,
+    /// Whether the replayed schedule is over: it ran out or was released
+    /// (`Scheduler::schedule_replay_over`).
+    schedule_over: bool,
 }
 
 struct SchedEventForLog<'a> {
@@ -9426,7 +10020,7 @@ where
                 Some(projection) => projection,
                 None => guest.regs().await,
             };
-            NonZeroUsize::new(regs.rip.try_into().unwrap()).unwrap()
+            NonZeroUsize::new(crate::arch::instruction_pointer(&regs).try_into().unwrap()).unwrap()
         };
         SchedEvent {
             end_rip: Some(end_rip),
@@ -9470,8 +10064,16 @@ where
             GlobalResponse::TraceSchedEvent(TraceSchedEventResponse {
                 print_stack_strace,
                 timeslice,
+                schedule_released,
+                schedule_over,
             }),
         ) => {
+            if schedule_released {
+                guest.thread_state_mut().callback_history.release();
+            }
+            if schedule_over {
+                guest.thread_state_mut().schedule_replay_over = true;
+            }
             if let Some(m_path) = print_stack_strace {
                 trace!("[trace_schedevent] writing stacktrace via Reverie...");
                 write_backtrace(guest, m_path.as_ref());
@@ -10836,14 +11438,6 @@ where
     }
 }
 
-pub async fn resolve_kill_targets<G, T>(guest: &mut G, detpid: DetPid) -> Vec<DetTid>
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    resolve_kill_targets_and_exit(guest, detpid).await.0
-}
-
 /// The live threads of `detpid`, and its exit state
 /// (`Scheduler::exited_process_is_zombie`).
 pub async fn resolve_kill_targets_and_exit<G, T>(
@@ -11669,6 +12263,7 @@ mod tests {
                 Some(super::PreemptionSummary {
                     max_timeslice_ns: expected_maximum,
                     timer_enabled: Some(expected_timer),
+                    stopless_slice_ends: None,
                 })
             );
         }
@@ -11785,8 +12380,10 @@ mod tests {
     mod comm_alias_open_tests;
     mod exec_identity_tests;
     mod exec_teardown_tests;
+    mod fatal_delivery_tests;
     mod gated_wait_turn_tests;
     mod guest_mask_publication_tests;
+    mod sigkill_deregistration_tests;
     mod stopping_refusal_tests;
     mod temporary_mask_publication_tests;
     mod timerless_clock_tests;
@@ -12271,6 +12868,7 @@ mod tests {
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 },
             );
             assert_eq!(
@@ -14788,6 +15386,7 @@ mod tests {
                     syscall_count: 3,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 };
                 for _ in 0..2 {
                     let (_, done) = state
@@ -14914,6 +15513,7 @@ mod tests {
                             syscall_count: 3,
                             syscall_histogram: Default::default(),
                             chaos_epochs: Vec::new(),
+                            killed_by_group_signal: false,
                         }),
                     ),
                 )
@@ -16601,6 +17201,7 @@ mod tests {
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 },
             )
             .await;
@@ -16678,6 +17279,7 @@ mod tests {
             maps: None,
             channels: Default::default(),
             open_file_namespace: None,
+            random_device_sequence: 0,
             exe: None,
         };
         state.pending_exec_states.lock().unwrap().insert(
@@ -16761,6 +17363,7 @@ mod tests {
                         syscall_count: 0,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: false,
                     }),
                 ),
             )
@@ -18171,6 +18774,7 @@ mod tests {
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 },
             )
             .await;
@@ -18199,6 +18803,7 @@ mod tests {
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 },
             )
             .await;
@@ -18515,6 +19120,7 @@ mod tests {
                         syscall_count: 17,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: false,
                     }),
                 ),
             )
@@ -18551,6 +19157,7 @@ mod tests {
                         syscall_count: 99,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: false,
                     }),
                 ),
             )
@@ -19763,6 +20370,223 @@ mod tests {
         assert!(!global_time.contains_thread(sender));
     }
 
+    /// A run that replays a schedule whose recording names the host files its
+    /// run opened reports each file whose first open now finds another file
+    /// (here, unhashed, another identity), once, in its summary, and keeps its own host-input set in the
+    /// summary and in the schedule it records. The comparison changes no
+    /// clock (`host_input_observations_are_kept_by_the_run_and_written_at_its_end`).
+    #[tokio::test]
+    async fn a_schedule_replay_reports_host_inputs_changed_since_its_recording() {
+        use detcore_model::host_input::HostFileIdentity;
+        use detcore_model::host_input::HostInputChange;
+        use detcore_model::host_input::HostInputRecord;
+
+        let identity = |ino: u64, size: i64| HostFileIdentity {
+            dev: 33,
+            ino,
+            size,
+            mtime_sec: 1_700_000_000,
+            mtime_nsec: 5,
+        };
+        let open = |path: &str, ino: u64, size: i64| HostInputRecord {
+            path: path.to_owned(),
+            dtid: 3,
+            syscall: 1,
+            identity: identity(ino, size),
+            content: None,
+            exec: false,
+            kernel_object: false,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let recorded = directory.path().join("recorded.json");
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()));
+        writer.set_host_inputs(crate::host_inputs::input_set(
+            &[
+                open("/etc/ld.so.cache", 9, 36887),
+                open("/lib64/libc.so.6", 10, 2_000_000),
+            ],
+            &BTreeSet::new(),
+        ));
+        writer.flush().unwrap();
+
+        let rerecorded = directory.path().join("rerecorded.json");
+        let summary = directory.path().join("summary.json");
+        let config = Config {
+            sequentialize_threads: true,
+            record_host_inputs: true,
+            replay_preemptions_from: Some(recorded),
+            record_preemptions: true,
+            record_preemptions_to: Some(rerecorded.clone()),
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(3);
+        let sender_time = DetTime::new(&config);
+        let global_before = state.global_time.lock().unwrap().as_nanos();
+        for (path, ino, size) in [
+            ("/etc/ld.so.cache", 11, 36839),
+            ("/lib64/libc.so.6", 10, 2_000_000),
+            // A second open of a changed path is not reported again.
+            ("/etc/ld.so.cache", 12, 36887),
+        ] {
+            let response = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(dettid.as_raw()),
+                    (
+                        sender_time.clone(),
+                        MmId::initial(dettid),
+                        GlobalRequest::RecordHostInput {
+                            path: path.into(),
+                            syscall: 1,
+                            identity: identity(ino, size),
+                            source: None,
+                            regular: true,
+                            exec: false,
+                            kernel_object: false,
+                        },
+                    ),
+                )
+                .await;
+            assert_eq!(response, (None, GlobalResponse::RecordHostInput(())));
+        }
+        assert_eq!(
+            state.global_time.lock().unwrap().as_nanos(),
+            global_before,
+            "no clock accounting"
+        );
+
+        state.clean_up(false, &Some(summary.clone())).await.unwrap();
+        let summary: detcore_model::summary::RunSummary =
+            serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(
+            summary.host_inputs_changed,
+            vec![HostInputChange {
+                path: "/etc/ld.so.cache".into(),
+                recorded: identity(9, 36887),
+                now: identity(11, 36839),
+            }]
+        );
+        let inputs = summary.host_inputs.expect("the run's host-input set");
+        assert_eq!(
+            inputs
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file.identity.ino))
+                .collect::<Vec<_>>(),
+            [("/etc/ld.so.cache", 11), ("/lib64/libc.so.6", 10)]
+        );
+        let rerecorded =
+            crate::preemptions::boundary_recording::Recording::read(&rerecorded).unwrap();
+        assert_eq!(rerecorded.host_inputs(), Some(&inputs));
+    }
+
+    /// The bytes of a file the guest opened are read when the run has ended,
+    /// not at the open (a read while the guest runs raises inotify events
+    /// it can see), and only where the file still has the identity the open
+    /// found; a replay's change that only the bytes can show is reported
+    /// then, in the summary.
+    #[tokio::test]
+    async fn host_input_contents_are_read_when_the_run_has_ended() {
+        use std::path::Path;
+        use std::path::PathBuf;
+
+        use detcore_model::host_input::HostFileIdentity;
+        use detcore_model::host_input::HostInputRecord;
+
+        let directory = tempfile::tempdir().unwrap();
+        let kept = directory.path().join("kept");
+        let edited = directory.path().join("edited");
+        let replaced = directory.path().join("replaced");
+        for file in [&kept, &edited, &replaced] {
+            std::fs::write(file, "input\n").unwrap();
+        }
+        let identity_of =
+            |path: &Path| HostFileIdentity::from_stat(&crate::util::raw_stat(path).unwrap());
+        // `printf 'input\n' | sha256sum`
+        let input = "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453";
+        // The recording read "input\n" at each path.
+        let recorded = directory.path().join("recorded.json");
+        let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()));
+        writer.set_host_inputs(crate::host_inputs::input_set(
+            &[&kept, &edited, &replaced].map(|file| HostInputRecord {
+                path: file.to_str().unwrap().to_owned(),
+                dtid: 3,
+                syscall: 1,
+                identity: identity_of(file),
+                content: Some(input.to_owned()),
+                exec: false,
+                kernel_object: false,
+            }),
+            &BTreeSet::new(),
+        ));
+        writer.flush().unwrap();
+        // This run finds other bytes of the same size at `edited`, and at
+        // `replaced` under a new inode.
+        std::fs::write(&edited, "other\n").unwrap();
+        let new = directory.path().join("new");
+        std::fs::write(&new, "other\n").unwrap();
+        std::fs::rename(&new, &replaced).unwrap();
+
+        let summary = directory.path().join("summary.json");
+        let config = Config {
+            sequentialize_threads: true,
+            record_host_inputs: true,
+            replay_preemptions_from: Some(recorded),
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(3);
+        let sender_time = DetTime::new(&config);
+        let opened: Vec<(PathBuf, HostFileIdentity)> = [&kept, &edited, &replaced]
+            .map(|file| (file.clone(), identity_of(file)))
+            .into();
+        for (file, identity) in &opened {
+            let response = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(dettid.as_raw()),
+                    (
+                        sender_time.clone(),
+                        MmId::initial(dettid),
+                        GlobalRequest::RecordHostInput {
+                            path: file.to_str().unwrap().to_owned(),
+                            syscall: 1,
+                            identity: *identity,
+                            source: Some(file.to_str().unwrap().to_owned()),
+                            regular: true,
+                            exec: false,
+                            kernel_object: false,
+                        },
+                    ),
+                )
+                .await;
+            assert_eq!(response, (None, GlobalResponse::RecordHostInput(())));
+        }
+        // Nothing was read at the opens: `replaced` is replaced again before
+        // the run ends, so the end does not read it and its identity decides.
+        std::fs::write(&new, "input\n").unwrap();
+        std::fs::rename(&new, &replaced).unwrap();
+
+        state.clean_up(false, &Some(summary.clone())).await.unwrap();
+        let summary: detcore_model::summary::RunSummary =
+            serde_json::from_str(&std::fs::read_to_string(&summary).unwrap()).unwrap();
+        let inputs = summary.host_inputs.expect("the run's host-input set");
+        let content = |file: &Path| inputs.file(file.to_str().unwrap()).unwrap().content.clone();
+        assert_eq!(content(&kept).as_deref(), Some(input));
+        assert_ne!(content(&edited).as_deref(), Some(input));
+        assert!(content(&edited).is_some());
+        // Read at the open, it would hold the bytes of "other\n".
+        assert_eq!(content(&replaced), None);
+        let changed: Vec<&str> = summary
+            .host_inputs_changed
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert_eq!(
+            changed,
+            [edited.to_str().unwrap(), replaced.to_str().unwrap()]
+        );
+    }
+
     /// A host-input observation, and a report of a path the guest rebound,
     /// belong to the run whose global state receives them. Each is answered
     /// with no logical time, before any clock accounting,
@@ -19808,6 +20632,10 @@ mod tests {
                         path: "/etc/ld.so.cache".into(),
                         syscall: 12,
                         identity,
+                        source: None,
+                        regular: true,
+                        exec: false,
+                        kernel_object: false,
                     },
                 ),
             )
@@ -19849,6 +20677,9 @@ mod tests {
                 dtid: 17,
                 syscall: 12,
                 identity,
+                content: None,
+                exec: false,
+                kernel_object: false,
             }
         );
         // A path rebound twice is one line.

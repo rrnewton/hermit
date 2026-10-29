@@ -348,6 +348,7 @@ mod tests {
             (
                 Error::new(crate::GuestTimedOut {
                     limit: std::time::Duration::from_secs(3),
+                    survivors: None,
                 }),
                 FailureKind::RunTimeout,
             ),

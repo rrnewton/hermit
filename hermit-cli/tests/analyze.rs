@@ -153,15 +153,20 @@ fn workloads() -> &'static AnalyzeWorkloads {
     })
 }
 
-/// Runs `hermit analyze --search` over `guest` and returns the combined
-/// stdout+stderr, asserting a successful exit and that at least one guest stack
-/// trace was printed. `expected_output`, when non-empty, must also appear (used
-/// to pin the blamed source line).
+/// Runs `hermit analyze --search` over `guest` and returns its report file,
+/// asserting a successful exit and that at least one guest stack trace was
+/// printed. `expected_output`, when non-empty, must also appear in the
+/// combined stdout+stderr (used to pin the blamed source line).
 ///
 /// Mirrors `tests/util/hermit_analyze_test.sh`: `--analyze-seed=0 --search`,
 /// then a chaotic run with a tight preemption timeout so the search has enough
 /// scheduling change points to expose the race.
-fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output: &str) {
+fn run_analyze(
+    label: &str,
+    guest: &Path,
+    analyze_opts: &[&str],
+    expected_output: &str,
+) -> serde_json::Value {
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
@@ -215,6 +220,18 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
         warnings.first().copied(),
         "{label}: {report}\n{combined}"
     );
+    if let Some(warning) = warnings.first() {
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!(
+                "------------------------------ hermit analyze report ------------------------------\n{warning}\n"
+            )),
+            "{label}: the report banner must be followed by its branch-counter caveat\n{combined}"
+        );
+    }
+    let report = fs::read_to_string(&report_file)
+        .unwrap_or_else(|error| panic!("{label}: no report file: {error}\n{combined}"));
+    serde_json::from_str(&report)
+        .unwrap_or_else(|error| panic!("{label}: unreadable report file: {error}\n{report}"))
 }
 
 /// Exercises analyze's fail-closed endpoint check for a workload whose target
@@ -282,6 +299,38 @@ fn analyze_racewrite_nostdlib() {
     );
 }
 
+/// `--prefix-search` finds the same race from the target schedule alone: the
+/// deciding event is the parent's return from fork, and the thread the
+/// scheduler would run there instead is the child at its racing write. The
+/// parent's slice ends right after that return in the target schedule, and a
+/// trial that stops there leaves that slice end to the scheduler; one that
+/// replayed it would name the parent's next event, one too late.
+#[test]
+#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_racewrite_nostdlib_prefix_search() {
+    let report = run_analyze(
+        "analyze racewrite_nostdlib --prefix-search",
+        &workloads().racewrite_nostdlib,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-exit-code=0",
+            "--target-stdout=foobar",
+        ],
+        "racewrite_nostdlib.c:35",
+    );
+    let header = report["header"].as_str().unwrap_or_default();
+    assert!(header.contains("Syscall(fork, Posthook)"), "{report}");
+    let thread = |event: &str| report[event]["stack"]["thread_id"].as_i64();
+    assert!(thread("critical_event1").is_some(), "{report}");
+    assert!(thread("critical_event2").is_some(), "{report}");
+    assert_ne!(
+        thread("critical_event1"),
+        thread("critical_event2"),
+        "{report}"
+    );
+}
+
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
@@ -290,4 +339,78 @@ fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
         &workloads().nanosleep_nocrash,
         &["--run-arg=--base-env=empty", "--target-exit-code=0"],
     );
+}
+
+/// A stopped replay establishes neither a baseline outcome nor a realized
+/// schedule. The outer bound is distinct from Hermit's own timeout marker.
+#[test]
+#[ignore = "requires working mount namespaces; selected by the calibrated analyze validation node"]
+fn bisect_rejects_a_timed_out_replay() {
+    use detcore::preemptions::PreemptionRecord;
+    use detcore::types::DetTid;
+    use detcore::types::SchedEvent;
+    use detcore::types::SyscallPhase;
+    use reverie::syscalls::Sysno;
+
+    let _guard = analyze_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.json");
+    let bad = dir.path().join("bad.json");
+    let report = dir.path().join("report.json");
+    for (path, syscall) in [(&good, Sysno::getpid), (&bad, Sysno::getppid)] {
+        let record = PreemptionRecord::from_sched_events(vec![SchedEvent::syscall(
+            DetTid::from_raw(3),
+            syscall,
+            SyscallPhase::Prehook,
+        )]);
+        record.validate().unwrap();
+        record.write_to_disk(path).unwrap();
+    }
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=KILL", "30s"])
+        .arg(hermit_test::hermit_binary())
+        .arg("bisect")
+        .arg(format!("--good={}", good.display()))
+        .arg(format!("--bad={}", bad.display()))
+        .arg(format!("--report-file={}", report.display()))
+        .args([
+            "--",
+            "--timeout=1",
+            "--no-rcb-time",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/sh",
+            "-c",
+            "while :; do :; done",
+        ]);
+    let output = hermit_test::hermit_output("bisect timed-out replay", &mut command);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(124), "{combined}");
+    assert!(
+        combined.contains("HERMIT_RUN_TIMEOUT class=run-timeout"),
+        "{combined}"
+    );
+    assert!(combined.contains("larger --timeout"), "{combined}");
+    assert!(
+        !report.exists(),
+        "an unfinished replay wrote a report: {combined}"
+    );
+    for unsupported_claim in [
+        "counted as the baseline condition",
+        "Completed analysis successfully",
+        "reproduces the good outcome",
+        "determines the program outcome",
+        "decides the outcome",
+        "hermit analyze report",
+    ] {
+        assert!(
+            !combined.contains(unsupported_claim),
+            "{unsupported_claim}: {combined}"
+        );
+    }
 }

@@ -21,14 +21,17 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Close;
 use reverie::syscalls::EpollPwait;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Select;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
@@ -37,6 +40,7 @@ use reverie::syscalls::family::SockOptFamily;
 use super::Recorder;
 use crate::event::AcceptEvent;
 use crate::event::EpollWaitEvent;
+#[cfg(target_arch = "x86_64")]
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::RecvmsgEvent;
@@ -374,6 +378,7 @@ fn capture_pollfds<M: MemoryAccess>(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn capture_poll_event<M: MemoryAccess>(
     memory: &M,
     fds_address: Option<AddrMut<'_, PollFd>>,
@@ -518,6 +523,7 @@ fn capture_select_event<M: MemoryAccess>(
 }
 
 impl Recorder {
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -595,6 +601,7 @@ impl Recorder {
         result
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -645,6 +652,7 @@ impl Recorder {
         result
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_select<G: Guest<Self>>(
         &self,
         guest: &mut G,

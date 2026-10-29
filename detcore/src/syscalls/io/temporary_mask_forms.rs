@@ -1176,6 +1176,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.write_pselect6_remaining(guest, call, deadline).await
     }
 
+    /// The stage-free probe of a masked `ppoll` with no room for its private
+    /// zero timeout (see `gated_masked_ppoll`): `poll` with an immediate zero
+    /// timeout on the guest's own array. `None` keeps the refusal.
+    #[cfg(target_arch = "x86_64")]
+    async fn stage_free_ppoll_probe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ppoll,
+    ) -> Option<Result<i64, Error>> {
+        let poll = syscalls::Poll::new()
+            .with_fds(call.fds().map(|fds| fds.cast()))
+            .with_nfds(call.nfds())
+            .with_timeout(0);
+        let unpublished = crate::syscalls::timerfd::may_publish(guest, Syscall::Ppoll(call));
+        match guest.inject(poll).await {
+            Ok(0) => None,
+            Err(errno) if crate::wait_signal_end::is_restart_code(errno) => None,
+            Ok(_) if unpublished => None,
+            ready_or_error => Some(ready_or_error.map_err(Error::from)),
+        }
+    }
+
+    /// The stage-free probe of a masked `ppoll` with no room for its private
+    /// zero timeout. aarch64 has no `poll`, and its `ppoll` needs memory for a
+    /// zero timeout, so there is no probe and the refusal stands.
+    #[cfg(not(target_arch = "x86_64"))]
+    async fn stage_free_ppoll_probe<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        _call: syscalls::Ppoll,
+    ) -> Option<Result<i64, Error>> {
+        None
+    }
+
     /// A masked `ppoll` under the gate, threads sequentialized, in run mode
     /// (D50 reader (5), replacing the `ENOSYS` of a masked `ppoll` that would
     /// wait), in Linux's order (`ppoll`, fs/select.c:1101-1124 at v6.12;
@@ -1257,17 +1291,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // count or 0 could miss a timerfd Linux reports ready: only an
             // error, which no readiness changes, is returned then, and
             // anything else keeps the refusal (round-3 ruling 5).
-            let poll = syscalls::Poll::new()
-                .with_fds(call.fds().map(|fds| fds.cast()))
-                .with_nfds(call.nfds())
-                .with_timeout(0);
-            let unpublished = crate::syscalls::timerfd::may_publish(guest, Syscall::Ppoll(call));
-            let result = match guest.inject(poll).await {
-                Ok(0) => None,
-                Err(errno) if crate::wait_signal_end::is_restart_code(errno) => None,
-                Ok(_) if unpublished => None,
-                ready_or_error => Some(ready_or_error.map_err(Error::from)),
-            };
+            let result = self.stage_free_ppoll_probe(guest, call).await;
             let Some(result) = result else {
                 return match self.refuse_unstageable_ppoll_copy(guest).await {
                     Some(refused) => refused,

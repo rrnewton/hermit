@@ -8,6 +8,7 @@
 
 //! Deterministic file descriptor
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -88,6 +89,38 @@ pub(crate) fn is_random_device(mode: libc::mode_t, rdev: libc::dev_t) -> bool {
         && matches!(libc::minor(rdev), 8 | 9)
 }
 
+/// Which of Hermit's random-device streams an open file description reads.
+///
+/// Every read of a Linux random device draws fresh bytes, so no two opens read
+/// the same ones. Detcore gives each open file description of a random device
+/// a stream of its own, named by the task that opened it and by how many
+/// random devices its descriptor table had opened before. Aliases of the
+/// description (`dup`, `fork`) share the stream and its cursor. The sequence
+/// counts only the guest's own opens of random devices, which reach Detcore
+/// on every backend, so the name does not depend on what else a backend's
+/// loader opens; [`OpenFileId`]'s sequence counts those opens too. A
+/// description Detcore discovers rather than sees opened is named by its
+/// descriptor number instead ([`RandomDeviceStream::discovered`]), so that a
+/// backend that discovers descriptors does not shift the names of later opens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RandomDeviceStream {
+    pub(crate) creator: DetTid,
+    pub(crate) sequence: u64,
+}
+
+impl RandomDeviceStream {
+    /// The sequences of discovered descriptions, apart from the count's.
+    const DISCOVERED: u64 = 1 << 63;
+
+    /// The name of a random device found at `fd` of a table owned by `owner`.
+    pub(crate) fn discovered(owner: DetTid, fd: RawFd) -> Self {
+        Self {
+            creator: owner,
+            sequence: Self::DISCOVERED | fd as u32 as u64,
+        }
+    }
+}
+
 /// How an active network trace mode classifies a socket's family and type
 /// (see `crate::syscalls::network_trace`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +136,54 @@ pub(crate) enum NetworkSocketKind {
     },
     /// Any other IPv4 or IPv6 socket, such as UDP or raw.
     InetOther,
+}
+
+/// `IPPROTO_L2TP` (include/uapi/linux/in.h), which the libc crate does not
+/// define.
+const IPPROTO_L2TP: i32 = 115;
+
+/// Whether a receive with `MSG_ERRQUEUE` on a socket that `socket(family,
+/// socket_type, protocol)` created never waits on Linux: its protocol reads the
+/// error queue and fails with `EAGAIN` when that is empty, even on a blocking
+/// socket. These do so: IPv4 and IPv6 TCP, UDP, UDP-Lite, ICMP ping and raw
+/// sockets (`tcp_recvmsg`, `udp_recvmsg`, `udpv6_recvmsg`, `ping_recvmsg`,
+/// `raw_recvmsg`, `rawv6_recvmsg`, through `ip_recv_error` and
+/// `ipv6_recv_error`), MPTCP and SCTP (`mptcp_recvmsg`, `sctp_recvmsg`), IPv6
+/// L2TP (`l2tp_ip6_recvmsg`), and every packet socket (`packet_recvmsg`,
+/// through `sock_recv_errqueue`). Every other socket keeps Detcore's polling:
+/// AF_UNIX and AF_NETLINK ignore the flag and wait as for a plain receive, so
+/// does IPv4 L2TP (`l2tp_ip_recvmsg`), and no other protocol or family is
+/// modelled.
+pub(crate) fn error_queue_read_never_waits(family: i32, socket_type: i32, protocol: i32) -> bool {
+    // Linux's SOCK_TYPE_MASK: the type without SOCK_NONBLOCK and SOCK_CLOEXEC.
+    let socket_type = socket_type & 0xf;
+    match family {
+        libc::AF_INET | libc::AF_INET6 => {
+            let ping = if family == libc::AF_INET {
+                libc::IPPROTO_ICMP
+            } else {
+                libc::IPPROTO_ICMPV6
+            };
+            match socket_type {
+                libc::SOCK_STREAM => matches!(
+                    protocol,
+                    0 | libc::IPPROTO_TCP | libc::IPPROTO_MPTCP | libc::IPPROTO_SCTP
+                ),
+                // SCTP is the only seqpacket protocol, so 0 selects it.
+                libc::SOCK_SEQPACKET => matches!(protocol, 0 | libc::IPPROTO_SCTP),
+                libc::SOCK_DGRAM => {
+                    matches!(protocol, 0 | libc::IPPROTO_UDP | libc::IPPROTO_UDPLITE)
+                        || protocol == ping
+                        || (family == libc::AF_INET6 && protocol == IPPROTO_L2TP)
+                }
+                // Every protocol of a raw socket reaches raw_recvmsg or rawv6_recvmsg.
+                libc::SOCK_RAW => true,
+                _ => false,
+            }
+        }
+        libc::AF_PACKET => true,
+        _ => false,
+    }
 }
 
 /// Read provenance authenticated at the container's initial image: a terminal
@@ -175,6 +256,82 @@ impl OpenFileHandle {
         detfd.set_cloexec(cloexec);
         Some(detfd)
     }
+
+    /// Runs `f` on the description's model, as [`DetFd::with_description`]
+    /// does, if any modeled descriptor still refers to it.
+    fn with_description<R>(&self, f: impl FnOnce(&mut OpenFileDescription) -> R) -> Option<R> {
+        let open_file = self.0.upgrade()?;
+        let mut state = open_file.lock().expect("open file mutex poisoned");
+        Some(match &mut *state {
+            OpenFileState::Local(description) => f(description),
+            OpenFileState::Shared(shared) => with_shared_description(shared.id, f),
+        })
+    }
+}
+
+/// The kernel's name for the file behind a descriptor: `(st_dev, st_ino)`, as
+/// `fstat` reports it. Every descriptor of one open file description has it.
+pub(crate) type FileIdentity = (u64, u64);
+
+/// One descriptor an `SCM_RIGHTS` message carried, as the sender's table knew
+/// it when the message was sent (`crate::syscalls::scm_rights`).
+#[derive(Clone, Debug)]
+pub(crate) struct SentDescriptor {
+    /// The file it names.
+    pub(crate) file: FileIdentity,
+    /// The open file description the sender's table modeled for it, if any.
+    /// It does not keep the description alive.
+    pub(crate) open_file: Option<OpenFileHandle>,
+}
+
+/// The most messages kept queued to one socket ([`SocketRights::queued`]):
+/// far more than a receiver leaves unread in practice. Beyond it the oldest
+/// is forgotten, and its receipt names no open file.
+const MAX_QUEUED_RIGHTS_MESSAGES: usize = 4096;
+
+/// The `SCM_RIGHTS` bookkeeping of one `AF_UNIX` socket: its peer, where
+/// Detcore knows it (the other socket of a `socketpair`, or of a connection
+/// it saw made and accepted), and the descriptors queued to it
+/// (`crate::syscalls::scm_rights`).
+#[derive(Clone, Debug, Default)]
+struct SocketRights {
+    /// The socket's type (`SOCK_STREAM`, `SOCK_SEQPACKET`, `SOCK_DGRAM`), as
+    /// `socket` or `accept` made it; `None` for one Detcore did not see made.
+    unix_type: Option<i32>,
+    /// The name a `bind` gave it (`crate::syscalls::scm_rights::unix_socket_name`),
+    /// and which bind of that name it was, by which a listener's connections
+    /// are found (`crate::syscalls::scm_rights::UnixConnections`).
+    unix_name: Option<(Box<[u8]>, u64)>,
+    /// The socket at the other end, which this one's messages reach.
+    peer: Option<OpenFileHandle>,
+    /// Whether the pair is `SOCK_STREAM`, where a send of no bytes carries
+    /// no descriptor.
+    stream: bool,
+    /// The descriptors of each message sent to this socket with
+    /// `SCM_RIGHTS` and not yet known to be received, oldest first.
+    queued: VecDeque<Vec<SentDescriptor>>,
+    /// Set once the queue may no longer follow the socket's messages one for
+    /// one: a message was sent to it without being queued, or a call took a
+    /// message from it that Detcore could not match while some were queued.
+    /// From then on only order could tell an anonymous inode's queued
+    /// descriptor from another's, as every anonymous inode has one file
+    /// identity, so none is joined (`Detcore::record_received_facts`). Never
+    /// regained: a message sent without being queued may still be in flight
+    /// however the queue looks.
+    lockstep_lost: bool,
+}
+
+/// Whether `received`, the identities of the descriptors one receive
+/// installed from one message, are those `sent` queued, in order: all of
+/// them, or a prefix where Linux set `MSG_CTRUNC` (`truncated`) because the
+/// control buffer had room for fewer.
+fn names_sent_rights(sent: &[SentDescriptor], received: &[FileIdentity], truncated: bool) -> bool {
+    !received.is_empty()
+        && (received.len() == sent.len() || (truncated && received.len() < sent.len()))
+        && received
+            .iter()
+            .zip(sent)
+            .all(|(received, sent)| *received == sent.file)
 }
 
 /// A socket's receive timeout (`SO_RCVTIMEO`, socket(7)), as the guest set it.
@@ -438,6 +595,9 @@ struct OpenFileDescription {
     /// Cursor into Hermit's backend-independent random-device byte stream.
     #[serde(default)]
     random_device_offset: u64,
+    /// The stream this random-device open file reads.
+    #[serde(default)]
+    random_device_stream: RandomDeviceStream,
     /// resource
     resource: Option<ResourceID>,
     /// Deterministic snapshot state for selected procfs files.
@@ -502,11 +662,22 @@ struct OpenFileDescription {
     /// `syscall_targets_internal_fd`.
     #[serde(default)]
     socketpair_endpoint: bool,
+    /// True when record/replay found that this socket's peer is a guest of
+    /// this container, so only guest progress can end a wait on it, as for a
+    /// socketpair endpoint. See `Detcore::classify_socket_peer`.
+    #[serde(default)]
+    guest_peer: bool,
     /// True when `accept(2)` or `accept4(2)` returned this socket. Record and
     /// replay keep such a connection only in the log, and replay stands in an
     /// eventfd for it. See `is_accepted_connection`.
     #[serde(default)]
     accepted_connection: bool,
+    /// True when a receive with `MSG_ERRQUEUE` on this socket never waits on
+    /// Linux, whatever the socket's blocking mode. Set by `socket(2)`
+    /// (`error_queue_read_never_waits`) and inherited by the connections
+    /// `accept(2)` returns.
+    #[serde(default)]
+    error_queue_never_waits: bool,
     /// True when record/replay runs a blocking `accept(2)` on this socket in
     /// the caller's turn, one nonblocking attempt at a time. `socket(2)` sets
     /// it for a stream socket the container created. See
@@ -623,6 +794,13 @@ struct OpenFileDescription {
     /// its lock calls natively, while one does. Not printed.
     #[serde(default)]
     may_hold_ofd_lock: bool,
+    /// For an `AF_UNIX` socket: its type, name and peer, and the
+    /// descriptors queued to it in `SCM_RIGHTS` messages
+    /// (`crate::syscalls::scm_rights`). It names descriptions by handles
+    /// that reach them only in the tool process that serves every guest
+    /// (ptrace, KVM), so it is never serialized. Not printed.
+    #[serde(skip)]
+    rights: SocketRights,
 }
 /// Written out, not derived, so that `channel` is printed only when it is set:
 /// a run without `--pipe-wake-latency` logs every description exactly as
@@ -646,6 +824,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("fifo_awaiting_guest_peer", &self.fifo_awaiting_guest_peer);
         debug.field("stat", &self.stat);
         debug.field("random_device_offset", &self.random_device_offset);
+        debug.field("random_device_stream", &self.random_device_stream);
         debug.field("resource", &self.resource);
         debug.field("procfs", &self.procfs);
         debug.field("sigalrm_phase1", &self.sigalrm_phase1);
@@ -660,6 +839,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("network_lowat", &self.network_lowat);
         debug.field("network_socket", &self.network_socket);
         debug.field("socketpair_endpoint", &self.socketpair_endpoint);
+        debug.field("guest_peer", &self.guest_peer);
         debug.field("accepted_connection", &self.accepted_connection);
         debug.field("accept_in_turn_eligible", &self.accept_in_turn_eligible);
         debug.field("read_shutdown_requested", &self.read_shutdown_requested);
@@ -816,7 +996,17 @@ impl DetFd {
         let result = SHARED_OPEN_FILE_CHANNEL
             .get()
             .ok_or_else(|| SharedOpenFileError("no shared open file channel installed".into()))
-            .and_then(|channel| channel.promote(&model));
+            .and_then(|channel| {
+                // Only the backends that run Detcore in each guest process
+                // install a channel. They discover received descriptors, so
+                // Detcore neither pairs their sockets nor queues on them, and
+                // the bookkeeping the model does not serialize is empty.
+                debug_assert!(
+                    model.0.rights.peer.is_none() && model.0.rights.queued.is_empty(),
+                    "a promoted description carries SCM_RIGHTS bookkeeping"
+                );
+                channel.promote(&model)
+            });
         if result.is_err() {
             *state = OpenFileState::Local(model.0);
         }
@@ -906,6 +1096,7 @@ impl DetFd {
                 fifo_awaiting_guest_peer: false,
                 stat: None,
                 random_device_offset: 0,
+                random_device_stream: RandomDeviceStream::default(),
                 resource: None,
                 procfs: None,
                 sigalrm_phase1: None,
@@ -920,7 +1111,9 @@ impl DetFd {
                 network_lowat: None,
                 network_socket: NetworkSocketKind::NotInet,
                 socketpair_endpoint: false,
+                guest_peer: false,
                 accepted_connection: false,
+                error_queue_never_waits: false,
                 accept_in_turn_eligible: false,
                 read_shutdown_requested: false,
                 exported: false,
@@ -934,6 +1127,7 @@ impl DetFd {
                 lock_tracked: false,
                 received_for_locks: false,
                 may_hold_ofd_lock: false,
+                rights: SocketRights::default(),
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             }))),
@@ -973,6 +1167,18 @@ impl DetFd {
     /// alias shares.
     pub(crate) fn set_type(&self, ty: FdType) {
         self.with_description(|d| d.ty = ty);
+    }
+    /// Make this descriptor's open file description a random device that
+    /// reads `stream`.
+    pub(crate) fn set_random_device(&self, stream: RandomDeviceStream) {
+        self.with_description(|d| {
+            d.ty = FdType::Rng;
+            d.random_device_stream = stream;
+        });
+    }
+    /// The stream this random-device open file reads, which every alias shares.
+    pub(crate) fn random_device_stream(&self) -> RandomDeviceStream {
+        self.with_description(|d| d.random_device_stream)
     }
     /// Set per-slot descriptor flags on a newly duplicated fd.
     pub fn with_fd_flags(mut self, flags: OFlag) -> Self {
@@ -1963,10 +2169,182 @@ impl DetFd {
         self.with_description(|d| d.socketpair_endpoint = true);
     }
 
+    /// Make this socket and `peer`, the two sockets of one `socketpair`, each
+    /// other's peer for `SCM_RIGHTS` bookkeeping (`queue_rights_to_peer`);
+    /// `stream` says whether they are `SOCK_STREAM`. Kept by every alias,
+    /// as the description is.
+    pub(crate) fn pair_sockets(&self, peer: &DetFd, stream: bool) {
+        self.pair_with(&peer.open_file_handle(), stream);
+    }
+
+    /// As [`Self::pair_sockets`], with the other socket named by a handle on
+    /// its description: an accepted connection and the socket whose
+    /// `connect` made it. Nothing if that socket is gone.
+    pub(crate) fn pair_with(&self, peer: &OpenFileHandle, stream: bool) {
+        let this = self.open_file_handle();
+        if peer
+            .with_description(|d| {
+                d.rights.peer = Some(this);
+                d.rights.stream = stream;
+            })
+            .is_some()
+        {
+            self.with_description(|d| {
+                d.rights.peer = Some(peer.clone());
+                d.rights.stream = stream;
+            });
+        }
+    }
+
+    /// Record that this is an `AF_UNIX` socket of type `unix_type`
+    /// (`SOCK_STREAM`, `SOCK_SEQPACKET` or `SOCK_DGRAM`).
+    pub(crate) fn set_unix_type(&self, unix_type: i32) {
+        self.with_description(|d| d.rights.unix_type = Some(unix_type));
+    }
+
+    /// This `AF_UNIX` socket's type, if Detcore saw it made.
+    pub(crate) fn unix_type(&self) -> Option<i32> {
+        self.with_description(|d| d.rights.unix_type)
+    }
+
+    /// Record the name a `bind` gave this `AF_UNIX` socket, and which bind
+    /// of that name it was (`generation`).
+    pub(crate) fn set_unix_name(&self, name: Box<[u8]>, generation: u64) {
+        self.with_description(|d| d.rights.unix_name = Some((name, generation)));
+    }
+
+    /// The name a `bind` gave this `AF_UNIX` socket, which bind of that name
+    /// it was, and the socket's type, if Detcore knows all three.
+    pub(crate) fn unix_name_and_type(&self) -> Option<(Box<[u8]>, u64, i32)> {
+        self.with_description(|d| {
+            let (name, generation) = d.rights.unix_name.clone()?;
+            Some((name, generation, d.rights.unix_type?))
+        })
+    }
+
+    /// This datagram socket's messages no longer reach the peer Detcore
+    /// paired it with: a `connect` gave it another peer, or none
+    /// (`unix_dgram_connect`). Neither socket is the other's peer any more,
+    /// so no send through either queues on the other; this socket's queue is
+    /// forgotten, as Linux purges its receive queue when its peer changes
+    /// (`unix_dgram_disconnected`); and neither queue follows its socket's
+    /// messages one for one any more (`SocketRights::lockstep_lost`), since
+    /// the old peer can still name this socket, and this socket the old peer.
+    /// A connect to the socket that already is its peer changes nothing in
+    /// Linux; Detcore forgets the queue then too, which costs only joins.
+    pub(crate) fn unpair_rights_peer(&self) {
+        let peer = self.with_description(|d| {
+            d.rights.queued.clear();
+            d.rights.lockstep_lost = true;
+            d.rights.peer.take()
+        });
+        if let Some(peer) = peer {
+            peer.with_description(|d| {
+                d.rights.peer = None;
+                d.rights.lockstep_lost = true;
+            });
+        }
+    }
+
+    /// Whether this socket has a peer Detcore knows (`pair_sockets`,
+    /// `pair_with`), and if so whether the pair is `SOCK_STREAM`.
+    pub(crate) fn rights_peer_is_stream(&self) -> Option<bool> {
+        self.with_description(|d| d.rights.peer.is_some().then_some(d.rights.stream))
+    }
+
+    /// Queue on this socket's peer the descriptors one message sent through
+    /// this socket carried, in order. Whether it was queued: not when this
+    /// socket has no peer Detcore knows, or the peer is gone.
+    pub(crate) fn queue_rights_to_peer(&self, sent: Vec<SentDescriptor>) -> bool {
+        let Some(peer) = self.with_description(|d| d.rights.peer.clone()) else {
+            return false;
+        };
+        peer.with_description(|d| {
+            if d.rights.queued.len() >= MAX_QUEUED_RIGHTS_MESSAGES {
+                d.rights.queued.pop_front();
+                d.rights.lockstep_lost = true;
+            }
+            d.rights.queued.push_back(sent);
+        })
+        .is_some()
+    }
+
+    /// A message this socket sent may have carried descriptors that were not
+    /// queued on its peer (`SocketRights::lockstep_lost`).
+    pub(crate) fn lose_peer_lockstep(&self) {
+        if let Some(peer) = self.with_description(|d| d.rights.peer.clone()) {
+            peer.with_description(|d| d.rights.lockstep_lost = true);
+        }
+    }
+
+    /// A call took a message from this socket that Detcore could not match
+    /// to its queue (`SocketRights::lockstep_lost`); nothing is lost while
+    /// nothing is queued.
+    pub(crate) fn lose_lockstep_if_queued(&self) {
+        self.with_description(|d| {
+            if !d.rights.queued.is_empty() {
+                d.rights.lockstep_lost = true;
+            }
+        });
+    }
+
+    /// The descriptors of the message queued to this socket that a receive,
+    /// which installed descriptors whose identities are `received` from one
+    /// message (`truncated` when Linux set `MSG_CTRUNC` for it), took: the
+    /// oldest queued message they name ([`names_sent_rights`]), or `None`;
+    /// and whether the queue still follows the socket's messages one for one
+    /// (`SocketRights::lockstep_lost`).
+    ///
+    /// Linux delivers a socket's messages in order, so the messages queued
+    /// before it were taken by calls Detcore could not match: they are
+    /// forgotten with it, and the queue is no longer in lockstep. A
+    /// `MSG_PEEK` receive (`peek`) leaves every message queued, as Linux
+    /// does.
+    pub(crate) fn take_queued_rights(
+        &self,
+        received: &[FileIdentity],
+        truncated: bool,
+        peek: bool,
+    ) -> Option<(Vec<SentDescriptor>, bool)> {
+        self.with_description(|d| {
+            let index = d
+                .rights
+                .queued
+                .iter()
+                .position(|sent| names_sent_rights(sent, received, truncated))?;
+            if index > 0 {
+                d.rights.lockstep_lost = true;
+            }
+            let sent = if peek {
+                d.rights.queued.get(index).cloned()
+            } else {
+                d.rights.queued.drain(..index);
+                d.rights.queued.pop_front()
+            };
+            sent.map(|sent| (sent, !d.rights.lockstep_lost))
+        })
+    }
+
     /// Whether this open file is one end of a `socketpair(2)`, and therefore
     /// container-internal.
     pub(crate) fn is_socketpair_endpoint(&self) -> bool {
         self.with_description(|d| d.socketpair_endpoint)
+    }
+
+    /// Mark this socket as one whose peer is a guest of this container. Like
+    /// `set_socketpair_endpoint` it applies to the open file description, so
+    /// dup, fork and `SCM_RIGHTS` aliases are covered too.
+    pub(crate) fn set_guest_peer(&self) {
+        self.with_description(|d| d.guest_peer = true);
+    }
+
+    /// Whether only guests of this container hold the other end of this
+    /// socket: a `socketpair(2)` endpoint, or a socket whose peer record/replay
+    /// found to be a guest. Detcore keeps such a socket physically nonblocking
+    /// and polls a blocking call on it in the caller's turn, as for a pipe
+    /// (`syscall_targets_internal_fd`).
+    pub(crate) fn is_internal_socket(&self) -> bool {
+        self.with_description(|d| d.socketpair_endpoint || d.guest_peer)
     }
 
     /// Mark this open file as a connection returned by `accept(2)` or
@@ -1974,6 +2352,18 @@ impl DetFd {
     /// aliases are covered too.
     pub(crate) fn set_accepted_connection(&self) {
         self.with_description(|d| d.accepted_connection = true);
+    }
+
+    /// Record whether a receive with `MSG_ERRQUEUE` on this socket never
+    /// waits. It applies to the open file description, so dup and fork aliases
+    /// are covered too.
+    pub(crate) fn set_error_queue_never_waits(&self, never_waits: bool) {
+        self.with_description(|d| d.error_queue_never_waits = never_waits);
+    }
+
+    /// Whether a receive with `MSG_ERRQUEUE` on this socket never waits.
+    pub(crate) fn error_queue_never_waits(&self) -> bool {
+        self.with_description(|d| d.error_queue_never_waits)
     }
 
     /// Whether `accept(2)` or `accept4(2)` returned this open file.
@@ -2233,6 +2623,94 @@ mod tests {
         assert!(!is_random_device(chr, libc::makedev(9, 1)));
     }
 
+    /// The protocols whose receive handler reads the error queue never wait
+    /// for it, with the type's SOCK_NONBLOCK and SOCK_CLOEXEC bits or not;
+    /// AF_UNIX, AF_NETLINK and IPv4 L2TP wait, and a protocol or family that is
+    /// not modelled keeps Detcore's polling.
+    #[test]
+    fn error_queue_reads_never_wait_on_the_protocols_that_read_the_queue() {
+        let flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            let ping = if family == libc::AF_INET {
+                libc::IPPROTO_ICMP
+            } else {
+                libc::IPPROTO_ICMPV6
+            };
+            for (socket_type, protocol) in [
+                (libc::SOCK_STREAM, 0),
+                (libc::SOCK_STREAM, libc::IPPROTO_TCP),
+                (libc::SOCK_STREAM, libc::IPPROTO_MPTCP),
+                (libc::SOCK_STREAM, libc::IPPROTO_SCTP),
+                (libc::SOCK_SEQPACKET, 0),
+                (libc::SOCK_SEQPACKET, libc::IPPROTO_SCTP),
+                (libc::SOCK_DGRAM, 0),
+                (libc::SOCK_DGRAM, libc::IPPROTO_UDP),
+                (libc::SOCK_DGRAM, libc::IPPROTO_UDPLITE),
+                (libc::SOCK_DGRAM, ping),
+                (libc::SOCK_RAW, libc::IPPROTO_RAW),
+                (libc::SOCK_RAW, libc::IPPROTO_UDP),
+            ] {
+                assert!(error_queue_read_never_waits(family, socket_type, protocol));
+                assert!(error_queue_read_never_waits(
+                    family,
+                    socket_type | flags,
+                    protocol
+                ));
+            }
+            for (socket_type, protocol) in [
+                (libc::SOCK_DGRAM, libc::IPPROTO_TCP),
+                (libc::SOCK_STREAM, libc::IPPROTO_UDP),
+                // IPPROTO_SMC: not modelled.
+                (libc::SOCK_STREAM, 256),
+                (libc::SOCK_RDM, 0),
+            ] {
+                assert!(!error_queue_read_never_waits(family, socket_type, protocol));
+            }
+        }
+        // ICMP ping is IPv4's protocol only, ICMPv6 IPv6's.
+        assert!(!error_queue_read_never_waits(
+            libc::AF_INET6,
+            libc::SOCK_DGRAM,
+            libc::IPPROTO_ICMP
+        ));
+        assert!(!error_queue_read_never_waits(
+            libc::AF_INET,
+            libc::SOCK_DGRAM,
+            libc::IPPROTO_ICMPV6
+        ));
+        // l2tp_ip6_recvmsg reads the error queue, l2tp_ip_recvmsg waits.
+        assert!(error_queue_read_never_waits(
+            libc::AF_INET6,
+            libc::SOCK_DGRAM,
+            IPPROTO_L2TP
+        ));
+        assert!(!error_queue_read_never_waits(
+            libc::AF_INET,
+            libc::SOCK_DGRAM,
+            IPPROTO_L2TP
+        ));
+        for socket_type in [libc::SOCK_RAW, libc::SOCK_DGRAM] {
+            assert!(error_queue_read_never_waits(
+                libc::AF_PACKET,
+                socket_type,
+                0
+            ));
+        }
+        for socket_type in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+            assert!(!error_queue_read_never_waits(libc::AF_UNIX, socket_type, 0));
+        }
+        assert!(!error_queue_read_never_waits(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_ROUTE
+        ));
+        assert!(!error_queue_read_never_waits(
+            libc::AF_VSOCK,
+            libc::SOCK_STREAM,
+            0
+        ));
+    }
+
     #[test]
     fn native_exec_directory_lease_probe_preserves_idle_stream_and_aliases() {
         use crate::native_exec::NativeExecCutError;
@@ -2435,6 +2913,14 @@ mod tests {
             !duplicate.is_loopback_peer(),
             "reconnects through one alias must clear loopback state for every alias"
         );
+
+        assert!(!original.is_internal_socket());
+        duplicate.set_guest_peer();
+        assert!(
+            original.is_internal_socket(),
+            "a guest peer belongs to the open file, so every alias must see it"
+        );
+        assert!(!original.is_socketpair_endpoint());
     }
 
     /// `flock(2)` locks belong to the open file description, so every `dup`
@@ -3129,5 +3615,92 @@ mod tests {
         timer.expire_through(at(20));
         assert_eq!(timer.unread, 1);
         assert_eq!(VirtualTimerfd::set(None, 0).unread, 0);
+    }
+
+    /// The descriptors a socket's messages carried are taken in order
+    /// (`DetFd::take_queued_rights`): a peek leaves its message queued, a
+    /// receive of fewer descriptors than a message carried names it only where
+    /// Linux set `MSG_CTRUNC`, and a receive that names a later message
+    /// forgets the earlier ones, which receives Detcore could not match took.
+    #[test]
+    fn queued_rights_are_taken_in_order() {
+        let owner = DetTid::from_raw(10);
+        let socket = |fd, sequence| {
+            DetFd::new(
+                fd,
+                OFlag::O_RDWR,
+                FdType::Socket,
+                OpenFileId::new(owner, sequence),
+            )
+        };
+        let (left, right) = (socket(3, 0), socket(4, 1));
+        left.pair_sockets(&right, false);
+        let file = |inode: u64| (1, inode);
+        let sent = |inodes: &[u64]| -> Vec<SentDescriptor> {
+            inodes
+                .iter()
+                .map(|&inode| SentDescriptor {
+                    file: file(inode),
+                    open_file: None,
+                })
+                .collect()
+        };
+        let inodes = |taken: Option<(Vec<SentDescriptor>, bool)>| {
+            taken.map(|(sent, _)| sent.iter().map(|sent| sent.file.1).collect::<Vec<_>>())
+        };
+
+        for message in [&[10][..], &[20, 21], &[30], &[40]] {
+            assert!(left.queue_rights_to_peer(sent(message)));
+        }
+        assert_eq!(
+            inodes(right.take_queued_rights(&[file(10)], false, true)),
+            Some(vec![10]),
+            "a peek names the first message"
+        );
+        assert_eq!(
+            inodes(right.take_queued_rights(&[file(10)], false, false)),
+            Some(vec![10]),
+            "and leaves it queued"
+        );
+        assert_eq!(
+            inodes(right.take_queued_rights(&[file(20)], false, false)),
+            None
+        );
+        assert_eq!(
+            right
+                .take_queued_rights(&[file(20)], true, false)
+                .map(|(sent, lockstep)| (sent.len(), lockstep)),
+            Some((2, true)),
+            "a truncated receive takes the whole message, in lockstep"
+        );
+        assert!(
+            right.take_queued_rights(&[file(10)], false, true).is_none(),
+            "a message taken is no longer queued"
+        );
+        let skipped = right.take_queued_rights(&[file(40)], false, false);
+        assert_eq!(
+            skipped.as_ref().map(|(_, lockstep)| *lockstep),
+            Some(false),
+            "a message taken after an unmatched one leaves the queue out of lockstep"
+        );
+        assert_eq!(inodes(skipped), Some(vec![40]));
+        assert_eq!(
+            inodes(right.take_queued_rights(&[file(30)], false, false)),
+            None,
+            "the message before the one taken is forgotten"
+        );
+
+        // A message sent through `right` reaches `left`; a socket with no
+        // known peer queues nothing.
+        assert!(right.queue_rights_to_peer(sent(&[50])));
+        assert_eq!(
+            inodes(right.take_queued_rights(&[file(50)], false, false)),
+            None
+        );
+        assert_eq!(
+            inodes(left.take_queued_rights(&[file(50)], false, false)),
+            Some(vec![50])
+        );
+        assert!(!socket(5, 2).queue_rights_to_peer(sent(&[60])));
     }
 }

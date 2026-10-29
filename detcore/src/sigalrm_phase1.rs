@@ -236,7 +236,10 @@ fn is_canonical_block_stat(path: &Path) -> bool {
 pub(crate) const ALWAYS_ALLOWED: &[Sysno] = &[
     // Measured in the target cells after their handler is installed.
     Sysno::fstat,
+    #[cfg(not(target_arch = "aarch64"))]
     Sysno::newfstatat,
+    #[cfg(target_arch = "aarch64")]
+    Sysno::fstatat,
     #[cfg(not(target_arch = "aarch64"))]
     Sysno::access,
     Sysno::getdents64,

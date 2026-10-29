@@ -292,6 +292,21 @@ pub(crate) fn tool_can_name_guest_descriptors(backend: &BackendCapabilities) -> 
     !backend.provides_process_signal_control
 }
 
+/// Whether the tool can read a guest process's working directory and root
+/// from host procfs, as `/proc/<pid>/cwd` and `/proc/<pid>/root` by the
+/// guest's process ID: the fact [`tool_can_name_guest_descriptors`] keys on,
+/// wherever guest threads are host tasks. Where the backend owns signal
+/// delivery because they are not (`provides_process_signal_control`, KVM),
+/// the guest's process ID names whatever host task holds it in the run's PID
+/// namespace, one of the supervisor's own threads
+/// (<https://github.com/rrnewton/hermit/issues/4541>), so Detcore reads the
+/// working directory from the guest instead, with an injected `getcwd`
+/// (`Detcore::read_guest_cwd_for_syscall`). A helper of its own over the
+/// same fact, so that each decision names what it reads from procfs.
+pub(crate) fn tool_can_read_guest_cwd(backend: &BackendCapabilities) -> bool {
+    tool_can_name_guest_descriptors(backend)
+}
+
 /// The key for the procfs entry at `path` within procfs on `device`: the
 /// 64-bit FNV-1a hash of the path's bytes, with [`PATH_KEY_BIT`] set.
 pub(crate) fn path_inode(device: u64, path: &Path) -> RawInode {
@@ -1466,6 +1481,34 @@ mod tests {
             assert!(tool_can_name_guest_descriptors(&backend));
         }
         assert!(!tool_can_name_guest_descriptors(&BackendCapabilities::KVM));
+    }
+
+    /// The working directory is read from host procfs wherever descriptors
+    /// are, and from the guest (an injected `getcwd`) under KVM, whose guest
+    /// process IDs name the supervisor's own threads
+    /// (<https://github.com/rrnewton/hermit/issues/4541>): one fact keys both,
+    /// never the backend's name.
+    #[test]
+    fn the_working_directory_is_read_from_procfs_where_descriptors_are() {
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::LITEINST_IN_GUEST,
+            BackendCapabilities::SABRE,
+            BackendCapabilities::DBT,
+            BackendCapabilities::KVM,
+        ] {
+            assert_eq!(
+                tool_can_read_guest_cwd(&backend),
+                tool_can_name_guest_descriptors(&backend)
+            );
+            assert_eq!(
+                tool_can_read_guest_cwd(&backend),
+                !backend.provides_process_signal_control
+            );
+        }
+        assert!(tool_can_read_guest_cwd(&BackendCapabilities::PTRACE));
+        assert!(tool_can_read_guest_cwd(&BackendCapabilities::DBT));
+        assert!(!tool_can_read_guest_cwd(&BackendCapabilities::KVM));
     }
 
     /// Once its task has exited, an entry is not named: following the link

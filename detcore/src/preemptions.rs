@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::collections::ReplayCursor;
+use detcore_model::host_input::HostInputSet;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::trace;
@@ -99,6 +100,47 @@ pub struct PreemptionRecord {
     /// replayed with it) keeps its recorded virtual times.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     expired_wait_runs_charged_once: bool,
+    /// The host files the recorded run's guest opened
+    /// (`detcore_model::host_input::HostInputSet`), so that a replay can
+    /// report one that changed since (`HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING`).
+    /// Information only: a replay never refuses or alters its schedule for
+    /// it. `None` for records written before the field existed, and for
+    /// records synthesized in memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_inputs: Option<HostInputSet>,
+    /// The store-exclusives that failed in the run that produced this record
+    /// (aarch64, `STREX_FAIL_SPEC`). Each retried a load/store exclusive loop
+    /// and so added retired branches the run's preemption points count, so a
+    /// replay of this record may diverge; a replay warns at its start when it
+    /// is nonzero. Zero, and absent, for a run that counted none, for other
+    /// architectures, and for records written before the field existed.
+    #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
+    store_exclusive_failures: HostObservedCount,
+}
+
+/// A count a record's run observed on its host rather than decided: it is
+/// kept in the record but compares and hashes as equal whatever its value,
+/// so that records of two runs of one schedule stay equal.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct HostObservedCount(u64);
+
+impl HostObservedCount {
+    fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl PartialEq for HostObservedCount {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HostObservedCount {}
+
+impl std::hash::Hash for HostObservedCount {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -121,6 +163,8 @@ impl PreemptionRecord {
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
+            host_inputs: None,
+            store_exclusive_failures: HostObservedCount::default(),
         }
     }
 
@@ -136,6 +180,112 @@ impl PreemptionRecord {
     pub fn with_expired_wait_runs_charged_once(mut self, once: bool) -> Self {
         self.expired_wait_runs_charged_once = once;
         self
+    }
+
+    /// The record a replay of only the first `len` scheduled events of this
+    /// one follows: those events, and the callback checkpoints they reach.
+    ///
+    /// A checkpoint names the callback that ended one of a thread's slices
+    /// and the thread's progress there (the sum of its events' counts, as
+    /// replay counts it, [`callback_history::Progress`]). The checkpoints of
+    /// threads the prefix runs, up to the progress each thread reaches in it,
+    /// end the prefix's slices where the recording did, so a replay of the
+    /// prefix keeps the software-expiry turns they mark. A schedule replayed
+    /// without them has no record of those turns, and its virtual time drifts
+    /// from the recording's. The scheduler runs freely after the prefix, so
+    /// later checkpoints are dropped, and so are those of threads the prefix
+    /// does not run, progress-0 ones included.
+    ///
+    /// Progress alone places a checkpoint, so one taken at exactly the
+    /// progress a thread reaches at the prefix end is kept: it ended the
+    /// thread's last slice in the prefix. Another one at the same progress,
+    /// from a later callback of the same handler after other threads ran past
+    /// the prefix, is kept too, and the replay applies it only when its
+    /// recorded time and branch count are reached.
+    ///
+    /// The thread that runs the prefix's last event is the exception while
+    /// another event follows: its checkpoints at the progress that event
+    /// reaches end its slice at the prefix's own end, which decides what runs
+    /// next, so they belong to the event after the prefix and are dropped. A
+    /// replay of the prefix then lets that thread run on, as it does past any
+    /// event the prefix leaves out. A prefix of the whole schedule keeps the
+    /// record's checkpoints.
+    ///
+    /// The per-thread histories stay whole, for the rows the checkpoints
+    /// name; a schedule replay reads only the events and the checkpoints.
+    pub fn schedule_prefix(&self, len: usize) -> PreemptionRecord {
+        let PreemptionRecord {
+            per_thread,
+            global,
+            epoch,
+            pipe_wake_latency,
+            signal_state_copy,
+            cap_preemption_charge,
+            callback_checkpoints,
+            rng_seed,
+            expired_wait_runs_charged_once,
+            host_inputs,
+            store_exclusive_failures: _,
+        } = self;
+        let followed = len < global.len();
+        let global = global[..len.min(global.len())].to_vec();
+        let mut reached = BTreeMap::<DetTid, callback_history::Progress>::new();
+        for event in &global {
+            reached
+                .entry(event.dettid)
+                .or_default()
+                .observe_event(event);
+        }
+        // The thread whose slice is still running at the prefix's end: the
+        // last event's, when that event advances it and another one follows.
+        let running = global
+            .last()
+            .filter(|last| followed && last.count > 0)
+            .map(|last| last.dettid);
+        let callback_checkpoints = callback_checkpoints
+            .iter()
+            .filter_map(|(tid, points)| {
+                let reached = reached.get(tid)?.count;
+                let within = |progress: u64| {
+                    if running == Some(*tid) {
+                        progress < reached
+                    } else {
+                        progress <= reached
+                    }
+                };
+                let kept: Vec<_> = points
+                    .iter()
+                    .filter(|point| within(point.origin.progress))
+                    .cloned()
+                    .collect();
+                (!kept.is_empty()).then_some((*tid, kept))
+            })
+            .collect();
+        PreemptionRecord {
+            per_thread: per_thread.clone(),
+            global,
+            epoch: *epoch,
+            pipe_wake_latency: *pipe_wake_latency,
+            signal_state_copy: *signal_state_copy,
+            cap_preemption_charge: *cap_preemption_charge,
+            callback_checkpoints,
+            rng_seed: *rng_seed,
+            expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
+            host_inputs: host_inputs.clone(),
+            // A count of this run's host, not part of the preemptions.
+            store_exclusive_failures: HostObservedCount::default(),
+        }
+    }
+
+    /// The same record with `events` as its schedule, or `None` if its
+    /// callback checkpoints do not fit those events (see [`Self::validate`]).
+    /// For a schedule that replayed this record's events and went on past
+    /// them: its own recording keeps no checkpoints, since a replay records
+    /// none, but the replayed part ended its slices where this record did.
+    pub fn with_schedule(&self, events: Vec<SchedEvent>) -> Option<PreemptionRecord> {
+        let mut record = self.clone();
+        record.global = events;
+        record.validate().is_ok().then_some(record)
     }
 
     /// The same record, stating the `--pipe-wake-latency` of the trials it
@@ -161,6 +311,17 @@ impl PreemptionRecord {
     /// from, if the record says.
     pub fn signal_state_copy(&self) -> Option<bool> {
         self.signal_state_copy
+    }
+
+    /// The host files the recorded run's guest opened, if the record says.
+    pub fn host_inputs(&self) -> Option<&HostInputSet> {
+        self.host_inputs.as_ref()
+    }
+
+    /// The store-exclusives that failed in the run this record came from
+    /// (zero where none were counted).
+    pub fn store_exclusive_failures(&self) -> u64 {
+        self.store_exclusive_failures.0
     }
 
     /// The same record, stating whether the copy was on in the trials it
@@ -254,6 +415,9 @@ impl PreemptionRecord {
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
+            host_inputs: self.host_inputs.clone(),
+            // A count of this run's host, not part of the preemptions.
+            store_exclusive_failures: HostObservedCount::default(),
         }
     }
 
@@ -317,6 +481,8 @@ impl PreemptionRecord {
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
+            host_inputs: None,
+            store_exclusive_failures: HostObservedCount::default(),
         }
     }
 
@@ -948,6 +1114,48 @@ mod tests {
         }
     }
 
+    /// The run's failed store-exclusives ride in a record so that a replay
+    /// can label a divergence: written only when nonzero, so a record of a
+    /// run without failures is byte-for-byte what it was before the field,
+    /// and read as zero from records that lack it. The count is the host's,
+    /// so it never makes two records unequal, and a copy of the preemptions
+    /// alone does not carry it.
+    #[test]
+    fn store_exclusive_failures_round_trip_and_legacy_records_have_none() {
+        let none = PreemptionWriter::new(None).with_signal_state_copy(true);
+        let legacy = none.into_string();
+        assert!(!legacy.contains("store_exclusive_failures"), "{legacy}");
+        let back: PreemptionRecord = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(back.store_exclusive_failures(), 0);
+
+        let mut zero = PreemptionWriter::new(None).with_signal_state_copy(true);
+        zero.record_store_exclusive_failures(0);
+        assert_eq!(zero.into_string(), legacy);
+
+        let mut writer = PreemptionWriter::new(None).with_signal_state_copy(true);
+        writer.record_store_exclusive_failures(20);
+        let written = writer.into_string();
+        assert!(
+            written.contains("\"store_exclusive_failures\":20"),
+            "{written}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.store_exclusive_failures(), 20);
+        assert_eq!(back.to_string(), written);
+        assert_eq!(back.clone_preemptions_only().store_exclusive_failures(), 0);
+
+        let without: PreemptionRecord = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(back, without);
+        let hash = |record: &PreemptionRecord| {
+            use std::hash::Hash;
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            record.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&back), hash(&without));
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -1223,6 +1431,164 @@ mod tests {
         self::assert_eq!(pr_with_latest_removed, expected_pr);
     }
 
+    /// Prefix trials must keep the recording's replay settings and host
+    /// inputs even when none, or only some, of its events are replayed.
+    #[test]
+    fn a_schedule_prefix_keeps_the_recorded_replay_settings_and_host_inputs() {
+        use detcore_model::host_input::HostFileIdentity;
+        use detcore_model::host_input::HostInput;
+
+        let tid = DetTid::from_raw(3);
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_cap_preemption_charge(true)
+        .with_expired_wait_runs_charged_once(true);
+        record.rng_seed = Some(1234567);
+        record.host_inputs = Some(HostInputSet {
+            digest: "ab".repeat(32),
+            files: vec![HostInput {
+                path: "/recorded/input".to_owned(),
+                identity: HostFileIdentity {
+                    dev: 2,
+                    ino: 3,
+                    size: 4,
+                    mtime_sec: 5,
+                    mtime_nsec: 6,
+                },
+                content: Some("cd".repeat(32)),
+            }],
+        });
+        for len in [0, 1, 2, 9] {
+            let prefix = record.schedule_prefix(len);
+            assert_eq!(prefix.global, record.global[..len.min(record.global.len())]);
+            assert_eq!(
+                (
+                    prefix.cap_preemption_charge,
+                    prefix.rng_seed,
+                    prefix.expired_wait_runs_charged_once,
+                    &prefix.host_inputs,
+                ),
+                (true, Some(1234567), true, &record.host_inputs),
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// A replay of a schedule's first events keeps the callback checkpoints
+    /// of the slices those events end, for the threads they run, and no later
+    /// ones: the slice end at the prefix's own end belongs to the event after
+    /// it. The result still validates, and lends its checkpoints to a
+    /// schedule that replayed it and went on.
+    #[test]
+    fn a_schedule_prefix_keeps_the_checkpoints_of_the_slices_its_events_end() {
+        use callback_history::Checkpoint;
+        use callback_history::Origin;
+        use callback_history::Site;
+
+        use crate::slice_boundary::callbacks::Callback;
+        let (main, other, late) = (
+            DetTid::from_raw(3),
+            DetTid::from_raw(5),
+            DetTid::from_raw(7),
+        );
+        // Progress per thread: main 10, 11 (after the OtherInstructions), 21;
+        // other 4; late 6.
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(main, 10),
+            SchedEvent::branches(other, 4),
+            SchedEvent {
+                op: Op::OtherInstructions,
+                ..SchedEvent::branches(main, 1)
+            },
+            SchedEvent::branches(main, 10),
+            SchedEvent::branches(late, 6),
+        ]);
+        let mut point = |tid: DetTid, row: usize, progress: u64, last_op: Op| {
+            let time = LogicalTime::from_nanos(100 * (row as u64 + 1));
+            let history = record.per_thread.entry(tid).or_default();
+            history.prio_changes.push((time, 1000));
+            history.preemption_rcbs.push(progress);
+            Checkpoint {
+                history_index: row,
+                origin: Origin {
+                    callback: Callback::PmuTimer,
+                    site: Site::Prehook,
+                    progress,
+                    last_op: Some(last_op),
+                    time,
+                    rcbs: progress,
+                },
+            }
+        };
+        let main_points = vec![
+            point(main, 0, 10, Op::Branch),
+            point(main, 1, 11, Op::OtherInstructions),
+            point(main, 2, 21, Op::Branch),
+            // A later callback at the same progress, after the schedule ends.
+            point(main, 3, 21, Op::Branch),
+        ];
+        let other_points = vec![point(other, 0, 4, Op::Branch)];
+        let late_points = vec![point(late, 0, 6, Op::Branch)];
+        record
+            .callback_checkpoints
+            .insert(main, main_points.clone());
+        record
+            .callback_checkpoints
+            .insert(other, other_points.clone());
+        record
+            .callback_checkpoints
+            .insert(late, late_points.clone());
+        record.validate().unwrap();
+
+        let kept = |len: usize| {
+            let prefix = record.schedule_prefix(len);
+            prefix.validate().unwrap();
+            assert_eq!(prefix.global, record.global[..len]);
+            prefix.callback_checkpoints
+        };
+        assert!(kept(0).is_empty());
+        // Each prefix of 1 to 4 events stops where its last event's slice
+        // ends (main's at 10, other's at 4, main's at 11, main's two at 21),
+        // so it drops those checkpoints and keeps the earlier ones.
+        assert!(kept(1).is_empty());
+        assert_eq!(kept(2), BTreeMap::from([(main, main_points[..1].to_vec())]));
+        assert_eq!(
+            kept(3),
+            BTreeMap::from([
+                (main, main_points[..1].to_vec()),
+                (other, other_points.clone()),
+            ])
+        );
+        assert_eq!(
+            kept(4),
+            BTreeMap::from([
+                (main, main_points[..2].to_vec()),
+                (other, other_points.clone()),
+            ])
+        );
+        // The whole schedule has no event after it, nor has a longer prefix.
+        assert_eq!(kept(5), record.callback_checkpoints);
+        assert_eq!(
+            record.schedule_prefix(9).callback_checkpoints,
+            record.callback_checkpoints
+        );
+
+        // A schedule that replayed the prefix and went on takes the prefix's
+        // checkpoints; one whose events they do not fit does not.
+        let prefix = record.schedule_prefix(3);
+        let mut continued = record.global[..3].to_vec();
+        continued.push(SchedEvent::branches(other, 9));
+        assert_eq!(
+            prefix
+                .with_schedule(continued.clone())
+                .map(|record| (record.global, record.callback_checkpoints)),
+            Some((continued, prefix.callback_checkpoints.clone()))
+        );
+        assert!(prefix.with_schedule(Vec::new()).is_none());
+    }
+
     #[test]
     fn callback_checkpoint_metadata_validates_and_only_time_stripping_preserves_it() {
         use callback_history::Checkpoint;
@@ -1456,6 +1822,18 @@ impl PreemptionWriter {
     pub fn with_cap_preemption_charge(mut self, on: bool) -> Self {
         self.inner.cap_preemption_charge = on;
         self
+    }
+
+    /// Store the host files the run's guest opened, once the run has ended
+    /// and before the record is flushed.
+    pub fn set_host_inputs(&mut self, inputs: HostInputSet) {
+        self.inner.host_inputs = Some(inputs);
+    }
+
+    /// Store the store-exclusives that failed in the run (aarch64), counted
+    /// once every thread has exited.
+    pub fn record_store_exclusive_failures(&mut self, failures: u64) {
+        self.inner.store_exclusive_failures = HostObservedCount(failures);
     }
 
     /// Does the record have zero entries?

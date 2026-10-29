@@ -366,6 +366,15 @@ impl RunData {
         // one.
         ro.det_opts.det_config.chaos = true;
 
+        // Trials may differ only in their schedule. `--seed` also seeds what the guest reads
+        // as randomness (getrandom, /dev/urandom) and syscall fuzzing, so a run2 seed or a
+        // schedule replay at the default seed would hand the guest other inputs, and no
+        // schedule could reproduce the target. Pin both to the target's seed.
+        let config = &mut ro.det_opts.det_config;
+        let target_seed = aopts.run1_seed.unwrap_or(config.seed);
+        config.rng_seed.get_or_insert(target_seed);
+        config.fuzz_seed.get_or_insert(target_seed);
+
         ro.validate_args()?;
         assert!(ro.det_opts.det_config.sequentialize_threads);
         if aopts.run1_seed.is_some() && !ro.det_opts.det_config.chaos {
@@ -381,9 +390,29 @@ impl RunData {
         Ok(ro)
     }
 
+    /// Trials write their records into the workspace from inside the
+    /// container, whose `/tmp` is private: a workspace under host `/tmp` is
+    /// bound into it. One elsewhere (`--tmp-dir`) is visible as it is, and a
+    /// bind of it would only make every trial warn that the bind has no
+    /// effect (`hermit run` honors binds under `/tmp` alone). Where the
+    /// workspace is is decided on its canonical path, so a relative path or a
+    /// symlink into `/tmp` is bound, and one under `/tmp` that leads out of it
+    /// is not.
     fn runopts_add_binds(aopts: &AnalyzeOpts, runopts: &mut RunOpts) -> anyhow::Result<()> {
-        let bind_dir: Bind = Bind::from_str(aopts.get_tmp()?.to_str().unwrap())?;
-        runopts.bind.push(bind_dir);
+        let workspace = aopts.get_tmp()?;
+        let workspace = std::fs::canonicalize(workspace)
+            .or_else(|_| std::path::absolute(workspace))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot resolve the workspace {}: {error}",
+                    workspace.display()
+                )
+            })?;
+        if workspace.starts_with("/tmp") {
+            runopts
+                .bind
+                .push(Bind::from_str(workspace.to_str().unwrap())?);
+        }
         runopts.validate_args()?;
         Ok(())
     }
@@ -508,17 +537,33 @@ impl RunData {
         }
     }
 
+    /// Replay the preemption record at `path`, a recording: a replay that
+    /// reaches a recorded slice end already passed stops, as any replay
+    /// that diverges does.
     pub fn with_preempts_path_in(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_preemptions_from = Some(path);
         self
     }
 
+    /// Replay the preemption record at `path`, one analyze edited
+    /// (minimization and the baseline search knock preemptions out of a
+    /// recording) or one a replay of such a record met the target with. A
+    /// thread can then reach recorded slices that have already ended, which
+    /// the replay skips (`--replay-edited-preemptions`).
+    pub fn with_edited_preempts_path_in(self, path: PathBuf) -> Self {
+        let mut run = self.with_preempts_path_in(path);
+        run.runopts.det_opts.det_config.replay_edited_preemptions = true;
+        run
+    }
+
+    /// Replay `pr`, a record analyze edited
+    /// ([`Self::with_edited_preempts_path_in`]).
     pub fn with_preempts_in(mut self, pr: PreemptionRecord) -> Self {
         let path = self.preempts_path_in().to_path_buf();
         pr.write_to_disk(&path)
             .expect("write of preempts file to succeed");
         self.in_mem_preempts_in = Some(pr);
-        self.with_preempts_path_in(path)
+        self.with_edited_preempts_path_in(path)
     }
 
     pub fn with_preemption_recording(self) -> Self {
@@ -627,6 +672,16 @@ impl AnalyzeOpts {
         }
         self.branch_counter_warning = warning.map(|line| line.trim_end().to_owned());
         Ok(())
+    }
+
+    /// The notice `hermit run` writes for a small `--max-timeslice`
+    /// (`RunOpts::small_max_timeslice_notice`), for the run arguments every
+    /// trial shares. Trials go straight to `RunOpts::run`, so `analyze` and
+    /// `bisect` write it once here, after the trials' PMU configuration is
+    /// installed, rather than once per trial. `skid_margin` is normally
+    /// `run::installed_skid_margin`.
+    pub fn small_trial_max_timeslice_notice(&self, skid_margin: fn() -> u64) -> Option<String> {
+        RunData::get_raw_runopts(self).small_trial_max_timeslice_notice(skid_margin)
     }
 
     /// Installs the trials' `--skid-margin`, as `RunOpts::main` does for a
@@ -824,9 +879,17 @@ impl AnalyzeOpts {
     }
 
     /// Write the schedule `events` for a trial to replay, stamped
-    /// ([`Self::stamp_trial_record`]).
+    /// ([`Self::stamp_trial_record`]). The events alone carry no callback
+    /// checkpoints: a schedule analyze edits (a swap, a reordering) has no
+    /// recorded slice ends to keep.
     pub fn write_trial_schedule(&self, events: Vec<SchedEvent>, path: &Path) -> anyhow::Result<()> {
-        self.stamp_trial_record(PreemptionRecord::from_sched_events(events))
+        self.write_trial_record(PreemptionRecord::from_sched_events(events), path)
+    }
+
+    /// Write `record` for a trial to replay, stamped
+    /// ([`Self::stamp_trial_record`]).
+    pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
+        self.stamp_trial_record(record)
             .write_to_disk(path)
             .map_err(anyhow::Error::msg)
     }
@@ -1033,6 +1096,56 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    /// The records analyze edited (minimization's and the baseline search's)
+    /// replay with `--replay-edited-preemptions`, and so do the repro
+    /// commands it prints for them; a recording replays strictly. Before, a
+    /// minimization trial whose knock-out let a thread start a slice past
+    /// its recorded end stopped the whole analysis with Detcore's "Cannot
+    /// set end of timeslice" panic (exit 101).
+    #[test]
+    fn analyze_replays_only_its_edited_preemption_records_as_edited() {
+        let args =
+            crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
+            panic!("not analyze")
+        };
+        options.apply_global(&args.global);
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let record = workspace.path().join("round_001.preempts");
+        let edited = RunData::new_baseline(&options, "round_001".to_string())
+            .unwrap()
+            .with_edited_preempts_path_in(record.clone());
+        assert!(edited.runopts.det_opts.det_config.replay_edited_preemptions);
+        let repro = edited.to_repro();
+        assert!(repro.contains(" --replay-edited-preemptions"), "{repro}");
+        // A record analyze builds in memory (the baseline search's
+        // knock-outs) is written to the workspace and replayed as edited.
+        let knocked_out = RunData::new_baseline(&options, "round_002".to_string())
+            .unwrap()
+            .with_preempts_in(PreemptionRecord::from_vecs(
+                &std::collections::BTreeMap::new(),
+            ));
+        let config = &knocked_out.runopts.det_opts.det_config;
+        assert!(config.replay_edited_preemptions);
+        assert!(config.replay_preemptions_from.as_ref().unwrap().is_file());
+        let recording = RunData::new_baseline(&options, "verify".to_string())
+            .unwrap()
+            .with_preempts_path_in(record);
+        assert!(
+            !recording
+                .runopts
+                .det_opts
+                .det_config
+                .replay_edited_preemptions
+        );
+        assert!(
+            !recording.to_repro().contains("--replay-edited-preemptions"),
+            "{}",
+            recording.to_repro()
+        );
+    }
 
     /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
     /// 2: the refusal `RunOpts::main` makes never sees an analyze or bisect
@@ -1671,11 +1784,13 @@ mod tests {
     /// Analyze's trials apply `--skid-margin`: its preflight records it as the
     /// skid margin of Reverie's per-process PMU configuration, so a later
     /// margin is refused. `main` refuses the unimplemented `--run1-schedule`
-    /// right after that preflight, which stops it before any workspace. This
-    /// relies on nextest running each test in a process of its own, as the
-    /// validation DAG does.
+    /// right after that preflight, which stops it before any workspace. That
+    /// configuration is per-process, so the test runs in a process of its own.
     #[test]
     fn analyze_installs_the_trials_skid_margin() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let argv = [
             "hermit",
             "analyze",
@@ -1888,6 +2003,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn trials_bind_only_a_workspace_the_private_tmp_would_hide() {
+        let mut options = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--run1-seed=6",
+            "--",
+            "--epoch=2026-01-01T00:00:00Z",
+            "/bin/true",
+        ])
+        .unwrap();
+        let binds = |options: &AnalyzeOpts| -> Vec<String> {
+            RunData::new_baseline(options, "trial".to_owned())
+                .unwrap()
+                .runopts
+                .bind
+                .iter()
+                .map(|bind| bind.target.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        options.tmp_dir = Some(PathBuf::from("/tmp/hermit_analyzeXYZ"));
+        assert_eq!(binds(&options), ["/tmp/hermit_analyzeXYZ"]);
+
+        options.tmp_dir = Some(PathBuf::from("someone/analyze-ws/hermit_analyzeXYZ"));
+        assert!(binds(&options).is_empty(), "visible as it is");
+
+        // Where the workspace really is decides. A relative path to a
+        // directory under /tmp is bound, as its canonical path.
+        let under_tmp = tempfile::Builder::new()
+            .prefix("hermit_analyze_bind")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let canonical = std::fs::canonicalize(under_tmp.path()).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert!(canonical.starts_with("/tmp"), "{}", canonical.display());
+        let relative = PathBuf::from("../".repeat(cwd.components().count() - 1))
+            .join(canonical.strip_prefix("/").unwrap());
+        assert!(relative.is_relative());
+        options.tmp_dir = Some(relative);
+        assert_eq!(binds(&options), [canonical.to_str().unwrap()]);
+        // A symlink under /tmp that leads out of it is not: the workspace is
+        // visible where it really is.
+        let link = canonical.join("out-of-tmp");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        options.tmp_dir = Some(link);
+        assert!(binds(&options).is_empty(), "{:?}", binds(&options));
+    }
+
+    #[test]
+    fn every_trial_hands_the_guest_the_target_seed_inputs() {
+        let mut options = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--run1-seed=6",
+            "--run2-seed=1",
+            "--",
+            "--chaos",
+            "--epoch=2026-01-01T00:00:00Z",
+            "/bin/true",
+        ])
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+
+        let target = RunData::new_run1_target(&options, "target".to_owned()).unwrap();
+        let target = &target.runopts.det_opts.det_config;
+        assert_eq!(
+            (target.sched_seed(), target.rng_seed()),
+            (6, 6),
+            "the failing run as found"
+        );
+
+        // A baseline or a schedule replay changes the schedule seed only.
+        let mut baseline = RunData::new_baseline(&options, "baseline".to_owned()).unwrap();
+        baseline.runopts.det_opts.det_config.seed = 1;
+        let baseline = &baseline.runopts.det_opts.det_config;
+        assert_eq!(baseline.sched_seed(), 1);
+        assert_eq!((baseline.rng_seed(), baseline.fuzz_seed()), (6, 6));
+
+        let mut explicit = options.clone();
+        explicit.run_args = [
+            "--chaos",
+            "--rng-seed=9",
+            "--epoch=2026-01-01T00:00:00Z",
+            "/bin/true",
+        ]
+        .map(String::from)
+        .to_vec();
+        let replay = RunData::new_baseline(&explicit, "replay".to_owned()).unwrap();
+        assert_eq!(
+            replay.runopts.det_opts.det_config.rng_seed(),
+            9,
+            "an explicit --rng-seed in the run arguments is kept"
+        );
     }
 
     #[test]

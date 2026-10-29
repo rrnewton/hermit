@@ -9,10 +9,12 @@
 //! A mode for analyzing a hermit run to detect concurrency bugs.
 
 mod consts;
+mod memory;
 mod minimize;
 mod phases;
 mod rundata;
 mod types;
 
+pub use memory::MemoryBudget;
 pub use types::AnalyzeOpts;
 pub use types::ExitStatusConstraint;

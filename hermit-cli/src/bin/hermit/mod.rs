@@ -8,6 +8,8 @@
 
 // Treat all Clippy warnings as errors.
 #![deny(clippy::all)]
+// Keep checked container cloning enforced after relocation into the library.
+#![deny(clippy::disallowed_methods)]
 #![allow(clippy::uninlined_format_args)]
 #![allow(
     unexpected_cfgs,
@@ -20,6 +22,7 @@ mod bisect;
 mod clean;
 mod cli_owned_lifecycle;
 mod container;
+mod container_clone;
 mod core_adapter;
 mod dap_adapter;
 mod dispatch_entry;
@@ -81,6 +84,8 @@ mod run_config;
 mod run_timeout;
 mod schedule_search;
 mod strace;
+#[cfg(test)]
+mod test_isolation;
 mod tracing;
 mod verify;
 mod verify_inputs;
@@ -92,6 +97,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
@@ -722,6 +728,7 @@ impl Subcommand {
         match self {
             Subcommand::Run(run) => {
                 run.set_backend(global.backend);
+                run.prepare_mapped_verification_inputs()?;
                 if selected_by_executable {
                     run.select_application_backend(A::NAME)?;
                 }
@@ -940,11 +947,36 @@ fn main_application<A: backend_hook::BackendAdapter>(adapter: A, selected_by_exe
             )
         });
 
-    let status = result.unwrap_or_else(|error| {
-        let status = ExitStatus::Exited(failure_exit_code(&error));
-        display_error(error);
-        status
-    });
+    match result {
+        Ok(status) => exit_with(status),
+        Err(error) => exit_with_error(error),
+    }
+}
+
+/// Report the error and exit through the common final output boundary.
+fn exit_with_error(error: Error) -> ! {
+    claim_the_exit();
+    let status = ExitStatus::Exited(failure_exit_code(&error));
+    display_error(error);
+    finish_exit(status)
+}
+
+fn exit_with(status: ExitStatus) -> ! {
+    claim_the_exit();
+    finish_exit(status)
+}
+
+/// Only the first exiting thread reports and chooses the final status.
+fn claim_the_exit() {
+    static EXITING: AtomicBool = AtomicBool::new(false);
+    if EXITING.swap(true, Ordering::SeqCst) {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+fn finish_exit(status: ExitStatus) -> ! {
     // From here on a write may fail but must not replace `status`.
     block_write_signals_until_exit();
     // Guest output agreed by both `--verify` runs can still be buffered (no
@@ -1511,6 +1543,9 @@ mod tests {
 
     #[test]
     fn entry_descriptor_failure_can_stamp_no_result_without_running_a_guest() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         use std::os::fd::AsRawFd;
         use std::os::fd::FromRawFd;
         use std::os::fd::OwnedFd;
@@ -1950,6 +1985,9 @@ mod tests {
 
     #[test]
     fn run_epoch_environment_and_cli_precedence() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         const CHILD: &str = "HERMIT_EPOCH_PRECEDENCE_TEST_CHILD";
         const ENV_EPOCH: &str = "2000-12-31T23:59:59.123456789Z";
         if std::env::var_os(CHILD).is_none() {

@@ -75,6 +75,7 @@ use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::scheduler::terminal_signals;
 use crate::stat::*;
 use crate::syscalls::guest_siginfo::GuestSiginfo;
+use crate::syscalls::signal::ProcessSignalTarget;
 use crate::syscalls::threads::kernel_sigset_bit;
 use crate::tool_global::*;
 use crate::tool_local::CapturedDetFdInstallError;
@@ -962,6 +963,26 @@ fn resolved_open_path(
     link.is_absolute().then_some(link)
 }
 
+/// What Detcore knows about a socket whose peer it classifies
+/// (`Detcore::classify_socket_peer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketRole {
+    /// `connect` connected it or `accept` returned it, so it has a peer.
+    Connected,
+    /// Received over `SCM_RIGHTS`; it may be a listener, which has no peer.
+    Received,
+}
+
+/// The buffer `Detcore::probe_socket_option` lends the kernel: an option
+/// value and its length, in one reservation so that the guest bytes under
+/// both are saved and put back together.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SocketOptionProbe<V: Copy> {
+    value: V,
+    length: libc::socklen_t,
+}
+
 /// The scope `pidfd_send_signal`'s flags select (Linux's `pidfd_send_signal`
 /// since 6.9; <https://github.com/rrnewton/hermit/issues/4108>).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1175,12 +1196,248 @@ fn descriptor_identity(tid: i32, fd: RawFd) -> Option<(PathBuf, bool)> {
 /// root. Stripping `/proc/<pid>/root` produces the same guest-absolute path in
 /// record and replay without depending on the opened descriptor (which is an
 /// eventfd placeholder during replay).
+///
+/// A working directory whose path is longer than the kernel renders into its
+/// link has none here (`ENAMETOOLONG`); for that case see
+/// [`climbed_out_of_unrendered_cwd`].
 pub(crate) fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     debug_assert!(!path.is_absolute());
     let root = std::fs::read_link(format!("/proc/{pid}/root")).ok()?;
-    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    let cwd = match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+        Ok(cwd) => cwd,
+        Err(error) if error.raw_os_error() == Some(libc::ENAMETOOLONG) => {
+            return climbed_out_of_unrendered_cwd(pid, &root, path);
+        }
+        Err(_) => return None,
+    };
     let guest_cwd = cwd.strip_prefix(root).ok()?;
     Some(Path::new("/").join(guest_cwd).join(path))
+}
+
+/// [`resolved_at_fdcwd_path`] where the kernel cannot render the working
+/// directory of process `pid` into its link because its path is longer than
+/// `PATH_MAX`, which Linux still walks `..` out of. A spelling whose leading
+/// `..` climb out of it is made absolute from the directory they reach, which
+/// the kernel's own walk names: an `O_PATH` open of `/proc/<pid>/cwd/..` (as
+/// many `..` as the spelling leads with), whose descriptor's link is that
+/// directory's path; the rest of the spelling follows byte for byte
+/// ([`split_leading_climb`]). `None`, resolving nothing, for any other
+/// spelling, and where the open or the link fails: the call's own walk then
+/// decides the spelling, with its own error
+/// (<https://github.com/rrnewton/hermit/issues/4541>). Both reads are raw
+/// syscalls ([`crate::util::RawFd`], [`crate::util::raw_read_link`]), as
+/// Detcore may run inside the guest.
+fn climbed_out_of_unrendered_cwd(pid: i32, root: &Path, path: &Path) -> Option<PathBuf> {
+    let (climbs, rest) = split_leading_climb(path);
+    if climbs == 0 {
+        return None;
+    }
+    let climbed = crate::util::RawFd::open(
+        Path::new(&format!("/proc/{pid}/cwd/{}", climb_spelling(climbs))),
+        libc::O_PATH | libc::O_DIRECTORY,
+    )
+    .ok()?;
+    let directory =
+        crate::util::raw_read_link(Path::new(&format!("/proc/self/fd/{}", climbed.raw()))).ok()?;
+    let guest_directory = directory.strip_prefix(root).ok()?;
+    Some(joined_verbatim(&Path::new("/").join(guest_directory), rest))
+}
+
+/// How many `..` the relative `path` climbs before its first other name,
+/// past any `.`, and the rest of the spelling after them, byte for byte, so
+/// that a trailing `/` or `/.` keeps its meaning for the walk of the rest:
+/// `../../proc/fs` climbs 2, to `proc/fs`; `./..//proc/uptime/` climbs 1, to
+/// `proc/uptime/`; `x/..` climbs none.
+pub(crate) fn split_leading_climb(path: &Path) -> (usize, &std::ffi::OsStr) {
+    use std::os::unix::ffi::OsStrExt;
+    let mut rest = path.as_os_str().as_bytes();
+    let mut climbs = 0;
+    while !rest.is_empty() {
+        let end = rest
+            .iter()
+            .position(|&byte| byte == b'/')
+            .unwrap_or(rest.len());
+        match &rest[..end] {
+            b".." => climbs += 1,
+            b"." => {}
+            _ => break,
+        }
+        let slashes = rest[end..].iter().take_while(|&&byte| byte == b'/').count();
+        rest = &rest[end + slashes..];
+    }
+    (climbs, std::ffi::OsStr::from_bytes(rest))
+}
+
+/// Whether `path` is `PATH_MAX` bytes long or more, which no name may be:
+/// Linux copies at most `PATH_MAX` bytes of a pathname, its NUL included,
+/// and refuses one whose NUL is not among them with `ENAMETOOLONG`, before
+/// any walk (`getname_flags`, fs/namei.c:206-210 at v6.17). Such a spelling
+/// is never resolved, so that the call's own lookup refuses it.
+pub(crate) fn names_past_path_max(path: &Path) -> bool {
+    path.as_os_str().len() >= libc::PATH_MAX as usize
+}
+
+/// `rest`, a relative spelling, below `directory`, byte for byte;
+/// `directory` itself where `rest` is empty.
+fn joined_verbatim(directory: &Path, rest: &std::ffi::OsStr) -> PathBuf {
+    if rest.is_empty() {
+        directory.to_path_buf()
+    } else {
+        directory.join(rest)
+    }
+}
+
+/// `..` `climbs` times: `..`, `../..`, and so on.
+fn climb_spelling(climbs: usize) -> String {
+    vec![".."; climbs].join("/")
+}
+
+/// The calling thread's working directory, read for the syscall it is
+/// running where the tool cannot read it from host procfs
+/// (`procfs_inode::tool_can_read_guest_cwd`: KVM), at most once per syscall
+/// (`ThreadState::syscall_cwd`, `Detcore::prepare_guest_cwd`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SyscallCwd {
+    /// Its path, as the thread's `getcwd` answered it.
+    Path(PathBuf),
+    /// No path: `getcwd` failed with `ENOENT`, for a removed directory, or
+    /// for one whose path is longer than `PATH_MAX` (`ENAMETOOLONG`,
+    /// `ERANGE`), which Linux still walks `..` from. By how many `..` a
+    /// spelling of the syscall climbs out of it, the path of the directory
+    /// it climbs to, read through a descriptor for it
+    /// (`Detcore::read_climbed_directory`), `None` where that failed.
+    Unrendered(BTreeMap<usize, Option<PathBuf>>),
+    /// No path otherwise (`getcwd` answered no path from the root, or failed
+    /// another way): its spellings are decided as given.
+    Unknown,
+}
+
+/// The directory a listing of a descriptor reads, for
+/// `Detcore::drop_absent_entries`. Where the tool's `/proc` entry for the
+/// caller is the caller's (`tool_sees_caller`,
+/// `procfs_inode::tool_can_name_guest_descriptors`): the kernel's path for
+/// the descriptor (`linked`, its link in that entry), or, where that link
+/// cannot be read (after a `chroot` into a root without `/proc`, where the
+/// tool runs inside the guest), the path the guest opened it by (`recorded`).
+/// Where the guest's threads are no host tasks (KVM), that entry names one of
+/// the supervisor's own tasks, whose descriptor of that number is no guest's,
+/// so its link is never read
+/// (<https://github.com/rrnewton/hermit/issues/4541>): the directory is the
+/// recorded path, with its `.` and `..` folded in by name, as the kernel's
+/// path has neither (`/sys/devices/system/cpu/.` is the directory the
+/// listing filters). `None` where the path is not absolute.
+fn listed_directory(
+    tool_sees_caller: bool,
+    linked: impl FnOnce() -> Option<PathBuf>,
+    recorded: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let directory = if tool_sees_caller {
+        linked().or_else(recorded)
+    } else {
+        recorded().map(|path| {
+            let mut folded = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        folded.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => folded.push(other),
+                }
+            }
+            folded
+        })
+    };
+    directory.filter(|path| path.is_absolute())
+}
+
+#[cfg(test)]
+mod leading_climb_tests {
+    use super::*;
+
+    /// A spelling climbs out of the working directory by the `..` before its
+    /// first other name, past any `.`; the rest is kept byte for byte, a
+    /// trailing `/` or `/.` included, for the walk below where they lead
+    /// (<https://github.com/rrnewton/hermit/issues/4541>).
+    #[test]
+    fn a_spelling_climbs_by_its_leading_dotdots() {
+        let climb = |path: &'static str| {
+            let (climbs, rest) = split_leading_climb(Path::new(path));
+            (climbs, rest.to_str().unwrap().to_owned())
+        };
+        let split = |climbs: usize, rest: &str| (climbs, rest.to_owned());
+        assert_eq!(climb("../../proc/fs"), split(2, "proc/fs"));
+        assert_eq!(climb("./../x"), split(1, "x"));
+        assert_eq!(climb("..//./..//proc/uptime/"), split(2, "proc/uptime/"));
+        assert_eq!(climb("../proc/."), split(1, "proc/."));
+        assert_eq!(climb(".."), split(1, ""));
+        assert_eq!(climb("../"), split(1, ""));
+        assert_eq!(climb("x/.."), split(0, "x/.."));
+        assert_eq!(climb("...x/../y"), split(0, "...x/../y"));
+        assert_eq!(climb("proc/fs"), split(0, "proc/fs"));
+        assert_eq!(climb(""), split(0, ""));
+        assert_eq!(
+            joined_verbatim(Path::new("/"), std::ffi::OsStr::new("proc/uptime/")),
+            PathBuf::from("/proc/uptime/")
+        );
+        assert_eq!(
+            joined_verbatim(Path::new("/tmp"), std::ffi::OsStr::new("")),
+            PathBuf::from("/tmp")
+        );
+        assert_eq!(climb_spelling(1), "..");
+        assert_eq!(climb_spelling(3), "../../..");
+    }
+}
+
+#[cfg(test)]
+mod listed_directory_tests {
+    use super::*;
+
+    /// Where the tool's `/proc` entry for the caller is not the caller's
+    /// (KVM), a listing's directory is the path the guest opened it by, its
+    /// `.` and `..` folded in, and the descriptor link of the entry is never
+    /// read; elsewhere the link is the directory, and the recorded path, as
+    /// it is, the fallback (<https://github.com/rrnewton/hermit/issues/4541>).
+    #[test]
+    fn a_listing_is_named_by_the_link_only_where_the_entry_is_the_callers() {
+        // Compared byte for byte: `Path`'s own comparison ignores a `.`.
+        let bytes = |path: Option<PathBuf>| path.map(PathBuf::into_os_string);
+        let cpu = || Some(PathBuf::from("/sys/devices/system/cpu"));
+        let unread = || -> Option<PathBuf> { panic!("the link of a host task was read") };
+        for recorded in [
+            "/sys/devices/system/cpu/.",
+            "/sys/devices/system/cpu/",
+            "/sys/devices/system/./cpu",
+            "/sys/devices/system/cpu/../cpu",
+        ] {
+            assert_eq!(
+                bytes(listed_directory(false, unread, || Some(PathBuf::from(
+                    recorded
+                )))),
+                bytes(cpu()),
+                "{recorded}"
+            );
+        }
+        assert_eq!(
+            listed_directory(false, unread, || Some(PathBuf::from("cpu"))),
+            None
+        );
+        assert_eq!(
+            bytes(listed_directory(true, cpu, || Some(PathBuf::from(
+                "/tmp/x"
+            )))),
+            bytes(cpu())
+        );
+        // Where the link cannot be read, the recorded path as it is.
+        assert_eq!(
+            bytes(listed_directory(
+                true,
+                || None,
+                || Some(PathBuf::from("/tmp/x/../y"))
+            )),
+            Some("/tmp/x/../y".into())
+        );
+    }
 }
 
 /// A name `call` removes, as `(dirfd, path)`.
@@ -1195,8 +1452,13 @@ type RemovedName<'a> = (RawFd, Option<PathPtr<'a>>);
 /// [`Detcore::guest_made_fifos_removed_by`] (without) look up.
 fn removed_names<'a>(
     call: &'a Syscall,
+    #[cfg_attr(
+        target_arch = "aarch64",
+        allow(unused_variables, reason = "only x86_64 has rmdir")
+    )]
     with_rmdir: bool,
 ) -> Option<(RemovedName<'a>, Option<RemovedName<'a>>)> {
+    #[cfg(not(target_arch = "aarch64"))]
     let at = libc::AT_FDCWD;
     Some(match call {
         #[cfg(not(target_arch = "aarch64"))]
@@ -1614,6 +1876,13 @@ mod fdinfo_refusal_tests {
         assert_eq!(fdinfo_inode(fdinfo).as_deref(), Some("1234"));
         assert_eq!(fdinfo_inode(b"pos:\t0\n"), None);
         assert_eq!(fdinfo_inode(b"ino:\tx\n"), None);
+    }
+}
+
+/// Puts back the guest bytes under a `Detcore::probe_socket_option` buffer.
+fn restore_socket_option_probe<M: MemoryAccess>(memory: &mut M, buffer: AddrMut<u8>, saved: &[u8]) {
+    if memory.write_exact(buffer, saved).is_err() {
+        info!("Could not restore the guest bytes under a socket option probe.");
     }
 }
 
@@ -3496,8 +3765,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A `/proc` path naming a process or thread by the guest's number
         // is looked up by the kernel's (DBT), as the guest's own call is
         // (`procfs_numbers`).
-        let probe = Syscall::Newfstatat(
-            syscalls::Newfstatat::new()
+        let probe = crate::arch::fstatat_syscall(
+            syscalls::Fstatat::new()
                 .with_dirfd(dirfd)
                 .with_path(Some(path))
                 .with_flags(flags),
@@ -3537,8 +3806,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         flags: AtFlags,
     ) -> Result<libc::stat, Errno> {
         let lstatat = move |statptr: StatPtr<'_>| {
-            Syscall::Newfstatat(
-                syscalls::Newfstatat::new()
+            crate::arch::fstatat_syscall(
+                syscalls::Fstatat::new()
                     .with_dirfd(dirfd)
                     .with_path(Some(path))
                     .with_stat(Some(statptr))
@@ -3548,7 +3817,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The scratch starts 128 bytes below the stack pointer, at addresses
         // computed by subtraction.
         let scratch = 128 + std::mem::size_of::<libc::stat>();
-        if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
+        if usize::try_from(crate::arch::stack_pointer(&guest.regs().await))
+            .map_or(true, |rsp| rsp <= scratch)
+        {
             return Self::inject_stat_in_transient_page(guest, lstatat, None)
                 .await
                 .map_err(StatFailure::errno);
@@ -3785,6 +4056,180 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(host_stat)
     }
 
+    /// Under replay, makes descriptor `fd`, which an `SCM_RIGHTS` receive
+    /// installed and which the recording found to name the open file of `other`
+    /// in this table, name that file in the kernel too.
+    ///
+    /// Replay serves the receive from the log and holds a placeholder eventfd
+    /// in `fd`, but the guest keeps using both descriptors: a write to a
+    /// received eventfd must reach the reader of the original, as it does in
+    /// the recording, and replay applies eventfd reads and writes in the kernel
+    /// (`ReplayFdKind::Eventfd`). `dup3` replaces the placeholder with `other`'s
+    /// file, which is the live object the recording's file corresponds to: the
+    /// open file the descriptor table names at `other` in both runs.
+    pub(crate) async fn install_live_alias<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        other: RawFd,
+        fd: RawFd,
+        flags: OFlag,
+    ) -> Result<(), Errno> {
+        let installed = guest
+            .inject_with_retry(
+                syscalls::Dup3::new()
+                    .with_oldfd(other)
+                    .with_newfd(fd)
+                    .with_flags(flags & OFlag::O_CLOEXEC),
+            )
+            .await?;
+        if installed != i64::from(fd) {
+            warn!("[detcore] replay's alias of {other} landed in {installed}, not {fd}");
+            return Err(Errno::EBADF);
+        }
+        Ok(())
+    }
+
+    /// Marks a socket whose peer is a guest of this container as internal
+    /// (`DetFd::set_guest_peer`), so record and replay poll a blocking call on
+    /// it in the caller's turn, as they do on a pipe or a socketpair endpoint,
+    /// instead of running it outside the turn as external I/O.
+    ///
+    /// Outside the turn, the kernel completed such a call at a host-timed
+    /// moment relative to the other threads' calls. A `recvmsg` that receives
+    /// descriptors over `SCM_RIGHTS` then took descriptor slots at that moment,
+    /// while replay, which serves the call from the log, reserves them when the
+    /// call rejoins the schedule; another thread's open in between took a
+    /// different slot in each, and replay refused with "replay FD namespace
+    /// diverged". In the turn, no other guest thread runs between the attempt
+    /// that receives and the reservation that replays it.
+    ///
+    /// The peer's credentials decide. Only `AF_UNIX` stream and seqpacket
+    /// sockets carry a peer's; Linux reports any other socket's, and a peer
+    /// outside the recording's PID namespace, as pid 0, which leaves the socket
+    /// external. So a pid above 0 names a guest only because `hermit record`
+    /// runs its guests in a PID namespace of their own (`cred_to_ucred` maps
+    /// the peer's pid into the caller's namespace, `pid_nr_ns`); a recording
+    /// that shared the host's PID namespace would count a host process's
+    /// socket as internal, and poll a wait on it in the caller's turn. Every
+    /// probe goes through the recording, so replay, which holds
+    /// placeholders, classifies the socket exactly as the recording did. A run
+    /// without sequentialized threads, or with `--debug-externalize-sockets`,
+    /// keeps every socket external; a plain run polls every socket already.
+    pub(crate) async fn classify_socket_peer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        role: SocketRole,
+    ) {
+        if !self.cfg.recordreplay_modes || !self.cfg.use_nonblocking_sockets() {
+            return;
+        }
+        match self.mark_guest_peer(guest, fd, role).await {
+            Ok(true) => trace!("[detcore] socket {fd} has a guest peer: polled as internal"),
+            Ok(false) => trace!("[detcore] socket {fd} has no guest peer: stays external"),
+            Err(errno) => {
+                trace!("[detcore] socket {fd} stays external: peer probe failed with {errno}")
+            }
+        }
+    }
+
+    /// [`Self::classify_socket_peer`]'s probes. Returns whether it marked the
+    /// socket.
+    async fn mark_guest_peer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        role: SocketRole,
+    ) -> Result<bool, Errno> {
+        // A listener reports its own credentials as SO_PEERCRED, not a peer's
+        // (sock_getsockopt in net/core/sock.c).
+        if role == SocketRole::Received
+            && self
+                .probe_socket_option::<_, libc::c_int>(guest, fd, libc::SO_ACCEPTCONN)
+                .await?
+                != 0
+        {
+            return Ok(false);
+        }
+        let peer: libc::ucred = self
+            .probe_socket_option(guest, fd, libc::SO_PEERCRED)
+            .await?;
+        if peer.pid <= 0 {
+            return Ok(false);
+        }
+        let (physically_nonblocking, status_flags) =
+            guest.thread_state().with_detfd(fd, |detfd| {
+                (detfd.physically_nonblocking(), detfd.status_flags())
+            })?;
+        if !physically_nonblocking {
+            // The guest's flags are unchanged: F_GETFL reports the logical ones.
+            self.record_or_replay(
+                guest,
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(F_SETFL(status_flags | OFlag::O_NONBLOCK.bits())),
+            )
+            .await?;
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_physically_nonblocking())?;
+        }
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.set_guest_peer())?;
+        Ok(true)
+    }
+
+    /// Reads the `SOL_SOCKET` option `optname` of `fd` through the recording
+    /// into a buffer borrowed from the guest stack scratch, whose bytes are put
+    /// back afterwards, as `inject_stat_on_stack` borrows its buffer.
+    async fn probe_socket_option<G: Guest<Self>, V: Copy>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        optname: libc::c_int,
+    ) -> Result<V, Errno> {
+        let mut stack = guest.stack().await;
+        let probe: AddrMut<SocketOptionProbe<V>> = stack.reserve();
+        let value: AddrMut<V> = probe.cast();
+        let length = AddrMut::<libc::socklen_t>::from_raw(
+            probe.as_raw() + std::mem::offset_of!(SocketOptionProbe<V>, length),
+        )
+        .ok_or(Errno::EFAULT)?;
+        // Ptrace lends bytes below the guest's red zone; save them before
+        // commit can write the reservation.
+        let mut saved = vec![0u8; std::mem::size_of::<SocketOptionProbe<V>>()];
+        guest.memory().read_exact(probe.cast(), &mut saved)?;
+        let guard = match stack.commit() {
+            Ok(guard) => guard,
+            Err(errno) => {
+                restore_socket_option_probe(&mut guest.memory(), probe.cast(), &saved);
+                return Err(errno);
+            }
+        };
+        let probed = match guest
+            .memory()
+            .write_value(length, &(std::mem::size_of::<V>() as libc::socklen_t))
+        {
+            Ok(()) => self
+                .record_or_replay(
+                    guest,
+                    syscalls::Getsockopt::new()
+                        .with_fd(fd)
+                        .with_level(libc::SOL_SOCKET)
+                        .with_optname(optname)
+                        .with_optval(Some(value.cast()))
+                        .with_optlen(Some(length)),
+                )
+                .await
+                .and_then(|_| guest.memory().read_value(value)),
+            Err(errno) => Err(errno),
+        };
+        restore_socket_option_probe(&mut guest.memory(), probe.cast(), &saved);
+        drop(guard);
+        probed
+    }
+
     pub(crate) async fn release_port_for_open_file<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3866,6 +4311,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(directory.join(path));
             }
         }
+        Self::prepare_guest_cwd(guest, dirfd, path).await;
         Self::observed_path(guest, dirfd, path)
     }
 
@@ -3975,17 +4421,236 @@ impl<T: RecordOrReplay> Detcore<T> {
         Some(directory)
     }
 
+    /// Whether a decision about `path`, looked up relative to `dirfd`, reads
+    /// the guest's working directory from the guest
+    /// ([`Self::prepare_guest_cwd`]): a nonempty spelling relative to the
+    /// working directory (`AT_FDCWD`), where the tool cannot read the working
+    /// directory from host procfs
+    /// ([`crate::procfs_inode::tool_can_read_guest_cwd`]: KVM). An absolute
+    /// spelling is bound already, and a directory descriptor supplies its own
+    /// recorded path. The empty spelling (`AT_EMPTY_PATH`) is the working
+    /// directory itself, which no decision classifies (`Detcore::decide`
+    /// takes it for no name), so it is kept as given
+    /// ([`Self::observed_path`]); so is a spelling `PATH_MAX` bytes long or
+    /// more, which Linux refuses before any walk ([`names_past_path_max`]).
+    fn reads_guest_cwd<G: Guest<Self>>(guest: &G, dirfd: i32, path: &Path) -> bool {
+        dirfd == libc::AT_FDCWD
+            && !path.is_absolute()
+            && !path.as_os_str().is_empty()
+            && !names_past_path_max(path)
+            && !crate::procfs_inode::tool_can_read_guest_cwd(&guest.config().backend)
+    }
+
+    /// Read what a decision about `path` needs of the calling thread's
+    /// working directory for the syscall it is running, where
+    /// [`Self::reads_guest_cwd`] says it reads it from the guest, before the
+    /// decision, which does not await ([`Self::observed_path`]): the
+    /// directory's path, once per syscall
+    /// ([`Self::read_guest_cwd_for_syscall`]); and where that has none (a
+    /// removed directory, or one whose path is longer than `PATH_MAX`), the
+    /// directory the spelling climbs to out of it with `..`, once per number
+    /// of `..` ([`Self::read_climbed_directory`]). Nothing happens elsewhere,
+    /// so no other spelling, and no backend whose tool reads the working
+    /// directory from host procfs, makes a call for it.
+    ///
+    /// The calls it injects stage their buffers in the guest stack scratch,
+    /// which KVM gives out once at a time and refuses with a panic while
+    /// taken (Reverie's `KvmStack`); so it must run before its caller takes
+    /// that scratch, never while the caller holds it. A caller that holds the
+    /// scratch across a call whose translation may reach it prepares the
+    /// spelling first (`Detcore::whole_link`), which leaves nothing for it to
+    /// read again.
+    pub(crate) async fn prepare_guest_cwd<G: Guest<Self>>(guest: &mut G, dirfd: i32, path: &Path) {
+        if !Self::reads_guest_cwd(guest, dirfd, path) {
+            return;
+        }
+        if guest.thread_state().syscall_cwd.is_none() {
+            Box::pin(Self::read_guest_cwd_for_syscall(guest)).await;
+        }
+        let (climbs, _) = split_leading_climb(path);
+        let unread = climbs > 0
+            && matches!(
+                &guest.thread_state().syscall_cwd,
+                Some(SyscallCwd::Unrendered(climbed)) if !climbed.contains_key(&climbs)
+            );
+        if unread {
+            let climbed = Box::pin(Self::read_climbed_directory(guest, climbs)).await;
+            if let Some(SyscallCwd::Unrendered(paths)) = &mut guest.thread_state_mut().syscall_cwd {
+                paths.insert(climbs, climbed);
+            }
+        }
+    }
+
+    /// The calling thread's working directory as its own `getcwd` answers
+    /// it, read once for the syscall it is running
+    /// ([`ThreadState::syscall_cwd`]): one `getcwd` injected in the thread,
+    /// its buffer staged by [`crate::syscalls::scratch::inject_with_scratch`]
+    /// (the guest stack scratch, whose bytes are put back after the call, or
+    /// a transient private page where that scratch cannot hold the buffer).
+    /// On KVM that scratch is not the guest's stack but the Tool's own page in
+    /// the boot-reserved layout, open to user access only while a Tool
+    /// callback runs (Reverie's `KvmStack`), and `PATH_MAX` bytes fill it
+    /// exactly, so no guest memory holds the buffer and no page is mapped
+    /// for it.
+    ///
+    /// A `getcwd` that fails with `ENOENT` (the directory was removed) or
+    /// with `ENAMETOOLONG` or `ERANGE` (its path is longer than `PATH_MAX`)
+    /// leaves the directory unrendered, as Linux leaves it walkable: a
+    /// spelling that climbs out of it with `..` is then decided from the
+    /// directory it climbs to ([`Self::prepare_guest_cwd`]). One that fails
+    /// otherwise, or that answers no path from the root (its "(unreachable)"
+    /// prefix), leaves every spelling to be decided as given, as a spelling
+    /// Detcore could not resolve always was. Called through
+    /// [`Self::prepare_guest_cwd`], boxed, so that its buffers do not grow
+    /// every system call's future.
+    async fn read_guest_cwd_for_syscall<G: Guest<Self>>(guest: &mut G) {
+        const PATH_MAX: usize = libc::PATH_MAX as usize;
+        let answered =
+            crate::syscalls::scratch::inject_with_scratch(guest, [0_u8; PATH_MAX], |buffer| {
+                Syscall::from(
+                    syscalls::Getcwd::new()
+                        .with_buf(Some(buffer.cast::<libc::c_char>()))
+                        .with_size(PATH_MAX),
+                )
+            })
+            .await;
+        let cwd = match answered {
+            // The length counts the NUL.
+            Ok((length, bytes)) => usize::try_from(length)
+                .ok()
+                .filter(|length| (1..=PATH_MAX).contains(length))
+                .map(|length| &bytes[..length - 1])
+                .filter(|path| path.starts_with(b"/"))
+                .map_or(SyscallCwd::Unknown, |path| {
+                    SyscallCwd::Path(PathBuf::from(
+                        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path),
+                    ))
+                }),
+            Err(Errno::ENOENT | Errno::ENAMETOOLONG | Errno::ERANGE) => {
+                SyscallCwd::Unrendered(BTreeMap::new())
+            }
+            Err(_) => SyscallCwd::Unknown,
+        };
+        guest.thread_state_mut().syscall_cwd = Some(cwd);
+    }
+
+    /// The path of the directory `climbs` `..` lead to from the calling
+    /// thread's working directory, where `getcwd` renders none for it (a
+    /// removed directory, or one whose path is longer than `PATH_MAX`), read
+    /// through a descriptor for that directory, three calls injected in the
+    /// thread: an `O_PATH` open of `..` (`climbs` of them), which the
+    /// executor walks from the working directory itself, as Linux's walk
+    /// leaves a removed directory for its parent; a `readlinkat` of that
+    /// descriptor's link (`/proc/thread-self/fd/<it>`, which the executor
+    /// answers from its own descriptor, as for
+    /// `Detcore::received_descriptor_link`); and the descriptor's `close`,
+    /// before the guest runs again, so the guest's next descriptor number
+    /// does not move. Each call's path and buffer are staged as
+    /// [`Self::read_guest_cwd_for_syscall`] stages `getcwd`'s. `None` where a
+    /// call fails, or where the link fills its buffer and may be cut.
+    async fn read_climbed_directory<G: Guest<Self>>(
+        guest: &mut G,
+        climbs: usize,
+    ) -> Option<PathBuf> {
+        const PATH_MAX: usize = libc::PATH_MAX as usize;
+        const LINK_PATH: usize = 64;
+        const LINK_TARGET: usize = PATH_MAX - LINK_PATH;
+        let climbed = climb_spelling(climbs);
+        if climbed.len() >= PATH_MAX {
+            return None;
+        }
+        let mut spelled = [0_u8; PATH_MAX];
+        spelled[..climbed.len()].copy_from_slice(climbed.as_bytes());
+        let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+        let (opened, _) = crate::syscalls::scratch::inject_with_scratch(guest, spelled, |base| {
+            syscalls::Openat::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                .with_flags(flags)
+                .with_mode(None)
+                .into()
+        })
+        .await
+        .ok()?;
+        let fd = RawFd::try_from(opened).ok()?;
+        let mut buffer = [0_u8; LINK_PATH + LINK_TARGET];
+        let link = format!("/proc/thread-self/fd/{fd}");
+        buffer[..link.len()].copy_from_slice(link.as_bytes());
+        let linked = crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
+            // SAFETY: the buffer holds LINK_PATH + LINK_TARGET bytes.
+            let target = unsafe { base.add(LINK_PATH) };
+            syscalls::Readlinkat::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
+                .with_buf(Some(target.cast::<libc::c_char>()))
+                .with_buf_len(LINK_TARGET)
+                .into()
+        })
+        .await;
+        let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+        let (length, bytes) = linked.ok()?;
+        let length = usize::try_from(length)
+            .ok()
+            .filter(|length| *length < LINK_TARGET)?;
+        let path = &bytes[LINK_PATH..LINK_PATH + length];
+        path.starts_with(b"/").then(|| {
+            PathBuf::from(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path))
+        })
+    }
+
     /// `path`, as a guest syscall named it relative to `dirfd`, made
     /// absolute in the guest's view. A relative spelling is not the object:
     /// absolute paths are already bound, a dirfd supplies its own prefix, and
     /// AT_FDCWD-relative spellings are resolved through the guest's root and
     /// cwd, so the result does not depend on Replayer's placeholder
     /// descriptor. A spelling that cannot be resolved is kept as given.
-    fn observed_path<G: Guest<Self>>(guest: &G, dirfd: i32, path: &Path) -> Result<PathBuf, Error> {
-        Ok(if path.is_absolute() {
+    ///
+    /// Where the tool cannot read the guest's working directory from host
+    /// procfs ([`crate::procfs_inode::tool_can_read_guest_cwd`]: KVM, whose
+    /// guest process IDs name the supervisor's own threads), the working
+    /// directory is the one the guest's `getcwd` answered for this syscall,
+    /// which an async caller reads first ([`Self::prepare_guest_cwd`]). Where
+    /// `getcwd` answered none (a removed directory, or one whose path is
+    /// longer than `PATH_MAX`), a spelling whose leading `..` climb out of it
+    /// is made absolute from the directory they reach, as the executor's own
+    /// walk named it ([`Self::read_climbed_directory`]), the rest of the
+    /// spelling following byte for byte ([`split_leading_climb`]). Any other
+    /// spelling, and one whose climb failed, is kept as given, so that the
+    /// call's own walk decides it, with its own error.
+    ///
+    /// A spelling relative to the working directory that is `PATH_MAX` bytes
+    /// long or more is kept as given before anything is read or reused for
+    /// it, on every backend: Linux refuses it with `ENAMETOOLONG` before any
+    /// walk ([`names_past_path_max`]), and a climb would shorten it into a
+    /// name Detcore serves.
+    pub(crate) fn observed_path<G: Guest<Self>>(
+        guest: &G,
+        dirfd: i32,
+        path: &Path,
+    ) -> Result<PathBuf, Error> {
+        // An absolute spelling is bound already; a relative one of PATH_MAX
+        // bytes or more names nothing, and the call refuses it.
+        let as_given = path.is_absolute() || (dirfd == libc::AT_FDCWD && names_past_path_max(path));
+        Ok(if as_given {
             path.to_path_buf()
         } else if dirfd == libc::AT_FDCWD {
-            resolved_at_fdcwd_path(guest.pid().as_raw(), path).unwrap_or_else(|| path.to_path_buf())
+            if crate::procfs_inode::tool_can_read_guest_cwd(&guest.config().backend) {
+                resolved_at_fdcwd_path(guest.pid().as_raw(), path)
+                    .unwrap_or_else(|| path.to_path_buf())
+            } else {
+                match &guest.thread_state().syscall_cwd {
+                    _ if path.as_os_str().is_empty() => path.to_path_buf(),
+                    Some(SyscallCwd::Path(cwd)) => cwd.join(path),
+                    Some(SyscallCwd::Unrendered(climbed)) => {
+                        let (climbs, rest) = split_leading_climb(path);
+                        match climbed.get(&climbs) {
+                            Some(Some(directory)) if climbs > 0 => joined_verbatim(directory, rest),
+                            _ => path.to_path_buf(),
+                        }
+                    }
+                    _ => path.to_path_buf(),
+                }
+            }
         } else {
             // A descriptor Detcore has no state for (one received over
             // `SCM_RIGHTS` and not recorded,
@@ -4012,6 +4677,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: &Syscall,
     ) {
+        #[cfg(not(target_arch = "aarch64"))]
         let at = libc::AT_FDCWD;
         let changed: Vec<(i32, Option<syscalls::PathPtr>)> = match call {
             #[cfg(not(target_arch = "aarch64"))]
@@ -4045,6 +4711,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let observed = match path.map(|path| path.read(&guest.memory())) {
                 Some(Ok(path)) => {
                     let path: PathBuf = path;
+                    Self::prepare_guest_cwd(guest, dirfd, &path).await;
                     Self::observed_path(guest, dirfd, &path).ok()
                 }
                 _ => None,
@@ -4343,6 +5010,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // bound; a dirfd supplies its own prefix; AT_FDCWD-relative spellings
         // are resolved through the guest's root and cwd before the open so the
         // result does not depend on Replayer's placeholder descriptor.
+        Self::prepare_guest_cwd(guest, call.dirfd(), &path).await;
         let observed_path = Self::observed_path(guest, call.dirfd(), &path)?;
         // The spelling Detcore's own lookups of the files it renders see.
         let procfs_spelling = self.procfs_spelling_at(guest, call.dirfd(), &path).await?;
@@ -4679,9 +5347,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .await
                     {
                         Ok(true) => {
-                            guest
-                                .thread_state()
-                                .with_detfd(fd, |detfd| detfd.set_type(FdType::Rng))?;
+                            guest.thread_state().classify_random_device(fd)?;
                             FdType::Rng
                         }
                         Ok(false) => fd_type,
@@ -4833,10 +5499,45 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
                 if let (true, Some(stat)) = (guest.config().record_host_inputs, &host_stat) {
+                    let identity = detcore_model::host_input::HostFileIdentity::from_stat(stat);
+                    let file_type = stat.st_mode & libc::S_IFMT;
+                    // Where the tool can name the guest's descriptor, the
+                    // kernel's path for it (a readlink, which raises no
+                    // inotify event the guest could see): whether it reached
+                    // a kernel object whatever path the guest spelled, and
+                    // otherwise, for a regular file or a directory, where the
+                    // run's end reads its bytes or names, which the guest
+                    // sees where it does not see the host's inode or times
+                    // (`crate::host_inputs::content_at_end`). Nothing is read
+                    // now, while the guest runs.
+                    let target = crate::fifo_peer::guest_descriptors_are_visible(
+                        &self.cfg.backend,
+                        guest.thread_state().physical_tid,
+                    )
+                    .then(|| {
+                        crate::util::raw_read_link(Path::new(&format!(
+                            "/proc/{}/fd/{fd}",
+                            guest.tid().as_raw()
+                        )))
+                        .ok()
+                    })
+                    .flatten();
+                    let kernel_object = target.as_deref().is_some_and(|target| {
+                        detcore_model::host_input::is_kernel_object(&target.to_string_lossy())
+                    });
+                    let source = target
+                        .filter(|_| {
+                            !kernel_object && matches!(file_type, libc::S_IFREG | libc::S_IFDIR)
+                        })
+                        .and_then(|target| target.to_str().map(str::to_owned));
                     crate::tool_global::record_host_input(
                         guest,
                         observed_path.to_string_lossy().into_owned(),
-                        detcore_model::host_input::HostFileIdentity::from_stat(stat),
+                        identity,
+                        source,
+                        file_type == libc::S_IFREG,
+                        false,
+                        kernel_object,
                     )
                     .await;
                 }
@@ -6018,6 +6719,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(crate::fd::is_random_device(stat.st_mode, stat.st_rdev))
     }
 
+    /// [`Self::recorded_fstat`] of a descriptor an `SCM_RIGHTS` receive
+    /// installed (`Detcore::record_received_descriptors`). A failed call,
+    /// recorded or not, is its errno, which leaves the descriptor unrecorded.
+    /// Under record and replay a buffer that cannot be prepared ends the run
+    /// instead, as an open's classification does: it recorded no event, so
+    /// the other run could consume a different one.
+    pub(crate) async fn received_descriptor_fstat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw_fd: RawFd,
+    ) -> Result<libc::stat, Error> {
+        match self.recorded_fstat(guest, raw_fd).await {
+            Ok(stat) => Ok(stat),
+            Err(StatFailure::Scratch(errno)) if self.cfg.recordreplay_modes => {
+                Err(Error::Tool(anyhow::anyhow!(
+                    "cannot record descriptor {raw_fd}, received over SCM_RIGHTS, under \
+                     record and replay: no buffer for its fstat ({errno})"
+                )))
+            }
+            Err(failure) => Err(failure.errno().into()),
+        }
+    }
+
     /// `fstat(fd)` through the recording, with [`Self::inject_fstat`]'s buffer
     /// placement and retry: recorded under record, served from the recording
     /// under replay, injected otherwise. Every attempt, including an
@@ -6084,24 +6808,48 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// What descriptor `fd` of the calling process names, as its
-    /// `/proc/self/fd` link reads, through the recording: the recording reads
-    /// the kernel's link and keeps its bytes, and replay, whose descriptor is
-    /// an eventfd, returns the same bytes. `None` for a deleted or anonymous
-    /// target, a link that cannot be read, or one too long for the 256 bytes
-    /// read: every path Detcore classifies is far shorter, and a truncated
-    /// one must not match.
-    ///
-    /// The link's name and the buffer go in the guest stack scratch, below the
-    /// red zone, or, where that memory is not writable (a stack pointer just
-    /// above a guard page or the lowest page of the main-thread stack), in a
-    /// transient private page, as `inject_fstat` does
-    /// (<https://github.com/rrnewton/hermit/issues/3328>): Detcore's
-    /// bookkeeping must never fail the guest's open.
+    /// `/proc/thread-self/fd` link reads, through the recording
+    /// ([`Self::recorded_descriptor_link`]): `None` for an anonymous target,
+    /// a link that cannot be read, one too long for the 256 bytes read (every
+    /// path Detcore classifies is far shorter, and a truncated one must not
+    /// match), or one Detcore had no buffer to read into, which must never
+    /// fail the guest's open.
     async fn recorded_open_path<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
     ) -> Result<Option<PathBuf>, Error> {
+        let bytes = self
+            .recorded_descriptor_link(guest, fd)
+            .await
+            .unwrap_or(None);
+        Ok(bytes.and_then(|bytes| {
+            let path = PathBuf::from(
+                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes),
+            );
+            path.is_absolute().then_some(path)
+        }))
+    }
+
+    /// The bytes of descriptor `fd`'s `/proc/thread-self/fd` link, through the
+    /// recording ([`Self::recorded_readlink`]): the recording reads the
+    /// kernel's link and keeps its bytes, and replay, whose slot may hold a
+    /// stand-in eventfd, returns the same bytes. `None` for a link that cannot
+    /// be read or fills the 256 bytes read.
+    ///
+    /// The link's name and the buffer go in the guest stack scratch, below the
+    /// red zone, or, where that memory is not writable (a stack pointer just
+    /// above a guard page or the lowest page of the main-thread stack), in a
+    /// transient private page, as `inject_fstat` does
+    /// (<https://github.com/rrnewton/hermit/issues/3328>). Neither placement
+    /// consumes an event. `Err` when neither could be prepared: no readlink
+    /// ran, so no event was recorded or consumed, and a caller under record
+    /// and replay decides whether that may end the run.
+    pub(crate) async fn recorded_descriptor_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<Vec<u8>>, Errno> {
         const LINK_CAPACITY: usize = 32;
         const TARGET_CAPACITY: usize = 256;
         let link_name = rendered_procfs::c_string::<LINK_CAPACITY>(
@@ -6110,13 +6858,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut stack = guest.stack().await;
         let link = stack.push(link_name);
         let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
-        let bytes = match stack.commit() {
+        match stack.commit() {
             Ok(stack_guard) => {
                 let bytes = self
                     .recorded_readlink(guest, link.as_raw(), target.as_raw(), TARGET_CAPACITY)
                     .await;
                 drop(stack_guard);
-                bytes
+                Ok(bytes)
             }
             Err(_) => {
                 info!(
@@ -6136,23 +6884,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .with_offset(0),
                     ))
                     .await;
-                let Some(page) = mapped
-                    .ok()
-                    .and_then(|mapped| usize::try_from(mapped).ok())
-                    .and_then(AddrMut::<u8>::from_raw)
-                else {
-                    return Ok(None);
-                };
-                let bytes = if guest.memory().write_exact(page, &link_name).is_ok() {
-                    self.recorded_readlink(
-                        guest,
-                        page.as_raw(),
-                        page.as_raw() + LINK_CAPACITY,
-                        TARGET_CAPACITY,
-                    )
-                    .await
+                let page = mapped.and_then(|mapped| {
+                    usize::try_from(mapped)
+                        .ok()
+                        .and_then(AddrMut::<u8>::from_raw)
+                        .ok_or(Errno::ENOMEM)
+                })?;
+                let bytes = if let Err(errno) = guest.memory().write_exact(page, &link_name) {
+                    Err(errno)
                 } else {
-                    None
+                    Ok(self
+                        .recorded_readlink(
+                            guest,
+                            page.as_raw(),
+                            page.as_raw() + LINK_CAPACITY,
+                            TARGET_CAPACITY,
+                        )
+                        .await)
                 };
                 if let Err(errno) = guest
                     .inject_with_retry(Syscall::Munmap(
@@ -6169,18 +6917,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 bytes
             }
-        };
-        Ok(bytes.and_then(|bytes| {
-            let path = PathBuf::from(
-                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes),
-            );
-            path.is_absolute().then_some(path)
-        }))
+        }
     }
 
     /// `readlink(link, target, capacity)` through the recording, both at guest
     /// addresses: the bytes it read, or `None` if it failed or filled the
-    /// buffer (a link that may be truncated).
+    /// buffer (a link that may be truncated). Retried while a signal stops it
+    /// before it runs; every attempt is an event, so replay retries as the
+    /// recording did.
     async fn recorded_readlink<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -6188,17 +6932,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         target: usize,
         capacity: usize,
     ) -> Option<Vec<u8>> {
+        const ATTEMPTS: usize = 64;
         let target = AddrMut::<u8>::from_raw(target)?;
-        let length = self
-            .record_or_replay(
-                guest,
-                syscalls::Readlink::new()
-                    .with_path(PathPtr::from_ptr(link as *const libc::c_char))
-                    .with_buf(Some(target.cast::<libc::c_char>()))
-                    .with_bufsize(capacity),
-            )
-            .await
-            .ok()?;
+        let path = PathPtr::from_ptr(link as *const libc::c_char);
+        let buf = Some(target.cast::<libc::c_char>());
+        #[cfg(target_arch = "x86_64")]
+        let call = syscalls::Readlink::new()
+            .with_path(path)
+            .with_buf(buf)
+            .with_bufsize(capacity);
+        // aarch64 has only `readlinkat`.
+        #[cfg(not(target_arch = "x86_64"))]
+        let call = syscalls::Readlinkat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(path)
+            .with_buf(buf)
+            .with_buf_len(capacity);
+        let mut answer = Err(Errno::ERESTARTSYS);
+        for _ in 0..ATTEMPTS {
+            answer = self.record_or_replay(guest, call).await;
+            if !matches!(answer, Err(Errno::EINTR | Errno::ERESTARTSYS)) {
+                break;
+            }
+        }
+        let length = answer.ok()?;
         let length = usize::try_from(length)
             .ok()
             .filter(|length| *length < capacity)?;
@@ -6224,8 +6981,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         len: usize,
         offset: Option<u64>,
     ) -> Result<i64, Error> {
-        // Linux's MAX_RW_COUNT: INT_MAX rounded down to a page.
-        const MAX_RW_COUNT: usize = 0x7fff_f000;
         let status = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.status_flags())?;
@@ -6255,7 +7010,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let destination = buf.map_or(0, |buf| buf.as_raw());
         let copied = self
-            .read_rendered_cmdline(guest, fd, destination, len.min(MAX_RW_COUNT), pos)
+            .read_rendered_cmdline(
+                guest,
+                fd,
+                destination,
+                len.min(crate::page::max_rw_count()),
+                pos,
+            )
             .await?;
         if offset.is_none() {
             guest.thread_state().with_detfd(fd, |detfd| {
@@ -7303,11 +8064,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Rng => {
                 trace!("Read call RNG fd {}, simulating...", call.fd());
                 let status_flags = descriptor.status_flags();
+                let stream = descriptor.random_device_stream();
                 descriptor
                     .with_random_device_stream(|offset| {
                         require_random_device_read_access(status_flags)?;
                         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                        self.fill_random_device_bytes(guest, remote_buf, call.len(), offset)
+                        self.fill_random_device_bytes(guest, stream, remote_buf, call.len(), offset)
                     })
                     .map(|n| n as i64)
             }
@@ -7662,9 +8424,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(copied as i64);
         }
 
-        let (fd_type, resource, status_flags) =
+        let (fd_type, resource, status_flags, stream) =
             guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
-                (detfd.ty(), detfd.resource(), detfd.status_flags())
+                (
+                    detfd.ty(),
+                    detfd.resource(),
+                    detfd.status_flags(),
+                    detfd.random_device_stream(),
+                )
             })?;
 
         if let Some(resource) = resource {
@@ -7680,8 +8447,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // checks FMODE_READ first; read and readv already check.
                 require_random_device_read_access(status_flags)?;
                 let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n =
-                    self.fill_random_device_bytes(guest, remote_buf, call.len(), offset as u64)?;
+                let n = self.fill_random_device_bytes(
+                    guest,
+                    stream,
+                    remote_buf,
+                    call.len(),
+                    offset as u64,
+                )?;
                 Ok(n as i64)
             })(),
             FdType::Regular if guest.config().deterministic_io => {
@@ -8781,11 +9553,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         )?;
         let total = iovecs.iter().map(|iov| iov.len).sum();
         validate_random_vector_read(request.offset, total, request.flags)?;
+        let stream = detfd.random_device_stream();
         let written = if let Some(offset) = request.offset {
-            self.fill_random_device_iovecs(guest, &iovecs, offset)?
+            self.fill_random_device_iovecs(guest, stream, &iovecs, offset)?
         } else {
             detfd.with_random_device_stream(|offset| {
-                self.fill_random_device_iovecs(guest, &iovecs, offset)
+                self.fill_random_device_iovecs(guest, stream, &iovecs, offset)
             })?
         };
         if written > 0 && self.cfg.detlog_io_buffers && crate::detlog_observed!() {
@@ -10164,13 +10937,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Outside record/replay that holds for every scheduler-managed type. In
     /// record/replay it holds only for a container-internal channel that is
     /// already physically nonblocking: a pipe, which is how `handle_pipe2`
-    /// leaves every guest-created pipe in both phases, or a socketpair endpoint,
-    /// which is how `handle_socketpair` leaves both ends. Forwarding the guest's
+    /// leaves every guest-created pipe in both phases, or an internal socket (a
+    /// socketpair endpoint, which is how `handle_socketpair` leaves both ends, or
+    /// a socket whose peer `classify_socket_peer` found to be a guest, which it
+    /// makes physically nonblocking). Forwarding the guest's
     /// clear would make the recording's next read on that channel a blocking
     /// read on an fd that `syscall_targets_internal_fd` calls internal, which
     /// deadlocks the sequentialized scheduler while the writer waits for its
     /// turn. Both phases take the same branch, because `fd_type`,
-    /// `socketpair_endpoint` and `physically_nonblocking` are Detcore
+    /// `internal_socket` and `physically_nonblocking` are Detcore
     /// bookkeeping that record and replay evolve identically: an F_SETFL is
     /// still recorded and replayed, with the kernel given `flags | O_NONBLOCK`
     /// in record and the recorded result returned in replay; a FIONBIO returns
@@ -10182,7 +10957,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     fn keeps_physically_nonblocking(
         &self,
         fd_type: FdType,
-        socketpair_endpoint: bool,
+        internal_socket: bool,
         physically_nonblocking: bool,
         inherited_external_read: bool,
     ) -> bool {
@@ -10190,7 +10965,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             && !inherited_external_read
             && match fd_type {
                 FdType::Pipe => !self.cfg.recordreplay_modes || physically_nonblocking,
-                FdType::Socket if socketpair_endpoint => {
+                FdType::Socket if internal_socket => {
                     !self.cfg.recordreplay_modes || physically_nonblocking
                 }
                 FdType::Socket | FdType::Eventfd => !self.cfg.recordreplay_modes,
@@ -10289,18 +11064,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             F_SETFL(flags) => {
-                let (fd_type, socketpair_endpoint, physically_nonblocking, inherited_external_read) =
+                let (fd_type, internal_socket, physically_nonblocking, inherited_external_read) =
                     guest.thread_state().with_detfd(fd, |detfd| {
                         (
                             detfd.ty(),
-                            detfd.is_socketpair_endpoint(),
+                            detfd.is_internal_socket(),
                             detfd.physically_nonblocking(),
                             detfd.inherited_external_read().is_some(),
                         )
                     })?;
                 let force_nonblocking = self.keeps_physically_nonblocking(
                     fd_type,
-                    socketpair_endpoint,
+                    internal_socket,
                     physically_nonblocking,
                     inherited_external_read,
                 );
@@ -10432,8 +11207,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A lock or unlock through a descriptor whose description the ledger
     /// may know under another identity (one Detcore keeps no model of, such
     /// as a descriptor received over `SCM_RIGHTS` and not recorded
-    /// (`Detcore::record_received_descriptors`), or one registered on
-    /// reception, which is a second model of the sender's description) can leave that other
+    /// (`Detcore::record_received_descriptors`), or one recorded on
+    /// reception as a second model of the sender's description, not one that
+    /// joined an open file its table models) can leave that other
     /// identity's entry stale, so no lock on that file's inode number counts
     /// from then on (`procfs::locks::LockLedger::alias_inode`): hidden, never
     /// a host's row admitted. If that descriptor's fdinfo cannot be read for
@@ -11321,18 +12097,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         // ioctl to their proxied pipe fd, and clearing it would violate the scheduler's
         // nonblockize-and-retry invariant. This mirrors F_SETFL's forced state split.
         if let Some(enabled) = nonblocking {
-            let (fd_type, socketpair_endpoint, physically_nonblocking, inherited_external_read) =
+            let (fd_type, internal_socket, physically_nonblocking, inherited_external_read) =
                 guest.thread_state().with_detfd(fd, |detfd| {
                     (
                         detfd.ty(),
-                        detfd.is_socketpair_endpoint(),
+                        detfd.is_internal_socket(),
                         detfd.physically_nonblocking(),
                         detfd.inherited_external_read().is_some(),
                     )
                 })?;
             if self.keeps_physically_nonblocking(
                 fd_type,
-                socketpair_endpoint,
+                internal_socket,
                 physically_nonblocking,
                 inherited_external_read,
             ) && physically_nonblocking
@@ -11379,6 +12155,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if let Some(pointer) = call.path() {
             let path: PathBuf = pointer.read(&guest.memory())?;
+            Self::prepare_guest_cwd(guest, libc::AT_FDCWD, &path).await;
             let observed = Self::observed_path(guest, libc::AT_FDCWD, &path)?;
             if self.rendered_procfs_at(guest, &observed).await?.is_some()
                 || Box::pin(Self::names_placeholder_directory(guest, &observed)).await
@@ -11500,10 +12277,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // below name the same four syscalls. Fail closed if they drift: "not
         // attempted" must never be observationally identical to a validated
         // emulated success.
-        if !matches!(
-            call,
-            Syscall::Chown(_) | Syscall::Fchown(_) | Syscall::Fchownat(_) | Syscall::Lchown(_)
-        ) {
+        let ownership_change = match call {
+            Syscall::Fchown(_) | Syscall::Fchownat(_) => true,
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Chown(_) | Syscall::Lchown(_) => true,
+            _ => false,
+        };
+        if !ownership_change {
             warn!(
                 "ownership-change no-op reached with an unexpected syscall {:?}; \
                  refusing unvalidated success",
@@ -11541,22 +12321,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             stack.commit()?;
 
             let validate = match &call {
-                Syscall::Chown(c) => Syscall::Newfstatat(
-                    syscalls::Newfstatat::new()
+                #[cfg(target_arch = "x86_64")]
+                Syscall::Chown(c) => crate::arch::fstatat_syscall(
+                    syscalls::Fstatat::new()
                         .with_dirfd(libc::AT_FDCWD)
                         .with_path(c.path())
                         .with_stat(Some(statptr))
                         .with_flags(AtFlags::empty()),
                 ),
-                Syscall::Lchown(c) => Syscall::Newfstatat(
-                    syscalls::Newfstatat::new()
+                #[cfg(target_arch = "x86_64")]
+                Syscall::Lchown(c) => crate::arch::fstatat_syscall(
+                    syscalls::Fstatat::new()
                         .with_dirfd(libc::AT_FDCWD)
                         .with_path(c.path())
                         .with_stat(Some(statptr))
                         .with_flags(AtFlags::AT_SYMLINK_NOFOLLOW),
                 ),
-                Syscall::Fchownat(c) => Syscall::Newfstatat(
-                    syscalls::Newfstatat::new()
+                Syscall::Fchownat(c) => crate::arch::fstatat_syscall(
+                    syscalls::Fstatat::new()
                         .with_dirfd(c.dirfd())
                         .with_path(c.path())
                         .with_stat(Some(statptr))
@@ -11589,12 +12371,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_owner(KEEP_ID)
                     .with_group(KEEP_ID),
             ),
+            #[cfg(target_arch = "x86_64")]
             Syscall::Chown(c) => Syscall::Chown(
                 syscalls::Chown::new()
                     .with_path(c.path())
                     .with_owner(KEEP_ID)
                     .with_group(KEEP_ID),
             ),
+            #[cfg(target_arch = "x86_64")]
             Syscall::Lchown(c) => Syscall::Lchown(
                 syscalls::Lchown::new()
                     .with_path(c.path())
@@ -11674,6 +12458,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// dup2 system call.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_dup2<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -11933,6 +12718,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// utime syscall: update access/modification time on a file
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_utime<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -11966,6 +12752,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// utimes syscall
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_utimes<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -12034,7 +12821,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let scratch = 128
             + staged.map_or(0, |_| std::mem::size_of::<[Timespec; 2]>())
             + std::mem::size_of::<libc::stat>();
-        if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
+        if usize::try_from(crate::arch::stack_pointer(&guest.regs().await))
+            .map_or(true, |rsp| rsp <= scratch)
+        {
             info!(
                 "Guest stack pointer cannot hold the utimensat target lookup; \
                  leaving the virtual mtime unchanged."
@@ -12208,8 +12997,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             ),
             Some(path) => {
                 let allowed = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
-                Syscall::Newfstatat(
-                    syscalls::Newfstatat::new()
+                crate::arch::fstatat_syscall(
+                    syscalls::Fstatat::new()
                         .with_dirfd(call.dirfd())
                         .with_path(Some(path))
                         .with_stat(Some(statptr))
@@ -12240,6 +13029,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?;
             self.mark_sock_diag_fd(guest, fd, &call);
+            self.note_unix_socket(guest, fd, call.family(), call.r#type());
+            self.mark_error_queue_reads(guest, fd, &call)?;
             // Linux's SOCK_TYPE_MASK: the type without SOCK_NONBLOCK and SOCK_CLOEXEC.
             const SOCK_TYPE_MASK: i32 = 0xf;
             if self.accept_in_turn_enabled() && call.r#type() & SOCK_TYPE_MASK == libc::SOCK_STREAM
@@ -12268,6 +13059,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
             self.maybe_set_nonblocking_fd(guest, fd);
             self.mark_sock_diag_fd(guest, fd, &call);
+            self.note_unix_socket(guest, fd, call.family(), call.r#type());
+            self.mark_error_queue_reads(guest, fd, &call)?;
 
             Ok(fd as i64)
         }
@@ -12284,6 +13077,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.cfg.recordreplay_modes
             && self.cfg.use_nonblocking_sockets()
             && !self.cfg.backend.tool_shares_guest_descriptor_table
+    }
+
+    /// Record whether a receive with `MSG_ERRQUEUE` on the socket `call`
+    /// created never waits (`crate::fd::error_queue_read_never_waits`), so that
+    /// such a receive runs once even on a socket the guest left blocking.
+    fn mark_error_queue_reads<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        call: &syscalls::Socket,
+    ) -> Result<(), Error> {
+        let never_waits =
+            crate::fd::error_queue_read_never_waits(call.family(), call.r#type(), call.protocol());
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.set_error_queue_never_waits(never_waits))?;
+        Ok(())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -12365,6 +13175,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .with_detfd(fd, |detfd| detfd.set_socketpair_endpoint());
                 }
             }
+            self.note_socketpair(guest, fds, call.family(), call.r#type());
 
             self.maybe_set_nonblocking_fd(guest, fds[0]);
             self.maybe_set_nonblocking_fd(guest, fds[1]);
@@ -12753,7 +13564,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
+        // The name a guest names this socket by, read before the call: Linux
+        // reads the address once, and another thread could rewrite it.
+        let unix_name = (sockaddr_family == libc::AF_UNIX as u16)
+            .then(|| {
+                crate::syscalls::scm_rights::unix_socket_name(
+                    &guest.memory(),
+                    addr.as_raw(),
+                    usize::try_from(call.addrlen()).unwrap_or(0),
+                )
+            })
+            .flatten();
         let res = self.record_or_replay(guest, call).await;
+        if res.is_ok()
+            && let Some(name) = unix_name
+        {
+            self.note_unix_bind(guest, sock_fd, &name);
+        }
         if let Some(name) = &notice_abstract_name {
             notice_host_network_abstract_bind(name, &res);
         }
@@ -13364,33 +14191,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(value);
         }
         // A process-directed signal. To a process with two or more live threads
-        // it is refused by name as `kill` refuses it: Linux's complete_signal
-        // picks the receiving thread, which Detcore does not model
-        // (https://github.com/rrnewton/hermit/issues/4047). Everything else is
-        // forwarded and the kernel answers: signal 0, which only checks that
-        // the process exists; a SIGKILL that could not be reserved, which kills
-        // the whole group whichever thread it reaches (the scheduler is told
-        // below); a process with one live thread, whose receiver the scheduler
-        // is then told about, as `kill` does; and a process with none (a
-        // zombie, which Linux still signals successfully).
+        // it goes to the thread Linux's complete_signal picks, as Detcore
+        // decides it, or waits in the shared queue when none wants it, as for
+        // `kill` (https://github.com/rrnewton/hermit/issues/4034). Everything
+        // else is forwarded and the kernel answers: signal 0, which only
+        // checks that the process exists; a SIGKILL that could not be
+        // reserved, which kills the whole group whichever thread it reaches
+        // (the scheduler is told below); a process with one live thread, whose
+        // receiver the scheduler is then told about, as `kill` does; and a
+        // process with none (a zombie, which Linux still signals
+        // successfully).
         let mut receiver = None;
         if signal != 0
             && signal != libc::SIGKILL
             && guest.config().sequentialize_threads
             && let Some(target) = process
         {
-            match resolve_kill_targets(guest, target).await.as_slice() {
-                [] => {}
-                [thread] => receiver = Some((*thread, target)),
-                _ => {
-                    self.process_signal_target(
-                        guest,
-                        reverie::syscalls::Sysno::pidfd_send_signal,
-                        target,
-                        signal,
-                    )
-                    .await?;
-                }
+            // A process-scoped pidfd names the process's leader; a
+            // `/proc/<tid>` descriptor names its thread.
+            let named_task = DetTid::from_raw(named.unwrap_or(target).as_raw());
+            match self
+                .process_signal_target(
+                    guest,
+                    reverie::syscalls::Sysno::pidfd_send_signal,
+                    target,
+                    named_task,
+                    signal,
+                )
+                .await
+            {
+                Ok(ProcessSignalTarget::Thread(thread)) => receiver = Some((thread, target)),
+                // Forwarded below, waking no thread: into the shared queue,
+                // to a zombie, or to a process the kernel answers for.
+                Ok(ProcessSignalTarget::SharedQueue | ProcessSignalTarget::Zombie)
+                | Err(Error::Errno(Errno::ESRCH)) => {}
+                Err(error) => return Err(error),
             }
         }
         let value = match receiver {
@@ -13668,6 +14503,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .thread_state()
                 .with_detfd(call.sockfd(), |detfd| detfd.is_accept_in_turn_listener())
                 .unwrap_or(false);
+        let completes_in_turn = in_turn || self.completes_in_turn(guest, call2);
+        // A connection reads its error queue as its listener does. Read before
+        // the accept, which may wait while other threads change the table.
+        let error_queue_never_waits = guest
+            .thread_state()
+            .with_detfd(call.sockfd(), |detfd| detfd.error_queue_never_waits())
+            .unwrap_or(false);
         let fd = if in_turn {
             // Record and replay run the accept in the caller's turn, so the new descriptor's
             // number is allocated deterministically (https://github.com/rrnewton/hermit/issues/3880).
@@ -13688,15 +14530,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.set_accepted_connection())?;
+        self.note_unix_accept(guest, call.sockfd(), fd, completes_in_turn);
+        guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.set_accepted_connection();
+            detfd.set_error_queue_never_waits(error_queue_never_waits);
+        })?;
 
         if physically_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);
         }
+        self.classify_socket_peer(guest, fd, SocketRole::Connected)
+            .await;
 
         Ok(fd as i64)
     }
 
     /// getdents system call.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_getdents<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -14439,19 +15289,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 !runtime_owned_descriptor_entry(&entry.name, |fd| guest.is_runtime_owned_fd(fd))
             });
         }
-        // The kernel's path for the descriptor; or, where the tool cannot
-        // read it (after a `chroot` into a root without `/proc`, where the
-        // tool runs inside the guest), the path the guest opened it by.
-        let directory = std::fs::read_link(&link)
-            .ok()
-            .or_else(|| {
+        let directory = listed_directory(
+            tool_sees_caller,
+            || std::fs::read_link(&link).ok(),
+            || {
                 guest
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.path())
                     .ok()
                     .flatten()
-            })
-            .filter(|path| path.is_absolute());
+            },
+        );
         // After a `chroot` into another root, the kernel names the directory
         // in the tool's view, below that root.
         let directory = match (directory, self.guest_root_in_view(guest)) {
@@ -15198,6 +16046,7 @@ impl<'a> GetdentsCall<'a> {
     /// The same call reading at most `count` bytes into `buf` instead.
     fn into_scratch<'b>(self, buf: AddrMut<'b, u8>, count: u32) -> GetdentsCall<'b> {
         let call = match self.call {
+            #[cfg(target_arch = "x86_64")]
             Syscall::Getdents(call) => {
                 Syscall::from(call.with_dirent(Some(buf.cast())).with_count(count))
             }
@@ -15709,6 +16558,31 @@ mod test {
     use super::terminal_can_become_controlling;
     use crate::test_pages::PAGE;
     use crate::test_pages::Pages;
+
+    /// Run the test named `case` in an isolated child process, returning
+    /// true when this invocation is the parent and the caller must return
+    /// at once. Tests that close this process's real descriptors and then
+    /// assert the numbers are dead race sibling test threads under plain
+    /// `cargo test`: a sibling can be handed a just-closed number before
+    /// the assertion reads it. A child process has no sibling threads
+    /// allocating descriptors.
+    fn isolated_child(case: &str) -> bool {
+        const CHILD: &str = "HERMIT_FILES_TEST_CHILD";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(case)) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case, "--nocapture", "--test-threads=1"])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        true
+    }
 
     /// A `/proc/self` or `/proc/thread-self` spelling leads to the opener's
     /// task, which a name relative to the descriptor is then looked up below,
@@ -16575,6 +17449,11 @@ mod test {
 
     #[test]
     fn pipe_capacity_failure_closes_both_created_descriptors() {
+        if isolated_child(
+            "syscalls::files::test::pipe_capacity_failure_closes_both_created_descriptors",
+        ) {
+            return;
+        }
         let mut created = [-1; 2];
         assert_eq!(
             unsafe { libc::pipe2(created.as_mut_ptr(), libc::O_CLOEXEC) },

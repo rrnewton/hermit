@@ -416,6 +416,16 @@ available. `--max-timeslice=N` controls the longest uninterrupted virtual
 time slice. Smaller values create more scheduling opportunities at additional
 runtime cost; positive values must be at least one RCB, which is 10 virtual
 nanoseconds at the default clock multiplier and scales with that multiplier.
+The cost grows steeply: each slice of a thread that computes without a syscall
+ends with a timer event, which the ptrace backend places by stepping the guest
+through up to the processor's skid margin (100 to 10000 RCBs, or
+`--skid-margin`), so a CPU-bound guest can run thousands of times slower at
+`--max-timeslice=1000` than at the default. When a slice is at most ten skid
+margins long (on a processor with a 10000-RCB margin, `--max-timeslice` of
+1000000 or less at the default clock multiplier), `hermit run`, `hermit
+analyze` and `hermit bisect` print a `NOTICE:` line saying so; there, a run that
+`--timeout` cuts off may be slow rather than hung, and `--summary` reports how
+many timeslices it had.
 `--target-timeslice=N` adds a cheaper logical deadline checked at syscall
 boundaries; it is useful for workloads that enter the kernel frequently.
 `--max-timeslice=disabled` avoids PMU use but can miss bugs in
@@ -467,9 +477,73 @@ long are charged as before. It changes the guest-visible time of short-slice
 runs, so a recorded schedule stores the setting and a replay under the other
 is refused.
 
+Most of that cost comes from stopping the guest at the end of every slice,
+and much of it is saved where no other thread could run. When every other
+thread waits on a futex without a timeout, on a child or in `rt_sigsuspend`,
+and no timer, sleeper, poll deadline or host call is pending, a slice end
+cannot hand the turn to anyone, so Hermit lets the thread run on and processes
+each end it skipped when the thread next enters Hermit (a system call, a
+signal, a trapped instruction), at the same retired-branch count and in the
+same order. The schedule, the virtual clock and the chaos draws are what a stop
+at every end gives; `--eager-lone-preemptions` restores those stops, for
+comparison, and `--summary` reports how many ends were taken without a stop.
+Inputs from the host are the exception, as they are timed by the host either
+way: a signal sent from outside (which can also wake a thread asleep in
+`rt_sigsuspend`, a call that waits in the kernel) is seen at the next scheduler
+turn, which may come later than a stop would have; and a thread killed from
+outside with `SIGKILL` never has its skipped ends processed.
+Slice ends while two threads can run still stop the guest. This applies to the
+ptrace backend's precise timer, and not where the run records or replays
+preemptions or schedules, or uses `--target-timeslice`,
+`--chaos-per-thread-slowdown`, `--imprecise-timers`, turn-numbered triggers
+(`--stop-after-turn`, `--stop-after-iter`, `--signal-at`), stack traces at
+preemptions or events, manual interrupt points, a happens-before program or
+`--gdbserver` (a debugger stopping the thread between skipped ends would see
+Hermit's slice bookkeeping behind its program counter).
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
-`--replay-preemptions-from=FILE`.
+`--replay-preemptions-from=FILE`. A record edited after it was recorded (for
+example, with preemptions removed, as `hermit analyze --minimize` does) can
+bring a thread to recorded slices that have already ended. A faithful replay
+never does, so Hermit stops it there; add `--replay-edited-preemptions` to skip
+those slices and go on with the first recorded slice still ahead, at its
+priority (at a thread's start, the record's first priority holds until that
+slice ends). `hermit analyze` adds it to the records it edits.
+
+A replay reproduces the recording only if the guest reads the same host
+files. The recorded schedule therefore keeps the set of host files the run
+read (`host_inputs`: each path with its host identity and, for a regular file
+of at most 32 MiB, the SHA-256 of its bytes, or for a directory, of the names
+in it), and a replay (with
+`--replay-preemptions-from` or `--replay-schedule-from`) prints one line for
+each such file that changed since:
+
+```text
+HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (...); the run may diverge where the guest reads it
+```
+
+The comparison counts the files the guest opens and those the kernel opens
+for its execs: each program image and its ELF interpreter (for a `#!`
+script, the interpreter the kernel ran, not the script). A file whose bytes
+were hashed in both runs counts as changed only if its bytes differ, so a
+file rewritten unchanged, as `ldconfig` rewrites `/etc/ld.so.cache`, is not
+reported; a directory counts as changed only if the names in it differ,
+leaving out the names the guest made or removed itself, so the `/tmp` Hermit
+makes afresh for each run is not reported. A file that was not hashed (larger
+than 32 MiB, changed again before the run ended, or on a backend whose tool
+cannot name the guest's descriptors) counts as changed when its host inode,
+size or modification time differs. Hermit reads the bytes and names only
+after every guest process has exited, never while the guest runs: Linux
+raises an inotify event for every open and read of a file, and a guest
+watching the file's directory would see those reads. So a regular file whose
+size changed is reported at the guest's first open of it, and any other
+change when the run ends. Kernel objects (paths under
+`/proc`, `/sys` and `/dev`, and names that lead there, such as `/etc/mtab`)
+are left out, and so are paths the guest itself renamed, linked or unlinked,
+or opened with `O_CREAT`. Under `--backend=dbt` nothing is recorded. The
+line is information, not a refusal: Hermit does not make a changing
+filesystem deterministic.
 
 ### Verify Mode
 
@@ -707,6 +781,20 @@ hermit analyze --search --target-exit-code=nonzero \
 Run `hermit analyze --help` before using this workflow. Search, minimization,
 and schedule replay can perform many guest executions and require a reliably
 reproducible target condition.
+
+By default analyze bisects between the failing schedule and a passing one from
+another run. When the two runs differ in events only one of them executed (for
+example timeslices that end at other points, or extra iterations of a polling
+loop), no single swap may separate the outcomes. `--prefix-search` searches
+within the failing schedule instead: each trial replays its first K events and
+then schedules without chaos, and a binary search finds the event at which the
+outcome flips. The report shows the stack of the thread the failing schedule
+runs at that event and of the thread that runs there otherwise:
+
+```bash
+hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
+  --target-exit-code=any --report-file=analysis.json -- --chaos -- PROGRAM
+```
 
 ## Common Run Options
 
@@ -1006,6 +1094,29 @@ same way and keeps the network the recording used.
 Environment controls include `--base-env=empty`, `--base-env=minimal`,
 `--base-env=host`, `-e NAME[=VALUE]`, and `--workdir=PATH`.
 
+`--base-env=minimal` gives the guest exactly these variables, with the same
+values on every host, plus the `ASAN_OPTIONS` and `LSAN_OPTIONS` leak-check
+overrides every instrumented guest gets:
+
+| Variable | Value |
+| --- | --- |
+| `HOSTNAME` | `hermetic-container.local` |
+| `PATH` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` |
+| `HOME` | `/root` |
+| `USER` | `root` |
+| `LOGNAME` | `root` |
+
+`HOME`, `USER` and `LOGNAME` name the guest's own identity, as login sets them
+for a user: Hermit presents every guest user ID 0 (`getuid()` returns 0), and
+the guest's user database (`getpwuid(0)`) names that user `root` with home
+directory `/root`. A program that reads `USER` sees the same user as one that
+asks the user database. `/root` is usually the host's root home directory, which
+the guest can find but usually cannot list or write. Give a program that writes
+under its home directory a writable one, for example `-e HOME=/tmp`.
+`-e NAME=VALUE` replaces any of these values, and `--base-env=empty` sets none
+of them. `LANG`, `TERM`, `TZ` and `SHELL` are not set; pass them with `-e` when
+a program needs them.
+
 ## Logs And Run Summaries
 
 Global logging options go before the subcommand:
@@ -1018,6 +1129,15 @@ hermit --log=info --log-file=hermit.log run --summary \
 The equivalent environment variables are `HERMIT_LOG` and
 `HERMIT_LOG_FILE`. Use `debug` or `trace` only for focused diagnosis; output can
 be large.
+
+The JSON summary also holds `host_inputs`, the host files the guest read
+(see the replay paragraph under "Chaos Mode"), with a `digest` of the set,
+and on a schedule replay `host_inputs_changed`, the files that changed since
+the recording. Two separate runs of the same command whose digests differ
+read different host files (or, for a file that was not hashed, the same path
+at another inode, size or time), so a difference in their results may come
+from those files rather than from Hermit: compare the `files` to find which,
+and rerun with them pinned before calling it a Hermit divergence.
 
 For a minimally invasive interception trace:
 
@@ -1413,7 +1533,10 @@ Before treating a result as reproducible:
 - Use the same Hermit revision, executable, arguments, and configuration.
 - Save the run's options with `--save-config` and rerun with `--config`; the
   file records the epoch and any seed Hermit chose.
-- Keep file contents and mount layout fixed.
+- Keep file contents and mount layout fixed. On a host whose packages
+  change, that includes system files such as `/etc/ld.so.cache`; compare the
+  runs' `--summary-json` `host_inputs` digests, or pin a file with
+  `--mount type=bind,source=COPY,target=/etc/ld.so.cache,readonly`.
 - Prefer `--base-env=minimal` and explicit `-e` variables.
 - Keep networking isolated; do not depend on external services.
 - Keep strict thread serialization and deterministic I/O enabled.

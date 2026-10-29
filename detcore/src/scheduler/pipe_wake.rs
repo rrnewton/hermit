@@ -27,8 +27,10 @@ use crate::pipe_wake::Wants;
 
 impl Scheduler {
     /// Record that `process` received a signal whose default action ends it,
-    /// in the turn that delivered it: from then on its threads are doomed
-    /// although their removal from the scheduler comes at host-timed moments.
+    /// in the turn that delivered it: from then on its threads are doomed.
+    /// Those `commit_fatal_delivery` does not retire at once (the delivering
+    /// thread, and every thread on a backend that does not retire a kill's
+    /// victims at the kill turn) leave the scheduler at host-timed moments.
     /// In-memory only; no recording carries it.
     pub(crate) fn record_committed_fatal_signal(&mut self, process: DetPid) {
         self.fatal_signal_doomed.insert(process);
@@ -42,8 +44,8 @@ impl Scheduler {
 
     /// Whether `tid`'s process is doomed by a decision some committed turn
     /// made: a granted exit, a committed SIGKILL, an exec teardown in flight,
-    /// or a delivered fatal signal. Such a thread leaves the scheduler at a
-    /// host-timed moment, so the scan below must not depend on whether it
+    /// or a delivered fatal signal. Such a thread may leave the scheduler at
+    /// a host-timed moment, so the scan below must not depend on whether it
     /// already has.
     pub(super) fn poller_is_doomed(&self, tid: DetTid) -> bool {
         let Some(process) = self.thread_tree.thread_to_leader.get(&tid).copied() else {

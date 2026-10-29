@@ -1202,6 +1202,7 @@ mod tests {
     use reverie::process::Namespace;
 
     use super::*;
+    use crate::app::container_clone::CheckedClone;
 
     /// `log_max_bytes` reads the process environment, which libtest's threads
     /// share.
@@ -1310,8 +1311,11 @@ mod tests {
 
     #[test]
     fn synchronous_pid_alignment_matches_the_file_appender_baseline() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let synchronous_pid = pid_namespace()
-            .run(|| {
+            .checked_run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
                 align_tracing_pid_baseline(Backend::Ptrace);
                 fork_and_observe_child_pid()
@@ -1319,7 +1323,7 @@ mod tests {
             .expect("synchronous baseline namespace failed");
 
         let appender_pid = pid_namespace()
-            .run(|| {
+            .checked_run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
                 let (_subscriber, guard) = file_subscriber(DEFAULT_TRACE_LEVEL, io::sink());
                 let child = fork_and_observe_child_pid();
@@ -1334,8 +1338,11 @@ mod tests {
 
     #[test]
     fn pid_alignment_succeeds_when_host_thread_creation_is_denied() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let guest_pid = pid_namespace()
-            .run(|| {
+            .checked_run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
                 deny_host_thread_creation().expect("cannot install host-thread deny filter");
                 align_tracing_pid_baseline(Backend::Ptrace);
@@ -1348,8 +1355,11 @@ mod tests {
 
     #[test]
     fn kvm_pid_alignment_allocates_no_host_task() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let next_pid = pid_namespace()
-            .run(|| {
+            .checked_run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
                 align_tracing_pid_baseline(Backend::Kvm);
                 // No task was allocated by alignment, so this first actual

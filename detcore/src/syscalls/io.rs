@@ -14,6 +14,10 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
+// Only the kernel-run `poll` restart reads the host clock, and only x86_64
+// has `poll`.
+#[cfg(target_arch = "x86_64")]
+use std::time::Instant;
 
 use nix::fcntl::OFlag;
 use reverie::Errno;
@@ -33,6 +37,7 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::linux_abi::Cmsghdr;
 use reverie::syscalls::linux_abi::Mmsghdr;
 use reverie::syscalls::linux_abi::Msghdr;
+#[cfg(target_arch = "x86_64")]
 use tracing::debug;
 use tracing::trace;
 
@@ -44,13 +49,18 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
+use crate::syscalls::files::SocketRole;
+#[cfg(target_arch = "x86_64")]
+use crate::syscalls::helpers::KernelPollDeadline;
 use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::PublishedWaitMask;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
+#[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::act_on_pending_real_time;
 use crate::syscalls::helpers::is_accepted_connection;
+#[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::observe_under_mask;
@@ -64,6 +74,8 @@ use crate::syscalls::helpers::retry_blocking_wait_under_mask;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::scm_rights::ReceiveGeometry;
+use crate::syscalls::scm_rights::ReceivedFrom;
+use crate::syscalls::scm_rights::SentRights;
 use crate::syscalls::scm_rights::received_descriptors;
 use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
@@ -80,6 +92,7 @@ mod temporary_mask_forms;
 
 // Printing helper
 // TODO: this should be subsumed by better syscall printing.
+#[cfg(target_arch = "x86_64")]
 fn print_poll(call: &syscalls::Poll) {
     let len = call.nfds();
     debug!("POLL: on {} fds, timeout {}", len, call.timeout());
@@ -308,7 +321,7 @@ where
         Err(Errno::EFAULT) => {}
         Err(errno) => return Err(errno),
     }
-    let rsp = guest.regs().await.rsp as usize;
+    let rsp = crate::arch::stack_pointer(&guest.regs().await) as usize;
     let Some(top) = rsp.checked_sub(len).map(|top| top & !7) else {
         return Ok(None);
     };
@@ -360,7 +373,8 @@ where
 /// the call then keeps the guest's wrapper and the kernel fails it with EFAULT
 /// in Linux's order (Claude review of
 /// https://github.com/rrnewton/hermit/pull/4166). `None` too when the call
-/// has no mask, its wrapper cannot be read, or the size is not the kernel's.
+/// has no mask, its wrapper cannot be read as the kernel copies it
+/// (`read_pselect6_argument`), or the size is not the kernel's.
 ///
 /// The read is the call's first injection: a signal that stops it restarts
 /// the call (`restart_if_first_probe_not_run`), the only error returned.
@@ -375,10 +389,7 @@ where
     let Some(wrapper) = call.sigmask() else {
         return Ok(None);
     };
-    let Ok(argument) = guest
-        .memory()
-        .read_value::<_, Pselect6SigmaskArg>(wrapper.cast())
-    else {
+    let Some(argument) = read_pselect6_argument(guest, wrapper) else {
         return Ok(None);
     };
     if argument.sigsetsize != KERNEL_SIGSET_SIZE {
@@ -396,6 +407,56 @@ where
     };
     super::signal_shadow::note_wait_mask(guest, mask);
     Ok(Some(mask))
+}
+
+/// Whether a pselect6 names no mask: it passes no `{ sigmask, sigsetsize }`
+/// argument, or one whose mask pointer is NULL, as glibc's `pselect` passes
+/// it. Linux then leaves the thread's mask in place without reading the size
+/// (`set_user_sigmask`). The argument is read whole, once, with the guest's
+/// own access (`read_pselect6_argument`), so one the kernel would fail to copy
+/// counts as naming a mask: the call keeps it, and its EFAULT.
+fn pselect6_names_no_mask<G, T>(guest: &mut G, call: syscalls::Pselect6) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(wrapper) = call.sigmask() else {
+        return true;
+    };
+    read_pselect6_argument(guest, wrapper).is_some_and(|argument| argument.sigmask == 0)
+}
+
+/// pselect6's `{ sigmask, sigsetsize }` argument at `wrapper`, read as Linux
+/// copies it (`get_sigset_argpack`): whole, in one read that honours the
+/// guest's page protections, or `None` where the kernel's copy would fault,
+/// or where the tracer cannot read it although the kernel can (a write-only
+/// page on x86). Either way the call keeps the guest's argument. A tracer read
+/// retried word by word reaches a `PROT_NONE` tail on ptrace
+/// (`PTRACE_PEEKDATA`), which the kernel's copy does not.
+fn read_pselect6_argument<G, T>(
+    guest: &mut G,
+    wrapper: Addr<'_, libc::sigset_t>,
+) -> Option<Pselect6SigmaskArg>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut bytes = [0u8; std::mem::size_of::<Pselect6SigmaskArg>()];
+    guest
+        .memory()
+        .read_exact_with_user_access(wrapper.cast::<u8>(), &mut bytes)
+        .ok()?;
+    let word = |at: usize| {
+        usize::from_ne_bytes(
+            bytes[at..at + std::mem::size_of::<usize>()]
+                .try_into()
+                .expect("a word"),
+        )
+    };
+    Some(Pselect6SigmaskArg {
+        sigmask: word(0),
+        sigsetsize: word(std::mem::size_of::<usize>()),
+    })
 }
 
 /// The temporary mask a replayed zero-timeout pselect6 sleeps under, read
@@ -447,7 +508,7 @@ where
         Ok(argument) if argument.sigmask != 0 => {}
         _ => return true,
     }
-    let rsp = guest.regs().await.rsp as usize;
+    let rsp = crate::arch::stack_pointer(&guest.regs().await) as usize;
     let mut cells = [0u8; MAX_PRIVATE_CELLS_LEN];
     rsp.checked_sub(MAX_PRIVATE_CELLS_LEN)
         .and_then(|top| AddrMut::<u8>::from_raw(top & !7))
@@ -692,6 +753,7 @@ async fn read_ppoll_mask<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// the check because the signed sum could wrap a negative timeout into a
 /// valid one. This follows v7.1, the measured host behaviour.) A sum that
 /// would overflow the signed seconds is `EINVAL` here.
+#[cfg(target_arch = "x86_64")]
 pub(super) fn select_timeout_duration(timeout: libc::timeval) -> Result<Duration, Errno> {
     if timeout.tv_sec < 0 || timeout.tv_usec < 0 {
         return Err(Errno::EINVAL);
@@ -964,16 +1026,119 @@ where
 /// turns either code into `EINTR`. Under a tracer a default-ignored `SIGCHLD`
 /// is still queued, so a child that exits while its parent polls is such a
 /// signal, and so is the backend's own timer signal under `--imprecise-timers`.
-fn kernel_poll_result(call: &syscalls::Poll, result: Result<i64, Error>) -> Result<i64, Error> {
-    match result {
-        Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK)) => Err(call.kernel_restart_errno().into()),
-        result => result,
+///
+/// A poll that `keeps_record` (`RestartCall::KernelPoll`) always returns
+/// `ERESTART_RESTARTBLOCK` here, even a restart whose time is up, and keeps
+/// its record for `restart_syscall`; `kernel_poll_restart_code` then decides
+/// the code the guest gets.
+#[cfg(target_arch = "x86_64")]
+fn kernel_poll_result(
+    call: &syscalls::Poll,
+    result: Result<i64, Error>,
+    keeps_record: bool,
+) -> Result<i64, Error> {
+    if !poll_interrupted(&result) {
+        result
+    } else if keeps_record {
+        Err(Errno::ERESTART_RESTARTBLOCK.into())
+    } else {
+        Err(call.kernel_restart_errno().into())
     }
+}
+
+/// The code a `poll` with a positive timeout returns to the guest when a
+/// signal stopped it before it ran (`before_run`,
+/// `poll_stopped_before_it_ran`), from `kept`, the result
+/// `kernel_poll_result` gave it. The backend holds such a signal for the
+/// guest's resume, and passes a held signal on unreported when the guest's
+/// call returns `ERESTART_RESTARTBLOCK`. Record then took no turn for its
+/// delivery, while replay, which serves the poll from the recording without
+/// running it, took one where the signal reached the guest at an ordinary
+/// delivery stop, and refused at the next logged readmission. Such a poll
+/// returns `ERESTARTNOHAND` instead, as a wait that holds a signal does
+/// (`helpers::held_signal_restart_errno`), and still keeps its record. With no
+/// handler to run the kernel then runs the guest's call again: a resumed
+/// poll's `restart_syscall`, which finds the record, or the guest's own poll,
+/// which never ran and starts its timeout again (Linux's restart would keep
+/// the first end time; under `--no-sequentialize-threads` the end moves by
+/// the delivery's latency). A handler turns either code into `EINTR`. A signal that ends a poll that ran is not held: it reaches
+/// the guest at an ordinary delivery stop, which the backend reports. Any
+/// other result passes through.
+#[cfg(target_arch = "x86_64")]
+fn kernel_poll_restart_code(kept: Result<i64, Error>, before_run: bool) -> Result<i64, Error> {
+    match kept {
+        Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK)) if before_run => {
+            Err(Errno::ERESTARTNOHAND.into())
+        }
+        kept => kept,
+    }
+}
+
+/// Whether a signal stopped a `poll` before it ran: the backend reports that
+/// as `ERESTARTSYS` (`Guest::inject`), which Linux's poll never returns.
+#[cfg(target_arch = "x86_64")]
+fn poll_stopped_before_it_ran(raw: &Result<i64, Error>) -> bool {
+    matches!(raw, Err(Error::Errno(Errno::ERESTARTSYS)))
+}
+
+/// Whether a signal ended a `poll` Detcore ran in the kernel: Linux's own
+/// `ERESTART_RESTARTBLOCK`, or `ERESTARTSYS` when the signal stopped the call
+/// before it ran (`Guest::inject`). Linux's poll never returns `ERESTARTSYS`
+/// (`do_poll` reports any signal as `-ERESTARTNOHAND`, which `poll` turns
+/// into `ERESTART_RESTARTBLOCK`), so both are the same interruption, and
+/// passing `ERESTARTSYS` on would let `SA_RESTART` rerun a poll that Linux
+/// ends with `EINTR`, and rerun a `restart_syscall` that keeps no record.
+#[cfg(target_arch = "x86_64")]
+fn poll_interrupted(result: &Result<i64, Error>) -> bool {
+    matches!(
+        result,
+        Err(Error::Errno(
+            Errno::ERESTART_RESTARTBLOCK | Errno::ERESTARTSYS
+        ))
+    )
+}
+
+/// Whether a `poll` with a nonzero timeout runs in the kernel: under record and
+/// replay, whose replay cannot rely on the descriptors, and without
+/// sequentialized threads. A plain or strict run (`--strict` refuses
+/// `--no-sequentialize-threads`) emulates it on virtual time
+/// (`handle_internal_poll`), so the host clock `kernel_poll_deadline` reads
+/// never reaches such a run.
+#[cfg(target_arch = "x86_64")]
+fn polls_in_kernel(sequentialize_threads: bool, recordreplay_modes: bool) -> bool {
+    !sequentialize_threads || recordreplay_modes
+}
+
+/// The end of a positive timeout for a `poll` Detcore runs in the kernel
+/// (`RestartCall::KernelPoll`), read when the poll is first issued; `None`
+/// for a zero or infinite timeout, whose restart reruns the call
+/// (`kernel_poll_result`). Under record and replay the end holds no instant
+/// (`KernelPollDeadline`), so those modes read no host clock here.
+#[cfg(target_arch = "x86_64")]
+fn kernel_poll_deadline(
+    call: &syscalls::Poll,
+    recordreplay_modes: bool,
+) -> Option<KernelPollDeadline> {
+    call.restart_keeps_deadline().then(|| {
+        KernelPollDeadline(
+            (!recordreplay_modes)
+                .then(|| Instant::now() + Duration::from_millis(call.timeout() as u64)),
+        )
+    })
+}
+
+/// The timeout, in whole milliseconds rounded up, that a restarted kernel-run
+/// `poll` waits from `now` until `end`: 0 once `end` has passed.
+#[cfg(target_arch = "x86_64")]
+fn remaining_poll_millis(now: Instant, end: Instant) -> i32 {
+    let left = end.saturating_duration_since(now).as_nanos();
+    i32::try_from(left.div_ceil(1_000_000)).unwrap_or(i32::MAX)
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -998,11 +1163,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::syscalls::timerfd::publish_expired(guest).await;
                 guest.inject(call).await
             };
-            kernel_poll_result(&call, result.map_err(Error::from))
-        } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
+            kernel_poll_result(&call, result.map_err(Error::from), false)
+        } else if polls_in_kernel(self.cfg.sequentialize_threads, self.cfg.recordreplay_modes) {
             // In replay mode, we cannot assume the existence of FILES during replay.
             // Thus we must record the poll and replay it from the trace.
-            Ok(self.handle_external_poll(guest, call).await?)
+            let deadline = kernel_poll_deadline(&call, self.cfg.recordreplay_modes);
+            Ok(self.handle_external_poll(guest, call, deadline).await?)
         } else {
             // TODO:
             // if is-external-poll { self.handle_external_poll(guest, call) }
@@ -1015,6 +1181,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// may wait in the kernel, so it runs as a blocking external operation. The
     /// recorder captures the descriptor sets and remaining time, so replay never
     /// asks the kernel about descriptors it did not recreate.
+    #[cfg(target_arch = "x86_64")]
     async fn record_or_replay_select_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1025,7 +1192,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             Ok(self.record_or_replay(guest, call).await?)
         } else {
-            self.record_or_replay_blocking(guest, call).await
+            self.record_or_replay_shielded_wait(guest, call).await
         }
     }
 
@@ -1198,6 +1365,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         self.record_or_replay_pselect6_under_a_private_mask(guest, call, mask)
                             .await?
                     }
+                    // A wrapper that names no mask leaves the thread's own
+                    // mask in place, which the scheduler reads and the shield
+                    // covers. The kernel is handed no wrapper, which Linux
+                    // takes alike, so a sibling cannot write a mask into the
+                    // guest's before the kernel reads it.
+                    None if pselect6_names_no_mask(guest, call) => {
+                        self.record_or_replay_shielded_wait(
+                            guest,
+                            Syscall::Pselect6(call.with_sigmask(None)),
+                        )
+                        .await
+                    }
                     None => {
                         self.record_or_replay_blocking_with_unknown_mask(
                             guest,
@@ -1215,7 +1394,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await
                     .map_err(Into::into)
             } else {
-                self.record_or_replay_blocking(guest, Syscall::Pselect6(call))
+                self.record_or_replay_shielded_wait(guest, Syscall::Pselect6(call))
                     .await
             };
             if let Some(mask) = temporary_mask
@@ -1226,7 +1405,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             return result;
         }
         if !self.cfg.sequentialize_threads {
-            return Ok(guest.inject(call).await?);
+            // A call with a mask waits under it; one that names none is
+            // shielded as select is, and the kernel is handed no wrapper (as
+            // under record), since a sibling runs concurrently here.
+            if !pselect6_names_no_mask(guest, call) {
+                return Ok(guest.inject(call).await?);
+            }
+            let may_wait = !call.timeout().is_some_and(|timeout| {
+                guest
+                    .memory()
+                    .read_value(timeout)
+                    .is_ok_and(|timeout: Timespec| timeout.tv_sec == 0 && timeout.tv_nsec == 0)
+            });
+            return self
+                .inject_shielded_wait(guest, call.with_sigmask(None), may_wait)
+                .await;
         }
         // Under the in-guest delivery gate (A5 step 3c.1d) the forms follow
         // design D39 and D50, and no probe carries the guest's temporary mask
@@ -1338,6 +1531,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 _ => None,
             };
             let Some(mask) = snapshot else {
+                if sigmask_argument.is_none_or(|argument| argument.sigmask == 0) {
+                    // No mask, read in this turn: hand the kernel no wrapper,
+                    // as record does.
+                    return self
+                        .record_or_replay_shielded_wait(
+                            guest,
+                            Syscall::Pselect6(call.with_sigmask(None)),
+                        )
+                        .await;
+                }
                 return self
                     .record_or_replay_blocking_with_mask(guest, Syscall::Pselect6(call), None)
                     .await;
@@ -1925,6 +2128,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// slept) and carries no signal mask.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#800): Review select determinization mirroring pselect6.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_select<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1942,7 +2146,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
         if !self.cfg.sequentialize_threads {
-            return Ok(guest.inject(call).await?);
+            // A zero timeout is not shielded, as it is not under record: a
+            // pending signal ends such a call with ERESTARTNOHAND and Linux
+            // runs it again in place, which the guest does not see, and every
+            // probe would pay for two mask changes. A timeout the tracer
+            // cannot read is shielded.
+            let may_wait = !call.timeout().is_some_and(|timeout| {
+                guest
+                    .memory()
+                    .read_value(timeout)
+                    .is_ok_and(|timeout: libc::timeval| timeout.tv_sec == 0 && timeout.tv_usec == 0)
+            });
+            return self.inject_shielded_wait(guest, call, may_wait).await;
         }
 
         if call.nfds() < 0 {
@@ -1968,7 +2183,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // over-reading the guest bitmap (Linux clamps raw fd-set copies to max_fds).
         if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
             return self
-                .record_or_replay_blocking(guest, Syscall::Select(call))
+                .record_or_replay_shielded_wait(guest, Syscall::Select(call))
                 .await;
         }
 
@@ -1976,6 +2191,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.handle_internal_select(guest, call, timeout).await
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_internal_select<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2211,6 +2427,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         refuse_held_signal_loss(guest, Sysno::select, result).await
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn copy_select_results<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2223,6 +2440,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         copy_pselect6_fd_set(guest, probe.exceptfds(), call.exceptfds(), len)
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn write_select_remaining<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2397,18 +2615,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             // recording without the kernel ever doing so; recording and replay
             // must schedule the call alike. The result has no `?`: an
             // interruption must reach the replay delivery below.
-            let result: Result<i64, Error> =
-                if self.cfg.recordreplay_modes && temporary_mask.is_some() {
-                    self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::Ppoll(call))
-                        .await
-                } else {
-                    self.record_or_replay_blocking_with_mask(
-                        guest,
-                        Syscall::Ppoll(call),
-                        blocked_signal_mask,
-                    )
+            let result: Result<i64, Error> = if temporary_mask.is_none() {
+                // No mask: the call waits under the thread's own.
+                self.record_or_replay_shielded_wait(guest, Syscall::Ppoll(call))
                     .await
-                };
+            } else if self.cfg.recordreplay_modes {
+                self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::Ppoll(call))
+                    .await
+            } else {
+                self.record_or_replay_blocking_with_mask(
+                    guest,
+                    Syscall::Ppoll(call),
+                    blocked_signal_mask,
+                )
+                .await
+            };
             if let Some(staged) = staged {
                 staged.release(guest);
             }
@@ -2734,6 +2955,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Handle a guest-internal poll call that can be fully determinized.
     // TODO-HUMAN-REVIEW(PR-1052): Review scheduler fairness for zero-timeout poll.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_internal_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2764,6 +2986,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `restart_syscall` resumes an interrupted `poll` here with the deadline the
     /// wait kept, as Linux's `do_restart_poll` does
     /// (`Detcore::handle_restart_syscall`).
+    #[cfg(target_arch = "x86_64")]
     pub(crate) async fn handle_internal_poll_until<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2779,10 +3002,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Handle a poll syscall that deponds on external, nondeterminstic IO.
-    pub async fn handle_external_poll<G: Guest<Self>>(
+    ///
+    /// `deadline` is the end of a positive timeout (`kernel_poll_deadline`).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) async fn handle_external_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Poll,
+        deadline: Option<KernelPollDeadline>,
     ) -> Result<i64, Error> {
         let len = call.nfds();
         let time_delta = Duration::from_millis(call.timeout() as u64);
@@ -2791,13 +3018,79 @@ impl<T: RecordOrReplay> Detcore<T> {
             let request = Self::sleep_request(guest, time_delta).await;
             resource_request(guest, request).await;
             Ok(0)
+        } else if call.timeout() == 0 {
+            // Not shielded, as no zero-timeout probe is: a signal pending at
+            // its entry still ends it with a restart code.
+            print_poll(&call);
+            self.run_kernel_poll(guest, call, deadline).await
         } else {
             print_poll(&call);
             let result = self
-                .record_or_replay_blocking(guest, Syscall::Poll(call))
+                .record_or_replay_shielded_wait(guest, Syscall::Poll(call))
                 .await;
-            kernel_poll_result(&call, result)
+            kernel_poll_result(&call, result, deadline.is_some())
         }
+    }
+
+    /// Runs `call` in the kernel through the recorder. A signal that ends a
+    /// poll with a positive timeout there leaves `ERESTART_RESTARTBLOCK`, and
+    /// with no handler Linux restarts it through `restart_syscall` until the
+    /// end time it kept (`do_restart_poll`), so such a poll keeps `deadline`
+    /// for that restart (`RestartCall::KernelPoll`). A poll without a deadline
+    /// restarts by running again (`kernel_poll_result`), and one that a
+    /// signal stopped before it ran returns `ERESTARTNOHAND`
+    /// (`kernel_poll_restart_code`).
+    #[cfg(target_arch = "x86_64")]
+    async fn run_kernel_poll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Poll,
+        deadline: Option<KernelPollDeadline>,
+    ) -> Result<i64, Error> {
+        debug_assert!(
+            polls_in_kernel(self.cfg.sequentialize_threads, self.cfg.recordreplay_modes),
+            "a plain or strict run emulates poll; it never runs one in the kernel"
+        );
+        let raw = self
+            .record_or_replay_blocking(guest, Syscall::Poll(call))
+            .await;
+        let before_run = poll_stopped_before_it_ran(&raw);
+        let result = kernel_poll_result(&call, raw, deadline.is_some());
+        if let Some(deadline) = deadline {
+            keep_restart_block(
+                guest,
+                &result,
+                RestartCall::KernelPoll(call, deadline),
+                None,
+            )
+            .await;
+        }
+        kernel_poll_restart_code(result, before_run)
+    }
+
+    /// The kernel's restart of a `poll` with a positive timeout that a signal
+    /// ended in the kernel (`RestartCall::KernelPoll`): the same poll with the
+    /// time left until `deadline`, as `do_restart_poll` reruns it until the
+    /// end time it kept. The time left is rounded up to whole milliseconds, so
+    /// the poll never ends before its deadline, and is 0 once the deadline has
+    /// passed: the poll then reports what is ready without waiting. Under
+    /// record and replay the poll keeps the timeout it was issued with
+    /// (`KernelPollDeadline`). It always
+    /// runs the recorded kernel call, never the zero-length sleep
+    /// `handle_external_poll` makes of a poll of no descriptors, so replay
+    /// serves it from the Poll event the recording holds.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) async fn resume_kernel_poll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Poll,
+        deadline: KernelPollDeadline,
+    ) -> Result<i64, Error> {
+        let call = match deadline.0 {
+            Some(end) => call.with_timeout(remaining_poll_millis(Instant::now(), end)),
+            None => call,
+        };
+        self.run_kernel_poll(guest, call, Some(deadline)).await
     }
 
     /// epoll_create1 syscall
@@ -2924,9 +3217,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             Ok(self.record_or_replay(guest, call).await?)
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
-            Ok(self
-                .record_or_replay_blocking(guest, Syscall::EpollPwait(call))
-                .await?)
+            self.record_or_replay_shielded_wait(guest, Syscall::EpollPwait(call))
+                .await
         } else {
             self.handle_internal_epoll_pwait(guest, call).await
         }
@@ -3200,7 +3492,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.record_or_replay_masked_epoll_pwait2(guest, args, !observed)
                         .await
                 } else {
-                    self.record_or_replay_blocking(guest, call).await
+                    self.record_or_replay_shielded_wait(guest, call).await
                 };
             }
         } else if self.cfg.sequentialize_threads
@@ -3227,7 +3519,56 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             crate::syscalls::timerfd::refuse_host_wait(guest, "epoll_pwait2 with a signal mask");
         }
-        Ok(self.record_or_replay(guest, call).await?)
+        // Only a call that may wait under the thread's own mask needs the
+        // shield; a masked one waits under its own temporary mask.
+        let shield = if zero_timeout || args.arg4 != 0 {
+            crate::syscalls::helpers::IgnoredSignalShield::none()
+        } else {
+            crate::syscalls::helpers::IgnoredSignalShield::raise(guest).await?
+        };
+        let result = self
+            .record_or_replay(guest, call)
+            .await
+            .map_err(Error::from);
+        shield.lower(guest).await?;
+        result
+    }
+
+    /// `record_or_replay_blocking` for a wait in the kernel under the thread's
+    /// own mask, with the signals the guest ignores blocked for the wait
+    /// (`IgnoredSignalShield`): an `epoll_wait`, or an `epoll_pwait` or
+    /// `epoll_pwait2` without a mask, or a `poll`, `select`, or `ppoll` or
+    /// `pselect6` naming no mask. Linux discards those signals at generation,
+    /// so they never end the wait, but ptrace queues them.
+    async fn record_or_replay_shielded_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let shield = crate::syscalls::helpers::IgnoredSignalShield::raise(guest).await?;
+        let result = self.record_or_replay_blocking(guest, call).await;
+        shield.lower(guest).await?;
+        result
+    }
+
+    /// `guest.inject(call)` for a `select`, or a `pselect6` handed no mask,
+    /// that waits in the kernel without sequentialized threads, with the
+    /// signals the guest ignores blocked for the wait when it `may_wait`
+    /// (`IgnoredSignalShield`).
+    async fn inject_shielded_wait<G: Guest<Self>, S: SyscallInfo>(
+        &self,
+        guest: &mut G,
+        call: S,
+        may_wait: bool,
+    ) -> Result<i64, Error> {
+        let shield = if may_wait {
+            crate::syscalls::helpers::IgnoredSignalShield::raise(guest).await?
+        } else {
+            crate::syscalls::helpers::IgnoredSignalShield::none()
+        };
+        let result = guest.inject(call).await.map_err(Error::from);
+        shield.lower(guest).await?;
+        result
     }
 
     /// An epoll_pwait2 that may wait, under sequentialized threads: it polls
@@ -3416,6 +3757,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// epoll_wait syscall (MAYHANG)
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3427,15 +3769,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             Ok(self.record_or_replay(guest, call).await?)
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
-            Ok(self
-                .record_or_replay_blocking(guest, Syscall::EpollWait(call))
-                .await?)
+            self.record_or_replay_shielded_wait(guest, Syscall::EpollWait(call))
+                .await
         } else {
             self.handle_internal_epoll_wait(guest, call).await
         }
     }
 
     /// Handle a guest-internal `epoll_wait` call that can be fully determinized.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_internal_epoll_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3479,7 +3821,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, req).await;
         }
 
+        // What the address names, read before the call as Linux reads it,
+        // and whether the connection completes in this turn.
+        let unix_address = uservaddr.map_or(
+            crate::syscalls::scm_rights::UnixAddress::Unnamed,
+            |address| {
+                crate::syscalls::scm_rights::unix_address(
+                    &guest.memory(),
+                    address.as_raw(),
+                    usize::try_from(addrlen).unwrap_or(0),
+                )
+            },
+        );
+        let in_turn = self.completes_in_turn(guest, call);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        if let Ok(0) = &result {
+            self.note_unix_connect(guest, fd, &unix_address, in_turn);
+        }
         if self.cfg.backend.loopback_pollers_yield_to_peers
             && connect_result_allows_peer_classification(&result)
         {
@@ -3525,6 +3883,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.set_loopback_peer(loopback_peer));
             }
+        }
+        if matches!(result, Ok(0)) {
+            self.classify_socket_peer(guest, fd, SocketRole::Connected)
+                .await;
         }
 
         result
@@ -3577,6 +3939,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(inspected) => inspected,
             Err(refusal) => return refusal,
         };
+        let in_turn = self.completes_in_turn(guest, call);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
         if outside_turn
@@ -3595,6 +3958,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let result = result?;
         guest.thread_state().forget_flock_modes();
+        if let Some(stream) = self.rights_peer_is_stream(guest, call.fd()) {
+            if in_turn {
+                // One message, of `result` bytes.
+                let sent = sent_rights(guest, &headers, |_| usize::try_from(result).unwrap_or(0));
+                self.queue_sent_rights(guest, call.fd(), stream, sent)
+                    .await?;
+            } else {
+                self.lose_peer_lockstep(guest, call.fd());
+            }
+        }
         Ok(result)
     }
 
@@ -3620,7 +3993,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(Vec<crate::types::OpenFileId>, bool), Result<i64, Error>>
     where
         G: Guest<Self>,
-        C: SyscallInfo + Into<Syscall> + Copy,
+        C: NonblockableSyscall + Into<Syscall> + Copy,
     {
         // Without sequentialized threads no thread has a turn: every check
         // Detcore makes may race the guest's other threads, that mode's named
@@ -3709,6 +4082,40 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+/// What the messages at `headers`, which a send completed in the caller's
+/// turn reports sending, passed over `SCM_RIGHTS`: for each that carried
+/// descriptors, those descriptors and the bytes `sent_bytes` says it sent
+/// (`Detcore::queue_sent_rights`). After such a send no other guest thread
+/// has run, so its header and control data are the ones the send read. A
+/// message whose header or control data cannot be read in full marks the
+/// whole as `unread`.
+fn sent_rights<T, G>(
+    guest: &G,
+    headers: &[usize],
+    sent_bytes: impl Fn(usize) -> usize,
+) -> SentRights
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut rights = SentRights::default();
+    for &header in headers {
+        match sent_descriptors(guest, &[header]) {
+            (_, true) => rights.unread = true,
+            (sent, false) if !sent.is_empty() => {
+                // Whether the message named its destination: a header whose
+                // name length cannot be read counts as one that did.
+                let addressed = Addr::<Msghdr>::from_raw(header)
+                    .and_then(|header| guest.memory().read_value::<_, Msghdr>(header).ok())
+                    .is_none_or(|header| header.msg_namelen != 0);
+                rights.messages.push((sent, sent_bytes(header), addressed));
+            }
+            _ => {}
+        }
+    }
+    rights
+}
+
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
 /// whether a header or control buffer could not be read in full, in which case
 /// the list may be incomplete (`mark_exported_listeners`).
@@ -3792,6 +4199,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok((_, outside_turn)) => outside_turn,
             Err(refusal) => return refusal,
         };
+        let in_turn = self.completes_in_turn(guest, call);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
         if outside_turn
@@ -3804,6 +4212,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         let result = result?;
         if result > 0 {
             guest.thread_state().forget_flock_modes();
+        }
+        if let Some(stream) = self.rights_peer_is_stream(guest, call.sockfd()) {
+            if in_turn {
+                // The first `result` entries were sent, each of the bytes
+                // Linux wrote back to its `msg_len`.
+                let sent_headers =
+                    &headers[..usize::try_from(result).unwrap_or(0).min(headers.len())];
+                let sent = sent_rights(guest, sent_headers, |header| {
+                    Addr::<u32>::from_raw(header + std::mem::offset_of!(Mmsghdr, msg_len))
+                        .and_then(|length| guest.memory().read_value(length).ok())
+                        .map_or(0, |length: u32| length as usize)
+                });
+                self.queue_sent_rights(guest, call.sockfd(), stream, sent)
+                    .await?;
+            } else {
+                self.lose_peer_lockstep(guest, call.sockfd());
+            }
         }
         Ok(result)
     }
@@ -3850,7 +4275,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let discovered = self.discovers_received_descriptors(guest);
         let wanted = !discovered || self.cfg.virtualize_time;
-        let in_turn = self.receipt_is_observable(guest, call);
+        let in_turn = self.completes_in_turn(guest, call);
         Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmsg(call));
         let result = self.receive_one_message(guest, call).await;
         let geometry = guest.thread_state_mut().receive_geometry.take().flatten();
@@ -3860,9 +4285,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .unwrap_or_default();
         let cloexec =
             Syscall::Recvmsg(call).into_parts().1.arg2 as i32 & libc::MSG_CMSG_CLOEXEC != 0;
+        let from = ReceivedFrom {
+            socket: call.sockfd(),
+            peek: call.flags() & libc::MSG_PEEK != 0,
+        };
         let recorded = self
-            .record_received_descriptors(guest, &delivered, in_turn, cloexec)
-            .await;
+            .record_received_descriptors(guest, &delivered, in_turn, cloexec, from)
+            .await?;
         // Where the tool discovers received descriptors, recvmsg's refresh
         // covers every descriptor delivered, as before; elsewhere only those
         // this receipt recorded.
@@ -3894,13 +4323,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// recorded, `Detcore::record_received_descriptors`) is left out, so its
     /// locks are hidden once no modelled table names the description (a
     /// named residual).
+    ///
+    /// Not under record and replay: they render no procfs files
+    /// (`Detcore::renders_procfs`), so the ledger feeds nothing the guest
+    /// reads, and the refresh reads each descriptor's fdinfo live, which in
+    /// replay is a stand-in eventfd's wherever the recording held a file this
+    /// process held nowhere else.
     async fn refresh_received_locks<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fds: &[RawFd],
         call: super::files::LockCall,
     ) -> Result<(), Error> {
-        if self.cfg.virtualize_time {
+        if self.cfg.virtualize_time && !self.cfg.recordreplay_modes {
             for &fd in fds {
                 self.refresh_description_locks(guest, fd, call).await?;
             }
@@ -4253,7 +4688,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Recvmmsg,
     ) -> Result<i64, Error> {
         let wanted = !self.discovers_received_descriptors(guest);
-        let in_turn = self.receipt_is_observable(guest, call);
+        let in_turn = self.completes_in_turn(guest, call);
         Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmmsg(call));
         let result = self.receive_message_batch(guest, call).await;
         let geometry = guest.thread_state_mut().receive_geometry.take().flatten();
@@ -4263,9 +4698,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .unwrap_or_default();
         let cloexec =
             Syscall::Recvmmsg(call).into_parts().1.arg3 as i32 & libc::MSG_CMSG_CLOEXEC != 0;
+        let from = ReceivedFrom {
+            socket: call.fd(),
+            peek: call.flags() & libc::MSG_PEEK as u32 != 0,
+        };
         let recorded = self
-            .record_received_descriptors(guest, &delivered, in_turn, cloexec)
-            .await;
+            .record_received_descriptors(guest, &delivered, in_turn, cloexec, from)
+            .await?;
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)
             .await?;
@@ -4346,33 +4785,133 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod tests {
     use super::*;
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn only_record_replay_and_unsequentialized_runs_poll_in_the_kernel() {
+        // A plain or strict run sequentializes threads without record or replay.
+        assert!(!polls_in_kernel(true, false));
+        assert!(polls_in_kernel(true, true));
+        assert!(polls_in_kernel(false, false));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_restarted_kernel_poll_waits_only_until_its_deadline() {
+        // Only a positive timeout has an end to keep, and record and replay
+        // read no clock.
+        let poll = |timeout| syscalls::Poll::new().with_timeout(timeout);
+        assert_eq!(kernel_poll_deadline(&poll(0), false), None);
+        assert_eq!(kernel_poll_deadline(&poll(-1), false), None);
+        assert_eq!(
+            kernel_poll_deadline(&poll(100), true),
+            Some(KernelPollDeadline(None))
+        );
+        let before = Instant::now();
+        let end = kernel_poll_deadline(&poll(100), false)
+            .and_then(|deadline| deadline.0)
+            .unwrap();
+        assert!(end >= before + Duration::from_millis(100));
+        assert!(end <= Instant::now() + Duration::from_millis(100));
+        // The restart waits for the time left, rounded up to whole milliseconds.
+        let now = Instant::now();
+        let end = now + Duration::from_millis(100);
+        assert_eq!(remaining_poll_millis(now, end), 100);
+        assert_eq!(
+            remaining_poll_millis(now + Duration::from_nanos(1), end),
+            100
+        );
+        assert_eq!(
+            remaining_poll_millis(now + Duration::from_millis(99), end),
+            1
+        );
+        // At or past the end it only reports what is ready.
+        assert_eq!(remaining_poll_millis(end, end), 0);
+        assert_eq!(remaining_poll_millis(end + Duration::from_secs(1), end), 0);
+        // An end beyond the range of poll's timeout waits the longest it can.
+        assert_eq!(
+            remaining_poll_millis(now, now + Duration::from_secs(10_000_000)),
+            i32::MAX
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_kernel_poll_without_a_deadline_restarts_by_running_again() {
-        let restart_block = || Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK));
-        for timeout in [0, -1] {
-            let call = syscalls::Poll::new().with_timeout(timeout);
+        // Linux's code, and a signal that stopped the call before it ran.
+        let interrupted = [Errno::ERESTART_RESTARTBLOCK, Errno::ERESTARTSYS];
+        for errno in interrupted {
+            for timeout in [0, -1] {
+                let call = syscalls::Poll::new().with_timeout(timeout);
+                assert!(matches!(
+                    kernel_poll_result(&call, Err(Error::Errno(errno)), false),
+                    Err(Error::Errno(Errno::ERESTARTNOHAND))
+                ));
+            }
+            // A positive timeout keeps its deadline in the kernel's restart block.
+            let timed = syscalls::Poll::new().with_timeout(5);
             assert!(matches!(
-                kernel_poll_result(&call, restart_block()),
-                Err(Error::Errno(Errno::ERESTARTNOHAND))
+                kernel_poll_result(&timed, Err(Error::Errno(errno)), false),
+                Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK))
             ));
         }
-        // A positive timeout keeps its deadline in the kernel's restart block.
-        let timed = syscalls::Poll::new().with_timeout(5);
-        assert!(matches!(
-            kernel_poll_result(&timed, restart_block()),
-            Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK))
-        ));
         // Every other result is the call's own.
         let zero = syscalls::Poll::new().with_timeout(0);
-        assert!(matches!(kernel_poll_result(&zero, Ok(2)), Ok(2)));
+        assert!(matches!(kernel_poll_result(&zero, Ok(2), false), Ok(2)));
         assert!(matches!(
-            kernel_poll_result(&zero, Err(Error::Errno(Errno::EINTR))),
+            kernel_poll_result(&zero, Err(Error::Errno(Errno::EINTR)), false),
             Err(Error::Errno(Errno::EINTR))
         ));
         assert!(matches!(
-            kernel_poll_result(&zero, Err(Error::Errno(Errno::ERESTARTSYS))),
-            Err(Error::Errno(Errno::ERESTARTSYS))
+            kernel_poll_result(&zero, Err(Error::Errno(Errno::ERESTARTNOINTR)), false),
+            Err(Error::Errno(Errno::ERESTARTNOINTR))
         ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_kernel_poll_that_keeps_a_record_restarts_through_restart_syscall() {
+        // Linux's code and a signal that stopped the call before it ran both
+        // restart a kept record, even once its time is up (timeout 0).
+        for errno in [Errno::ERESTART_RESTARTBLOCK, Errno::ERESTARTSYS] {
+            for timeout in [100, 0] {
+                let call = syscalls::Poll::new().with_timeout(timeout);
+                assert!(matches!(
+                    kernel_poll_result(&call, Err(Error::Errno(errno)), true),
+                    Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK))
+                ));
+            }
+        }
+        let call = syscalls::Poll::new().with_timeout(100);
+        assert!(matches!(kernel_poll_result(&call, Ok(1), true), Ok(1)));
+        assert!(matches!(
+            kernel_poll_result(&call, Err(Error::Errno(Errno::EINTR)), true),
+            Err(Error::Errno(Errno::EINTR))
+        ));
+        // A poll that a signal stopped before it ran gives the guest
+        // ERESTARTNOHAND, so the backend reports the signal it holds; one that
+        // ran keeps Linux's code.
+        let restart = || Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK));
+        assert!(poll_stopped_before_it_ran(&Err(Error::Errno(
+            Errno::ERESTARTSYS
+        ))));
+        for other in [Ok(0), restart(), Err(Error::Errno(Errno::EINTR))] {
+            assert!(!poll_stopped_before_it_ran(&other), "{other:?}");
+        }
+        assert!(matches!(
+            kernel_poll_restart_code(restart(), true),
+            Err(Error::Errno(Errno::ERESTARTNOHAND))
+        ));
+        assert!(matches!(
+            kernel_poll_restart_code(restart(), false),
+            Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK))
+        ));
+        for before_run in [true, false] {
+            assert!(matches!(kernel_poll_restart_code(Ok(0), before_run), Ok(0)));
+            assert!(matches!(
+                kernel_poll_restart_code(Err(Error::Errno(Errno::EINTR)), before_run),
+                Err(Error::Errno(Errno::EINTR))
+            ));
+        }
     }
 
     #[test]

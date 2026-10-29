@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -66,6 +67,130 @@ class ContentCohort(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,'one complete reviewed content cohort'):
                     self.apply(root,bad)
 
+    def current_fixture(self, root):
+        source = D.parents[2]
+        for owner, path, _, _ in cohort.FINAL_FUNCTION_SECTIONS_054:
+            relative = Path(path) if owner == 'H' else Path('reverie') / path
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source / relative, target)
+        # Construct the exact historical first-party source fixture. These
+        # inverses affect this temporary data fixture only, never cohort.bind's
+        # observed source or expected hashes; assert_complete_cohort checks all
+        # 31 original whole-file identities below.
+        inverses = {
+            'detcore-liteinst/build.rs': [
+                (b'//! src/lib.rs compiles common/inguest/glibc_compat.rs',
+                 b'//! src/lib.rs compiles detcore-sabre/src/glibc_compat.rs'),
+            ],
+            'detcore-liteinst/src/lib.rs': [
+                (b"// SHARED FILE: the guest preloads' glibc compatibility definitions, compiled",
+                 b"// SHARED FILE: the SaBRe plugin's glibc compatibility definitions, compiled"),
+                (b'#[path = "../../common/inguest/glibc_compat.rs"]',
+                 b'#[path = "../../detcore-sabre/src/glibc_compat.rs"]'),
+            ],
+            'reverie/reverie-inguest/Cargo.toml': [
+                (b'# Read-only native callback observations; no constructor or entry authority.\n'
+                 b'native-entry-observer = ["coordinator-rpc"]\n', b''),
+            ],
+        }
+        for relative, edits in inverses.items():
+            path = root / relative
+            raw = path.read_bytes()
+            for current, historical in edits:
+                self.assertEqual(raw.count(current), 1)
+                raw = raw.replace(current, historical)
+            path.write_bytes(raw)
+
+    # Reverse only the two reviewed section-directive hunks in a temporary
+    # fixture. The historical complete-file digest must still match exactly.
+    trap_section_edits = (
+        (b'    .pushsection .text.reverie_inguest_trusted_syscall,"ax",@progbits\n',
+         b'    .text\n'),
+        (b'    .size reverie_inguest_trusted_syscall, .-reverie_inguest_trusted_syscall\n'
+         b'    .popsection\n\n    .text\n',
+         b'    .size reverie_inguest_trusted_syscall, .-reverie_inguest_trusted_syscall\n\n'),
+    )
+
+    def development_fixture(self, root):
+        self.current_fixture(root)
+        trap = root / 'reverie/reverie-inguest/src/trap.rs'
+        raw = trap.read_bytes()
+        for before, after in self.trap_section_edits:
+            self.assertEqual(raw.count(before), 1)
+            raw = raw.replace(before, after)
+        expected = next(row for row in cohort.FINAL_DEVELOPMENT_054
+                        if row[:2] == ('R', 'reverie-inguest/src/trap.rs'))
+        self.assertEqual((len(raw), hashlib.sha256(raw).hexdigest()), expected[2:])
+        trap.write_bytes(raw)
+
+    def assert_complete_cohort(self, root, name, rows):
+        self.assertEqual(len(rows), 31)
+        expected = {
+            str(root / (Path(path) if owner == 'H' else Path('reverie') / path)):
+                (size, digest)
+            for owner, path, size, digest in rows
+        }
+        self.assertEqual(len(expected), 31)
+        for path, fact in expected.items():
+            raw = Path(path).read_bytes()
+            self.assertEqual((len(raw), hashlib.sha256(raw).hexdigest()), fact)
+        result = cohort.bind(root)
+        self.assertEqual(result['cohort'], name)
+        self.assertEqual(len(result['files']), 31)
+        self.assertEqual({fact['path']: (fact['bytes'], fact['sha256'])
+                          for fact in result['files']}, expected)
+
+    def test_current_runtime_source_cohort_keeps_all_31_exact_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.current_fixture(root)
+            self.assert_complete_cohort(root, 'function-sections-054-content-v1',
+                                        cohort.FINAL_FUNCTION_SECTIONS_054)
+
+    def test_development_runtime_source_cohort_keeps_all_31_exact_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.development_fixture(root)
+            self.assert_complete_cohort(root, 'development-054-content-v1',
+                                        cohort.FINAL_DEVELOPMENT_054)
+
+    def test_partial_function_section_transition_is_not_a_reviewed_cohort(self):
+        for before, after in self.trap_section_edits:
+            with self.subTest(directive=before), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.current_fixture(root)
+                trap = root / 'reverie/reverie-inguest/src/trap.rs'
+                raw = trap.read_bytes()
+                self.assertEqual(raw.count(before), 1)
+                trap.write_bytes(raw.replace(before, after))
+                with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
+                    cohort.bind(root)
+
+    def test_one_previous_manifest_does_not_form_a_reviewed_cohort(self):
+        for fixture in [self.current_fixture, self.development_fixture]:
+            for path in ['reverie-inguest/Cargo.toml', 'reverie-loader/Cargo.toml']:
+                with self.subTest(cohort=fixture.__name__, path=path), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    fixture(root)
+                    manifest = root / 'reverie' / path
+                    raw = manifest.read_bytes()
+                    self.assertIn(b'0.5.4', raw)
+                    manifest.write_bytes(raw.replace(b'0.5.4', b'0.5.1'))
+                    with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
+                        cohort.bind(root)
+
+    def test_unknown_manifest_version_is_not_a_runtime_source_identity(self):
+        for fixture in [self.current_fixture, self.development_fixture]:
+            with self.subTest(cohort=fixture.__name__), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                fixture(root)
+                for path in ['reverie-inguest/Cargo.toml', 'reverie-loader/Cargo.toml']:
+                    manifest = root / 'reverie' / path
+                    manifest.write_bytes(manifest.read_bytes().replace(b'0.5.4', b'0.5.5'))
+                with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
+                    cohort.bind(root)
+
 
 class NeutralCoreSupportCohort(unittest.TestCase):
     """Source-association controls only; neither compilation nor qualification."""
@@ -83,7 +208,7 @@ class NeutralCoreSupportCohort(unittest.TestCase):
         # present. They do not substitute for observed-file or Git custody proof.
         root = Path('/data-only-cohort')
         historical = cohort.COHORTS[:-1]
-        self.assertEqual(len(historical), 5)
+        self.assertEqual(len(historical), 7)
         for name, rows in historical:
             with self.subTest(cohort=name):
                 facts = self.facts(rows, root)
@@ -91,11 +216,11 @@ class NeutralCoreSupportCohort(unittest.TestCase):
                     self.assertEqual(cohort.bind(root)['cohort'], name)
 
     def test_current_neutral_core_sources_match_complete_association(self):
-        self.assertEqual(cohort.bind(D.parents[2])['cohort'], 'neutral-core-support-content-v1')
+        self.assertEqual(cohort.bind(D.parents[2])['cohort'], 'current-split-runtime-content-v1')
 
     def test_mixed_old_and_neutral_support_rows_are_refused(self):
         root = Path('/data-only-cohort')
-        facts = self.facts(cohort.NEUTRAL_CORE_SUPPORT, root)
+        facts = self.facts(cohort.CURRENT_SPLIT_RUNTIME, root)
         old = self.facts(cohort.FINAL_DEVELOPMENT_054, root)
         path = str(root / 'detcore-liteinst/build.rs')
         facts[path] = old[path]
@@ -107,7 +232,7 @@ class NeutralCoreSupportCohort(unittest.TestCase):
         source = D.parents[2]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for label, relative, _, _ in cohort.NEUTRAL_CORE_SUPPORT:
+            for label, relative, _, _ in cohort.CURRENT_SPLIT_RUNTIME:
                 relative = Path('reverie') / relative if label == 'R' else Path(relative)
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)

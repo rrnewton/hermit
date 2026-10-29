@@ -83,6 +83,8 @@ impl GlobalRPC<GlobalState> for ClockGuest {
                     GlobalResponse::TraceSchedEvent(TraceSchedEventResponse {
                         print_stack_strace: None,
                         timeslice: None,
+                        schedule_released: false,
+                        schedule_over: false,
                     }),
                 )
             }

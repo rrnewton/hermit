@@ -78,7 +78,13 @@ use crate::config::FatalCoreCapture;
 
 /// Uncompressed bytes per zstd frame.
 const CHUNK: usize = 1 << 20;
-const PAGE: u64 = 4096;
+/// The page size a core's file note and segments are laid out in:
+/// `PAGE_SIZE` in `fill_files_note` and `ELF_EXEC_PAGESIZE` in
+/// `elf_core_dump` (fs/binfmt_elf.c), which is the host's page size on
+/// x86_64 and arm64 alike.
+fn core_page() -> u64 {
+    crate::page::page_size()
+}
 static ZEROS: [u8; CHUNK] = [0; CHUNK];
 
 /// What one [`capture`] did.
@@ -501,7 +507,7 @@ impl Snapshot {
                 let filesz = if all {
                     len
                 } else if elf_header {
-                    len.min(PAGE)
+                    len.min(core_page())
                 } else {
                     0
                 };
@@ -703,11 +709,11 @@ fn nt_file(maps: &[MemoryMap]) -> Vec<u8> {
         .collect();
     let mut out = Vec::new();
     out.extend_from_slice(&(files.len() as u64).to_le_bytes());
-    out.extend_from_slice(&PAGE.to_le_bytes());
+    out.extend_from_slice(&core_page().to_le_bytes());
     for (map, _) in &files {
         out.extend_from_slice(&map.address.0.to_le_bytes());
         out.extend_from_slice(&map.address.1.to_le_bytes());
-        out.extend_from_slice(&(map.offset / PAGE).to_le_bytes());
+        out.extend_from_slice(&(map.offset / core_page()).to_le_bytes());
     }
     for (_, path) in &files {
         use std::os::unix::ffi::OsStrExt;
@@ -715,6 +721,26 @@ fn nt_file(maps: &[MemoryMap]) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+/// The fields of `struct elf_prstatus_common` (include/linux/elfcore.h) that
+/// precede `pr_reg` and do not come from registers, at the same offsets on
+/// every 64-bit architecture: `pr_info.si_signo`, `pr_cursig`, the pending
+/// and blocked signal sets, then the thread's, parent's, process group's and
+/// session's IDs. The four times after them stay zero.
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code, reason = "no other architecture has a prstatus layout here")
+)]
+fn prstatus_common(out: &mut [u8], signal: i32, id: &Identity) {
+    put(out, 0, &signal.to_le_bytes()); // pr_info.si_signo
+    put(out, 12, &(signal as i16).to_le_bytes()); // pr_cursig
+    put(out, 16, &id.sigpend.to_le_bytes());
+    put(out, 24, &id.sighold.to_le_bytes());
+    put(out, 32, &id.tid.to_le_bytes());
+    put(out, 36, &id.ppid.to_le_bytes());
+    put(out, 40, &id.pgrp.to_le_bytes());
+    put(out, 44, &id.sid.to_le_bytes());
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -733,14 +759,7 @@ mod arch {
         const REGS: usize = std::mem::size_of::<libc::user_regs_struct>();
         const _: () = assert!(REGS == 216);
         let mut out = vec![0u8; 336];
-        put(&mut out, 0, &signal.to_le_bytes()); // pr_info.si_signo
-        put(&mut out, 12, &(signal as i16).to_le_bytes()); // pr_cursig
-        put(&mut out, 16, &id.sigpend.to_le_bytes());
-        put(&mut out, 24, &id.sighold.to_le_bytes());
-        put(&mut out, 32, &id.tid.to_le_bytes());
-        put(&mut out, 36, &id.ppid.to_le_bytes());
-        put(&mut out, 40, &id.pgrp.to_le_bytes());
-        put(&mut out, 44, &id.sid.to_le_bytes());
+        super::prstatus_common(&mut out, signal, id);
         // SAFETY: user_regs_struct is plain old data of exactly REGS bytes.
         let bytes = unsafe { std::slice::from_raw_parts(regs as *const _ as *const u8, REGS) };
         put(&mut out, 112, bytes);
@@ -748,7 +767,33 @@ mod arch {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+mod arch {
+    use super::Identity;
+    use super::put;
+
+    pub(super) const MACHINE: u16 = 183; // EM_AARCH64
+
+    pub(super) fn stack_pointer(regs: &libc::user_regs_struct) -> u64 {
+        regs.sp
+    }
+
+    /// `struct elf_prstatus` for arm64 (392 bytes): the common fields, then
+    /// `pr_reg`, the 34 words of `struct user_pt_regs` (x0-x30, sp, pc,
+    /// pstate), then `pr_fpvalid`.
+    pub(super) fn prstatus(signal: i32, id: &Identity, regs: &libc::user_regs_struct) -> Vec<u8> {
+        const REGS: usize = std::mem::size_of::<libc::user_regs_struct>();
+        const _: () = assert!(REGS == 272);
+        let mut out = vec![0u8; 392];
+        super::prstatus_common(&mut out, signal, id);
+        // SAFETY: user_regs_struct is plain old data of exactly REGS bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(regs as *const _ as *const u8, REGS) };
+        put(&mut out, 112, bytes);
+        out
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod arch {
     use super::Identity;
 
@@ -832,7 +877,7 @@ impl Compressed {
 fn headers(notes_len: u64, segments: &[Segment]) -> (Vec<u8>, u64) {
     let phnum = 1 + segments.len() as u64;
     let notes_offset = EHDR_SIZE + PHDR_SIZE * phnum;
-    let data_offset = (notes_offset + notes_len).next_multiple_of(PAGE);
+    let data_offset = (notes_offset + notes_len).next_multiple_of(core_page());
     let mut out = Vec::with_capacity(notes_offset as usize);
     out.extend_from_slice(b"\x7fELF\x02\x01\x01");
     out.resize(16, 0);
@@ -868,9 +913,9 @@ fn headers(notes_len: u64, segments: &[Segment]) -> (Vec<u8>, u64) {
             segment.vaddr,
             segment.filesz,
             segment.memsz,
-            PAGE,
+            core_page(),
         );
-        offset += segment.filesz.next_multiple_of(PAGE);
+        offset += segment.filesz.next_multiple_of(core_page());
     }
     (out, data_offset)
 }
@@ -906,7 +951,7 @@ fn write_core(
             Some(mem) => copy_memory(&mut out, mem, segment.vaddr, segment.filesz, &mut page)?,
             None => out.push_zeros(segment.filesz)?,
         }
-        out.push_zeros(segment.filesz.next_multiple_of(PAGE) - segment.filesz)?;
+        out.push_zeros(segment.filesz.next_multiple_of(core_page()) - segment.filesz)?;
     }
     out.flush()?;
     Ok(out.written)
@@ -927,7 +972,7 @@ fn copy_memory(
         match read_fully(mem, &mut buf[..want], addr) {
             Ok(()) => out.push(&buf[..want])?,
             Err(_) => {
-                for page in buf[..want].chunks_mut(PAGE as usize) {
+                for page in buf[..want].chunks_mut(core_page() as usize) {
                     let page_addr = addr;
                     addr += page.len() as u64;
                     if read_fully(mem, page, page_addr).is_err() {
@@ -988,7 +1033,7 @@ mod tests {
         ];
         let (bytes, data_offset) = headers(100, &segments);
         assert_eq!(bytes.len() as u64, EHDR_SIZE + 4 * PHDR_SIZE);
-        assert_eq!(data_offset, PAGE);
+        assert_eq!(data_offset, core_page());
         assert_eq!(&bytes[..4], b"\x7fELF");
         let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
         assert_eq!(u16_at(16), 4, "e_type is ET_CORE");
@@ -1000,9 +1045,9 @@ mod tests {
         assert_eq!(u64_at(phdr(0) + 32), 100);
         // Stored segments follow each other at page granularity; an empty
         // one takes no file space.
-        assert_eq!(u64_at(phdr(1) + 8), PAGE);
-        assert_eq!(u64_at(phdr(2) + 8), PAGE + 0x3000);
-        assert_eq!(u64_at(phdr(3) + 8), PAGE + 0x3000);
+        assert_eq!(u64_at(phdr(1) + 8), core_page());
+        assert_eq!(u64_at(phdr(2) + 8), core_page() + 0x3000);
+        assert_eq!(u64_at(phdr(3) + 8), core_page() + 0x3000);
         assert_eq!(u64_at(phdr(3) + 32), 0x1000);
         assert_eq!(u64_at(phdr(3) + 40), 0x5000);
     }
@@ -1178,6 +1223,26 @@ mod tests {
 
     #[test]
     fn the_lock_wait_gives_up_at_the_deadline() {
+        const CHILD: &str = "HERMIT_TEST_DIR_LOCK_DEADLINE_CHILD";
+        const CASE: &str = "fatal_core::tests::the_lock_wait_gives_up_at_the_deadline";
+        if std::env::var_os(CHILD).is_none() {
+            // The last acquisition below allows no wait at all, so it only
+            // succeeds if the dropped lock is really gone. A sibling test in
+            // this binary that forks while this lock is held leaves the
+            // descriptor open in its child and keeps the flock taken, so
+            // the sequence runs in an isolated child process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let held = DirLock::acquire(dir.path(), Instant::now()).unwrap();
         let start = Instant::now();
@@ -1221,16 +1286,17 @@ mod tests {
             MMPermissions::READ | MMPermissions::WRITE | MMPermissions::PRIVATE,
             0,
         );
-        heap.address = (PAGE, 2 * PAGE);
+        heap.address = (core_page(), 2 * core_page());
         let mut stack = heap.clone();
         stack.pathname = MMapPath::Stack;
-        stack.address = (2 * PAGE, 3 * PAGE);
-        mem.write_all_at(&vec![0x5a; PAGE as usize], PAGE).unwrap();
-        mem.write_all_at(&vec![0xa5; PAGE as usize], 2 * PAGE)
+        stack.address = (2 * core_page(), 3 * core_page());
+        mem.write_all_at(&vec![0x5a; core_page() as usize], core_page())
+            .unwrap();
+        mem.write_all_at(&vec![0xa5; core_page() as usize], 2 * core_page())
             .unwrap();
         let snapshot = Snapshot {
             tgid: 1,
-            stack_pointer: 2 * PAGE,
+            stack_pointer: 2 * core_page(),
             notes: Vec::new(),
             maps: vec![heap, stack],
             rules: vec![
@@ -1284,7 +1350,7 @@ mod tests {
         assert_eq!(tier, Tier::Full, "the reference core fell back");
         assert_eq!(attempted, [Tier::Full]);
         assert!(!fresh.load(Ordering::Relaxed));
-        assert_eq!(stored_memory(&big), 2 * PAGE);
+        assert_eq!(stored_memory(&big), 2 * core_page());
 
         let flag = AtomicBool::new(false);
         let (_, tier, attempted) = capture("timed-out", &flag, Some(WriteError::Deadline));
@@ -1297,7 +1363,7 @@ mod tests {
         let (small, tier, attempted) = capture("after-timeout", &flag, None);
         assert_eq!(tier, Tier::Stack);
         assert_eq!(attempted, [Tier::Stack], "a later capture retried Full");
-        assert_eq!(stored_memory(&small), PAGE);
+        assert_eq!(stored_memory(&small), core_page());
         assert!(
             stored_memory(&small) < stored_memory(&big),
             "the core after a timeout was not smaller"

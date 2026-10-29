@@ -335,6 +335,34 @@ fn a_multithreaded_crash_keeps_the_faulting_threads_registers() {
     );
 }
 
+/// A thread's fault ends the whole process even while its main thread waits on
+/// a condition variable nothing signals, whose futex wait no thread's exit
+/// wakes. The run ends as the native run does, by SIGSEGV; before, Hermit saw
+/// the leader still waiting after the other threads were reaped and refused
+/// the run as a deadlock (exit 125).
+#[test]
+fn a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable() {
+    let (guest, _root) = guest("leader-waits");
+    let mut native = Command::new("timeout");
+    native
+        .args(["--kill-after", "5s", "120s"])
+        .arg(&guest)
+        .arg("leader-waits");
+    let native = native.output().expect("failed to run the guest natively");
+    let output = hermit(&[], &guest, &["leader-waits"]);
+    assert!(
+        !stderr(&output).contains("Deadlock detected"),
+        "hermit refused the run as a deadlock:\n{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        output.status,
+        native.status,
+        "hermit's exit status differs from the native run's:\n{}",
+        stderr(&output)
+    );
+}
+
 #[test]
 fn cores_stay_within_the_per_core_and_total_caps() {
     let (guest, root) = guest("caps");

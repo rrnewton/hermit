@@ -53,7 +53,9 @@
 //! is not a replacement, an incomplete log names nothing, an open whose finish
 //! record a log does not show exactly once is not placed, and paths below
 //! `/proc`, `/sys` and `/dev` are skipped: those are kernel objects whose
-//! metadata is not file content and which Hermit virtualizes separately.
+//! metadata is not file content and which Hermit virtualizes separately. So
+//! are the records of files the kernel opened for an exec
+//! (`HostInputRecord::exec`), which have no open in the log to place.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -63,6 +65,8 @@ use detcore_model::host_input::HostFileIdentity;
 use detcore_model::host_input::HostInputLogEnd;
 use detcore_model::host_input::HostInputRecord;
 use detcore_model::host_input::HostMutationRecord;
+use detcore_model::host_input::guest_rebound;
+use detcore_model::host_input::is_kernel_object;
 
 use crate::canonical_verdict::InfrastructureError;
 use crate::canonical_verdict::VerificationRun;
@@ -101,7 +105,12 @@ fn parse_host_inputs(text: &str) -> HostInputs {
     let mut parsed = true;
     for line in &lines {
         if let Ok(record) = serde_json::from_str::<HostInputRecord>(line) {
-            records.push(record);
+            // A file the kernel opened for an exec has no open in the log;
+            // the walk below sees exactly the opens it saw before such
+            // records existed.
+            if !record.exec {
+                records.push(record);
+            }
         } else if let Ok(mutation) = serde_json::from_str::<HostMutationRecord>(line) {
             mutated.push(mutation.mutated);
         } else {
@@ -114,29 +123,6 @@ fn parse_host_inputs(text: &str) -> HostInputs {
         mutated,
         complete,
     }
-}
-
-/// Whether the guest may have rebound `path`, or a directory above it, in its
-/// file namespace: one of `mutated` is `path` or an ancestor of it. Detcore
-/// reports `/`, the ancestor of every absolute path, for a change whose path
-/// it could not establish. An open whose path could not be made absolute
-/// cannot be matched against those changes at all, so it counts as rebound
-/// too.
-fn guest_rebound(mutated: &[String], path: &str) -> bool {
-    !Path::new(path).is_absolute()
-        || mutated
-            .iter()
-            .any(|rebound| Path::new(path).starts_with(Path::new(rebound)))
-}
-
-/// Kernel objects rather than host input files; see the module documentation.
-fn is_kernel_object(path: &str) -> bool {
-    ["/proc", "/sys", "/dev"].iter().any(|root| {
-        path == *root
-            || path
-                .strip_prefix(root)
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
 }
 
 /// The opens one run has made so far: for each path, the distinct
@@ -343,6 +329,9 @@ mod tests {
                     dtid: 3,
                     syscall: index as u64 + 10,
                     identity: identity(*ino),
+                    content: None,
+                    exec: false,
+                    kernel_object: false,
                 })
                 .collect(),
             mutated: Vec::new(),

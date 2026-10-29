@@ -399,7 +399,12 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
 ];
 
 fn ret_gates_output(call: &Syscall) -> bool {
-    !matches!(call, Syscall::Poll(_) | Syscall::Ppoll(_))
+    match call {
+        Syscall::Ppoll(_) => false,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Poll(_) => false,
+        _ => true,
+    }
 }
 
 /// The structure a stat-family call fills: its guest address and size.
@@ -419,10 +424,15 @@ fn stat_buffer(call: &Syscall) -> Option<(Option<u64>, u64)> {
     let stat = |p: Option<reverie::syscalls::StatPtr<'_>>| p.map(|p| p.0.as_raw() as u64);
     let stat_len = std::mem::size_of::<libc::stat>() as u64;
     Some(match call {
+        #[cfg(target_arch = "x86_64")]
         Syscall::Stat(c) => (stat(c.stat()), stat_len),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Lstat(c) => (stat(c.stat()), stat_len),
         Syscall::Fstat(c) => (stat(c.stat()), stat_len),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Newfstatat(c) => (stat(c.stat()), stat_len),
+        #[cfg(target_arch = "aarch64")]
+        Syscall::Fstatat(c) => (stat(c.stat()), stat_len),
         Syscall::Statx(c) => (
             c.statx().map(|p| p.0.as_raw() as u64),
             std::mem::size_of::<reverie::syscalls::linux_abi::Statx>() as u64,
@@ -517,6 +527,7 @@ fn extents<M: MemoryAccess>(
             c.count() as usize,
             ret,
         ),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Readlink(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.bufsize(), ret),
         Syscall::Readlinkat(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.buf_len(), ret),
         Syscall::Recvmsg(c) => msghdr_extents(memory, c.msg().map_or(0, |p| p.as_raw()), ret)?,
@@ -548,6 +559,7 @@ fn extents<M: MemoryAccess>(
         // `unsigned int`, so only its low 32 bits count: a guest that sets the
         // high word gets the low word's array, and the observer must not read
         // more.
+        #[cfg(target_arch = "x86_64")]
         Syscall::Poll(c) => whole(
             c.fds().map(|p| p.as_raw() as u64),
             pollfd_array_len(c.nfds()),
@@ -2145,14 +2157,14 @@ mod event_tests {
             assert_eq!(result.unwrap(), 20);
             let expected = if advances {
                 [
-                    41, 114, 187, 4, 77, 150, 223, 40, 113, 186, 3, 76, 149, 222, 39, 112, 185, 2,
-                    75, 148,
+                    175, 102, 200, 166, 218, 176, 40, 143, 247, 174, 112, 238, 2, 248, 208, 215,
+                    63, 22, 56, 54,
                 ]
             } else {
-                // Literal seed0 stream at explicit offset19, distinct from cursor0.
+                // The fixture's stream at explicit offset 19, distinct from its cursor at 0.
                 [
-                    148, 221, 38, 111, 184, 1, 74, 147, 220, 37, 110, 183, 0, 73, 146, 219, 36,
-                    109, 182, 255,
+                    54, 74, 0, 152, 31, 135, 94, 224, 126, 178, 72, 64, 167, 207, 134, 168, 134,
+                    250, 144, 8,
                 ]
             };
             assert_eq!(memory.bytes(second_iovec, 16), expected[..16]);
@@ -2210,9 +2222,9 @@ mod event_tests {
                 matches!(cause.downcast_ref::<Error>(), Some(Error::Errno(error)) if *error == fault)
             }));
                 let expected = if advances {
-                    [41, 114, 187, 4, 77, 150, 223, 40]
+                    [175, 102, 200, 166, 218, 176, 40, 143]
                 } else {
-                    [148, 221, 38, 111, 184, 1, 74, 147]
+                    [54, 74, 0, 152, 31, 135, 94, 224]
                 };
                 assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
                 assert_eq!(memory.bytes(RETRY_DEST + 3, 1), [CANARY]);
@@ -2278,9 +2290,9 @@ mod event_tests {
                 "{name}"
             );
             let expected = if advances {
-                [41, 114, 187, 4, 77, 150, 223, 40]
+                [175, 102, 200, 166, 218, 176, 40, 143]
             } else {
-                [148, 221, 38, 111, 184, 1, 74, 147]
+                [54, 74, 0, 152, 31, 135, 94, 224]
             };
             assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
             assert_eq!(memory.bytes(FIRST_DEST, 5), expected[3..]);
@@ -2319,9 +2331,9 @@ mod event_tests {
             let result = tool.handle_syscall_event(&mut guest, call).await;
             assert_eq!(result.unwrap(), 8, "{name}");
             let expected = if advances {
-                [41, 114, 187, 4, 77, 150, 223, 40]
+                [175, 102, 200, 166, 218, 176, 40, 143]
             } else {
-                [148, 221, 38, 111, 184, 1, 74, 147]
+                [54, 74, 0, 152, 31, 135, 94, 224]
             };
             assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
             assert_eq!(memory.bytes(FIRST_DEST, 5), expected[3..]);
@@ -2363,9 +2375,9 @@ mod event_tests {
                 let result = tool.handle_syscall_event(&mut guest, call).await;
                 assert_eq!(result.unwrap(), 8);
                 let expected = if advances {
-                    [41, 114, 187, 4, 77, 150, 223, 40]
+                    [175, 102, 200, 166, 218, 176, 40, 143]
                 } else {
-                    [148, 221, 38, 111, 184, 1, 74, 147]
+                    [54, 74, 0, 152, 31, 135, 94, 224]
                 };
                 assert_eq!(memory.bytes(FIRST_DEST, 3), expected[..3]);
                 assert_eq!(memory.bytes(FIRST_DEST + 3, 1), [CANARY]);

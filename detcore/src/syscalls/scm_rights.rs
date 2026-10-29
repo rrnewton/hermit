@@ -27,7 +27,8 @@
 //! each received descriptor as the receive returns
 //! ([`Detcore::record_received_descriptors`]), from the facts the in-guest
 //! discovery takes (`fcntl(F_GETFD)`, `fcntl(F_GETFL)` and `fstat`, here
-//! injected), through the same `FileMetadata::add_discovered_fd`, so the
+//! taken through the recording), through the same
+//! `FileMetadata::add_discovered_fd`, so the
 //! record is the description the in-guest discovery makes: a directory, for
 //! one, gets a sorted stream of its own. Unlike that discovery, a received
 //! descriptor is never given the container's stdio resource (it is not the
@@ -51,20 +52,118 @@
 //! call may have overwritten its
 //! own inputs, whose vector cannot be read in full, or whose inputs changed
 //! before the attempt that succeeded; and every receive on the background
-//! path. Under record and replay and without sequentialized threads no
-//! receive is recorded, logged at debug level only (`ReceiptMode`).
+//! path. Without sequentialized threads no receive is recorded, logged at
+//! debug level only (`ReceiptMode`).
 //!
-//! Every received descriptor is a description of its own in Detcore's model,
-//! as in the in-guest discovery, even when it is an alias of a description
-//! the process already holds (it sent the descriptor to itself, say): Linux
-//! then shares the status flags, the directory position and lock ownership
-//! between the two, and Detcore's two models do not
-//! (<https://github.com/rrnewton/hermit/issues/4670>). Detcore cannot tell such
-//! an alias apart on every backend, and joining them only where it can would
-//! make the guest-visible result depend on the backend.
+//! Under record and replay every fact is taken through the recording, so
+//! replay, which serves the receive from the log and holds a stand-in in each
+//! received slot, rebuilds the table the recording built. Where the recording
+//! joined a received descriptor to an open file the receiving table holds,
+//! replay also makes the received slot name the live open file
+//! (`Detcore::install_live_alias`), and a received socket whose peer is a
+//! guest is polled in the caller's turn (`Detcore::classify_socket_peer`).
+//!
+//! Linux installs the sender's `struct file` (`receive_fd`): the received
+//! descriptor shares its status flags, directory position and lock ownership
+//! with every descriptor of that open file, the sender's included, in
+//! whichever process holds them. Detcore names that open file without asking
+//! the kernel, as <https://github.com/rrnewton/hermit/issues/4670> proposes:
+//! at the send, it queues on the receiving socket the open file description
+//! its table modeled for each descriptor carried, with the file's
+//! `(st_dev, st_ino)` from an injected `fstat`
+//! ([`Detcore::queue_sent_rights`]); at the receipt, it takes the oldest
+//! queued message whose identities are the received descriptors', in order
+//! (all of them, or a prefix where Linux set `MSG_CTRUNC`; a `MSG_PEEK`
+//! receive leaves it queued), and each received descriptor joins the
+//! description its sender's table modeled, as `dup` would, before the
+//! anonymous-inode refusal, so a received eventfd is the sender's eventfd.
+//! The decision depends only on Detcore's own model and the facts its
+//! injected `fcntl` and `fstat` take, so it is the same on every backend that
+//! records received descriptors (ptrace, KVM); before, it asked the kernel
+//! through `kcmp(KCMP_FILE)`, which KVM's executor does not answer and which
+//! the host's kernel configuration and seccomp profile can refuse.
+//!
+//! The receiving socket is known only where Detcore knows a socket's peer,
+//! in any process that holds it and through any of its aliases: the two
+//! sockets of a `socketpair`, and an `AF_UNIX` stream or seqpacket connection
+//! and the socket whose `connect` made it. Linux queues each connection on
+//! the listener's receive queue at the tail (`unix_stream_connect`,
+//! `__skb_queue_tail(&other->sk_receive_queue, skb)`,
+//! <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.9#n1641>)
+//! and `accept` takes it from the head (`unix_accept`, `skb_recv_datagram`,
+//! <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.9#n1711>),
+//! so Detcore queues each guest's connection to a name a guest bound,
+//! abstract or an absolute path, where the `connect` completed in the
+//! caller's turn, and pairs the oldest with the socket an `accept` on that
+//! listener returns, also in its turn ([`Detcore::note_unix_accept`]).
+//!
+//! That needs every connection a listener gets. So a connect or accept on
+//! the name outside the turn leaves its order unknown until the name is
+//! bound again, and so does any `AF_UNIX` stream connect Detcore cannot
+//! attribute to one bound name, for every name: one through a relative path
+//! or another spelling of a path, to a name no guest bound here, or of a
+//! socket whose type Detcore did not see made ([`UnixConnections`]). A
+//! listener bound before its path was unlinked and bound again pairs
+//! nothing: the connections Detcore tracks for the name are the later
+//! listener's. A connection made from outside Hermit is not seen at all, and
+//! shifts the pairing of those queued after it.
+//!
+//! A `socketpair` datagram socket reaches its peer only while it stays
+//! connected to it and names no other destination. A `connect` gives it
+//! another peer, or none, and Linux then purges its receive queue
+//! (`unix_dgram_connect`, `unix_dgram_disconnected`,
+//! <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.9#n1414>),
+//! so Detcore unpairs the two and neither queue is in lockstep any more
+//! (`DetFd::unpair_rights_peer`). A send that names its destination
+//! (`msg_namelen`, `unix_dgram_sendmsg`,
+//! <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.9#n1980>)
+//! queues nothing, and its peer's queue is no longer in lockstep, since the
+//! named socket may be the peer itself. A seqpacket send ignores the name
+//! (`unix_seqpacket_sendmsg`) and a stream send with one fails
+//! (`unix_stream_sendmsg`).
+//!
+//! A descriptor received any other way is a description of its own in
+//! Detcore's model, as before: through any other socket (a datagram socket
+//! not made by `socketpair`, a connection Detcore did not pair), from a
+//! sender outside Hermit or whose send Detcore did not see complete in its
+//! turn, one whose sender's table modeled no description for it, or one
+//! whose every modeled descriptor was closed before the receipt (Linux's
+//! in-flight reference keeps that `struct file` alive; Detcore's queue keeps
+//! no model alive). The in-guest backends discover received descriptors
+//! lazily and keep the separate model they had.
+//!
+//! The identities confirm what order proposes, except for anonymous inodes:
+//! every eventfd, timerfd, signalfd and epoll set has one file identity. So
+//! once a socket's queue may no longer follow its messages one for one, no
+//! anonymous inode received through it joins anything
+//! (`DetFd::take_queued_rights`). That is from the first message sent to it
+//! that was not queued (unreadable control data, facts that could not be
+//! taken, a send outside the turn, a datagram send that named its
+//! destination, more than 4096 waiting), a `connect` of a datagram socket of
+//! the pair, or the first
+//! call that took a message from it Detcore could not match while some were
+//! queued: a `read`, `readv` or `recvfrom`, a receive that released
+//! descriptors (`MSG_CTRUNC` with none installed), one outside the turn or
+//! with an untrusted layout, one whose descriptors' facts could not be
+//! taken, or one that matched a later message than the oldest. Other files
+//! out of lockstep still join where their identities match, and two open
+//! files of one file are then told apart only by order.
+//!
+//! Under record and replay the send's `fstat` goes through the recording too,
+//! and a received descriptor joins its sender's description only where the
+//! receiving table holds a descriptor of it: replay holds a stand-in in the
+//! received slot and can put the live open file there only by duplicating a
+//! descriptor of the same table. One whose description only another
+//! process's table holds is recorded from the kernel's facts, in both runs
+//! alike.
 
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::os::fd::RawFd;
+use std::sync::Arc;
 
+use nix::fcntl::OFlag;
+use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
@@ -77,7 +176,11 @@ use reverie::syscalls::linux_abi::Msghdr;
 use tracing::debug;
 use tracing::warn;
 
+use crate::fd::FileIdentity;
+use crate::fd::OpenFileHandle;
+use crate::fd::SentDescriptor;
 use crate::record_or_replay::RecordOrReplay;
+use crate::syscalls::files::SocketRole;
 use crate::syscalls::rendered_procfs::placeholder_identity;
 use crate::syscalls::rendered_procfs::placeholders_exist;
 use crate::tool_local::Detcore;
@@ -305,9 +408,249 @@ pub(crate) struct ReceiveGeometry {
 pub(crate) struct Delivered {
     /// The descriptors Linux reports installing, in order.
     pub(crate) fds: Vec<RawFd>,
+    /// Each message that delivered descriptors, in order: its share of
+    /// `fds`, which follow one another. A message that delivered none is
+    /// listed, with a count of 0, only where Linux may have released
+    /// descriptors it carried.
+    pub(crate) messages: Vec<DeliveredMessage>,
     /// Why the receive's descriptors cannot be named, if they cannot: then
     /// `fds` is empty, and none of the call's descriptors is recorded.
     pub(crate) refused: Option<&'static str>,
+}
+
+/// The descriptors one received message delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeliveredMessage {
+    /// How many of [`Delivered::fds`] it delivered.
+    pub(crate) count: usize,
+    /// Whether Linux set `MSG_CTRUNC` in its `msg_flags`: the control buffer
+    /// had room for fewer descriptors than the message carried, which Linux
+    /// installed in order, releasing the rest.
+    pub(crate) truncated: bool,
+}
+
+/// What a send completed in the caller's turn passed over `SCM_RIGHTS`
+/// (`Detcore::queue_sent_rights`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SentRights {
+    /// For each message Linux reports sending that carried descriptors: the
+    /// descriptors, in order, the bytes it sent, and whether it named its
+    /// destination (a nonzero `msg_namelen`), which a datagram socket's send
+    /// reaches instead of its peer (`unix_dgram_sendmsg`).
+    pub(crate) messages: Vec<(Vec<RawFd>, usize, bool)>,
+    /// Whether a message Linux reports sending could not be read in full, so
+    /// that what it carried is unknown.
+    pub(crate) unread: bool,
+}
+
+/// The socket a receive took its messages from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReceivedFrom {
+    /// The receiving socket's descriptor.
+    pub(crate) socket: RawFd,
+    /// A `MSG_PEEK` receive, which installs the descriptors and leaves the
+    /// message queued.
+    pub(crate) peek: bool,
+}
+
+/// What an address a guest passed names, for `AF_UNIX` pairing
+/// ([`unix_address`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UnixAddress {
+    /// Not an `AF_UNIX` address (its family is another, or it is too short
+    /// to have one).
+    Other,
+    /// An `AF_UNIX` name Detcore can compare: an abstract name's bytes after
+    /// `sun_family`, its leading NUL included, which Linux compares whole
+    /// (`unix_find_abstract`), or an absolute path up to its first NUL.
+    Named(Box<[u8]>),
+    /// An `AF_UNIX` address whose socket Detcore cannot name: a relative
+    /// path, which names a different file from each working directory, an
+    /// unnamed address, or one it could not read (a `connect` or `bind`
+    /// through an unreadable address fails with `EFAULT`, so only a call
+    /// that succeeded is ever attributed).
+    Unnamed,
+}
+
+/// What the address at `address` in guest memory (`length` bytes) names
+/// ([`UnixAddress`]).
+pub(crate) fn unix_address<M: MemoryAccess>(
+    memory: &M,
+    address: usize,
+    length: usize,
+) -> UnixAddress {
+    const PATH: usize = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    let length = length.min(size_of::<libc::sockaddr_un>());
+    if length < size_of::<libc::sa_family_t>() {
+        return UnixAddress::Other;
+    }
+    let mut bytes = vec![0u8; length];
+    let read = Addr::<u8>::from_raw(address)
+        .is_some_and(|address| memory.read_exact(address, &mut bytes).is_ok());
+    if !read {
+        return UnixAddress::Unnamed;
+    }
+    if u16::from_ne_bytes([bytes[0], bytes[1]]) != libc::AF_UNIX as u16 {
+        return UnixAddress::Other;
+    }
+    let path = bytes.get(PATH..).unwrap_or_default();
+    match path.first() {
+        Some(0) => UnixAddress::Named(path.into()),
+        Some(b'/') => path
+            .split(|&byte| byte == 0)
+            .next()
+            .map_or(UnixAddress::Unnamed, |path| UnixAddress::Named(path.into())),
+        _ => UnixAddress::Unnamed,
+    }
+}
+
+/// The name an `AF_UNIX` address names a socket by ([`UnixAddress::Named`]),
+/// read from guest memory at `address` (`length` bytes). `None` for another
+/// family, an unnamed or unreadable address, or a relative path.
+pub(crate) fn unix_socket_name<M: MemoryAccess>(
+    memory: &M,
+    address: usize,
+    length: usize,
+) -> Option<Box<[u8]>> {
+    match unix_address(memory, address, length) {
+        UnixAddress::Named(name) => Some(name),
+        UnixAddress::Other | UnixAddress::Unnamed => None,
+    }
+}
+
+/// The most connections kept waiting for an `accept` on one name
+/// ([`UnixConnections`]); beyond it the name's order is unknown.
+const MAX_PENDING_CONNECTIONS: usize = 4096;
+
+/// The connections guests made to one `AF_UNIX` name a guest bound
+/// ([`UnixConnections`]).
+#[derive(Default)]
+struct PendingConnections {
+    /// Which bind of the name this is: a listener bound before the name was
+    /// unlinked and bound again keeps the earlier one, and its accepts take
+    /// connections Detcore no longer tracks.
+    generation: u64,
+    /// The connecting sockets' descriptions, oldest first, as Linux queues
+    /// the connections on the listener for `accept` to take: at the tail
+    /// (`unix_stream_connect`), from the head (`unix_accept`).
+    sockets: VecDeque<OpenFileHandle>,
+    /// A `connect` or `accept` on the name completed outside its caller's
+    /// turn, a connect Detcore could not attribute may have reached it, or
+    /// too many connections waited: which connection an `accept` takes is
+    /// unknown until a guest binds the name again.
+    unknown: bool,
+}
+
+impl PendingConnections {
+    fn lose_order(&mut self) {
+        self.sockets.clear();
+        self.unknown = true;
+    }
+}
+
+/// The connections waiting for an `accept` on each `AF_UNIX` name a guest
+/// bound, so that an accepted connection and the socket whose `connect` made
+/// it are paired (`Detcore::note_unix_accept`). One per run: every task of
+/// the process tree shares it (`ThreadState::unix_connections`), as it shares
+/// the guest clock, so a bind, a connect and an accept in different threads
+/// or processes meet.
+///
+/// A connect Detcore cannot attribute to one of these names may have
+/// reached any of them: one through a relative path or another spelling of
+/// a path (a doubled slash, a `..`, a symlink or hard link, a renamed
+/// socket file), to a name no guest bound here, through an absolute path
+/// from a task whose root may not be the container's (`chroot`, where one
+/// path names another file), or of a socket whose type Detcore did not see
+/// made. Every name's order is then unknown until it is bound again
+/// ([`UnixConnections::lost`]), so no accept pairs with a socket whose
+/// connection it may not have taken. A bind through an absolute path from
+/// such a task is not tracked. A connection made from outside Hermit is not
+/// seen at all.
+///
+/// That costs precision, never correctness: one stream connect to a socket
+/// no guest bound here, as a glibc user or group lookup makes through NSS
+/// (nscd, systemd-userdb), stops pairing for every name until it is bound
+/// again, and descriptors received over those connections are then handled
+/// as on main.
+#[derive(Default)]
+pub(crate) struct UnixConnections {
+    names: BTreeMap<Box<[u8]>, PendingConnections>,
+    /// The last bind's generation ([`PendingConnections::generation`]).
+    binds: u64,
+}
+
+impl UnixConnections {
+    /// A guest bound a socket to `name`: its listener's queue starts empty.
+    /// Which bind of the name it was, for the listener to keep.
+    fn bound(&mut self, name: &[u8]) -> u64 {
+        self.binds += 1;
+        self.names.insert(
+            name.into(),
+            PendingConnections {
+                generation: self.binds,
+                ..Default::default()
+            },
+        );
+        self.binds
+    }
+
+    /// A guest's `connect` to `name` completed: `socket` is the connecting
+    /// socket where it completed in the caller's turn, `None` where it did
+    /// not. A name no guest bound here may be another spelling of one that
+    /// was ([`Self::lost`]).
+    fn connected(&mut self, name: &[u8], socket: Option<OpenFileHandle>) {
+        let Some(pending) = self.names.get_mut(name) else {
+            self.lost();
+            return;
+        };
+        match socket {
+            _ if pending.unknown => {}
+            Some(socket) if pending.sockets.len() < MAX_PENDING_CONNECTIONS => {
+                pending.sockets.push_back(socket)
+            }
+            _ => pending.lose_order(),
+        }
+    }
+
+    /// A guest's stream or seqpacket `connect` completed that Detcore cannot
+    /// attribute to one name ([`UnixConnections`]): every name's order is
+    /// unknown.
+    fn lost(&mut self) {
+        self.names
+            .values_mut()
+            .for_each(PendingConnections::lose_order);
+    }
+
+    /// A guest's `accept` on the listener bound to `name` by bind
+    /// `generation` completed, in the caller's turn or not (`in_turn`): the
+    /// socket whose connection it took, if that is known. A listener whose
+    /// name was bound again since has none: the connections Detcore tracks
+    /// are the later listener's.
+    fn accepted(&mut self, name: &[u8], generation: u64, in_turn: bool) -> Option<OpenFileHandle> {
+        let pending = self
+            .names
+            .get_mut(name)
+            .filter(|pending| pending.generation == generation)?;
+        if !in_turn {
+            pending.lose_order();
+        }
+        if pending.unknown {
+            return None;
+        }
+        pending.sockets.pop_front()
+    }
+}
+
+/// Runs `f` on the run's [`UnixConnections`].
+fn with_connections<T: RecordOrReplay, G: Guest<Detcore<T>>, R>(
+    guest: &G,
+    f: impl FnOnce(&mut UnixConnections) -> R,
+) -> R {
+    let connections = Arc::clone(&guest.thread_state().unix_connections);
+    let mut connections = connections
+        .lock()
+        .expect("AF_UNIX connection registry poisoned");
+    f(&mut connections)
 }
 
 impl ReceiveGeometry {
@@ -441,6 +784,7 @@ impl ReceiveGeometry {
     pub(crate) fn delivered<M: MemoryAccess>(&self, memory: &M, ret: i64) -> Delivered {
         let refused = |reason| Delivered {
             fds: Vec::new(),
+            messages: Vec::new(),
             refused: Some(reason),
         };
         if ret < 0 {
@@ -461,33 +805,90 @@ impl ReceiveGeometry {
             self.messages.len().min(1)
         };
         let mut fds = Vec::new();
+        let mut messages = Vec::new();
         for message in &self.messages[..count] {
-            if message.control.0 == 0 || message.control.1 == 0 {
-                continue;
-            }
-            let written = message.header.0 + std::mem::offset_of!(Msghdr, msg_controllen);
-            let Some(length) =
-                Addr::<usize>::from_raw(written).and_then(|at| memory.read_value(at).ok())
-            else {
-                return refused("its control length cannot be read back");
+            // Linux writes the message's flags back too.
+            let flags = message.header.0 + std::mem::offset_of!(Msghdr, msg_flags);
+            let flags: Option<libc::c_int> =
+                Addr::<libc::c_int>::from_raw(flags).and_then(|at| memory.read_value(at).ok());
+            let received = if message.control.0 == 0 || message.control.1 == 0 {
+                Vec::new()
+            } else {
+                let written = message.header.0 + std::mem::offset_of!(Msghdr, msg_controllen);
+                let Some(length) =
+                    Addr::<usize>::from_raw(written).and_then(|at| memory.read_value(at).ok())
+                else {
+                    return refused("its control length cannot be read back");
+                };
+                if length > message.control.1 {
+                    return refused("its control buffer grew before the attempt that succeeded");
+                }
+                let length = length.min(MAX_CONTROL_BYTES);
+                let mut control = vec![0; length];
+                match Addr::<u8>::from_raw(message.control.0)
+                    .map(|at| memory.read_exact(at, &mut control))
+                {
+                    _ if length == 0 => Vec::new(),
+                    Some(Ok(())) => received_descriptors(&control),
+                    _ => return refused("its control data cannot be read back"),
+                }
             };
-            if length > message.control.1 {
-                return refused("its control buffer grew before the attempt that succeeded");
-            }
-            let length = length.min(MAX_CONTROL_BYTES);
-            if length == 0 {
+            if received.is_empty() {
+                // With no room for even one descriptor (no control buffer,
+                // or too small a one), Linux releases them all and sets
+                // `MSG_CTRUNC` (`scm_detach_fds`, `scm_recv_unix`): the
+                // message may have carried some. So may one whose flags
+                // cannot be read back.
+                if flags.is_none_or(|flags| flags & libc::MSG_CTRUNC != 0) {
+                    messages.push(DeliveredMessage {
+                        count: 0,
+                        truncated: true,
+                    });
+                }
                 continue;
             }
-            let mut control = vec![0; length];
-            match Addr::<u8>::from_raw(message.control.0)
-                .map(|at| memory.read_exact(at, &mut control))
-            {
-                Some(Ok(())) => fds.extend(received_descriptors(&control)),
-                _ => return refused("its control data cannot be read back"),
-            }
+            // Flags that cannot be read back count as complete, so that only
+            // all of a queued message can match.
+            let truncated = flags.is_some_and(|flags| flags & libc::MSG_CTRUNC != 0);
+            messages.push(DeliveredMessage {
+                count: received.len(),
+                truncated,
+            });
+            fds.extend(received);
         }
-        Delivered { fds, refused: None }
+        Delivered {
+            fds,
+            messages,
+            refused: None,
+        }
     }
+}
+
+/// The kernel's facts about one received descriptor, taken as the receive
+/// returns ([`Detcore::received_facts`]).
+struct ReceivedFacts {
+    /// `F_GETFD`.
+    descriptor_flags: i32,
+    /// `F_GETFL`.
+    status_flags: i32,
+    stat: libc::stat,
+}
+
+impl ReceivedFacts {
+    fn file(&self) -> FileIdentity {
+        (self.stat.st_dev, self.stat.st_ino)
+    }
+}
+
+/// What became of one received descriptor ([`Detcore::record_received_facts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Receipt {
+    /// Recorded as an open file new to this table.
+    New,
+    /// Joined an open file this table already models, as an alias.
+    Joined,
+    /// Left out of the table.
+    Unrecorded,
 }
 
 /// How this run handles descriptors received over `SCM_RIGHTS`.
@@ -505,19 +906,17 @@ enum ReceiptMode {
 impl<T: RecordOrReplay> Detcore<T> {
     /// How this run handles received descriptors. Recorded only where the
     /// tool does not share the guest's descriptor table (it discovers them
-    /// there), with sequentialized threads (otherwise another thread could
+    /// there), and with sequentialized threads (otherwise another thread could
     /// close a number, or `dup2` another file over it, between the receive
     /// and the facts taken here; a received rendered procfs descriptor is
     /// refused by name there when first named,
-    /// `Detcore::adopt_received_placeholders`), and not under record and
-    /// replay (replay stands in a placeholder for each received descriptor
-    /// and serves its calls from the log, so facts taken from the kernel
-    /// would differ between the two runs).
+    /// `Detcore::adopt_received_placeholders`). Under record and replay the
+    /// facts come from the recording ([`Self::probe_received`]), so replay,
+    /// which stands in a placeholder for each received descriptor, takes the
+    /// recording's.
     fn receipt_mode<G: Guest<Self>>(&self, guest: &G) -> ReceiptMode {
         if self.cfg.backend.tool_shares_guest_descriptor_table {
             ReceiptMode::Discovered
-        } else if self.cfg.recordreplay_modes {
-            ReceiptMode::Unrecorded("under record and replay")
         } else if !guest.config().sequentialize_threads {
             ReceiptMode::Unrecorded("without sequentialized threads")
         } else {
@@ -525,16 +924,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Whether a send or receive through `call` completes in the caller's
+    /// turn, decided before the call: the descriptor is one Detcore polls in
+    /// turn (`IOAction::NonblockizeRetry`) or one already nonblocking
+    /// (`IOAction::PassThru`). Any other call runs on the background path
     /// Whether a receive through `call` completes in the caller's turn,
     /// decided before the call: the descriptor is one Detcore polls in turn
-    /// (`IOAction::NonblockizeRetry`) or one already nonblocking
-    /// (`IOAction::PassThru`). Any other receive runs on the background path
+    /// (`IOAction::NonblockizeRetry`), or one already nonblocking or a call
+    /// whose own flags keep it from waiting (`MSG_DONTWAIT`;
+    /// `IOAction::PassThru`). Any other receive runs on the background path
     /// (`BlockingExternalIO`: a physically blocking socket, or one Detcore
     /// keeps no model of), where other tasks run between the kernel's
     /// completion and the caller's continuation and could close or replace a
-    /// delivered number, or rewrite the control data; its descriptors are
-    /// never recorded.
-    pub(crate) fn receipt_is_observable<G, C>(&self, guest: &mut G, call: C) -> bool
+    /// delivered number, or rewrite the control data; the descriptors such a
+    /// receive delivers are never recorded, nor those such a send carries
+    /// queued.
+    pub(crate) fn completes_in_turn<G, C>(&self, guest: &mut G, call: C) -> bool
     where
         G: Guest<Self>,
         C: crate::syscalls::helpers::NonblockableSyscall + Into<Syscall>,
@@ -553,29 +958,34 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Record in this thread's descriptor table each descriptor a receive
-    /// installed (`delivered`), where this run records received descriptors
-    /// and the receive completed in the caller's turn (`in_turn`,
-    /// [`Self::receipt_is_observable`]), and return those it recorded. The
-    /// guest's result is never changed. A descriptor left out of the table, as
-    /// every received descriptor was before, is named in a warning: for each
-    /// receive whose layout cannot be trusted, each receive on the background
-    /// path, each number that already has a record, each anonymous inode
-    /// other than an inotify instance, and each descriptor whose facts cannot
-    /// be taken. Under record and replay
-    /// and without sequentialized threads none is recorded, logged at debug
-    /// level only (a warning per call, or per tool process, would differ
-    /// between runs that share a process). `cloexec` is whether the receive
-    /// asked for its descriptors close-on-exec (`MSG_CMSG_CLOEXEC`), which a
-    /// descriptor listed without its facts keeps.
+    /// from `from` installed (`delivered`), where this run records received
+    /// descriptors and the receive completed in the caller's turn (`in_turn`,
+    /// [`Self::completes_in_turn`]), and return those it recorded as open
+    /// files new to the table. One that joined the open file its sender's
+    /// table modeled (see the module documentation) is not returned: it brings
+    /// the lock ledger no new identity, and `refresh_description_locks` would
+    /// mark that shared open file, the sender's too, as received. The guest's
+    /// result is never changed. A descriptor left out of the table, as every
+    /// received descriptor was before, is named in a warning: for each receive
+    /// whose layout cannot be trusted, each receive on the background path,
+    /// each number that already has a record, each anonymous inode other than
+    /// an inotify instance, and each descriptor whose facts cannot be taken.
+    /// Without sequentialized threads none is recorded, logged at debug level
+    /// only (a warning per call, or per tool process, would differ between
+    /// runs that share a process). `cloexec` is whether the receive asked for
+    /// its descriptors close-on-exec (`MSG_CMSG_CLOEXEC`), which a descriptor
+    /// listed without its facts keeps. A tool error, after which record and
+    /// replay could no longer follow each other, ends the run.
     pub(crate) async fn record_received_descriptors<G: Guest<Self>>(
         &self,
         guest: &mut G,
         delivered: &Delivered,
         in_turn: bool,
         cloexec: bool,
-    ) -> Vec<RawFd> {
+        from: ReceivedFrom,
+    ) -> Result<Vec<RawFd>, Error> {
         match self.receipt_mode(guest) {
-            ReceiptMode::Discovered => return Vec::new(),
+            ReceiptMode::Discovered => return Ok(Vec::new()),
             ReceiptMode::Unrecorded(why) => {
                 if !delivered.fds.is_empty() || delivered.refused.is_some() {
                     // A listing of this table cannot come from the model now
@@ -589,7 +999,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         delivered.fds
                     );
                 }
-                return Vec::new();
+                return Ok(Vec::new());
             }
             ReceiptMode::Recorded => {}
         }
@@ -599,9 +1009,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "[detcore] the descriptors a receive got over SCM_RIGHTS, if any, are not \
                  recorded: {reason}"
             );
-            return Vec::new();
+            self.lose_lockstep_if_queued(guest, from);
+            return Ok(Vec::new());
         }
         if !in_turn {
+            self.lose_lockstep_if_queued(guest, from);
             if !delivered.fds.is_empty() {
                 guest.thread_state().note_unaccounted_receipt();
                 warn!(
@@ -611,37 +1023,76 @@ impl<T: RecordOrReplay> Detcore<T> {
                     delivered.fds
                 );
             }
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut recorded = Vec::new();
-        for &fd in &delivered.fds {
-            if fd < 0 {
+        let mut rest = delivered.fds.as_slice();
+        for message in &delivered.messages {
+            if message.count == 0 {
+                // Linux may have released the descriptors of a message this
+                // receive took.
+                self.lose_lockstep_if_queued(guest, from);
                 continue;
             }
-            match self.record_received_descriptor(guest, fd).await {
-                Ok(true) => recorded.push(fd),
-                Ok(false) => {}
-                Err(error) => {
-                    // Open, but without its facts: listed, never modelled.
-                    guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
-                    warn!(
-                        "[detcore] descriptor {fd}, received over SCM_RIGHTS, is not recorded: \
-                         {error}"
-                    )
+            let (fds, after) = rest.split_at(message.count.min(rest.len()));
+            rest = after;
+            let mut facts = Vec::with_capacity(fds.len());
+            for &fd in fds {
+                match self.received_facts(guest, fd).await {
+                    Err(Error::Tool(error)) => return Err(Error::Tool(error)),
+                    taken => facts.push(taken),
+                }
+            }
+            let (sent, lockstep) =
+                Self::queued_rights(guest, from, &facts, message.truncated).unzip();
+            let lockstep = lockstep.unwrap_or(false);
+            for (index, (&fd, facts)) in fds.iter().zip(facts).enumerate() {
+                let facts = match facts {
+                    Ok(Some(facts)) => facts,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        // Open, but without its facts: listed, never modelled.
+                        guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
+                        warn!(
+                            "[detcore] descriptor {fd}, received over SCM_RIGHTS, is not \
+                             recorded: {error}"
+                        );
+                        continue;
+                    }
+                };
+                let sent = sent.as_ref().and_then(|sent| sent.get(index));
+                match self
+                    .record_received_facts(guest, fd, &facts, sent, lockstep)
+                    .await
+                {
+                    Ok(Receipt::New) => recorded.push(fd),
+                    Ok(Receipt::Joined | Receipt::Unrecorded) => {}
+                    Err(Error::Tool(error)) => return Err(Error::Tool(error)),
+                    Err(error) => {
+                        // Open, but without its facts: listed, never modelled.
+                        guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
+                        warn!(
+                            "[detcore] descriptor {fd}, received over SCM_RIGHTS, is not \
+                             recorded: {error}"
+                        )
+                    }
                 }
             }
         }
-        recorded
+        Ok(recorded)
     }
 
-    /// Record descriptor `fd`, which Linux has just installed through
-    /// `SCM_RIGHTS`, from the kernel's facts about it.
-    /// Whether it was recorded.
-    async fn record_received_descriptor<G: Guest<Self>>(
+    /// The kernel's facts about descriptor `fd`, which Linux has just
+    /// installed through `SCM_RIGHTS`: `None` for a number that already has a
+    /// record, which is kept as it is.
+    async fn received_facts<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<ReceivedFacts>, Error> {
+        if fd < 0 {
+            return Ok(None);
+        }
         // Linux gave the receiver free numbers. A record of one already
         // describes something Detcore does not know to be gone: kept as it is.
         if guest.thread_state().with_detfd(fd, |_| ()).is_ok() {
@@ -649,24 +1100,147 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "[detcore] descriptor {fd}, received over SCM_RIGHTS, already has a record, \
                  which is kept"
             );
-            return Ok(false);
+            return Ok(None);
         }
-        // Passive probes, retried when a signal stopped them before they ran.
-        let descriptor_flags = guest
-            .inject_with_retry(
+        // Passive probes through the recording, retried when a signal stopped
+        // them before they ran.
+        let descriptor_flags = self
+            .probe_received(
+                guest,
                 syscalls::Fcntl::new()
                     .with_fd(fd)
                     .with_cmd(syscalls::FcntlCmd::F_GETFD),
             )
             .await? as i32;
-        let status_flags = guest
-            .inject_with_retry(
+        let status_flags = self
+            .probe_received(
+                guest,
                 syscalls::Fcntl::new()
                     .with_fd(fd)
                     .with_cmd(syscalls::FcntlCmd::F_GETFL),
             )
             .await? as i32;
-        let stat = self.inject_fstat(guest, fd).await?;
+        let stat = self.received_descriptor_fstat(guest, fd).await?;
+        Ok(Some(ReceivedFacts {
+            descriptor_flags,
+            status_flags,
+            stat,
+        }))
+    }
+
+    /// The descriptors a send queued on the socket `from` names (see the
+    /// module documentation) for the message whose received descriptors'
+    /// facts are `facts` (`truncated` when Linux set `MSG_CTRUNC` for it), in
+    /// the order sent, and whether that queue is still in lockstep with the
+    /// socket's messages (`DetFd::take_queued_rights`): `None` when no queued
+    /// message has their identities, or when one of them has no facts, which
+    /// leaves the message, if queued, unmatched.
+    fn queued_rights<G: Guest<Self>>(
+        guest: &mut G,
+        from: ReceivedFrom,
+        facts: &[Result<Option<ReceivedFacts>, Error>],
+        truncated: bool,
+    ) -> Option<(Vec<SentDescriptor>, bool)> {
+        let received = facts
+            .iter()
+            .map(|facts| match facts {
+                Ok(Some(facts)) => Some(facts.file()),
+                _ => None,
+            })
+            .collect::<Option<Vec<FileIdentity>>>();
+        let Some(received) = received else {
+            if !from.peek {
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(from.socket, |socket| socket.lose_lockstep_if_queued());
+            }
+            return None;
+        };
+        guest
+            .thread_state()
+            .with_detfd(from.socket, |socket| {
+                socket.take_queued_rights(&received, truncated, from.peek)
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// A receive from `from` took a message Detcore could not match to the
+    /// socket's queue (`DetFd::lose_lockstep_if_queued`); not a `MSG_PEEK`
+    /// receive, which takes nothing.
+    fn lose_lockstep_if_queued<G: Guest<Self>>(&self, guest: &mut G, from: ReceivedFrom) {
+        if !from.peek {
+            let _ = guest
+                .thread_state()
+                .with_detfd(from.socket, |socket| socket.lose_lockstep_if_queued());
+        }
+    }
+
+    /// A `read`, `readv` or `recvfrom` through `fd` returned `result`. On a
+    /// socket with descriptors queued to it, it may have taken a message that
+    /// carried some, which Linux then releases unseen
+    /// (`DetFd::lose_lockstep_if_queued`).
+    pub(crate) fn note_receive_without_control<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        result: &Result<i64, Error>,
+    ) {
+        if matches!(result, Ok(taken) if *taken >= 0) && self.pairs_unix_sockets(guest) {
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.lose_lockstep_if_queued());
+        }
+    }
+
+    /// Record descriptor `fd`, which Linux has just installed through
+    /// `SCM_RIGHTS`, from the kernel's facts about it (`facts`), and say how:
+    /// as an alias of the open file description its sender's table modeled
+    /// (`sent`, the descriptor the send queued in its place, taken from a
+    /// queue in lockstep with the socket's messages or not, `lockstep`), or
+    /// as an open file of its own.
+    async fn record_received_facts<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        facts: &ReceivedFacts,
+        sent: Option<&SentDescriptor>,
+        lockstep: bool,
+    ) -> Result<Receipt, Error> {
+        let cloexec = facts.descriptor_flags & libc::FD_CLOEXEC != 0;
+        // Every anonymous inode has one file identity, so out of lockstep
+        // only order could say which queued one this is: none is joined.
+        let anonymous = facts.stat.st_mode & libc::S_IFMT == 0;
+        // Linux installed the sender's `struct file`, so the received
+        // descriptor shares its status flags, lock state, directory position
+        // and scheduler resource, as `dup` would make it: an `O_NONBLOCK` set
+        // through either shows through both, and a blocking read through the
+        // received end of a pipe Detcore keeps physically nonblocking still
+        // waits for the writer. Checked before the anonymous-inode refusal, so
+        // a received eventfd is the sender's eventfd.
+        if let Some(open_file) = sent
+            .filter(|sent| sent.file == facts.file() && (lockstep || !anonymous))
+            .and_then(|sent| sent.open_file.as_ref())
+            && self
+                .join_sent_open_file(guest, fd, cloexec, open_file)
+                .await?
+        {
+            // The copy is no longer in flight: it was received, so its
+            // description may take a placeholder lock again
+            // (`procfs::locks::LockLedger::placeholder_copies`).
+            if let Ok(open_file_id) = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.open_file_id())
+            {
+                let _ = crate::tool_global::placeholder_copies(
+                    guest,
+                    crate::procfs::locks::PlaceholderCopies::Received(open_file_id),
+                )
+                .await;
+            }
+            return Ok(Receipt::Joined);
+        }
+        let stat = &facts.stat;
         // An anonymous inode (an eventfd, signalfd, timerfd, epoll set,
         // inotify instance, pidfd, userfaultfd, ...) has no file type, and
         // `fstat` cannot tell which it is. Recorded as an ordinary file, its
@@ -675,9 +1249,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `EFD_SEMAPHORE` eventfd read twice). Its link names an inotify
         // instance, which is recorded as one, so its reads renumber rename
         // cookies (`crate::syscalls::inotify`); any other is left unrecorded,
-        // as before.
+        // as before. Under record and replay the link is read through the
+        // recording (`Self::received_descriptor_link`), so replay, whose slot
+        // holds a stand-in eventfd, classifies the descriptor as the
+        // recording did.
         let link = if stat.st_mode & libc::S_IFMT == 0 {
-            self.received_descriptor_link(guest, fd).await
+            self.received_descriptor_link(guest, fd).await?
         } else {
             None
         };
@@ -686,9 +1263,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             // Open, and listed in the table's descriptor directory, but not
             // modelled.
-            guest
-                .thread_state()
-                .note_unmodelled_descriptor(fd, descriptor_flags & libc::FD_CLOEXEC != 0);
+            guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
             match &link {
                 Some(link) => warn!(
                     "[detcore] descriptor {fd}, received over SCM_RIGHTS, is an anonymous inode \
@@ -700,52 +1275,422 @@ impl<T: RecordOrReplay> Detcore<T> {
                      whose link cannot be read, so its kind is unknown: not recorded"
                 ),
             }
-            return Ok(false);
+            return Ok(Receipt::Unrecorded);
         }
-        if may_be_placeholder(&stat)
+        if may_be_placeholder(stat)
             && placeholders_exist()
             && self.renders_procfs(guest)
             && let Some(path) = placeholder_identity(stat.st_dev, stat.st_ino)
         {
             self.adopt_received_placeholder(guest, fd, path, (stat.st_dev, stat.st_ino))
                 .await?;
-            return Ok(true);
+            return Ok(Receipt::New);
         }
-        // Every received descriptor is a description of its own in the model,
-        // even where it is an alias of one this process holds (see the
-        // module documentation), made exactly as the in-guest discovery
-        // makes it: a directory gets a sorted stream of its own.
+        // Any other received descriptor is a description of its own in the
+        // model (see the module documentation), made exactly as the in-guest
+        // discovery makes it: a directory gets a sorted stream of its own.
         guest.thread_state().add_discovered_fd(
             fd,
-            descriptor_flags,
-            status_flags,
-            &stat,
+            facts.descriptor_flags,
+            facts.status_flags,
+            stat,
             link.as_deref(),
         )?;
         // A placeholder descriptor, which its identity and its tag tell apart
         // (`descriptor_directory`).
-        self.recognize_received_placeholder(guest, fd, &stat, status_flags)
+        self.recognize_received_placeholder(guest, fd, stat, facts.status_flags)
             .await;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFSOCK {
+            self.classify_socket_peer(guest, fd, SocketRole::Received)
+                .await;
+        }
+        Ok(Receipt::New)
+    }
+
+    /// Make received descriptor `fd` an alias of `open_file`, the description
+    /// its sender's table modeled, as `dup` would, with `FD_CLOEXEC` as
+    /// `cloexec` says; whether it did. Not once every modeled descriptor of
+    /// that description is closed. Under record and replay only where this
+    /// table holds a descriptor of it (the lowest numbered, `other`): replay
+    /// holds a stand-in in `fd` and first duplicates `other` over it, so that
+    /// the slot names the live open file (`Detcore::install_live_alias`).
+    async fn join_sent_open_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        cloexec: bool,
+        open_file: &OpenFileHandle,
+    ) -> Result<bool, Error> {
+        let Some(alias) = open_file.descriptor(fd, cloexec) else {
+            return Ok(false);
+        };
+        if self.cfg.recordreplay_modes {
+            let Some(other) = guest
+                .thread_state()
+                .lowest_slot_naming(alias.open_file_id())
+            else {
+                return Ok(false);
+            };
+            if self.cfg.replaying {
+                let flags = if cloexec {
+                    OFlag::O_CLOEXEC
+                } else {
+                    OFlag::empty()
+                };
+                self.install_live_alias(guest, other, fd, flags)
+                    .await
+                    .map_err(|errno| {
+                        Error::Tool(anyhow::anyhow!(
+                            "replay cannot make descriptor {fd} the alias of {other} the \
+                             recording found: {errno}"
+                        ))
+                    })?;
+            }
+        }
+        guest.thread_state().install_alias(alias);
         Ok(true)
     }
 
-    /// What descriptor `fd` of the calling thread links to, read in the
-    /// guest (`readlinkat` of `/proc/thread-self/fd/<fd>`, injected), or
-    /// `None` where that read fails or the link is longer than any anonymous
-    /// inode's. The path and the result share one buffer, staged where
-    /// `inject_fstat` stages its own
+    /// `call`, a passive probe of a received descriptor, through the
+    /// recording: recorded under record, served from the recording under
+    /// replay (which holds a stand-in where the recording held the
+    /// descriptor), injected otherwise. Retried while a signal stops it
+    /// before it runs; every attempt is an event, so replay retries as the
+    /// recording did.
+    async fn probe_received<G, S>(&self, guest: &mut G, call: S) -> Result<i64, Errno>
+    where
+        G: Guest<Self>,
+        S: Into<Syscall> + Copy,
+    {
+        const ATTEMPTS: usize = 64;
+        let mut last = Errno::ERESTARTSYS;
+        for _ in 0..ATTEMPTS {
+            match self.record_or_replay(guest, call).await {
+                Err(errno @ (Errno::EINTR | Errno::ERESTARTSYS)) => last = errno,
+                answer => return answer,
+            }
+        }
+        Err(last)
+    }
+
+    /// Whether a send through `socket` queues the open files its
+    /// `SCM_RIGHTS` messages carry ([`Self::queue_sent_rights`]): only where
+    /// this run records received descriptors, and only for a socket whose
+    /// peer Detcore knows (see the module documentation). If it does,
+    /// whether the pair is
+    /// `SOCK_STREAM`.
+    pub(crate) fn rights_peer_is_stream<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        socket: RawFd,
+    ) -> Option<bool> {
+        if self.receipt_mode(guest) != ReceiptMode::Recorded {
+            return None;
+        }
+        guest
+            .thread_state()
+            .with_detfd(socket, |socket| socket.rights_peer_is_stream())
+            .ok()
+            .flatten()
+    }
+
+    /// After a send through `socket` that completed in the caller's turn
+    /// ([`Self::completes_in_turn`]) and queues the open files it carries
+    /// ([`Self::rights_peer_is_stream`] says whether the pair is a stream,
+    /// `stream`), queue on the socket's peer, for each message Linux reports
+    /// sending (`sent`: the descriptors its `SCM_RIGHTS` messages carried,
+    /// and the bytes it sent), the open file description this table modeled
+    /// for each descriptor and the file's identity from an injected `fstat`,
+    /// so that the receipt can name the open file each received descriptor
+    /// is (see the module documentation).
+    ///
+    /// A stream socket's message of no bytes carried nothing: Linux attaches
+    /// the descriptors to the first buffer it queues, and queues none. A
+    /// message whose descriptors' facts cannot all be taken queues nothing,
+    /// so its receipt names no open file, as before. A send that failed
+    /// queued nothing in Linux and queues nothing here. A tool error (an
+    /// `fstat` under record and replay that could not be recorded) ends the
+    /// run.
+    pub(crate) async fn queue_sent_rights<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        socket: RawFd,
+        stream: bool,
+        sent: SentRights,
+    ) -> Result<(), Error> {
+        if sent.unread {
+            self.lose_peer_lockstep(guest, socket);
+        }
+        // A datagram send that names its destination reaches the socket it
+        // names, not the peer (`unix_dgram_sendmsg`); a seqpacket send
+        // ignores a name (`unix_seqpacket_sendmsg`) and a stream send with
+        // one fails (`unix_stream_sendmsg`).
+        let datagram = guest
+            .thread_state()
+            .with_detfd(socket, |socket| socket.unix_type())
+            .ok()
+            .flatten()
+            == Some(libc::SOCK_DGRAM);
+        for (fds, bytes, addressed) in sent.messages {
+            if stream && bytes == 0 {
+                continue;
+            }
+            if datagram && addressed {
+                // The named socket may be the peer itself, which then holds a
+                // message its queue does not.
+                self.lose_peer_lockstep(guest, socket);
+                continue;
+            }
+            let mut descriptors = Vec::with_capacity(fds.len());
+            for &fd in &fds {
+                // Through the recording, as the receipt's facts are, so that
+                // replay matches what the recording matched.
+                let stat = match self.received_descriptor_fstat(guest, fd).await {
+                    Ok(stat) => stat,
+                    Err(Error::Tool(error)) => return Err(Error::Tool(error)),
+                    Err(_) => break,
+                };
+                descriptors.push(SentDescriptor {
+                    file: (stat.st_dev, stat.st_ino),
+                    open_file: guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.open_file_handle())
+                        .ok(),
+                });
+            }
+            if descriptors.len() == fds.len() {
+                let mut descriptors = Some(descriptors);
+                let _ = guest.thread_state().with_detfd(socket, |socket| {
+                    descriptors
+                        .take()
+                        .is_some_and(|descriptors| socket.queue_rights_to_peer(descriptors))
+                });
+            } else {
+                self.lose_peer_lockstep(guest, socket);
+            }
+        }
+        Ok(())
+    }
+
+    /// A send through `socket` may have passed descriptors its peer's queue
+    /// does not hold: a message whose control data could not be read, one
+    /// whose descriptors' facts could not be taken, or a send outside the
+    /// caller's turn (`DetFd::lose_peer_lockstep`).
+    pub(crate) fn lose_peer_lockstep<G: Guest<Self>>(&self, guest: &mut G, socket: RawFd) {
+        let _ = guest
+            .thread_state()
+            .with_detfd(socket, |socket| socket.lose_peer_lockstep());
+    }
+
+    /// Whether this run pairs `AF_UNIX` connections, so that their sends
+    /// queue the open files they carry: where it records received
+    /// descriptors.
+    fn pairs_unix_sockets<G: Guest<Self>>(&self, guest: &G) -> bool {
+        self.receipt_mode(guest) == ReceiptMode::Recorded
+    }
+
+    /// `socketpair` made `fds`, of `family` and `kind` (its type, flags
+    /// included): each socket's messages reach the other, so a receive
+    /// through one can name the open files a send through the other carried
+    /// (see the module documentation).
+    pub(crate) fn note_socketpair<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fds: [RawFd; 2],
+        family: i32,
+        kind: i32,
+    ) {
+        // Linux's SOCK_TYPE_MASK: the type without SOCK_NONBLOCK and SOCK_CLOEXEC.
+        const SOCK_TYPE_MASK: i32 = 0xf;
+        if family != libc::AF_UNIX || !self.pairs_unix_sockets(guest) {
+            return;
+        }
+        let kind = kind & SOCK_TYPE_MASK;
+        if let Ok(first) = guest
+            .thread_state()
+            .with_detfd(fds[0], |first| first.clone())
+        {
+            let _ = guest.thread_state().with_detfd(fds[1], |second| {
+                first.set_unix_type(kind);
+                second.set_unix_type(kind);
+                first.pair_sockets(second, kind == libc::SOCK_STREAM);
+            });
+        }
+    }
+
+    /// `socket` made `fd`, of `family` and `kind` (its type, flags
+    /// included): record an `AF_UNIX` socket's type.
+    pub(crate) fn note_unix_socket<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        family: i32,
+        kind: i32,
+    ) {
+        // Linux's SOCK_TYPE_MASK: the type without SOCK_NONBLOCK and SOCK_CLOEXEC.
+        const SOCK_TYPE_MASK: i32 = 0xf;
+        if family == libc::AF_UNIX && self.pairs_unix_sockets(guest) {
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_unix_type(kind & SOCK_TYPE_MASK));
+        }
+    }
+
+    /// A `bind` gave socket `fd` the `AF_UNIX` name `name`
+    /// ([`unix_socket_name`]): a listener there starts with no connection
+    /// waiting.
+    pub(crate) fn note_unix_bind<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd, name: &[u8]) {
+        // An absolute path names another file from a task whose root may not
+        // be the container's: such a listener is not tracked.
+        if self.pairs_unix_sockets(guest) && !Self::path_names_another_file(guest, name) {
+            let generation = with_connections(guest, |connections| connections.bound(name));
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_unix_name(name.into(), generation));
+        }
+    }
+
+    /// A `connect` of socket `fd` to `address` succeeded, in the caller's
+    /// turn or not (`in_turn`, decided before the call,
+    /// [`Self::completes_in_turn`]).
+    ///
+    /// A datagram socket now sends to the socket it connected to, or to
+    /// none (`AF_UNSPEC`), not to the peer Detcore paired it with
+    /// (`DetFd::unpair_rights_peer`). A stream or seqpacket connection to a
+    /// name a guest bound queues for that listener's `accept`; only one
+    /// completed in the turn has a known place among the others. Any other
+    /// `AF_UNIX` connect may have reached any listener: through a relative
+    /// path or another spelling of a path, or from a socket whose type
+    /// Detcore did not see made ([`UnixConnections`]).
+    pub(crate) fn note_unix_connect<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        address: &UnixAddress,
+        in_turn: bool,
+    ) {
+        if !self.pairs_unix_sockets(guest) {
+            return;
+        }
+        let kind = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.unix_type())
+            .ok()
+            .flatten();
+        if kind == Some(libc::SOCK_DGRAM) {
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.unpair_rights_peer());
+            return;
+        }
+        let address = match address {
+            UnixAddress::Named(name) if Self::path_names_another_file(guest, name) => {
+                &UnixAddress::Unnamed
+            }
+            address => address,
+        };
+        match (address, kind) {
+            (UnixAddress::Other, _) => {}
+            (UnixAddress::Named(name), Some(libc::SOCK_STREAM | libc::SOCK_SEQPACKET)) => {
+                let socket = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.open_file_handle())
+                    .ok()
+                    .filter(|_| in_turn);
+                with_connections(guest, |connections| connections.connected(name, socket));
+            }
+            // A named connect of a socket whose type Detcore did not see made
+            // may be a stream connection: that name's order, or every name's
+            // where no guest bound it here, is unknown.
+            (UnixAddress::Named(name), None) => {
+                with_connections(guest, |connections| connections.connected(name, None));
+            }
+            (UnixAddress::Named(_), Some(_)) => {}
+            (UnixAddress::Unnamed, _) => with_connections(guest, UnixConnections::lost),
+        }
+    }
+
+    /// Whether `name`, an `AF_UNIX` name ([`UnixAddress::Named`]), is an
+    /// absolute path the calling task may resolve against another root
+    /// than the container's: one it, or a task it shares or inherited its
+    /// root from, changed with `chroot` (`ThreadState::changed_root`). An
+    /// abstract name names the same socket from any root.
+    fn path_names_another_file<G: Guest<Self>>(guest: &G, name: &[u8]) -> bool {
+        name.first() == Some(&b'/')
+            && guest
+                .thread_state()
+                .changed_root
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// An `accept` on `listener` made the connection `fd`, in the caller's
+    /// turn or not (`in_turn`): it is a socket of the listener's type, and
+    /// the peer of the socket whose `connect` it took, where Detcore knows
+    /// which ([`UnixConnections`]).
+    pub(crate) fn note_unix_accept<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        listener: RawFd,
+        fd: RawFd,
+        in_turn: bool,
+    ) {
+        if !self.pairs_unix_sockets(guest) {
+            return;
+        }
+        let Ok(Some((name, generation, kind))) = guest
+            .thread_state()
+            .with_detfd(listener, |detfd| detfd.unix_name_and_type())
+        else {
+            return;
+        };
+        let peer = with_connections(guest, |connections| {
+            connections.accepted(&name, generation, in_turn)
+        });
+        let _ = guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.set_unix_type(kind);
+            if let Some(peer) = &peer {
+                detfd.pair_with(peer, kind == libc::SOCK_STREAM);
+            }
+        });
+    }
+
+    /// What descriptor `fd` of the calling thread links to, or `None` where
+    /// that read fails or the link is longer than any anonymous inode's.
+    ///
+    /// Under record and replay the link is read through the recording
+    /// (`Detcore::recorded_descriptor_link`): replay's slot holds a stand-in
+    /// eventfd until the recording's answers say otherwise, so a live read
+    /// there would name the stand-in. A buffer that cannot be prepared ends
+    /// the run there, as for the received descriptor's `fstat`: no readlink
+    /// ran, so the other phase could consume an event this one did not.
+    ///
+    /// Otherwise it is read in the guest (`readlinkat` of
+    /// `/proc/thread-self/fd/<fd>`, injected). The path and the result share
+    /// one buffer, staged where `inject_fstat` stages its own
     /// ([`crate::syscalls::scratch::inject_with_scratch`]).
     async fn received_descriptor_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
-    ) -> Option<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if self.cfg.recordreplay_modes {
+            return self
+                .recorded_descriptor_link(guest, fd)
+                .await
+                .map_err(|errno| {
+                    Error::Tool(anyhow::anyhow!(
+                        "cannot record descriptor {fd}, received over SCM_RIGHTS, under record \
+                         and replay: no buffer for its link ({errno})"
+                    ))
+                });
+        }
         let mut buffer = [0_u8; LINK_PATH + LINK_TARGET];
         let spelled = format!("/proc/thread-self/fd/{fd}");
-        buffer
-            .get_mut(..spelled.len())?
-            .copy_from_slice(spelled.as_bytes());
-        let (length, bytes) =
+        let Some(slot) = buffer.get_mut(..spelled.len()) else {
+            return Ok(None);
+        };
+        slot.copy_from_slice(spelled.as_bytes());
+        let Ok((length, bytes)) =
             crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
                 // SAFETY: the buffer holds LINK_PATH + LINK_TARGET bytes.
                 let target = unsafe { base.add(LINK_PATH) };
@@ -757,11 +1702,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .into()
             })
             .await
-            .ok()?;
-        let length = usize::try_from(length)
+        else {
+            return Ok(None);
+        };
+        Ok(usize::try_from(length)
             .ok()
-            .filter(|length| *length < LINK_TARGET)?;
-        Some(bytes[LINK_PATH..LINK_PATH + length].to_vec())
+            .filter(|length| *length < LINK_TARGET)
+            .map(|length| bytes[LINK_PATH..LINK_PATH + length].to_vec()))
     }
 }
 
@@ -1083,5 +2030,182 @@ mod tests {
         stat.st_size = 0;
         stat.st_mode = libc::S_IFIFO | 0o600;
         assert!(!may_be_placeholder(&stat));
+    }
+
+    /// The `AF_UNIX` name an address gives: an abstract name whole, an
+    /// absolute path up to its NUL, and none for a relative path, another
+    /// family or an unnamed address.
+    #[test]
+    fn unix_socket_names_are_abstract_names_and_absolute_paths() {
+        let offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        let name_of = |family: i32, path: &[u8], length: usize| {
+            let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            address.sun_family = family as libc::sa_family_t;
+            for (slot, byte) in address.sun_path.iter_mut().zip(path) {
+                *slot = *byte as libc::c_char;
+            }
+            unix_socket_name(&LocalMemory::new(), (&raw const address) as usize, length)
+        };
+        assert_eq!(
+            name_of(libc::AF_UNIX, b"\0abc", offset + 4).as_deref(),
+            Some(&b"\0abc"[..])
+        );
+        assert_eq!(
+            name_of(libc::AF_UNIX, b"/tmp/s\0junk", offset + 11).as_deref(),
+            Some(&b"/tmp/s"[..])
+        );
+        assert_eq!(name_of(libc::AF_UNIX, b"relative", offset + 8), None);
+        assert_eq!(name_of(libc::AF_UNIX, b"", offset), None);
+        assert_eq!(name_of(libc::AF_INET, b"\0abc", offset + 4), None);
+    }
+
+    /// Connections to a bound name are taken by its accepts in order; a
+    /// connect or accept outside the turn leaves the order unknown until the
+    /// name is bound again.
+    #[test]
+    fn unix_connections_are_accepted_in_order() {
+        use crate::fd::DetFd;
+        use crate::fd::FdType;
+        use crate::types::DetTid;
+        use crate::types::OpenFileId;
+        let mut connections = UnixConnections::default();
+        let name = b"\0unix-connections-are-accepted-in-order";
+        let socket = |sequence| {
+            DetFd::new(
+                3,
+                nix::fcntl::OFlag::O_RDWR,
+                FdType::Socket,
+                OpenFileId::new(DetTid::from_raw(1), sequence),
+            )
+        };
+        let (first, second) = (socket(0), socket(1));
+        let taken = |accepted: Option<OpenFileHandle>| {
+            accepted
+                .and_then(|handle| handle.descriptor(9, false))
+                .map(|detfd| detfd.open_file_id())
+        };
+
+        connections.connected(name, Some(first.open_file_handle()));
+        let bind = connections.bound(name);
+        assert_eq!(
+            taken(connections.accepted(name, bind, true)),
+            None,
+            "no guest bound the name yet"
+        );
+        connections.connected(name, Some(first.open_file_handle()));
+        connections.connected(name, Some(second.open_file_handle()));
+        assert_eq!(
+            taken(connections.accepted(name, bind, true)),
+            Some(first.open_file_id())
+        );
+        assert_eq!(
+            taken(connections.accepted(name, bind, true)),
+            Some(second.open_file_id())
+        );
+        assert_eq!(taken(connections.accepted(name, bind, true)), None);
+
+        connections.connected(name, None);
+        connections.connected(name, Some(first.open_file_handle()));
+        assert_eq!(
+            taken(connections.accepted(name, bind, true)),
+            None,
+            "after a connect outside the turn"
+        );
+
+        let bind = connections.bound(name);
+        connections.connected(name, Some(second.open_file_handle()));
+        assert_eq!(taken(connections.accepted(name, bind, false)), None);
+        connections.connected(name, Some(first.open_file_handle()));
+        assert_eq!(
+            taken(connections.accepted(name, bind, true)),
+            None,
+            "after an accept outside the turn"
+        );
+    }
+
+    /// A connect Detcore cannot attribute to one bound name (a relative
+    /// path, another spelling of a path, a name no guest bound here) may have
+    /// reached any listener: every name's order is unknown until it is bound
+    /// again, so a later accept pairs with nothing rather than with the
+    /// wrong connecting socket.
+    #[test]
+    fn an_unattributed_connect_leaves_every_name_unknown() {
+        use crate::fd::DetFd;
+        use crate::fd::FdType;
+        use crate::types::DetTid;
+        use crate::types::OpenFileId;
+        let socket = |sequence| {
+            DetFd::new(
+                3,
+                nix::fcntl::OFlag::O_RDWR,
+                FdType::Socket,
+                OpenFileId::new(DetTid::from_raw(1), sequence),
+            )
+        };
+        let (first, second) = (socket(0), socket(1));
+        let taken = |accepted: Option<OpenFileHandle>| {
+            accepted
+                .and_then(|handle| handle.descriptor(9, false))
+                .map(|detfd| detfd.open_file_id())
+        };
+        let (path, other) = (&b"/tmp/listener"[..], &b"\0other-listener"[..]);
+
+        type Unattributed<'a> = Box<dyn Fn(&mut UnixConnections) + 'a>;
+        let unattributed: [Unattributed<'_>; 3] = [
+            // A relative path, or a socket of a type Detcore did not see made.
+            Box::new(|connections| connections.lost()),
+            // Another spelling of the bound path, in the turn or not.
+            Box::new(|connections| connections.connected(b"/tmp//listener", None)),
+            Box::new(|connections| {
+                connections.connected(b"/tmp/listener-link", Some(first.open_file_handle()))
+            }),
+        ];
+        for unattributed in unattributed {
+            let mut connections = UnixConnections::default();
+            let (bind, other_bind) = (connections.bound(path), connections.bound(other));
+            unattributed(&mut connections);
+            connections.connected(path, Some(second.open_file_handle()));
+            connections.connected(other, Some(first.open_file_handle()));
+            assert_eq!(taken(connections.accepted(path, bind, true)), None);
+            assert_eq!(taken(connections.accepted(other, other_bind, true)), None);
+
+            let bind = connections.bound(path);
+            connections.connected(path, Some(first.open_file_handle()));
+            assert_eq!(
+                taken(connections.accepted(path, bind, true)),
+                Some(first.open_file_id()),
+                "a new bind starts the name's order again"
+            );
+        }
+    }
+
+    /// A listener bound before its path was unlinked and bound again takes
+    /// connections Detcore no longer tracks: its accepts pair with nothing,
+    /// and the later listener's connections stay its own.
+    #[test]
+    fn a_listener_whose_name_was_bound_again_pairs_nothing() {
+        use crate::fd::DetFd;
+        use crate::fd::FdType;
+        use crate::types::DetTid;
+        use crate::types::OpenFileId;
+        let socket = DetFd::new(
+            3,
+            nix::fcntl::OFlag::O_RDWR,
+            FdType::Socket,
+            OpenFileId::new(DetTid::from_raw(1), 0),
+        );
+        let path = &b"/tmp/rebound"[..];
+        let mut connections = UnixConnections::default();
+        let earlier = connections.bound(path);
+        let later = connections.bound(path);
+        connections.connected(path, Some(socket.open_file_handle()));
+        assert!(connections.accepted(path, earlier, true).is_none());
+        assert!(
+            connections
+                .accepted(path, later, true)
+                .and_then(|handle| handle.descriptor(9, false))
+                .is_some_and(|detfd| detfd.open_file_id() == socket.open_file_id()),
+            "the later listener takes its own connection"
+        );
     }
 }

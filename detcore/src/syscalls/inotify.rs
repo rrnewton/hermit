@@ -675,14 +675,17 @@ pub(crate) async fn queued_before<G, T, C>(guest: &mut G, fd: RawFd, call: C) ->
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
-    C: SyscallInfo + Into<Syscall>,
+    C: SyscallInfo + Into<Syscall> + crate::syscalls::helpers::NonblockableSyscall,
 {
     let config = guest.config();
     if !config.sequentialize_threads || config.recordreplay_modes {
         return None;
     }
+    let wrapped: Syscall = call.into();
+    let call_fd = crate::syscalls::helpers::get_fd(wrapped)
+        .unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
     if !matches!(
-        crate::syscalls::helpers::ioaction_based_on_fd_status(guest, call),
+        crate::syscalls::helpers::ioaction_based_on_fd(guest, call_fd),
         Ok(crate::syscalls::helpers::IOAction::PassThru)
     ) {
         return None;

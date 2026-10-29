@@ -127,7 +127,7 @@ fn run_with_containment(
     hermit::declare_dbt_launcher(&mut config, &drrun).expect("declare actual DBT launcher");
     hermit::record_dbt_launched_image(&mut config, Path::new(program), Some(Path::new("/")), None);
     config.validate();
-    let environment = BTreeMap::<OsString, OsString>::from([
+    let mut environment = BTreeMap::<OsString, OsString>::from([
         ("PATH".into(), "/usr/bin:/bin".into()),
         ("LANG".into(), "C".into()),
         ("LC_ALL".into(), "C".into()),
@@ -139,6 +139,11 @@ fn run_with_containment(
             detcore::config_wire_fingerprint().into(),
         ),
     ]);
+    if std::env::var_os("HERMIT_TEST_DBT_PLACEMENT_MAPPING_CHILD").is_some() {
+        let observer = std::env::var_os(super::dbt_placement_probe::OBSERVER_ENV)
+            .expect("isolated placement observer path");
+        environment.insert("LD_PRELOAD".into(), observer);
+    }
     // Pending-completion errors can be returned after captured guest output
     // was collected. Keep native records in the runner's separate real channel.
     static NEXT_RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -569,6 +574,7 @@ fn dbt_mapping_capture_preserves_legitimate_nonzero_guest_exits() {
                 "--test-threads=1",
             ])
             .env(CHILD, "1")
+            .env(super::dbt_placement_probe::OBSERVER_ENV, probe.observer())
             .env("HERMIT_INSTALL_DIR", install)
             .output()
             .expect("run isolated mapping placement controls");

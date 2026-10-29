@@ -18847,7 +18847,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "96");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "102");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -18929,16 +18929,24 @@ mod nextest_timeout_tests {
         // (https://github.com/rrnewton/hermit/issues/4604): 94. And
         // run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing
         // and run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity
-        // (https://github.com/rrnewton/hermit/issues/4798): 96. The spinner is
+        // (https://github.com/rrnewton/hermit/issues/4798): 96. And
+        // run_kvm_relative_names_are_decided_by_the_guests_working_directory,
+        // run_kvm_dotdot_names_are_decided_by_where_they_lead,
+        // run_kvm_the_virtual_cpus_are_listed_by_every_spelling,
+        // run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory
+        // and run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files
+        // (https://github.com/rrnewton/hermit/issues/4541): 101. And
+        // run_kvm_signal_permits_are_per_thread
+        // (https://github.com/rrnewton/hermit/issues/4899): 102. The spinner is
         // retained but ignored and excluded because its explicit maximum
-        // requests an unavailable timer: 95 selected CLI tests remain.
+        // requests an unavailable timer: 101 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            96,
+            102,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 95);
+        assert_eq!(names.len(), 101);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -18967,6 +18975,12 @@ mod nextest_timeout_tests {
             "run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none",
             "run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing",
             "run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity",
+            "run_kvm_relative_names_are_decided_by_the_guests_working_directory",
+            "run_kvm_dotdot_names_are_decided_by_where_they_lead",
+            "run_kvm_the_virtual_cpus_are_listed_by_every_spelling",
+            "run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory",
+            "run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files",
+            "run_kvm_signal_permits_are_per_thread",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -20065,7 +20079,15 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing
         // and run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity
         // (https://github.com/rrnewton/hermit/issues/4798): 96 selected.
-        ("privileged-only-test.cli_kvm", 96usize),
+        // run_kvm_relative_names_are_decided_by_the_guests_working_directory,
+        // run_kvm_dotdot_names_are_decided_by_where_they_lead,
+        // run_kvm_the_virtual_cpus_are_listed_by_every_spelling,
+        // run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory
+        // and run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files
+        // (https://github.com/rrnewton/hermit/issues/4541): 101 selected. And
+        // run_kvm_signal_permits_are_per_thread
+        // (https://github.com/rrnewton/hermit/issues/4899): 102 selected.
+        ("privileged-only-test.cli_kvm", 102usize),
     ] {
         let step = privileged
             .steps

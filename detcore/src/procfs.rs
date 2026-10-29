@@ -460,12 +460,21 @@ pub struct CmdlineArea {
 }
 
 /// The most bytes one argument or environment string takes, its NUL
-/// included: Linux's `MAX_ARG_STRLEN` (32 pages), past which an exec fails.
-const MAX_ARG_STRLEN: u64 = 32 * 4096;
+/// included: Linux's `MAX_ARG_STRLEN` (32 pages, include/uapi/linux/binfmts.h),
+/// past which an exec fails.
+fn max_arg_strlen() -> u64 {
+    32 * crate::page::page_size()
+}
 
 /// The page size `get_mm_cmdline` reads in, and which bounds a
-/// `setproctitle` title (`get_mm_proctitle`).
-const CMDLINE_PAGE: u64 = 4096;
+/// `setproctitle` title (`get_mm_proctitle`): the host's.
+fn cmdline_page() -> u64 {
+    crate::page::page_size()
+}
+
+/// How much [`string_length`] reads at a time. 4096 divides every page
+/// size, so a read never crosses a page boundary.
+const STRING_CHUNK: u64 = 4096;
 
 /// The argument and environment areas of a new image whose initial stack
 /// pointer is `stack`, found as `create_elf_tables` makes them: from
@@ -539,12 +548,13 @@ pub(crate) fn initial_stack_cmdline_area(
 /// be read or no NUL comes within that bound.
 fn string_length(at: u64, read: &mut impl FnMut(u64, &mut [u8]) -> usize) -> Option<u64> {
     let mut length = 0;
-    let mut chunk = [0_u8; CMDLINE_PAGE as usize];
-    while length < MAX_ARG_STRLEN {
+    let mut chunk = [0_u8; STRING_CHUNK as usize];
+    let max_arg_strlen = max_arg_strlen();
+    while length < max_arg_strlen {
         let address = at.checked_add(length)?;
         // Up to the next page boundary, so that a read stops where the
         // mapped bytes do.
-        let size = (CMDLINE_PAGE - address % CMDLINE_PAGE).min(MAX_ARG_STRLEN - length) as usize;
+        let size = (STRING_CHUNK - address % STRING_CHUNK).min(max_arg_strlen - length) as usize;
         let got = read(address, &mut chunk[..size]);
         if got == 0 {
             return None;
@@ -629,10 +639,10 @@ pub(crate) fn read_cmdline(
     }
     let mut last = [0_u8];
     if memory.read(arg_end - 1, &mut last) == 1 && last[0] != 0 {
-        if pos >= CMDLINE_PAGE {
+        if pos >= cmdline_page() {
             return Ok(0);
         }
-        let mut page = vec![0_u8; CMDLINE_PAGE as usize];
+        let mut page = vec![0_u8; cmdline_page() as usize];
         let got = memory.read(arg_start, &mut page);
         if got == 0 {
             return Ok(0);
@@ -660,9 +670,9 @@ pub(crate) fn read_cmdline(
     };
     let mut remaining = count.min(arg_end - at);
     let mut copied = 0;
-    let mut page = vec![0_u8; CMDLINE_PAGE as usize];
+    let mut page = vec![0_u8; cmdline_page() as usize];
     while remaining > 0 {
-        let size = remaining.min(CMDLINE_PAGE) as usize;
+        let size = remaining.min(cmdline_page()) as usize;
         let got = memory.read(at, &mut page[..size]);
         if got == 0 {
             break;
@@ -3554,12 +3564,18 @@ fn sanitize_status_held(
             normalized.extend_from_slice(PPID);
             normalized.extend_from_slice(format!("\t{virtual_ppid}").as_bytes());
         } else if body.starts_with(TRACER_PID) {
+            // No guest task has a tracer the guest could know of: Detcore
+            // refuses `ptrace` to every guest
+            // (`is_privileged_observation_refused_syscall`), and the backend's
+            // own tracer (under ptrace, Hermit's container init, pid 1 in the
+            // guest's pid namespace) is not the guest's debugger. Linux shows 0
+            // for a task with no tracer (`task_state`, fs/proc/array.c,
+            // lines 156, 163-165 and 188 at v6.16), which is what the program
+            // reads natively. Showing the tracer sent programs that look for a
+            // debugger down their debugger path: a death test's assertion then
+            // raised SIGTRAP to break into it instead of aborting.
             normalized.extend_from_slice(TRACER_PID);
-            normalized.extend_from_slice(if virtual_identity.is_some() {
-                b"\t1"
-            } else {
-                b"\t0"
-            });
+            normalized.extend_from_slice(b"\t0");
         } else if body.starts_with(NS_PGID) || body.starts_with(NS_SID) {
             let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
             normalized.extend_from_slice(label);
@@ -7470,8 +7486,27 @@ Rss:                   4 kB\n" as &[u8];
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
             sanitize_status(input, Some((3, 3, 1)), None, false),
-            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t0\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
+    }
+
+    /// A status shows no tracer, as Linux does for a task nobody traces,
+    /// whatever the kernel reports for the backend's own tracer and whether
+    /// the status is the reader's own (a virtual identity) or another task's.
+    #[test]
+    fn status_shows_no_tracer() {
+        for kernel_tracer in ["0", "1", "4242"] {
+            let input = format!("Name:\tcat\nPid:\t1234\nTracerPid:\t{kernel_tracer}\n");
+            for identity in [Some((3, 3, 1)), None] {
+                let output =
+                    String::from_utf8(sanitize_status(input.as_bytes(), identity, None, false))
+                        .unwrap();
+                assert!(
+                    output.contains("\nTracerPid:\t0\n"),
+                    "kernel TracerPid {kernel_tracer}, identity {identity:?}: {output:?}"
+                );
+            }
+        }
     }
 
     #[test]

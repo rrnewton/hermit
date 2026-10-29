@@ -239,7 +239,12 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
+    use crate::ivar::Ivar;
     use crate::preemptions::PreemptionWriter;
+    use crate::resources::Permission;
+    use crate::resources::ResourceID;
+    use crate::resources::Resources;
+    use crate::scheduler::ThreadNextTurn;
     use crate::scheduler::boundary_replayer::BoundaryReplayer;
     use crate::scheduler::runqueue::DEFAULT_PRIORITY;
 
@@ -521,6 +526,47 @@ mod tests {
         );
         assert_eq!((scheduler.turn, scheduler.committed_time), before);
         assert!(!scheduler.replay_priorities_released);
+    }
+
+    /// The replayed-SIGCHLD rule reads the boundary cursor too: a parked or
+    /// arriving delivery is not held behind a replay-held polling retry when
+    /// the next stored record, here a timeslice-end marker, is the signaled
+    /// thread's, and it still is when the next record is the poller's
+    /// (`Scheduler::sigchld_waits_behind_work`).
+    #[test]
+    fn a_replayed_sigchld_reads_the_boundary_cursor() {
+        let (poller, signaled) = (DetTid::from_raw(3), DetTid::from_raw(7));
+        for (next_owner, waits) in [(7, false), (3, true)] {
+            let mut scheduler = scheduler(vec![marker(next_owner, 1)]);
+            let mut polling = Resources::new(poller);
+            polling.insert(ResourceID::InternalIOPolling, Permission::W);
+            scheduler.next_turns.insert(
+                poller,
+                ThreadNextTurn {
+                    dettid: poller,
+                    child_tid_addr: 0,
+                    req: Ivar::full(Ok(polling)),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler
+                .priorities
+                .insert(poller, REPLAY_DEFERRED_PRIORITY);
+            scheduler.runqueue_push_back(poller);
+            assert!(scheduler.run_queue.has_runnable_besides(signaled));
+            assert_eq!(
+                scheduler.sigchld_waits_behind_work(signaled),
+                waits,
+                "next record owned by {next_owner}"
+            );
+            scheduler.blocked.sigchld_deferred.insert(signaled);
+            assert_eq!(
+                scheduler.replay_readmits_parked_sigchld(),
+                (!waits).then_some(signaled),
+                "next record owned by {next_owner}"
+            );
+        }
     }
 
     #[test]

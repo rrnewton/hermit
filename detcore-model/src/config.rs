@@ -608,6 +608,20 @@ pub struct Config {
     #[clap(long)]
     pub imprecise_timers: bool,
 
+    /// Stop the guest at every timeslice end, including one where no other
+    /// guest thread could run. By default Hermit does not stop a thread that
+    /// is the only one able to run before it next enters Detcore (every other
+    /// thread waits on a futex without a timeout, on a child or in
+    /// `rt_sigsuspend`; no timer, sleeper, poll deadline or host call is
+    /// pending): it processes those timeslice ends when the thread next
+    /// enters Detcore, at the same branch counts and in the same order, so the
+    /// schedule, the virtual clock and the chaos draws are the same either
+    /// way and only the stops are saved. This option turns that off, for
+    /// comparison.
+    #[serde(default)]
+    #[clap(long)]
+    pub eager_lone_preemptions: bool,
+
     /// Turn off Detcore's own copy of each guest thread's signal dispositions
     /// and masks (A5, docs/SIGNAL_STATE_CHECK.md). The copy is on by default
     /// where it can run (ptrace with serialized threads): it is checked
@@ -731,6 +745,16 @@ pub struct Config {
     #[clap(long)]
     pub die_on_desync: bool,
 
+    /// The preemption record `--replay-preemptions-from` reads is not the recording of this
+    /// run's schedule but an edited one, for example one `hermit analyze` knocked preemptions
+    /// out of. A thread then can reach recorded slices that have already ended, which a faithful
+    /// replay never does: the replay skips them and goes on with the first recorded slice still
+    /// ahead, at its priority, instead of stopping the run. (At a thread's start the record's
+    /// first priority, which the scheduler has already applied, holds until that slice ends.)
+    #[serde(default)]
+    #[clap(long, requires = "replay_preemptions_from")]
+    pub replay_edited_preemptions: bool,
+
     /// Given schedule events traced on recording or replaying, print the stack trace at the moment
     /// after the Nth event in the trace. Optionally, provide an output file into which the stack
     /// trace will be printed, otherwise it goes to stderr.
@@ -851,6 +875,19 @@ pub struct Config {
     /// Set this to `disabled` or `0` to disable PMU-backed preemption. Positive values must be at
     /// least one RCB (10 virtual nanoseconds at the default clock multiplier) and require
     /// user-space hardware performance counters.
+    ///
+    /// Small values are expensive. A thread that computes without returning to Detcore is stopped
+    /// by a PMU timer event at the end of every timeslice, and on the ptrace backend a precise
+    /// timer (the default) is placed by stepping the guest through up to the last skid margin of
+    /// the slice: 100 to 10000 RCBs depending on the processor, or the `--skid-margin` override. A
+    /// slice no longer than the margin is stepped through whole. A CPU-bound guest can run
+    /// thousands of times slower than at the default (a pipeline test took 0.3 s at the default and
+    /// 994 s at 1000), and a `--timeout` that expires may mean a slow run rather than a hung one.
+    /// `hermit run`, `hermit analyze` and `hermit bisect` say so on stderr when a slice is at most
+    /// ten skid margins long, so that at least a tenth of it is stepped (1000000 virtual
+    /// nanoseconds at the default clock multiplier on a processor with a 10000-RCB margin); a
+    /// preemption replay, whose recording sets the slices, and `--imprecise-timers`, which steps
+    /// nothing, say nothing. `--summary` reports how many timeslices the run had.
     #[serde(alias = "preemption_timeout")]
     #[clap(
                 long,
@@ -1439,15 +1476,31 @@ impl Config {
         self.epoch = epoch_from_host_time(now);
     }
 
-    /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
-    pub fn minimum_max_timeslice_nanos(&self) -> u64 {
+    /// Virtual nanoseconds one RCB takes at this clock multiplier and, under a
+    /// chaos per-thread slowdown, at its largest factor: the most any thread's
+    /// RCB takes, so a timeslice of `n` virtual nanoseconds is at least
+    /// `n / largest_nanos_per_rcb()` RCBs for every thread.
+    ///
+    /// The two multipliers are combined first and then applied to
+    /// `NANOS_PER_RCB`, the order of the one-RCB PMU epsilon that Detcore's
+    /// post-hook compares with the end of the maximum
+    /// (`post_handler_hook_observed` and `callback_checkpoint_expiry_due` in
+    /// `detcore/src/lib.rs`), which [`Self::minimum_max_timeslice_nanos`]
+    /// bounds. Floating-point multiplication is not associative: at a clock
+    /// multiplier of 2.5 and a largest factor of 4.4, `(10 * 2.5) * 4.4` is one
+    /// unit in the last place above 110, which would raise that minimum to 111.
+    pub fn largest_nanos_per_rcb(&self) -> f64 {
         let slowdown = if self.chaos && self.chaos_per_thread_slowdown {
             self.chaos_slowdown_max_factor
         } else {
             1.0
         };
-        let multiplier = self.clock_multiplier.unwrap_or(1.0) * slowdown;
-        ((NANOS_PER_RCB * multiplier).ceil() as u64).max(NANOS_PER_RCB as u64)
+        NANOS_PER_RCB * (self.clock_multiplier.unwrap_or(1.0) * slowdown)
+    }
+
+    /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
+    pub fn minimum_max_timeslice_nanos(&self) -> u64 {
+        (self.largest_nanos_per_rcb().ceil() as u64).max(NANOS_PER_RCB as u64)
     }
 
     /// Check invariants that must hold at every execution boundary without mutating the config.
@@ -1555,6 +1608,42 @@ impl Config {
     /// This is independent of RCB accounting and does not certify a clock.
     pub fn use_preemption_timer(&self) -> bool {
         self.max_timeslice.is_some() && self.backend.delivers_preemption_timer_events
+    }
+
+    /// Whether a thread that is the only one able to run may skip its
+    /// timeslice-end stops and have them processed when it next enters
+    /// Detcore (see [`Config::eager_lone_preemptions`]). Only where a
+    /// timeslice end reads nothing from the guest but its branch count, and
+    /// nothing but the thread's next entry could act before the next one:
+    /// precise PMU timers keyed to retired branches at one virtual-time rate,
+    /// no recorded or replayed schedule or preemptions (they capture guest
+    /// state at each end), no slice-boundary protocol, no stack traces at
+    /// preemptions or events, no turn-numbered triggers (`--stop-after-turn`,
+    /// `--stop-after-iter`, `--signal-at`), no happens-before program, no
+    /// manual interrupt points and no syscall-boundary deadline
+    /// (`--target-timeslice`). Never with a gdbserver either: a debugger is
+    /// served at the stops, and between skipped ends it would see Detcore's
+    /// slice bookkeeping lag the guest's program counter.
+    pub fn replays_lone_preemptions(&self) -> bool {
+        !self.eager_lone_preemptions
+            && self.use_preemption_timer()
+            && self.use_rcb_time()
+            && self.sequentialize_threads
+            && !self.imprecise_timers
+            && !self.chaos_per_thread_slowdown
+            && !self.record_preemptions
+            && !self.strict_schedule_boundaries
+            && self.replay_preemptions_from.is_none()
+            && self.replay_schedule_from.is_none()
+            && self.target_timeslice.is_none()
+            && !self.preemption_stacktrace
+            && self.stacktrace_event.is_empty()
+            && self.stop_after_turn.is_none()
+            && self.stop_after_iter.is_none()
+            && self.signal_at.is_none()
+            && self.happens_before.is_none()
+            && self.interrupt_at.is_empty()
+            && !self.gdbserver
     }
 
     /// Should we use RCB in computing logical time?
@@ -1783,6 +1872,9 @@ impl fmt::Display for Config {
         if self.imprecise_timers {
             write!(f, " --imprecise-timers")?;
         }
+        if self.eager_lone_preemptions {
+            write!(f, " --eager-lone-preemptions")?;
+        }
         if !self.signal_state_copy {
             write!(f, " --no-signal-state-copy")?;
         }
@@ -1813,6 +1905,9 @@ impl fmt::Display for Config {
         }
         if self.die_on_desync {
             write!(f, " --die-on-desync")?;
+        }
+        if self.replay_edited_preemptions {
+            write!(f, " --replay-edited-preemptions")?;
         }
         for (index, path) in &self.stacktrace_event {
             write!(f, " --stacktrace-event={}", index)?;
@@ -2425,7 +2520,8 @@ fn config_wire_default() -> Config {
     config.sched_seed = None;
     // `BackendCapabilities` is defined in Reverie, outside
     // `CONFIG_DEFINITION_SOURCES`, so the source domain cannot see a change to
-    // it; only its encoding can. Every field is a bool, so any constant
+    // it; only its encoding can. Every field encodes in one byte (a bool, or
+    // the `u8` width of `hardware_watchpoints`), so any constant
     // carries every field's width (see
     // `config_fingerprint_sees_the_width_of_every_backend_capability`). KVM's
     // is kept, as it was when one field was optional and only KVM's set it.
@@ -2527,7 +2623,8 @@ impl Default for Config {
 /// [`Config::in_guest_signal_delivery`], false for DBT, which read back as
 /// false. So is [`Config::notice_host_network_abstract_binds`], added after this form
 /// froze, which reads back as false: DBT's runtime then prints no notice for
-/// an abstract `AF_UNIX` bind. Every
+/// an abstract `AF_UNIX` bind. So is [`Config::eager_lone_preemptions`], added after this form froze,
+/// which has no effect without a PMU timer and reads back as false. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
@@ -2961,6 +3058,14 @@ impl LegacyBackendKeys {
         backend.reports_sigreturns = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
+        // Added after the legacy form froze (Reverie 1161 made it a `u8`
+        // width). The legacy form carries no width for it: by absence it
+        // says the bool false, and the minimal width that represents a
+        // legacy bool false is 0, so it reads back as 0. A backend with a
+        // nonzero width (ptrace reports 4 on x86_64) is preserved exactly
+        // only by the versioned envelope of `encode_backend_config_json`,
+        // never by these keys.
+        backend.hardware_watchpoints = 0;
         backend
     }
 }
@@ -3066,7 +3171,13 @@ mod legacy_backend_json {
     /// `notice_host_network_abstract_binds` came after it too. It is never written and
     /// reads as false, so the DBT runtime prints no notice for an abstract
     /// `AF_UNIX` bind under host networking.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 32] = [
+    /// `replay_edited_preemptions` came after it too. It is never written and
+    /// reads as false; it cannot matter there, since a timerless backend
+    /// such as DBT refuses `--replay-preemptions-from`, which it requires.
+    /// `eager_lone_preemptions` came after it too. DBT has no PMU timer, so
+    /// the option has no effect there; it is never written and reads as
+    /// false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 34] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3099,6 +3210,8 @@ mod legacy_backend_json {
         "annotated_priority_replay",
         "virtual_cpus",
         "notice_host_network_abstract_binds",
+        "replay_edited_preemptions",
+        "eager_lone_preemptions",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3196,8 +3309,8 @@ mod legacy_backend_json {
     /// [`Config::in_guest_signal_delivery`], [`Config::launch_image`],
     /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
-    /// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`] or
-    /// [`Config::inherited_seccomp`] takes
+    /// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`],
+    /// [`Config::inherited_seccomp`] or [`Config::replay_edited_preemptions`] takes
     /// an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
@@ -3242,7 +3355,9 @@ mod legacy_backend_json {
                     | "replaying"
                     | "signal_delivery_check_fatal"
                     | "container_procfs"
-                    | "notice_host_network_abstract_binds",
+                    | "notice_host_network_abstract_binds"
+                    | "replay_edited_preemptions"
+                    | "eager_lone_preemptions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
                 Some("in_guest_reserved_signals") => {
@@ -3558,7 +3673,9 @@ mod legacy_backend_json {
                 | "in_guest_signal_delivery"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
-                | "notice_host_network_abstract_binds" => Ok(()),
+                | "notice_host_network_abstract_binds"
+                | "replay_edited_preemptions"
+                | "eager_lone_preemptions" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3770,6 +3887,9 @@ mod tests {
         backend.promotes_open_files_before_native_lifecycle =
             backend.requires_thread_directed_process_signals;
         backend.loopback_pollers_yield_to_peers = backend.tool_shares_guest_descriptor_table;
+        // The legacy form carries no width for `hardware_watchpoints`: it
+        // reads back as 0, the minimal width (see `LegacyBackendKeys::capabilities`).
+        backend.hardware_watchpoints = 0;
         backend
     }
 
@@ -3860,7 +3980,13 @@ mod tests {
         let baseline = serde_json::to_value(BackendCapabilities::DBT).unwrap();
         for (name, value) in baseline.as_object().unwrap() {
             let mut edited = baseline.clone();
-            edited[name] = serde_json::Value::Bool(!value.as_bool().unwrap());
+            // Every capability is a bool except `hardware_watchpoints`, a
+            // `u8` width: flip it to another width (0 is DBT's, so 1).
+            edited[name] = if name == "hardware_watchpoints" {
+                serde_json::Value::from(1u8)
+            } else {
+                serde_json::Value::Bool(!value.as_bool().unwrap())
+            };
             let backend = serde_json::from_value(edited).unwrap();
             let sent = Config {
                 backend,
@@ -4246,8 +4372,8 @@ mod tests {
     /// `in_guest_signal_delivery`,
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
-    /// `scheduler_turn_cost`, `cap_preemption_charge` or
-    /// `inherited_seccomp`, which is the
+    /// `scheduler_turn_cost`, `cap_preemption_charge`,
+    /// `inherited_seccomp` or `replay_edited_preemptions`, which is the
     /// key order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
@@ -4293,7 +4419,9 @@ mod tests {
                 | "in_guest_signal_delivery"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
-                | "notice_host_network_abstract_binds" => {}
+                | "notice_host_network_abstract_binds"
+                | "replay_edited_preemptions"
+                | "eager_lone_preemptions" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -4315,12 +4443,13 @@ mod tests {
         // `mountinfo_mount_namespace`, `directory_placeholder`,
         // `container_procfs`, `signal_delivery_check_fatal`,
         // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
-        // `annotated_priority_replay`, `virtual_cpus`,
-        // `notice_host_network_abstract_binds` and `strict_schedule_boundaries`
-        // none: fourteen more keys and thirty-one fewer, so seventeen keys fewer
+        // `annotated_priority_replay`, `virtual_cpus`, `replay_edited_preemptions`,
+        // `notice_host_network_abstract_binds`, `eager_lone_preemptions` and
+        // `strict_schedule_boundaries`
+        // none: fourteen more keys and thirty-three fewer, so nineteen keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 17);
+        assert_eq!(fields.len(), keys.len() + 19);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5045,6 +5174,39 @@ mod tests {
         assert!(!Config::default().to_string().contains("virtual-cpus"));
     }
 
+    /// `eager_lone_preemptions` came after the legacy form froze, so it never
+    /// enters it (DBT has no PMU timer, where it would act), and both the
+    /// object and the array form read it back as false.
+    #[test]
+    fn eager_lone_preemptions_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            eager_lone_preemptions: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("eager_lone_preemptions"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .eager_lone_preemptions
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .eager_lone_preemptions
+        );
+    }
+
     /// `Config` crosses Reverie RPC as positional legacy bincode, so
     /// `signal_at` is encoded whether set or not.
     #[test]
@@ -5323,6 +5485,92 @@ mod tests {
                 .unwrap()
                 .in_guest_signal_delivery
         );
+    }
+
+    /// `--replay-edited-preemptions` stays out of the legacy (DBT) form, and
+    /// reads as false from it.
+    #[test]
+    fn replay_edited_preemptions_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            replay_preemptions_from: Some("record.preempts".into()),
+            ..Config::default()
+        };
+        let on = Config {
+            replay_edited_preemptions: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("replay_edited_preemptions"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .replay_edited_preemptions
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .replay_edited_preemptions
+        );
+    }
+
+    /// `--replay-edited-preemptions` describes the record
+    /// `--replay-preemptions-from` reads, so it needs one. It round-trips
+    /// through the rendered options and through Reverie's bincode handshake,
+    /// and a JSON configuration without the key reads as off.
+    #[test]
+    fn replay_edited_preemptions_needs_a_replayed_record_and_round_trips() {
+        assert!(Config::try_parse_from(["detcore", "--replay-edited-preemptions"]).is_err());
+        let config = Config::try_parse_from([
+            "detcore",
+            "--replay-preemptions-from=record.preempts",
+            "--replay-edited-preemptions",
+        ])
+        .unwrap();
+        assert!(config.replay_edited_preemptions);
+        // The rendered options parse back to the same replay settings.
+        let rendered = config.to_string();
+        let words: Vec<String> = shell_words::split(&rendered)
+            .unwrap()
+            .into_iter()
+            .filter(|word| word.starts_with("--replay-"))
+            .collect();
+        let reparsed =
+            Config::try_parse_from(std::iter::once("detcore".to_owned()).chain(words)).unwrap();
+        assert!(reparsed.replay_edited_preemptions, "{rendered}");
+        assert_eq!(
+            reparsed.replay_preemptions_from, config.replay_preemptions_from,
+            "{rendered}"
+        );
+        let strict =
+            Config::try_parse_from(["detcore", "--replay-preemptions-from=record.preempts"])
+                .unwrap();
+        assert!(!strict.to_string().contains("--replay-edited-preemptions"));
+
+        for config in [&config, &strict] {
+            let wire = bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(
+                decoded.replay_edited_preemptions,
+                config.replay_edited_preemptions
+            );
+        }
+        let mut encoded = serde_json::to_value(&config).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("replay_edited_preemptions")
+            .expect("the field is serialized");
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.replay_edited_preemptions);
     }
 
     /// The gate reaches every Tool image through Reverie's bincode handshake
@@ -5902,6 +6150,162 @@ mod tests {
         assert!(!restored.container_procfs);
     }
 
+    /// Lone slice ends are processed without stops only where a slice end
+    /// reads nothing from the guest but its branch count: each listed option
+    /// turns it off.
+    #[test]
+    fn lone_preemptions_are_replayed_only_where_a_slice_end_reads_nothing_else() {
+        let base = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::PTRACE,
+            ..Config::parse_from(["detcore"])
+        };
+        assert!(base.replays_lone_preemptions());
+        let off: Vec<(&str, Config)> = vec![
+            (
+                "--eager-lone-preemptions",
+                Config {
+                    eager_lone_preemptions: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "no sequentialization",
+                Config {
+                    sequentialize_threads: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--max-timeslice=disabled",
+                Config {
+                    max_timeslice: None,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--no-rcb-time",
+                Config {
+                    no_rcb_time: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--imprecise-timers",
+                Config {
+                    imprecise_timers: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--chaos-per-thread-slowdown",
+                Config {
+                    chaos_per_thread_slowdown: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--record-preemptions",
+                Config {
+                    record_preemptions: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--strict-schedule-boundaries",
+                Config {
+                    strict_schedule_boundaries: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--replay-preemptions-from",
+                Config {
+                    replay_preemptions_from: Some("p".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--replay-schedule-from",
+                Config {
+                    replay_schedule_from: Some("s".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--target-timeslice",
+                Config {
+                    target_timeslice: NonZeroU64::new(1_000),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--preemption-stacktrace",
+                Config {
+                    preemption_stacktrace: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--stacktrace-event",
+                Config {
+                    stacktrace_event: vec![(1, None)],
+                    ..base.clone()
+                },
+            ),
+            (
+                "--stop-after-turn",
+                Config {
+                    stop_after_turn: Some(1),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--stop-after-iter",
+                Config {
+                    stop_after_iter: Some(1),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--interrupt-at",
+                Config {
+                    interrupt_at: vec![(DetTid::from_raw(3), 1)],
+                    ..base.clone()
+                },
+            ),
+            (
+                "--signal-at",
+                Config {
+                    signal_at: Some(parse_signal_at("turn=1:SIGUSR1").unwrap()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--happens-before",
+                Config {
+                    happens_before: Some(crate::happens_before::HappensBeforeProgram {
+                        version: 1,
+                        anchors: Default::default(),
+                        edges: Vec::new(),
+                        max_hold_ns: None,
+                    }),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--gdbserver",
+                Config {
+                    gdbserver: true,
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (option, config) in off {
+            assert!(!config.replays_lone_preemptions(), "{option}");
+        }
+    }
+
     #[test]
     fn runs_post_fork_parses_all_modes_and_defaults_to_child() {
         assert_eq!(Config::default().runs_post_fork, RunsPostFork::Child);
@@ -6186,18 +6590,25 @@ mod tests {
     fn config_fingerprint_sees_the_width_of_every_backend_capability() {
         // `BackendCapabilities` lives in Reverie, outside the fingerprinted
         // sources, so only its encoding can reveal a change to it. Every
-        // field is a bool, one byte in the encoding whatever its value, so the
-        // encoded default carries every field, and adding, removing or
-        // widening one changes the bytes. A field that is optional would have
+        // field encodes in one byte whatever its value (a bool, or the `u8`
+        // width of `hardware_watchpoints`), so the encoded default carries
+        // every field, and adding, removing or widening one changes the
+        // bytes. A field that is optional would have
         // to be present in the default, or a change to its width would encode
         // as the same bare `None`; this fails first.
         let config = config_wire_default();
         let fields = serde_json::to_value(config.backend).unwrap();
         let fields = fields.as_object().unwrap();
-        assert!(
-            fields.values().all(serde_json::Value::is_boolean),
-            "{fields:?}"
-        );
+        // The true widths from the capability table: every field is a bool
+        // except `hardware_watchpoints`, a `u8` count.
+        for (name, value) in fields {
+            if name == "hardware_watchpoints" {
+                let width = value.as_u64().expect("a u8 count encodes as a number");
+                assert!(width <= u64::from(u8::MAX), "{name}={width} exceeds a u8");
+            } else {
+                assert!(value.is_boolean(), "{name}={value} is not a bool");
+            }
+        }
         let encode = |config: &Config| {
             bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap()
         };
@@ -6213,6 +6624,14 @@ mod tests {
         });
         assert_eq!(encode(&flipped).len(), encode(&config).len());
         assert_ne!(encode(&flipped), encode(&config));
+        // The one numeric capability: another width within a `u8` changes
+        // the bytes at the same length; a wider type would change the length
+        // asserted above.
+        let widened = config.clone().with_backend(|backend| {
+            backend.hardware_watchpoints = backend.hardware_watchpoints.wrapping_add(1)
+        });
+        assert_eq!(encode(&widened).len(), encode(&config).len());
+        assert_ne!(encode(&widened), encode(&config));
     }
 
     #[test]
@@ -6451,6 +6870,55 @@ mod tests {
             ..Default::default()
         };
         config.validate();
+    }
+
+    /// The one-RCB minimum multiplies like the PMU epsilon of Detcore's
+    /// post-hook, `NANOS_PER_RCB * (clock_multiplier * factor)` in
+    /// `detcore/src/lib.rs`, bit for bit. Every pair below rounds differently
+    /// when multiplied left to right; in the first three that moves the
+    /// minimum: at `--clock-multiplier=2.5` and
+    /// `--chaos-slowdown-max-factor=4.4` the left-to-right product refused
+    /// `--max-timeslice=110` as below "at least 111".
+    #[test]
+    fn one_rcb_minimum_multiplies_like_detcores_pmu_epsilon() {
+        let slowed = |clock_multiplier: f64, factor: f64, max_timeslice: u64| Config {
+            chaos: true,
+            chaos_per_thread_slowdown: true,
+            chaos_slowdown_max_factor: factor,
+            clock_multiplier: Some(clock_multiplier),
+            max_timeslice: NonZeroU64::new(max_timeslice),
+            ..Default::default()
+        };
+
+        let mut config = slowed(2.5, 4.4, 110);
+        assert_eq!(config.minimum_max_timeslice_nanos(), 110);
+        config.validate();
+
+        for (clock_multiplier, factor, minimum) in [
+            (2.5, 4.4, 110),
+            (2.5, 2.2, 55),
+            (7.0, 1.1, 78),
+            (0.7, 3.0, 21),
+            (1.1, 5.5, 61),
+        ] {
+            let detcore = NANOS_PER_RCB * (clock_multiplier * factor);
+            assert_ne!(
+                (NANOS_PER_RCB * clock_multiplier * factor).to_bits(),
+                detcore.to_bits(),
+                "{clock_multiplier} x {factor} does not tell the orders apart"
+            );
+            let config = slowed(clock_multiplier, factor, 1_000_000);
+            assert_eq!(
+                config.largest_nanos_per_rcb().to_bits(),
+                detcore.to_bits(),
+                "{clock_multiplier} x {factor}"
+            );
+            assert_eq!(
+                config.minimum_max_timeslice_nanos(),
+                minimum,
+                "{clock_multiplier} x {factor}"
+            );
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

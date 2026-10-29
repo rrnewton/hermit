@@ -15,11 +15,33 @@ use detcore_model::schedule::Op;
 use detcore_model::schedule::SchedEvent;
 use detcore_model::schedule::SyscallPhase;
 use detcore_model::time::LogicalTime;
+use reverie::syscalls::Sysno;
 use tracing::debug;
 use tracing::info;
 use tracing::trace;
 
 const LOOKAHEAD_WINDOW: usize = 10;
+
+/// How many observed events in a row may leave the replayed schedule's next
+/// event unmatched before the replay stops following the schedule
+/// (`Replayer::observe_event`). An unmatched polling retry is not counted,
+/// and does not end the run of unmatched events either. A replay that resynchronizes matches within a
+/// few events: fast-forward looks `LOOKAHEAD_WINDOW` events ahead, and an
+/// inserted event is followed by the recorded one. A thousand is a long way
+/// past both, and short of a stuck run: a `sched_yield` spinner makes four
+/// events per turn, so the replay lets it go after 250 turns.
+pub(super) const UNMATCHED_EVENTS_BEFORE_RELEASE: u64 = 1000;
+
+/// Where a replay dropped the rest of its schedule
+/// (`Replayer::release_schedule`), for the run summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Release {
+    /// The observed event, by its number in the run, that the release
+    /// happened at.
+    pub(super) event: u64,
+    /// How many recorded events the release left unreplayed.
+    pub(super) unreplayed: usize,
+}
 
 /// Replayer
 #[derive(Debug)]
@@ -33,13 +55,36 @@ pub struct Replayer {
     /// The number of events we've popped from the recording.
     pub events_popped: u64,
 
+    /// How many observed events in a row have left the schedule's next event
+    /// unmatched (`UNMATCHED_EVENTS_BEFORE_RELEASE`).
+    unmatched_run: u64,
+
+    /// Where the replay dropped the rest of the schedule, if it did
+    /// (`Replayer::release_schedule`).
+    release: Option<Release>,
+
     /// Desync events observed per thread.  Counts different kinds of desyncs.
     pub desync_counts: BTreeMap<DetTid, DesyncStats>,
     /// A cached copy of the same (immutable) field in Config.
     pub replay_exhausted_panic: bool,
     /// A cached copy of the same (immutable) field in Config.
     pub die_on_desync: bool,
+    /// The syscall each thread has in flight, as its observed events name it:
+    /// the number its prehook named, and the number its latest unsuccessful
+    /// attempt named (a retry may probe with another call than the guest's).
+    syscalls_in_flight: BTreeMap<DetTid, (Option<Sysno>, Option<Sysno>)>,
+    /// The last retry turn `keep_retry_turn` kept: the thread, how many
+    /// schedule events remained then, and how many turns in a row that thread
+    /// has kept with that many remaining.
+    kept_retry: Option<(DetTid, usize, u32)>,
 }
+
+/// How many retry turns in a row a polling thread keeps
+/// (`Replayer::keep_retry_turn`) while the replayed schedule does not
+/// advance. Past this the retry backs off as a poller, as outside a replay,
+/// so a replay that has drifted from its record cannot spin forever on a poll
+/// that nothing in the run will satisfy.
+pub(super) const REPLAY_KEPT_RETRY_LIMIT: u32 = 1000;
 
 /// The count of desyncs for a particular thread.
 #[derive(Debug, PartialEq, Eq, Default, Copy, Clone)]
@@ -121,14 +166,6 @@ fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
     }
 }
 
-/// Are the two events consistent with eachother, i.e. that they could come from the same execution.
-/// This returns true for an event which is a prefix of another (having a lower count).
-///
-/// This weaker notion always implies `events_match` but not the other way around.
-pub fn events_consistent(observed: &SchedEvent, expected: &SchedEvent) -> bool {
-    !is_hard_desync(observed, expected)
-}
-
 /// Do the events describe the same range of instructions, based on all the information present.
 /// end_time is ignored because it depends on the global context, not just these events.
 pub fn events_match(observed: &SchedEvent, expected: &SchedEvent) -> bool {
@@ -170,10 +207,12 @@ fn hard_desync_fields(observed: &SchedEvent, expected: &SchedEvent) -> Vec<&'sta
     if observed.op != expected.op {
         fields.push("op");
     }
-    if observed.start_rip != expected.start_rip {
+    // A RIP the trace leaves open matches any observed one, as in
+    // `is_hard_desync`.
+    if expected.start_rip.is_some() && observed.start_rip != expected.start_rip {
         fields.push("start_rip");
     }
-    if observed.end_rip != expected.end_rip {
+    if expected.end_rip.is_some() && observed.end_rip != expected.end_rip {
         fields.push("end_rip");
     }
     fields
@@ -186,6 +225,15 @@ fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
     strip2.end_time = None;
     strip1.count = 0;
     strip2.count = 0;
+    // As in `is_desync`, the observed event may carry information the trace
+    // lacks: a recorded timer preemption's branch event has no end RIP while the
+    // replayed one does, and that is the same event, not a different one.
+    if expected.start_rip.is_none() {
+        strip1.start_rip = None;
+    }
+    if expected.end_rip.is_none() {
+        strip1.end_rip = None;
+    }
     strip1 != strip2
 }
 
@@ -194,12 +242,16 @@ impl Replayer {
     pub fn new(i: impl IntoIterator<Item = SchedEvent>) -> Replayer {
         let cursor = ReplayCursor::from_iter(i);
         Replayer {
+            syscalls_in_flight: BTreeMap::new(),
+            kept_retry: None,
             cursor,
             desync_counts: BTreeMap::new(),
             die_on_desync: false,
             replay_exhausted_panic: false,
             traced_event_count: 0,
             events_popped: 0,
+            unmatched_run: 0,
+            release: None,
         }
     }
 
@@ -251,6 +303,15 @@ impl Replayer {
         self.cursor.next()
     }
 
+    /// The thread of the first remaining recorded event that one of
+    /// `threads` runs, other than `except`, if any.
+    pub(super) fn next_thread_among(&self, threads: &[DetTid], except: DetTid) -> Option<DetTid> {
+        (0..)
+            .map_while(|index| self.cursor.peek_nth(index))
+            .map(|event| event.dettid)
+            .find(|thread| *thread != except && threads.contains(thread))
+    }
+
     fn peek_next(&self) -> Option<SchedEvent> {
         self.cursor.peek().cloned()
     }
@@ -262,6 +323,70 @@ impl Replayer {
         self.cursor
             .peek()
             .map(|next| (next.dettid, self.resolve_time_to_run(next)))
+    }
+
+    /// Whether the next replayed event is `tid` retrying a blocked syscall: either
+    /// another unsuccessful attempt or its completion, of the syscall `tid`'s
+    /// observed events say it has in flight. A recorded event of another
+    /// syscall is not this retry.
+    pub(super) fn next_is_retry_by(&self, tid: DetTid) -> bool {
+        self.cursor.peek().is_some_and(|next| {
+            next.dettid == tid
+                && match next.op {
+                    Op::Syscall(sysno, SyscallPhase::Polling | SyscallPhase::Posthook) => self
+                        .syscalls_in_flight
+                        .get(&tid)
+                        .is_some_and(|(entered, attempted)| {
+                            *entered == Some(sysno) || *attempted == Some(sysno)
+                        }),
+                    _ => false,
+                }
+        })
+    }
+
+    /// Count one more retry turn kept by `tid`, and say whether it may keep
+    /// it: no more than [`REPLAY_KEPT_RETRY_LIMIT`] turns in a row while the
+    /// replayed schedule does not advance. Every recorded event the replay
+    /// consumes, or drops to resync, starts the count again.
+    pub(super) fn keep_retry_turn(&mut self, tid: DetTid) -> bool {
+        let remaining = self.cursor.len();
+        let kept = match self.kept_retry {
+            Some((thread, left, kept)) if thread == tid && left == remaining => {
+                kept.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.kept_retry = Some((tid, remaining, kept));
+        if kept == REPLAY_KEPT_RETRY_LIMIT + 1 {
+            tracing::warn!(
+                "[tracereplay] dtid {} kept {} retry turns in a row without the replayed schedule advancing; it backs off as a poller from now on. Next recorded event: {}",
+                tid,
+                REPLAY_KEPT_RETRY_LIMIT,
+                self.cursor
+                    .peek()
+                    .map_or_else(|| "none".to_string(), ToString::to_string),
+            );
+        }
+        kept <= REPLAY_KEPT_RETRY_LIMIT
+    }
+
+    /// Whether the next replayed event is `tid`'s unsuccessful attempt at a
+    /// blocked syscall: the recording retried it and failed again.
+    pub(super) fn next_is_failed_attempt_by(&self, tid: DetTid) -> bool {
+        self.cursor.peek().is_some_and(|next| {
+            next.dettid == tid && matches!(next.op, Op::Syscall(_, SyscallPhase::Polling))
+        })
+    }
+
+    /// Whether the replay dropped the rest of the schedule after a long run of
+    /// unmatched events (`Replayer::release_schedule`).
+    pub(super) fn released(&self) -> bool {
+        self.release.is_some()
+    }
+
+    /// Where the replay dropped the rest of the schedule, if it did.
+    pub(super) fn release(&self) -> Option<&Release> {
+        self.release.as_ref()
     }
 
     /// Whether the recorded schedule still has an event to replay. Past its
@@ -282,6 +407,7 @@ impl Replayer {
         let mytid = observed.dettid;
         let current_ix = self.traced_event_count;
         self.traced_event_count += 1;
+        self.note_syscall_in_flight(observed);
 
         if let Some(expected) = self.peek_next() {
             debug!(
@@ -339,7 +465,19 @@ impl Replayer {
                 // is_desync = false; // Logically correct, but... unused_assignments
             }
 
-            if !in_hard_desync_mode {
+            if in_hard_desync_mode {
+                // A polling retry does not count: how many retries a blocked
+                // call makes can depend on host timing, when something outside
+                // the container makes its descriptor ready
+                // (`Scheduler::is_polling_turn`), and the count decides the
+                // event the release happens at.
+                if !matches!(observed.op, Op::Syscall(_, SyscallPhase::Polling)) {
+                    self.unmatched_run += 1;
+                    if self.unmatched_run >= UNMATCHED_EVENTS_BEFORE_RELEASE {
+                        return self.release_schedule(current_ix);
+                    }
+                }
+            } else {
                 // Whether naturally or by fast forward, we should end up in this state before we pop:
                 if !self.next_replay_matches(observed) {
                     tracing::warn!(
@@ -349,6 +487,7 @@ impl Replayer {
                     );
                 }
                 let _ = self.pop_next();
+                self.unmatched_run = 0;
             }
 
             let action = self.check_context_switch(observed);
@@ -378,6 +517,67 @@ impl Replayer {
             );
             ReplayAction::Continue(None)
         }
+    }
+
+    /// Track which syscall `observed`'s thread has in flight
+    /// (`next_is_retry_by`): a prehook enters one, an unsuccessful attempt
+    /// names the call it retried with, and a posthook ends it.
+    fn note_syscall_in_flight(&mut self, observed: &SchedEvent) {
+        let tid = observed.dettid;
+        match observed.op {
+            Op::Syscall(sysno, SyscallPhase::Prehook) => {
+                self.syscalls_in_flight.insert(tid, (Some(sysno), None));
+            }
+            Op::Syscall(sysno, SyscallPhase::Polling) => {
+                self.syscalls_in_flight.entry(tid).or_default().1 = Some(sysno);
+            }
+            Op::Syscall(_, SyscallPhase::Posthook) => {
+                self.syscalls_in_flight.remove(&tid);
+            }
+            _ => {}
+        }
+    }
+
+    /// Stop following the schedule: `UNMATCHED_EVENTS_BEFORE_RELEASE`
+    /// observed events in a row, through event `current_ix`, matched none of
+    /// its next event.
+    ///
+    /// The replay runs the thread the schedule names next and holds every
+    /// other thread back. When that thread cannot produce the recorded event,
+    /// a spinner waiting for a thread the replay holds back, say, the run
+    /// stops making progress for good. Dropping the rest of the schedule
+    /// ends the replay as running out of it does: the scheduler gives every
+    /// thread the default priority (`Scheduler::consume_schedevent`), each
+    /// thread's recorded callback checkpoints go with the events once it hears
+    /// of the release (`Scheduler::schedule_replay_reply`), and the run goes
+    /// on unguided. Under `--replay-exhausted-panic` the run stops here
+    /// instead.
+    ///
+    /// The count is a liveness backstop, and a heuristic: a detour longer than
+    /// the threshold that would have rejoined the schedule loses the rest of
+    /// it too. It is a function of the observed events in turn order alone,
+    /// polling retries left out, so the release happens at the same event in
+    /// every run.
+    fn release_schedule(&mut self, current_ix: u64) -> ReplayAction {
+        let dropped = self.cursor.by_ref().count();
+        self.release = Some(Release {
+            event: current_ix,
+            unreplayed: dropped,
+        });
+        tracing::warn!(
+            "[tracereplay] {} observed events in a row, through event #{}, matched none of the replayed schedule's next event; the replay no longer follows the schedule ({} recorded events left unreplayed)",
+            UNMATCHED_EVENTS_BEFORE_RELEASE,
+            current_ix,
+            dropped
+        );
+        if self.replay_exhausted_panic {
+            eprintln!(
+                "[detcore] The replay left its schedule at event #{} with {} recorded events left; stopping (--replay-exhausted-panic)",
+                current_ix, dropped
+            );
+            return ReplayAction::Stop(StopReason::ReplayExausted);
+        }
+        ReplayAction::Continue(None)
     }
 
     /// Logically advance the counting machinery to the next round.
@@ -554,6 +754,7 @@ mod builder {
 
 #[cfg(test)]
 mod tests {
+    use detcore_model::schedule::InstructionPointer;
     use pretty_assertions::assert_eq;
     use reverie::syscalls::Sysno;
 
@@ -572,6 +773,75 @@ mod tests {
                 ..*se
             })
             .collect()
+    }
+
+    /// A replay lets go of its schedule once `UNMATCHED_EVENTS_BEFORE_RELEASE`
+    /// observed events in a row match none of its next event, and not before:
+    /// a matched event starts the count again.
+    #[test]
+    fn a_replay_releases_its_schedule_after_a_long_unmatched_run() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.other(SOME_RIP, tid(3));
+        let spinner = b.other(SOME_RIP + 8, tid(5));
+        let mut replayer = Replayer::new([recorded.clone(), recorded.clone(), recorded.clone()]);
+
+        let unmatched = |replayer: &mut Replayer, count: u64| {
+            for _ in 0..count {
+                assert_eq!(
+                    replayer.observe_event(&spinner),
+                    ReplayAction::ContextSwitch(true, tid(3), None)
+                );
+            }
+        };
+        unmatched(&mut replayer, UNMATCHED_EVENTS_BEFORE_RELEASE - 1);
+        assert_eq!(
+            replayer.observe_event(&recorded),
+            ReplayAction::Continue(None)
+        );
+        unmatched(&mut replayer, UNMATCHED_EVENTS_BEFORE_RELEASE - 1);
+        assert!(replayer.has_events_left());
+        assert!(!replayer.released());
+
+        assert_eq!(
+            replayer.observe_event(&spinner),
+            ReplayAction::Continue(None)
+        );
+        assert!(!replayer.has_events_left());
+        assert!(replayer.released());
+    }
+
+    /// Unmatched polling retries do not count toward the release, nor end the
+    /// run of unmatched events: how many a blocked call makes can depend on
+    /// host timing, and the count decides the event the release happens at.
+    #[test]
+    fn unmatched_polling_retries_do_not_count_toward_a_release() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.other(SOME_RIP, tid(3));
+        let spinner = b.other(SOME_RIP + 8, tid(5));
+        let retry = SchedEvent {
+            op: Op::Syscall(Sysno::read, SyscallPhase::Polling),
+            ..spinner.clone()
+        };
+        let mut replayer = Replayer::new([recorded.clone(), recorded.clone(), recorded]);
+        let held = ReplayAction::ContextSwitch(true, tid(3), None);
+        for _ in 1..UNMATCHED_EVENTS_BEFORE_RELEASE {
+            assert_eq!(replayer.observe_event(&spinner), held);
+        }
+        for _ in 0..2 * UNMATCHED_EVENTS_BEFORE_RELEASE {
+            assert_eq!(replayer.observe_event(&retry), held);
+        }
+        assert!(!replayer.released());
+        assert_eq!(
+            replayer.observe_event(&spinner),
+            ReplayAction::Continue(None)
+        );
+        assert_eq!(
+            replayer.release(),
+            Some(&Release {
+                event: 3 * UNMATCHED_EVENTS_BEFORE_RELEASE - 1,
+                unreplayed: 3,
+            })
+        );
     }
 
     /// A fatal desync names the fields that differed: an event that matches
@@ -596,6 +866,205 @@ mod tests {
             vec!["dettid", "end_rip"]
         );
         assert!(hard_desync_fields(&recorded, &recorded).is_empty());
+    }
+
+    /// The fields a fatal desync names agree with `is_hard_desync`: a RIP the
+    /// trace leaves open is never named, since it cannot cause the bail, and
+    /// an event pair names a field exactly when it is a hard desync.
+    #[test]
+    fn a_hard_desync_never_names_a_rip_the_trace_leaves_open() {
+        let mut b = builder::SchedTestBuilder::new();
+        let open = SchedEvent {
+            start_rip: None,
+            end_rip: None,
+            ..b.syscall_pre(Sysno::read, SOME_RIP, tid(3))
+        };
+        let observed = SchedEvent {
+            dettid: tid(4),
+            start_rip: std::num::NonZeroUsize::new(SOME_RIP),
+            end_rip: std::num::NonZeroUsize::new(SOME_RIP + 2),
+            ..open
+        };
+        assert!(is_hard_desync(&observed, &open));
+        assert_eq!(hard_desync_fields(&observed, &open), vec!["dettid"]);
+
+        let rips = [
+            None,
+            std::num::NonZeroUsize::new(SOME_RIP),
+            std::num::NonZeroUsize::new(SOME_RIP + 2),
+        ];
+        for tid_o in [tid(3), tid(4)] {
+            for start_o in rips {
+                for end_o in rips {
+                    for start_e in rips {
+                        for end_e in rips {
+                            let observed = SchedEvent {
+                                dettid: tid_o,
+                                start_rip: start_o,
+                                end_rip: end_o,
+                                ..open
+                            };
+                            let expected = SchedEvent {
+                                start_rip: start_e,
+                                end_rip: end_e,
+                                ..open
+                            };
+                            assert_eq!(
+                                hard_desync_fields(&observed, &expected).is_empty(),
+                                !is_hard_desync(&observed, &expected),
+                                "observed {observed:?}, recorded {expected:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_observed_rip_the_trace_lacks_is_not_a_hard_desync() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = SchedEvent {
+            end_rip: None,
+            ..b.branch(12203, tid(59))
+        };
+        let replayed = SchedEvent {
+            end_rip: Some(InstructionPointer::new(0x7fff_f7c9_6c68).unwrap()),
+            end_time: Some(LogicalTime::from_nanos(150)),
+            ..recorded.clone()
+        };
+        assert!(
+            !is_hard_desync(&replayed, &recorded),
+            "the trace leaves the RIP open"
+        );
+        assert!(is_desync(&replayed, &recorded), "the time still differs");
+
+        let other_rip = SchedEvent {
+            end_rip: Some(InstructionPointer::new(0x1000).unwrap()),
+            ..recorded.clone()
+        };
+        let recorded_with_rip = SchedEvent {
+            end_rip: Some(InstructionPointer::new(0x2000).unwrap()),
+            ..recorded
+        };
+        assert!(
+            is_hard_desync(&other_rip, &recorded_with_rip),
+            "a RIP the trace names must match"
+        );
+    }
+
+    #[test]
+    fn a_blocked_syscall_retry_is_recognized_only_for_its_thread() {
+        let mut b = builder::SchedTestBuilder::new();
+        let pre = b.syscall_pre(Sysno::read, SOME_RIP, tid(3));
+        let polling = SchedEvent {
+            op: Op::Syscall(Sysno::read, SyscallPhase::Polling),
+            ..b.syscall_pre(Sysno::read, SOME_RIP, tid(3))
+        };
+        let schedule = vec![
+            pre,
+            polling,
+            b.syscall_post(Sysno::read, SOME_RIP, tid(3)),
+            b.branch(5, tid(5)),
+        ];
+        let mut replayer = Replayer::new(schedule.clone());
+
+        let _ = replayer.observe_event(&schedule[0]);
+        assert!(
+            replayer.next_is_retry_by(tid(3)),
+            "thread 3 polls its read next"
+        );
+        assert!(
+            !replayer.next_is_retry_by(tid(5)),
+            "thread 5 has nothing to retry"
+        );
+        let _ = replayer.observe_event(&schedule[1]);
+        assert!(
+            replayer.next_is_retry_by(tid(3)),
+            "thread 3 completes its read next"
+        );
+        let _ = replayer.observe_event(&schedule[2]);
+        assert!(!replayer.next_is_retry_by(tid(3)), "the read is done");
+        assert!(
+            !replayer.next_is_retry_by(tid(5)),
+            "a branch is not a retry"
+        );
+    }
+
+    /// A recorded retry is this thread's retry only if it names the syscall
+    /// the thread has in flight: the one its prehook entered, or the probe its
+    /// latest unsuccessful attempt used.
+    #[test]
+    fn a_recorded_retry_of_another_syscall_is_not_this_retry() {
+        let mut b = builder::SchedTestBuilder::new();
+        let polling = |b: &mut builder::SchedTestBuilder, sysno| SchedEvent {
+            op: Op::Syscall(sysno, SyscallPhase::Polling),
+            ..b.syscall_pre(sysno, SOME_RIP, tid(3))
+        };
+        // The recording completes a different call than the one in flight.
+        let schedule = vec![
+            b.syscall_pre(Sysno::read, SOME_RIP, tid(3)),
+            b.syscall_post(Sysno::recvfrom, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(schedule.clone());
+        assert!(
+            !replayer.next_is_retry_by(tid(3)),
+            "nothing is in flight before the prehook"
+        );
+        let _ = replayer.observe_event(&schedule[0]);
+        assert!(
+            !replayer.next_is_retry_by(tid(3)),
+            "thread 3 is in a read, and the recording completes a recvfrom"
+        );
+
+        // A retry that probes with another call matches either number.
+        let schedule = vec![
+            b.syscall_pre(Sysno::pselect6, SOME_RIP, tid(3)),
+            polling(&mut b, Sysno::poll),
+            polling(&mut b, Sysno::poll),
+            b.syscall_post(Sysno::pselect6, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(schedule.clone());
+        let _ = replayer.observe_event(&schedule[0]);
+        assert!(
+            !replayer.next_is_retry_by(tid(3)),
+            "no attempt has used the probe yet"
+        );
+        let _ = replayer.observe_event(&schedule[1]);
+        assert!(
+            replayer.next_is_retry_by(tid(3)),
+            "the recording retries with the probe the attempt used"
+        );
+        let _ = replayer.observe_event(&schedule[2]);
+        assert!(
+            replayer.next_is_retry_by(tid(3)),
+            "the recording completes the call the prehook entered"
+        );
+    }
+
+    /// A thread keeps at most `REPLAY_KEPT_RETRY_LIMIT` retry turns in a row
+    /// while the schedule stands still; consuming a recorded event starts the
+    /// count again.
+    #[test]
+    fn kept_retry_turns_are_capped_while_the_schedule_stands_still() {
+        let mut b = builder::SchedTestBuilder::new();
+        let schedule = vec![
+            b.syscall_pre(Sysno::recvfrom, SOME_RIP, tid(3)),
+            b.syscall_post(Sysno::recvfrom, SOME_RIP, tid(3)),
+            b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(schedule.clone());
+        let _ = replayer.observe_event(&schedule[0]);
+        for turn in 1..=REPLAY_KEPT_RETRY_LIMIT {
+            assert!(replayer.keep_retry_turn(tid(3)), "kept turn {turn}");
+        }
+        assert!(!replayer.keep_retry_turn(tid(3)), "the cap");
+        assert!(!replayer.keep_retry_turn(tid(3)), "still capped");
+        let _ = replayer.observe_event(&schedule[1]);
+        assert!(
+            replayer.keep_retry_turn(tid(3)),
+            "the schedule advanced, so the count starts again"
+        );
     }
 
     #[test]

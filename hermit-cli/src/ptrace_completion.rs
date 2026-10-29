@@ -392,6 +392,13 @@ pub(crate) struct Control {
     timeout: Option<(Instant, Duration)>,
     expired: Cell<bool>,
     received_failure: Cell<bool>,
+    /// The guest processes still running when the timeout expired, read once
+    /// at expiry (`timeout_survivors`), before the termination kills them.
+    survivors: RefCell<Option<String>>,
+    /// The run's root guest process, once the tracer has spawned it: a
+    /// survivor whose parent is Hermit but which is not the root was orphaned
+    /// and re-parented to Hermit, as it is when Hermit is the container's init.
+    root: Cell<Option<i32>>,
     cancellation_deadline: Cell<Option<Instant>>,
     global_cleanup_deadline: Cell<Option<Instant>>,
     stage: Cell<HermitCleanupStage>,
@@ -406,6 +413,8 @@ impl Control {
             timeout: timeout.map(|d| (Instant::now() + d, d)),
             expired: Cell::new(false),
             received_failure: Cell::new(false),
+            survivors: RefCell::new(None),
+            root: Cell::new(None),
             cancellation_deadline: Cell::new(None),
             global_cleanup_deadline: Cell::new(None),
             stage: Cell::new(HermitCleanupStage::Startup),
@@ -425,7 +434,7 @@ impl Control {
         if let (Some(handle), Some((_, limit))) = (self.termination.borrow().as_ref(), self.timeout)
         {
             // Reverie preserves an earlier Tool failure as primary.
-            handle.terminate(reverie::Error::Tool(Error::new(GuestTimedOut { limit })));
+            handle.terminate(reverie::Error::Tool(Error::new(self.timed_out(limit))));
         }
     }
     /// Mark the run timed out if `now` is at or past its deadline. The caller
@@ -434,17 +443,23 @@ impl Control {
     fn expire_if_due(&self, now: Instant) {
         if !self.expired.get() && self.timeout.is_some_and(|(at, _)| now >= at) {
             self.expired.set(true);
+            *self.survivors.borrow_mut() =
+                crate::timeout_survivors::traced_processes_now(self.root.get());
             if !self.received_failure.get() {
                 let mut snapshot = self.snapshot.borrow_mut();
                 snapshot.kind = FailureKind::RunTimeout;
-                snapshot.primary = GuestTimedOut {
-                    limit: self.timeout.unwrap().1,
-                }
-                .to_string();
+                snapshot.primary = self.timed_out(self.timeout.unwrap().1).to_string();
             }
             self.publish_timeout();
             self.cancellation_deadline
                 .set(Some(Instant::now() + ATTEMPT_BUDGET));
+        }
+    }
+    /// The timeout failure, naming the guest processes read at expiry.
+    fn timed_out(&self, limit: Duration) -> GuestTimedOut {
+        GuestTimedOut {
+            limit,
+            survivors: self.survivors.borrow().clone(),
         }
     }
     async fn yield_checkpoint(&self) {
@@ -618,7 +633,7 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
                 if let Poll::Ready(result) = polled {
                     let result = match (result, control.timeout) {
                         (Ok(_), Some((_, limit))) if control.expired.get() => {
-                            Err(Error::new(GuestTimedOut { limit }))
+                            Err(Error::new(control.timed_out(limit)))
                         }
                         (result, _) => result,
                     };
@@ -715,6 +730,7 @@ pub(crate) async fn wait(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::ExitStatus, detcore::GlobalState), Error> {
+    control.root.set(Some(tracer.guest_pid().as_raw()));
     control.register(tracer.termination_handle());
     consume(tracer.wait_completion().await, control).await
 }
@@ -722,6 +738,7 @@ pub(crate) async fn wait_with_output(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::process::Output, detcore::GlobalState), Error> {
+    control.root.set(Some(tracer.guest_pid().as_raw()));
     control.register(tracer.termination_handle());
     consume(tracer.wait_with_output_completion().await, control).await
 }

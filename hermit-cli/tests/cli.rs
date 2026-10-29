@@ -148,9 +148,11 @@ static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_GUEST_ENVIRONMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static ABSTRACT_UNIX_BIND_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static MINIMAL_ENV_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PRCTL_SET_PTRACER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FIFO_PEER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -175,15 +177,22 @@ static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_ZERO_TIMEOUT_RESTART_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static POLL_TIMEOUT_RESTART_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_EXEC_RESUME_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_COUNT_ZERO_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REQUEUE_WAKE_OP_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static FUTEX_LOCK_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_REQUEUE_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_PI_COMMANDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_PI_MUTEX_CONTENDED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_PI_ROBUST_OWNER_DEATH_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_PI_CONDVAR_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_PI_OWNER_END_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SLEEP_RESTART_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGNAL_MASKED_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_LAST_BAND_ADMISSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static YIELD_LOOP_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -192,13 +201,18 @@ static FUSE_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_POLLER_BESIDE_SLEEPERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMED_WAIT_POLLERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static EPOLL_IGNORED_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_READER_BESIDE_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HANDOFF_BESIDE_NEWCOMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SLEEPER_BESIDE_NEWCOMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static POLLERS_BESIDE_WORKER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCHEDULER_SIGNAL_WAITING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_WAITING_BESIDE_BACKGROUND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROCESS_SIGNAL_RECEIVER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REALTIME_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIPE_READ_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -213,6 +227,7 @@ static CPUID_PROFILE_V3_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_PROFILE_V3_LAZY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_HOST_NO_RDRAND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RANDOM_DEVICE_HOST_NO_RDRAND_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RANDOM_DEVICE_INDEPENDENT_OPENS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -237,6 +252,8 @@ static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_CPUS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_CPUS_POOL_RACE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CWD_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RECEIVED_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -244,7 +261,12 @@ static PROC_CPU_TIMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DATAGRAM_READ_SHUTDOWN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROC_STATUS_TRACER_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DEATH_TEST_TRACER_CHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SOCKET_DONTWAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SOCKET_ERRQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FATAL_SIGNAL_FUTEX_WAITERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
@@ -267,12 +289,15 @@ static FLOCK_EXCLUSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE3_SET_TID_REUSE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARENT_DEATH_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static UNTRACED_CLONE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGNAL_PERMITS_PER_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GROUP_EXIT_SIGNAL_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_WAIT_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_READ_SIGNAL_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static REPLAY_DESYNC_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -601,6 +626,31 @@ fn abstract_unix_bind_guest() -> &'static Path {
     })
 }
 
+fn minimal_env_identity_guest() -> &'static Path {
+    MINIMAL_ENV_IDENTITY_GUEST.get_or_init(|| {
+        let build_root = process_build_root("minimal-env-identity");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create minimal-environment identity guest directory");
+        let guest = build_root.join("minimal_env_identity");
+        let output = Command::new("cc")
+            .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal_env_identity.c"),
+            )
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile minimal-environment identity guest");
+        assert!(
+            output.status.success(),
+            "minimal-environment identity guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 /// The lines of `output`'s standard error that are Detcore's notice for an
 /// abstract `AF_UNIX` bind under host networking.
 fn host_network_abstract_bind_notices(output: &Output) -> Vec<String> {
@@ -610,7 +660,6 @@ fn host_network_abstract_bind_notices(output: &Output) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
-
 fn read_terminal_dbt_verdict(path: &Path) -> serde_json::Value {
     let verdict: serde_json::Value =
         serde_json::from_slice(&fs::read(path).expect("failed to read DBT verification verdict"))
@@ -791,6 +840,32 @@ fn exec_clock_continuity_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "exec-clock-continuity guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn prctl_set_ptracer_guest() -> &'static Path {
+    PRCTL_SET_PTRACER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("prctl-set-ptracer");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create prctl-set-ptracer guest directory");
+        let guest = build_root.join("prctl_set_ptracer");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/prctl_set_ptracer.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile prctl-set-ptracer guest");
+        assert!(
+            output.status.success(),
+            "prctl-set-ptracer guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -1281,6 +1356,32 @@ fn kill_multithreaded_process_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "kill-multithreaded-process guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn process_signal_receiver_guest() -> &'static Path {
+    PROCESS_SIGNAL_RECEIVER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("process-signal-receiver");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create process-signal-receiver guest directory");
+        let guest = build_root.join("process_signal_receiver");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/process_signal_receiver.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile process-signal-receiver guest");
+        assert!(
+            output.status.success(),
+            "process-signal-receiver guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -3082,6 +3183,32 @@ fn signal_then_sibling_exit_guest() -> &'static Path {
     })
 }
 
+fn signal_permits_per_thread_guest() -> &'static Path {
+    SIGNAL_PERMITS_PER_THREAD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("signal-permits-per-thread");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the signal-permits-per-thread guest directory");
+        let guest = build_root.join("signal_permits_per_thread");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/signal_permits_per_thread.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the signal-permits-per-thread guest");
+        assert!(
+            output.status.success(),
+            "signal-permits-per-thread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 fn parked_wait_then_exec_guest() -> &'static Path {
     PARKED_WAIT_THEN_EXEC_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3160,6 +3287,32 @@ fn chaos_spinner_and_new_thread_guest() -> &'static Path {
     })
 }
 
+fn replay_desync_spinner_guest() -> &'static Path {
+    REPLAY_DESYNC_SPINNER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("replay-desync-spinner");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the replay-desync-spinner guest directory");
+        let guest = build_root.join("replay_desync_spinner");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/replay_desync_spinner.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the replay-desync-spinner guest");
+        assert!(
+            output.status.success(),
+            "replay-desync-spinner guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 fn clone_pidfd_guest() -> &'static Path {
     CLONE_PIDFD_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3178,6 +3331,32 @@ fn clone_pidfd_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "clone-pidfd guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn untraced_clone_guest() -> &'static Path {
+    UNTRACED_CLONE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("untraced-clone");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the untraced-clone guest directory");
+        let guest = build_root.join("untraced_clone");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-std=gnu11", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/untraced_clone.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the untraced-clone guest");
+        assert!(
+            output.status.success(),
+            "untraced-clone guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -7481,6 +7660,435 @@ fn run_kvm_procfs_directories_are_served_only_in_a_container() {
     serve_procfs_directories_in_a_container_only("kvm", "/proc/fs/nfsd");
 }
 
+/// A guest for <https://github.com/rrnewton/hermit/issues/4541>. In `$1`, a
+/// new directory holding `proc/fs`, it looks up names relative to its
+/// working directory whose first component is `proc`, which Detcore decides
+/// against the `--proc` level by the directory they are relative to: the
+/// shell's `[ -d ]`, an `ls` of the directory, and `mkdir -p`, relative and
+/// with an absolute path, whose components it makes relative to each
+/// directory it enters. With a second argument it then looks up `proc/fs`
+/// from `/`, where it is the `/proc/fs` the level omits: first in the shell
+/// itself, by a redirection, whose error it names (the same process looked
+/// `proc/fs` up from its old directory before, so this one is decided only
+/// by the working directory read again for this call); then by `ls`, with
+/// `/proc/fs` itself, each with the error it meets.
+const RELATIVE_PROCFS_NAMES: &str = r#"mkdir "$1" "$1/proc" "$1/proc/fs" || exit 9
+cd "$1" || exit 9
+if [ -d proc/fs ]; then echo '[ -d proc/fs ]: true'; else echo '[ -d proc/fs ]: false'; fi
+ls proc/fs; echo "ls proc/fs: $?"
+mkdir -p proc/fs/made; echo "mkdir -p proc/fs/made: $?"
+mkdir -p "$1/again/proc/fs"; echo "mkdir -p DIRECTORY/again/proc/fs: $?"
+ls proc/fs; echo "ls proc/fs: $?"
+ls again/proc; echo "ls again/proc: $?"
+[ "$#" -gt 1 ] || exit 0
+cd / || exit 9
+if { true < proc/fs; } 2>/tmp/e; then e=opened; else
+  read -r e < /tmp/e
+  case "$e" in *"No such file"*) e=ENOENT ;; *"Permission denied"*) e=EACCES ;; esac
+fi
+echo "from /, < proc/fs in the shell: $e"
+for name in proc/fs /proc/fs; do
+  echo "from /, ls -d $name: $(ls -d "$name" 2>&1 >/dev/null | sed 's/.*: //')"
+done
+"#;
+
+/// What [`RELATIVE_PROCFS_NAMES`] prints natively without its second
+/// argument: below its directory every name is an ordinary one.
+const RELATIVE_PROCFS_NAMES_NATIVELY: &str = "[ -d proc/fs ]: true\nls proc/fs: 0\n\
+                                              mkdir -p proc/fs/made: 0\n\
+                                              mkdir -p DIRECTORY/again/proc/fs: 0\nmade\n\
+                                              ls proc/fs: 0\nfs\nls again/proc: 0\n";
+
+/// On `backend`, Detcore decides a guest's names relative to its working
+/// directory by that directory, whichever directory Hermit was started in
+/// (<https://github.com/rrnewton/hermit/issues/4541>): in a directory holding
+/// `proc/fs`, the names [`RELATIVE_PROCFS_NAMES`] looks up get their native
+/// answers, and from `/`, `proc/fs` is omitted as `/proc/fs` is. Hermit is
+/// started in `/` and in a directory of its own, and both runs print the
+/// same. Before the fix, Detcore on KVM read the working directory of the
+/// host task the guest's process ID names, one of Hermit's own threads,
+/// which is in Hermit's starting directory: started in `/`, the names in the
+/// guest's directory were taken for `/proc`'s (`[ -d proc/fs ]` false,
+/// `mkdir -p` refused with `EACCES`); started elsewhere, `proc/fs` from `/`
+/// was not taken for `/proc/fs` and reached KVM's executor, which refuses it
+/// with `EACCES` rather than omitting it. The shell's own lookup from `/`
+/// needs the working directory read again for that call: one still saved
+/// from its earlier call in the old directory would take `proc/fs` for an
+/// ordinary name there, and KVM's executor would refuse it with `EACCES`.
+fn decide_relative_names_by_the_guests_working_directory(backend: &str) {
+    let native = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = Command::new("/bin/sh")
+        .args(["-c", RELATIVE_PROCFS_NAMES, "sh"])
+        .arg(native.path().join("r"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(output.status.success(), "natively: {output:?}");
+    assert_eq!(stdout(&output), RELATIVE_PROCFS_NAMES_NATIVELY, "natively");
+    let expected = format!(
+        "{RELATIVE_PROCFS_NAMES_NATIVELY}from /, < proc/fs in the shell: ENOENT\n\
+         from /, ls -d proc/fs: No such file or directory\n\
+         from /, ls -d /proc/fs: No such file or directory\n"
+    );
+    let elsewhere = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        RELATIVE_PROCFS_NAMES,
+        "sh",
+        "/tmp/r",
+        "from /",
+    ];
+    for started_in in [Path::new("/"), elsewhere.path()] {
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&args)
+                .current_dir(started_in)
+                .stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            expected,
+            "{backend}, Hermit started in {}; stderr:\n{}",
+            started_in.display(),
+            stderr(&output)
+        );
+    }
+}
+
+/// [`decide_relative_names_by_the_guests_working_directory`] on ptrace,
+/// whose tool reads the guest's working directory from host procfs: the
+/// control for KVM's run.
+#[test]
+fn relative_names_are_decided_by_the_guests_working_directory() {
+    decide_relative_names_by_the_guests_working_directory("ptrace");
+}
+
+/// [`decide_relative_names_by_the_guests_working_directory`] on KVM, whose
+/// tool reads the guest's working directory with a `getcwd` injected in the
+/// guest.
+#[test]
+fn run_kvm_relative_names_are_decided_by_the_guests_working_directory() {
+    let test = "run_kvm_relative_names_are_decided_by_the_guests_working_directory";
+    if kvm_unavailable(test) {
+        return;
+    }
+    decide_relative_names_by_the_guests_working_directory("kvm");
+}
+
+/// What `tests/c/cwd_dotdot_lookups.c` prints under Hermit, on every backend,
+/// as natively for every name the `--proc` level does not hide: from a
+/// removed working directory and from one whose path is longer than
+/// `PATH_MAX` (whose `getcwd` glibc answers with ERANGE, natively too, after
+/// the kernel's ENAMETOOLONG), names whose leading `..` reach `/proc/fs`,
+/// which Hermit hides at every `--proc` level, are absent; `/proc`,
+/// `/tmp/sibling` and its file are found; `/proc/uptime/`, a file spelled as a
+/// directory, is no directory; the long directory's own `proc/fs` is found,
+/// directly and through `x/..`; and a climb to `/proc/uptime` padded with
+/// separators resolves at 4095 bytes and is refused with ENAMETOOLONG at
+/// 4096 and 4097, as Linux refuses any name of `PATH_MAX` bytes or more.
+const CWD_DOTDOT_LOOKUPS: &str = "absolute /proc/fs: stat=ENOENT open=ENOENT\n\
+                                  live ../sibling: stat=0 open=0\n\
+                                  removed getcwd: ENOENT\n\
+                                  removed ../../proc/fs: open=ENOENT\n\
+                                  removed ../../proc: stat=0 open=0\n\
+                                  removed ../../proc/uptime/: stat=ENOTDIR open=ENOTDIR\n\
+                                  removed /proc/fs: stat=ENOENT open=ENOENT\n\
+                                  removed ../sibling: stat=0 open=0\n\
+                                  removed ../sibling/file: stat=0 open=0\n\
+                                  removed .: stat=0 open=0\n\
+                                  removed x: stat=ENOENT open=ENOENT\n\
+                                  removed (../ x2, 4095 bytes)proc/uptime: stat=0 open=0\n\
+                                  removed (../ x2, 4096 bytes)proc/uptime: \
+                                  stat=ENAMETOOLONG open=ENAMETOOLONG\n\
+                                  removed (../ x2, 4097 bytes)proc/uptime: \
+                                  stat=ENAMETOOLONG open=ENAMETOOLONG\n\
+                                  overlong getcwd: ERANGE\n\
+                                  overlong proc/fs: stat=0 open=0\n\
+                                  overlong x/../proc/fs: stat=0 open=0\n\
+                                  overlong (../ x20)proc/fs: stat=ENOENT open=ENOENT\n\
+                                  overlong (../ x20)proc: stat=0 open=0\n\
+                                  overlong (../ x20)proc/uptime/: stat=ENOTDIR open=ENOTDIR\n\
+                                  overlong (../ x19)sibling: stat=0 open=0\n\
+                                  overlong (../ x20, 4095 bytes)proc/uptime: stat=0 open=0\n\
+                                  overlong (../ x20, 4096 bytes)proc/uptime: \
+                                  stat=ENAMETOOLONG open=ENAMETOOLONG\n\
+                                  overlong (../ x20, 4097 bytes)proc/uptime: \
+                                  stat=ENAMETOOLONG open=ENAMETOOLONG\n\
+                                  next descriptor: 3\n";
+
+/// On `backend`, Detcore decides a name that climbs out of a working
+/// directory `getcwd` cannot name by where the climb leads, from Hermit
+/// started in `/` and in a directory of its own
+/// (<https://github.com/rrnewton/hermit/issues/4541>): Linux still walks `..`
+/// out of a removed working directory (`getcwd`: ENOENT) and out of one whose
+/// path is longer than `PATH_MAX` (ENAMETOOLONG), and
+/// `tests/c/cwd_dotdot_lookups.c` looks names up through their leading `..`
+/// from each, and other names below the long one. The answers are the ones
+/// [`CWD_DOTDOT_LOOKUPS`] lists, and the calls that read where a climb leads
+/// leave the guest's next descriptor where it was. A climb padded to
+/// `PATH_MAX` bytes or more is never shortened into a name Detcore serves.
+/// Before, KVM decided these
+/// names by the working directory of one of Hermit's own threads: started in
+/// `/`, the long directory's own `proc/fs` was taken for the hidden
+/// `/proc/fs`; started elsewhere, KVM's executor refused the climbs to `/proc`
+/// with EACCES. Without the climb, it refused them from both directories.
+/// On ptrace, the stat of a climb to `/proc/fs` out of the long directory
+/// succeeded, as no climb out of a directory the kernel cannot name in its
+/// link was resolved.
+fn decide_dotdot_names_by_where_they_lead(backend: &str) {
+    let guest = futex_c_guest(&CWD_DOTDOT_LOOKUPS_GUEST, "cwd_dotdot_lookups")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let elsewhere = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+    ];
+    for started_in in [Path::new("/"), elsewhere.path()] {
+        let output = hermit_test::hermit_output(
+            "hermit run",
+            hermit_command(&args)
+                .current_dir(started_in)
+                .stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            CWD_DOTDOT_LOOKUPS,
+            "{backend}, Hermit started in {}; stderr:\n{}",
+            started_in.display(),
+            stderr(&output)
+        );
+    }
+}
+
+/// [`decide_dotdot_names_by_where_they_lead`] on ptrace, whose tool reads the
+/// working directory from host procfs, and, for one whose path no link
+/// holds, the directory a climb leads to through the kernel's own walk.
+#[test]
+fn dotdot_names_are_decided_by_where_they_lead() {
+    decide_dotdot_names_by_where_they_lead("ptrace");
+}
+
+/// [`decide_dotdot_names_by_where_they_lead`] on KVM, whose tool reads the
+/// working directory with an injected `getcwd`, and, where that names none,
+/// the directory a climb leads to through an injected descriptor for it,
+/// opened by the executor's own walk.
+#[test]
+fn run_kvm_dotdot_names_are_decided_by_where_they_lead() {
+    let test = "run_kvm_dotdot_names_are_decided_by_where_they_lead";
+    if kvm_unavailable(test) {
+        return;
+    }
+    decide_dotdot_names_by_where_they_lead("kvm");
+}
+
+/// The `/sys` CPU directory lists only the virtual CPUs by every spelling of
+/// it, on `backend`: Detcore names a listing's directory by the descriptor's
+/// kernel path where its `/proc` entry for the caller is the caller's, and
+/// otherwise (KVM) by the path the guest opened it by, `.` and `..` folded in,
+/// never by the link of a host task the guest's thread number names
+/// (<https://github.com/rrnewton/hermit/issues/4541>). Before, KVM listed
+/// every host CPU through `.`, `./cpu`, `cpu/` and `../cpu`, and through
+/// every relative spelling before the guest's working directory was its own.
+fn list_the_virtual_cpus_by_every_spelling(backend: &str) {
+    let script = "cpus=$(nproc)\n\
+                  cd /sys/devices/system || exit 9\n\
+                  for name in cpu ./cpu cpu/ /sys/devices/system/cpu; do\n\
+                  \x20 echo \"$name: $(ls \"$name\" | grep -c '^cpu[0-9][0-9]*$') of $cpus\"\n\
+                  done\n\
+                  cd cpu || exit 9\n\
+                  for name in . ../cpu; do\n\
+                  \x20 echo \"$name: $(ls \"$name\" | grep -c '^cpu[0-9][0-9]*$') of $cpus\"\n\
+                  done\n";
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+    ];
+    let output =
+        hermit_test::hermit_output("hermit run", hermit_command(&args).stdin(Stdio::null()));
+    assert_success(&output, &args);
+    let listed = stdout(&output);
+    let cpus = listed
+        .lines()
+        .next()
+        .and_then(|line| line.rsplit_once(" of "))
+        .map(|(_, cpus)| cpus.to_owned())
+        .unwrap_or_default();
+    let expected = [
+        "cpu",
+        "./cpu",
+        "cpu/",
+        "/sys/devices/system/cpu",
+        ".",
+        "../cpu",
+    ]
+    .iter()
+    .map(|name| format!("{name}: {cpus} of {cpus}\n"))
+    .collect::<String>();
+    assert!(
+        !cpus.is_empty(),
+        "{backend}: {listed}\nstderr:\n{}",
+        stderr(&output)
+    );
+    assert_eq!(listed, expected, "{backend}; stderr:\n{}", stderr(&output));
+}
+
+/// [`list_the_virtual_cpus_by_every_spelling`] on ptrace.
+#[test]
+fn the_virtual_cpus_are_listed_by_every_spelling() {
+    list_the_virtual_cpus_by_every_spelling("ptrace");
+}
+
+/// [`list_the_virtual_cpus_by_every_spelling`] on KVM.
+#[test]
+fn run_kvm_the_virtual_cpus_are_listed_by_every_spelling() {
+    let test = "run_kvm_the_virtual_cpus_are_listed_by_every_spelling";
+    if kvm_unavailable(test) {
+        return;
+    }
+    list_the_virtual_cpus_by_every_spelling("kvm");
+}
+
+/// A `readlink` of the caller's descriptor link to `/proc/self/fd`, open on
+/// descriptor 7, names that directory, `/proc/<pid>/fd`, on `backend`, as
+/// natively: by its absolute spelling, and relative to the working directory
+/// `/` (<https://github.com/rrnewton/hermit/issues/4541>). Before, KVM refused
+/// the relative spelling with `EACCES`: Detcore read no working directory for
+/// it, and its executor refuses procfs. A spelling through `..` is not
+/// decided here (<https://github.com/rrnewton/hermit/issues/4901>).
+fn read_descriptor_directory_links_relative_to_the_working_directory(backend: &str) {
+    let script = "exec 7< /proc/self/fd || exit 9\n\
+                  link() { echo \"$1: $(readlink \"$2\" 2>&1 | sed 's#/proc/[0-9]*/#/proc/N/#')\"; }\n\
+                  cd / || exit 9\n\
+                  link abs /proc/self/fd/7\n\
+                  link rel proc/self/fd/7\n";
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+    ];
+    let output =
+        hermit_test::hermit_output("hermit run", hermit_command(&args).stdin(Stdio::null()));
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "abs: /proc/N/fd\nrel: /proc/N/fd\n",
+        "{backend}; stderr:\n{}",
+        stderr(&output)
+    );
+}
+
+/// [`read_descriptor_directory_links_relative_to_the_working_directory`] on ptrace.
+#[test]
+fn descriptor_directory_links_are_read_relative_to_the_working_directory() {
+    read_descriptor_directory_links_relative_to_the_working_directory("ptrace");
+}
+
+/// [`read_descriptor_directory_links_relative_to_the_working_directory`] on KVM.
+#[test]
+fn run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory() {
+    let test = "run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory";
+    if kvm_unavailable(test) {
+        return;
+    }
+    read_descriptor_directory_links_relative_to_the_working_directory("kvm");
+}
+
+/// What `tests/c/received_dotdot_lookups.c` prints under Hermit, on every
+/// backend, as natively: through `..` from a directory descriptor for
+/// `/tmp/d/sub`, opened or received over `SCM_RIGHTS`, the guest's own
+/// `/tmp/d/proc/uptime` is read and its own `/tmp/d/proc/fs` is found;
+/// `/proc/fs` itself is absent; and a lookup from a descriptor that is not
+/// open, and one whose walk meets a file before its `..`, fail as Linux fails
+/// them.
+const RECEIVED_DOTDOT_LOOKUPS: &str = "opened ../proc/uptime: read=\"the guest's own file\"\n\
+                                       received ../proc/uptime: read=\"the guest's own file\"\n\
+                                       opened ../proc/fs: stat=0 open=0\n\
+                                       received ../proc/fs: stat=0 open=0\n\
+                                       received ../../d/proc/fs: stat=0 open=0\n\
+                                       absolute /proc/fs: stat=ENOENT open=ENOENT\n\
+                                       not open ../proc/uptime: open=EBADF\n\
+                                       absolute /dev/null/../../proc/uptime: open=ENOTDIR\n";
+
+/// On `backend`, a name relative to a directory descriptor is looked up
+/// from that descriptor's directory, never from `/`
+/// (<https://github.com/rrnewton/hermit/issues/4541>): a descriptor received
+/// over `SCM_RIGHTS`, for which Detcore may keep no path, keeps its name
+/// relative, and the kernel's or the executor's walk from the descriptor
+/// decides it, as for the descriptor the guest opened itself. The answers
+/// are the ones [`RECEIVED_DOTDOT_LOOKUPS`] lists. A general resolution of
+/// `..` that walked such a name from `/` read Detcore's own
+/// `/proc/uptime` instead of the guest's file, hid the guest's `proc/fs`, and
+/// answered the lookups that fail with EBADF and ENOTDIR.
+fn look_up_dotdot_from_received_descriptors(backend: &str) {
+    let guest = futex_c_guest(&RECEIVED_DOTDOT_LOOKUPS_GUEST, "received_dotdot_lookups")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+    ];
+    let output =
+        hermit_test::hermit_output("hermit run", hermit_command(&args).stdin(Stdio::null()));
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        RECEIVED_DOTDOT_LOOKUPS,
+        "{backend}; stderr:\n{}",
+        stderr(&output)
+    );
+}
+
+/// [`look_up_dotdot_from_received_descriptors`] on ptrace.
+#[test]
+fn dotdot_from_a_received_descriptor_finds_the_guests_own_files() {
+    look_up_dotdot_from_received_descriptors("ptrace");
+}
+
+/// [`look_up_dotdot_from_received_descriptors`] on KVM.
+#[test]
+fn run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files() {
+    let test = "run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files";
+    if kvm_unavailable(test) {
+        return;
+    }
+    look_up_dotdot_from_received_descriptors("kvm");
+}
+
 /// The calls on and below a `/proc` directory Detcore serves that Detcore
 /// cannot answer as Linux does are refused by name (ARCHITECTURE.md rule 6),
 /// never reached through the directory's object nor answered with a
@@ -11544,6 +12152,211 @@ fn piped_stdin_verifies_at_bitwise_parity_on_every_backend() {
     }
 }
 
+/// The public first-image loader must replay nonempty stdin in both strict
+/// verification runs. This needs the qualified private runtime package staged
+/// for this CLI; a missing package must fail, rather than skip the assertion.
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[test]
+fn loader_public_verify_replays_stdin_bytes_and_eof_at_bitwise_parity() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("loader.json");
+    let report_arg = report.to_str().expect("report path is UTF-8");
+    let input = b"first\0line\nlast-without-newline\xff";
+    let cat = &piped_stdin_guests().0;
+    let args = [
+        "--backend=in-guest-trap",
+        "--log=info",
+        "run",
+        "--in-guest-exec-stop",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        "--seed=0",
+        "--sched-seed=0",
+        "--rng-seed=0",
+        "--max-timeslice=disabled",
+        "--no-rcb-time",
+        "--base-env=empty",
+        "--verify-json",
+        report_arg,
+        "--",
+        cat.as_str(),
+    ];
+    let output = hermit_with_stdin(&args, input);
+    assert_success(&output, &args);
+    assert_eq!(output.stdout, input, "{}", stderr(&output));
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["verdict"], "matched", "{verdict}");
+    assert_eq!(verdict["verified"], true, "{verdict}");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    assert_eq!(
+        verdict["comparison"]["strictness"], "canonical",
+        "{verdict}"
+    );
+    assert_eq!(
+        verdict["comparison"]["compare_io_buffers"], true,
+        "{verdict}"
+    );
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "loader compared no INFO messages: {verdict}"
+    );
+    for side in ["left", "right"] {
+        let actual = &verdict["compared_outputs"][side];
+        assert_eq!(actual["exit_code"], 0, "{side}: {verdict}");
+        assert!(actual["signal"].is_null(), "{side}: {verdict}");
+        assert_eq!(actual["stdout_bytes"], input.len(), "{side}: {verdict}");
+        assert_eq!(
+            actual["stdout_sha256"],
+            detcore::Digest::new(input).to_string(),
+            "{side}: {verdict}"
+        );
+        assert_eq!(actual["stderr_bytes"], 0, "{side}: {verdict}");
+        assert_eq!(
+            actual["stderr_sha256"],
+            detcore::Digest::new(b"").to_string(),
+            "{side}: {verdict}"
+        );
+    }
+    // The opt-in package qualification keeps this real fixture and the entire
+    // successful report for the saved-pair test. Ordinary CLI selection has
+    // no extra output or package requirement; all assertions above still run.
+    if let Some(record_path) = std::env::var_os("HERMIT_LOADER_QUALIFICATION_RECORD") {
+        assert!(
+            !record_path.is_empty(),
+            "qualification record path is empty"
+        );
+        let install = std::env::var_os("HERMIT_INSTALL_DIR")
+            .filter(|path| !path.is_empty())
+            .expect("package qualification requires HERMIT_INSTALL_DIR");
+        let install = fs::canonicalize(install).expect("canonical package installation");
+        let identity = |path: &Path| {
+            use sha2::Digest as _;
+
+            let path = fs::canonicalize(path).expect("canonical qualification input");
+            assert!(path.is_file(), "qualification input is not a regular file");
+            let mut digest = sha2::Sha256::new();
+            std::io::copy(&mut fs::File::open(&path).unwrap(), &mut digest).unwrap();
+            serde_json::json!({
+                "path": path,
+                "sha256": format!("{:x}", digest.finalize()),
+            })
+        };
+        let command = hermit_command(&args);
+        let argv = std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|word| {
+                word.to_str()
+                    .expect("qualification argv is UTF-8")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let record = serde_json::json!({
+            "schema": 1,
+            "hermit": identity(Path::new(env!("CARGO_BIN_EXE_hermit"))),
+            "cat": identity(Path::new(cat)),
+            "image": identity(&install.join("rsrcs/detcore_private_runtime.elf")),
+            "descriptor": identity(&install.join("rsrcs/detcore_private_runtime.package.json")),
+            "install": install,
+            "inline_argv": argv,
+            "stdin_sha256": detcore::Digest::new(input).to_string(),
+            "inline_report": verdict,
+        });
+        let mut record_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(record_path)
+            .expect("claim a new qualification record; never reuse an earlier run");
+        serde_json::to_writer_pretty(&mut record_file, &record).unwrap();
+        record_file.write_all(b"\n").unwrap();
+        record_file.sync_all().unwrap();
+    }
+}
+
+/// Omitting the loader opt-in retains strict stdin verification on the
+/// existing in-guest startup path, even in a build that contains the loader.
+#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[test]
+fn in_guest_trap_without_loader_opt_in_keeps_strict_stdin_verification() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("loader.json");
+    let report_arg = report.to_str().expect("report path is UTF-8");
+    let input = b"first\0line\nlast-without-newline\xff";
+    let cat = &piped_stdin_guests().0;
+    let args = [
+        "--backend=in-guest-trap",
+        "--log=info",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        "--seed=0",
+        "--sched-seed=0",
+        "--rng-seed=0",
+        "--max-timeslice=disabled",
+        "--no-rcb-time",
+        "--base-env=empty",
+        "--verify-json",
+        report_arg,
+        "--",
+        cat.as_str(),
+    ];
+    let output = hermit_with_stdin(&args, input);
+    assert_success(&output, &args);
+    assert!(
+        stderr(&output).lines().any(|line| line ==
+            "hermit: [in-guest-trap] selected: the guest preload is to host the Detcore Tool, with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)"),
+        "omitted loader flag must preserve the preload selection output: {}",
+        stderr(&output)
+    );
+    assert_eq!(output.stdout, input, "{}", stderr(&output));
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["verdict"], "matched", "{verdict}");
+    assert_eq!(verdict["verified"], true, "{verdict}");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    assert_eq!(
+        verdict["comparison"]["strictness"], "canonical",
+        "{verdict}"
+    );
+    assert_eq!(
+        verdict["comparison"]["compare_io_buffers"], true,
+        "{verdict}"
+    );
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "loader compared no INFO messages: {verdict}"
+    );
+    for side in ["left", "right"] {
+        let actual = &verdict["compared_outputs"][side];
+        assert_eq!(actual["exit_code"], 0, "{side}: {verdict}");
+        assert!(actual["signal"].is_null(), "{side}: {verdict}");
+        assert_eq!(actual["stdout_bytes"], input.len(), "{side}: {verdict}");
+        assert_eq!(
+            actual["stdout_sha256"],
+            detcore::Digest::new(input).to_string(),
+            "{side}: {verdict}"
+        );
+        assert_eq!(actual["stderr_bytes"], 0, "{side}: {verdict}");
+        assert_eq!(
+            actual["stderr_sha256"],
+            detcore::Digest::new(b"").to_string(),
+            "{side}: {verdict}"
+        );
+    }
+}
+
 /// A guest that reads one byte of its piped stdin leaves the rest in the pipe
 /// for the next reader, on every backend, as natively: neither the backend nor
 /// Hermit reads ahead of the guest. The guest reads exactly one byte
@@ -13001,7 +13814,7 @@ fn assert_pid_lifecycle_transcript(output: &str) {
                 "child grandchild={grandchild} waited={grandchild} exit=5\n",
                 "root child={child} waited={child} exit=6\n",
                 "exec-child pid={exec} ppid=3 tid={exec}\n",
-                "exec-proc stat={exec}/3 status={exec}/3 tracer=1\n",
+                "exec-proc stat={exec}/3 status={exec}/3 tracer=0\n",
                 "root exec={exec} waited={exec} exit=8\n",
                 "waitid-child pid={waitid} ppid=3 tid={waitid}\n",
                 "root waitid={waitid} reported={waitid} exit=9\n",
@@ -13029,7 +13842,7 @@ fn assert_pid_lifecycle_oracle_rejects_broken_relationships() {
         "child grandchild=7 waited=7 exit=5\n",
         "root child=4 waited=4 exit=6\n",
         "exec-child pid=9 ppid=3 tid=9\n",
-        "exec-proc stat=9/3 status=9/3 tracer=1\n",
+        "exec-proc stat=9/3 status=9/3 tracer=0\n",
         "root exec=9 waited=9 exit=8\n",
         "waitid-child pid=12 ppid=3 tid=12\n",
         "root waitid=12 reported=12 exit=9\n",
@@ -13804,6 +14617,46 @@ fn run_kvm_names_the_execve_filename_in_at_execfn_as_ptrace_does() {
         "{execfns:?}"
     );
     assert_eq!(execfns[3], "./sub/inner.sh");
+}
+
+/// A schedule replay that has run out of its schedule ends slices as a run
+/// without a schedule does, which `hermit analyze` assumes of the
+/// continuation after a replayed prefix. A 5 ms sleep requested while a
+/// sibling spins on getppid ends near 5 ms in a plain run: the spinner's slice
+/// ends at the sleeper's deadline
+/// (https://github.com/rrnewton/hermit/issues/4121). Replaying an empty
+/// schedule must print the same. Before, the replay kept its threads' slices
+/// uncapped after its schedule ran out, and the sleep waited out the
+/// spinner's 200 ms slice (`waited_us=201009`).
+#[test]
+fn a_replay_past_its_schedule_ends_slices_as_a_run_without_one_does() {
+    let guest = kvm_deadline_spin_wait_guest()
+        .to_str()
+        .expect("deadline guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = dir.path().join("empty.json");
+    fs::write(&schedule, r#"{"per_thread":{},"global":[]}"#).unwrap();
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run", "--strict", "--epoch=2026-01-01T00:00:00Z"];
+        args.extend_from_slice(extra);
+        args.extend(["--", guest, "nanosleep", "getppid", "late"]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        stdout(&output)
+    };
+    let plain = run(&[]);
+    let waited: i64 = plain
+        .split("waited_us=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no waited_us in stdout:\n{plain}"));
+    assert!(
+        (5_000..20_000).contains(&waited),
+        "a 5 ms sleep took {waited} us:\n{plain}"
+    );
+    assert_eq!(run(&[replay.as_str()]), plain);
 }
 
 /// On KVM a 5 ms sleep requested while a sibling spins on getppid is a
@@ -15218,8 +16071,8 @@ fn namespace_only_applies_minimal_and_explicit_environment() {
         "--",
         "/bin/sh",
         "-c",
-        "printf 'home=%s\\nhostname=%s\\npath=%s\\nexplicit=%s\\nhost=%s\\nasan=%s\\nlsan=%s\\n' \
-         \"${HOME-UNSET}\" \"${HOSTNAME-UNSET}\" \"${PATH-UNSET}\" \
+        "printf 'home=%s\\nuser=%s\\nlogname=%s\\nhostname=%s\\npath=%s\\nexplicit=%s\\nhost=%s\\nasan=%s\\nlsan=%s\\n' \
+         \"${HOME-UNSET}\" \"${USER-UNSET}\" \"${LOGNAME-UNSET}\" \"${HOSTNAME-UNSET}\" \"${PATH-UNSET}\" \
          \"${NAMESPACE_ONLY_EXPLICIT-UNSET}\" \"${NAMESPACE_ONLY_HOST_ONLY-UNSET}\" \
          \"${ASAN_OPTIONS-UNSET}\" \"${LSAN_OPTIONS-UNSET}\"",
     ];
@@ -15235,11 +16088,71 @@ fn namespace_only_applies_minimal_and_explicit_environment() {
     assert_success(&output, &args);
     assert_eq!(
         stdout(&output),
-        "home=/root\nhostname=hermetic-container.local\n\
+        "home=/root\nuser=root\nlogname=root\nhostname=hermetic-container.local\n\
          path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
          explicit=present\nhost=UNSET\nasan=UNSET\nlsan=UNSET\n"
     );
     assert_eq!(stderr(&output), "");
+}
+
+/// `--base-env=minimal` names the guest's own identity in HOME, USER and
+/// LOGNAME: the user `getpwuid(getuid())` returns in the guest, root (uid 0)
+/// with home directory /root. USER and LOGNAME used to be unset, so a guest
+/// that used `getenv("USER")` without a NULL check crashed only under Hermit.
+#[test]
+fn run_minimal_base_env_names_the_guests_own_user_and_home() {
+    let _guard = hermit_run_guard();
+    let guest = minimal_env_identity_guest()
+        .to_str()
+        .expect("minimal-environment identity guest path should be UTF-8");
+    let args = ["run", "--base-env=minimal", "--", guest];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "uid=0\nHOME=/root\nUSER=root\nLOGNAME=root\npw_name=root\npw_dir=/root\n\
+         HOME is a directory: yes\nidentity agrees\n"
+    );
+}
+
+/// `--env` replaces the `--base-env=minimal` values it names and leaves the
+/// rest, and the guest then reports each disagreement with its user database,
+/// which shows that its check can fail.
+#[test]
+fn run_explicit_env_replaces_the_minimal_user_and_home() {
+    let _guard = hermit_run_guard();
+    let guest = minimal_env_identity_guest()
+        .to_str()
+        .expect("minimal-environment identity guest path should be UTF-8");
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--env=USER=builder",
+        "--env=HOME=/tmp",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+
+    // The guest exits 1 when the `--env` values disagree with its user
+    // database (the `disagrees:` lines asserted below), and hermit
+    // propagates that status rather than choosing 1 itself.
+    // EXIT-CLASS: guest
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "hermit {args:?} should exit with the guest's status 1\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(
+        stdout(&output),
+        "uid=0\nHOME=/tmp\nUSER=builder\nLOGNAME=root\npw_name=root\npw_dir=/root\n\
+         HOME is a directory: yes\n\
+         disagrees: HOME=/tmp, user database /root\n\
+         disagrees: USER=builder, user database root\n"
+    );
 }
 
 #[test]
@@ -16546,11 +17459,14 @@ fn run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills() {
 /// tests/c/signal_then_sibling_exit.c on KVM: a worker signals the main thread
 /// and exits at once, while the main thread takes the signal at a system-call
 /// return (`spin`, a getpid loop) or in a `sigsuspend` loop. The waiting
-/// thread holds a delivery permit until its `InboundSignal` turn, and the
-/// protocol allows one boundary per process, so the worker's controlled exit
-/// was refused as a protocol failure ("KVM parked signal protocol failed ...
-/// Identity"), on main 2bf536af for `spin` in 4 of 4 runs. The exit now waits
-/// for the permit's release (https://github.com/rrnewton/hermit/issues/4367).
+/// thread holds a delivery permit until its `InboundSignal` turn. While the
+/// protocol allowed one permit per process, the worker's controlled exit was
+/// refused as a protocol failure ("KVM parked signal protocol failed ...
+/// Identity"), on main 2bf536af for `spin` in 4 of 4 runs
+/// (https://github.com/rrnewton/hermit/issues/4367); the exit then waited for
+/// the permit's release. Permits are now per thread, so the exit proceeds
+/// while the main thread holds its own
+/// (https://github.com/rrnewton/hermit/issues/4899).
 /// `sigsuspend` also runs under three chaos seeds. `spin` runs at the default
 /// schedule: it busy-waits with no blocking call, and under chaos it holds a
 /// new thread off for up to two full slices (200 ms of virtual time each), too
@@ -16619,6 +17535,194 @@ fn run_kvm_a_sibling_may_exit_while_its_signal_is_taken() {
             );
         }
     }
+}
+
+/// The modes of tests/c/signal_permits_per_thread.c and the line Linux
+/// prints for each: threads of one process taking signals at the same time,
+/// beside a parked wait that a process alarm interrupts, and while a sibling
+/// exits or ends the process, also while that alarm interrupts the wait.
+const SIGNAL_PERMIT_MODES: [(&str, &str); 16] = [
+    ("raise", "raise: ok\n"),
+    ("tgkill", "tgkill: ok\n"),
+    ("spin", "spin: ok\n"),
+    ("sigsuspend", "sigsuspend: ok\n"),
+    ("alarm-spin", "alarm-spin: ok\n"),
+    ("alarm-nanosleep", "alarm-nanosleep: ok\n"),
+    ("alarm-clock_nanosleep", "alarm-clock_nanosleep: ok\n"),
+    ("alarm-pause", "alarm-pause: ok\n"),
+    ("alarm-sigsuspend", "alarm-sigsuspend: ok\n"),
+    ("alarm-read", "alarm-read: ok\n"),
+    ("alarm-waitid", "alarm-waitid: ok\n"),
+    ("thread-exit", "thread-exit: ok\n"),
+    ("exit-group", "exit-group: exited 3\n"),
+    ("fatal", "fatal: killed by signal 15\n"),
+    ("fatal-alarm", "fatal-alarm: killed by signal 14\n"),
+    ("alarm-exit-group", "alarm-exit-group: exited 3\n"),
+];
+
+/// Runs each of `modes` of tests/c/signal_permits_per_thread.c under strict
+/// verification on `backend`, and requires the line Linux prints and bitwise
+/// parity with INFO messages compared. `check_log` then reads each mode's
+/// retained first-run INFO log, the one the verification compared.
+fn assert_signal_permit_modes<'a>(
+    backend: &str,
+    modes: impl IntoIterator<Item = (&'a str, &'a str)>,
+    check_log: impl Fn(&str, &str),
+) {
+    let guest = signal_permits_per_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for (mode, expected) in modes {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let logs = directory.path().join("logs");
+        let logs_arg = logs.to_str().expect("log directory path should be UTF-8");
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--keep-logs",
+            "--verify-log-dir",
+            logs_arg,
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend} {mode}");
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(
+            verdict["bitwise_parity"], true,
+            "{backend} {mode}: {verdict}"
+        );
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{backend} {mode}: no INFO messages compared: {verdict}"
+            );
+        }
+        let first_run_log = fs::read_dir(&logs)
+            .expect("--keep-logs retained no log directory")
+            .map(|entry| entry.expect("unreadable retained log entry").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("run1"))
+            })
+            .unwrap_or_else(|| panic!("{backend} {mode}: --keep-logs retained no first-run log"));
+        let log = fs::read_to_string(&first_run_log).expect("retained log is not UTF-8 text");
+        check_log(mode, &log);
+    }
+}
+
+/// In tests/c/signal_permits_per_thread.c's alarm-exit-group mode, requires
+/// the INFO `log` to show the worker's group exit committed while the main
+/// thread held its observed wait's permit: after the main thread began
+/// handling its SIGALRM ("handling inbound signal ... SIGALRM", logged once
+/// the observation took the alarm) and before that thread's InboundSignal
+/// turn for it, which releases the permit at the return boundary. Where the
+/// exit lands depends on the schedule: the worker's default count of 1100
+/// self-signals lands it in this window on KVM, which ran from 975 to 1250
+/// self-signals when this test was written, for guests built against glibc
+/// 2.34 and 2.42 alike. A failure here means the window moved; find it again
+/// with the guest's optional count argument.
+fn assert_group_exit_beside_an_observed_wait(log: &str) {
+    let lines: Vec<&str> = log.lines().collect();
+    let (handling, main) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(index, line)| {
+            if !(line.contains("handling inbound signal (#") && line.contains(") SIGALRM")) {
+                return None;
+            }
+            let after = line.split("[dtid ").nth(1)?;
+            let tid = after.split(']').next()?;
+            Some((index, tid.to_owned()))
+        })
+        .unwrap_or_else(|| {
+            panic!("alarm-exit-group: the main thread never handled its SIGALRM: the group exit came first")
+        });
+    let exit_resource = format!("Exit {{ group: true, process: DetPid({main})");
+    let main_commit = format!("dettid {main} using resources");
+    let main_alarm_turn = |line: &&str| {
+        line.contains("COMMIT turn")
+            && line.contains(&main_commit)
+            && line.contains("InboundSignal(SigWrapper(14))")
+    };
+    let exit = lines[handling..]
+        .iter()
+        .position(|line| {
+            line.contains("COMMIT turn")
+                && line.contains(&exit_resource)
+                && !line.contains(&main_commit)
+        })
+        .map(|offset| handling + offset)
+        .unwrap_or_else(|| {
+            panic!("alarm-exit-group: no sibling committed the group exit after dtid {main} handled SIGALRM (line {})", handling + 1)
+        });
+    if let Some(offset) = lines[handling..exit].iter().position(main_alarm_turn) {
+        panic!(
+            "alarm-exit-group: dtid {main}'s InboundSignal turn (line {}) came before the group exit (line {}), so the exit did not meet its observed wait's permit",
+            handling + offset + 1,
+            exit + 1
+        );
+    }
+}
+
+/// tests/c/signal_permits_per_thread.c on KVM: Detcore held one
+/// signal-delivery permit per process, so a thread that reached a signal
+/// boundary while a sibling waited for its turn to deliver was refused, and
+/// reverie-kvm failed the run after 64 refusals ("KVM signal hook exhausted
+/// one return boundary without selecting delivery"). On main b82ae16f every
+/// mode but `thread-exit` and `exit-group` failed that way; those two passed
+/// only because the exit waited for the sibling's permit. Permits are now
+/// per thread (https://github.com/rrnewton/hermit/issues/4899): each mode
+/// prints the line Linux prints and reaches bitwise parity, and in the
+/// `alarm-*` modes the sibling's boundaries come while the main thread's
+/// observed parked wait holds its permit. In `alarm-exit-group` the sibling's
+/// group exit comes then, which the retained INFO log must show; on main
+/// b82ae16f that exit waited for the permit's release instead.
+#[test]
+fn run_kvm_signal_permits_are_per_thread() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM per-thread signal permit cases: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    assert_signal_permit_modes("--backend=kvm", SIGNAL_PERMIT_MODES, |mode, log| {
+        if mode == "alarm-exit-group" {
+            assert_group_exit_beside_an_observed_wait(log);
+        }
+    });
+}
+
+/// The same guest on ptrace, where the kernel delivers each thread's signals
+/// and Detcore holds no permits: fifteen of the sixteen modes print the same
+/// line as on Linux and KVM and reach bitwise parity. `alarm-waitid` is left
+/// out: on ptrace its waitid is not interrupted by the alarm and the run
+/// never ends, on main b82ae16f as here
+/// (https://github.com/rrnewton/hermit/issues/4133).
+#[test]
+fn run_ptrace_signal_permits_are_per_thread() {
+    let _guard = hermit_run_guard();
+    assert_signal_permit_modes(
+        "--backend=ptrace",
+        SIGNAL_PERMIT_MODES
+            .into_iter()
+            .filter(|(mode, _)| *mode != "alarm-waitid"),
+        |_, _| {},
+    );
 }
 
 /// tests/c/parked_wait_then_exec.c on KVM: a parked wait that a real-timer
@@ -17234,6 +18338,29 @@ fn run_rejects_a_missing_bind_source_before_mounting() {
     );
 }
 
+/// A `--mount` target outside `/tmp` that does not exist is named before the
+/// container is set up. Hermit mounts onto such a target as it is, so at
+/// setup it failed with only `ENOENT` from a mount, which said neither the
+/// path nor which mount: the same report a host without `/tmp` gave for
+/// Hermit's own private `/tmp`.
+#[test]
+fn run_rejects_a_missing_mount_target_outside_tmp_by_name() {
+    let source = tempfile::tempdir().unwrap();
+    let mount = format!(
+        "--mount=type=bind,source={},target=/definitely/missing/hermit-target",
+        source.path().display()
+    );
+    let output = hermit(&["run", &mount, "--", "/bin/true"]);
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Hermit,
+        &[
+            "--mount target /definitely/missing/hermit-target",
+            "does not exist on this host",
+        ],
+    );
+}
+
 #[test]
 fn run_reports_denied_ptrace_and_seccomp_capabilities() {
     for (syscall, expected) in [
@@ -17291,6 +18418,37 @@ fn run_ptrace_virtual_clock_advances_across_execve() {
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "exec-clock-continuity-ok\n");
+}
+
+/// `prctl(PR_SET_PTRACER)` answers under Hermit as it does natively on the
+/// same host: 0 with the Yama LSM, EINVAL without it. Detcore used to answer
+/// ENOSYS, which bionic's crash handler treats as fatal, so every crashing
+/// guest on Android exited 1 instead of dying of its signal.
+#[test]
+fn prctl_set_ptracer_answers_as_the_host_kernel_does() {
+    let program = prctl_set_ptracer_guest()
+        .to_str()
+        .expect("prctl-set-ptracer guest path should be UTF-8");
+    let native = Command::new(program)
+        .output()
+        .expect("failed to run the prctl-set-ptracer guest natively");
+    assert!(native.status.success(), "native run failed: {native:?}");
+    let native_stdout = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(
+        !native_stdout.contains("ENOSYS"),
+        "the host kernel answered ENOSYS:\n{native_stdout}"
+    );
+    let args = [
+        "run",
+        "--strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), native_stdout);
 }
 
 /// The same exec-boundary clock trajectory must also be reproducible, so the
@@ -17509,6 +18667,365 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
             .count(),
         8
     );
+}
+
+/// A schedule replay names a host file the guest reads whose bytes changed
+/// since the recording, once, on stderr and in its summary, and stays quiet
+/// for a file rewritten with the same bytes. Hermit does not make a changing
+/// filesystem deterministic: a replay that reads other bytes may diverge, as
+/// a seed rerun on a host whose package manager rewrote `/etc/ld.so.cache`
+/// did, and it now says why. The recorded schedule and the summary carry the
+/// set of host files the run read; recording it changes no scheduling
+/// decision. PMU-free: no `--chaos`, so the schedule records no preemptions,
+/// and the host-input comparison does not depend on any.
+///
+/// Only the test's own file `F` is asserted on: other host files the shell
+/// reads (the loader cache among them) can be rewritten by the host between
+/// the runs, and then reporting them is right.
+#[test]
+fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let input = directory.path().join("F");
+    fs::write(&input, "input\n").unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let input_path = input.to_str().unwrap();
+    let run = |schedule_arg: String, summary: &Path| {
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let args = [
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            &schedule_arg,
+            &summary_arg,
+            "--",
+            "/bin/cat",
+            input_path,
+        ];
+        let output = hermit_test::hermit_output(
+            "host-input schedule run",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(summary).unwrap()).unwrap();
+        (stdout(&output), stderr(&output), summary)
+    };
+    // The lines naming `F`, and the summary's changes to `F`.
+    let named = |stderr: &str| -> Vec<String> {
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING"))
+            .filter(|line| line.contains(&format!("host input {input_path} changed")))
+            .map(str::to_owned)
+            .collect()
+    };
+    let changed = |summary: &serde_json::Value| -> Vec<serde_json::Value> {
+        summary["host_inputs_changed"]
+            .as_array()
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter(|change| change["path"] == input_path)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let (out, _, summary) = run(
+        format!("--record-preemptions-to={}", schedule.display()),
+        &directory.path().join("record.json"),
+    );
+    assert_eq!(out, "input\n");
+    // The schedule and the summary carry the same set, which holds `F` with
+    // its size and the SHA-256 of its bytes (`printf 'input\n' | sha256sum`).
+    let recorded: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    assert_eq!(
+        recorded["host_inputs"], summary["host_inputs"],
+        "{recorded}"
+    );
+    let file = recorded["host_inputs"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == input_path)
+        .unwrap_or_else(|| panic!("the recording does not hold {input_path}: {recorded}"))
+        .clone();
+    assert_eq!(file["size"], 6, "{file}");
+    assert_eq!(
+        file["content"], "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453",
+        "{file}"
+    );
+    assert_eq!(
+        recorded["host_inputs"]["digest"].as_str().map(str::len),
+        Some(64),
+        "{recorded}"
+    );
+    // The program the kernel exec'd is in the set too, under the path its
+    // `/proc/<pid>/exe` link names, and so is the ELF interpreter it names.
+    let holds = |path: &str| {
+        recorded["host_inputs"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == path)
+    };
+    let program = fs::canonicalize("/bin/cat").unwrap();
+    assert!(
+        holds(program.to_str().unwrap()),
+        "the recording does not hold {}: {recorded}",
+        program.display()
+    );
+    if let Some(interpreter) = elf_program_interpreter(&program) {
+        assert!(
+            holds(&interpreter),
+            "the recording does not hold {interpreter}: {recorded}"
+        );
+    }
+
+    let replay = || format!("--replay-preemptions-from={}", schedule.display());
+    let (out, err, summary) = run(replay(), &directory.path().join("unchanged.json"));
+    assert_eq!(out, "input\n");
+    assert!(named(&err).is_empty(), "{err}");
+    assert!(changed(&summary).is_empty(), "{summary}");
+
+    // Replaced with other bytes: named once, with the recorded and the new size.
+    let replacement = directory.path().join("F.new");
+    fs::write(&replacement, "changed input\n").unwrap();
+    fs::rename(&replacement, &input).unwrap();
+    let (out, err, summary) = run(replay(), &directory.path().join("changed.json"));
+    assert_eq!(out, "changed input\n");
+    let lines = named(&err);
+    assert_eq!(lines.len(), 1, "{err}");
+    assert!(
+        lines[0].contains("size 6 mtime") && lines[0].contains("size 14 mtime"),
+        "{}",
+        lines[0]
+    );
+    let changes = changed(&summary);
+    assert_eq!(changes.len(), 1, "{summary}");
+    assert_eq!(
+        (&changes[0]["recorded"]["size"], &changes[0]["now"]["size"]),
+        (&serde_json::json!(6), &serde_json::json!(14))
+    );
+    // A schedule-trace replay of the same recording compares the same way.
+    let (out, err, summary) = run(
+        format!("--replay-schedule-from={}", schedule.display()),
+        &directory.path().join("changed-trace.json"),
+    );
+    assert_eq!(out, "changed input\n");
+    assert_eq!(named(&err).len(), 1, "{err}");
+    assert_eq!(changed(&summary).len(), 1, "{summary}");
+
+    // Other bytes of the recorded size: named once, by the bytes, which
+    // Hermit reads when the run has ended.
+    fs::write(&replacement, "INPUT\n").unwrap();
+    fs::rename(&replacement, &input).unwrap();
+    let (out, err, summary) = run(replay(), &directory.path().join("same-size.json"));
+    assert_eq!(out, "INPUT\n");
+    let lines = named(&err);
+    assert_eq!(lines.len(), 1, "{err}");
+    assert!(lines[0].contains("size 6 mtime"), "{}", lines[0]);
+    assert_eq!(changed(&summary).len(), 1, "{summary}");
+
+    // Rewritten with the recorded bytes under a new inode: not a change.
+    fs::write(&replacement, "input\n").unwrap();
+    fs::rename(&replacement, &input).unwrap();
+    let (out, err, summary) = run(replay(), &directory.path().join("restored.json"));
+    assert_eq!(out, "input\n");
+    assert!(named(&err).is_empty(), "{err}");
+    assert!(changed(&summary).is_empty(), "{summary}");
+    // The digest follows what the comparison compares: paths and bytes (or
+    // an identity where a file was not hashed), not `F`'s new inode. Other
+    // host files may really change between the runs; only when none did must
+    // the digests agree.
+    let compared = |set: &serde_json::Value| -> Vec<(String, String)> {
+        set["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| {
+                let key = match file["content"].as_str() {
+                    Some(content) => content.to_owned(),
+                    None => format!("{}:{}:{}", file["dev"], file["ino"], file["size"]),
+                };
+                (file["path"].as_str().unwrap().to_owned(), key)
+            })
+            .collect()
+    };
+    let inode = |set: &serde_json::Value| {
+        set["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == input_path)
+            .map(|file| file["ino"].clone())
+    };
+    assert_ne!(
+        inode(&summary["host_inputs"]),
+        inode(&recorded["host_inputs"])
+    );
+    if compared(&summary["host_inputs"]) == compared(&recorded["host_inputs"]) {
+        assert_eq!(
+            summary["host_inputs"]["digest"], recorded["host_inputs"]["digest"],
+            "{summary}"
+        );
+    }
+}
+
+/// Recording the host files a run reads changes nothing the guest can see:
+/// a guest that watches a directory with inotify and reads one file in it
+/// sees the events of its own open, read and close, as natively, whether or
+/// not the run keeps its host-input set (`--summary-json`). Hermit reads a
+/// file's bytes for the set only after every guest process has exited; a
+/// read while the guest runs queues inotify events in the guest's watch
+/// (`fsnotify_access`, fs/read_write.c), which it reads back.
+#[test]
+fn recording_host_inputs_queues_no_inotify_event_for_the_guest() {
+    let guest = program_break_guest("inotify-read-watch", "inotify_read_watch.c", &[]);
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    fs::write(directory.path().join("F"), "input\n").unwrap();
+    let watched = directory.path().to_str().unwrap();
+    let native = Command::new(&guest)
+        .args([watched, "F"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    assert_eq!(stdout(&native), "OPEN ACCESS CLOSE_NOWRITE\n");
+    let summary = directory.path().join("summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let guest = guest.to_str().unwrap();
+    for extra in [None, Some(summary_arg.as_str())] {
+        let mut args = vec![
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        ];
+        args.extend(extra);
+        args.extend(["--", guest, watched, "F"]);
+        let output = hermit_test::hermit_output(
+            "inotify host-input run",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), stdout(&native), "{args:?}");
+    }
+    // The run with the summary did keep the set, and read `F`'s bytes.
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+    let path = directory.path().join("F");
+    let file = summary["host_inputs"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == path.to_str().unwrap())
+        .unwrap_or_else(|| panic!("the summary does not hold F: {summary}"))
+        .clone();
+    assert_eq!(
+        file["content"], "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453",
+        "{file}"
+    );
+}
+
+/// A guest that lists, then writes into, the `/tmp` Hermit makes afresh for
+/// each run is recorded and replayed without any host input named as
+/// changed, and the two runs' digests agree. Each run's `/tmp` is a new
+/// directory, with its own inode and times, and the guest's write changes
+/// its times; the guest sees neither, only the names in it, which are the
+/// same. So a directory is compared by the names in it (leaving out those
+/// the guest made or removed itself), not by its identity: a run whose guest
+/// makes another name there read the same `/tmp` from the host.
+#[test]
+fn a_schedule_replay_of_a_guest_using_its_private_tmp_names_no_host_input() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let run = |schedule_arg: String, summary: &Path, made: &str| {
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let script = format!("ls -a /tmp; echo made > /tmp/{made}; ls -a /tmp");
+        let mut args = vec![
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            &summary_arg,
+        ];
+        if !schedule_arg.is_empty() {
+            args.push(&schedule_arg);
+        }
+        args.extend(["--", "/bin/sh", "-c", &script]);
+        let output = hermit_test::hermit_output(
+            "private /tmp schedule run",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(summary).unwrap()).unwrap();
+        (stdout(&output), stderr(&output), summary)
+    };
+    let (recorded_out, _, recorded) = run(
+        format!("--record-preemptions-to={}", schedule.display()),
+        &directory.path().join("record.json"),
+        "made",
+    );
+    assert!(recorded_out.ends_with("made\n"), "{recorded_out}");
+
+    let (out, err, replayed) = run(
+        format!("--replay-preemptions-from={}", schedule.display()),
+        &directory.path().join("replay.json"),
+        "made",
+    );
+    assert_eq!(out, recorded_out);
+    assert!(
+        !err.contains("HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING"),
+        "{err}"
+    );
+    assert_eq!(replayed.get("host_inputs_changed"), None, "{replayed}");
+    assert_eq!(
+        replayed["host_inputs"]["digest"], recorded["host_inputs"]["digest"],
+        "{replayed}"
+    );
+    // `/tmp` is in the set, compared by the names in it, which leave out
+    // the one the guest made.
+    let tmp = |summary: &serde_json::Value| {
+        summary["host_inputs"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "/tmp")
+            .unwrap_or_else(|| panic!("the set does not hold /tmp: {summary}"))
+            .clone()
+    };
+    assert!(tmp(&recorded)["content"].is_string(), "{recorded}");
+    let (out, _, other) = run(String::new(), &directory.path().join("other.json"), "other");
+    assert!(out.lines().any(|line| line == "other"), "{out}");
+    assert_eq!(
+        tmp(&other)["content"],
+        tmp(&recorded)["content"],
+        "{} {}",
+        tmp(&other),
+        tmp(&recorded)
+    );
+}
+
+/// The program interpreter (`PT_INTERP`) an ELF64 executable names, or `None`
+/// for a static one.
+fn elf_program_interpreter(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let u16_at = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+    if bytes.get(..4)? != b"\x7fELF" {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (u64_at(32), u16_at(54), u16_at(56));
+    (0..phnum)
+        .map(|index| phoff + index * phentsize)
+        .find(|entry| u32::from_le_bytes(bytes[*entry..*entry + 4].try_into().unwrap()) == 3)
+        .map(|entry| {
+            let (offset, size) = (u64_at(entry + 8), u64_at(entry + 32));
+            let name = &bytes[offset..offset + size];
+            String::from_utf8_lossy(name.split(|byte| *byte == 0).next().unwrap()).into_owned()
+        })
 }
 
 #[test]
@@ -21038,6 +22555,250 @@ fn a_desynced_schedule_replay_admits_a_non_root_process_child() {
             .any(|(_, rest)| !rest.starts_with("3;")),
         "no thread of a process other than the root registered unguided:\n{log}"
     );
+}
+
+/// A schedule replay that cannot follow its schedule any more lets every
+/// thread run. tests/c/replay_desync_spinner.c is recorded joining its worker
+/// at once and replayed spinning on sched_yield until the worker, which first
+/// sleeps, sets a flag. The replay leaves its schedule at the first
+/// sched_yield, where the schedule's next event is the main thread's join. It
+/// kept running the main thread, the thread that event names, and held the
+/// worker back, so the spinner took every turn and the run never finished
+/// (it ran into `--timeout`, exit 124; the fixed run takes under a second). After a thousand unmatched events the
+/// replay now drops the rest of the schedule and gives every thread the
+/// default priority, as when a schedule runs out.
+#[test]
+fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
+    let _guard = hermit_run_guard();
+    let guest = replay_desync_spinner_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let common = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    let record_to = format!("--record-preemptions-to={}", schedule.display());
+    let mut record_args: Vec<&str> = common.to_vec();
+    record_args.extend([record_to.as_str(), "--", guest]);
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+
+    let replay_from = format!("--replay-schedule-from={}", schedule.display());
+    let summary = directory.path().join("replay.summary");
+    let summary_to = format!("--summary-json={}", summary.display());
+    let mut replay_args = vec!["--log=warn"];
+    replay_args.extend(common);
+    replay_args.extend([
+        "--timeout=20",
+        replay_from.as_str(),
+        summary_to.as_str(),
+        "--",
+        guest,
+        "spin",
+    ]);
+    let replay = hermit(&replay_args);
+    let log = stderr(&replay);
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "{replay_args:?}:\n{}",
+        log.lines().take(40).collect::<Vec<_>>().join("\n")
+    );
+    assert_eq!(stdout(&replay), "done\n");
+    assert!(
+        log.contains("the replay no longer follows the schedule"),
+        "the replay did not leave its schedule, so this is not the case:\n{log}"
+    );
+    // The run summary, which `hermit analyze` keeps for each trial, says so
+    // too: a released trial is not a faithful replay of its schedule.
+    let summary: RunSummary = serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+    let desyncs = summary.desync_descrip.unwrap_or_default();
+    assert!(
+        desyncs.contains("RELEASED replayed schedule at event #"),
+        "the summary does not record the release:\n{desyncs}"
+    );
+}
+
+/// Under `--replay-exhausted-panic` a replay that leaves its schedule stops
+/// there, as one that runs out of it does, instead of running on unguided:
+/// the container exits with status 1 (`immediate_fatal_exit`), which hermit
+/// reports as its internal-failure exit, with the reason on stderr, and the
+/// guest never finishes.
+#[test]
+fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
+    let _guard = hermit_run_guard();
+    let guest = replay_desync_spinner_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let common = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    let record_to = format!("--record-preemptions-to={}", schedule.display());
+    let mut record_args: Vec<&str> = common.to_vec();
+    record_args.extend([record_to.as_str(), "--", guest]);
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+
+    let replay_from = format!("--replay-schedule-from={}", schedule.display());
+    let mut replay_args = vec!["--log=warn"];
+    replay_args.extend(common);
+    replay_args.extend([
+        "--timeout=20",
+        "--replay-exhausted-panic",
+        replay_from.as_str(),
+        "--",
+        guest,
+        "spin",
+    ]);
+    let replay = hermit(&replay_args);
+    let log = stderr(&replay);
+    assert_eq!(
+        replay.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{replay_args:?}:\n{}",
+        log.lines().take(40).collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        log.contains("The replay left its schedule at event #")
+            && log.contains("stopping (--replay-exhausted-panic)")
+            && log.contains("class=container-child-exit status=Exited(1)"),
+        "the replay did not stop where it left its schedule:\n{log}"
+    );
+    assert_eq!(stdout(&replay), "", "the guest ran on past the release");
+}
+
+/// A schedule replay hands the CPU to the next recorded thread when it traces
+/// the event that ended a slice. A trapped `rdtsc` that ends a slice (an
+/// expired `--target-timeslice`, checked at the trap) used to read the guest
+/// TSC only after that hand-off, so the replayed guest saw the time the other
+/// threads ran meanwhile and left its spin loop at another iteration than
+/// the recording did: every seed below desynced. The TSC is now read before
+/// the event is traced, where the recording read it.
+///
+/// Every slice ends at a check-in, a trapped `rdtsc` or a syscall, where the
+/// expired `--target-timeslice` is found: the PMU timer is armed only at the
+/// default 200 ms maximum, which this guest never reaches, so the schedule
+/// does not depend on where a timer interrupt lands.
+#[test]
+fn a_schedule_replay_reads_a_trapped_rdtsc_before_switching_away() {
+    static GUEST: OnceLock<PathBuf> = OnceLock::new();
+    let guest = futex_c_guest(&GUEST, "rdtsc_spin_deadline")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for seed in ["1", "2", "3", "4"] {
+        let schedule = directory.path().join(format!("schedule-{seed}.json"));
+        let record = format!("--record-preemptions-to={}", schedule.display());
+        let recorded = hermit(&[
+            "run",
+            "--strict",
+            "--chaos",
+            "--seed",
+            seed,
+            "--target-timeslice=20000",
+            &record,
+            "--",
+            &guest,
+        ]);
+        assert!(
+            recorded.status.success(),
+            "seed {seed}: {}",
+            stderr(&recorded)
+        );
+        // The case under test: a recorded slice ended at a trapped rdtsc and
+        // another thread ran next.
+        let recording: serde_json::Value =
+            serde_json::from_slice(&fs::read(&schedule).unwrap()).unwrap();
+        let events = recording["global"].as_array().unwrap();
+        assert!(
+            events
+                .windows(2)
+                .any(|pair| pair[0]["op"] == "Rdtsc" && pair[0]["dettid"] != pair[1]["dettid"]),
+            "seed {seed}: no recorded slice ended at an rdtsc"
+        );
+
+        let summary = directory.path().join(format!("summary-{seed}.json"));
+        let replay = format!("--replay-schedule-from={}", schedule.display());
+        let summary_flag = format!("--summary-json={}", summary.display());
+        let replayed = hermit(&["run", "--strict", &replay, &summary_flag, "--", &guest]);
+        assert!(
+            replayed.status.success(),
+            "seed {seed}: {}",
+            stderr(&replayed)
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+        assert_eq!(
+            summary["schedevent_desynced"], 0,
+            "seed {seed}: the replay left its recorded schedule: {summary}"
+        );
+        // And it followed the whole recording: past its end a replay runs on
+        // unguided and counts no desyncs.
+        assert_eq!(
+            summary["schedevent_replayed"],
+            events.len(),
+            "seed {seed}: the replay did not follow the whole recording: {summary}"
+        );
+        assert_eq!(stdout(&replayed), stdout(&recorded), "seed {seed}");
+    }
+}
+
+/// A schedule recorded with `--record-preemptions-to` replays with
+/// `--replay-schedule-from` under the thread IDs it recorded. On aarch64 a run
+/// that records preemptions counts store-exclusives, and the probe that checks
+/// the counters ran on a new thread of the tracer. The tracer runs in the
+/// guest's PID namespace, so that thread took a PID there and every guest
+/// thread after it got the next ID up. A replay of the schedule does not
+/// probe, so it left its schedule at the first switch to the guest's second
+/// thread (recorded as 6, running as 5). `hermit analyze` replays each trial
+/// that way and could not search on aarch64.
+#[test]
+fn a_recorded_schedule_replays_its_threads_under_their_recorded_ids() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let guest = hb_two_threads_guest().to_str().unwrap().to_owned();
+    let record = format!("--record-preemptions-to={}", schedule.display());
+    let recorded = hermit(&[
+        "run",
+        "--strict",
+        "--max-timeslice=disabled",
+        &record,
+        "--",
+        &guest,
+    ]);
+    assert!(recorded.status.success(), "{}", stderr(&recorded));
+
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    let replayed = hermit(&[
+        "run",
+        "--strict",
+        "--max-timeslice=disabled",
+        &replay,
+        "--",
+        &guest,
+    ]);
+    let log = stderr(&replayed);
+    assert!(
+        replayed.status.success(),
+        "exit {:?}:\n{log}",
+        replayed.status.code()
+    );
+    assert!(
+        !log.contains("desynced state") && !log.contains("expected to be running thread"),
+        "the replay left its recorded schedule:\n{log}"
+    );
+    assert_eq!(stdout(&replayed), stdout(&recorded));
 }
 
 /// A gate on a vfork child before its exec can never open: while the child
@@ -30230,6 +31991,47 @@ fn run_timeout_fires_by_name_and_unwinds_the_container() {
     );
 }
 
+/// A root that exits while a child it never reaped sits blocked: the run lasts
+/// until every guest process exits, so it reaches the bound. The report then
+/// names the process left running and the call it is in, not only the bound;
+/// before, it named the bound alone, which reads like a stuck root.
+#[test]
+fn run_timeout_names_the_guest_process_left_running_after_its_root_exited() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // `cat` opens a FIFO nothing will ever write, and blocks in that open; the
+    // shell that started it in the background exits at once. The FIFO's name
+    // carries this test process's pid and is removed afterwards: a fixed name
+    // would survive in /tmp, the next run's `mkfifo` would fail on it, and no
+    // `cat` would ever block.
+    let fifo = format!("/tmp/never-written-{}", std::process::id());
+    let _ = std::fs::remove_file(&fifo);
+    let script = format!("mkfifo {fifo} && exec cat {fifo} & exit 0");
+    let child = spawn_timed_run(RUN_TIMEOUT_SECS, &["/bin/sh", "-c", &script]);
+    let session = child.id() as i32;
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for hermit run --timeout");
+    let _ = std::fs::remove_file(&fifo);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    for pid in run_timeout_pids_in_session(session) {
+        // SAFETY: `kill` takes a pid and a signal and touches no caller memory;
+        // a stale pid can only fail with ESRCH.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    assert_eq!(output.status.code(), Some(124), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("1 guest process was still running: pid ")
+            && stderr.contains("\"cat\"")
+            && stderr.contains("orphaned: its parent exited")
+            && stderr.contains(" in openat"),
+        "the timeout report must name the guest process left running, `cat`, say it \
+         was orphaned, and name the call it is blocked in, not only the bound. \
+         stderr:\n{stderr}"
+    );
+}
+
 /// INSIDE the bound: a guest that finishes in time is untouched.
 ///
 /// Without this direction the cell above is satisfied by a `--timeout` that
@@ -31095,6 +32897,180 @@ fn tool_output_respects_page_protection_and_the_private_page() {
     }
 }
 
+/// A receive with `MSG_ERRQUEUE` reads the socket's error queue, and on an
+/// IPv4 or IPv6 socket Linux never waits for it: an empty queue is -1 EAGAIN
+/// at once, blocking socket or not (`ip_recv_error`, `ipv6_recv_error`).
+/// Detcore polled such a receive on the socket it had made physically
+/// nonblocking until it stopped failing with EAGAIN, which was forever.
+/// AF_UNIX ignores the flag, so there the call stays a plain receive that
+/// waits for data. The guest (`tests/c/socket_errqueue.c`) reads the error
+/// queue of UDP, UDPv6 and TCP sockets (unconnected, connected and accepted)
+/// with recvfrom, recvmsg and recvmmsg, empty and holding the ICMP port
+/// unreachable that `IP_RECVERR` queues for a send to a closed port, and
+/// makes blocking `MSG_ERRQUEUE` receives on AF_UNIX datagram and stream
+/// socketpairs and on AF_UNIX sockets from socket(2), which must wait for a
+/// later sender. Its native output is the oracle, under `hermit run` with and
+/// without `--strict`.
+#[test]
+fn msg_errqueue_returns_at_once_on_inet_sockets_and_waits_on_unix_sockets() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&SOCKET_ERRQUEUE_GUEST, "socket_errqueue");
+    let eagain = "-1 (Resource temporarily unavailable)";
+    let empty = |kind: &str| {
+        format!("{kind} recvfrom: {eagain}\n{kind} recvmsg: {eagain}\n{kind} recvmmsg: {eagain}\n")
+    };
+    let unix = |kind: &str| {
+        let mut lines =
+            format!("{kind} queued recv: 3\n{kind} empty recv MSG_DONTWAIT: {eagain}\n");
+        for (call, length) in [("recvfrom", 4), ("recvmsg", 4), ("recvmmsg", 1)] {
+            lines +=
+                &format!("{kind} blocking {call}: {length}\n{kind} blocking {call} data: late\n");
+        }
+        lines
+    };
+    let native = native_stdout(guest);
+    // A host booted without IPv6 cannot make the UDPv6 socket; Hermit's output
+    // must still match native's.
+    let udp6 = if native.contains("udp6 socket: ") {
+        "udp6 socket: Address family not supported by protocol\n".to_owned()
+    } else {
+        empty("udp6 unbound")
+    };
+    let expected = [
+        empty("udp unbound"),
+        "udp poll after a send to a closed port: 1\nudp poll revents POLLERR: yes\n\
+         udp error queue recvmsg: 4\nudp error queue msg_flags MSG_ERRQUEUE: yes\n\
+         udp error: Connection refused, origin 2, ICMP type 3 code 3\n"
+            .to_owned(),
+        empty("udp drained"),
+        udp6,
+        empty("tcp unconnected"),
+        empty("tcp connected"),
+        empty("tcp accepted"),
+        unix("unix datagram pair"),
+        unix("unix stream pair"),
+        unix("unix datagram socket"),
+    ]
+    .concat();
+    assert_eq!(native, expected);
+    let guest = guest.to_str().unwrap();
+    for strict in [true, false] {
+        let mut args = vec!["run", "--timeout", "120"];
+        if strict {
+            args.push("--strict");
+        }
+        args.extend(["--base-env=minimal", "--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+}
+
+/// `MSG_DONTWAIT` makes one send or receive nonblocking on a socket the guest
+/// left blocking: Linux gives the call a zero timeout (`sock_rcvtimeo` and
+/// `sock_sndtimeo`, `include/net/sock.h`), so it returns at once, -1 EAGAIN
+/// where it would wait. Detcore retried such a call on the socket it had made
+/// physically nonblocking until it stopped failing with EAGAIN, which on an
+/// empty queue or a full peer was forever. The guest
+/// (`tests/c/socket_dontwait.c`) covers recvfrom, recvmsg, recvmmsg (with and
+/// without `MSG_WAITFORONE`), sendto, sendmsg and sendmmsg on UDP, AF_UNIX
+/// datagram and stream socketpairs and TCP, with nothing queued, with data,
+/// and with a full peer, and calls without the flag on the same sockets, which
+/// still wait. Its native output is the oracle, under `hermit run` with and
+/// without `--strict`, and its socketpair sections without the batched calls,
+/// which record and replay do not record, under `record start --verify`.
+#[test]
+fn msg_dontwait_returns_at_once_on_a_blocking_socket() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&SOCKET_DONTWAIT_GUEST, "socket_dontwait");
+    let eagain = "-1 (Resource temporarily unavailable)";
+    let receives = |kind: &str, batched: bool| {
+        let mut lines = format!("{kind} recvfrom: {eagain}\n{kind} recvmsg: {eagain}\n");
+        if batched {
+            lines +=
+                &format!("{kind} recvmmsg: {eagain}\n{kind} recvmmsg MSG_WAITFORONE: {eagain}\n");
+        }
+        lines
+    };
+    let sends = |kind: &str, batched: bool| {
+        let mut lines = format!("{kind} sendto: {eagain}\n{kind} sendmsg: {eagain}\n");
+        if batched {
+            lines += &format!("{kind} sendmmsg: {eagain}\n");
+        }
+        lines
+    };
+    let socketpairs = |batched: bool| {
+        [
+            receives("unix datagram empty", batched),
+            "unix datagram send: 3\nunix datagram queued recv: 3\n".to_owned(),
+            if batched {
+                "unix datagram two queued recvmmsg: 2\n\
+                 unix datagram two queued data: one!two!\n"
+                    .to_owned()
+            } else {
+                String::new()
+            },
+            "unix datagram fill ends after some sends: Resource temporarily unavailable\n"
+                .to_owned(),
+            sends("unix datagram full", batched),
+            "unix datagram drained every send: yes (Resource temporarily unavailable)\n".to_owned(),
+            receives("unix stream empty", batched),
+            "unix stream fill ends after some bytes: Resource temporarily unavailable\n".to_owned(),
+            sends("unix stream full", batched),
+            "unix stream blocking send: 4096\n".to_owned(),
+            receives("unix stream drained", batched),
+        ]
+        .concat()
+    };
+    let expected = [
+        receives("udp empty", true),
+        "udp queued recv: 4\nudp queued data: ping\n\
+         udp blocking recvmmsg MSG_WAITFORONE: 1\nudp late data: late\n"
+            .to_owned(),
+        socketpairs(true),
+        receives("tcp connected", true),
+        receives("tcp accepted", true),
+    ]
+    .concat();
+    assert_eq!(native_stdout(guest), expected);
+    let guest = guest.to_str().unwrap();
+    for strict in [true, false] {
+        let mut args = vec!["run", "--timeout", "120"];
+        if strict {
+            args.push("--strict");
+        }
+        args.extend(["--base-env=minimal", "--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+
+    let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let data_dir = format!("--data-dir={}", data.path().display());
+    let args = [
+        "record",
+        "start",
+        "--verify",
+        "--verify-strict",
+        "--record-timeout",
+        "120",
+        data_dir.as_str(),
+        "--",
+        guest,
+        "unbatched",
+        "unix_datagram",
+        "unix_stream",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), socketpairs(false), "{args:?}");
+    let log = stderr(&output);
+    assert!(
+        log.contains("Success: replay matched recording."),
+        "the replay must match the recording:\n{log}"
+    );
+}
+
 /// `select`'s timeout is read as Linux v7.1 reads it: `kern_select`
 /// (`fs/select.c`) refuses a negative field, then folds `tv_usec >= 1000000`
 /// into the seconds before `poll_select_set_timeout`, so `{0, 1500000}` is a
@@ -31194,6 +33170,60 @@ fn a_datagram_receive_ends_when_its_read_side_is_shut_down() {
             args.push("--strict");
         }
         args.extend(["--base-env=minimal", "--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+}
+
+/// A guest reads `TracerPid: 0` on every procfs path to a task's status, as a
+/// program run outside a debugger does natively (`task_state`,
+/// `fs/proc/array.c`). Detcore showed 1 on the task's own paths
+/// (`/proc/self`, `/proc/thread-self`, a second thread's, a forked child's)
+/// and 0 by number, so the same task had two answers and the own-path one
+/// told the program a debugger was attached. The guest's native output is the
+/// oracle (`tests/c/proc_status_tracer_pid.c`).
+#[test]
+fn procfs_status_shows_no_tracer_on_any_path() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&PROC_STATUS_TRACER_PID_GUEST, "proc_status_tracer_pid");
+    let expected = "self 0\n\
+         thread-self 0\n\
+         by pid 0\n\
+         by pid and tid 0\n\
+         second thread's thread-self 0\n\
+         forked child's self 0\n";
+    assert_eq!(native_stdout(guest), expected);
+    let args = ["run", "--base-env=minimal", "--", guest.to_str().unwrap()];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected, "{args:?}");
+}
+
+/// A death test whose statement is a fatal assertion that looks for a
+/// debugger (`tests/c/death_test_tracer_check.c`, googletest's "fast" style)
+/// dies of SIGABRT under Hermit, as it does natively. When the guest read
+/// `TracerPid: 1`, the assertion raised SIGTRAP to break into a debugger
+/// instead. The ptrace backend used not to deliver a SIGTRAP a guest sends
+/// itself, so the child lived, and googletest's statement then waited: the
+/// death test hung under plain and chaos runs alike. This guest's child reports
+/// that it lived and exits, so that failure shows here at once. Now that the
+/// backend delivers the SIGTRAP, a child that reads `TracerPid: 1` dies of it
+/// (signal 5) instead of SIGABRT. Either way the output differs from the
+/// native one this test expects.
+#[test]
+fn a_death_test_that_looks_for_a_debugger_dies_as_it_does_natively() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&DEATH_TEST_TRACER_CHECK_GUEST, "death_test_tracer_check");
+    let expected = "TracerPid 0\n\
+         status byte: none\n\
+         child: killed by signal 6\n";
+    assert_eq!(native_stdout(guest), expected);
+    let guest = guest.to_str().unwrap();
+    for schedule in [&[][..], &["--chaos", "--seed=1"][..]] {
+        let mut args = vec!["run", "--base-env=minimal"];
+        args.extend(schedule);
+        args.extend(["--", guest]);
         let output = hermit(&args);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{args:?}");
@@ -31690,9 +33720,9 @@ fn liteinst_in_guest_refuses_a_statically_linked_guest() {
 ///
 /// The guest is observed from OUTSIDE hermit. It cannot answer this question
 /// about itself: Detcore virtualizes `/proc/<pid>/status` and reports
-/// `TracerPid: 1` under every backend (`sanitize_status` in
-/// `detcore/src/procfs.rs`), so a guest-side probe reads 1 under in-guest
-/// LiteInst as well and cannot tell the backends apart.
+/// `TracerPid: 0` under every backend (`sanitize_status` in
+/// `detcore/src/procfs.rs`), so a guest-side probe reads 0 under ptrace as
+/// well and cannot tell the backends apart.
 ///
 /// The guest is `/bin/cat <fifo>`. Once a non-blocking open of the FIFO for
 /// writing stops failing with `ENXIO`, the guest has reached its own `open`,
@@ -33456,6 +35486,114 @@ fn a_zero_timeout_poll_ended_by_a_signal_restarts_as_on_linux() {
     assert_eq!(stdout(&output), expected, "{args:?}");
 }
 
+/// A signal that ends a `poll` with a positive timeout in the kernel leaves
+/// `ERESTART_RESTARTBLOCK`. With no handler to run, Linux restarts the poll
+/// through `restart_syscall` until the end time it kept (`do_restart_poll`,
+/// `fs/select.c`); with a handler it returns `EINTR`. Detcore runs such a poll
+/// in the kernel under record and replay and `--no-sequentialize-threads`,
+/// and refused the restart there as an unsupported syscall (exit 122). In the
+/// guest (`tests/c/poll_timeout_restart.c`) children that exit while their
+/// parent waits in 100 ms polls send SIGCHLD, which ptrace queues although it
+/// is ignored; a child sends 40 SIGWINCH, ignored by default, 20 ms apart, and
+/// the poll they end over and over must still time out after 100 ms, long
+/// before they stop; and a 30 ms ITIMER_REAL interrupts five more polls
+/// through a SIGALRM handler. Every mode must print native's lines, except that
+/// record compares only the storm's poll result (see the comment there). The
+/// strict and plain legs emulate the poll on virtual time and passed before;
+/// the `--no-sequentialize-threads` and record legs run it in the kernel.
+#[test]
+fn a_kernel_run_poll_a_signal_ends_restarts_until_its_deadline() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&POLL_TIMEOUT_RESTART_GUEST, "poll_timeout_restart");
+    let guest = guest.to_str().unwrap();
+    let expected = [
+        (
+            "chld",
+            "chld: 5 timed out, 0 ready, 0 EINTR, 0 other; late data: 1 revents 0x1; 9 children\n",
+        ),
+        (
+            "alrm",
+            "alrm: 0 timed out, 0 ready, 5 EINTR, 0 other, 5 alarms\n",
+        ),
+        (
+            "storm",
+            "storm: poll 0; the storm was still running when it returned: yes; 1 children\n",
+        ),
+    ];
+    // As in run_strict_flag_is_accepted_and_runs, the strict leg disables the
+    // PMU timer and CPUID faulting so it runs where those are unavailable.
+    let strict = [
+        "--strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+    ];
+    for (mode, line) in expected {
+        let native = Command::new(guest)
+            .arg(mode)
+            .output()
+            .expect("failed to run the guest natively");
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            line,
+            "native {mode}"
+        );
+        for flags in [&strict[..], &[], &["--no-sequentialize-threads"]] {
+            let mut args = vec!["run", "--timeout", "120", "--base-env=minimal"];
+            args.extend_from_slice(flags);
+            args.extend(["--", guest, mode]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), line, "{args:?}");
+        }
+        // The storm is recorded three times: its signals reach the restarted
+        // poll at host-timed points, and replay refused or diverged on most
+        // such recordings while record left a signal that stopped a restart
+        // before it ran out of its schedule (`kernel_poll_restart_code`).
+        // Two of them start each backgrounded call up to 10 ms late
+        // (docs/RACE_PROBES.md), so signals reach restarts before they run. Its sender's sleeps take virtual time under
+        // record, so only the poll's result is compared.
+        let recordings: &[bool] = if mode == "storm" {
+            &[true, true, false]
+        } else {
+            &[false]
+        };
+        for &probe in recordings {
+            let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .expect("failed to create the recording data dir");
+            let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+            let args = [
+                "record",
+                "start",
+                "--verify",
+                "--verify-strict",
+                "--record-timeout",
+                "120",
+                &data_dir_arg,
+                "--",
+                guest,
+                mode,
+            ];
+            let mut command = hermit_command(&args);
+            if probe {
+                command
+                    .env("HERMIT_RACE_PROBE", "bg_pre_call=0-10")
+                    .env("HERMIT_RACE_PROBE_SEED", "7");
+            }
+            let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+            assert_success(&output, &args);
+            let recorded = stdout(&output);
+            if mode == "storm" {
+                assert!(
+                    recorded.starts_with("storm: poll 0; "),
+                    "{args:?} (probe: {probe}): {recorded}"
+                );
+            } else {
+                assert_eq!(recorded, line, "{args:?}");
+            }
+        }
+    }
+}
+
 /// A `ppoll` with a timeout returns on time while another thread spins without
 /// syscalls (https://github.com/rrnewton/hermit/issues/3952). The guest waits
 /// five times for 50 ms each; every wait must return 0 after at least 50 ms and
@@ -34044,14 +36182,13 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
     );
 }
 
-/// A process-directed signal to the sender's own process with two live threads
-/// is delivered only when the schedule fixes the receiver, and refused by name
-/// otherwise (https://github.com/rrnewton/hermit/issues/4034). The main
-/// thread sends `kill(getpid(), SIGUSR1)`, then `rt_sigqueueinfo`, then a kill
-/// naming the other thread's id, while the other thread sleeps in
-/// `sigsuspend`, outside the schedule, at moments host timing sets, so each
-/// call is refused: a fail-closed run stops with the policy-refusal status at
-/// the first, and with `--allow-unsupported-syscalls` each returns ENOSYS.
+/// A process-directed signal to the sender's own process with two live
+/// threads is refused by name when the kernel's own choice of receiver is
+/// host-timed: here the second thread sleeps in `sigsuspend`, outside the
+/// schedule, where the kernel can wake it for the copy at a moment host
+/// timing sets (https://github.com/rrnewton/hermit/issues/4034). A
+/// fail-closed run stops with the policy-refusal status at the first such
+/// call, and `--allow-unsupported-syscalls` returns ENOSYS.
 ///
 /// `kill` to a zombie child answers 0, as Linux does, and ESRCH once it is
 /// reaped; before https://github.com/rrnewton/hermit/issues/4091 the zombie
@@ -34070,7 +36207,7 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
 /// (EPERM, E2BIG, EFAULT), as Linux does, before its ESRCH
 /// (https://github.com/rrnewton/hermit/issues/4124).
 #[test]
-fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
+fn a_process_directed_signal_to_a_sleeping_sibling_is_refused_by_name() {
     let guest = kill_multithreaded_process_guest()
         .to_str()
         .unwrap()
@@ -34128,7 +36265,7 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     );
     assert!(
         log.contains("process-directed signal 10 to process")
-            && log.contains("by kill is not supported: thread ")
+            && log.contains("by kill is not supported: ")
             && log.contains("runs or sleeps outside the schedule"),
         "the refusal must name the call and the reason:\nstderr:\n{log}"
     );
@@ -34167,6 +36304,203 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     assert!(
         log.contains("by rt_sigqueueinfo is not supported"),
         "the compatibility run must still name each refusal:\nstderr:\n{log}"
+    );
+}
+
+/// A process-directed signal to a multi-threaded process reaches the thread
+/// Linux's `complete_signal` gives it: the thread the call names (the leader,
+/// for a process id) if it does not block the signal, and otherwise the first
+/// that does not, walking from the process's `curr_target`; with none, the
+/// signal stays queued until a thread unblocks it
+/// (https://github.com/rrnewton/hermit/issues/4034). The call is forwarded
+/// unchanged, so the copy is the kernel's own, and the scheduler resumes the
+/// chosen thread before any other that could take it. Each mode of the guest
+/// prints the thread that ran the handler and the siginfo it saw, and Hermit
+/// must print what Linux prints (measured natively, 30 of 30 runs identical
+/// each):
+/// - `term`: a parent's `kill(child, SIGTERM)` to a four-thread child whose
+///   threads all leave it unblocked goes to the child's main thread;
+/// - `term-one`: with SIGTERM blocked in every thread but worker 2, worker 2;
+/// - `term-queued`: with SIGTERM blocked in every thread, it stays pending
+///   until worker 2 unblocks it, and worker 2 takes it;
+/// - `term-busy`: as `term`, but worker 1 is runnable and spinning instead
+///   of parked: the main thread still takes it, and the child exits before
+///   the spinning worker can print, so this case fails if the chosen thread
+///   is not resumed before any other runnable thread;
+/// - `segv-pidfd`: a worker's `pidfd_send_signal` of SIGSEGV to its own
+///   two-thread process, at its default disposition, ends the whole process.
+///
+/// Every one is `SI_USER` from the sender's pid, as Linux delivers it. The
+/// first three run under `--strict --verify --verify-strict` at bitwise
+/// parity. `segv-pidfd` runs under `--strict` alone: the deaths of a group a
+/// fatal signal ends are retired at host-timed moments until
+/// https://github.com/rrnewton/hermit/pull/4589 and the change stacked on it
+/// land. Before, every one of these sends was refused by name.
+#[test]
+fn a_process_directed_signal_goes_to_the_thread_linux_chooses() {
+    let guest = process_signal_receiver_guest().to_str().unwrap().to_owned();
+    let receiver =
+        |thread: &str| format!("receiver: {thread}\nsi_code: SI_USER\nsi_pid is the sender: yes\n");
+    let exited = "child exit status: 0\n";
+    let cases: Vec<(&str, String, bool)> = vec![
+        ("term", receiver("main thread") + exited, true),
+        ("term-one", receiver("worker 2") + exited, true),
+        (
+            "term-queued",
+            "pending after the send: SIGTERM\n".to_owned() + &receiver("worker 2") + exited,
+            true,
+        ),
+        ("term-busy", receiver("main thread") + exited, true),
+        (
+            "segv-pidfd",
+            "child killed by signal 11\n".to_owned(),
+            false,
+        ),
+    ];
+    for (mode, expected, verify) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let mut command_args = vec!["--log=info", "run", "--strict"];
+        if verify {
+            command_args.extend([
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+            ]);
+        }
+        command_args.extend(["--timeout", "60", "--", guest.as_str(), mode]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&command_args),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        if verify {
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                    .expect("the verdict must be JSON");
+            assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+        }
+    }
+}
+
+/// A schedule replay delivers a process-directed signal to the thread its
+/// recording delivered it to (https://github.com/rrnewton/hermit/issues/4034).
+/// It decides from the same schedule as the recording, and the forwarded copy
+/// goes to the first thread it resumes that does not block the signal, which
+/// is the thread the recording resumed first. Each mode of the guest above
+/// is recorded under `--chaos` and replayed with `--replay-schedule-from`:
+/// the replay prints the recording's receiver, worker 2 in `term-one` and
+/// `term-queued`, with no desync, and `segv-pidfd`'s fatal signal ends the
+/// replay's process as it ended the recording's. `segv-pidfd`'s schedule is
+/// not compared: the deaths of a group a fatal signal ends are retired at
+/// host-timed moments until https://github.com/rrnewton/hermit/pull/4589 and
+/// the change stacked on it land, so its parent's wait ends at another point
+/// (its `--verify` is not at parity either, above). Before, the replay refused
+/// every such send by name.
+#[test]
+fn a_schedule_replay_delivers_a_process_directed_signal_as_its_recording_did() {
+    let guest = process_signal_receiver_guest().to_str().unwrap().to_owned();
+    let receiver =
+        |thread: &str| format!("receiver: {thread}\nsi_code: SI_USER\nsi_pid is the sender: yes\n");
+    let exited = "child exit status: 0\n";
+    let cases: Vec<(&str, String, bool)> = vec![
+        ("term", receiver("main thread") + exited, true),
+        ("term-one", receiver("worker 2") + exited, true),
+        (
+            "term-queued",
+            "pending after the send: SIGTERM\n".to_owned() + &receiver("worker 2") + exited,
+            true,
+        ),
+        (
+            "segv-pidfd",
+            "child killed by signal 11\n".to_owned(),
+            false,
+        ),
+    ];
+    for (mode, expected, exact) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let schedule = directory.path().join("schedule.json");
+        let summary = directory.path().join("replay.summary.json");
+        let record = format!("--record-preemptions-to={}", schedule.display());
+        let replay = format!("--replay-schedule-from={}", schedule.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        for (leg, run_args) in [
+            ("recording", vec!["--chaos", "--seed=1", record.as_str()]),
+            ("replay", vec![replay.as_str(), summary_arg.as_str()]),
+        ] {
+            let mut command_args = vec!["--log=error", "run", "--strict"];
+            command_args.extend(run_args);
+            command_args.extend(["--timeout", "60", "--", guest.as_str(), mode]);
+            let (status, log) = run_with_deadline(
+                hermit_command(&command_args),
+                directory.path(),
+                Duration::from_secs(180),
+                false,
+            );
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(0),
+                "{mode} {leg}:\nstdout:\n{stdout}\nstderr:\n{log}"
+            );
+            assert_eq!(stdout, expected, "{mode} {leg}: stderr:\n{log}");
+        }
+        if exact {
+            let summary: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+            assert_eq!(summary["schedevent_desynced"], 0, "{mode}: {summary}");
+        }
+    }
+}
+
+/// A thread's process-directed signal to its own process that Linux gives to
+/// another thread is refused by name
+/// (https://github.com/rrnewton/hermit/issues/4034). Under ptrace every other
+/// thread of the process is stopped, so the sender is the one thread the
+/// kernel's `complete_signal` admits, and a forwarded copy would reach the
+/// sender rather than the thread Linux chooses. The guest's `usr1-self` mode
+/// has a worker send `kill(getpid(), SIGUSR1)` with every thread unblocked,
+/// which Linux gives to the main thread: a fail-closed run stops with the
+/// policy-refusal status.
+#[test]
+fn a_signal_to_the_senders_own_process_that_another_thread_takes_is_refused_by_name() {
+    let guest = process_signal_receiver_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "usr1-self",
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("process-directed signal 10 to process")
+            && log.contains("the sending thread does not block the signal"),
+        "the refusal must name the call and the reason:\nstderr:\n{log}"
     );
 }
 
@@ -34301,6 +36635,149 @@ fn a_guest_or_child_killed_by_a_realtime_signal_reports_it() {
     assert!(
         log.contains(":: Success: deterministic. Determinism verified."),
         "verification failed:\n{log}"
+    );
+}
+
+/// A process whose other threads are all parked in futex waits ends by a
+/// signal's default action (`tests/c/fatal_signal_futex_waiters.c`): abort(3),
+/// raise(3) of SIGTERM, and a forced SIGSEGV. Linux kills the whole thread
+/// group at that delivery, so Hermit ends with the guest's signal and the
+/// guest's output: under a chaos `run` recording its schedule, whose replay
+/// follows it with no desynchronized event, and, for abort(3), under `record
+/// start`, whose recording replays to the same end. Before, the parked
+/// threads left the scheduler only at their own host-timed exit reports, and
+/// one that came after the delivering thread's made the empty run queue read
+/// as a deadlock: Hermit exited 125 (`container-child-exit`) and wrote no
+/// schedule. The run verifies at bitwise parity, with the other threads in
+/// futex waits and, `sleeping`, in timed sleeps, and so does the same end in
+/// a forked child, which its parent reports; before, the threads' removals
+/// interleaved with the turns that followed at host-chosen points.
+#[test]
+fn a_default_fatal_signal_ends_a_process_whose_other_threads_wait_on_a_futex() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(
+        &FATAL_SIGNAL_FUTEX_WAITERS_GUEST,
+        "fatal_signal_futex_waiters",
+    )
+    .to_str()
+    .unwrap();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for (mode, signal) in [
+        ("abort", libc::SIGABRT),
+        ("term", libc::SIGTERM),
+        ("segv", libc::SIGSEGV),
+    ] {
+        let path = |name: &str| {
+            let path = directory.path().join(format!("{mode}-{name}"));
+            path.to_str().unwrap().to_owned()
+        };
+        let (schedule, summary, data) = (path("schedule.json"), path("summary.json"), path("data"));
+        let record = format!("--record-preemptions-to={schedule}");
+        let replay = format!("--replay-schedule-from={schedule}");
+        let summary_json = format!("--summary-json={summary}");
+        let printed = format!("3 waiters blocked, ending by {mode}\n");
+        for shape in ["", "sleeping"] {
+            let report = path(&format!("verify{shape}.json"));
+            let mut args = vec![
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-allow=failure",
+                "--verify-json",
+                &report,
+                "--",
+                guest,
+                mode,
+            ];
+            args.extend((!shape.is_empty()).then_some(shape));
+            let output = hermit(&args);
+            let log = stderr(&output);
+            assert_eq!(
+                output.status.signal(),
+                Some(signal),
+                "hermit {args:?} ended with {}:\n{log}",
+                output.status
+            );
+            assert_eq!(stdout(&output), printed, "hermit {args:?}:\n{log}");
+            assert_bitwise_parity(&report, &format!("{mode} {shape}"));
+            let report: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+            assert_eq!(report["guest_signal"], signal, "{mode} {shape}: {report}");
+        }
+        let mut runs = vec![
+            vec![
+                "run", "--strict", "--chaos", "--seed=5", &record, "--", guest, mode,
+            ],
+            vec!["run", "--strict", &replay, &summary_json, "--", guest, mode],
+        ];
+        if mode == "abort" {
+            runs.push(vec![
+                "record",
+                "start",
+                "--data-dir",
+                &data,
+                "--",
+                guest,
+                mode,
+            ]);
+            runs.push(vec!["replay", "--autopilot", "--data-dir", &data]);
+        }
+        for args in &runs {
+            let output = hermit(args);
+            let log = stderr(&output);
+            assert_eq!(
+                output.status.signal(),
+                Some(signal),
+                "hermit {args:?} ended with {}:\n{log}",
+                output.status
+            );
+            assert_eq!(stdout(&output), printed, "hermit {args:?}:\n{log}");
+            assert!(
+                !log.contains("Deadlock detected"),
+                "hermit {args:?}:\n{log}"
+            );
+        }
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(summary["schedevent_desynced"], 0, "{mode}: {summary}");
+
+        let report = path("verify-forked.json");
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report,
+            "--",
+            guest,
+            mode,
+            "forked",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("{printed}child ended by signal {signal}\n")
+        );
+        assert_bitwise_parity(&report, &format!("{mode} forked"));
+    }
+}
+
+/// The `--verify-json` report at `path` says bitwise parity, with the same
+/// nonzero number of INFO records compared on each side.
+fn assert_bitwise_parity(path: &str, case: &str) {
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let compared = &report["compared_log_messages"];
+    assert_eq!(report["bitwise_parity"], true, "{case}: {report}");
+    assert!(
+        compared["left"].as_u64().is_some_and(|left| left > 0)
+            && compared["left"] == compared["right"],
+        "{case}: {report}"
     );
 }
 
@@ -34791,7 +37268,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x187, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x193, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
@@ -34815,7 +37292,13 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
 /// was taken in the recording and not in the replay, which diverged (Claude
 /// review of https://github.com/rrnewton/hermit/pull/4510). Keyed to the
 /// thread's own scheduling points it is the same in both; each guest prints
-/// its native line and runs to its normal exit under gdb.
+/// its native line and runs to its normal exit under gdb. Since Reverie
+/// 3b0715351 the gdbserver reports a guest's signals to gdb as stops, as a
+/// native gdbserver does, so the batch `continue` would stop at the guest's
+/// SIGUSR1 and gdb would kill the guest when its command list ran out; the
+/// test therefore passes the guest's signals silently (`handle ... nostop
+/// noprint pass` for SIGUSR1 and SIGUSR2, which `repeat-join-two` also
+/// sends), which is how a user who wants the run to finish drives it.
 #[test]
 fn the_4505_signal_guests_replay_under_gdb() {
     let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
@@ -34828,7 +37311,7 @@ fn the_4505_signal_guests_replay_under_gdb() {
             "record",
             "start",
             "--verify-with-gdbex",
-            "continue",
+            "handle SIGUSR1 nostop noprint pass;handle SIGUSR2 nostop noprint pass;continue",
             "--",
             guest.as_str(),
             mode,
@@ -35160,9 +37643,14 @@ fn a_signal_to_the_senders_own_process_waits_for_the_sender_beside_a_runnable_si
     }
 }
 
-/// A signal on the sender's private queue refuses its send to its own process,
-/// in a forced order (refusal 8 of the design for
-/// https://github.com/rrnewton/hermit/issues/4034). The guest's `pending` mode
+/// A signal on the sender's private queue no longer refuses its send to its
+/// own process, in a forced order
+/// (https://github.com/rrnewton/hermit/issues/4034). The call is forwarded, so
+/// the copy is the kernel's own in the process's shared queue, and the kernel
+/// dequeues the sender's private queue before it (`dequeue_signal`,
+/// kernel/signal.c:627-633): the order is Linux's, not Hermit's. Before, the
+/// send was refused by name because Hermit forwarded it only when it could
+/// prove that order itself. The guest's `pending` mode
 /// has a worker send `pthread_kill(main, n)` while the main thread sends
 /// `kill(getpid(), SIGUSR1)`. Two hard happens-before edges, at syscall counts
 /// a calibration run finds under an inert spec, put the worker's send between
@@ -35173,7 +37661,7 @@ fn a_signal_to_the_senders_own_process_waits_for_the_sender_beside_a_runnable_si
 /// refuse by name; with `--allow-unsupported-syscalls` the `kill` returns
 /// ENOSYS.
 #[test]
-fn a_signal_pending_on_the_sender_refuses_its_send_to_its_own_process() {
+fn a_signal_pending_on_the_sender_no_longer_refuses_its_send_to_its_own_process() {
     let guest = own_process_signal_guest().to_str().unwrap().to_owned();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let inert = directory.path().join("inert.json");
@@ -35182,7 +37670,7 @@ fn a_signal_pending_on_the_sender_refuses_its_send_to_its_own_process() {
         r#"{"version": 1, "events": {"inert": {"thread": "3", "syscalls": 1000000000}}, "edges": []}"#,
     )
     .unwrap();
-    for (signal, pending) in [("10", "0x200"), ("12", "0x800")] {
+    for signal in ["10", "12"] {
         let run = |spec: &Path| {
             hermit(&[
                 "--log",
@@ -35237,32 +37725,31 @@ fn a_signal_pending_on_the_sender_refuses_its_send_to_its_own_process() {
         assert!(forced.status.success(), "signal {signal}:\n{log}");
         assert_eq!(
             String::from_utf8_lossy(&forced.stdout),
-            "pending rc=-1 ENOSYS\n",
+            "pending rc=0 -\n",
             "signal {signal}:\n{log}"
         );
         assert!(
-            log.contains(&format!(
-                "by kill is not supported: the sending thread has signals pending ({pending})"
-            )),
-            "signal {signal}: the refusal must name the pending signal:\n{log}"
+            !log.contains("is not supported"),
+            "signal {signal}: the send must not be refused:\n{log}"
         );
     }
 }
 
-/// A scheduler signal still in the shared queue refuses a send to the sender's
-/// own process even after a thread took another copy of the same number, in a
-/// forced order (https://github.com/rrnewton/hermit/issues/4122). The guest's
-/// `stolen` mode arms a POSIX timer for SIGHUP and sends `kill(getpid(),
-/// SIGTERM)`, while a worker that blocks SIGHUP spins past the expiry, queues
-/// its own SIGHUP with `tgkill` and unblocks it: it takes its private copy
-/// first, and its handler sleeps with SIGHUP blocked. A hard happens-before
-/// edge, at counts a calibration run finds under an inert spec, holds the
-/// `kill` until that sleep, so the timer's copy (the scheduler's) is still in
-/// the shared queue and Linux would dequeue it before SIGTERM. The send must
-/// refuse by name. Before, the worker's delivery of its own copy cleared the
-/// record and the send was admitted.
+/// A scheduler signal still in the shared queue no longer refuses a send to
+/// the sender's own process, in a forced order
+/// (https://github.com/rrnewton/hermit/issues/4122,
+/// https://github.com/rrnewton/hermit/issues/4034). The guest's `stolen` mode
+/// arms a POSIX timer for SIGHUP and sends `kill(getpid(), SIGTERM)`, while a
+/// worker that blocks SIGHUP spins past the expiry, queues its own SIGHUP
+/// with `tgkill` and unblocks it: it takes its private copy first, and its
+/// handler sleeps with SIGHUP blocked. A hard happens-before edge, at counts
+/// a calibration run finds under an inert spec, holds the `kill` until that
+/// sleep, so the timer's copy (the scheduler's) is still in the shared queue
+/// and Linux dequeues it before SIGTERM. The send is forwarded, so that order
+/// is the kernel's own; before, Hermit refused it rather than reproduce the
+/// order itself.
 #[test]
-fn a_scheduler_signal_left_in_the_shared_queue_refuses_a_send_after_another_copy_is_taken() {
+fn a_scheduler_signal_left_in_the_shared_queue_no_longer_refuses_a_later_send() {
     let guest = own_process_signal_guest().to_str().unwrap().to_owned();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let inert = directory.path().join("inert.json");
@@ -35321,121 +37808,160 @@ fn a_scheduler_signal_left_in_the_shared_queue_refuses_a_send_after_another_copy
     assert!(forced.status.success(), "{log}");
     assert_eq!(
         String::from_utf8_lossy(&forced.stdout),
-        "stolen rc=-1 ENOSYS\n",
+        "stolen rc=0 -\n",
         "{log}"
     );
     assert!(
-        log.contains(
-            "by kill is not supported: the scheduler sent signals 0x1 that no thread has taken yet"
-        ),
-        "the refusal must name the scheduler's signal:\n{log}"
+        !log.contains("is not supported"),
+        "the send must not be refused:\n{log}"
     );
 }
 
-/// Every process-directed signal to the sender's own multi-threaded process
-/// whose receiver or dequeue the schedule does not fix is refused by name, and
-/// sends nothing (https://github.com/rrnewton/hermit/issues/4034). Each mode
-/// runs with `--allow-unsupported-syscalls`, so the refused `kill` returns
-/// ENOSYS and the guest goes on; the log names the reason:
-/// - a worker sends while the main thread waits with the signal unblocked;
-/// - the main thread sends to the thread id of a worker that does not block
-///   the signal, which Linux prefers;
-/// - the sender blocks the signal;
-/// - SIGCHLD, SIGCONT, SIGTSTP, SIGRTMIN, SIGSEGV, SIGTRAP and SIGSTKFLT, each
-///   caught, are outside the seven admitted signals;
-/// - SIGTERM with its default, fatal, disposition;
+/// A process-directed signal to the sender's own multi-threaded process whose
+/// receiver or dequeue the schedule does not fix, so that it is not forwarded
+/// as it is, goes to the thread Linux's `complete_signal` gives it, as Detcore
+/// decides it (https://github.com/rrnewton/hermit/issues/4034). Each mode runs
+/// under `--strict`, and Hermit must print what Linux prints (measured
+/// natively, 3 of 3 runs identical each), exiting as Linux does:
+/// - the sender blocks the signal, so the thread Linux chooses takes the
+///   forwarded copy;
+/// - SIGCHLD, SIGCONT, SIGTSTP, SIGRTMIN and SIGSEGV, each caught;
+/// - SIGTERM with its default, fatal, disposition, which ends the process;
 /// - armed host-timed sources the sender does not block: an `F_SETOWN_EX`
-///   thread owner with `F_SETSIG(SIGUSR2)`, an `F_SETOWN` pid owner, a sent
-///   SIGTSTP (the orphaned
-///   process group's SIGHUP and SIGCONT), and a raw clone child with SIGUSR2 as
-///   its exit signal, which stays recorded after the child is reaped;
+///   thread owner with `F_SETSIG(SIGUSR2)`, also with `--stacktrace-signal`,
+///   an `F_SETOWN` pid owner, a sent SIGTSTP, and a raw clone child with
+///   SIGUSR2 as its exit signal, before and after it is reaped;
 /// - a signalfd in the process;
 /// - a guest's earlier send of SIGSTKFLT, Reverie's timer marker;
 /// - `rt_sigqueueinfo` of SIGSEGV and of SIGRTMIN whose `siginfo_t` is in a
-///   write-only page, which the kernel reads and the tracer reads through
-///   `/proc/<tid>/mem` (before, an unreadable-looking buffer went to the
-///   kernel unchecked and the signal was delivered);
+///   write-only page, which the kernel reads.
+///
+/// Before, each was refused by name.
+#[test]
+fn each_unforced_signal_to_the_senders_own_process_reaches_the_thread_linux_chooses() {
+    let guest = own_process_signal_guest().to_str().unwrap().to_owned();
+    let delivered = |mode: &str, sig: &str| {
+        format!("{mode} sig={sig} rc=0 ran_before_return=1 on_sender=1 code=0 pid_ok=1 uid_ok=1\n")
+    };
+    let rtmin = libc::SIGRTMIN().to_string();
+    let cases: Vec<(Vec<&str>, String)> = vec![
+        (vec!["sender_blocks"], "sender_blocks rc=0 -\n".to_owned()),
+        (vec!["not_admitted", "17"], delivered("not_admitted", "17")),
+        (vec!["not_admitted", "18"], delivered("not_admitted", "18")),
+        (vec!["not_admitted", "20"], delivered("not_admitted", "20")),
+        (
+            vec!["not_admitted", rtmin.as_str()],
+            delivered("not_admitted", rtmin.as_str()),
+        ),
+        (vec!["not_admitted", "11"], delivered("not_admitted", "11")),
+        (vec!["owner_tid"], delivered("owner_tid", "10")),
+        (
+            vec!["--stacktrace-signal=SIGUSR2", "owner_tid", "blocked"],
+            delivered("owner_tid", "10"),
+        ),
+        (vec!["owner_pid"], delivered("owner_pid", "10")),
+        (vec!["stop"], delivered("stop", "10")),
+        (vec!["exit_signal"], delivered("exit_signal", "10")),
+        (
+            vec!["exit_signal", "reaped"],
+            delivered("exit_signal", "10"),
+        ),
+        (vec!["signalfd"], delivered("signalfd", "10")),
+        (vec!["marker"], delivered("marker", "10")),
+        (vec!["wo_queue", "11"], "wo_queue rc=0 -\n".to_owned()),
+        (
+            vec!["wo_queue", rtmin.as_str()],
+            "wo_queue rc=0 -\n".to_owned(),
+        ),
+        (vec!["default"], String::new()),
+    ];
+    for (args, expected) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (flags, args): (Vec<&str>, Vec<&str>) =
+            args.iter().partition(|arg| arg.starts_with("--"));
+        let mut command_args = vec!["--log=error", "run", "--strict", "--timeout", "60"];
+        command_args.extend(flags.iter().copied());
+        command_args.push("--");
+        command_args.push(guest.as_str());
+        command_args.extend(args.iter().copied());
+        let (status, log) = run_with_deadline(
+            hermit_command(&command_args),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        let status = status.expect("the run must finish");
+        if args[0] == "default" {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGTERM),
+                "the process ends of SIGTERM, as natively:\nstdout:\n{stdout}\nstderr:\n{log}"
+            );
+        } else {
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{args:?}:\nstdout:\n{stdout}\nstderr:\n{log}"
+            );
+        }
+        assert_eq!(stdout, expected, "{args:?}: stderr:\n{log}");
+    }
+}
+
+/// A process-directed signal to the sender's own multi-threaded process whose
+/// receiver Linux's rule gives to a thread Hermit cannot hand it to is refused
+/// by name, and sends nothing (https://github.com/rrnewton/hermit/issues/4034).
+/// Each mode runs with `--allow-unsupported-syscalls`, so the refused call
+/// returns ENOSYS and the guest goes on; the log names the reason:
+/// - a worker sends while the main thread waits with the signal unblocked,
+///   and the main thread sends to the thread id of a worker that does not
+///   block the signal, which Linux prefers: the sender, which does not block
+///   the signal either, is the one thread the kernel's `complete_signal`
+///   admits under ptrace, so it would take the forwarded copy first;
+/// - SIGTRAP and SIGSTKFLT, each caught: Reverie takes both for itself, so a
+///   receiver's handler would never run;
 /// - `rt_sigqueueinfo` whose `siginfo_t` pointer is the vDSO's `[vvar]` page,
 ///   which the kernel copies from but neither tracer read reaches, and one
 ///   whose `siginfo_t` starts 48 bytes before an unmapped page (the kernel
 ///   copies only those 48 for `SI_QUEUE`, and Linux delivers it);
 /// - `rt_sigqueueinfo` of SIGSEGV and of SIGUSR1 whose `siginfo_t` pointer is
 ///   in the hole one page below a `MAP_GROWSDOWN` mapping, which the kernel's
-///   copy grows (Linux delivers);
-/// - `--stacktrace-signal` configured.
+///   copy grows (Linux delivers).
 ///
-/// A fail-closed run of the default-disposition case stops with the
-/// policy-refusal status, and so does a replay of a recorded schedule
-/// (`--replay-schedule-from`) of an otherwise admitted send.
+/// A replay of a recorded schedule (`--replay-schedule-from`) of a send that
+/// the recording forwarded as it is also stops with the policy-refusal status.
 #[test]
-fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
+fn each_signal_to_the_senders_own_process_detcore_cannot_route_is_refused_by_name() {
     let guest = own_process_signal_guest().to_str().unwrap().to_owned();
-    let not_admitted = "only SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGPIPE and SIGTERM";
-    let armed = "at moments host timing sets is armed";
-    let signum = |sig: i32| sig.to_string();
-    let rtmin = signum(libc::SIGRTMIN());
+    let unreadable = "Hermit cannot read all 128 bytes of it";
+    let sender_takes_it = "the sending thread does not block the signal";
     let cases: Vec<(Vec<&str>, &str)> = vec![
-        (vec!["marker"], "a guest sent SIGSTKFLT"),
-        (vec!["vvar_queue"], "Hermit cannot read all 128 bytes of it"),
+        (vec!["sender_is_not_sole"], sender_takes_it),
+        (vec!["sibling_tid_unblocked"], sender_takes_it),
+        (vec!["not_admitted", "5"], "ptrace consumes every SIGTRAP"),
         (
-            vec!["straddle_queue"],
-            "Hermit cannot read all 128 bytes of it",
+            vec!["not_admitted", "16"],
+            "reverie uses it as PERF_EVENT_SIGNAL",
         ),
-        (
-            vec!["growsdown_queue", "11"],
-            "Hermit cannot read all 128 bytes of it",
-        ),
-        (
-            vec!["growsdown_queue", "10"],
-            "Hermit cannot read all 128 bytes of it",
-        ),
-        (vec!["wo_queue", "11"], not_admitted),
-        (vec!["wo_queue", rtmin.as_str()], not_admitted),
-        (
-            vec!["--stacktrace-signal=SIGUSR2", "owner_tid", "blocked"],
-            "--stacktrace-signal is configured",
-        ),
-        (
-            vec!["sender_is_not_sole"],
-            "does not block the signal, so Linux could give it to either thread",
-        ),
-        (
-            vec!["sibling_tid_unblocked"],
-            "does not block the signal, so Linux could give it to either thread",
-        ),
-        (
-            vec!["sender_blocks"],
-            "the sending thread blocks the signal",
-        ),
-        (vec!["not_admitted", "17"], not_admitted),
-        (vec!["not_admitted", "18"], not_admitted),
-        (vec!["not_admitted", "20"], not_admitted),
-        (vec!["not_admitted", rtmin.as_str()], not_admitted),
-        (vec!["not_admitted", "11"], not_admitted),
-        (vec!["not_admitted", "5"], not_admitted),
-        (vec!["not_admitted", "16"], not_admitted),
-        (vec!["default"], "the signal has its default disposition"),
-        (vec!["owner_tid"], armed),
-        (vec!["owner_pid"], armed),
-        (vec!["stop"], armed),
-        (vec!["exit_signal"], armed),
-        (vec!["exit_signal", "reaped"], armed),
-        (vec!["signalfd"], "the process holds a signalfd"),
+        (vec!["vvar_queue"], unreadable),
+        (vec!["straddle_queue"], unreadable),
+        (vec!["growsdown_queue", "11"], unreadable),
+        (vec!["growsdown_queue", "10"], unreadable),
     ];
     for (args, reason) in cases {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        let (flags, args): (Vec<&str>, Vec<&str>) =
-            args.iter().partition(|arg| arg.starts_with("--"));
         let mut command_args = vec![
             "--log=error",
             "run",
             "--allow-unsupported-syscalls",
             "--timeout",
             "60",
+            "--",
+            guest.as_str(),
         ];
-        command_args.extend(flags.iter().copied());
-        command_args.push("--");
-        command_args.push(guest.as_str());
         command_args.extend(args.iter().copied());
         let (status, log) = run_with_deadline(
             hermit_command(&command_args),
@@ -35456,7 +37982,6 @@ fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
             "{args:?}: stderr:\n{log}"
         );
         let call = match args[0] {
-            "wo_queue" => "by rt_sigqueueinfo is not supported: ",
             "vvar_queue" | "straddle_queue" | "growsdown_queue" => {
                 "rt_sigqueueinfo with a siginfo_t at "
             }
@@ -35467,27 +37992,6 @@ fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
             "{args:?}: the refusal must name `{call}` and the reason `{reason}`:\nstderr:\n{log}"
         );
     }
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let (status, log) = run_with_deadline(
-        hermit_command(&[
-            "--log=error",
-            "run",
-            "--strict",
-            "--timeout",
-            "60",
-            "--",
-            guest.as_str(),
-            "default",
-        ]),
-        directory.path(),
-        Duration::from_secs(120),
-        false,
-    );
-    assert_eq!(
-        status.and_then(|status| status.code()),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "a fail-closed run must stop with the policy-refusal status:\nstderr:\n{log}"
-    );
 
     // A replayed schedule's trace turn after the send can hand the turn to
     // another thread before the sender takes the signal, so the send is
@@ -35549,9 +38053,11 @@ fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
 /// tracing event, and only the policy-refusal status leaves the container, so
 /// under `--verify` the reason is only in run 1's log. The refused run used to
 /// return before the echo: stderr said "the refusal reason is above", and it
-/// was not. The guest's `sender_blocks` send is refused as in
-/// [`each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name`],
+/// was not. The guest's `sender_is_not_sole` send is refused as in
+/// [`each_signal_to_the_senders_own_process_detcore_cannot_route_is_refused_by_name`],
 /// here fail-closed, so run 1 stops with the policy-refusal status.
+/// (`sender_blocks` no longer serves: process-directed sends to a sender
+/// that blocks the signal are now delivered to the thread Linux chooses.)
 ///
 /// - With the flag, the reason is on stderr exactly once, and the
 ///   `--verify-json` record is run 1's `run_failed` policy refusal,
@@ -35563,8 +38069,7 @@ fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
 #[test]
 fn verify_print_verify_logs_echoes_a_refused_first_runs_log() {
     let guest = own_process_signal_guest().to_str().unwrap().to_owned();
-    let reason = "by kill is not supported: the sending thread blocks the signal \
-                  (https://github.com/rrnewton/hermit/issues/4034)";
+    let reason = "the sending thread does not block the signal";
     let run = |label: &str, flags: &[&str]| {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let verdict = directory.path().join("verify.json");
@@ -35579,7 +38084,7 @@ fn verify_print_verify_logs_echoes_a_refused_first_runs_log() {
             "60",
         ];
         args.extend_from_slice(flags);
-        args.extend(["--", guest.as_str(), "sender_blocks"]);
+        args.extend(["--", guest.as_str(), "sender_is_not_sole"]);
         // --verify buffers a non-seekable stdin to its end for both runs, so
         // an inherited open pipe would hold the run until the deadline.
         let mut command = hermit_command(&args);
@@ -36740,13 +39245,19 @@ fn a_pidfd_signal_through_hermits_own_proc_directories_is_eperm() {
 
 /// A send with no flag through `/proc/<tid>` of a sibling thread names the
 /// sender's own two-thread process (https://github.com/rrnewton/hermit/issues/4094),
-/// so it is refused by name as `kill(getpid())` is there, and so is a send
-/// through `PIDFD_SELF_THREAD_GROUP`, and a worker's send through
-/// `PIDFD_SELF_THREAD` with `PIDFD_SIGNAL_THREAD_GROUP`, which name the same
-/// process (https://github.com/rrnewton/hermit/issues/4147). Each refusal names
-/// the process, not the sender's thread id. A fail-closed run stops with the
-/// policy-refusal status at the first, and with
-/// `--allow-unsupported-syscalls` each send returns ENOSYS.
+/// so it is refused by name as `kill(getpid())` is there: Linux gives it to
+/// the sibling, and under ptrace the sender would take the forwarded copy
+/// first (https://github.com/rrnewton/hermit/issues/4034). The refusal names
+/// the process, not the sender's thread id, and a fail-closed run stops with
+/// the policy-refusal status; with `--allow-unsupported-syscalls` the send
+/// returns ENOSYS. The two sends through `PIDFD_SELF_THREAD_GROUP` and
+/// through `PIDFD_SELF_THREAD` with `PIDFD_SIGNAL_THREAD_GROUP`, which name
+/// the same process (https://github.com/rrnewton/hermit/issues/4147), are
+/// forwarded to the host kernel, so which of its two answers appears here
+/// depends on the kernel: EBADF from a kernel that does not know the
+/// sentinel, and 0 with the handler run from one that does (Linux 7.1).
+/// This test accepts either; the deterministic answer for this send is
+/// asserted by `pidfd_send_signal_flags_and_proc_descriptors_answer_as_linux_does_at_bitwise_parity`.
 #[test]
 fn a_pidfd_signal_through_a_siblings_proc_directory_names_the_process() {
     let guest = futex_c_guest(&PIDFD_SEND_SIGNAL_FLAGS_GUEST, "pidfd_send_signal_flags")
@@ -36817,19 +39328,28 @@ fn a_pidfd_signal_through_a_siblings_proc_directory_names_the_process() {
         "stdout:\n{stdout}\nstderr:\n{log}"
     );
     let (pid, text) = refusal(&stdout);
-    assert_eq!(
-        stdout,
-        format!(
-            "process {pid}\n/proc/<sibling tid> rc=-1 ENOSYS ran=0\n\
-             PIDFD_SELF_THREAD_GROUP rc=-1 ENOSYS ran=0\n\
-             worker, PIDFD_SELF_THREAD, thread group rc=-1 ENOSYS ran=0\n"
-        ),
-        "stderr:\n{log}"
+    // The forwarded sentinel send is answered by the host kernel: EBADF
+    // where it does not know the sentinel, 0 with the handler run where it
+    // does. Both are the kernel's answer; everything else must match.
+    let sentinel_lines = [
+        "PIDFD_SELF_THREAD_GROUP rc=-1 EBADF ran=0\n",
+        "PIDFD_SELF_THREAD_GROUP rc=0 - ran=1\n",
+    ];
+    assert!(
+        sentinel_lines.iter().any(|line| {
+            stdout
+                == format!(
+                    "process {pid}\n/proc/<sibling tid> rc=-1 ENOSYS ran=0\n\
+                     {line}\
+                     worker, PIDFD_SELF_THREAD, thread group rc=0 - ran=0\n"
+                )
+        }),
+        "stdout:\n{stdout}\nstderr:\n{log}"
     );
     assert_eq!(
         log.matches(&text).count(),
-        3,
-        "each of the three refusals must name the process, not a thread id:\n{log}"
+        1,
+        "the refusal must name the process, not a thread id:\n{log}"
     );
 }
 
@@ -36903,21 +39423,21 @@ fn a_process_group_pidfd_signal_is_refused_by_name() {
     );
 }
 
-/// pidfd_send_signal to a process with two live threads is refused by name,
-/// as `kill` is (https://github.com/rrnewton/hermit/issues/4047). A pidfd names
-/// a whole process, so the signal is process-directed, and Linux's
-/// complete_signal would pick the receiving thread, which Detcore does not
-/// model. Before the change the call was forwarded to the kernel, which chose
-/// the thread. A fail-closed run stops with the policy-refusal status at that
-/// call; with `--allow-unsupported-syscalls` it returns ENOSYS; without
-/// sequentialized threads it is forwarded. Everything else stays the kernel's
-/// answer: a one-thread target, a zombie target (0, as Linux), signal 0, and
-/// SIGKILL to a two-threaded child, which kills it whichever thread it reaches.
-/// A one-thread child blocked in pause() is woken to run its handler, as `kill`
-/// wakes it; before https://github.com/rrnewton/hermit/issues/4099
-/// the scheduler was not told and the run hung to its deadline.
+/// pidfd_send_signal to a process with two live threads is refused by name
+/// when the kernel's own choice of receiver is host-timed, as `kill` is: here
+/// the second thread sleeps in `sigsuspend`, outside the schedule
+/// (https://github.com/rrnewton/hermit/issues/4034). A pidfd names a whole
+/// process, so the signal is process-directed. A fail-closed run stops with
+/// the policy-refusal status at that call; with
+/// `--allow-unsupported-syscalls` it returns ENOSYS; without sequentialized
+/// threads it is forwarded. Everything else stays the kernel's answer: a
+/// one-thread target, a zombie target (0, as Linux), signal 0, and SIGKILL to
+/// a two-threaded child, which kills it whichever thread it reaches. A
+/// one-thread child blocked in pause() is woken to run its handler, as `kill`
+/// wakes it; before https://github.com/rrnewton/hermit/issues/4099 the
+/// scheduler was not told and the run hung to its deadline.
 #[test]
-fn a_pidfd_signal_to_several_threads_is_refused_by_name() {
+fn a_pidfd_signal_to_a_sleeping_sibling_is_refused_by_name() {
     let guest = futex_c_guest(
         &PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST,
         "pidfd_send_signal_multithread",
@@ -36957,8 +39477,8 @@ fn a_pidfd_signal_to_several_threads_is_refused_by_name() {
     );
     assert!(
         log.contains("process-directed signal 10 to process")
-            && log
-                .contains("by pidfd_send_signal is not supported: the process has 2 live threads"),
+            && log.contains("by pidfd_send_signal is not supported: ")
+            && log.contains("runs or sleeps outside the schedule"),
         "the refusal must name the call and the reason:\nstderr:\n{log}"
     );
     assert_eq!(stdout, answered, "stderr:\n{log}");
@@ -36989,8 +39509,8 @@ fn a_pidfd_signal_to_several_threads_is_refused_by_name() {
         format!("{answered}two threads, pidfd_send_signal: -1 ENOSYS\n"),
         "stderr:\n{log}"
     );
-    // Without sequentialized threads nothing is refused: the call is forwarded
-    // and the kernel answers, as natively.
+    // Without sequentialized threads the call is forwarded and the kernel
+    // answers, as natively.
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (status, log) = run_with_deadline(
         hermit_command(&[
@@ -37613,6 +40133,64 @@ fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
         Some(true),
         "fresh: no bitwise parity over equal, nonzero INFO counts:\n{log}"
     );
+}
+
+/// Runs `tests/c/untraced_clone.c` in `mode` natively and under `hermit run`
+/// (ptrace), and requires the same output and a zero exit from both. Before,
+/// a child made with `CLONE_UNTRACED` ran untraced, Detcore waited for its
+/// first turn, and the clone never returned.
+fn untraced_clone_runs_as_natively(mode: &str) {
+    let guest = untraced_clone_guest();
+    let guest_arg = guest.to_str().expect("the guest path is UTF-8");
+    let native = Command::new(guest)
+        .arg(mode)
+        .output()
+        .expect("failed to run the untraced-clone guest natively");
+    assert!(native.status.success(), "native {mode}: {native:?}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--timeout", "30", "--", guest_arg, mode]),
+        directory.path(),
+        Duration::from_secs(45),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{mode}: hermit run did not end as the native run did:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        String::from_utf8_lossy(&native.stdout),
+        "{mode}: the guest printed other than natively:\n{log}"
+    );
+}
+
+/// LeakSanitizer's helper shape: shares memory, files and fs, has no exit
+/// signal, and is waited for with `__WALL`.
+#[test]
+fn an_untraced_helper_runs_as_natively() {
+    untraced_clone_runs_as_natively("helper");
+}
+
+/// A fork-like child that exits 7.
+#[test]
+fn an_untraced_process_runs_as_natively() {
+    untraced_clone_runs_as_natively("process");
+}
+
+/// A thread joined through `CLONE_CHILD_CLEARTID`.
+#[test]
+fn an_untraced_thread_runs_as_natively() {
+    untraced_clone_runs_as_natively("thread");
+}
+
+/// `clone3`'s fork-like child.
+#[test]
+fn an_untraced_clone3_child_runs_as_natively() {
+    untraced_clone_runs_as_natively("clone3");
 }
 
 /// A pidfd from `clone(CLONE_PIDFD)` or `clone3`'s pidfd field is a pidfd
@@ -39919,8 +42497,12 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
 ///   front is stale or has an entry behind it (disclosure 8);
 /// - `setsig_usr1`: `F_SETSIG` arms a host-timed source of USR1 while a timer
 ///   entry waits behind a kill's;
-/// - `forged_shared`: the shared-queue form of the forged row, refused by the
-///   https://github.com/rrnewton/hermit/issues/4034 rule.
+///
+/// `forged_shared`, the shared-queue form of the forged row, was refused by
+/// the https://github.com/rrnewton/hermit/issues/4034 rule and is now
+/// delivered: the sender blocks SIGUSR1, so Linux gives the copy to the parked
+/// worker, which is what Detcore chooses. It prints
+/// `forged_shared queue=0 deliveries=1 on_worker=1`, as natively.
 ///
 /// Known divergences, with Linux's answer beside Hermit's:
 /// - `fallback_pipe`, `fallback_cont` and `fallback_alrm`: SIGPIPE and SIGCONT
@@ -39943,10 +42525,6 @@ fn posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named() {
         ("susp_behind_stale", transition),
         ("susp_two", transition),
         ("setsig_usr1", transition),
-        (
-            "forged_shared",
-            "the sending thread blocks the signal (https://github.com/rrnewton/hermit/issues/4034)",
-        ),
     ] {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let (status, log) = run_with_deadline(
@@ -40020,6 +42598,37 @@ fn posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named() {
             "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
         );
         assert_eq!(stdout, hermit, "{mode}: stderr:\n{log}");
+    }
+    // `forged_shared` is no longer refused: the sender blocks SIGUSR1, so
+    // the copy is delivered to the parked worker Detcore chooses, as Linux
+    // chooses it. Assert that delivery, not only the doc comment above.
+    {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                "forged_shared",
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "forged_shared:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(
+            stdout, "forged_shared queue=0 deliveries=1 on_worker=1\n",
+            "forged_shared: stderr:\n{log}"
+        );
     }
 }
 
@@ -40588,6 +43197,50 @@ fn cpu_profile_host_no_rdrand_random_device_has_bitwise_parity() {
     }
 }
 
+/// Every read of a Linux random device is a fresh draw, so separate opens of
+/// /dev/urandom read different bytes: two threads' draws, one thread's two
+/// draws, and a parent's and its child's draws after a fork. Two threads that
+/// elect a leader from such draws, as libstdc++'s std::random_device makes
+/// them when RDRAND is hidden, agree on one. When every open read the run's
+/// one stream from its start, all three pairs were equal and the election tied
+/// on every attempt. Two complete strict runs agree bitwise.
+#[test]
+fn separate_random_device_opens_read_distinct_bytes_at_bitwise_parity() {
+    let guest = compiled_c_guest(
+        &RANDOM_DEVICE_INDEPENDENT_OPENS_GUEST,
+        "random_device_independent_opens",
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let output = hermit(&[
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict.to_str().unwrap(),
+        "--",
+        guest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "election: one leader\nsequential: distinct\nfork: distinct\n",
+        "{stderr}"
+    );
+    assert!(output.status.success(), "{:?}\n{stderr}", output.status);
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "no {side} INFO messages compared: {report}"
+        );
+    }
+}
+
 /// Flip only the oracle's RDRAND feature bit after executing intercepted
 /// CPUID. It must reject that observation, even on a host without RDRAND.
 #[test]
@@ -40990,6 +43643,31 @@ fn cpu_profile_v3_library_run_with_unqualified_facts_is_refused() {
 /// a guest to completion there.
 #[test]
 fn library_runs_return_on_a_256_kib_thread() {
+    // This is the one cli test that runs Detcore sessions in this process
+    // rather than in a hermit subprocess. In the threaded harness its
+    // tracer shares the process with hundreds of sibling sessions and
+    // guests, and has been seen wedged with its tracee stopped and the
+    // tracer waiting on a pipe; run the body in a fresh process, as
+    // nextest would.
+    const CHILD: &str = "HERMIT_LIBRARY_RUNS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "library_runs_return_on_a_256_kib_thread",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
     // Built here: `DetConfig::default` parses an empty command line with clap,
     // whose debug-build frame alone is about 516 KiB. The command is not
     // `Send`, so it is built on the small thread.
@@ -42095,6 +44773,87 @@ fn a_timer_armed_by_a_thread_that_blocks_its_signal_wakes_another_thread() {
     }
 }
 
+/// A timed sleep or futex wait that a signal ends in the kernel leaves
+/// `ERESTART_RESTARTBLOCK`. With no handler to run, Linux restarts it through
+/// `restart_syscall` until the end it kept (`hrtimer_nanosleep_restart` in
+/// kernel/time/hrtimer.c, `futex_wait_restart` in kernel/futex/waitwake.c); a
+/// handler gets `EINTR`. Without sequentialized threads Detcore runs these
+/// waits in the kernel and refused the restart as an unsupported syscall
+/// (exit 122). In the guest (`tests/c/sleep_restart.c`) a child sends 40
+/// SIGWINCH, ignored by default but queued under ptrace, 20 ms apart while the
+/// parent waits 100 ms in `nanosleep`, a relative and an absolute
+/// `clock_nanosleep`, or a `FUTEX_WAIT`; each wait must outlast the third
+/// signal (a count the child keeps in shared memory) and still end long before
+/// the signals stop. A SIGALRM handler must still get `EINTR` and the time
+/// left. Every mode must print native's line, except that record skips the
+/// absolute sleep (see the comment there). The strict, plain and record legs
+/// emulate the waits and passed before; the `--no-sequentialize-threads` leg
+/// runs them in the kernel.
+#[test]
+fn kernel_run_sleeps_and_futex_waits_restart_as_on_linux() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&SLEEP_RESTART_GUEST, "sleep_restart");
+    let guest = guest.to_str().unwrap();
+    // As in run_strict_flag_is_accepted_and_runs, the strict leg disables the
+    // PMU timer and CPUID faulting so it runs where those are unavailable.
+    let strict = [
+        "--strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+    ];
+    for mode in ["nanosleep", "clock_nanosleep", "abs", "futex", "alrm"] {
+        let native = Command::new(guest)
+            .arg(mode)
+            .output()
+            .expect("failed to run the guest natively");
+        let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+        let pinned = if mode == "alrm" {
+            "alrm: nanosleep EINTR (time left within 0-100 ms: yes), clock_nanosleep EINTR \
+             (time left within 0-100 ms: yes), futex EINTR; 3 alarms\n"
+                .to_owned()
+        } else {
+            let result = if mode == "futex" { "ETIMEDOUT" } else { "0" };
+            format!(
+                "{mode}: {result}; at least 3 signals came first: yes; the storm was still \
+                 running when it returned: yes; 1 children\n"
+            )
+        };
+        assert_eq!(expected, pinned, "native {mode}");
+        for flags in [&strict[..], &[], &["--no-sequentialize-threads"]] {
+            let mut args = vec!["run", "--timeout", "120", "--base-env=minimal"];
+            args.extend_from_slice(flags);
+            args.extend(["--", guest, mode]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+        }
+        // Record skips the absolute sleep: without virtual time a
+        // sequentialized absolute clock_nanosleep only yields
+        // (`handle_nanosleep_family`), so it returns before the signals.
+        if mode == "abs" {
+            continue;
+        }
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the recording data dir");
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout",
+            "120",
+            &data_dir_arg,
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+}
+
 /// Main waits in `pause` for its alarm while a worker sleeps in
 /// `rt_sigsuspend` with nothing blocked. The kernel wakes the sleeper while
 /// the drawn thread is held in a ptrace stop, so the sleeper must be the
@@ -42600,6 +45359,430 @@ fn a_socket_reader_beside_a_spinner_is_retried_within_a_poll_upgrade_period() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// Two threads hand a turn back and forth through a condition variable, with
+/// no timeout, while main creates a third thread and joins it
+/// (tests/c/handoff_beside_newcomer.c). Each hand-off is a turn charged half
+/// a millisecond of virtual time but costs its thread microseconds of its
+/// own, and chaos change points came only when a thread's own-time slice
+/// ended. On main 46be6638, at `--chaos --seed=1` and `--seed=6` the new
+/// thread drew a worse band than both players and waited 13.3 s and 7.6 s
+/// of virtual time for its first instruction, and at seeds 2 and 4 main
+/// itself waited through 17,000-26,000 hand-offs to create it. Turns now
+/// count toward a chaos slice, so a change point comes within about 400
+/// turns and the starvation bound acts: on this head the new thread waits at
+/// most 0.24 s and a run takes at most 1,728 hand-offs. Each seed must give
+/// it its first turn within 1 s and finish in fewer than 10,000 hand-offs. A
+/// chaos run also verifies at bitwise parity. The seed-6 recording, whose
+/// slices the bound ended, replays as recorded under `--chaos
+/// --replay-schedule-from` (as analyze trials run). A preemption replay ends
+/// such a slice at its recorded branch count, which can fall just before the
+/// syscall check-in it ended at, so until
+/// https://github.com/rrnewton/hermit/pull/4597 lands its run can differ by
+/// a turn: at seeds 2, 6 and 11 the new thread's wait comes out one turn
+/// charge (0.5 ms) different. The seed-6 preemption replay must stay within
+/// one turn of the recording (0.6 ms of wait, one hand-off), and the seed-3
+/// recording, whose slices the bound leaves alone, must replay exactly under
+/// `--chaos --replay-preemptions-from` at another seed.
+#[test]
+fn chaos_change_points_come_within_a_timeslice_of_turn_charges() {
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&HANDOFF_BESIDE_NEWCOMER_GUEST, "handoff_beside_newcomer")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let measure = |stdout: &str| -> (u64, u64) {
+        let mut words = stdout.split_whitespace();
+        let waited = words.nth(2).and_then(|w| w.parse().ok());
+        let handoffs = words.nth(1).and_then(|w| w.parse().ok());
+        waited
+            .zip(handoffs)
+            .unwrap_or_else(|| panic!("unexpected output {stdout:?}"))
+    };
+    for seed in ["1", "2", "3", "4", "5", "6"] {
+        let output = hermit(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "120",
+            "--chaos",
+            "--seed",
+            seed,
+            "--",
+            &guest,
+        ]);
+        let out = stdout(&output);
+        assert!(output.status.success(), "seed {seed}: {}", stderr(&output));
+        let (waited_us, handoffs) = measure(&out);
+        assert!(
+            waited_us < 1_000_000 && handoffs < 10_000,
+            "seed {seed}: the new thread waited {waited_us} us for its first turn, after \
+             {handoffs} hand-offs in all"
+        );
+    }
+
+    let verdict = directory.path().join("verify.json");
+    let verdict_arg = verdict.to_str().unwrap().to_owned();
+    let verified = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "1",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &verdict_arg,
+        "--",
+        &guest,
+    ]);
+    assert!(verified.status.success(), "{}", stderr(&verified));
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&verdict).expect("failed to read the verify verdict"),
+    )
+    .expect("the verify verdict is not JSON");
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "no INFO messages compared: {report}"
+        );
+    }
+
+    let schedule = directory.path().join("schedule.json");
+    let record = format!("--record-preemptions-to={}", schedule.display());
+    let recorded = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "6",
+        &record,
+        "--",
+        &guest,
+    ]);
+    assert!(recorded.status.success(), "{}", stderr(&recorded));
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    let replayed = hermit(&[
+        "--log=info",
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "6",
+        &replay,
+        "--",
+        &guest,
+    ]);
+    let log = stderr(&replayed);
+    assert!(
+        replayed.status.success() && log.contains("(0 desynced)"),
+        "the schedule replay must not desync:\n{}",
+        log.lines()
+            .filter(|line| line.contains("desync") || line.contains("expected to be running"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        stdout(&replayed),
+        stdout(&recorded),
+        "the schedule replay must print what the recording printed"
+    );
+    let shaped = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "7",
+        &format!("--replay-preemptions-from={}", schedule.display()),
+        "--",
+        &guest,
+    ]);
+    assert!(shaped.status.success(), "{}", stderr(&shaped));
+    let (recorded_wait, recorded_handoffs) = measure(&stdout(&recorded));
+    let (shaped_wait, shaped_handoffs) = measure(&stdout(&shaped));
+    assert!(
+        recorded_wait.abs_diff(shaped_wait) <= 600
+            && recorded_handoffs.abs_diff(shaped_handoffs) <= 1,
+        "the preemption replay of slices the bound ended must stay within one turn of the \
+         recording until #4597: {} vs {}",
+        stdout(&shaped),
+        stdout(&recorded)
+    );
+    let preemption_schedule = directory.path().join("preemptions.json");
+    let preemption_record = format!("--record-preemptions-to={}", preemption_schedule.display());
+    let recorded = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "3",
+        &preemption_record,
+        "--",
+        &guest,
+    ]);
+    assert!(recorded.status.success(), "{}", stderr(&recorded));
+    let fresh = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "7",
+        "--",
+        &guest,
+    ]);
+    assert!(fresh.status.success(), "{}", stderr(&fresh));
+    assert_ne!(
+        stdout(&fresh),
+        stdout(&recorded),
+        "seed 7 must schedule differently for the replay below to show anything"
+    );
+    let preemptions = format!(
+        "--replay-preemptions-from={}",
+        preemption_schedule.display()
+    );
+    let preempted = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "7",
+        &preemptions,
+        "--",
+        &guest,
+    ]);
+    assert!(preempted.status.success(), "{}", stderr(&preempted));
+    assert_eq!(
+        stdout(&preempted),
+        stdout(&recorded),
+        "the preemption replay must print what the recording printed"
+    );
+}
+
+/// A thread sleeps for 100 us in a loop, less than a scheduler turn charge, so
+/// its sleep is always due when it is next selected, while main creates a
+/// second thread (tests/c/sleeper_beside_newcomer.c). The sleeper's turns end
+/// timed waits at their deadlines and do not count toward its chaos slice, so
+/// its slices run on its own time. On main 288c4e60, at `--chaos --seed=9`,
+/// `23` and `24` the new thread drew a worse band and waited 6.3 s, 16.9 s and
+/// 19.9 s of virtual time for its first instruction. A thread that has not
+/// yet run and loses 400 grants in a row on priority now makes every grant
+/// end its slice at the next check-in, and the starvation bound puts the
+/// threads ahead behind it: it waits 0.25 s at each of these seeds. Each must
+/// give it its first turn within 1 s, a chaos run verifies at bitwise parity,
+/// and the seed-9 recording replays as recorded under `--chaos
+/// --replay-schedule-from` (as analyze trials run). Its preemption replay is
+/// one turn off until https://github.com/rrnewton/hermit/pull/4597 lands, as
+/// for chaos_change_points_come_within_a_timeslice_of_turn_charges.
+#[test]
+fn a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second() {
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&SLEEPER_BESIDE_NEWCOMER_GUEST, "sleeper_beside_newcomer")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for seed in ["9", "23", "24"] {
+        let output = hermit(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "120",
+            "--chaos",
+            "--seed",
+            seed,
+            "--",
+            &guest,
+        ]);
+        let out = stdout(&output);
+        assert!(output.status.success(), "seed {seed}: {}", stderr(&output));
+        let waited_us: u64 = out
+            .split_whitespace()
+            .nth(3)
+            .and_then(|word| word.parse().ok())
+            .unwrap_or_else(|| panic!("seed {seed}: unexpected output {out:?}"));
+        assert!(
+            waited_us < 1_000_000,
+            "seed {seed}: the new thread waited {waited_us} us for its first turn"
+        );
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let verdict_arg = verdict.to_str().unwrap().to_owned();
+    let verified = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "9",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &verdict_arg,
+        "--",
+        &guest,
+    ]);
+    assert!(verified.status.success(), "{}", stderr(&verified));
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&verdict).expect("failed to read the verify verdict"),
+    )
+    .expect("the verify verdict is not JSON");
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "no INFO messages compared: {report}"
+        );
+    }
+
+    let schedule = directory.path().join("schedule.json");
+    let record = format!("--record-preemptions-to={}", schedule.display());
+    let recorded = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "9",
+        &record,
+        "--",
+        &guest,
+    ]);
+    assert!(recorded.status.success(), "{}", stderr(&recorded));
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    let replayed = hermit(&[
+        "--log=info",
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "9",
+        &replay,
+        "--",
+        &guest,
+    ]);
+    let log = stderr(&replayed);
+    assert!(
+        replayed.status.success() && log.contains("(0 desynced)"),
+        "the schedule replay must not desync:\n{}",
+        log.lines()
+            .filter(|line| line.contains("desync") || line.contains("expected to be running"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        stdout(&replayed),
+        stdout(&recorded),
+        "the schedule replay must print what the recording printed"
+    );
+}
+
+/// The same 100 us sleep loop beside a thread that has already run
+/// (tests/c/sleeper_beside_newcomer.c `existing`): the thread sleeps 50 ms and
+/// wakes, due, behind the loop. Neither rule frees a thread that has run, so
+/// it waits as on main: at `--chaos --seed=4` it wakes 5.8 s late on main
+/// 288c4e60 and on this head, and 0.30 s late when every turn counted. This
+/// holding is what reproduces a real use-after-free (main held off for 3.8 s
+/// behind a 200 us sleep loop), so the test guards it: the thread must wake
+/// at least 1 s late.
+#[test]
+fn a_thread_that_has_run_still_waits_behind_a_short_sleep_loop() {
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&SLEEPER_BESIDE_NEWCOMER_GUEST, "sleeper_beside_newcomer")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let output = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "4",
+        "--",
+        &guest,
+        "existing",
+    ]);
+    let out = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let late_us: u64 = out
+        .split_whitespace()
+        .nth(3)
+        .and_then(|word| word.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected output {out:?}"));
+    assert!(
+        late_us >= 1_000_000,
+        "the thread that had run woke only {late_us} us late behind the sleep loop; if \
+         priorities are now drawn differently, check that seed 4 still draws it behind the \
+         loop (5.8 s late on main 288c4e60)"
+    );
+}
+
+/// Four threads loop on a 10 us `pthread_cond_timedwait` that nobody signals,
+/// beside a compute-bound worker (tests/c/pollers_beside_worker.c). Each
+/// timed-out wait is a turn charged half a millisecond of virtual time for a
+/// few microseconds of the poller's own time. Unlike a due sleep's, those
+/// turns count toward the pollers' chaos slices: a futex wait that times out
+/// waits for another thread, and letting its loop hold the CPU starves that
+/// thread. When they did not count, as on main c7e03195, the worker was held
+/// off for 17-28 s at a time at `--chaos` seeds 1-6, and at two of them did
+/// not finish within 60 s. Here it is held off for at most 1.2 s at a time
+/// and finishes within 10 s of virtual time. Each seed must finish and keep
+/// the worker's longest gap under 5 s.
+#[test]
+fn a_worker_is_not_held_off_by_futex_waits_that_time_out() {
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&POLLERS_BESIDE_WORKER_GUEST, "pollers_beside_worker")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for seed in ["1", "2"] {
+        let output = hermit(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "120",
+            "--chaos",
+            "--seed",
+            seed,
+            "--",
+            &guest,
+        ]);
+        let out = stdout(&output);
+        assert!(output.status.success(), "seed {seed}: {}", stderr(&output));
+        let gap_us: u64 = out
+            .split_whitespace()
+            .nth(6)
+            .and_then(|word| word.parse().ok())
+            .unwrap_or_else(|| panic!("seed {seed}: unexpected output {out:?}"));
+        assert!(
+            gap_us < 5_000_000,
+            "seed {seed}: the worker was held off for {gap_us} us beside the pollers"
+        );
+    }
 }
 
 /// Run tests/c/scheduler_signal_waiting.c under `run --strict` in each mode
@@ -43518,13 +46701,14 @@ fn run_kvm_futex_wait_on_an_unreadable_word_matches_linux() {
     );
 }
 
-/// A priority-inheritance futex command is refused by name, never a panic
-/// (https://github.com/rrnewton/hermit/issues/3958): a fail-closed run stops with
-/// the policy-refusal status, and with `--allow-unsupported-syscalls` the guest
-/// gets ENOSYS, Linux's answer when built without CONFIG_FUTEX_PI.
+/// The requeue-PI pair, FUTEX_WAIT_REQUEUE_PI and FUTEX_CMP_REQUEUE_PI, is
+/// refused by name, never a panic (https://github.com/rrnewton/hermit/issues/3958):
+/// a fail-closed run stops with the policy-refusal status, and with
+/// `--allow-unsupported-syscalls` the guest gets ENOSYS, Linux's answer when
+/// built without CONFIG_FUTEX_PI. Natively the guest's call returns 0.
 #[test]
-fn futex_lock_pi_is_refused_by_name() {
-    let guest = futex_c_guest(&FUTEX_LOCK_PI_REFUSED_GUEST, "futex_lock_pi_refused")
+fn futex_requeue_pi_is_refused_by_name() {
+    let guest = futex_c_guest(&FUTEX_REQUEUE_PI_REFUSED_GUEST, "futex_requeue_pi_refused")
         .to_str()
         .unwrap()
         .to_owned();
@@ -43549,7 +46733,7 @@ fn futex_lock_pi_is_refused_by_name() {
         "a fail-closed run must stop with the policy-refusal status:\nstderr:\n{log}"
     );
     assert!(
-        log.contains("futex command FUTEX_LOCK_PI is not supported"),
+        log.contains("futex command FUTEX_CMP_REQUEUE_PI is not supported"),
         "the refusal must name the command:\nstderr:\n{log}"
     );
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -43574,7 +46758,306 @@ fn futex_lock_pi_is_refused_by_name() {
         Some(0),
         "stdout:\n{stdout}\nstderr:\n{log}"
     );
-    assert_eq!(stdout, "lock_pi: -1 ENOSYS\n", "stderr:\n{log}");
+    assert_eq!(stdout, "cmp_requeue_pi: -1 ENOSYS\n", "stderr:\n{log}");
+}
+
+/// FUTEX_LOCK_PI from the init of a nested PID namespace is refused by name:
+/// the TID a PI word holds is the caller's namespace's, which Detcore does not
+/// translate into the thread IDs it keys PI ownership by. Natively the call
+/// takes the free word (0).
+#[test]
+fn futex_lock_pi_in_a_nested_pid_namespace_is_refused_by_name() {
+    let guest = futex_c_guest(&FUTEX_REQUEUE_PI_REFUSED_GUEST, "futex_requeue_pi_refused")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "nested-pid",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains(
+            "futex command FUTEX_LOCK_PI is not supported: the caller is in a nested PID \
+             namespace"
+        ),
+        "the refusal must name the command and the reason:\nstderr:\n{log}"
+    );
+}
+
+/// `guest` under ptrace `run --strict --verify --verify-strict` with `schedule`
+/// (the default one, or a chaos seed): the two runs must agree at bitwise parity
+/// with INFO messages compared on both sides. Returns the guest's stdout.
+fn futex_pi_guest_at_bitwise_parity(guest: &str, schedule: &[&str]) -> String {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path should be UTF-8");
+    let mut args = vec![
+        "--backend=ptrace",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    args.extend_from_slice(schedule);
+    args.extend([
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--",
+        guest,
+    ]);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("strict verification wrote no verdict"))
+            .expect("strict verification verdict is valid JSON");
+    assert_eq!(verdict["bitwise_parity"], true, "{args:?}: {verdict}");
+    for side in ["left", "right"] {
+        assert!(
+            verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "{args:?}: no INFO messages compared: {verdict}"
+        );
+    }
+    stdout(&output)
+}
+
+/// FUTEX_LOCK_PI, FUTEX_LOCK_PI2, FUTEX_TRYLOCK_PI and FUTEX_UNLOCK_PI called
+/// directly, as Linux's kernel/futex/pi.c answers them: taking a free word,
+/// EDEADLK for its owner, EPERM for an unlock by anyone else, the argument
+/// checks in Linux's order, FUTEX_WAITERS left by a failed TRYLOCK_PI and by
+/// ESRCH for an exited owner, absolute deadlines on each clock, a plain wake
+/// and requeue stopping at a PI waiter, EINVAL behind a plain waiter, the
+/// hand-over to waiters first in, first out, a caught signal restarting a
+/// blocked lock with its deadline, EDEADLK for a lock that closes a cycle, an
+/// owner's exit and an owner's exec handing the word to its waiter with
+/// FUTEX_OWNER_DIED, and a process-shared word handed to a child. Every line
+/// must match native, and native the fixed expectation; under Hermit the run is
+/// at bitwise parity under the default schedule and a chaos seed.
+#[test]
+fn futex_pi_lock_commands_match_linux() {
+    let guest = futex_c_guest(&FUTEX_PI_COMMANDS_GUEST, "futex_pi_commands");
+    let expected = "trylock_pi, unowned word: 0, word main\n\
+         lock_pi, word the caller owns: -1 EDEADLK, word main\n\
+         trylock_pi, word the caller owns: -1 EDEADLK, word main\n\
+         unlock_pi, no waiter: 0, word 0\n\
+         unlock_pi, word 0: -1 EPERM, word 0\n\
+         lock_pi, unowned word: 0, word main\n\
+         unlock_pi again: 0, word 0\n\
+         lock_pi, tv_nsec 1e9: -1 EINVAL, word 0\n\
+         lock_pi, unmapped timeout: -1 EFAULT, word 0\n\
+         trylock_pi ignores its timeout argument: 0, word main\n\
+         unlock_pi: 0, word 0\n\
+         lock_pi with FUTEX_CLOCK_REALTIME: -1 ENOSYS, word 0\n\
+         lock_pi, NULL word: -1 EFAULT\n\
+         lock_pi, misaligned word: -1 EINVAL\n\
+         unlock_pi, misaligned word naming the caller: -1 EINVAL\n\
+         unlock_pi, misaligned word naming nobody: -1 EPERM\n\
+         lock_pi, read-only word: -1 EFAULT, word 0\n\
+         shared lock_pi, read-only anonymous word: -1 EFAULT, word 0\n\
+         unlock_pi, read-only word naming nobody: -1 EPERM, word 0\n\
+         unlock_pi, word another thread holds: -1 EPERM, word holder\n\
+         trylock_pi, word another thread holds: -1 EAGAIN, word holder|WAITERS\n\
+         lock_pi, CLOCK_REALTIME deadline 20 ms on: -1 ETIMEDOUT, word holder|WAITERS\n\
+         lock_pi2, CLOCK_MONOTONIC deadline 20 ms on: -1 ETIMEDOUT, word holder|WAITERS\n\
+         lock_pi2 with FUTEX_CLOCK_REALTIME, deadline 20 ms on: -1 ETIMEDOUT, word holder|WAITERS\n\
+         the holder's unlock_pi with no waiter left: 0, word 0\n\
+         lock_pi, word naming an exited thread: -1 ESRCH, word exited|WAITERS\n\
+         trylock_pi, word naming an exited thread: -1 ESRCH, word exited|WAITERS\n\
+         trylock_pi, word marked OWNER_DIED: 0, word main|OWNER_DIED\n\
+         unlock_pi, word marked OWNER_DIED: 0, word 0\n\
+         word with a queued waiter: 0, word main|WAITERS\n\
+         futex_wake, word with a PI waiter: -1 EINVAL, word main|WAITERS\n\
+         futex_requeue 0 and 0, word with a PI waiter: 0, word main|WAITERS\n\
+         futex_requeue 0 and 1, word with a PI waiter: -1 EINVAL, word main|WAITERS\n\
+         unlock_pi, waiter queued: 0, word waiter|WAITERS\n\
+         the waiter: lock_pi 0, word waiter|WAITERS; its unlock_pi 0, word 0\n\
+         unlock_pi, two waiters queued: 0, word first|WAITERS\n\
+         the first waiter: lock_pi 0, word first|WAITERS; its unlock_pi 0, word second|WAITERS\n\
+         the second waiter: lock_pi 0, word second|WAITERS; its unlock_pi 0, word 0\n\
+         another thread's trylock_pi, plain waiter queued first: -1 EINVAL, word main\n\
+         its lock_pi: -1 EINVAL, word main\n\
+         unlock_pi, plain waiter queued first: -1 EINVAL, word main\n\
+         futex_wake of the plain waiter: 1, word main\n\
+         unlock_pi once it left: 0, word 0\n\
+         unlock_pi, waiter signalled with SA_RESTART: 0, word restarted|WAITERS\n\
+         the signalled waiter: lock_pi 0, word restarted|WAITERS; its unlock_pi 0, word 0\n\
+         unlock_pi, waiter signalled without SA_RESTART: 0, word resumed|WAITERS\n\
+         the signalled waiter: lock_pi 0, word resumed|WAITERS; its unlock_pi 0, word 0\n\
+         the waiter signalled 200 ms into a 300 ms deadline: lock_pi -1 ETIMEDOUT, ended by the deadline: yes, handler ran 3 times in all\n\
+         unlock_pi, timed waiter gone: 0, word 0\n\
+         lock_pi on a word whose owner waits for the caller's: -1 EDEADLK, word cycle|WAITERS\n\
+         unlock_pi, cycle waiter queued: 0, word cycle|WAITERS\n\
+         the cycle waiter: lock_pi 0, word cycle|WAITERS; its unlock_pi 0, word 0\n\
+         its unlock_pi of the word main waited on: 0, word 0\n\
+         the waiter when its owner exited: lock_pi 0, word heir|OWNER_DIED|WAITERS; its unlock_pi 0, word 0\n\
+         shared unlock_pi, child queued: 0, word child|WAITERS\n\
+         the child: lock_pi 0, word child|WAITERS; its unlock_pi 0, word 0\n\
+         the child when its owner exec'd: lock_pi 0, word exec child|OWNER_DIED|WAITERS; its unlock_pi 0, word 0\n";
+    assert_eq!(native_stdout(guest), expected, "natively");
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    for schedule in [&[][..], &["--chaos", "--sched-seed=2"]] {
+        assert_eq!(
+            futex_pi_guest_at_bitwise_parity(guest, schedule),
+            expected,
+            "{schedule:?}"
+        );
+    }
+}
+
+/// Four threads contend a PTHREAD_PRIO_INHERIT mutex, which glibc serves with
+/// FUTEX_LOCK_PI and FUTEX_UNLOCK_PI, and every one finds itself alone in the
+/// critical section; the final count matches native. Main holds the mutex
+/// while it starts them and until a FUTEX_LOCK_PI has queued behind it, so
+/// every run contends it at least once. Under the default
+/// schedule and a chaos seed the run is at bitwise parity. Before Detcore
+/// emulated the PI commands, the first contended lock stopped the run with the
+/// policy-refusal status.
+#[test]
+fn a_contended_pi_mutex_keeps_mutual_exclusion_at_bitwise_parity() {
+    let guest = futex_c_guest(&FUTEX_PI_MUTEX_CONTENDED_GUEST, "futex_pi_mutex_contended");
+    let expected = "threads 4, iterations 100: count 400, overlaps 0\n";
+    assert_eq!(native_stdout(guest), expected, "natively");
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    for schedule in [&[][..], &["--chaos", "--sched-seed=1"]] {
+        assert_eq!(
+            futex_pi_guest_at_bitwise_parity(guest, schedule),
+            expected,
+            "{schedule:?}"
+        );
+    }
+}
+
+/// A robust PTHREAD_PRIO_INHERIT mutex whose owner exits holding it: the next
+/// pthread_mutex_lock (FUTEX_LOCK_PI) and pthread_mutex_trylock
+/// (FUTEX_TRYLOCK_PI) get EOWNERDEAD, and so does a waiter blocked in
+/// FUTEX_LOCK_PI when the owner exits, whom the exit hands the lock. Each then
+/// makes the mutex consistent and locks it again, as natively, at bitwise
+/// parity under the default schedule and a chaos seed.
+#[test]
+fn a_robust_pi_mutex_reports_its_owners_death_as_linux() {
+    let guest = futex_c_guest(
+        &FUTEX_PI_ROBUST_OWNER_DEATH_GUEST,
+        "futex_pi_robust_owner_death",
+    );
+    let recovered = "EOWNERDEAD, consistent 0, unlock 0, lock again 0, unlock 0, word 0\n";
+    let expected = format!(
+        "owner exited holding it, no waiter: word OWNER_DIED\n\
+         pthread_mutex_lock: {recovered}\
+         pthread_mutex_trylock: {recovered}\
+         pthread_mutex_lock blocked when the owner exited: {recovered}"
+    );
+    assert_eq!(native_stdout(guest), expected, "natively");
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    for schedule in [&[][..], &["--chaos", "--sched-seed=4"]] {
+        assert_eq!(
+            futex_pi_guest_at_bitwise_parity(guest, schedule),
+            expected,
+            "{schedule:?}"
+        );
+    }
+}
+
+/// A PI word whose owner ends while the word still names it, and a
+/// FUTEX_LOCK_PI that nothing orders after that end but the schedule: an owner
+/// thread's raw `exit` raced by main spinning on a flag it sets just before,
+/// and a child process holding a process-shared word that main SIGKILLs and
+/// then locks. Natively either order happens. Under Hermit each schedule gives
+/// one answer at bitwise parity, following the committed order, whenever the
+/// owner's thread deregisters: the lock with FUTEX_OWNER_DIED where main
+/// queued behind the owner first (`exit_pi_state_list`), and ESRCH with
+/// FUTEX_WAITERS left where the owner's exit was granted, or its SIGKILL
+/// committed, first (`handle_exit_race`). A waiter already queued when the
+/// SIGKILL comes is handed the lock, natively and under Hermit. When another
+/// member of the owner's process group sends the SIGKILL, telling the owner
+/// to unlock just before, the owner is alive until the kill commits: its
+/// FUTEX_UNLOCK_PI hands the waiter the lock or never runs, and never fails.
+#[test]
+fn a_pi_owner_that_exits_or_is_killed_is_dead_from_its_committed_end() {
+    let guest = futex_c_guest(&FUTEX_PI_OWNER_END_GUEST, "futex_pi_owner_end");
+    let raw_exit = "lock_pi on a word whose owner left by a raw exit";
+    let killed = "lock_pi right after a SIGKILL ended the owner's process";
+    let waiter = "the waiter queued when a SIGKILL ended the owner's process: \
+                  0, word waiter|OWNER_DIED|WAITERS";
+    let group_waiter = "the waiter queued when a member's group SIGKILL ended the owner's process";
+    let group_unlock = "the owner's unlock_pi before the kill";
+    let handed = "0, word main|OWNER_DIED|WAITERS";
+    let dead = "-1 ESRCH, word owner|WAITERS";
+    // The group kill's two lines: the owner unlocked first and handed the
+    // waiter the lock, or the kill ended it first.
+    let unlocked_first = format!("{group_waiter}: 0, word waiter|WAITERS\n{group_unlock}: 0");
+    let killed_first =
+        format!("{group_waiter}: 0, word waiter|OWNER_DIED|WAITERS\n{group_unlock}: not reached");
+    let native = native_stdout(guest);
+    let lines: Vec<&str> = native.lines().collect();
+    assert_eq!(lines.len(), 5, "natively: {native}");
+    for (line, what) in lines.iter().zip([raw_exit, killed]) {
+        assert!(
+            [handed, dead]
+                .iter()
+                .any(|answer| *line == format!("{what}: {answer}")),
+            "natively: {native}"
+        );
+    }
+    assert_eq!(lines[2], waiter, "natively");
+    // Natively the owner can also unlock and die before it records that it
+    // did, so the hand-over can come with "not reached". It never fails.
+    let unlocked_unrecorded =
+        format!("{group_waiter}: 0, word waiter|WAITERS\n{group_unlock}: not reached");
+    let group = lines[3..].join("\n");
+    assert!(
+        [&unlocked_first, &killed_first, &unlocked_unrecorded].contains(&&group),
+        "natively: {native}"
+    );
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    for (schedule, first, group) in [
+        (&[][..], handed, &unlocked_first),
+        (&["--chaos", "--sched-seed=1"][..], dead, &killed_first),
+        (&["--chaos", "--sched-seed=2"][..], dead, &killed_first),
+    ] {
+        assert_eq!(
+            futex_pi_guest_at_bitwise_parity(guest, schedule),
+            format!("{raw_exit}: {first}\n{killed}: {dead}\n{waiter}\n{group}\n"),
+            "{schedule:?}"
+        );
+    }
+}
+
+/// A bounded queue under a PTHREAD_PRIO_INHERIT mutex and two condition
+/// variables, whose threads yield while holding the mutex: glibc's condition
+/// variables wait on their own words and take the contended mutex again with
+/// FUTEX_LOCK_PI, never the requeue-PI pair. Every item is consumed once, as
+/// natively, under the default schedule and a chaos seed.
+#[test]
+fn a_pi_mutex_condition_variable_queue_matches_linux() {
+    let guest = futex_c_guest(&FUTEX_PI_CONDVAR_GUEST, "futex_pi_condvar");
+    let expected = "producers 2, consumers 2: items 300, sum as produced, queue left 0\n";
+    assert_eq!(native_stdout(guest), expected, "natively");
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    for schedule in [&[][..], &["--chaos", "--sched-seed=3"]] {
+        assert_eq!(
+            futex_pi_guest_at_bitwise_parity(guest, schedule),
+            expected,
+            "{schedule:?}"
+        );
+    }
 }
 
 /// FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP key and access their
@@ -47905,6 +51388,174 @@ fn private_sigchld_epoll_and_other_wait_rows_under_record_and_replay() {
     record_private_sigchld_rows();
 }
 
+/// Linux discards a signal the process ignores when it is generated
+/// (`sig_ignored`, kernel/signal.c), so such a signal never ends an
+/// `epoll_wait` (`ep_poll` returns `EINTR` only for a pending signal,
+/// fs/eventpoll.c). Under ptrace the kernel queues it anyway, and a wait
+/// Detcore ran in the kernel (under record, and without sequentialized
+/// threads) returned `EINTR`. In the guest (`tests/c/epoll_ignored_signal.c`)
+/// each 100 ms wait is in turn an `epoll_wait`, an `epoll_pwait` and an
+/// `epoll_pwait2` without a mask: `chld` and `sigign` fork a child per wait
+/// (`SIGCHLD` ignored by default, or set to `SIG_IGN`), `storm` waits while a
+/// child sends 40 `SIGWINCH`, and in `alrm` a caught `SIGALRM` must still end
+/// each wait with `EINTR`. The guest blocks SIGUSR2 first; after the waits,
+/// and in the handler, its mask must be exactly that. Every mode must print
+/// native's line, except that under record the storm, whose sender sleeps on
+/// virtual time, may end before the waits do. `sigign` fails only under
+/// record: with SIGCHLD set to SIG_IGN the kernel sends nothing, and only the
+/// scheduler's own SIGCHLD reached the wait. In `exit` the process exits while
+/// a thread is inside an `epoll_wait` with no timeout: the thread dies during
+/// its wait, under the shield, which then has no mask to put back. It is not
+/// recorded: replay does not yet serve a call that was still in flight at exit
+/// (the thread's recorded events end before it).
+#[test]
+fn kernel_run_epoll_waits_are_not_ended_by_ignored_signals() {
+    check_kernel_run_waits_are_not_ended_by_ignored_signals(&[], &[None]);
+}
+
+/// As `kernel_run_epoll_waits_are_not_ended_by_ignored_signals`, with the
+/// poll family: each wait is in turn a `poll`, a `ppoll`, a `select`, a
+/// `pselect6` without a mask argument and one with an argument that names no
+/// mask (as glibc's `pselect` passes it). Linux ends these with a restart code
+/// only for a pending signal (`do_poll`, `core_sys_select`, fs/select.c), so
+/// an ignored one never ends them. Under ptrace it did. A `poll` then
+/// restarts through `restart_syscall`, which Detcore refuses, so under record
+/// and without sequentialized threads `chld` and `storm` ended with a policy
+/// refusal, and under record `sigign` too. The other calls' timeouts sit on a
+/// read-only page, where Linux cannot write back the time left, so such a call
+/// returned EINTR instead of running again. The `select`, and the late wait
+/// (a `pselect6`), watch fd 100, more descriptors than Hermit emulates, so
+/// they wait in the kernel under `--strict` and plain runs too (where, as
+/// under record, only the storm's counts are compared). The late wait's one
+/// second is then host time in those runs, against the writer child's 60 ms
+/// of virtual time. The storm's sender exits right
+/// after its last signal, so its SIGCHLD reaches the first wait with the
+/// storm's last SIGWINCH under record. Two more recordings of the storm start
+/// each backgrounded call up to 10 ms late, with two seeds
+/// (docs/RACE_PROBES.md), so signals reach the wait while it would restart.
+#[test]
+fn kernel_run_poll_waits_are_not_ended_by_ignored_signals() {
+    check_kernel_run_waits_are_not_ended_by_ignored_signals(
+        &["poll"],
+        &[None, Some("7"), Some("8")],
+    );
+}
+
+/// The start of the storm's line in
+/// `check_kernel_run_waits_are_not_ended_by_ignored_signals`: all that a run
+/// whose sender sleeps on virtual time while the waits run in the kernel can
+/// be held to.
+const STORM_COUNTS: &str = "storm: 3 timed out, 0 ready, 0 EINTR, 0 other; mask as before: yes; ";
+
+/// Runs `tests/c/epoll_ignored_signal.c` with `family` after each mode
+/// (`kernel_run_epoll_waits_are_not_ended_by_ignored_signals`), and records
+/// the storm once for each entry of `storm_probes`: under the race probe with
+/// that seed for a `Some`.
+fn check_kernel_run_waits_are_not_ended_by_ignored_signals(
+    family: &[&str],
+    storm_probes: &[Option<&str>],
+) {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&EPOLL_IGNORED_SIGNAL_GUEST, "epoll_ignored_signal");
+    let guest = guest.to_str().unwrap();
+    // As in run_strict_flag_is_accepted_and_runs, the strict leg disables the
+    // PMU timer and CPUID faulting so it runs where those are unavailable.
+    let strict = [
+        "--strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+    ];
+    for mode in ["chld", "storm", "sigign", "alrm", "exit"] {
+        let native = Command::new(guest)
+            .arg(mode)
+            .args(family)
+            .output()
+            .expect("failed to run the guest natively");
+        let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+        let pinned = match mode {
+            "chld" => {
+                "chld: 5 timed out, 0 ready, 0 EINTR, 0 other; late data: 1; mask as before: \
+                 yes; 9 children\n"
+            }
+            "storm" => {
+                "storm: 3 timed out, 0 ready, 0 EINTR, 0 other; mask as before: yes; the storm was \
+                 still running when they returned: yes; 1 children\n"
+            }
+            "sigign" => {
+                "sigign: 5 timed out, 0 ready, 0 EINTR, 0 other; late data: 1; mask as before: \
+                 yes; 0 children\n"
+            }
+            "alrm" => {
+                "alrm: 0 timed out, 0 ready, 5 EINTR, 0 other, 5 alarms; mask as before in the \
+                 handler: yes, after: yes\n"
+            }
+            _ => "exit: a thread was still waiting\n",
+        };
+        assert_eq!(expected, pinned, "native {mode} {family:?}");
+        for flags in [&strict[..], &[], &["--no-sequentialize-threads"]] {
+            let mut args = vec!["run", "--timeout", "120", "--base-env=minimal"];
+            args.extend_from_slice(flags);
+            args.extend(["--", guest, mode]);
+            args.extend_from_slice(family);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            let printed = stdout(&output);
+            if mode == "storm" && !family.is_empty() && flags != ["--no-sequentialize-threads"] {
+                // The poll family's select waits in the kernel even in a
+                // sequentialized run, while the sender sleeps on virtual
+                // time, so the storm may end before the waits do, as under
+                // record.
+                assert!(printed.starts_with(STORM_COUNTS), "{args:?}: {printed}");
+            } else {
+                assert_eq!(printed, expected, "{args:?}");
+            }
+        }
+        if mode == "exit" {
+            continue;
+        }
+        let probes: &[Option<&str>] = if mode == "storm" {
+            storm_probes
+        } else {
+            &[None]
+        };
+        for &probe in probes {
+            let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .expect("failed to create the recording data dir");
+            let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+            let mut args = vec![
+                "record",
+                "start",
+                "--verify",
+                "--verify-strict",
+                "--record-timeout",
+                "120",
+                &data_dir_arg,
+                "--",
+                guest,
+                mode,
+            ];
+            args.extend_from_slice(family);
+            let mut command = hermit_command(&args);
+            if let Some(seed) = probe {
+                command
+                    .env("HERMIT_RACE_PROBE", "bg_pre_call=0-10")
+                    .env("HERMIT_RACE_PROBE_SEED", seed);
+            }
+            let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+            assert_success(&output, &args);
+            let recorded = stdout(&output);
+            if mode == "storm" {
+                assert!(
+                    recorded.starts_with(STORM_COUNTS),
+                    "{args:?} (probe seed: {probe:?}): {recorded}"
+                );
+            } else {
+                assert_eq!(recorded, expected, "{args:?}");
+            }
+        }
+    }
+}
+
 /// The single-threaded caught rows and the pending rows of
 /// `record_private_sigchld_rows`.
 #[test]
@@ -48366,4 +52017,165 @@ fn a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied() {
     let ran = hermit_where_user_namespaces_are_denied(&args).expect("unshare worked above");
     assert_success(&ran, &args);
     assert_eq!(stdout(&ran), "ran\n", "stderr:\n{}", stderr(&ran));
+}
+
+/// `hermit run --max-timeslice=1000` writes one stderr notice that a CPU-bound
+/// guest runs orders of magnitude slower and that a `--timeout` that expires
+/// may not mean a hang; the default writes none. So does a maximum of exactly
+/// one RCB under a chaos slowdown, 110 virtual nanoseconds at
+/// `--clock-multiplier=2.5` and `--chaos-slowdown-max-factor=4.4`, which is
+/// accepted rather than refused as below one RCB. The notice comes before the
+/// program is checked, so a missing program runs no guest and the case needs
+/// no PMU: where perf counters are unavailable Hermit disables the maximum,
+/// says so, and writes no notice, which the case then checks instead.
+#[test]
+fn a_small_max_timeslice_gets_one_notice() {
+    const GUEST: &str = "/nonexistent-small-max-timeslice-guest";
+    let slowed_one_rcb = [
+        "--chaos",
+        "--chaos-per-thread-slowdown",
+        "--chaos-slowdown-max-factor=4.4",
+        "--clock-multiplier=2.5",
+        "--max-timeslice=110",
+    ];
+    for (options, small) in [
+        (&["--max-timeslice=1000"][..], true),
+        (&slowed_one_rcb[..], true),
+        (&[][..], false),
+    ] {
+        let mut args = vec!["run"];
+        args.extend(options);
+        args.extend(["--", GUEST]);
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?}"),
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        let log = stderr(&output);
+        assert!(!output.status.success(), "{args:?}: {log}");
+        assert!(!log.contains("at least one RCB"), "{args:?}: {log}");
+        assert!(log.contains(GUEST), "the missing program is named: {log}");
+        let timer = !log.contains("continuing with --max-timeslice=disabled");
+        assert_eq!(
+            log.matches("NOTICE: --max-timeslice=").count(),
+            usize::from(small && timer),
+            "{args:?}: {log}"
+        );
+    }
+}
+
+/// A recording whose thread stream cannot be written out in full when the
+/// thread exits is reported by record and refused by replay with the reason.
+/// The recorder used to drop its streams and ignore the error of their last
+/// write: record reported success and replay panicked on the cut stream.
+/// Here that write fails with EFBIG: `/bin/echo` is recorded once to learn
+/// the size of its root thread's event stream, then again under an
+/// `RLIMIT_FSIZE` one byte short of it, with SIGXFSZ ignored, so only the
+/// stream's last write crosses the limit, as one to a full disk would fail.
+#[test]
+fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
+    use std::os::unix::process::CommandExt as _;
+
+    use hermit_record_format::event_stream::EventStreamId;
+    use hermit_record_format::event_stream::EventWriter;
+
+    let _lock = hermit_run_guard();
+    let record = |limit: Option<u64>| {
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the recording data dir");
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let args = [
+            "record",
+            "start",
+            "--record-timeout",
+            "120",
+            &data_dir_arg,
+            "--",
+            "/bin/echo",
+            "stream",
+        ];
+        let mut command = hermit_command(&args);
+        if let Some(limit) = limit {
+            // SAFETY: setrlimit and signal are async-signal-safe.
+            unsafe {
+                command.pre_exec(move || {
+                    let rlimit = libc::rlimit {
+                        rlim_cur: limit,
+                        rlim_max: limit,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit) != 0
+                        || libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), "stream\n", "{args:?}");
+        let id = std::fs::read_dir(data_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .find(|name| !["last", "last-run", "tmp"].contains(&name.as_str()))
+            .expect("record start committed no recording");
+        (data_dir, data_dir_arg, id, output)
+    };
+
+    // The root stream's file name, from a fresh writer.
+    let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    drop(EventWriter::create(scratch.path(), &EventStreamId::root()).unwrap());
+    let root_stream = std::fs::read_dir(scratch.path().join("thread"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .find(|name| std::path::Path::new(name).extension().is_none())
+        .unwrap();
+
+    let (whole, _, whole_id, _) = record(None);
+    let whole = whole.path().join(&whole_id);
+    let size = std::fs::metadata(whole.join("thread").join(&root_stream))
+        .unwrap()
+        .len();
+    // Every other file the recording writes must stay under the limit.
+    let mut directories = vec![whole.clone()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = std::fs::metadata(&path).unwrap();
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if path.file_name() != Some(root_stream.as_os_str()) {
+                assert!(
+                    metadata.len() < size - 1,
+                    "{path:?} is as large as the root stream"
+                );
+            }
+        }
+    }
+
+    let (_cut, cut_arg, cut_id, recorded) = record(Some(size - 1));
+    let reason = format!(
+        "the recording of thread stream {} could not be written in full",
+        EventStreamId::root()
+    );
+    let record_stderr = String::from_utf8_lossy(&recorded.stderr);
+    assert!(
+        record_stderr.contains(&format!(
+            "WARNING: replay will refuse this recording: {reason}"
+        )) && !record_stderr.contains("RECORDING COMPLETE"),
+        "record did not report the stream:\n{record_stderr}"
+    );
+    let args = ["replay", "--autopilot", &cut_arg, &cut_id];
+    let replay = hermit(&args);
+    assert!(
+        !replay.status.success(),
+        "{args:?} replayed a cut recording"
+    );
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "This recording cannot be replayed faithfully: {reason}"
+        )) && stderr.contains("File too large"),
+        "{args:?}:\n{stderr}"
+    );
 }

@@ -89,6 +89,10 @@ pub struct FileMetadata {
     /// Socket-only sequence used for backend-independent socket cookies.
     #[serde(default)]
     next_socket_open_file_sequence: u64,
+    /// Random-device-only sequence that names each random-device open file's
+    /// stream (`crate::fd::RandomDeviceStream`).
+    #[serde(default)]
+    next_random_device_sequence: u64,
     /// A random-device or timerfd OFD from this table has been promoted.
     /// Retain this history after its final close so exec cannot reuse a
     /// canonical identity. (Serialized under its earlier name, which the
@@ -285,6 +289,12 @@ pub struct ExecFdState {
     /// channel elsewhere may still carry.
     #[serde(default)]
     pub(crate) open_file_namespace: Option<(DetTid, u64)>,
+    /// The old table's count of random-device opens. A backend that
+    /// rebuilds its descriptor table after exec starts the new one from it,
+    /// so no open after the exec reuses a stream's name
+    /// (`crate::fd::RandomDeviceStream`).
+    #[serde(default)]
+    pub(crate) random_device_sequence: u64,
     /// The image the exec runs, as Detcore resolved it from the exec's
     /// arguments before the exec ([`crate::exec_record`]), or for the
     /// registered root's first image the one its launch named
@@ -319,6 +329,9 @@ impl std::fmt::Debug for ExecFdState {
         }
         if let Some(namespace) = &self.open_file_namespace {
             debug.field("open_file_namespace", namespace);
+        }
+        if self.random_device_sequence != 0 {
+            debug.field("random_device_sequence", &self.random_device_sequence);
         }
         if let Some(exe) = &self.exe {
             debug.field("exe", &exe.exe);
@@ -419,6 +432,7 @@ impl ExecFdState {
             && self.maps.is_none()
             && self.channels.is_empty()
             && self.open_file_namespace.is_none()
+            && self.random_device_sequence == 0
             && self.exe.is_none()
     }
 }
@@ -853,6 +867,7 @@ impl FileMetadata {
             files_id: FilesId::initial(owner),
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
+            next_random_device_sequence: 0,
             has_promoted_shared_files: false,
             file_handles: HashMap::new(),
             accept_waits: Vec::new(),
@@ -1095,6 +1110,7 @@ impl FileMetadata {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            next_random_device_sequence: self.next_random_device_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
             file_handles: self.file_handles.clone(),
             accept_waits: Vec::new(),
@@ -1113,6 +1129,7 @@ impl FileMetadata {
             files_id: self.files_id.for_exec(task),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            next_random_device_sequence: self.next_random_device_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
             file_handles: self
                 .file_handles
@@ -1415,6 +1432,11 @@ impl FileMetadata {
         } else {
             owner
         };
+        if shared_guest_table {
+            self.next_random_device_sequence = self
+                .next_random_device_sequence
+                .max(state.random_device_sequence);
+        }
         self.apply_exec_blocking_overrides(owner, state.blocking);
         if !shared_guest_table {
             return Ok(());
@@ -1716,6 +1738,10 @@ impl FileMetadata {
         // This newly discovered description predates our observation. Its
         // kernel lock may be held, but no cached lock claim existed to go stale.
         self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
+        if ty == FdType::Rng {
+            let stream = crate::fd::RandomDeviceStream::discovered(owner, fd);
+            self.with_detfd(fd, |detfd| detfd.set_random_device(stream))?;
+        }
         if ty == FdType::Pipe && physically_nonblocking {
             self.with_detfd(fd, |detfd| detfd.set_physically_nonblocking())?;
         }
@@ -1813,6 +1839,19 @@ impl FileMetadata {
         let id = self.allocate_open_file_id(creator, ty);
         let detfd = DetFd::new(fd, flags, ty, id).with_stat(stat);
         self.add_detfd(detfd);
+        Ok(())
+    }
+
+    /// Make `fd`, which `creator` just opened, a random device that reads a
+    /// stream named by the opener and the table's count of random-device
+    /// opens (`crate::fd::RandomDeviceStream`).
+    fn classify_random_device(&mut self, creator: DetTid, fd: RawFd) -> Result<(), Errno> {
+        let stream = crate::fd::RandomDeviceStream {
+            creator,
+            sequence: self.next_random_device_sequence,
+        };
+        self.with_detfd(fd, |detfd| detfd.set_random_device(stream))?;
+        self.next_random_device_sequence += 1;
         Ok(())
     }
 
@@ -2083,6 +2122,32 @@ mod file_metadata_tests {
     use crate::pipe_wake::ChannelEnd;
     use crate::pipe_wake::ChannelId;
 
+    /// Run the test named `case` in an isolated child process, returning
+    /// true when this invocation is the parent and the caller must return
+    /// at once. Tests here key model tables by this process's real
+    /// descriptor numbers; under plain `cargo test` a sibling thread can
+    /// be handed a number this test is using as a model-only alias, or
+    /// reuse a number this test just closed, so the model observes a
+    /// descriptor that is not its own. A child process has no sibling
+    /// threads allocating descriptors.
+    fn isolated_child(case: &str) -> bool {
+        const CHILD: &str = "HERMIT_FILE_METADATA_CHILD";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(case)) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case, "--nocapture", "--test-threads=1"])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        true
+    }
+
     #[test]
     fn maps_exec_survivors_keep_opened_target_aliases_and_cursor() {
         use crate::procfs::BoundTask;
@@ -2289,11 +2354,13 @@ mod file_metadata_tests {
         parent
             .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
+        parent.classify_random_device(fd).unwrap();
         parent.dup_fd(fd, alias_fd, OFlag::empty()).unwrap();
         parent.dup_fd(fd, closed_fd, OFlag::O_CLOEXEC).unwrap();
         parent
             .add_fd(distinct_fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
+        parent.classify_random_device(distinct_fd).unwrap();
         parent
             .add_fd(socket_fd, OFlag::O_RDWR, FdType::Socket, None)
             .unwrap();
@@ -2371,6 +2438,7 @@ mod file_metadata_tests {
                 creator,
                 ExecFdState {
                     open_files: Some(transfer),
+                    random_device_sequence: parent.random_device_sequence_for_exec(),
                     ..ExecFdState::default()
                 },
                 true,
@@ -2410,6 +2478,7 @@ mod file_metadata_tests {
         successor
             .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
+        successor.classify_random_device(fd).unwrap();
         let reopened = successor.metadata().file_handles[&fd].open_file_id();
         assert_ne!(reopened, first_id);
         assert_ne!(reopened, high);
@@ -2417,6 +2486,13 @@ mod file_metadata_tests {
             reopened,
             OpenFileId::new(creator, successor.metadata().next_open_file_sequence - 1)
         );
+        // A survivor keeps its stream, and the exec exchange carries the count
+        // of random-device opens, so the new image's first open reads a new one.
+        let stream_of = |fd| successor.metadata().file_handles[&fd].random_device_stream();
+        let named = |sequence| crate::fd::RandomDeviceStream { creator, sequence };
+        assert_eq!(stream_of(alias_fd), named(0));
+        assert_eq!(stream_of(distinct_fd), named(1));
+        assert_eq!(stream_of(fd), named(2));
         assert_ne!(
             successor
                 .metadata()
@@ -2676,6 +2752,11 @@ mod file_metadata_tests {
 
     #[test]
     fn a_pipe_channel_follows_its_description_through_dup_and_fork() {
+        if isolated_child(
+            "tool_local::file_metadata_tests::a_pipe_channel_follows_its_description_through_dup_and_fork",
+        ) {
+            return;
+        }
         let owner = DetTid::from_raw(9018);
         let mut parent = FileMetadata::new(owner);
         let (reader, _writer) = nix::unistd::pipe2(OFlag::empty()).unwrap();
@@ -3283,6 +3364,15 @@ mod file_metadata_tests {
                 .expect("live descriptor should be discovered");
             assert_eq!(metadata.file_handles[&fd].ty(), expected, "fd {fd}");
         }
+        // A discovered random device is named by its descriptor, apart from
+        // the count of opens, which discovery leaves alone.
+        for fd in [random.as_raw_fd(), urandom.as_raw_fd()] {
+            assert_eq!(
+                metadata.file_handles[&fd].random_device_stream(),
+                crate::fd::RandomDeviceStream::discovered(owner, fd)
+            );
+        }
+        assert_eq!(metadata.next_random_device_sequence, 0);
     }
 
     #[test]
@@ -3433,6 +3523,68 @@ mod file_metadata_tests {
         // Descriptor flags stay per descriptor.
         assert!(!three.is_cloexec());
         assert!(four.is_cloexec());
+    }
+
+    /// Each open of a random device reads a stream of its own, named by its
+    /// opener and the table's count of earlier random-device opens; a dup
+    /// alias shares it. Other opens leave the count alone. Fork and exec
+    /// carry it, and so does the exec exchange of a backend that rebuilds its
+    /// table, so no later open in the table or a copy of it reuses a name.
+    #[test]
+    fn each_random_device_open_reads_its_own_stream() {
+        use crate::fd::RandomDeviceStream;
+        let owner = DetTid::from_raw(9);
+        let thread = DetTid::from_raw(11);
+        let stream = |table: &mut FileMetadata, fd| {
+            table
+                .with_detfd(fd, |detfd| detfd.random_device_stream())
+                .expect("registered descriptor")
+        };
+        let open = |table: &mut FileMetadata, creator, fd| {
+            table
+                .add_fd(creator, fd, OFlag::empty(), FdType::Regular, None)
+                .expect("register the open");
+            table
+                .classify_random_device(creator, fd)
+                .expect("classify it");
+        };
+        let mut metadata = FileMetadata::new(owner);
+        open(&mut metadata, owner, 3);
+        metadata.dup_fd(3, 4, OFlag::empty()).expect("dup it");
+        metadata
+            .add_fd(owner, 5, OFlag::empty(), FdType::Regular, None)
+            .expect("open a regular file");
+        open(&mut metadata, thread, 6);
+        assert_eq!(
+            metadata.classify_random_device(thread, 7),
+            Err(Errno::EBADF)
+        );
+        let child = DetTid::from_raw(10);
+        let mut forked = metadata.fork_for(child);
+        open(&mut forked, child, 7);
+        let mut exec = metadata.for_exec(owner);
+        open(&mut exec, owner, 7);
+        let mut rebuilt = FileMetadata::new(owner);
+        rebuilt
+            .apply_exec_fd_state(
+                owner,
+                ExecFdState {
+                    random_device_sequence: 2,
+                    ..ExecFdState::default()
+                },
+                true,
+            )
+            .expect("apply the exec exchange");
+        open(&mut rebuilt, owner, 3);
+
+        let named = |creator, sequence| RandomDeviceStream { creator, sequence };
+        assert_eq!(stream(&mut metadata, 3), named(owner, 0));
+        assert_eq!(stream(&mut metadata, 4), named(owner, 0));
+        assert_eq!(stream(&mut metadata, 6), named(thread, 1));
+        assert_eq!(stream(&mut forked, 3), named(owner, 0));
+        assert_eq!(stream(&mut forked, 7), named(child, 2));
+        assert_eq!(stream(&mut exec, 7), named(owner, 2));
+        assert_eq!(stream(&mut rebuilt, 3), named(owner, 2));
     }
 
     #[test]
@@ -4523,6 +4675,14 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) guest_clock: Arc<Mutex<GuestClock>>,
 
+    /// The `AF_UNIX` connections waiting for an `accept`, shared by every
+    /// task in this process tree, as the guest clock is
+    /// (`crate::syscalls::scm_rights::UnixConnections`). It names
+    /// descriptions by handles that reach them only in the tool process that
+    /// serves every guest (ptrace, KVM), so it is never serialized.
+    #[serde(skip)]
+    pub(crate) unix_connections: Arc<Mutex<crate::syscalls::scm_rights::UnixConnections>>,
+
     /// Parent process accounting notified when this process leader exits.
     pub(crate) parent_process_cpu_time: Option<Arc<Mutex<ProcessCpuTime>>>,
 
@@ -4530,12 +4690,26 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) parent_cpu_publication: Option<Arc<ChildCpuPublication>>,
 
-    /// The deadline of a wait this thread's last syscall ended with
+    /// The record of a wait this thread's last syscall ended with
     /// `ERESTART_RESTARTBLOCK`, for the `restart_syscall` that resumes it
     /// (`syscalls::helpers::RestartBlock`). The next syscall takes it
     /// (`Detcore::handle_syscall_event`).
     #[serde(skip)]
     pub(crate) restart_block: Option<crate::syscalls::helpers::RestartBlock>,
+
+    /// The calling thread's working directory in the guest's view, read for
+    /// the syscall it is running where the tool cannot read it from host
+    /// procfs (`procfs_inode::tool_can_read_guest_cwd`: KVM): its path where
+    /// an injected `getcwd` answered one, else, where `getcwd` rendered none
+    /// (a removed directory, or one whose path is longer than `PATH_MAX`),
+    /// the directories the syscall's spellings climb to out of it with `..`
+    /// (`syscalls::SyscallCwd`); `None` until it is read, at most
+    /// once per syscall (`Detcore::prepare_guest_cwd`). Each syscall starts
+    /// without it (`Detcore::handle_syscall_event`), so a later syscall never
+    /// decides by a directory read before it. Never carried across a fork or
+    /// a migration.
+    #[serde(skip)]
+    pub(crate) syscall_cwd: Option<crate::syscalls::SyscallCwd>,
 
     /// Whether this thread's process has a guest handler for SIGALRM, so that
     /// signal phase 1's table (`sigalrm_phase1`) gates its syscalls. Set by the
@@ -4881,6 +5055,32 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub last_rcb_timer_is_max: bool,
 
+    /// Whether the scheduler's last reply to this thread was a grant that
+    /// found it the only thread able to run before it next enters Detcore
+    /// (`GlobalResponse::WithLoneGrant`). Every reply without that mark
+    /// clears it.
+    #[serde(default)]
+    pub lone_grant: bool,
+
+    /// While the thread runs alone (`Config::replays_lone_preemptions`): the
+    /// branch count, in `committed_clock_value` units, at which its current
+    /// timeslice ends. No timer stops the guest there; the thread's next
+    /// entry into Detcore processes every such end at or before the count it
+    /// reached, in order (`Detcore::catch_up_lone_slice_ends`).
+    #[serde(default)]
+    pub lone_slice_end: Option<u64>,
+
+    /// While such an end is processed: its branch count, which the clock
+    /// update reads in place of the hardware counter.
+    #[serde(default)]
+    pub replaying_lone_slice_end: Option<u64>,
+
+    /// Set when a grant while such an end was processed did not find the
+    /// thread alone, which the scheduler's predicate rules out; taken by
+    /// `Detcore::catch_up_lone_slice_ends`, which reports it.
+    #[serde(default)]
+    pub lone_replay_unsound: bool,
+
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
     pub(crate) past_global_first_execve: bool,
@@ -4907,6 +5107,15 @@ pub struct ThreadState<T> {
     pub(crate) slice_boundary: Option<crate::slice_boundary::Observations>,
     #[serde(default)]
     pub(crate) callback_history: crate::preemptions::callback_history::State,
+
+    /// Under `--replay-schedule-from`, whether the replayed schedule is over
+    /// for this thread: it ran out, or the replay released it
+    /// (`Scheduler::schedule_replay_over`). The thread learns it from the
+    /// reply to its next traced event, and a new thread inherits it from the
+    /// thread that created it. From then on its slices end as in a run
+    /// without a schedule (`follows_replayed_schedule`).
+    #[serde(default)]
+    pub(crate) schedule_replay_over: bool,
 }
 
 /// We cannot assume that the record_or_replay "subtool" is Debug, so it is handy to be able to
@@ -5548,9 +5757,11 @@ impl<T> ThreadState<T> {
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
             guest_clock: Arc::new(Mutex::new(GuestClock::default())),
+            unix_connections: Default::default(),
             parent_process_cpu_time: None,
             parent_cpu_publication: None,
             restart_block: None,
+            syscall_cwd: None,
             sigalrm_handled: false,
             signal_shadow: None,
             signal_shadow_lost: false,
@@ -5604,6 +5815,10 @@ impl<T> ThreadState<T> {
             published_runtime_private_memory: None,
             last_rcb_timer: None,
             last_rcb_timer_is_max: false,
+            lone_grant: false,
+            lone_slice_end: None,
+            replaying_lone_slice_end: None,
+            lone_replay_unsound: false,
             record_or_replay,
             preemption_points: None,
             past_global_first_execve: false,
@@ -5612,6 +5827,7 @@ impl<T> ThreadState<T> {
             robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
             slice_boundary: None,
             callback_history: Default::default(),
+            schedule_replay_over: false,
         }
     }
 
@@ -6091,6 +6307,7 @@ impl<T> ThreadState<T> {
             callback_checkpoint: None,
             priority_row: None,
             slice_expired: false,
+            zero_length_sleep: false,
         }
     }
 
@@ -6231,6 +6448,19 @@ impl<T> ThreadState<T> {
             raw_stat,
             link,
         )
+    }
+
+    /// Make `fd`, which this thread just opened, a random device
+    /// (`FileMetadata::classify_random_device`).
+    pub(crate) fn classify_random_device(&self, fd: RawFd) -> Result<(), Errno> {
+        self.metadata()
+            .classify_random_device(self.open_file_creator.unwrap_or(self.dettid), fd)
+    }
+
+    /// This table's count of random-device opens, for the exec exchange
+    /// (`ExecFdState::random_device_sequence`).
+    pub(crate) fn random_device_sequence_for_exec(&self) -> u64 {
+        self.metadata().next_random_device_sequence
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6545,6 +6775,17 @@ impl<T> ThreadState<T> {
             .any(|detfd| detfd.placeholder().is_some())
     }
 
+    /// The lowest numbered descriptor of this thread's table that names the
+    /// open file description `open_file`, if any.
+    pub(crate) fn lowest_slot_naming(&self, open_file: OpenFileId) -> Option<RawFd> {
+        self.metadata()
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| detfd.open_file_id() == open_file)
+            .map(|(&fd, _)| fd)
+            .min()
+    }
+
     /// The descriptions in this thread's table whose locks
     /// `procfs::locks::LockLedger` follows, each with how many slots name it,
     /// in description order.
@@ -6650,6 +6891,17 @@ impl<T> ThreadState<T> {
         &mut self.prng
     }
 
+    /// Whether this thread's slices still follow a replayed schedule
+    /// (`--replay-schedule-from`): they end where the schedule says, and no
+    /// pending deadline or PMU maximum ends them. False without a schedule,
+    /// and once the schedule is over for this thread
+    /// (`schedule_replay_over`): its slices then end as in a run without a
+    /// schedule, which `hermit analyze` assumes of a replayed prefix's
+    /// continuation.
+    pub(crate) fn follows_replayed_schedule(&self, cfg: &Config) -> bool {
+        cfg.replay_schedule_from.is_some() && !self.schedule_replay_over
+    }
+
     /// Whether a trapped instruction (`rdtsc`, `cpuid`) should end the current
     /// timeslice.
     ///
@@ -6665,8 +6917,9 @@ impl<T> ThreadState<T> {
     /// With no PMU maximum it is the only way out of a busy-wait on the TSC,
     /// and it still ends the expired target. Replay of recorded preemptions or
     /// schedules keeps its recorded boundaries.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn instruction_trap_ends_timeslice(&self, cfg: &Config) -> bool {
-        let replaying = self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
+        let replaying = self.preemption_points.is_some() || self.follows_replayed_schedule(cfg);
         match self.max_timeslice_end {
             Some(max_end) if cfg.target_timeslice_syscalls_only && !replaying => {
                 self.thread_logical_time.as_nanos() >= max_end
@@ -6763,6 +7016,19 @@ impl<T> ThreadState<T> {
             return None;
         }
         self.callback_history.remaining().next()
+    }
+
+    /// The post-hook's margin of one retired conditional branch, in logical
+    /// time at this thread's current clock and chaos slowdown: a PMU
+    /// deadline closer than this ends the slice at once.
+    pub(crate) fn pmu_epsilon(&self, cfg: &Config) -> Duration {
+        Duration::from_nanos((NANOS_PER_RCB * self.clock_multiplier(cfg)).ceil() as u64)
+    }
+
+    /// Logical nanoseconds per nanosecond of retired-branch time for this
+    /// thread now: the configured clock multiplier times its chaos slowdown.
+    pub(crate) fn clock_multiplier(&self, cfg: &Config) -> f64 {
+        cfg.clock_multiplier.unwrap_or(1.0) * self.rcb_time_multiplier().as_f64()
     }
 
     /// Whether this thread has consumed its current logical timeslice.
@@ -6881,13 +7147,45 @@ impl<T> ThreadState<T> {
             let mut result = None;
             self.replay_rcb_end = None;
             let replay_controls_deadline =
-                self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
+                self.preemption_points.is_some() || self.follows_replayed_schedule(cfg);
 
+            // How far ahead an edited record's slice without an RCB target
+            // must end to be replayed (`next_edited_slice`): the post-hook's
+            // one-RCB margin at this slice's clock, which ends a closer slice
+            // at once. Without a PMU maximum there is no such margin, so a
+            // slice is kept whenever it ends ahead, as in a faithful replay.
+            let margin = if cfg.max_timeslice.is_some() {
+                self.pmu_epsilon(cfg)
+            } else {
+                Duration::from_nanos(1)
+            };
             // Preemption-point replay from recorded --chaos configuration.
             if let Some(thi) = &mut self.preemption_points {
                 if self.stats.last_recorded_slice.is_none() {
                     // We have not tapped out the recording yet.
-                    if let Some((end_time, prio, replay_rcb_end)) = thi.next_with_rcbs() {
+                    let current_rcbs = self.committed_clock_value;
+                    // For an edited record, skip the recorded slices that
+                    // already ended (`next_edited_slice`). The chaos epoch
+                    // advanced only to the previous slice's end (above), so
+                    // a slice after skipped ones keeps that epoch's
+                    // slowdown: deterministic, if stale. At a thread's start
+                    // the scheduler has already applied the record's first
+                    // priority, which then holds until the kept slice ends
+                    // (the startup reset files no scheduler request).
+                    let next = if cfg.replay_edited_preemptions {
+                        let (next, skipped) =
+                            next_edited_slice(thi, current_ns, current_rcbs, margin);
+                        if skipped > 0 {
+                            debug!(
+                                "[dtid {}] edited record: skipped {} recorded slices that ended before {} (RCB {})",
+                                self.dettid, skipped, current_ns, current_rcbs
+                            );
+                        }
+                        next
+                    } else {
+                        thi.next_with_rcbs()
+                    };
+                    if let Some((end_time, prio, replay_rcb_end)) = next {
                         debug!(
                             "[dtid {}] next timeslice (T{}), set by recording to {:?} (current {}), priority {}",
                             self.dettid,
@@ -6896,18 +7194,23 @@ impl<T> ThreadState<T> {
                             current_ns,
                             prio
                         );
-                        let current_rcbs = self.committed_clock_value;
                         if let Some(target_rcbs) = replay_rcb_end
                             && target_rcbs < current_rcbs
                         {
                             panic!(
-                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}.",
+                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}. \
+                                 An edited record, not the recording of this run's schedule, needs \
+                                 --replay-edited-preemptions.",
                                 target_rcbs, self.dettid, current_rcbs
                             )
                         }
                         let exact_deadline_is_now =
                             replay_rcb_end.is_some_and(|target| target == current_rcbs);
-                        if end_time <= current_ns && !exact_deadline_is_now {
+                        // An edited record keeps a slice whose end has passed
+                        // while its RCB target is ahead: the target governs.
+                        let rcb_target_governs =
+                            cfg.replay_edited_preemptions && replay_rcb_end.is_some();
+                        if end_time <= current_ns && !exact_deadline_is_now && !rcb_target_governs {
                             // Records that store their epoch are reconciled with
                             // this run's epoch before any guest starts (see
                             // `adopt_replayed_schedule_epoch` in hermit-cli), so
@@ -6918,7 +7221,8 @@ impl<T> ThreadState<T> {
                                 "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}. \
                                  The replayed preemption record's timeslice ends are absolute virtual times; if it was \
                                  recorded under a different virtual-time epoch, replay it with that --epoch \
-                                 (https://github.com/rrnewton/hermit/issues/3413).",
+                                 (https://github.com/rrnewton/hermit/issues/3413). An edited record, not the \
+                                 recording of this run's schedule, needs --replay-edited-preemptions.",
                                 end_time, self.dettid, current_ns
                             )
                         }
@@ -6948,7 +7252,7 @@ impl<T> ThreadState<T> {
                     result = Some(thi.final_priority())
                 }
             } else if !cfg.chaos {
-                if cfg.replay_schedule_from.is_some() {
+                if self.follows_replayed_schedule(cfg) {
                     if cfg.no_rcb_time {
                         let max_timeslice = cfg
                             .max_timeslice
@@ -7023,9 +7327,24 @@ impl<T> ThreadState<T> {
                 );
             }
 
-            let configured_max_end = cfg
-                .max_timeslice
-                .map(|max_timeslice| current_ns + Duration::from_nanos(u64::from(max_timeslice)));
+            // Past an edited record's last recorded slice, a restored chaos
+            // slowdown can make one RCB longer than the configured maximum
+            // (the configuration checks that maximum at the ambient
+            // slowdown): keep at least the post-hook's one-RCB margin, or it
+            // would end this slice at once and find itself past its maximum
+            // again.
+            let past_an_edited_record = cfg.replay_edited_preemptions
+                && self.preemption_points.is_some()
+                && self.end_of_timeslice == Some(LogicalTime::MAX);
+            let configured_max_end = cfg.max_timeslice.map(|max_timeslice| {
+                let length = Duration::from_nanos(u64::from(max_timeslice));
+                current_ns
+                    + if past_an_edited_record {
+                        length.max(margin)
+                    } else {
+                        length
+                    }
+            });
             self.max_timeslice_end = if replay_controls_deadline {
                 if cfg.max_timeslice.is_some() {
                     // A replay history uses `LogicalTime::MAX` after its last
@@ -7097,6 +7416,41 @@ impl<T> ThreadState<T> {
     /// guarantee determinism!
     pub fn guest_past_first_execve(&self) -> bool {
         self.past_global_first_execve
+    }
+}
+
+/// The first recorded slice of an edited record (`--replay-edited-preemptions`)
+/// still ahead of a thread at logical time `now` and committed PMU count
+/// `rcbs`, and how many recorded slices before it were skipped.
+///
+/// An edited record (`hermit analyze` knocks preemptions out of a recording)
+/// changes when threads run, so a thread can reach recorded slices that have
+/// already ended. Those no longer apply. A slice is ahead when its RCB target
+/// is, since that target governs where there is one (its end may have
+/// passed), and otherwise when it ends at least `margin` ahead
+/// ([`ThreadState::next_timeslice`] passes the post-hook's one-RCB margin), so
+/// a recorded one-RCB slice that starts where the previous one ended is kept.
+/// Only the baseline search's knock-outs keep RCB targets; minimization's
+/// records skip by time alone. The returned target is the kept slice's own,
+/// or none when its end governs.
+fn next_edited_slice(
+    history: &mut ThreadHistoryIterator,
+    now: LogicalTime,
+    rcbs: u64,
+    margin: Duration,
+) -> (Option<(LogicalTime, Priority, Option<u64>)>, usize) {
+    let mut skipped = 0;
+    loop {
+        match history.next_with_rcbs() {
+            None => return (None, skipped),
+            Some((end, prio, Some(target))) if target >= rcbs => {
+                return (Some((end, prio, Some(target))), skipped);
+            }
+            Some((end, prio, _)) if end >= now + margin => {
+                return (Some((end, prio, None)), skipped);
+            }
+            Some(_) => skipped += 1,
+        }
     }
 }
 
@@ -8048,6 +8402,347 @@ mod timeslice_tests {
             state.end_of_timeslice,
             Some(now + Duration::from_nanos(200))
         );
+    }
+
+    /// A thread at 500 ns of logical time (50 RCBs at multiplier 1) and PMU
+    /// count 10, replaying `history` from its start with `config`: returns
+    /// the thread, the priority its next slice gets, and the time it chose
+    /// that slice at.
+    fn replay_from_500ns(
+        config: &Config,
+        history: ThreadHistory,
+    ) -> (ThreadState<()>, Option<Priority>, LogicalTime) {
+        let mut state = ThreadState::new(DetPid::from_raw(5), config, ());
+        state.preemption_points = Some(history.into_iter());
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(50, RcbTimeMultiplier::ONE);
+        state.committed_clock_value = 10;
+        let now = state.thread_logical_time.as_nanos();
+        let prio = state.next_timeslice(config);
+        (state, prio, now)
+    }
+
+    fn edited_replay_config() -> Config {
+        Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            replay_edited_preemptions: true,
+            ..Default::default()
+        }
+    }
+
+    /// With --replay-edited-preemptions, recorded slices that ended before
+    /// the thread got to them are skipped: the first slice still ahead
+    /// applies, with its own end, priority and RCB target, and the slice
+    /// after it follows as recorded. Slices whose RCB target has passed, or
+    /// that end within the post-hook's one-RCB margin, count as ended.
+    #[test]
+    fn an_edited_record_skips_the_slices_that_already_ended() {
+        let config = edited_replay_config();
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (at(100), DEFAULT_PRIORITY + 1),
+                // RCB target behind, end within one RCB (10 ns) of 500 ns.
+                (at(505), DEFAULT_PRIORITY + 2),
+                (at(900), DEFAULT_PRIORITY + 3),
+                (at(1300), DEFAULT_PRIORITY + 4),
+            ])
+            .with_preemption_rcbs(vec![4, 9, 90, 130]);
+        let (mut state, prio, _) = replay_from_500ns(&config, history);
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 3));
+        assert_eq!(state.end_of_timeslice, Some(at(900)));
+        assert_eq!(state.replay_rcb_end, Some(90));
+
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(40, RcbTimeMultiplier::ONE);
+        state.committed_clock_value = 90;
+        assert!(state.timeslice_expired());
+        assert_eq!(state.next_timeslice(&config), Some(DEFAULT_PRIORITY + 4));
+        assert_eq!(state.end_of_timeslice, Some(at(1300)));
+        assert_eq!(state.replay_rcb_end, Some(130));
+    }
+
+    /// Only one clock may have passed: an RCB target still ahead governs a
+    /// slice whose end has passed, and an end still ahead (with no RCB
+    /// target, or a passed one) governs on its own.
+    #[test]
+    fn an_edited_record_keeps_a_slice_one_of_whose_deadlines_is_ahead() {
+        let config = edited_replay_config();
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        let one_slice = |end: u64, rcbs: Option<u64>| {
+            let history = ThreadHistory::new().with_prio_changes(vec![
+                (at(end), DEFAULT_PRIORITY + 7),
+                (at(5000), DEFAULT_PRIORITY),
+            ]);
+            match rcbs {
+                Some(rcbs) => history.with_preemption_rcbs(vec![rcbs, 500]),
+                None => history,
+            }
+        };
+        // End passed, RCB target ahead: the target governs.
+        let (state, prio, _) = replay_from_500ns(&config, one_slice(100, Some(20)));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(state.replay_rcb_end, Some(20));
+        assert!(!state.timeslice_expired());
+        // RCB target passed, end ahead: the end governs, without the target.
+        let (state, prio, _) = replay_from_500ns(&config, one_slice(800, Some(4)));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(
+            (state.end_of_timeslice, state.replay_rcb_end),
+            (Some(at(800)), None)
+        );
+        // An RCB target exactly at the current count ends the slice at once,
+        // as in any replay.
+        let (state, prio, _) = replay_from_500ns(&config, one_slice(100, Some(10)));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(state.replay_rcb_end, Some(10));
+        assert!(state.timeslice_expired());
+    }
+
+    /// When every recorded slice has ended, the thread goes on at the
+    /// record's final priority, as after the last recorded slice.
+    #[test]
+    fn an_edited_record_whose_slices_all_ended_goes_on_at_its_final_priority() {
+        let config = edited_replay_config();
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let history = ThreadHistory::new().with_prio_changes(vec![
+            (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+            (start + Duration::from_nanos(200), DEFAULT_PRIORITY + 2),
+        ]);
+        let final_priority = history.clone().into_iter().final_priority();
+        let (state, prio, now) = replay_from_500ns(&config, history);
+        assert_eq!(prio, Some(final_priority));
+        // As after the last recorded slice of any replay: no recorded end,
+        // so the configured maximum timeslice bounds it.
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(100_000))
+        );
+        assert!(state.stats.last_recorded_slice.is_some());
+    }
+
+    /// The one-RCB margin follows the clock multiplier and the thread's chaos
+    /// slowdown: at multiplier 0.3 one RCB is 3 ns, so an end 2 ns ahead is
+    /// within it (the post-hook would end that slice at once) and one 3 ns
+    /// ahead is not. Without a PMU maximum there is no margin.
+    #[test]
+    fn the_skipping_margin_is_one_rcb_at_the_thread_clock() {
+        let config = Config {
+            clock_multiplier: Some(0.3),
+            ..edited_replay_config()
+        };
+        let state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(3));
+        let mut slowed = ThreadState::new(DetPid::from_raw(5), &config, ());
+        slowed.chaos_slowdown_factor = RcbTimeMultiplier::from_f64(2.0);
+        slowed.chaos_slowdown_active = true;
+        assert_eq!(slowed.pmu_epsilon(&config), Duration::from_nanos(6));
+
+        let start = state.thread_logical_time.as_nanos();
+        for (ahead, skipped) in [(2, true), (3, false)] {
+            // 50 RCBs at multiplier 1 are 500 ns; at 0.3 the thread's time
+            // advances by 150 ns.
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            state
+                .thread_logical_time
+                .add_rcbs_with_multiplier(50, RcbTimeMultiplier::ONE);
+            let now = state.thread_logical_time.as_nanos();
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_prio_changes(vec![
+                        (now + Duration::from_nanos(ahead), DEFAULT_PRIORITY + 1),
+                        (start + Duration::from_nanos(9000), DEFAULT_PRIORITY + 2),
+                    ])
+                    .into_iter(),
+            );
+            let prio = state.next_timeslice(&config);
+            let expected = if skipped {
+                DEFAULT_PRIORITY + 2
+            } else {
+                DEFAULT_PRIORITY + 1
+            };
+            assert_eq!(prio, Some(expected), "{ahead} ns ahead");
+        }
+
+        // At a 2 times slowdown (a recorded epoch) one RCB is 6 ns: an end
+        // 5 ns ahead is within it, one 6 ns ahead is not.
+        for (ahead, skipped) in [(5, true), (6, false)] {
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let begin = state.thread_logical_time.as_nanos();
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_prio_changes(vec![
+                        (begin + Duration::from_nanos(ahead), DEFAULT_PRIORITY + 1),
+                        (begin + Duration::from_nanos(9000), DEFAULT_PRIORITY + 2),
+                    ])
+                    .with_chaos_epochs(vec![ChaosEpochTransition {
+                        logical_time: begin,
+                        epoch: 0,
+                        factor: RcbTimeMultiplier::from_f64(2.0),
+                    }])
+                    .into_iter(),
+            );
+            let prio = state.next_timeslice(&config);
+            assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(6));
+            let expected = if skipped {
+                DEFAULT_PRIORITY + 2
+            } else {
+                DEFAULT_PRIORITY + 1
+            };
+            assert_eq!(prio, Some(expected), "{ahead} ns ahead at 2 times");
+        }
+
+        // Without a PMU maximum the post-hook has no margin: a slice is kept
+        // whenever it ends ahead, as in a faithful replay.
+        let unbounded = Config {
+            max_timeslice: None,
+            ..edited_replay_config()
+        };
+        for (end, expected) in [(501, DEFAULT_PRIORITY + 1), (500, DEFAULT_PRIORITY + 2)] {
+            let history = ThreadHistory::new().with_prio_changes(vec![
+                (start + Duration::from_nanos(end), DEFAULT_PRIORITY + 1),
+                (start + Duration::from_nanos(9000), DEFAULT_PRIORITY + 2),
+            ]);
+            let (_, prio, _) = replay_from_500ns(&unbounded, history);
+            assert_eq!(
+                prio,
+                Some(expected),
+                "an end at {end} ns, without a maximum"
+            );
+        }
+    }
+
+    /// A recorded one-RCB slice that starts exactly where the previous one
+    /// ended is one the post-hook runs, not one that ended: on a record
+    /// without RCB targets (as minimization writes), an edited replay keeps
+    /// every such slice, with the same ends and priorities as a faithful one.
+    #[test]
+    fn an_edited_replay_keeps_one_rcb_slices_as_a_faithful_one_does() {
+        let edited = edited_replay_config();
+        let faithful = Config {
+            replay_edited_preemptions: false,
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &edited, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        // At 500 ns, one RCB (10 ns) per slice, then a longer one.
+        let history = ThreadHistory::new().with_prio_changes(vec![
+            (at(510), DEFAULT_PRIORITY + 1),
+            (at(520), DEFAULT_PRIORITY + 2),
+            (at(530), DEFAULT_PRIORITY + 3),
+            (at(900), DEFAULT_PRIORITY + 4),
+        ]);
+        let slices = |config: &Config| {
+            let (mut state, prio, _) = replay_from_500ns(config, history.clone());
+            let mut slices = vec![(prio, state.end_of_timeslice)];
+            for _ in 0..3 {
+                state.thread_logical_time.add_rcbs(1);
+                let prio = state.next_timeslice(config);
+                slices.push((prio, state.end_of_timeslice));
+            }
+            slices
+        };
+        assert_eq!(slices(&edited), slices(&faithful));
+        assert_eq!(
+            slices(&edited)[..3],
+            [
+                (Some(DEFAULT_PRIORITY + 1), Some(at(510))),
+                (Some(DEFAULT_PRIORITY + 2), Some(at(520))),
+                (Some(DEFAULT_PRIORITY + 3), Some(at(530))),
+            ]
+        );
+    }
+
+    /// Past an edited record's last recorded slice, a restored chaos slowdown
+    /// can make one RCB longer than the configured maximum timeslice: the
+    /// slice's PMU maximum is kept at least one RCB ahead, so the post-hook
+    /// neither ends it at once nor finds itself past it again. A faithful
+    /// replay keeps the configured maximum.
+    #[test]
+    fn past_an_edited_record_the_maximum_keeps_one_rcb_at_a_restored_slowdown() {
+        let config = |edited: bool| Config {
+            target_timeslice: None,
+            max_timeslice: nz(10),
+            replay_edited_preemptions: edited,
+            ..Default::default()
+        };
+        for (edited, expected) in [(true, 20), (false, 10)] {
+            let config = config(edited);
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let now = state.thread_logical_time.as_nanos();
+            let doubled = ChaosEpochTransition {
+                logical_time: now,
+                epoch: 1,
+                factor: RcbTimeMultiplier::from_f64(2.0),
+            };
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_chaos_epochs(vec![doubled])
+                    .into_iter(),
+            );
+            state.next_timeslice(&config);
+            assert_eq!(state.chaos_slowdown_factor, doubled.factor);
+            assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(20));
+            assert!(state.stats.last_recorded_slice.is_some());
+            assert_eq!(
+                state.max_timeslice_end,
+                Some(now + Duration::from_nanos(expected)),
+                "edited: {edited}"
+            );
+        }
+    }
+
+    /// Without --replay-edited-preemptions, a replay that reaches a recorded
+    /// slice end already passed stops: a faithful replay never does, so the
+    /// replay diverged.
+    #[test]
+    #[should_panic(expected = "needs --replay-edited-preemptions")]
+    fn a_faithful_replay_past_a_recorded_end_stops() {
+        let config = Config {
+            replay_edited_preemptions: false,
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let history = ThreadHistory::new().with_prio_changes(vec![
+            (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+            (start + Duration::from_nanos(900), DEFAULT_PRIORITY),
+        ]);
+        replay_from_500ns(&config, history);
+    }
+
+    /// The same for a recorded RCB deadline the PMU count has passed.
+    #[test]
+    #[should_panic(expected = "count is already 10. An edited record")]
+    fn a_faithful_replay_past_a_recorded_rcb_end_stops() {
+        let config = Config {
+            replay_edited_preemptions: false,
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+                (start + Duration::from_nanos(900), DEFAULT_PRIORITY),
+            ])
+            .with_preemption_rcbs(vec![4, 90]);
+        replay_from_500ns(&config, history);
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

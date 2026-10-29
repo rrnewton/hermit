@@ -131,7 +131,9 @@
 //! - once a lock or unlock goes through a descriptor whose description the
 //!   ledger may know under another identity (one Detcore keeps no model of,
 //!   such as a descriptor received over `SCM_RIGHTS` and not recorded, or one
-//!   registered on reception, a second model of the sender's description), no
+//!   recorded on reception as a second model of the sender's description; one
+//!   that joined the description its sender's table modeled is no second
+//!   model), no
 //!   lock on that inode number,
 //!   on any device, is shown again; if that descriptor's fdinfo cannot be
 //!   read, no OFD or flock lock is shown again;

@@ -957,6 +957,7 @@ fn unavailable_reason(reason: reverie::SignalDeliveryUnavailable) -> &'static st
 /// Whether Detcore sees syscall number `nr` through a Tool callback: a number
 /// in Reverie's syscall table. Another number (beyond the table, or negative)
 /// reaches the kernel with no callback.
+#[cfg(target_arch = "x86_64")]
 fn sees_syscall(nr: i64) -> bool {
     usize::try_from(nr).is_ok_and(|nr| reverie::syscalls::Sysno::new(nr).is_some())
 }
@@ -1887,7 +1888,7 @@ where
     if guest.thread_state().signal_shadow.is_none() {
         return;
     }
-    let sp = guest.regs().await.rsp as usize;
+    let sp = crate::arch::stack_pointer(&guest.regs().await) as usize;
     let restored = Addr::<u64>::from_raw(sp.wrapping_add(super::signal::UC_SIGMASK_OFFSET))
         .and_then(|address| guest.memory().read_value(address).ok());
     if let Some(mask) = restored {

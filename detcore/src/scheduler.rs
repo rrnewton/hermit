@@ -30,6 +30,7 @@ mod pipe_wake;
 pub(crate) mod posix_timer_coalesce;
 #[cfg(test)]
 mod posix_timer_coalesce_tests;
+pub(crate) mod process_signal_receiver;
 pub(crate) mod real_timer;
 mod rejoin_log;
 mod replayer;
@@ -119,9 +120,9 @@ use crate::scheduler::rejoin_log::Rejoin;
 use crate::scheduler::rejoin_log::RejoinRefusal;
 use crate::scheduler::rejoin_log::RejoinWriter;
 use crate::scheduler::replayer::StopReason;
-use crate::scheduler::replayer::events_consistent;
-use crate::scheduler::replayer::events_match;
 use crate::syscalls::KernelSignalState;
+use crate::syscalls::pi_futex::PiFutexState;
+use crate::syscalls::pi_futex::PiHandOver;
 use crate::syscalls::read_kernel_signal_state;
 use crate::syscalls::thread_is_gone;
 use crate::types::ChildWaitExitClass;
@@ -238,6 +239,19 @@ pub enum SchedValue {
         /// Waiters moved onto the target futex.
         moved: u64,
     },
+    /// What the scheduler holds for a priority-inheritance futex
+    /// (`FutexAction::PiState`).
+    PiFutex(PiFutexState),
+    /// How a woken FUTEX_LOCK_PI waiter was handed the lock, or `None` when it
+    /// was not (`FutexAction::PiTake`).
+    PiTaken(Option<PiHandOver>),
+    /// A plain wake or requeue reached a FUTEX_LOCK_PI waiter in its word's
+    /// queue, which Linux answers with `EINVAL` after waking the waiters before
+    /// it (`futex_wake`, `futex_requeue`): how many it woke.
+    PiWaiterReached {
+        /// The waiters woken before the PI waiter.
+        woken: u64,
+    },
 }
 
 /// A single interaction between a guest and the scheduler: first, request resourcees, followed
@@ -295,6 +309,44 @@ pub struct FutexWaiter {
     /// that reports it. `None` otherwise: a scheduler-sent signal then wakes the
     /// waiter whatever its disposition, and a cross-task signal does not.
     signal_watch: Option<FutexSignalWatch>,
+    /// A FUTEX_LOCK_PI waiter, queued on the word's priority-inheritance state
+    /// (`Scheduler::sleep_pi_futex_waiter`). Only FUTEX_UNLOCK_PI or its
+    /// owner's death hands it the lock. A plain wake or requeue that reaches it
+    /// in the queue stops there with `EINVAL` (`futex_wake`,
+    /// kernel/futex/waitwake.c:180-199 at v6.16), so none takes it.
+    pi: bool,
+    /// A FUTEX_LOCK_PI waiter the scheduler woke for a signal, which has not
+    /// yet run to see whether the signal is still pending. Linux's rt_mutex
+    /// waiter stays queued through such a wake and leaves only when the signal
+    /// is pending in its own context (`rt_mutex_slowlock_block`,
+    /// kernel/locking/rtmutex.c:1604-1656 at v6.16), so this one keeps its
+    /// place: an unlock or owner death meanwhile hands it the lock, which it
+    /// takes in its turn (`Scheduler::take_handed_pi_futex`), and if it finds
+    /// no signal it sleeps again where it was (`Scheduler::park_futex_waiter`).
+    /// It leaves the queue when its call ends (`Scheduler::leave_pi_futex_queue`).
+    woken: bool,
+}
+
+/// The owner of a contended priority-inheritance futex: the thread that holds
+/// the word's `pi_state` in Linux (kernel/futex/pi.c). Kept while PI waiters
+/// are queued on the word, as a `pi_state` lives while a waiter holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PiFutexOwner {
+    /// The owning thread.
+    owner: DetTid,
+    /// When it became the owner, in the order of
+    /// `BlockedPool::pi_futex_owner_epoch`: its death releases its words
+    /// latest first, as Linux pushes each one onto the head of the owner's
+    /// `pi_state_list` (`pi_state_update_owner`, kernel/futex/pi.c:60-66) and
+    /// `exit_pi_state_list` (kernel/futex/core.c:1323-1402) walks it from the
+    /// head.
+    since: u64,
+    /// How the owner was handed the lock, while it has not yet run to take it.
+    /// Linux keeps such a waiter at the head of the futex queue, holding the
+    /// `pi_state`, until it leaves the queue (`futex_unqueue_pi`), so a
+    /// FUTEX_LOCK_PI meanwhile still finds the state, and a plain wake or
+    /// requeue still meets a PI waiter first.
+    handed: Option<PiHandOver>,
 }
 
 /// What a precise-mode futex waiter's backend tells the scheduler about the
@@ -569,6 +621,16 @@ pub struct BlockedPool {
     /// waiting on a futex will have a request filled in `next_turns` but for zero resources.
     pub futex_waiters: HashMap<FutexID, Vec<FutexWaiter>>,
 
+    /// The owners of contended priority-inheritance futexes
+    /// (`Scheduler::pi_futex_state`). An entry speaks for its word only while
+    /// a PI waiter is queued there: a waiter that times out, is interrupted or
+    /// is killed leaves the pool without updating it, and the next PI command
+    /// on the word, or its owner's death, drops it.
+    pub pi_futex_owners: HashMap<FutexID, PiFutexOwner>,
+
+    /// The count of PI futex ownership changes, ordering `pi_futex_owners`.
+    pub pi_futex_owner_epoch: u64,
+
     /// Futex waiters whose deadlines expired and must receive `ETIMEDOUT` when scheduled.
     /// Timed-out waiters are removed from `futex_waiters` before entering the run queue.
     pub timed_out_futex_waiters: HashSet<DetTid>,
@@ -630,7 +692,9 @@ pub struct BlockedPool {
     /// where the call ran and was interrupted in the kernel, and replay, where
     /// it was not. A call that returned normally has no entry: Linux restored
     /// the thread's own mask before it returned, and the kernel holds that in
-    /// both.
+    /// both (with the signals the thread ignores blocked over it until after
+    /// the continuation, for a wait Detcore shielded from them,
+    /// `syscalls::helpers::IgnoredSignalShield`).
     pub continuation_masks: BTreeMap<DetTid, Option<u64>>,
 
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
@@ -1370,6 +1434,14 @@ pub struct Scheduler {
     /// never part of a deadlock. An entry is dropped when its process is
     /// reaped.
     sigkilled_processes: BTreeSet<DetPid>,
+    /// Processes a SIGKILL was committed against, for priority-inheritance
+    /// futexes (`Scheduler::pi_futex_thread_doomed`): recorded by
+    /// `record_committed_sigkill` alone, after the send or at a reserved
+    /// kill's commit. `sigkilled_processes` also takes a process-group kill's
+    /// notice before the send (`record_unresolved_sigkill`), while its victims
+    /// may still run and unlock. Dropped when the process is reaped or its pid
+    /// registers a new leader.
+    pi_doomed_processes: BTreeSet<DetPid>,
     /// Whether the backend reports every process's children
     /// (`BackendCapabilities::tracks_process_children`). Without it, a wait
     /// may have a child Detcore has no record of, so the children it knows
@@ -1792,8 +1864,17 @@ pub struct Scheduler {
     /// deadlocked.
     namespace_zap_victims: BTreeSet<DetPid>,
 
-    /// When the current wait for `namespace_zap_victims` began; reset once
-    /// none is left. Bounded by `namespace_zap_valve`.
+    /// Processes a fatal signal is ending: one of their threads died of a
+    /// signal that ends its whole thread group (`note_signal_killed_group`),
+    /// and Linux is ending the others, whose deaths are reported one by one
+    /// (the leader's last). While one of them still has a thread, an empty
+    /// run queue is waiting for those deaths, not deadlocked. Bounded, with
+    /// `namespace_zap_victims`, by `namespace_zap_valve`.
+    signal_death_victims: BTreeSet<DetPid>,
+
+    /// When the current wait for `namespace_zap_victims` or
+    /// `signal_death_victims` began; reset once none is left. Bounded by
+    /// `namespace_zap_valve`.
     namespace_zap_wait_since: Option<std::time::Instant>,
 
     /// `NAMESPACE_ZAP_VALVE`, shortened only by tests that expire it.
@@ -2083,6 +2164,19 @@ pub struct Scheduler {
     /// never cleared.
     guest_sent_marker_signal: bool,
 
+    /// Each process's `signal->curr_target`: the thread the walk of
+    /// `complete_signal` last chose for a process-directed signal a guest sent
+    /// (`process_signal_receiver`). Absent: the process's leader, where
+    /// Linux starts it.
+    signal_curr_targets: BTreeMap<DetPid, DetTid>,
+
+    /// For each thread, the signals it was chosen to take of the
+    /// process-directed copies a guest sent and the scheduler left in its
+    /// process's shared queue (`process_signal_receiver`). Step 3 resumes
+    /// such a thread before any other, so it is the one that takes the copy
+    /// (`first_process_signal_taker`).
+    process_signal_takers: BTreeMap<DetTid, u64>,
+
     /// Test-only stand-in for the /proc signal-mask fields, keyed by
     /// (process, thread, field). Unit tests use small fake pids that can name
     /// real host processes, so tests never read /proc: an absent entry reads
@@ -2138,6 +2232,16 @@ pub struct Scheduler {
     /// taken by the grant's reply so the thread can end its slice there
     /// (<https://github.com/rrnewton/hermit/issues/4121>).
     deadline_hints: BTreeMap<DetTid, Duration>,
+
+    /// The threads whose latest grant found them the only thread able to run
+    /// before they next enter Detcore
+    /// ([`Scheduler::runs_alone_until_it_enters_detcore`]), taken by the
+    /// grant's reply as `GlobalResponse::WithLoneGrant`. Kept only under
+    /// [`Config::replays_lone_preemptions`].
+    lone_grants: BTreeSet<DetTid>,
+
+    /// [`Config::replays_lone_preemptions`], fixed for the run.
+    replays_lone_preemptions: bool,
 
     /// The threads the scheduler resumed from a wait since their current
     /// request arrived: granted a turn ([`Scheduler::unblock_guest`]), or a
@@ -2200,9 +2304,21 @@ pub struct Scheduler {
     boundary_replayer: Option<boundary_replayer::BoundaryReplayer>,
     boundary_stacktrace_events: std::collections::BTreeMap<usize, Option<PathBuf>>,
 
+    /// The host files the run whose schedule this run replays
+    /// (`Config::replay_schedule_from`) opened, if its recording says. The
+    /// global state compares this run's opens against them
+    /// (`crate::host_inputs::ReplayHostInputs`); no scheduling decision reads
+    /// them.
+    pub(crate) recorded_host_inputs: Option<detcore_model::host_input::HostInputSet>,
+
     /// Whether the replayed schedule's priorities were dropped when its
     /// recording ran out (`release_replay_priorities_if_exhausted`).
     replay_priorities_released: bool,
+
+    /// How many recorded callback checkpoints the scheduler dropped for each
+    /// thread when the thread heard that the replay released its schedule
+    /// (`drop_released_callback_checkpoints`), for the run summary.
+    released_callback_checkpoints: BTreeMap<DetTid, usize>,
 
     /// Count record_event calls which determines the event number if we're recording a schedule
     /// event trace.
@@ -2280,6 +2396,30 @@ pub struct Scheduler {
     /// thread over since its last committed turn
     /// ([`Self::bound_chaos_starvation`]).
     chaos_passed_over: BTreeMap<DetTid, u32>,
+    /// Where change points are bounded (`chaos_bounds_starvation`), each
+    /// thread's committed turns, host-timed polling retries aside, since its
+    /// last priority change point (`chaos_slice_spent_in_turns`). An entry
+    /// goes when its thread retires (a last turn committed after that may
+    /// leave one behind, which nothing reads unless the thread ID returns).
+    chaos_turns_in_slice: BTreeMap<DetTid, u64>,
+    /// How many committed turns end a chaos slice: as many as charge one
+    /// maximum timeslice of virtual time, but at least
+    /// `MIN_CHAOS_TURNS_PER_SLICE`; `None` when either is zero or unset.
+    chaos_turns_per_slice: Option<u64>,
+    /// The thread whose grant this pass ended a sleep at its deadline
+    /// (`ends_a_due_sleep`), taken by the next `bump_global_time`: such a turn
+    /// does not count toward the thread's chaos slice
+    /// (`chaos_slice_spent_in_turns`).
+    chaos_due_sleep_grant: Option<DetTid>,
+    /// The threads that have had a grant, so that a thread that has not yet
+    /// run can be told apart (`note_chaos_first_turn_waits`). An entry goes
+    /// when its thread retires.
+    chaos_had_turn: BTreeSet<DetTid>,
+    /// Where change points are bounded, each queued thread that has not yet
+    /// run and lost the latest grants to threads of better priority, with how
+    /// many consecutive non-polling grants it has lost
+    /// (`chaos_first_turn_overdue`).
+    chaos_first_turn_waits: BTreeMap<DetTid, u64>,
 
     /// Happens-before enforcement state, present only when the run carries a
     /// `HappensBeforeProgram`. Holds AFTER anchors until their BEFORE anchors
@@ -3121,6 +3261,11 @@ impl ThreadTree {
         self.thread_group_leaders.contains(tid) || self.thread_to_leader.contains_key(tid)
     }
 
+    /// Every thread the thread group of `me` has had, live or not, found by
+    /// walking the tree from its leader. The tree keeps exited threads, so
+    /// this costs every thread the group ever had; for the live ones use
+    /// `Scheduler::live_thread_group`.
+    ///
     /// Locks: takes scheduler lock.
     pub fn my_thread_group(&self, me: &DetTid) -> Vec<DetTid> {
         let root_tid: DetTid = if self.thread_group_leaders.contains(me) {
@@ -4207,9 +4352,36 @@ pub type MaybePrintStack = Option<Option<PathBuf>>;
 /// How many chaos timer-slice change points may pass a runnable thread over,
 /// since its last committed turn, before the changing thread moves behind it
 /// ([`Scheduler::bound_chaos_starvation`]). Each pass ends a slice, capped by
-/// `--max-timeslice`, so a passed-over thread waits at most this many slices
-/// of a thread that never blocks.
+/// `--max-timeslice` of the thread's own time and, for a thread that takes
+/// many turns, by `chaos_turns_per_slice` of its turns
+/// (`Scheduler::chaos_slice_spent_in_turns`), or at once while a thread that
+/// has not yet run is overdue (`Scheduler::chaos_first_turn_overdue`), so a
+/// passed-over thread waits at most this many slices of a thread that never
+/// blocks.
 const CHAOS_PASSOVER_BOUND: u32 = 2;
+
+/// The fewest committed turns that end a chaos slice
+/// (`Scheduler::chaos_slice_spent_in_turns`), 200 ms of turn charges at the
+/// default charge, whatever the maximum timeslice. With a small maximum,
+/// own-time slices already end every few turns of a thread that hands off
+/// the CPU, and counting its turns would add a change point every turn or
+/// two.
+const MIN_CHAOS_TURNS_PER_SLICE: u64 = 400;
+
+/// Whether `request` is a sleep whose deadline has come by `now`: a single
+/// `SleepUntil` with a real deadline, neither the zero of a yield epoch nor
+/// an indefinite one, that its caller did not ask to last no time (a
+/// zero-length sleep is a yield idiom: `Resources::zero_length_sleep`). Its
+/// grant does not count toward a chaos slice
+/// (`Scheduler::chaos_due_sleep_grant`).
+fn ends_a_due_sleep(request: &Resources, now: LogicalTime) -> bool {
+    !request.zero_length_sleep
+        && request.resources.len() == 1
+        && request.resources.keys().any(|resource| {
+            matches!(resource, ResourceID::SleepUntil(deadline)
+                if deadline.as_nanos() > 0 && !deadline.is_indefinite() && *deadline <= now)
+        })
+}
 
 enum ThreadStatus {
     // Not present in scheduler structures.
@@ -4252,6 +4424,7 @@ impl Scheduler {
         > = BTreeMap::new();
         let mut boundary_replayer = None;
         let mut boundary_stacktrace_events = BTreeMap::new();
+        let mut recorded_host_inputs = None;
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
@@ -4261,6 +4434,7 @@ impl Scheduler {
                 recording
                     .require_strict_mode(cfg.strict_schedule_boundaries)
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
+                recorded_host_inputs = recording.host_inputs().cloned();
                 match recording {
                     Recording::Legacy(record) => {
                         callback_checkpoints = record
@@ -4270,10 +4444,15 @@ impl Scheduler {
                             .collect();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
+                        // Indices are traced (observed) event counts, the same
+                        // counting `hermit analyze` uses for the events it names,
+                        // so no recorded event is kept to match against, and one at
+                        // or past the end names the events the run makes after the
+                        // schedule runs out.
                         let toprint = cfg
                             .stacktrace_event
                             .iter()
-                            .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
+                            .map(|(ix, path)| (*ix, None, path.clone()))
                             .collect();
                         let mut replayer = Replayer::new(vec);
                         replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
@@ -4380,7 +4559,9 @@ impl Scheduler {
             replayer,
             boundary_replayer,
             boundary_stacktrace_events,
+            recorded_host_inputs,
             replay_priorities_released: false,
+            released_callback_checkpoints: BTreeMap::new(),
             recorded_event_count: 0,
             stacktrace_events,
             stop_after_turn: cfg.stop_after_turn,
@@ -4436,6 +4617,7 @@ impl Scheduler {
             released_vfork_barriers: Default::default(),
             vfork_rejoin_edges: Default::default(),
             sigkilled_processes: Default::default(),
+            pi_doomed_processes: Default::default(),
             complete_child_lineage: cfg.backend.tracks_process_children,
             committed_exits: Default::default(),
             retired_exited_leaders: Default::default(),
@@ -4538,6 +4720,7 @@ impl Scheduler {
             deregistration_accounted: Default::default(),
             pending_physical_process_exits: Default::default(),
             namespace_zap_victims: Default::default(),
+            signal_death_victims: Default::default(),
             namespace_zap_wait_since: None,
             namespace_zap_valve: Self::NAMESPACE_ZAP_VALVE,
             logically_exited_processes: Default::default(),
@@ -4585,6 +4768,8 @@ impl Scheduler {
             undelivered_scheduler_signals: Default::default(),
             thread_timer_copies: Default::default(),
             guest_sent_marker_signal: false,
+            signal_curr_targets: Default::default(),
+            process_signal_takers: Default::default(),
             #[cfg(test)]
             test_signal_masks: Default::default(),
             resources: Default::default(),
@@ -4595,6 +4780,8 @@ impl Scheduler {
             boundary_budgets: Default::default(),
             boundary_owners: boundaries.then(Default::default),
             deadline_hints: Default::default(),
+            lone_grants: Default::default(),
+            replays_lone_preemptions: cfg.replays_lone_preemptions(),
             granted: Default::default(),
             per_thread_timeslice: Default::default(),
             per_thread_syscalls: Default::default(),
@@ -4609,6 +4796,19 @@ impl Scheduler {
                 && cfg.sched_heuristic == crate::config::SchedHeuristic::None
                 && cfg.replay_preemptions_from.is_none(),
             chaos_passed_over: Default::default(),
+            chaos_turns_in_slice: Default::default(),
+            chaos_turns_per_slice: cfg
+                .max_timeslice
+                .map(std::num::NonZeroU64::get)
+                .zip(
+                    cfg.scheduler_turn_charge()
+                        .ok()
+                        .filter(|charge| *charge > 0),
+                )
+                .map(|(slice, charge)| slice.div_ceil(charge).max(MIN_CHAOS_TURNS_PER_SLICE)),
+            chaos_due_sleep_grant: None,
+            chaos_had_turn: Default::default(),
+            chaos_first_turn_waits: Default::default(),
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
@@ -4836,8 +5036,32 @@ impl Scheduler {
         match process {
             Some(process) => {
                 self.sigkilled_processes.insert(process);
+                self.pi_doomed_processes.insert(process);
+                self.release_pi_futexes_of_killed(process);
             }
             None => self.unresolved_sigkill = true,
+        }
+    }
+
+    /// A committed SIGKILL doomed `process` (`record_committed_sigkill`,
+    /// never a process group's notice before its send): the PI futexes its threads
+    /// own go to their waiters now, in the sender's turn, as each thread will
+    /// release them in its own exit (`futex_exit_release`) before anything
+    /// later can see it. Their retirement comes at a host-timed moment that no
+    /// turn waits for (https://github.com/rrnewton/hermit/issues/3994), so
+    /// releasing there would admit the waiters at a host-timed drain. A doomed
+    /// thread runs no more guest code, so it cannot unlock meanwhile.
+    // TODO-HUMAN-REVIEW(#4616): Review handing a SIGKILLed process's PI
+    // futexes over at the kill's commit.
+    fn release_pi_futexes_of_killed(&mut self, process: DetPid) {
+        let threads: Vec<DetTid> = self
+            .next_turns
+            .keys()
+            .copied()
+            .filter(|thread| self.thread_tree.process_of(*thread) == Some(process))
+            .collect();
+        for thread in threads {
+            self.release_pi_futexes_of(thread);
         }
     }
 
@@ -4862,6 +5086,65 @@ impl Scheduler {
         }
     }
 
+    /// Whether an empty run queue waits for `process`'s deaths after one of
+    /// its threads died of a fatal signal (test observation).
+    #[cfg(test)]
+    pub(crate) fn signal_death_victim(&self, process: DetPid) -> bool {
+        self.signal_death_victims.contains(&process)
+    }
+
+    /// Retire `leader` at its own exit as `retire_exited_leader` does on
+    /// ptrace, with its exit granted (test setup).
+    #[cfg(test)]
+    pub(crate) fn retire_test_exited_leader(&mut self, leader: DetTid, mm: MmId) -> bool {
+        self.models_signal_targets = true;
+        self.committed_exits.insert(leader);
+        self.retire_exited_leader(leader, mm)
+    }
+
+    /// `sender`, in its delivery turn, is about to take a signal whose action
+    /// is the default and whose default action ends the process. Linux ends
+    /// the whole thread group at that delivery: `get_signal` carries out the
+    /// default action with `do_group_exit` (or `do_coredump` first), which
+    /// queues SIGKILL to every other thread before any of them runs another
+    /// user instruction. Two exceptions decide nothing here: a PID
+    /// namespace's init, for which `get_signal` skips the default action
+    /// (`SIGNAL_UNKILLABLE`), and a process with an exec in flight, whose
+    /// `de_thread` kills the other threads instead (`do_group_exit` and
+    /// `zap_threads` defer to `group_exec_task`).
+    ///
+    /// The process is recorded doomed (`record_committed_fatal_signal`). When
+    /// `retire_others` (the caller read that the kernel carries the default
+    /// action out when it resumes `sender`), on a backend that retires a
+    /// kill's victims at the kill turn (ptrace), its other threads are
+    /// retired here, as committed victims (`retire_fatal_delivery_victims`). Before, each left at its own
+    /// host-timed exit report, and a report that came after the sender's let
+    /// the empty run queue read as a deadlock of the threads still parked in
+    /// futex waits. Returns whether any thread was retired: the sender then
+    /// files nothing more, since turn selection now waits for the victims'
+    /// deaths, which only its delivery causes.
+    pub(crate) fn commit_fatal_delivery(&mut self, sender: DetTid, retire_others: bool) -> bool {
+        let Some(process) = self.registered_process(sender) else {
+            return false;
+        };
+        if self.thread_tree.is_pid_namespace_init(process)
+            || self.exec_teardowns.contains_key(&process)
+        {
+            return false;
+        }
+        self.record_committed_fatal_signal(process);
+        if !retire_others {
+            return false;
+        }
+        if !self.holds_serial_grant(sender) {
+            tracing::warn!(
+                "[scheduler] dettid {sender} reported a fatal delivery without holding the serial grant; its process's other threads stay"
+            );
+            return false;
+        }
+        !self.retire_fatal_delivery_victims(sender).is_empty()
+    }
+
     /// Whether a committed SIGKILL doomed `process`, and whether one with an
     /// unnamed victim was seen (test observation of the record above).
     #[cfg(test)]
@@ -4872,14 +5155,34 @@ impl Scheduler {
         )
     }
 
+    /// `dettid`'s own `Exit` (an `exit` or `exit_group`) is granted, in its
+    /// committed turn. Its priority-inheritance futexes go to their waiters
+    /// here, at the grant, rather than when it deregisters at a host-timed
+    /// moment: Linux releases them in the exiting thread's own context
+    /// (`futex_exit_release` from `exit_mm`), before anything a later turn can
+    /// see, and no locker may attach to it any more
+    /// (`Self::pi_futex_live_owner_named`). The waiters it hands a futex are
+    /// admitted at the next drain, as at a deregistration.
+    // TODO-HUMAN-REVIEW(#4616): Review releasing an exiting owner's PI futexes
+    // at its committed Exit grant.
+    fn commit_own_exit(&mut self, dettid: DetTid) {
+        self.committed_exits.insert(dettid);
+        self.release_pi_futexes_of(dettid);
+    }
+
     /// A thread is being registered on `dettid`: any committed exit recorded
     /// for an earlier thread with that tid no longer applies.
     pub(crate) fn forget_committed_exit(&mut self, dettid: DetTid) {
         self.forget_sigkill_receipt(dettid);
         self.committed_exits.remove(&dettid);
+        // A leader registering on a pid names a new process.
+        self.pi_doomed_processes
+            .remove(&DetPid::from_raw(dettid.as_raw()));
         self.retired_exited_leaders.remove(&dettid);
-        // A reused pid names a new process, not one a namespace's end doomed.
+        // A reused pid names a new process, not one a namespace's end or a
+        // fatal signal doomed.
         self.namespace_zap_victims.remove(&dettid);
+        self.signal_death_victims.remove(&dettid);
     }
 
     pub(crate) fn note_process_sigkill(
@@ -5241,36 +5544,61 @@ impl Scheduler {
 
     /// Try to pop the next event from the sorted list of stacktrace_events, if it matches the given
     /// index.  This is idempotent, because subsequent attempts will just fizzle.
+    ///
+    /// The index is the traced (observed) event count, when recording and
+    /// under `--replay-schedule-from` alike: it is the counting
+    /// `hermit analyze` names critical events by, including a pair a flipped
+    /// schedule cannot consume in flipped order at a thread's exit.
+    ///
+    /// A run can pass a requested index without printing it: the list can be
+    /// installed after events were already consumed. Every requested index
+    /// below `current_ix` is then reported as missed and discarded, so it
+    /// neither disappears silently nor stays at the head of the list and
+    /// blocks every later index.
     fn try_pop_stacktrace_event(
         &mut self,
         current_ix: u64,
         observed: &SchedEvent,
     ) -> MaybePrintStack {
         let mut result = None;
-        if let Some(iter) = &mut self.stacktrace_events
-            && let Some((next_ix, event, m_path)) = iter.peek()
-        {
-            let go = if let Some(ev) = event {
-                (*next_ix == current_ix && events_consistent(observed, ev))
-                    || events_match(observed, ev)
-            } else {
-                *next_ix == current_ix
-            };
-            if go {
-                info!(
-                    "Now output stack trace for scheduled event #{} = {}:",
-                    current_ix, observed,
+        if let Some(iter) = &mut self.stacktrace_events {
+            while let Some((missed, _, m_path)) = iter.next_if(|(ix, _, _)| *ix < current_ix) {
+                let destination = m_path
+                    .as_ref()
+                    .map_or_else(|| "stderr".to_string(), |p| p.display().to_string());
+                tracing::warn!(
+                    "No stack trace for scheduled event #{} (requested for {}): the run passed that position without running it, and reached #{} = {}",
+                    missed,
+                    destination,
+                    current_ix,
+                    observed,
                 );
-                if m_path.is_none() {
-                    crate::util::capped_eprintln!(
-                        "\nPrinting stack trace for scheduled event #{} = {}:",
-                        current_ix,
-                        observed,
-                    );
-                }
-                result = Some(m_path.clone());
-                let _ = iter.next();
+                crate::util::capped_eprintln!(
+                    "\nMissed stack trace for scheduled event #{} (requested for {}): the run passed that position without running it, and reached #{} = {}",
+                    missed,
+                    destination,
+                    current_ix,
+                    observed,
+                );
             }
+        }
+        if let Some(iter) = &mut self.stacktrace_events
+            && let Some((next_ix, _, m_path)) = iter.peek()
+            && *next_ix == current_ix
+        {
+            info!(
+                "Now output stack trace for scheduled event #{} = {}:",
+                current_ix, observed,
+            );
+            if m_path.is_none() {
+                crate::util::capped_eprintln!(
+                    "\nPrinting stack trace for scheduled event #{} = {}:",
+                    current_ix,
+                    observed,
+                );
+            }
+            result = Some(m_path.clone());
+            let _ = iter.next();
         }
         result
     }
@@ -5330,7 +5658,8 @@ impl Scheduler {
 
         if let Some((ix, action)) = self.replayer.as_mut().map(|r| {
             let current_ix = r.traced_event_count;
-            (current_ix, r.observe_event(observed))
+            let action = r.observe_event(observed);
+            (current_ix, action)
         }) {
             let print_stack = self.try_pop_stacktrace_event(ix, observed);
             debug!("Next ReplayAction = {:?}", action);
@@ -5411,10 +5740,8 @@ impl Scheduler {
             return false;
         }
         let siblings = self
-            .thread_tree
-            .my_thread_group(&process)
-            .into_iter()
-            .filter(|tid| *tid != caller && self.next_turns.contains_key(tid))
+            .live_process_threads(process)
+            .filter(|tid| *tid != caller)
             .collect();
         self.exec_teardowns.insert(
             process,
@@ -5525,6 +5852,9 @@ impl Scheduler {
         self.deschedule_or_defer(*dtid);
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
+        self.chaos_turns_in_slice.remove(dtid);
+        self.chaos_had_turn.remove(dtid);
+        self.chaos_first_turn_waits.remove(dtid);
         self.retire_sigalrm_thread(*dtid, *detpid);
         // The process's last thread: its shared queue goes with it.
         let last_of_process = self
@@ -5534,6 +5864,7 @@ impl Scheduler {
         self.work_span_retire_thread(*dtid, *detpid);
         if last_of_process {
             self.shared_queue_scheduler_signals.remove(detpid);
+            self.signal_curr_targets.remove(detpid);
             // The generation stays, so that no publication older than one
             // already taken can bring dispositions back.
             if let Some(published) = self.published_dispositions.get_mut(detpid) {
@@ -5543,6 +5874,7 @@ impl Scheduler {
         // Its own queue goes with it; a later thread with its tid starts empty.
         self.thread_timer_copies
             .retain(|(thread, _), _| thread != dtid);
+        self.process_signal_takers.remove(dtid);
         self.remove_physical_thread(dtid, mm);
         // A killed vfork parent must not leave its barrier behind: step2a
         // drops a barrier only when it can read the parent's pending request,
@@ -5611,6 +5943,9 @@ impl Scheduler {
                     // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
                     nextturn.resp.try_put(SchedResponse::Signaled(None));
                 }
+                // Linux's `futex_cleanup` releases the PI futexes the thread
+                // owns before `mm_release` clears its child TID and wakes it.
+                self.release_pi_futexes_of(*dtid);
                 if nextturn.child_tid_addr != 0 {
                     self.wake_futex_child_cleartid(
                         FutexID::private(mm, nextturn.child_tid_addr),
@@ -5627,24 +5962,17 @@ impl Scheduler {
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
-        let live_process_thread = self
-            .thread_tree
-            .my_thread_group(detpid)
-            .into_iter()
-            .any(|tid| self.next_turns.contains_key(&tid));
+        let live_process_thread = self.live_process_threads(*detpid).next().is_some();
         // A raw clone child with a non-SIGCHLD exit signal is its own process
         // in the thread tree, although the backend reports its creator's pid
         // (`ResourceID::Exit` below makes the same distinction). Its exit
         // still decides its orphans, when its last thread leaves.
         if let Some(registered) = self.registered_process(*dtid)
             && registered != *detpid
-            && !self
-                .thread_tree
-                .my_thread_group(&registered)
-                .into_iter()
-                .any(|tid| self.next_turns.contains_key(&tid))
+            && self.live_process_threads(registered).next().is_none()
         {
             self.namespace_zap_victims.remove(&registered);
+            self.signal_death_victims.remove(&registered);
             self.reparent_orphans(registered);
             self.work_span_parent_gone(registered);
         }
@@ -5653,8 +5981,9 @@ impl Scheduler {
             self.reparent_orphans(*detpid);
             self.work_span_parent_gone(*detpid);
             self.logically_exited_processes.insert(*detpid);
-            // The kill a namespace's end owed it has arrived.
+            // The kill a namespace's end or a fatal signal owed it has arrived.
             self.namespace_zap_victims.remove(detpid);
+            self.signal_death_victims.remove(detpid);
             // Linux decides at exit whether the parent reaps this child
             // automatically (do_notify_parent), and only for a child whose
             // exit signal is SIGCHLD; a later change of the parent's
@@ -6142,20 +6471,25 @@ impl Scheduler {
         }
     }
 
-    /// Whether a process `note_pid_namespace_end` saw Linux about to kill
-    /// still has a thread in the scheduler. Victims whose threads are all
-    /// gone are dropped. The run already carries the determinism loss for
-    /// them, so waiting here only lets the host's kill arrive; it cannot make
-    /// a comparable run depend on host timing.
+    /// Whether a process `note_pid_namespace_end` saw Linux about to kill,
+    /// or one a fatal signal is ending (`note_signal_killed_group`), still
+    /// has a thread in the scheduler. Victims whose threads are all gone are
+    /// dropped. A namespace's victims already carry the run's determinism
+    /// loss; a fatal signal's are threads the kernel has already queued
+    /// SIGKILL to, which run no further guest code. Either way, waiting here
+    /// only lets the host report deaths that are certain; it grants no turn
+    /// and moves no virtual time.
     fn awaiting_namespace_zap(&mut self) -> bool {
         let next_turns = &self.next_turns;
         let thread_tree = &self.thread_tree;
-        self.namespace_zap_victims.retain(|victim| {
+        let has_a_thread = |victim: &DetPid| {
             next_turns
                 .keys()
                 .any(|tid| thread_tree.process_of(*tid) == Some(*victim))
-        });
-        !self.namespace_zap_victims.is_empty()
+        };
+        self.namespace_zap_victims.retain(has_a_thread);
+        self.signal_death_victims.retain(has_a_thread);
+        !self.namespace_zap_victims.is_empty() || !self.signal_death_victims.is_empty()
     }
 
     /// The reaper Linux's `find_new_reaper` falls back to when no subreaper
@@ -6925,15 +7259,62 @@ impl Scheduler {
     /// its process's end a second time, at this host-timed moment (deciding
     /// again whether its parent reaps it automatically, and waking the
     /// parent's waiters again).
-    pub(crate) fn retire_deregistered_thread(&mut self, dettid: DetTid, detpid: DetPid, mm: MmId) {
+    ///
+    /// Returns false for such a leader, whose death this deregistration
+    /// reports only after its exit was already accounted.
+    pub(crate) fn retire_deregistered_thread(
+        &mut self,
+        dettid: DetTid,
+        detpid: DetPid,
+        mm: MmId,
+    ) -> bool {
         if self.take_retired_exited_leader(dettid) {
-            return;
+            return false;
         }
         self.hold_turns_until_the_kernel_ends(dettid, mm);
         if !self.defer_exec_sibling_retirement(dettid, detpid, mm)
             && !self.thread_is_logically_killed(dettid)
         {
             self.logically_kill_thread(&dettid, &detpid, mm);
+        }
+        true
+    }
+
+    /// `dettid`, a thread of `detpid`, died of a signal that ends its whole
+    /// thread group (`signal_ends_thread_group`), and its accounted
+    /// deregistration took the ordinary path: no guest sent a SIGKILL through
+    /// the scheduler (`sigkill_retirement`). Such a death comes from a fault
+    /// (SIGSEGV, SIGBUS), an abort, a debugger's `kill` or `signal`, the OOM
+    /// killer or a host `kill`. Linux ends every thread of the group
+    /// (`get_signal` calls `do_group_exit`), and each death is reported in
+    /// turn, the leader's last. Until they all are, a thread of the group left
+    /// blocked, a leader in a futex wait no exit wakes above all, must not
+    /// read as a deadlock, so the process becomes a signal-death victim that
+    /// an empty run queue waits for (`awaiting_namespace_zap`). Each thread is
+    /// still retired at its own deregistration, which keeps the order a robust
+    /// list's owner deaths are accounted in.
+    ///
+    /// A process a guest's reserved SIGKILL owns (`sigkill_owns_process`) is
+    /// not one: that send retires its threads at its kill turn, and noting a
+    /// death the kill caused here, at a host-timed deregistration, would wait
+    /// at a host-chosen moment (https://github.com/rrnewton/hermit/issues/4445).
+    ///
+    /// The note is logged at debug level only: the deregistration's moment is
+    /// the host's, so it is no INFO record (which `--verify-strict` compares).
+    pub(crate) fn note_signal_killed_group(&mut self, dettid: DetTid, detpid: DetPid) {
+        if self.sigkill_owns_process(detpid) {
+            return;
+        }
+        let others_live = self
+            .live_group_members(detpid)
+            .into_iter()
+            .any(|thread| thread != dettid && self.next_turns.contains_key(&thread));
+        if others_live {
+            debug!(
+                "[scheduler] dettid {} died of a fatal signal; waiting for the other threads of process {} to die",
+                dettid, detpid
+            );
+            self.signal_death_victims.insert(detpid);
         }
     }
 
@@ -7556,12 +7937,8 @@ impl Scheduler {
             return false;
         }
         let unreported: Vec<DetTid> = self
-            .thread_tree
-            .my_thread_group(&detpid)
-            .into_iter()
-            .filter(|tid| {
-                self.next_turns.contains_key(tid) && !self.deregistration_accounted.contains(tid)
-            })
+            .live_process_threads(detpid)
+            .filter(|tid| !self.deregistration_accounted.contains(tid))
             .collect();
         for tid in &unreported {
             // A late DeregisterThread from the same incarnation, if one was
@@ -7579,9 +7956,9 @@ impl Scheduler {
 
     pub(crate) fn has_unreported_exit(&self, detpid: DetPid) -> bool {
         self.thread_tree.contains(&detpid)
-            && self.thread_tree.my_thread_group(&detpid).iter().any(|tid| {
-                self.next_turns.contains_key(tid) && !self.deregistration_accounted.contains(tid)
-            })
+            && self
+                .live_process_threads(detpid)
+                .any(|tid| !self.deregistration_accounted.contains(&tid))
     }
 
     /// Release every physical-exit barrier after the backend supervisor has drained all tracees.
@@ -7601,6 +7978,7 @@ impl Scheduler {
     /// Remove entries from everywhere that non-runnable threads lurk.
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
         self.deadline_hints.remove(dtid);
+        self.lone_grants.remove(dtid);
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
         self.blocked.replay_log_served.remove(dtid);
@@ -7623,7 +8001,6 @@ impl Scheduler {
             !waiters.is_empty()
         });
         self.pending_run_queue_admissions.remove(dtid);
-        self.parked.exits_awaiting_permit.remove(dtid);
         self.chaos_passed_over.remove(dtid);
         self.forget_poll_deadline(*dtid);
         let _ = self.remove_futex_waiter(dtid);
@@ -7658,17 +8035,42 @@ impl Scheduler {
         bitset: u32,
         signal_watch: Option<FutexSignalWatch>,
     ) {
+        self.park_futex_waiter(dettid, futexid, maybe_timeout, bitset, signal_watch, false);
+    }
+
+    /// Park `dettid` in the futex waiter pool, as a PI waiter when `pi`. A PI
+    /// waiter still queued from a wake for a signal it did not find
+    /// (`FutexWaiter::woken`) sleeps again in its place; any other joins the
+    /// tail.
+    fn park_futex_waiter(
+        &mut self,
+        dettid: &DetTid,
+        futexid: FutexID,
+        maybe_timeout: Option<LogicalTime>,
+        bitset: u32,
+        signal_watch: Option<FutexSignalWatch>,
+        pi: bool,
+    ) {
         let nxt = self
             .next_turns
             .get(dettid)
             .expect("Missing next_turns entry");
         let entry: &mut Vec<_> = self.blocked.futex_waiters.entry(futexid).or_default();
-        entry.push(FutexWaiter {
+        let waiter = FutexWaiter {
             dettid: *dettid,
             response: nxt.resp.clone(),
             bitset,
             signal_watch,
-        });
+            pi,
+            woken: false,
+        };
+        match entry
+            .iter_mut()
+            .find(|queued| pi && queued.woken && queued.dettid == *dettid)
+        {
+            Some(queued) => *queued = waiter,
+            None => entry.push(waiter),
+        }
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because
         // we're not actually waiting on the scheduler giving us the resource.  We're waiting in the
@@ -7771,12 +8173,18 @@ impl Scheduler {
         vec.split_off(vec.len() - num_woken)
     }
 
+    /// The waiters a plain wake of `futexid` takes, and whether it met a
+    /// FUTEX_LOCK_PI waiter first. Linux's `futex_wake` walks the queue in
+    /// order and stops with `EINVAL` at the first PI waiter it reaches before
+    /// it has woken `max_to_wake`, waking those it took before it
+    /// (kernel/futex/waitwake.c:180-199 at v6.16). A waiter handed a PI lock
+    /// that has not yet taken it heads the queue (`PiFutexOwner::handed`).
     fn take_futex_wakees(
         &mut self,
         futexid: FutexID,
         max_to_wake: i32,
         wake_mask: u32,
-    ) -> Vec<FutexWaiter> {
+    ) -> (Vec<FutexWaiter>, bool) {
         // Linux's `futex_wake` (kernel/futex/waitwake.c) counts a matching waiter
         // before it compares the count, `if (++ret >= nr_wake) break;`, and
         // `nr_wake` is the kernel's `int`. So a count of 0, or a `u32` count above
@@ -7790,6 +8198,9 @@ impl Scheduler {
         } else {
             max_to_wake as usize
         };
+        if self.pi_futex_hand_over_pending(futexid) {
+            return (Vec::new(), true);
+        }
         let mut vec: Vec<FutexWaiter> = {
             match self.blocked.futex_waiters.get_mut(&futexid) {
                 None => {
@@ -7797,11 +8208,14 @@ impl Scheduler {
                         "[detcore] Futex wake {} waiters FIZZLED -- none waiting",
                         max_to_wake
                     );
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
                 Some(r) => std::mem::take(r),
             }
         };
+        // Only the waiters queued before the first PI waiter can be woken.
+        let reachable = vec.iter().position(|waiter| waiter.pi).unwrap_or(vec.len());
+        let beyond = vec.split_off(reachable);
         trace!(
             "Waking up to {} Futex waiters, out of {} waiting.",
             max_to_wake,
@@ -7831,28 +8245,44 @@ impl Scheduler {
             vec = kept;
             to_wake
         };
+        let met_pi = to_wake.len() < max_to_wake && !beyond.is_empty();
+        vec.extend(beyond);
         // Put back what wasn't woken up:
         if !vec.is_empty() {
             let junk = self.blocked.futex_waiters.insert(futexid, vec);
             assert!(junk.unwrap().is_empty());
         }
-        to_wake
+        (to_wake, met_pi)
     }
 
     /// Reschedule all threads blocked on a particular futex.
     pub fn wake_futex_waiters(
         &mut self,
-        _waker_dettid: DetTid,
+        waker_dettid: DetTid,
         futexid: FutexID,
         max_to_wake: i32,
         wake_mask: u32,
     ) -> u64 {
-        let to_wake = self.take_futex_wakees(futexid, max_to_wake, wake_mask);
+        self.wake_futex_waiters_until_pi(waker_dettid, futexid, max_to_wake, wake_mask)
+            .0
+    }
+
+    /// `Self::wake_futex_waiters`, also answering whether the wake met a
+    /// FUTEX_LOCK_PI waiter, at which Linux's `futex_wake` stops with `EINVAL`
+    /// after waking the waiters before it (`Self::take_futex_wakees`).
+    pub(crate) fn wake_futex_waiters_until_pi(
+        &mut self,
+        _waker_dettid: DetTid,
+        futexid: FutexID,
+        max_to_wake: i32,
+        wake_mask: u32,
+    ) -> (u64, bool) {
+        let (to_wake, met_pi) = self.take_futex_wakees(futexid, max_to_wake, wake_mask);
         let num_woken = to_wake.len();
         for waiter in to_wake {
             self.wake_futex_waiter(waiter);
         }
-        num_woken as u64
+        (num_woken as u64, met_pi)
     }
 
     /// `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` on plain (non-PI) futexes, as
@@ -7875,23 +8305,40 @@ impl Scheduler {
     ///
     /// The caller checks `nr_wake` and `nr_requeue` are not negative (`-EINVAL`)
     /// and, for `FUTEX_CMP_REQUEUE`, the futex word against `val3` (`-EAGAIN`).
+    ///
+    /// The third value says whether the walk reached a FUTEX_LOCK_PI waiter
+    /// before its counts ran out: `futex_requeue` then stops with `EINVAL`,
+    /// keeping what it woke and moved before (kernel/futex/requeue.c:585-603
+    /// at v6.16). A waiter handed a PI lock heads the queue
+    /// (`PiFutexOwner::handed`).
     pub fn requeue_futex_waiters(
         &mut self,
         from: FutexID,
         to: FutexID,
         nr_wake: usize,
         nr_requeue: usize,
-    ) -> (u64, u64) {
+    ) -> (u64, u64, bool) {
+        // `task_count - nr_wake >= nr_requeue`, in Linux's signed `int`s.
+        let counts_run_out =
+            |task_count: usize| task_count as i128 - nr_wake as i128 >= nr_requeue as i128;
+        if self.pi_futex_hand_over_pending(from) {
+            return (0, 0, !counts_run_out(0));
+        }
         let Some(waiters) = self.blocked.futex_waiters.remove(&from) else {
-            return (0, 0);
+            return (0, 0, false);
         };
         let mut woken = Vec::new();
         let mut moved = Vec::new();
         let mut kept = Vec::with_capacity(waiters.len());
         let mut task_count: usize = 0;
+        let mut met_pi = false;
         for waiter in waiters {
-            // `task_count - nr_wake >= nr_requeue`, in Linux's signed `int`s.
-            if task_count as i128 - nr_wake as i128 >= nr_requeue as i128 {
+            if met_pi || counts_run_out(task_count) {
+                kept.push(waiter);
+                continue;
+            }
+            if waiter.pi {
+                met_pi = true;
                 kept.push(waiter);
                 continue;
             }
@@ -7921,10 +8368,341 @@ impl Scheduler {
             self.wake_futex_waiter(waiter);
         }
         trace!(
-            "[detcore] futex requeue {:?} -> {:?}: woke {}, moved {}",
-            from, to, num_woken, num_moved
+            "[detcore] futex requeue {:?} -> {:?}: woke {}, moved {}, met a PI waiter: {}",
+            from, to, num_woken, num_moved, met_pi
         );
-        (num_woken, num_moved)
+        (num_woken, num_moved, met_pi)
+    }
+
+    /// Whether a FUTEX_LOCK_PI waiter is queued on `futex`.
+    pub(crate) fn has_pi_waiters(&self, futex: FutexID) -> bool {
+        self.blocked
+            .futex_waiters
+            .get(&futex)
+            .is_some_and(|waiters| waiters.iter().any(|waiter| waiter.pi))
+    }
+
+    /// The owner of `futex`'s priority-inheritance state while that state is
+    /// live: PI waiters are queued, or the owner was handed the lock and has not
+    /// yet taken it (`PiFutexOwner::handed`), as a Linux `pi_state` lives while
+    /// a queued waiter holds it. A stale record is dropped.
+    fn live_pi_futex_owner(&mut self, futex: FutexID) -> Option<DetTid> {
+        let record = *self.blocked.pi_futex_owners.get(&futex)?;
+        if record.handed.is_some() || self.has_pi_waiters(futex) {
+            Some(record.owner)
+        } else {
+            self.blocked.pi_futex_owners.remove(&futex);
+            None
+        }
+    }
+
+    /// Whether `futex`'s PI owner was handed the lock and has not yet taken it:
+    /// in Linux that waiter stays queued until it runs. FUTEX_UNLOCK_PI hands
+    /// over only when a PI waiter heads the queue, so it still does. An owner's
+    /// death hands the lock to the first PI waiter wherever plain waiters stand
+    /// (`exit_pi_state_list`); a word with both kinds of waiter is already
+    /// misused, and Detcore treats that waiter as first too.
+    fn pi_futex_hand_over_pending(&self, futex: FutexID) -> bool {
+        self.blocked
+            .pi_futex_owners
+            .get(&futex)
+            .is_some_and(|record| record.handed.is_some())
+    }
+
+    /// Record `owner` as the owner of `futex`'s PI state, with how it was
+    /// handed the lock when it has not yet taken it.
+    fn set_pi_futex_owner(&mut self, futex: FutexID, owner: DetTid, handed: Option<PiHandOver>) {
+        self.blocked.pi_futex_owner_epoch += 1;
+        let since = self.blocked.pi_futex_owner_epoch;
+        self.blocked.pi_futex_owners.insert(
+            futex,
+            PiFutexOwner {
+                owner,
+                since,
+                handed,
+            },
+        );
+    }
+
+    /// What the scheduler holds for the PI futex `futex`, whose word names the
+    /// TID `named`, for a FUTEX_LOCK_PI or FUTEX_UNLOCK_PI by `caller`
+    /// (`PiFutexState`): Linux's `futex_top_waiter` and its `pi_state`. Waiters
+    /// queue in arrival order, a waiter handed the lock still heads the queue,
+    /// and the first PI waiter is also the rt_mutex's top waiter, since every
+    /// guest thread has the same rt_mutex priority (`syscalls::pi_futex`).
+    /// Whether `caller` queueing behind the owner would deadlock
+    /// (`Self::pi_futex_wait_deadlocks`) is answered here, as Linux decides it
+    /// before the caller sleeps.
+    pub(crate) fn pi_futex_state(
+        &mut self,
+        futex: FutexID,
+        named: u32,
+        caller: DetTid,
+    ) -> PiFutexState {
+        let waiters = self.blocked.futex_waiters.get(&futex);
+        let plain_first = waiters
+            .and_then(|waiters| waiters.first())
+            .is_some_and(|waiter| !waiter.pi);
+        let next_owner = self
+            .pi_futex_successor(futex)
+            .and_then(|at| waiters.and_then(|waiters| waiters.get(at)))
+            .map(|waiter| waiter.dettid);
+        if plain_first && !self.pi_futex_hand_over_pending(futex) {
+            return PiFutexState::PlainWaiters;
+        }
+        match self.live_pi_futex_owner(futex) {
+            Some(owner) => PiFutexState::Contended {
+                owner,
+                next_owner,
+                queueing_deadlocks: self.pi_futex_wait_deadlocks(owner, caller),
+            },
+            None => {
+                let named_owner = self.pi_futex_live_owner_named(named);
+                PiFutexState::Unqueued {
+                    named_owner_alive: named_owner.is_some(),
+                    queueing_deadlocks: named_owner
+                        .is_some_and(|owner| self.pi_futex_wait_deadlocks(owner, caller)),
+                }
+            }
+        }
+    }
+
+    /// The live guest thread the TID in a PI futex word names, as
+    /// `find_get_task_by_vpid` finds it and `attach_to_pi_owner` then checks
+    /// its futex exit state (kernel/futex/pi.c:427-465 at v6.16). A retired
+    /// thread, a zombie leader included, has finished its futex cleanup, so
+    /// Linux answers `ESRCH` for it (`handle_exit_race`).
+    ///
+    /// So does a thread that is doomed but has not deregistered yet
+    /// (`Self::pi_futex_thread_doomed`): its own `Exit` was granted, or a
+    /// committed SIGKILL ends its process. Linux makes a locker wait for an
+    /// exiting owner (`handle_exit_race`'s `EBUSY`, `wait_for_owner_exiting`,
+    /// kernel/futex/pi.c:321-331 and 974) and then answers `ESRCH`. A locker
+    /// that attached before the owner reached `exit_mm` would instead queue
+    /// and be handed the lock with `FUTEX_OWNER_DIED`; Detcore orders the
+    /// owner's end at its committed grant or kill, so every later locker takes
+    /// the `ESRCH` branch. The deregistration comes at a host-timed moment, so
+    /// `next_turns` alone would make the answer depend on when it came.
+    fn pi_futex_live_owner_named(&self, named: u32) -> Option<DetTid> {
+        let raw = i32::try_from(named).ok().filter(|raw| *raw != 0)?;
+        let thread = DetTid::from_raw(raw);
+        (self.next_turns.contains_key(&thread) && !self.pi_futex_thread_doomed(thread))
+            .then_some(thread)
+    }
+
+    /// The futex `thread` waits on as a FUTEX_LOCK_PI waiter, if any. A thread
+    /// waits on one futex at most, so the answer does not depend on the pool's
+    /// iteration order.
+    fn pi_futex_waited_on(&self, thread: DetTid) -> Option<FutexID> {
+        self.blocked
+            .futex_waiters
+            .iter()
+            .find(|(_, waiters)| {
+                waiters
+                    .iter()
+                    .any(|waiter| waiter.pi && waiter.dettid == thread)
+            })
+            .map(|(futex, _)| *futex)
+    }
+
+    /// Whether a FUTEX_LOCK_PI waiter queued behind `owner` would deadlock:
+    /// `owner` is `waiter`, or waits through a chain of PI futexes for a lock
+    /// `waiter` owns. The rt_mutex chain walk that `__rt_mutex_start_proxy_lock`
+    /// asks for reports that as `EDEADLK` before the waiter sleeps
+    /// (`rt_mutex_adjust_prio_chain`, kernel/locking/rtmutex.c:860-861 at
+    /// v6.16), as it does a chain longer than `max_lock_depth` (rtmutex.c:704).
+    pub(crate) fn pi_futex_wait_deadlocks(&mut self, mut owner: DetTid, waiter: DetTid) -> bool {
+        /// `max_lock_depth`'s default (kernel/locking/rtmutex_api.c:14 at v6.16).
+        const MAX_LOCK_DEPTH: usize = 1024;
+        for _ in 0..=MAX_LOCK_DEPTH {
+            if owner == waiter {
+                return true;
+            }
+            let Some(next) = self
+                .pi_futex_waited_on(owner)
+                .and_then(|futex| self.live_pi_futex_owner(futex))
+            else {
+                return false;
+            };
+            owner = next;
+        }
+        true
+    }
+
+    /// Park `dettid` as a FUTEX_LOCK_PI waiter on `futex`, queued behind
+    /// `owner`, whom the caller found by `lock_pi_step` in this turn (which
+    /// also ruled out a deadlock). The first PI waiter records `owner` as the
+    /// state's owner (`attach_to_pi_owner`); later ones join the state already
+    /// there. A waiter woken for a signal it then did not find pending sleeps
+    /// again in the place it kept (`FutexWaiter::woken`); any other joins the
+    /// tail.
+    pub(crate) fn sleep_pi_futex_waiter(
+        &mut self,
+        dettid: DetTid,
+        futex: FutexID,
+        maybe_timeout: Option<LogicalTime>,
+        signal_watch: Option<FutexSignalWatch>,
+        owner: DetTid,
+    ) {
+        if self.live_pi_futex_owner(futex).is_none() {
+            self.set_pi_futex_owner(futex, owner, None);
+        }
+        self.park_futex_waiter(&dettid, futex, maybe_timeout, u32::MAX, signal_watch, true);
+    }
+
+    /// Take `dettid` off its futex queue if it is parked there as a
+    /// FUTEX_LOCK_PI waiter, with the futex and its place. A thread waits on
+    /// one futex at most, so the answer does not depend on the pool's
+    /// iteration order.
+    fn take_parked_pi_waiter(&mut self, dettid: DetTid) -> Option<(FutexID, usize, FutexWaiter)> {
+        if !self.next_turns.get(&dettid).is_some_and(is_futex_request) {
+            return None;
+        }
+        let (futex, at) = self
+            .blocked
+            .futex_waiters
+            .iter()
+            .find_map(|(futex, waiters)| {
+                waiters
+                    .iter()
+                    .position(|waiter| waiter.pi && waiter.dettid == dettid)
+                    .map(|at| (*futex, at))
+            })?;
+        let waiters = self.blocked.futex_waiters.get_mut(&futex)?;
+        Some((futex, at, waiters.remove(at)))
+    }
+
+    /// `dettid`'s futex call has ended. A place it kept as a FUTEX_LOCK_PI
+    /// waiter woken for a signal (`FutexWaiter::woken`) is given up: Linux's
+    /// waiter leaves the queue when its call returns, and a restarted or
+    /// repeated call queues at the tail.
+    pub(crate) fn leave_pi_futex_queue(&mut self, dettid: DetTid) {
+        self.blocked.futex_waiters.retain(|_, waiters| {
+            waiters.retain(|waiter| !(waiter.woken && waiter.dettid == dettid));
+            !waiters.is_empty()
+        });
+    }
+
+    /// Whether `thread` will run no more guest code, so it can neither hold
+    /// nor take a PI futex: its own `Exit` was granted (`committed_exits`), a
+    /// committed SIGKILL doomed its process (`pi_doomed_processes`), or it was
+    /// logically killed. Each is decided in a committed turn, while the
+    /// thread's deregistration, which removes it from `next_turns`, comes at a
+    /// host-timed moment.
+    fn pi_futex_thread_doomed(&self, thread: DetTid) -> bool {
+        self.committed_exits.contains(&thread)
+            || self.thread_is_logically_killed(thread)
+            || self
+                .thread_tree
+                .process_of(thread)
+                .is_some_and(|process| self.pi_doomed_processes.contains(&process))
+    }
+
+    /// The longest-waiting PI waiter on `futex` that is not doomed
+    /// (`Self::pi_futex_thread_doomed`). A doomed waiter is passed over: in
+    /// Linux it is leaving the queue with its fatal signal or exit, and in
+    /// Detcore it would otherwise take the lock at a host-timed moment, its
+    /// retirement, only to pass it on.
+    fn pi_futex_successor(&self, futex: FutexID) -> Option<usize> {
+        self.blocked
+            .futex_waiters
+            .get(&futex)?
+            .iter()
+            .position(|waiter| waiter.pi && !self.pi_futex_thread_doomed(waiter.dettid))
+    }
+
+    /// Take the longest-waiting PI waiter that is not doomed off `futex` and
+    /// make it the state's owner, which has yet to take the lock, as
+    /// `pi_state_update_owner` does (kernel/futex/pi.c:46-67 at v6.16) before
+    /// the waiter runs. A successor still `woken` for a signal is already
+    /// runnable, and takes the lock in its turn.
+    fn take_pi_futex_successor(&mut self, futex: FutexID, how: PiHandOver) -> Option<FutexWaiter> {
+        let position = self.pi_futex_successor(futex)?;
+        let waiters = self.blocked.futex_waiters.get_mut(&futex)?;
+        let successor = waiters.remove(position);
+        if waiters.is_empty() {
+            self.blocked.futex_waiters.remove(&futex);
+        }
+        self.set_pi_futex_owner(futex, successor.dettid, Some(how));
+        Some(successor)
+    }
+
+    /// FUTEX_UNLOCK_PI's hand-over, in the owner's turn (`wake_futex_pi`,
+    /// kernel/futex/pi.c:614-669 at v6.16): the longest PI waiter becomes the
+    /// owner and is woken. Returns it, or `None` when no PI waiter is queued.
+    pub(crate) fn hand_off_pi_futex(&mut self, futex: FutexID) -> Option<DetTid> {
+        let successor = self.take_pi_futex_successor(futex, PiHandOver::Unlock)?;
+        let to = successor.dettid;
+        if !successor.woken {
+            self.wake_futex_waiter(successor);
+        }
+        Some(to)
+    }
+
+    /// A woken FUTEX_LOCK_PI waiter takes the lock it was handed, as it leaves
+    /// the futex queue in Linux (`futex_unqueue_pi`). Returns how it was handed
+    /// `futex`, or `None` when it was not; the state is dropped when no PI
+    /// waiter remains.
+    pub(crate) fn take_handed_pi_futex(
+        &mut self,
+        futex: FutexID,
+        dettid: DetTid,
+    ) -> Option<PiHandOver> {
+        let record = self.blocked.pi_futex_owners.get_mut(&futex)?;
+        if record.owner != dettid {
+            return None;
+        }
+        let how = record.handed.take()?;
+        let _ = self.live_pi_futex_owner(futex);
+        Some(how)
+    }
+
+    /// Linux's `exit_pi_state_list` (kernel/futex/core.c:1323-1402 at v6.16)
+    /// for `dead`, at its own committed `Exit` grant (`Self::commit_own_exit`),
+    /// at the commit of a SIGKILL that dooms its process
+    /// (`Self::release_pi_futexes_of_killed`), or else at its retirement: each
+    /// PI futex it owns goes to its longest waiter that is not doomed, latest
+    /// acquired first (`PiFutexOwner::since`), and the waiter writes its TID
+    /// when it runs (`pi_futex::owner_death_word`). A word with no waiter left
+    /// keeps what the owner's exit wrote, and its state is dropped. Linux runs
+    /// this after the robust list walk (`futex_cleanup`, core.c:1407-1423),
+    /// which already marked a robust word `FUTEX_OWNER_DIED`.
+    ///
+    /// The successor is admitted at the next deterministic drain, like the
+    /// other wakes a thread's retirement makes (`Self::wake_futex_child_cleartid`).
+    /// A successful exec releases the caller's PI futexes the same way, at its
+    /// `MarkPastFirstExecve` edge (`futex_exec_release`, core.c:1490-1506).
+    // TODO-HUMAN-REVIEW(#4616): Review the owner-death hand-over of PI futexes,
+    // which changes how a dying or exec'ing owner's waiters are scheduled.
+    pub(crate) fn release_pi_futexes_of(&mut self, dead: DetTid) {
+        let mut owned: Vec<(u64, FutexID)> = self
+            .blocked
+            .pi_futex_owners
+            .iter()
+            .filter(|(_, record)| record.owner == dead)
+            .map(|(futex, record)| (record.since, *futex))
+            .collect();
+        owned.sort_unstable_by_key(|&(since, _)| std::cmp::Reverse(since));
+        for (_, futex) in owned {
+            match self.take_pi_futex_successor(futex, PiHandOver::OwnerDeath) {
+                Some(successor) => {
+                    debug!(
+                        "[detcore] PI futex {:?} owner dtid {} died; handing it to dtid {}",
+                        futex, dead, successor.dettid
+                    );
+                    if successor.woken {
+                        // Already runnable: it takes the lock in its turn.
+                    } else if self.backend_failed() {
+                        self.wake_futex_waiter(successor);
+                    } else {
+                        self.admit_futex_waiter_after_exit(successor);
+                    }
+                }
+                None => {
+                    self.blocked.pi_futex_owners.remove(&futex);
+                }
+            }
+        }
     }
 
     /// Whether `tid` waits for admission at the next deterministic drain.
@@ -7948,21 +8726,29 @@ impl Scheduler {
         wakes
             .iter()
             .map(|(_owner, futexid)| {
-                let to_wake = self.take_futex_wakees(*futexid, 1, u32::MAX);
+                // A PI waiter in the way ends the wake, as `futex_wake`'s
+                // EINVAL, which the kernel's exit path ignores.
+                let (to_wake, _) = self.take_futex_wakees(*futexid, 1, u32::MAX);
                 let num_woken = to_wake.len();
                 for waiter in to_wake {
-                    let waiterid = waiter.dettid;
-                    self.blocked.timed_waiters.remove(waiterid);
-                    let next_turn = self
-                        .next_turns
-                        .get_mut(&waiterid)
-                        .expect("Thread must have an entry in next_turns");
-                    assert_futex_request(next_turn);
-                    self.admit_to_run_queue(waiterid, AdmitIntent::Fixed(AdmitSide::Back));
+                    self.admit_futex_waiter_after_exit(waiter);
                 }
                 num_woken as u64
             })
             .collect()
+    }
+
+    /// Admit a futex waiter that a thread's retirement woke at the next
+    /// deterministic run-queue drain (`Self::wake_futex_waiters_after_exit`).
+    fn admit_futex_waiter_after_exit(&mut self, waiter: FutexWaiter) {
+        let waiterid = waiter.dettid;
+        self.blocked.timed_waiters.remove(waiterid);
+        let next_turn = self
+            .next_turns
+            .get_mut(&waiterid)
+            .expect("Thread must have an entry in next_turns");
+        assert_futex_request(next_turn);
+        self.admit_to_run_queue(waiterid, AdmitIntent::Fixed(AdmitSide::Back));
     }
 
     /// Simulate the effect of CLONE_CHILD_CLEARTID.
@@ -8349,21 +9135,107 @@ impl Scheduler {
         if std::mem::take(&mut self.fast_forward_for_alone_poller) {
             self.fast_forward_to_next_finite_deadline(global_time);
         }
+        // No thread runs until the replayed thread wakes: committed time
+        // catches up in the next pass's step 1 (a replay with callback
+        // checkpoints holds only once the wake is due), and each pass then
+        // pops one due timed event, the replayed thread's last if others pop
+        // ahead of it.
+        let held_for_replayed_wake = self.replay_fast_forward_to_recorded_wake(global_time);
         self.step2b_process_timed(global_time);
-        self.step2b_restore_due_pollers();
-        self.upgrade_pollers_on_time();
+        if !held_for_replayed_wake {
+            self.step2b_restore_due_pollers();
+            self.upgrade_pollers_on_time();
+        }
         // A timed signal that just armed a background thread is followed by an
         // empty pass, so the barrier above requeues it at the top of the next
-        // one whether or not its continuation is already posted.
+        // one whether or not its continuation is already posted. A held pass
+        // ends here too, after the same backend-failure and control-barrier
+        // checks as any other.
         if self.backend_failed()
             || self.control_barrier()
             || !self.blocked.signaled_background.is_empty()
+            || held_for_replayed_wake
         {
             return Err(SkipTurn);
         }
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred();
         self.step2d_handle_empty_queue(global_time)
+    }
+
+    /// Under `--replay-schedule-from`, when the next recorded event belongs to a
+    /// thread asleep until a finite deadline, move global time to that deadline
+    /// and report that the pass must wait for the wake (true).
+    ///
+    /// The recorded schedule is authoritative: if the recording resumed that
+    /// thread here, its deadline had passed in the recording, since any wake by
+    /// another thread would already have been replayed and taken it out of the
+    /// timed waiters. A replay can reach this point with less virtual time
+    /// elapsed than the recording (its context switches are replay turns, which
+    /// charge no scheduler time, where the recording's were ordinary turns), and
+    /// it would then run another thread here and leave the schedule. Advancing
+    /// time keeps it monotonic and makes the recorded wake legal; timed waiters
+    /// with earlier deadlines wake on the way, as they would have in the
+    /// recording.
+    ///
+    /// The pass waits only while the wake is not yet due: committed time is
+    /// behind the deadline, or another timed event pops first (an earlier
+    /// deadline, or the same deadline ordered ahead: every timer signal
+    /// sorts before every thread at one deadline, threads in thread order).
+    /// Once the thread's own wake is next to pop, the ordinary pass pops it
+    /// and goes on to its turn, as the recording's pass did.
+    ///
+    /// A schedule that carries callback checkpoints replays its software
+    /// expiry turns from them (`callback_history_active`), so it keeps the
+    /// recording's time and its time is never moved here. Its passes still
+    /// wait while another due timed event pops ahead of the replayed thread's
+    /// due wake: a pass pops one due event and puts a woken thread at the
+    /// front of its band, so a thread whose earlier deadline pops first would
+    /// take the turn the recording gave the replayed thread (the recording's
+    /// priorities ordered the two). One without checkpoints, such as the
+    /// trials `hermit analyze` wrote before they carried them, has nothing
+    /// else to wake the thread on time.
+    /// After a hard desync the cursor stays on the event it expected, so the
+    /// jump can repeat for that thread; it still only moves time forward.
+    fn replay_fast_forward_to_recorded_wake(
+        &mut self,
+        global_time: &Arc<Mutex<GlobalTime>>,
+    ) -> bool {
+        let Some((tid, _)) = self
+            .replayer
+            .as_ref()
+            .and_then(|replayer| replayer.next_resume())
+        else {
+            return false;
+        };
+        let Some(deadline) = self.blocked.timed_waiters.thread_deadline(tid) else {
+            return false;
+        };
+        if deadline.is_indefinite() {
+            return false;
+        }
+        // Another timed event pops ahead of the replayed thread's wake: one
+        // with an earlier deadline, or with the same deadline ordered first
+        // (`TimedEvent`'s order: timer signals, then threads by id).
+        let another_pops_first = self
+            .blocked
+            .timed_waiters
+            .iter()
+            .next()
+            .is_some_and(|(_, event)| event != TimedEvent::ThreadEvt(tid));
+        if self.callback_history_active {
+            return deadline <= self.committed_time && another_pops_first;
+        }
+        let mut gt = global_time.lock().unwrap();
+        let now = gt.as_nanos();
+        if deadline > now {
+            info!(
+                "[scheduler] The replayed schedule resumes dtid {} next, which sleeps until {}; skipping global time ahead to it.",
+                tid, deadline
+            );
+            gt.add_extra_time(deadline.duration_since(now));
+        }
+        deadline > self.committed_time || another_pops_first
     }
 
     /// Move global time to the earliest finite timed deadline, if it lies
@@ -8407,7 +9279,8 @@ impl Scheduler {
     pub(crate) const SIGKILL_FENCE_VALVE: Duration = Duration::from_secs(30);
 
     /// How long, in host time, an empty run queue waits for Linux's kill of
-    /// the processes of an ended PID namespace to be reported
+    /// the processes of an ended PID namespace, or of the rest of a thread
+    /// group a fatal signal ends, to be reported
     /// (`report_terminal_deadlock_unless_zap_pending`) before the run is
     /// stopped by name. A backend that never reports such a death (an
     /// in-guest tool that a SIGKILL gives no exit hook) would otherwise wait
@@ -8504,14 +9377,30 @@ impl Scheduler {
     /// deterministic-work-first gate as `step2c_process_io_blockers`: a deferred
     /// signal is delivered only once the run queue holds no ordinary (non-poller)
     /// guest work, so its commit order is fixed by the scheduler rather than by
-    /// host signal-arrival timing. Runs after external-IO harvesting so a ready
-    /// IO continuation is always ordered ahead of a deferred signal.
+    /// host signal-arrival timing. Where that gate keeps the deliveries parked,
+    /// a schedule replay still readmits the one whose thread its recorded
+    /// schedule runs next once only polling retries are queued
+    /// (`replay_readmits_parked_sigchld`). Runs after external-IO harvesting so
+    /// a ready IO continuation is always ordered ahead of a deferred signal.
     fn step2e_process_signal_deferred(&mut self) {
         if self.blocked.sigchld_deferred.is_empty() {
             return;
         }
         let only_pollers = self.run_queue.only_pollers() && !self.vfork_child_runs_turn();
         if !self.run_queue.is_empty() && !only_pollers {
+            // Where this gate keeps the deliveries parked, a schedule replay
+            // still readmits the one whose thread its recorded schedule runs
+            // next once nothing but polling retries is queued, the test a
+            // delivery takes before it is parked (`sigchld_waits_behind_work`):
+            // replay-held pollers count as work for `only_pollers`, so the
+            // gate would keep it parked past its turn. Where the gate admits
+            // every parked delivery, below, nothing changes.
+            if let Some(next) = self.replay_readmits_parked_sigchld() {
+                info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", next);
+                self.blocked.sigchld_deferred.remove(&next);
+                self.blocked.sigchld_ready.insert(next);
+                self.readmit_ready_thread(next);
+            }
             return;
         }
         // BTreeSet drains in sorted DetTid order, giving a canonical admission
@@ -9827,18 +10716,8 @@ impl Scheduler {
                 }
             }
         }
-        // A thread whose exit waits for a sibling's delivery permit
-        // (`exits_awaiting_permit`) is still live, and so still among
-        // `process_signal_targets`, but it is exiting: the kernel passes it by
-        // (`wants_signal` skips an exiting thread), and a signal sent to it
-        // would never be delivered (`wake_signaled_guest`). So it is not chosen
-        // here; a live sibling is (the Codex review of
-        // https://github.com/rrnewton/hermit/issues/4367).
         match self.thread_status(detpid) {
-            ThreadStatus::Gone => self
-                .process_signal_targets(detpid)
-                .into_iter()
-                .find(|thread| !self.parked.exits_awaiting_permit.contains(thread)),
+            ThreadStatus::Gone => self.process_signal_targets(detpid).into_iter().next(),
             ThreadStatus::Running | ThreadStatus::NotRunning => Some(detpid),
         }
     }
@@ -10239,6 +11118,7 @@ impl Scheduler {
         self.work_span_forget_exit(parent, child);
         self.completed_physical_process_exits.remove(&child);
         self.sigkilled_processes.remove(&child);
+        self.pi_doomed_processes.remove(&child);
         self.thread_tree.process_parent.remove(&child);
         self.thread_tree.process_wait.remove(&child);
         self.thread_tree.child_subreapers.remove(&child);
@@ -10509,14 +11389,24 @@ impl Scheduler {
     /// id names its whole thread group (<https://github.com/rrnewton/hermit/issues/4094>).
     /// `None` when the id names neither a thread group nor a live thread: the
     /// id of an exited thread names nothing.
+    ///
+    /// `thread_group_leaders` keeps every id that ever led a process. Linux
+    /// frees a process's id only once the process is reaped, and may then
+    /// give it to a thread of another process; `thread_to_leader` then names
+    /// that process, and the id is a plain thread id like any other: it names
+    /// that process while the thread lives, and nothing (ESRCH) after it has
+    /// exited, not the process it once led.
     pub fn signal_target_process(&self, detpid: DetPid) -> Option<DetPid> {
-        if self.thread_tree.thread_group_leaders.contains(&detpid) {
+        let current = self.thread_tree.thread_to_leader.get(&detpid).copied();
+        if self.thread_tree.thread_group_leaders.contains(&detpid)
+            && current.is_none_or(|leader| leader == detpid)
+        {
             return Some(detpid);
         }
         if !self.next_turns.contains_key(&detpid) {
             return None;
         }
-        self.thread_tree.thread_to_leader.get(&detpid).copied()
+        current
     }
 
     /// What the `sigev_notify_thread_id` `named` of a `timer_create` in
@@ -10581,10 +11471,44 @@ impl Scheduler {
         let Some(leader) = self.signal_target_process(detpid) else {
             return Vec::new();
         };
-        let mut targets = self.thread_tree.my_thread_group(&leader);
-        targets.retain(|tid| self.next_turns.contains_key(tid));
-        targets.sort();
-        targets
+        self.live_thread_group(&leader).collect()
+    }
+
+    /// The live threads of the thread group that `member` belongs to, in
+    /// DetTid order: the threads with turn state (`next_turns`) whose group
+    /// leader is that group's. Without reused thread IDs these are the threads
+    /// of `ThreadTree::my_thread_group` that have turn state, but finding them
+    /// costs the run's live threads, not every thread the group ever had: the
+    /// tree keeps exited threads, and every thread exit asks this question, so
+    /// walking the tree made a guest that starts and joins N threads cost
+    /// O(N^2). After Linux reuses a thread ID the tree can also list the
+    /// thread under its earlier group, or twice, and `thread_group_leaders`
+    /// still holds an ID that once led a process; `thread_to_leader`, which
+    /// maps every registered thread (a leader to itself), holds its current
+    /// group.
+    pub(crate) fn live_thread_group(&self, member: &DetTid) -> impl Iterator<Item = DetTid> + '_ {
+        let leader = *self
+            .thread_tree
+            .thread_to_leader
+            .get(member)
+            .expect("thread must be in to_leader table");
+        self.live_process_threads(leader)
+    }
+
+    /// The live threads of the process `process`, in DetTid order: the
+    /// threads with turn state whose group leader is `process`. Unlike
+    /// `live_thread_group`, this names the process by its ID, not by one of
+    /// its members: after Linux gives the ID of a process that has gone to a
+    /// thread of another process, the gone process has no live threads here,
+    /// and the other process's threads are not taken for its own.
+    pub(crate) fn live_process_threads(
+        &self,
+        process: DetPid,
+    ) -> impl Iterator<Item = DetTid> + '_ {
+        self.next_turns
+            .keys()
+            .copied()
+            .filter(move |tid| self.thread_tree.thread_to_leader.get(tid) == Some(&process))
     }
 
     fn wake_timed_event(&mut self, time_ns: LogicalTime, dettid: DetTid) {
@@ -11021,21 +11945,6 @@ impl Scheduler {
     ) {
         let signal = signal.into();
         if self.in_guest_fatal_alarm_pending(dettid) {
-            return;
-        }
-        // A thread whose exit waits for a sibling's delivery permit
-        // (`exits_awaiting_permit`) has already made its exit call, and Linux
-        // runs an exit to completion: a signal sent to an exiting thread is
-        // never delivered to it, and process-directed signals pass it by
-        // (`thread_status` reports it gone, so no target selection picks it).
-        // Its retained `Exit` request is left as it is, and the permit's
-        // release re-admits it (https://github.com/rrnewton/hermit/issues/4367).
-        // Before, it was found in no pool, and the send panicked.
-        if self.parked.exits_awaiting_permit.contains(&dettid) {
-            debug!(
-                "[dtid {}] signal {} not woken: the thread is exiting.",
-                dettid, signal
-            );
             return;
         }
         // The physical send has already happened. Preserve its real kernel
@@ -12599,7 +13508,19 @@ impl Scheduler {
             "[dtid {}] removing blocking entries and requeuing thread",
             dettid
         );
+        let pi_waiter = self.take_parked_pi_waiter(dettid);
         self.remove_blocking_entries(&dettid);
+        if let Some((futex, at, waiter)) = pi_waiter {
+            // A PI waiter keeps its place through the wake
+            // (`FutexWaiter::woken`).
+            self.blocked.futex_waiters.entry(futex).or_default().insert(
+                at,
+                FutexWaiter {
+                    woken: true,
+                    ..waiter
+                },
+            );
+        }
         // The substituted request resolves any polling wait the thread was in.
         self.end_sigalrm_polling_wait(dettid);
 
@@ -12688,23 +13609,6 @@ impl Scheduler {
                     && !self.vfork_barriers.contains_key(*child)
             })
             .copied()
-    }
-
-    /// The vfork barriers' children whose call runs in the background
-    /// (`external_io_blockers`), in thread order. Under the rejoin log
-    /// `step2c_process_io_blockers` readmits each as soon as its call finishes
-    /// and logs the turn (<https://github.com/rrnewton/hermit/issues/4211>).
-    fn backgrounded_vfork_children(&self) -> impl Iterator<Item = DetTid> + '_ {
-        let mut children: Vec<DetTid> = self
-            .vfork_barriers
-            .values()
-            .flatten()
-            .copied()
-            .filter(|child| self.blocked.external_io_blockers.contains_key(child))
-            .collect();
-        children.sort();
-        children.dedup();
-        children.into_iter()
     }
 
     /// Whether `dtid`'s backgrounded call, or signal-less wait, has finished,
@@ -12804,10 +13708,11 @@ impl Scheduler {
     /// polling): step 3 then selects it first. The deterministic-work-first
     /// gates count it as ordinary work even when its priority is in the last
     /// band, where `only_pollers` counts every entry as a poller, so that no
-    /// background call or deferred signal is admitted between its turns at a
-    /// moment the host chose. The fence that step 3 applies and the gates that
-    /// admit host-timed completions then agree on what is runnable work (Codex
-    /// re-check of https://github.com/rrnewton/hermit/pull/4205).
+    /// deferred signal, and no background call whose turn no rejoin log
+    /// records, is admitted between its turns at a moment the host chose. The
+    /// fence that step 3 applies and the gates that admit host-timed
+    /// completions then agree on what is runnable work (Codex re-check of
+    /// https://github.com/rrnewton/hermit/pull/4205).
     fn vfork_child_runs_turn(&self) -> bool {
         self.vfork_barriers
             .values()
@@ -12877,9 +13782,10 @@ impl Scheduler {
                 }
             };
 
-            // FIXME TODO (T137183027): for record/replay to work properly, we need to ALLOW the
-            // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
-            // the meantime, use a deterministic eager policy once there is no other runnable work.
+            // Record and replay. Which pass finds a background call finished is
+            // host-timed, so the rejoin log records the turn of each readmission
+            // (`log_rejoin`) and replay readmits the call at that turn
+            // (`step2c_replay_rejoin`) (T137183027).
             if self.recordreplay_modes {
                 // A call that replay serves from the recording cannot block, but it
                 // changes guest state while it runs: the stand-in for an accepted
@@ -12900,68 +13806,28 @@ impl Scheduler {
                     return Err(SkipTurn);
                 }
 
-                // Only *real* deterministic work should defer external-IO harvesting.
-                // Internal pollers sit at LAST_PRIORITY and are frequently spinning on
-                // the very result an external-IO blocker will produce (e.g. the reader
-                // side of `echo hi | cat`, where one stage uses InternalIOPolling while
-                // its peer is backgrounded on BlockingExternalIO). Treat a run queue
-                // that holds only pollers as "no deterministic work" so we still harvest
-                // completed IO below; a queued poller must not starve a ready blocker.
-                // Nor must a thread queued because it yielded: a sibling spinning
-                // on `sched_yield` is always queued, and it starved a finished
-                // background pselect6 forever (https://github.com/rrnewton/hermit/issues/4092).
-                // Whether the call has finished is host-timed, as for a poller;
-                // `log_rejoin` records the turn of the readmission for replay.
-                // A vfork barrier's child that will run a turn is work too,
-                // whatever its priority (see `vfork_child_runs_turn`).
-                let only_pollers =
-                    self.run_queue.only_pollers_or_yielders() && !self.vfork_child_runs_turn();
-
-                // Deterministic work is runnable: let it proceed. Waiting here while such
-                // work exists can deadlock thread creation -- the parent and new child
-                // cannot complete clone while an existing worker blocks indefinitely in
-                // epoll_wait.
-                //
-                // With the rejoin log active there is no vfork-gated child
-                // (`vfork_gated_background_child`): a backgrounded vfork child
-                // is readmitted below and logged like any other call. Without
-                // it, the gated child is readmitted here unlogged: until then
-                // no turn can commit (step 3 waits for it), so the turn of its
-                // readmission does not depend on when its call finished.
-                if !self.run_queue.is_empty() && !only_pollers {
-                    if let Some(child) = self.vfork_gated_background_child()
-                        && ready.contains(&child)
-                    {
-                        requeue_ready(self, &[child]);
-                    }
-                    // With the rejoin log active, a backgrounded vfork child is
-                    // readmitted as soon as its call finishes, even though other
-                    // work is runnable, and the turn is logged: a sibling of the
-                    // vfork parent can spin until the child is done, and deferring
-                    // the child behind it would never readmit it. Replay follows
-                    // the log here too, so a readmission due now is applied in the
-                    // same branch the recording took (the schedules agree up to
-                    // this turn, so the run queue is the same)
-                    // (https://github.com/rrnewton/hermit/issues/4211).
-                    if self.rejoin_replay.is_some() {
-                        if self.rejoin_due_now() {
-                            return self.step2c_replay_rejoin(&blockers, &ready, requeue_ready);
-                        }
-                    } else if self.rejoin_writer.is_some() {
-                        let children: Vec<DetTid> = self
-                            .backgrounded_vfork_children()
-                            .filter(|child| ready.contains(child))
-                            .collect();
-                        if !children.is_empty() {
-                            self.log_rejoin(&blockers, &children);
-                            requeue_ready(self, &children);
-                        }
-                    }
+                // Record readmits every call it finds finished, in the first pass
+                // that finds it, whatever else is runnable, and logs the turn.
+                // Runnable work can be waiting for that very call: a sibling of a
+                // vfork parent that spins until the child is done
+                // (https://github.com/rrnewton/hermit/issues/4211), or threads whose
+                // short sleeps fall due at every turn while the pollers they wait
+                // for stay backgrounded. Deferring the call behind such work never
+                // readmitted it. When a vfork child's release edge was one the
+                // scheduler committed (exec, Exit, logical kill), step2a has already
+                // dropped the parent's barrier or ended the pass, so no barrier
+                // holder is ready here; only a release the scheduler did not commit
+                // can post a continuation after step2a's read.
+                if self.rejoin_writer.is_some() && !ready.is_empty() {
+                    self.log_rejoin(&blockers, &ready);
+                    requeue_ready(self, &ready);
                     return Ok(());
                 }
 
-                // Replay readmits each call at the turn the recording logged, not when
-                // it finishes (see `rejoin_log`).
+                // Replay readmits each call at the turn the recording logged, not
+                // when it finishes (see `rejoin_log`), whatever else is queued: the
+                // schedules agree up to that turn, so replay reaches it with the
+                // recording's run queue.
                 if self.rejoin_replay.is_some() {
                     // As record does below: with nothing to run and no
                     // readmission due, a parent parked for its deferred
@@ -12973,6 +13839,42 @@ impl Scheduler {
                         return Ok(());
                     }
                     return self.step2c_replay_rejoin(&blockers, &ready, requeue_ready);
+                }
+
+                // With a rejoin log, record has readmitted every finished call above,
+                // and what follows only lets queued threads run, or waits while
+                // nothing is queued. Without one (a configuration only unit tests
+                // build), the gate below decides when a finished call is readmitted.
+                // Pollers sit at LAST_PRIORITY and often spin on the very result an
+                // external-IO blocker will produce (e.g. the reader side of
+                // `echo hi | cat`, where one stage uses InternalIOPolling while its
+                // peer is backgrounded on BlockingExternalIO), and a thread queued
+                // because it yielded asks for another to run first
+                // (https://github.com/rrnewton/hermit/issues/4092), so a run queue
+                // holding only those counts as no runnable work. A vfork barrier's
+                // child that will run a turn is work, whatever its priority (see
+                // `vfork_child_runs_turn`).
+                let only_pollers =
+                    self.run_queue.only_pollers_or_yielders() && !self.vfork_child_runs_turn();
+
+                // Deterministic work is runnable: let it proceed. Waiting here while such
+                // work exists can deadlock thread creation -- the parent and new child
+                // cannot complete clone while an existing worker blocks indefinitely in
+                // epoll_wait.
+                //
+                // With the rejoin log active there is no vfork-gated child
+                // (`vfork_gated_background_child`): a backgrounded vfork child
+                // is readmitted above and logged like any other call. Without
+                // it, the gated child is readmitted here unlogged: until then
+                // no turn can commit (step 3 waits for it), so the turn of its
+                // readmission does not depend on when its call finished.
+                if !self.run_queue.is_empty() && !only_pollers {
+                    if let Some(child) = self.vfork_gated_background_child()
+                        && ready.contains(&child)
+                    {
+                        requeue_ready(self, &[child]);
+                    }
+                    return Ok(());
                 }
 
                 // Readmit those calls first, in thread order; every one has finished.
@@ -12989,11 +13891,11 @@ impl Scheduler {
                 // return early forever, so the completed read/write was never rescheduled
                 // and the poller spun on data that never arrived.
                 //
-                // Which pass finds a call finished depends on host timing, so record
-                // logs the turn of each readmission for replay to follow.
+                // With a rejoin log, record readmitted and logged every finished call
+                // above, so a call is still ready here only without one (a Detcore
+                // configuration without a recording directory), where nothing logs it.
                 // TODO-HUMAN-REVIEW(PR-3908)
                 if !ready.is_empty() {
-                    self.log_rejoin(&blockers, &ready);
                     requeue_ready(self, &ready);
                     return Ok(());
                 }
@@ -13042,20 +13944,20 @@ impl Scheduler {
 
                 // No completed IO yet, and nothing to run. The
                 // blocking syscalls are executing in the host kernel; go around the loop
-                // and re-check readiness. (Still a busy-wait; see T137183027 for the
-                // record-the-nondeterministic-event fix.)
+                // and re-check readiness. (Still a busy-wait.)
                 trace!(
                     "[step2] eagerly waiting on external IO for dtids {:?}. spinning.",
                     &self.blocked.external_io_blockers
                 );
                 std::thread::yield_now();
                 return Err(SkipTurn);
-            } // End region which should be deleted.
+            } // End of the record and replay policy.
 
-            // Use the same deterministic-work-first policy as record/replay. Host
-            // completion timing must not decide whether a ready continuation overtakes
-            // guest work that was already runnable. Pollers are excluded because they
-            // commonly wait for the completed operation and would otherwise starve it.
+            // Run mode has no rejoin log, so host completion timing must not decide
+            // whether a ready continuation overtakes guest work that was already
+            // runnable: a finished call is readmitted only once no such work is queued.
+            // Pollers are excluded because they commonly wait for the completed
+            // operation and would otherwise starve it.
             let only_pollers = self.run_queue.only_pollers() && !self.vfork_child_runs_turn();
             if !self.run_queue.is_empty() && !only_pollers {
                 if let Some(child) = self.vfork_gated_background_child()
@@ -13135,7 +14037,9 @@ impl Scheduler {
     ///   turn could commit. A call still unfinished after `REJOIN_STALL_VALVE`
     ///   is refused rather than waited on forever.
     /// - Until then a finished call stays parked, and queued threads run as
-    ///   they did in record.
+    ///   they did in record. Such a pass also ends any earlier wait
+    ///   (`rejoin_stalled_since`), so a later due readmission gets the whole
+    ///   `REJOIN_STALL_VALVE`.
     /// - Replay refuses if it reaches a later turn than a logged readmission,
     ///   or if the parked call is not the logged one.
     ///   With nothing runnable and no readmission due, record spun until a call
@@ -13612,9 +14516,10 @@ impl Scheduler {
     }
 
     /// [`Self::report_terminal_deadlock`], except while a process Linux is
-    /// killing for its namespace's end still has a thread
-    /// ([`Self::awaiting_namespace_zap`]): that thread, often a `pause(2)`
-    /// with no deadline, is about to die, so the state is not terminal. Spin
+    /// killing for its namespace's end, or for a fatal signal, still has a
+    /// thread ([`Self::awaiting_namespace_zap`]): that thread, often a
+    /// `pause(2)` or a futex wait with no deadline, is about to die, so the
+    /// state is not terminal. Spin
     /// until the backend reports the kill, as the external-IO wait does, but
     /// at most `namespace_zap_valve`: a backend that never reports the death
     /// gets a named deadlock instead of an unbounded wait.
@@ -13628,8 +14533,8 @@ impl Scheduler {
             .get_or_insert_with(std::time::Instant::now);
         if since.elapsed() < self.namespace_zap_valve {
             trace!(
-                "[scheduler] empty run-queue while Linux kills {:?} for their PID namespace's end. SPINNING!",
-                &self.namespace_zap_victims
+                "[scheduler] empty run-queue while Linux kills {:?} for their PID namespace's end and {:?} for a fatal signal. SPINNING!",
+                &self.namespace_zap_victims, &self.signal_death_victims
             );
             std::thread::yield_now();
             return SkipTurn;
@@ -13642,10 +14547,17 @@ impl Scheduler {
             && !self.terminal_is_refusal
             && let Some(report) = self.terminal_deadlock.as_mut()
         {
-            *report = format!(
-                "HERMIT_DEADLOCK: processes {:?}, which Linux kills because their PID namespace's init exited, were not reported dead within {:?}\n{}",
-                self.namespace_zap_victims, self.namespace_zap_valve, report
-            );
+            *report = if self.namespace_zap_victims.is_empty() {
+                format!(
+                    "HERMIT_DEADLOCK: processes {:?}, which a fatal signal ends, were not reported dead within {:?}\n{}",
+                    self.signal_death_victims, self.namespace_zap_valve, report
+                )
+            } else {
+                format!(
+                    "HERMIT_DEADLOCK: processes {:?}, which Linux kills because their PID namespace's init exited, were not reported dead within {:?}\n{}",
+                    self.namespace_zap_victims, self.namespace_zap_valve, report
+                )
+            };
         }
         skip
     }
@@ -13968,7 +14880,17 @@ impl Scheduler {
             // caller), so it is the thread that takes the process-directed
             // copy (`sigchld_takers`).
             let taker = self.first_sigchld_taker();
-            let next_dtid = match self.queued_group_exit_decider().or(taker).or(gated_child) {
+            // So does the thread a guest's process-directed signal was sent
+            // to: Linux woke no ptrace-stopped thread, so the copy waits in
+            // the shared queue for the first thread that resumes and does not
+            // block it (`process_signal_takers`).
+            let process_taker = self.first_process_signal_taker();
+            let next_dtid = match self
+                .queued_group_exit_decider()
+                .or(taker)
+                .or(process_taker)
+                .or(gated_child)
+            {
                 Some(child) => self
                     .run_queue
                     .tentative_pop_tid(child)
@@ -14127,8 +15049,40 @@ impl Scheduler {
             // Requeue the thread as a poller
             let popped = self.run_queue.commit_tentative_pop();
             assert_eq!(dettid, popped);
-            self.run_queue
-                .push_poller(dettid, self.get_priority(dettid), rs.poll_attempt);
+            let priority = self.get_priority(dettid);
+            // The replayed schedule's next event is this retry: a poll backoff
+            // would hand the turn to another thread and leave the schedule. A
+            // recorded unsuccessful attempt keeps the turn. So does a recorded
+            // completion, except a retry that is a second one after an attempt
+            // that moved nothing on guest state alone (`polls_guest_state_only`):
+            // only another thread's action can make that retry succeed, and the
+            // recording ran it as a retry with no event of its own (a FIFO open
+            // waiting for its peer's open), so it backs off as before; kept
+            // running, it would never let that thread run. A retry whose outcome
+            // the host can change keeps the turn and tries again (an event-loop
+            // poll whose data arrives a few attempts later): backing it off
+            // would run another thread, an event the recording does not have
+            // there. The first retry keeps the turn, since the grant before it
+            // may have finished other calls, which counts as progress. The
+            // recorded event must name the syscall the thread has in flight,
+            // and a thread keeps at most `REPLAY_KEPT_RETRY_LIMIT` turns in a
+            // row while the schedule does not advance: a replay that has
+            // drifted can wait on a poll nothing in the run will satisfy (an
+            // epoll or a socket the host can change, whose peer's write the
+            // drift skipped), and only the backoff lets another thread run.
+            let keeps_turn = self.replayer.as_mut().is_some_and(|replayer| {
+                replayer.next_is_retry_by(dettid)
+                    && (replayer.next_is_failed_attempt_by(dettid)
+                        || !(rs.polls_guest_state_only
+                            && Self::retries_its_call_without_progress(rs)))
+                    && replayer.keep_retry_turn(dettid)
+            });
+            if keeps_turn {
+                self.run_queue.push_back(dettid, priority);
+            } else {
+                self.run_queue
+                    .push_poller(dettid, priority, rs.poll_attempt);
+            }
             // Before the count reset below hides that this is a retry.
             self.note_sigalrm_polling_wait(dettid, rs);
             self.work_span_note_wait(dettid, rs);
@@ -14505,14 +15459,6 @@ impl Scheduler {
                 if self.group_exit_decider == Some(dettid) {
                     self.group_exit_decider = None;
                 }
-                if self.exit_awaits_sibling_permit(dettid, *process) {
-                    info!(
-                        "[scheduler] NONCOMMIT turn {}, parking dettid {}'s exit behind a sibling's signal delivery",
-                        self.turn, dettid
-                    );
-                    self.parked.exits_awaiting_permit.insert(dettid);
-                    return self.skip_turn_blocked(dettid);
-                }
                 let reserve_mode = match self.reserve_exit_boundary(dettid, *process, *mm, *group) {
                     Ok(mode) => mode,
                     Err(failure) => {
@@ -14529,12 +15475,7 @@ impl Scheduler {
                 // thread in: for a raw clone child with a non-SIGCHLD exit
                 // signal, the backend's `process` names its creator instead.
                 if let Some(exiting) = self.registered_process(dettid)
-                    && (*group
-                        || !self
-                            .thread_tree
-                            .my_thread_group(&exiting)
-                            .into_iter()
-                            .any(|tid| tid != dettid && self.next_turns.contains_key(&tid)))
+                    && (*group || !self.live_process_threads(exiting).any(|tid| tid != dettid))
                 {
                     self.thread_tree.granted_exits.insert(exiting);
                     self.note_pid_namespace_end(exiting);
@@ -14551,12 +15492,9 @@ impl Scheduler {
                 self.release_vfork_child(dettid, true);
                 // The thread leaves by its own committed exit, not by dying
                 // with its process (https://github.com/rrnewton/hermit/issues/3904).
-                self.committed_exits.insert(dettid);
-                let last_live_thread = !self
-                    .thread_tree
-                    .my_thread_group(process)
-                    .into_iter()
-                    .any(|tid| tid != dettid && self.next_turns.contains_key(&tid));
+                self.commit_own_exit(dettid);
+                let last_live_thread =
+                    !self.live_process_threads(*process).any(|tid| tid != dettid);
                 // An exit that ends its process leaves the host some time after
                 // this grant. Hold turn selection from here until the backend
                 // reports the process physically gone (asynchronous exit
@@ -14736,6 +15674,14 @@ impl Scheduler {
                     if sig.raw() == libc::SIGCHLD {
                         self.blocked.sigchld_takers.remove(&dettid);
                     }
+                    // The copy it was chosen to take is taken
+                    // (`process_signal_takers`).
+                    if let Some(signals) = self.process_signal_takers.get_mut(&dettid) {
+                        *signals &= !kernel_signal_bit(sig.raw());
+                        if *signals == 0 {
+                            self.process_signal_takers.remove(&dettid);
+                        }
+                    }
                 }
                 // `sigchld_ready` marks a parent step2e has already re-admitted,
                 // or a delivery the scheduler already placed; grant it now rather
@@ -14746,7 +15692,7 @@ impl Scheduler {
                 if sig.signal() == Some(Signal::SIGCHLD)
                     && signal_interrupt_errno.is_none()
                     && !already_readmitted
-                    && self.run_queue.has_runnable_besides(dettid)
+                    && self.sigchld_waits_behind_work(dettid)
                 {
                     self.run_queue.undo_tentative_pop(); // Begun in step3.
                     assert!(self.run_queue.remove_tid(dettid));
@@ -14757,6 +15703,71 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// Whether a host-async `SIGCHLD` delivery to `dettid` is deferred behind
+    /// other runnable work (`sigchld_deferred`): whether any queued thread
+    /// besides it counts as work (`RunQueue::has_runnable_besides`).
+    ///
+    /// A schedule replay counts the threads it does not want to run
+    /// differently from the recording. A polling thread counts as work until
+    /// its backoff reaches the last priority band, and a replay holds such a
+    /// thread in the deferred band, one short of the last, without running its
+    /// backoff. A poller the recording passed over as a poller therefore reads
+    /// as work in the replay, and the replay parked a delivery the recording
+    /// had granted, handing the turn to the poller, whose polling attempt then
+    /// came out of order.
+    ///
+    /// So where the recorded schedule runs `dettid` next, a queued thread whose
+    /// filed request is a polling retry its turn grants (`files_polling_turn`)
+    /// is not counted. Had the recording run that retry before the delivery,
+    /// its attempt, a recorded event, would come next instead. Any other queued
+    /// work still defers the delivery, as in the recording: a kernel-run
+    /// blocking call, or a poller's pending backoff, records no event, so the
+    /// schedule cannot say whether it went first, and it keeps the order the
+    /// run queue gives it.
+    fn sigchld_waits_behind_work(&self, dettid: DetTid) -> bool {
+        if self.replay_runs_next(dettid) {
+            self.run_queue
+                .has_runnable_besides_unless(dettid, |tid| self.files_polling_turn(tid))
+        } else {
+            self.run_queue.has_runnable_besides(dettid)
+        }
+    }
+
+    /// Under a schedule replay, the thread with a parked `SIGCHLD` delivery
+    /// (`sigchld_deferred`) that the recorded schedule runs next, once its
+    /// delivery no longer waits behind work (`sigchld_waits_behind_work`) and
+    /// no vfork child is to run its turn first.
+    fn replay_readmits_parked_sigchld(&self) -> Option<DetTid> {
+        let (next, _) = self.replay_next_resume()?;
+        (self.has_schedule_replay()
+            && self.blocked.sigchld_deferred.contains(&next)
+            && !self.vfork_child_runs_turn()
+            && !self.sigchld_waits_behind_work(next))
+        .then_some(next)
+    }
+
+    /// Under a schedule replay, whether the recorded schedule's next record
+    /// belongs to `dettid`.
+    fn replay_runs_next(&self, dettid: DetTid) -> bool {
+        self.has_schedule_replay()
+            && self
+                .replay_next_resume()
+                .is_some_and(|(next, _)| next == dettid)
+    }
+
+    /// Whether `tid`'s filed request is a polling retry that its next turn
+    /// grants (`is_polling_turn`, with `poll_attempt` 0), so the guest's
+    /// attempt is recorded when it runs. A request with `poll_attempt > 0` is a
+    /// pending backoff: step 4 requeues it without a grant and records nothing,
+    /// so it is not one.
+    fn files_polling_turn(&self, tid: DetTid) -> bool {
+        self.next_turns
+            .get(&tid)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .is_some_and(|request| Self::is_polling_turn(&request) && request.poll_attempt == 0)
     }
 
     /// `child`, created by the vfork whose `BlockingVfork` operation is
@@ -14961,6 +15972,7 @@ impl Scheduler {
         chaos_epochs: &[crate::resources::ChaosEpochTransition],
     ) -> Result<(), SkipTurn> {
         assert!(runqueue::is_ordinary_priority(new_priority));
+        self.chaos_turns_in_slice.remove(&dettid);
         let new_priority = self.bound_chaos_starvation(dettid, new_priority);
         // Alter the threads priority and requeue.
         let old_priority = self.priorities.insert(dettid, new_priority);
@@ -15148,6 +16160,92 @@ impl Scheduler {
                         .is_some_and(|hb| hb.parked.contains(&tid));
                 idle_poller || parked
             })
+    }
+
+    /// Whether no guest thread other than `dtid` can run before `dtid` next
+    /// enters Detcore, judged at `dtid`'s grant from scheduler state alone
+    /// (`Config::eager_lone_preemptions`). Stricter than
+    /// [`Scheduler::nothing_else_can_run`], which lets a timer, a host or an
+    /// idle poller count as waiting: here nothing else may be queued, every
+    /// other registered thread must wait for what only a guest's own call
+    /// brings (a futex wake without a timeout, a child's change of state, a
+    /// signal), with no signal already pending for it, and nothing may be
+    /// pending that a scheduler pass acts on by itself: no deadline, alarm,
+    /// interval or POSIX timer, no poll deadline, no call waiting on a host,
+    /// no physical child, no deferred `SIGCHLD`, no happens-before program,
+    /// and nothing queued for a pass's prefix
+    /// ([`Scheduler::pass_has_pending_work`]).
+    ///
+    /// While that holds, nothing changes it but `dtid`'s own requests, so
+    /// every scheduler pass until `dtid` next enters Detcore grants `dtid`
+    /// again: a timeslice end in between decides nothing, and `dtid`'s next
+    /// entry can process it at its branch count with the same effect.
+    fn runs_alone_until_it_enters_detcore(&self, dtid: DetTid) -> bool {
+        self.run_queue.tids().all(|tid| *tid == dtid)
+            && !self.pass_has_pending_work()
+            && self.blocked.timed_waiters.holds_nothing()
+            && self.poll_deadlines.is_empty()
+            && self.blocked.external_io_blockers.is_empty()
+            && self.blocked.physical_child_waiters.is_empty()
+            && self.blocked.physical_child_ready.is_empty()
+            && self.blocked.sigchld_deferred.is_empty()
+            && self.happens_before.is_none()
+            && self
+                .next_turns
+                .keys()
+                .filter(|&&tid| tid != dtid)
+                .all(|&tid| {
+                    let parked_futex = self.next_turns.get(&tid).is_some_and(is_futex_request)
+                        && self
+                            .blocked
+                            .futex_waiters
+                            .values()
+                            .any(|waiters| waiters.iter().any(|waiter| waiter.dettid == tid));
+                    let waits_on_a_guest = parked_futex
+                        || self.blocked.child_waiters.contains_key(&tid)
+                        || self.blocked.rt_sigsuspend_blockers.contains_key(&tid);
+                    waits_on_a_guest && self.inbound_signals(tid).is_empty()
+                })
+    }
+
+    /// Whether a scheduler pass has anything to act on before it picks a
+    /// thread: what `step2_drain_prefix` drains or waits for (parent-death
+    /// signals, the SIGKILL fence and its retained wakes, run-queue removals
+    /// and admissions, cross-task signals, physical process exits and
+    /// child-exit publications not yet seen, the vfork, background-entry,
+    /// exited-leader and exited-thread barriers) and the blocked pool's
+    /// one-pass marks (signaled background calls and `rt_sigsuspend`
+    /// requests, `SIGCHLD` deliveries placed or to be taken, drain-woken and
+    /// timed-out waiters, woken sleeps). A queue added to that prefix belongs
+    /// here too.
+    fn pass_has_pending_work(&self) -> bool {
+        !self.pending_parent_death_signals.is_empty()
+            || self.sigkill_fence_holds()
+            || self.has_retained_sigkill_wakes()
+            || !self.pending_run_queue_removals.is_empty()
+            || !self.pending_cross_task_signals.is_empty()
+            || !self.pending_run_queue_admissions.is_empty()
+            || !self.pending_physical_process_exits.is_empty()
+            || !self.child_exit_publications_pending.is_empty()
+            || !self.vfork_barriers.is_empty()
+            || !self.background_entry_barriers.is_empty()
+            || !self.exited_leader_barriers.is_empty()
+            || !self.exited_thread_barriers.is_empty()
+            || !self.blocked.signaled_background.is_empty()
+            || !self.blocked.signaled_sigsuspend_requests.is_empty()
+            || !self.blocked.sigchld_ready.is_empty()
+            || !self.blocked.sigchld_takers.is_empty()
+            || !self.blocked.drain_woken_waiters.is_empty()
+            || !self.blocked.woken_sleeps.is_empty()
+            || !self.blocked.timed_out_futex_waiters.is_empty()
+    }
+
+    /// Take the mark [`Scheduler::unblock_guest`] left for `dtid`'s latest
+    /// grant (`Scheduler::lone_grants`). Every request clears it on arrival,
+    /// as it does the deadline hint, so a reply carries only a mark recorded
+    /// while its own request was pending.
+    pub fn take_lone_grant(&mut self, dtid: DetTid) -> bool {
+        self.lone_grants.remove(&dtid)
     }
 
     /// A strong yield issued, on a backend whose loopback pollers yield to their peers
@@ -15364,6 +16462,9 @@ impl Scheduler {
             }
             gtime.as_nanos()
         };
+        // Taken at every bump, a skipped one included, so it never outlives
+        // the turn its grant began.
+        let due_sleep_grant = self.chaos_due_sleep_grant.take();
         // A host-timed retry is not a turn that both runs of --verify share:
         // letting it set the previous turn's thread would make whether the
         // next signal delivery is charged depend on how many retries ran.
@@ -15378,6 +16479,12 @@ impl Scheduler {
         {
             self.previous_turn_tid = Some(resources.tid);
             self.previous_turn_expired_wait = expired_wait;
+            if self.chaos_bounds_starvation
+                && !self.has_schedule_replay()
+                && due_sleep_grant != Some(resources.tid)
+            {
+                *self.chaos_turns_in_slice.entry(resources.tid).or_insert(0) += 1;
+            }
         }
 
         match snapshot.cmp(&self.committed_time) {
@@ -15551,23 +16658,33 @@ impl Scheduler {
         }
         let fatal_alarm = self.in_guest_fatal_alarm_pending(dtid);
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
-        let (guest_state_poll, fruitless, wants_alone, sleep_due) = match self
-            .next_turns
-            .get(&dtid)
-            .and_then(|turn| turn.req.try_read())
-        {
-            Some(Ok(rs)) => (
-                Self::is_polling_turn(&rs) && rs.polls_guest_state_only,
-                Self::retries_its_call_without_progress(&rs),
-                rs.waits_until_nothing_else_can_run,
-                Self::is_due_sleep(&rs, self.committed_time),
-            ),
-            _ => (false, false, false, false),
-        };
+        let now = self.committed_time;
+        let (polling_grant, guest_state_only, fruitless, wants_alone, sleep_due, chaos_sleep_due) =
+            match self
+                .next_turns
+                .get(&dtid)
+                .and_then(|turn| turn.req.try_read())
+            {
+                Some(Ok(rs)) => (
+                    Self::is_polling_turn(&rs),
+                    rs.polls_guest_state_only,
+                    Self::retries_its_call_without_progress(&rs),
+                    rs.waits_until_nothing_else_can_run,
+                    Self::is_due_sleep(&rs, self.committed_time),
+                    ends_a_due_sleep(&rs, now),
+                ),
+                _ => (false, false, false, false, false, false),
+            };
+        let guest_state_poll = polling_grant && guest_state_only;
         // Whether this grant ends a timed wait at its deadline
         // (`expired_wait_grant`, read by `bump_global_time`).
         self.expired_wait_grant =
             ((futex_timed_out || sleep_due) && !signaled && !fatal_alarm).then_some(dtid);
+        self.chaos_due_sleep_grant = (chaos_sleep_due && !signaled && !fatal_alarm).then_some(dtid);
+        if !polling_grant {
+            self.note_chaos_first_turn_waits(dtid);
+        }
+        self.chaos_had_turn.insert(dtid);
         // The committed request, read before `clear_nextturn` empties it.
         let work_span_request = self
             .work_span
@@ -15635,15 +16752,191 @@ impl Scheduler {
                 SchedResponse::Go(as_schedvalue)
             }
         };
-        match self.deadline_remaining_from(dtid, self.committed_time) {
+        match self.grant_deadline_hint(dtid) {
             Some(remaining) => self.deadline_hints.insert(dtid, remaining),
             None => self.deadline_hints.remove(&dtid),
         };
+        if self.replays_lone_preemptions && self.runs_alone_until_it_enters_detcore(dtid) {
+            self.lone_grants.insert(dtid);
+        } else {
+            self.lone_grants.remove(&dtid);
+        }
         self.granted.insert(dtid);
         self.parked.running = Some(dtid);
         self.boundary_budgets.committed_grant(dtid);
         resp.put(answer);
         Ok(())
+    }
+
+    /// The deadline hint a grant to `granted` carries: zero once its turns
+    /// have spent its chaos slice (`chaos_slice_spent_in_turns`) or while a
+    /// thread that has not yet run is overdue for its first turn
+    /// (`chaos_first_turn_overdue`), else the time left before the earliest
+    /// pending deadline (`deadline_remaining_from`).
+    fn grant_deadline_hint(&self, granted: DetTid) -> Option<Duration> {
+        if self.chaos_slice_spent_in_turns(granted) || self.chaos_first_turn_overdue() {
+            Some(Duration::ZERO)
+        } else {
+            self.deadline_remaining_from(granted, self.committed_time)
+        }
+    }
+
+    /// Under bounded chaos, update `chaos_first_turn_waits` at a non-polling
+    /// grant to `granted`: each queued, non-polling thread that has not yet
+    /// run and whose priority is worse than `granted`'s lost this grant on
+    /// priority, and its count of consecutive lost grants goes up by one. Any
+    /// other thread's count goes: one that ran, left the queue or had the
+    /// better priority (it was passed for another reason, a gated or deferred
+    /// request) is not waiting on chaos priorities.
+    ///
+    /// The inputs are the run queue and the priorities at a grant, the same
+    /// ones turn selection reads, and only non-polling grants count, as for
+    /// `chaos_turns_in_slice`: how many host-timed polling retries ran does
+    /// not move the count.
+    fn note_chaos_first_turn_waits(&mut self, granted: DetTid) {
+        if !self.chaos_bounds_starvation || self.recordreplay_modes || self.has_schedule_replay() {
+            return;
+        }
+        let Some(granted_priority) = self.priorities.get(&granted).copied() else {
+            self.chaos_first_turn_waits.clear();
+            return;
+        };
+        let waits: BTreeMap<DetTid, u64> = self
+            .run_queue
+            .tids()
+            .copied()
+            .filter(|tid| {
+                *tid != granted
+                    && !self.chaos_had_turn.contains(tid)
+                    && self.run_queue.contains_non_polling_tid(*tid)
+                    && !self.pending_run_queue_removals.contains_key(tid)
+                    && self
+                        .priorities
+                        .get(tid)
+                        .is_some_and(|priority| *priority > granted_priority)
+            })
+            .map(|tid| {
+                let lost = self.chaos_first_turn_waits.get(&tid).copied().unwrap_or(0);
+                (tid, lost + 1)
+            })
+            .collect();
+        self.chaos_first_turn_waits = waits;
+    }
+
+    /// Whether a thread that has not yet run has lost `chaos_turns_per_slice`
+    /// consecutive grants on priority (`note_chaos_first_turn_waits`): 400 at
+    /// the default settings, about 0.2 s of virtual time. While one has, every
+    /// grant carries a zero deadline hint (`grant_deadline_hint`), so each
+    /// thread that runs ends its slice at its next check-in, and at two such
+    /// change points the starvation bound puts the changing thread behind the
+    /// new one (`bound_chaos_starvation`). A new thread then gets its first
+    /// turn within about 400 grants and a few hundred more turns, whatever
+    /// the threads ahead of it do.
+    ///
+    /// This covers what `chaos_slice_spent_in_turns` leaves out: a thread
+    /// whose turns end sleeps at their deadlines, such as a loop of sleeps
+    /// shorter than a turn charge, which is always due and can hold a worse
+    /// band off the CPU for seconds. A newly created thread waited
+    /// 5 s for its first turn behind a 1 ms sleep loop, and a test's own 5 s
+    /// watchdog fired. A thread that has run before is not bounded by this
+    /// rule: the same holding is what reproduces a real use-after-free (main
+    /// held off for 3.8 s behind a 200 us sleep loop while a pipeline
+    /// restarts), and a bound shorter than that loses it. It is freed too
+    /// only when a new thread is overdue at the same time, since the
+    /// starvation bound puts the changing thread behind every thread it
+    /// passed over.
+    ///
+    /// Same conditions as `chaos_slice_spent_in_turns`.
+    fn chaos_first_turn_overdue(&self) -> bool {
+        self.chaos_bounds_starvation
+            && !self.recordreplay_modes
+            && !self.has_schedule_replay()
+            && self.chaos_turns_per_slice.is_some_and(|turns| {
+                self.chaos_first_turn_waits
+                    .values()
+                    .any(|lost| *lost >= turns)
+            })
+    }
+
+    /// Whether `granted` has taken `chaos_turns_per_slice` committed turns
+    /// since its last chaos change point (`chaos_turns_in_slice`): at the
+    /// default settings 400 turns, as many as charge one maximum timeslice
+    /// of virtual time. If so, its grant carries a zero deadline hint
+    /// (`grant_deadline_hint`), so the thread ends its slice at its next
+    /// check-in once it has run the minimum slice, one turn charge of its own
+    /// time (`cap_timeslice_at_deadline`), and the slice end is a change
+    /// point like any other. A change point therefore comes at the latest
+    /// 400 turns plus one turn charge of the thread's own time into a slice
+    /// (about 100 more turns of 5 us syscalls), unless the thread's own time
+    /// ends it sooner.
+    ///
+    /// Chaos draws a new priority, and the starvation bound
+    /// (`bound_chaos_starvation`) acts, only at a change point. A change point
+    /// comes when a thread's slice ends, and a slice is measured in the
+    /// thread's own time. Threads that pass the CPU back and forth (a condition
+    /// variable hand-off, a `sched_yield` loop beside a short sleeper) spend
+    /// microseconds of their own time per turn while each turn charges half a
+    /// millisecond of virtual time. A futex call or `sched_yield` costs 5 us
+    /// of a thread's own time, so a 200 ms slice could take up to 40,000 of
+    /// them (about 30,000 were seen), many seconds of virtual time, without
+    /// a change point. A
+    /// thread that drew a worse band waited that long for its first turn,
+    /// and a guest's own watchdogs fired.
+    ///
+    /// Any thread that takes that many turns within one slice is affected,
+    /// not only one that hands off the CPU: a thread making turn-taking
+    /// syscalls back to back now gets a change point every 400 turns, where
+    /// its own-time slice could have lasted 20,000 to 40,000 syscalls (10 us
+    /// for most, 5 us for a futex call or `sched_yield`).
+    ///
+    /// A turn whose grant ended a sleep at its deadline (`ends_a_due_sleep`,
+    /// `chaos_due_sleep_grant`) does not count. A sleep is paced by its
+    /// thread's own deadline, not handed to it by another thread. A sleep
+    /// shorter than a turn charge is always due, so a loop of them holds a
+    /// worse band off the CPU until its own-time slice ends, and that holding
+    /// is what reproduces a real use-after-free: main held off for 3.8 s
+    /// behind a 200 us sleep loop while a pipeline restarts. Counting those
+    /// turns cut the holding to about 0.2 s and the repro from 4 of 12 seeds
+    /// to 0. A thread that has not yet run is still bounded
+    /// (`chaos_first_turn_overdue`). A zero-length sleep (`nanosleep` of
+    /// zero, `poll` of nothing with a zero timeout) is a yield idiom and
+    /// counts. So does a futex wait that timed out: its thread waits for
+    /// another thread, and a loop of them holding the CPU starves the thread
+    /// they wait for. Sixteen pollers on a 10 us `wait_for` held a
+    /// bundle-adjustment solver off for minutes when their timeouts did not
+    /// count.
+    /// The count is of turns, not of virtual time, so it keeps counting
+    /// across a sleep. The threshold uses the maximum timeslice, the bound
+    /// on a slice, not the mean a chaos slice is drawn with
+    /// (`--target-timeslice`), because it bounds how long a slice can last.
+    ///
+    /// Only where change points are bounded (`chaos_bounds_starvation`: chaos
+    /// with timer preemption and the default heuristic, not replaying
+    /// preemptions), and neither under a schedule replay nor under `hermit
+    /// record`/`hermit replay` (`recordreplay_modes`), as for every deadline
+    /// hint. The count is of committed turns, host-timed polling retries
+    /// aside, as for `previous_turn_tid`: background calls and skipped turns
+    /// do not commit, and host-timed admissions and signals change only which
+    /// pass a turn falls in, not how many turns a thread has taken. Both runs
+    /// of --verify therefore end the same slices. A preemption recording
+    /// records the slice end it causes like any other change point, and a
+    /// preemption or schedule replay follows its recorded slice ends and
+    /// applies no hint (`cap_timeslice_at_deadline`), so a replay needs none.
+    /// Such a slice ends at a syscall check-in, and a preemption replay ends
+    /// a slice recorded there at the same branch count, which can fall just
+    /// before the syscall rather than after it; until
+    /// <https://github.com/rrnewton/hermit/pull/4597> lands, its virtual times
+    /// can then differ from the recording's by a few microseconds.
+    /// No clock moves: only the software end of the thread's slice does.
+    fn chaos_slice_spent_in_turns(&self, granted: DetTid) -> bool {
+        self.chaos_bounds_starvation
+            && !self.recordreplay_modes
+            && !self.has_schedule_replay()
+            && self.chaos_turns_per_slice.is_some_and(|turns| {
+                self.chaos_turns_in_slice
+                    .get(&granted)
+                    .is_some_and(|spent| *spent >= turns)
+            })
     }
 
     /// The virtual time left, from `now`, before the earliest deadline a turn
@@ -15970,14 +17263,27 @@ impl Scheduler {
         }
     }
 
+    /// Whether a schedule replay has been in hard desync with its record at
+    /// some point: a thread ran an event other than the recorded one.
+    pub(crate) fn replay_left_its_record(&self) -> bool {
+        self.replayer.as_ref().is_some_and(|replayer| {
+            replayer
+                .desync_counts
+                .values()
+                .any(|counts| counts.hard > 0)
+        })
+    }
+
     /// Once the replayed schedule has no events left, give every thread the
     /// default priority, once. Nothing guides the run past that point, and a
     /// thread the schedule left at the deferred priority would otherwise wait
     /// for ever behind a foreground thread that never blocks, a thread the
     /// schedule readmitted at the deferred priority included
     /// (https://github.com/rrnewton/hermit/issues/4472). The point is the
-    /// consumption of the last recorded event, a scheduled event of a running
-    /// thread, so it is the same in every run.
+    /// consumption of the last recorded event, or the replayer's release of
+    /// the rest of the schedule after a long run of events that match none of
+    /// it (`Replayer::release_schedule`). Either is a scheduled event of a
+    /// running thread, so it is the same in every run.
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()
@@ -15986,10 +17292,77 @@ impl Scheduler {
             return;
         }
         self.replay_priorities_released = true;
-        info!("[sched] the replayed schedule ran out; every thread takes the default priority");
+        info!(
+            "[sched] the replayed schedule {}; every thread takes the default priority",
+            if self.schedule_released() {
+                "was released"
+            } else {
+                "ran out"
+            }
+        );
         let threads: Vec<DetTid> = self.priorities.keys().copied().collect();
         for dettid in threads {
             self.requeue_with_new_priority(dettid, DEFAULT_PRIORITY);
+        }
+    }
+
+    /// Whether the replay dropped the rest of its schedule after a long run of
+    /// unmatched events (`Replayer::release_schedule`).
+    pub(crate) fn schedule_released(&self) -> bool {
+        self.replayer.as_ref().is_some_and(Replayer::released)
+    }
+
+    /// Whether the replayed schedule is over: its last event was consumed, or
+    /// the replay released the rest (`release_replay_priorities_if_exhausted`,
+    /// at a scheduled event of a running thread). Each thread hears of it in
+    /// the reply to its next traced event and then runs, and creates threads,
+    /// as a run without a schedule does
+    /// (`ThreadState::follows_replayed_schedule`).
+    pub(crate) fn schedule_replay_over(&self) -> bool {
+        self.replay_priorities_released
+    }
+
+    /// What the reply to a traced event of `dettid` tells the thread about
+    /// the replayed schedule: whether the replay released it
+    /// (`schedule_released`), and whether it is over
+    /// (`schedule_replay_over`). The scheduler drops its copy of the thread's
+    /// callback checkpoints here when the schedule was released
+    /// (`drop_released_callback_checkpoints`), as the thread drops its own
+    /// copy when this reply reaches it (`trace_schedevent`).
+    pub(crate) fn schedule_replay_reply(&mut self, dettid: DetTid) -> (bool, bool) {
+        self.drop_released_callback_checkpoints(dettid);
+        (self.schedule_released(), self.schedule_replay_over())
+    }
+
+    /// Once the replay has released its schedule, drop the scheduler's copy
+    /// of `dettid`'s callback checkpoints: they belong to the recorded slices
+    /// the replay no longer follows, and acting on them in the unguided rest
+    /// of the run would add scheduler turns and report desyncs.
+    ///
+    /// The thread holds a copy of the same checkpoints and drops it at the
+    /// same point: when the reply to its next traced event reaches it
+    /// (`schedule_replay_reply`), or at its start (`StartNewThread`). Until
+    /// then the two copies stay equal, so what the thread filed against its
+    /// copy before it heard of the release, a priority request carrying a
+    /// checkpoint (`step4_resource_block`) or a mismatch report
+    /// (`callback_checkpoint_mismatch`), still finds the scheduler's copy of
+    /// the same checkpoint, however much later it is selected. A thread waits
+    /// for each request's reply before it sends the next, so nothing it filed
+    /// is outstanding when its traced event is answered. Dropping every
+    /// thread's copy at the release instead left such a request without its
+    /// checkpoint, and the scheduler panicked.
+    pub(crate) fn drop_released_callback_checkpoints(&mut self, dettid: DetTid) {
+        if !self.schedule_released() {
+            return;
+        }
+        if let Some(points) = self.callback_checkpoints.get_mut(&dettid)
+            && !points.is_empty()
+        {
+            *self
+                .released_callback_checkpoints
+                .entry(dettid)
+                .or_default() += points.len();
+            points.clear();
         }
     }
 
@@ -16868,6 +18241,34 @@ impl Scheduler {
             None
         };
 
+        // A released schedule is not a faithful replay of it: say so, with
+        // what the release left unreplayed, so a reader of the summary (and
+        // `hermit analyze`, which keeps each trial's) can tell.
+        if let Some(release) = self.replayer.as_ref().and_then(Replayer::release) {
+            let mut message = format!(
+                "RELEASED replayed schedule at event #{}: {} observed events in a row matched \
+                 none of it; {} recorded events left unreplayed",
+                release.event,
+                replayer::UNMATCHED_EVENTS_BEFORE_RELEASE,
+                release.unreplayed,
+            );
+            if !self.released_callback_checkpoints.is_empty() {
+                let dropped: Vec<String> = self
+                    .released_callback_checkpoints
+                    .iter()
+                    .map(|(tid, count)| format!("dtid {tid}: {count}"))
+                    .collect();
+                write!(
+                    message,
+                    "; callback checkpoints dropped with it: {}",
+                    dropped.join(", ")
+                )?;
+            }
+            desync_descrip
+                .get_or_insert_with(String::new)
+                .push_str(&format!("{message}\n"));
+        }
+
         // Legacy EOF policy does not make an unconsumed suffix fatal. Name
         // incomplete callback metadata separately; do not invent guest events.
         for (tid, points) in &self.callback_checkpoints {
@@ -16974,6 +18375,14 @@ impl Scheduler {
                 syscall_histogram: Some(
                     syscall_histogram.summary(SyscallObservationScope::Complete),
                 ),
+                // GlobalState keeps the host-input records.
+                host_inputs: None,
+                host_inputs_changed: Vec::new(),
+                // GlobalState records what the run learned of its
+                // store-exclusive sequences (aarch64).
+                exclusive_pairs: Default::default(),
+                store_exclusives: None,
+                store_exclusives_unavailable: None,
             },
             info_reprio_descrip,
         ))
@@ -17417,6 +18826,8 @@ mod test {
             response: Ivar::new(),
             bitset,
             signal_watch: None,
+            pi: false,
+            woken: false,
         }
     }
 
@@ -17521,6 +18932,238 @@ mod test {
         register_known_thread(&mut sched, opener);
         queued_poller(&mut sched, DetTid::from_raw(5), true);
         assert!(sched.nothing_else_can_run(opener));
+    }
+
+    /// A sequentialized ptrace configuration with the PMU timer, under which
+    /// grants may be marked lone (`Config::replays_lone_preemptions`).
+    fn lone_config() -> Config {
+        let config = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::PTRACE,
+            ..Config::default()
+        };
+        assert!(config.replays_lone_preemptions());
+        config
+    }
+
+    /// `waiter` parked in a futex wait without a timeout.
+    fn park_untimed_futex_waiter(sched: &mut Scheduler, waiter: DetTid) {
+        register_known_thread(sched, waiter);
+        let mut resources = Resources::new(waiter);
+        resources.insert(ResourceID::FutexWait, Permission::W);
+        sched.next_turns[&waiter].req.put(Ok(resources));
+        sched
+            .blocked
+            .futex_waiters
+            .entry(FutexID::private(MmId::initial(waiter), 0x1000))
+            .or_default()
+            .push(futex_waiter(waiter.as_raw(), u32::MAX));
+    }
+
+    /// Beside threads in untimed futex waits a thread runs alone; a deadline,
+    /// an alarm or a call waiting on a host anywhere means a pass may act
+    /// without it.
+    #[test]
+    fn a_thread_runs_alone_only_while_nothing_but_its_own_calls_can_wake_another() {
+        let runner = DetTid::from_raw(3);
+        let waiter = DetTid::from_raw(5);
+        let alone = |prepare: &dyn Fn(&mut Scheduler)| {
+            let mut sched = Scheduler::new(&lone_config());
+            register_known_thread(&mut sched, runner);
+            park_untimed_futex_waiter(&mut sched, waiter);
+            prepare(&mut sched);
+            sched.runs_alone_until_it_enters_detcore(runner)
+        };
+        assert!(alone(&|_| {}));
+        assert!(!alone(&|sched| {
+            sched
+                .blocked
+                .timed_waiters
+                .insert(LogicalTime::from_nanos(1_000_000), waiter);
+        }));
+        assert!(!alone(&|sched| {
+            sched.blocked.timed_waiters.insert_alarm(
+                LogicalTime::from_nanos(1_000_000),
+                DetPid::from_raw(3),
+                runner,
+                Signal::SIGALRM,
+                LogicalTime::from_nanos(0),
+            );
+        }));
+        assert!(!alone(&|sched| {
+            let other = DetTid::from_raw(7);
+            register_known_thread(sched, other);
+            sched
+                .blocked
+                .external_io_blockers
+                .insert(other, ExternalOpId::new(other, 1));
+        }));
+        assert!(!alone(&|sched| {
+            sched
+                .poll_deadlines
+                .insert((LogicalTime::from_nanos(1_000_000), waiter));
+        }));
+        assert!(!alone(&|sched| {
+            sched
+                .blocked
+                .physical_child_waiters
+                .entry(DetPid::from_raw(9))
+                .or_default()
+                .insert(waiter);
+        }));
+        assert!(!alone(&|sched| {
+            sched.blocked.physical_child_ready.insert(waiter);
+        }));
+        assert!(!alone(&|sched| {
+            sched.blocked.sigchld_deferred.insert(waiter);
+        }));
+        assert!(!alone(&|sched| {
+            sched.happens_before = Some(HbRuntime::new(
+                detcore_model::happens_before::HappensBeforeProgram {
+                    version: 1,
+                    anchors: Default::default(),
+                    edges: Vec::new(),
+                    max_hold_ns: None,
+                },
+            ));
+        }));
+        // Work a pass acts on by itself (`pass_has_pending_work`).
+        assert!(!alone(&|sched| {
+            sched
+                .pending_cross_task_signals
+                .entry(waiter)
+                .or_default()
+                .push(SigWrapper::from(Signal::SIGUSR1));
+        }));
+        assert!(!alone(&|sched| {
+            sched
+                .exited_leader_barriers
+                .insert(DetTid::from_raw(11), std::time::Instant::now());
+        }));
+        assert!(!alone(&|sched| {
+            sched.blocked.woken_sleeps.insert(waiter);
+        }));
+    }
+
+    /// A thread whose request is a futex wait the pool does not hold has not
+    /// parked yet; one in a child wait or `rt_sigsuspend` waits on a guest.
+    #[test]
+    fn only_parked_guest_waits_leave_a_thread_alone() {
+        let runner = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let with = |prepare: &dyn Fn(&mut Scheduler)| {
+            let mut sched = Scheduler::new(&lone_config());
+            register_known_thread(&mut sched, runner);
+            register_known_thread(&mut sched, other);
+            prepare(&mut sched);
+            sched.runs_alone_until_it_enters_detcore(runner)
+        };
+        assert!(!with(&|sched| {
+            let mut resources = Resources::new(other);
+            resources.insert(ResourceID::FutexWait, Permission::W);
+            sched.next_turns[&other].req.put(Ok(resources));
+        }));
+        assert!(with(&|sched| {
+            sched
+                .blocked
+                .rt_sigsuspend_blockers
+                .insert(other, ExternalOpId::new(other, 1));
+        }));
+        assert!(with(&|sched| {
+            sched.blocked.child_waiters.insert(
+                other,
+                (DetPid::from_raw(5), normal_wait(ChildWaitSelector::Any)),
+            );
+        }));
+    }
+
+    /// A thread waiting on a guest whose request already carries a signal
+    /// (`inbound_signals`) may take its turn at any pass, so no other thread
+    /// runs alone beside it: whether it sleeps in `rt_sigsuspend` with an
+    /// `InboundSignal` filed or in a child wait with a `WaitidSignals` batch.
+    /// The same thread without the signal leaves the other thread alone.
+    #[test]
+    fn a_guest_waiter_with_a_signal_already_pending_means_no_thread_runs_alone() {
+        let runner = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let with = |signal: Option<ResourceID>, parked: &dyn Fn(&mut Scheduler)| {
+            let mut sched = Scheduler::new(&lone_config());
+            register_known_thread(&mut sched, runner);
+            register_known_thread(&mut sched, other);
+            let mut resources = Resources::new(other);
+            if let Some(signal) = signal {
+                resources.insert(signal, Permission::W);
+            }
+            sched.next_turns[&other].req.put(Ok(resources));
+            parked(&mut sched);
+            assert!(!sched.pass_has_pending_work());
+            sched.runs_alone_until_it_enters_detcore(runner)
+        };
+        let sigsuspend = |sched: &mut Scheduler| {
+            sched
+                .blocked
+                .rt_sigsuspend_blockers
+                .insert(other, ExternalOpId::new(other, 1));
+        };
+        let child_wait = |sched: &mut Scheduler| {
+            sched.blocked.child_waiters.insert(
+                other,
+                (DetPid::from_raw(5), normal_wait(ChildWaitSelector::Any)),
+            );
+        };
+        let inbound = ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1));
+        let batch = ResourceID::WaitidSignals(vec![SigWrapper::from(Signal::SIGUSR1)]);
+        assert!(with(None, &sigsuspend));
+        assert!(!with(Some(inbound.clone()), &sigsuspend));
+        assert!(with(None, &child_wait));
+        assert!(!with(Some(batch), &child_wait));
+        assert!(!with(Some(inbound), &child_wait));
+    }
+
+    /// A queued thread, even an idle poller that
+    /// [`Scheduler::nothing_else_can_run`] counts as waiting, takes turns at
+    /// slice ends; so may a registered thread not yet admitted.
+    #[test]
+    fn a_queued_or_unadmitted_thread_means_no_thread_runs_alone() {
+        let runner = DetTid::from_raw(3);
+        let mut sched = Scheduler::new(&lone_config());
+        register_known_thread(&mut sched, runner);
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        assert!(sched.nothing_else_can_run(runner));
+        assert!(!sched.runs_alone_until_it_enters_detcore(runner));
+
+        let mut sched = Scheduler::new(&lone_config());
+        register_known_thread(&mut sched, runner);
+        register_known_thread(&mut sched, DetTid::from_raw(7));
+        assert!(!sched.runs_alone_until_it_enters_detcore(runner));
+    }
+
+    /// A grant is marked lone when the thread runs alone, once, and never
+    /// under `--eager-lone-preemptions`.
+    #[test]
+    fn a_grant_to_a_thread_running_alone_is_marked_once() {
+        let runner = DetTid::from_raw(3);
+        let grant = |config: &Config, beside_a_poller: bool| {
+            let mut sched = Scheduler::new(config);
+            register_known_thread(&mut sched, runner);
+            if beside_a_poller {
+                queued_poller(&mut sched, DetTid::from_raw(5), true);
+            }
+            sched.next_turns[&runner]
+                .req
+                .put(Ok(Resources::new(runner)));
+            let _ = turn_answer(&mut sched, runner);
+            let first = sched.take_lone_grant(runner);
+            assert!(!sched.take_lone_grant(runner), "a mark is taken once");
+            first
+        };
+        assert!(grant(&lone_config(), false));
+        assert!(!grant(&lone_config(), true));
+        let eager = Config {
+            eager_lone_preemptions: true,
+            ..lone_config()
+        };
+        assert!(!grant(&eager, false));
     }
 
     #[test]
@@ -19279,6 +20922,93 @@ mod test {
         assert_eq!(sched.run_queue.queued_priority(readmitted), Some(eager));
     }
 
+    /// A replay has left its record once a thread runs an event other than the
+    /// recorded one; until then it has not.
+    #[test]
+    fn a_replay_leaves_its_record_at_its_first_hard_desync() {
+        let mut sched = Scheduler::new(&Config::default());
+        assert!(!sched.replay_left_its_record(), "not replaying");
+        let at = LogicalTime::from_nanos;
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(at(10_000));
+        let second =
+            SchedEvent::syscall(DetTid::from_raw(3), Sysno::getppid, SyscallPhase::Prehook)
+                .with_time(at(20_000));
+        let third = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getuid, SyscallPhase::Prehook)
+            .with_time(at(30_000));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), second, third]));
+        let _ = sched.consume_schedevent(&first);
+        assert!(!sched.replay_left_its_record(), "in step");
+        let other = SchedEvent::syscall(DetTid::from_raw(5), Sysno::gettid, SyscallPhase::Prehook)
+            .with_time(at(20_000));
+        let _ = sched.consume_schedevent(&other);
+        assert!(sched.replay_left_its_record());
+    }
+
+    /// Under a schedule replay a `--stacktrace-event` index is a traced
+    /// (observed) event count, the counting `hermit analyze` names the
+    /// critical events of a schedule bisect by: the second of a pair at a
+    /// thread's exit still prints when a flipped schedule cannot consume
+    /// the pair in flipped order.
+    #[test]
+    fn a_replayed_stacktrace_event_prints_at_its_traced_index() {
+        let mut sched = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(3);
+        let at = LogicalTime::from_nanos;
+        let first =
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook).with_time(at(10_000));
+        let second =
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook).with_time(at(20_000));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), second.clone()]));
+        sched.stacktrace_events = Some(vec![(2, None, None)].into_iter().peekable());
+        assert_eq!(sched.consume_schedevent(&first).print_stack, None);
+        let extra = SchedEvent::branches(tid, 2).with_time(at(15_000));
+        assert_eq!(sched.consume_schedevent(&extra).print_stack, None);
+        assert_eq!(
+            sched.consume_schedevent(&second).print_stack,
+            Some(None),
+            "the third observed event is traced event #2"
+        );
+    }
+
+    /// A requested index the run has already passed (the list was installed
+    /// after those events were consumed) is reported as missed and discarded
+    /// instead of staying at the head of the list, so the next requested
+    /// index still prints at its own traced index.
+    #[test]
+    fn a_skipped_stacktrace_index_is_reported_and_the_next_one_prints() {
+        let mut sched = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(3);
+        let at = LogicalTime::from_nanos;
+        let schedule: Vec<SchedEvent> =
+            [Sysno::getpid, Sysno::getppid, Sysno::getuid, Sysno::getgid]
+                .into_iter()
+                .zip(1..)
+                .map(|(sysno, n)| {
+                    SchedEvent::syscall(tid, sysno, SyscallPhase::Prehook).with_time(at(n * 10_000))
+                })
+                .collect();
+        sched.replayer = Some(Replayer::new(schedule.clone()));
+        // Traced events #0 and #1 are consumed before the list is installed.
+        assert_eq!(sched.consume_schedevent(&schedule[0]).print_stack, None);
+        assert_eq!(sched.consume_schedevent(&schedule[1]).print_stack, None);
+        sched.stacktrace_events = Some(
+            vec![(1, None, None), (2, None, None)]
+                .into_iter()
+                .peekable(),
+        );
+        assert_eq!(
+            sched.consume_schedevent(&schedule[2]).print_stack,
+            Some(None),
+            "traced event #2 prints although #1 was skipped"
+        );
+        assert!(
+            sched.stacktrace_events.as_mut().unwrap().peek().is_none(),
+            "the skipped index #1 was reported and discarded"
+        );
+        assert_eq!(sched.consume_schedevent(&schedule[3]).print_stack, None);
+    }
+
     /// A thread queued at the deferred replay priority when the recording
     /// runs out does not stay behind the foreground thread: consuming the
     /// last recorded event gives every thread the default priority
@@ -20637,6 +22367,220 @@ mod test {
             sched.run_queue.tentative_pop_in_progress(),
             "a proceeding turn must keep its tentative selection open for step4"
         );
+    }
+
+    /// Where chaos change points are bounded, a thread's committed turns since
+    /// its last change point count toward its slice: once they have charged a
+    /// maximum timeslice (400 turns of 0.5 ms against 200 ms), its next grant
+    /// ends the slice (`chaos_slice_spent_in_turns`). A polling retry, a
+    /// skipped turn and a turn whose grant ended a sleep at its deadline do
+    /// not count, a change point restarts the count, and nothing counts
+    /// without chaos or under `hermit record`/`hermit replay`.
+    #[test]
+    fn a_chaos_slice_is_spent_after_a_timeslice_of_turn_charges() {
+        let thread = DetTid::from_raw(13);
+        let chaos = Config {
+            chaos: true,
+            ..Config::default()
+        };
+        let setup = |config: &Config| {
+            let mut sched = Scheduler::new(config);
+            register_known_thread_for(&mut sched, thread);
+            sched.runqueue_push_back(thread);
+            (sched, Mutex::new(GlobalTime::new(config)))
+        };
+        let commit = |sched: &mut Scheduler, time: &Mutex<GlobalTime>, turns: u64| {
+            for _ in 0..turns {
+                sched.bump_global_time(time, &Ok(Resources::new(thread)));
+            }
+        };
+
+        let (mut sched, time) = setup(&chaos);
+        assert_eq!(sched.chaos_turns_per_slice, Some(400));
+        commit(&mut sched, &time, 399);
+        assert!(!sched.chaos_slice_spent_in_turns(thread), "399 turns");
+        let mut retry = Resources::new(thread);
+        retry.insert(ResourceID::InternalIOPolling, Permission::W);
+        retry.poll_attempt = 1;
+        sched.bump_global_time(&time, &Ok(retry));
+        sched.chaos_due_sleep_grant = Some(thread);
+        sched.bump_global_time(&time, &Err(SkipTurn));
+        assert_eq!(
+            sched.chaos_due_sleep_grant, None,
+            "a skipped bump takes the note too"
+        );
+        sched.chaos_due_sleep_grant = Some(thread);
+        commit(&mut sched, &time, 1);
+        assert!(
+            !sched.chaos_slice_spent_in_turns(thread),
+            "a polling retry, a skipped turn and a due sleep's end do not count"
+        );
+        assert_eq!(sched.chaos_due_sleep_grant, None, "taken by the bump");
+        commit(&mut sched, &time, 1);
+        assert!(sched.chaos_slice_spent_in_turns(thread), "400 turns");
+        assert_eq!(
+            sched.grant_deadline_hint(thread),
+            Some(Duration::ZERO),
+            "the grant ends the slice at the next check-in"
+        );
+        sched.recordreplay_modes = true;
+        assert!(
+            !sched.chaos_slice_spent_in_turns(thread),
+            "under hermit record/replay"
+        );
+        sched.recordreplay_modes = false;
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(thread));
+        let _ = sched.perform_priority_changepoint(
+            thread,
+            DEFAULT_PRIORITY,
+            LogicalTime::from_nanos(1),
+            1,
+            &[],
+        );
+        assert!(
+            !sched.chaos_slice_spent_in_turns(thread),
+            "a change point restarts the count"
+        );
+
+        let (mut plain, time) = setup(&Config::default());
+        commit(&mut plain, &time, 400);
+        assert!(!plain.chaos_slice_spent_in_turns(thread), "without chaos");
+
+        let small = Config {
+            chaos: true,
+            max_timeslice: std::num::NonZeroU64::new(1_000_000),
+            ..Config::default()
+        };
+        assert_eq!(
+            Scheduler::new(&small).chaos_turns_per_slice,
+            Some(400),
+            "a 1 ms timeslice still takes 400 turns"
+        );
+    }
+
+    /// A sleep's grant ends a timed wait at its deadline once the deadline
+    /// has come; a future, zero (yield epoch) or indefinite deadline, a
+    /// zero-length sleep, or a request that holds more than the sleep, does
+    /// not.
+    #[test]
+    fn a_due_sleep_is_one_whose_deadline_has_come() {
+        let thread = DetTid::from_raw(13);
+        let now = LogicalTime::from_nanos(5_000_000);
+        let sleep = |deadline: LogicalTime| {
+            let mut request = Resources::new(thread);
+            request.insert(ResourceID::SleepUntil(deadline), Permission::W);
+            request
+        };
+        assert!(ends_a_due_sleep(&sleep(now), now), "at its deadline");
+        assert!(
+            ends_a_due_sleep(&sleep(LogicalTime::from_nanos(4_000_000)), now),
+            "past it"
+        );
+        assert!(
+            !ends_a_due_sleep(&sleep(LogicalTime::from_nanos(6_000_000)), now),
+            "before it"
+        );
+        assert!(
+            !ends_a_due_sleep(&sleep(LogicalTime::ZERO), now),
+            "a yield epoch's zero"
+        );
+        assert!(
+            !ends_a_due_sleep(&sleep(LogicalTime::MAX), now),
+            "indefinite"
+        );
+        let mut zero_length = sleep(now);
+        zero_length.zero_length_sleep = true;
+        assert!(!ends_a_due_sleep(&zero_length, now), "a zero-length sleep");
+        let mut more = sleep(now);
+        more.insert(ResourceID::FutexWait, Permission::R);
+        assert!(!ends_a_due_sleep(&more, now), "more than a sleep");
+        assert!(!ends_a_due_sleep(&Resources::new(thread), now), "no sleep");
+    }
+
+    /// Under bounded chaos, a queued thread that has not yet run and loses
+    /// `chaos_turns_per_slice` consecutive grants on priority
+    /// (`note_chaos_first_turn_waits`, called here as `unblock_guest` calls it
+    /// for a non-polling grant) makes every grant end its slice at the next
+    /// check-in (`chaos_first_turn_overdue`). Its count goes once it has had
+    /// a grant; a thread that has run or one of better priority never
+    /// counts; nothing counts without chaos or under record or replay.
+    #[test]
+    fn a_new_thread_overdue_for_its_first_turn_ends_every_grants_slice() {
+        let runner = DetTid::from_raw(3);
+        let newcomer = DetTid::from_raw(5);
+        let chaos = Config {
+            chaos: true,
+            ..Config::default()
+        };
+        let setup = |newcomer_priority: Priority| {
+            let mut sched = Scheduler::new(&chaos);
+            for tid in [runner, newcomer] {
+                sched.thread_tree.add_child(runner, tid, true);
+                register_known_thread_for(&mut sched, tid);
+            }
+            sched.priorities.insert(runner, 1000);
+            sched.priorities.insert(newcomer, newcomer_priority);
+            sched.runqueue_push_back(newcomer);
+            sched.chaos_had_turn.insert(runner);
+            sched
+        };
+        let grant = |sched: &mut Scheduler, grants: u64| {
+            for _ in 0..grants {
+                sched.note_chaos_first_turn_waits(runner);
+            }
+        };
+
+        let mut sched = setup(9000);
+        grant(&mut sched, 399);
+        assert!(!sched.chaos_first_turn_overdue(), "399 lost grants");
+        assert_eq!(
+            sched.grant_deadline_hint(runner),
+            sched.deadline_remaining_from(runner, sched.committed_time),
+            "the ordinary hint"
+        );
+        grant(&mut sched, 1);
+        assert!(sched.chaos_first_turn_overdue(), "400 lost grants");
+        assert_eq!(
+            sched.grant_deadline_hint(runner),
+            Some(Duration::ZERO),
+            "every grant ends its slice at the next check-in"
+        );
+        sched.recordreplay_modes = true;
+        assert!(
+            !sched.chaos_first_turn_overdue(),
+            "under hermit record/replay"
+        );
+        sched.recordreplay_modes = false;
+        sched.chaos_had_turn.insert(newcomer);
+        sched.note_chaos_first_turn_waits(runner);
+        assert!(
+            !sched.chaos_first_turn_overdue(),
+            "once it has run, its wait goes"
+        );
+
+        let mut better = setup(500);
+        grant(&mut better, 400);
+        assert!(
+            !better.chaos_first_turn_overdue(),
+            "a thread of better priority was passed for another reason"
+        );
+
+        let mut ran = setup(9000);
+        ran.chaos_had_turn.insert(newcomer);
+        grant(&mut ran, 400);
+        assert!(!ran.chaos_first_turn_overdue(), "a thread that has run");
+
+        let mut plain = Scheduler::new(&Config::default());
+        for tid in [runner, newcomer] {
+            plain.thread_tree.add_child(runner, tid, true);
+            register_known_thread_for(&mut plain, tid);
+        }
+        plain.priorities.insert(newcomer, 9000);
+        plain.runqueue_push_back(newcomer);
+        for _ in 0..400 {
+            plain.note_chaos_first_turn_waits(runner);
+        }
+        assert!(!plain.chaos_first_turn_overdue(), "without chaos");
     }
 
     /// F8 (non-committing fizzle must not advance virtual time): both sides of
@@ -23270,46 +25214,124 @@ mod test {
         assert_eq!(replay.vfork_gated_background_child(), None);
     }
 
-    /// Record readmits a backgrounded vfork child as soon as its call finishes,
-    /// though other work is runnable, and logs the turn; a finished blocker that
-    /// is not a vfork child still waits for the queue to hold only pollers.
+    /// Record readmits every finished background call as soon as a pass finds
+    /// it, though other work is runnable, in thread order, and logs the turn:
+    /// a vfork child (https://github.com/rrnewton/hermit/issues/4211) and any
+    /// other call alike. An unfinished call stays parked and is not logged.
     #[test]
-    fn record_readmits_and_logs_a_finished_vfork_child_while_work_is_runnable() {
+    fn record_readmits_and_logs_every_finished_call_while_work_is_runnable() {
         let dir = tempfile::tempdir().unwrap();
         let parent = DetTid::from_raw(7);
         let child = ExternalOpId::new(DetTid::from_raw(25), 4);
         let other = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let running = ExternalOpId::new(DetTid::from_raw(23), 2);
         let mut scheduler = Scheduler::new(&Config::default());
         scheduler.recordreplay_modes = true;
         scheduler.vfork_barriers.insert(parent, Some(child.tid));
         background(&mut scheduler, child, true);
         background(&mut scheduler, other, true);
+        background(&mut scheduler, running, false);
         queue_worker(&mut scheduler, DetTid::from_raw(9));
         scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
         scheduler.turn = 12;
 
         assert!(scheduler.step2c_process_io_blockers().is_ok());
-        assert!(
-            !scheduler
-                .blocked
-                .external_io_blockers
-                .contains_key(&child.tid)
-        );
-        assert!(scheduler.run_queue.contains_tid(child.tid));
+        for readmitted in [child.tid, other.tid] {
+            assert!(
+                !scheduler
+                    .blocked
+                    .external_io_blockers
+                    .contains_key(&readmitted)
+            );
+            assert!(scheduler.run_queue.contains_tid(readmitted));
+        }
         assert!(
             scheduler
                 .blocked
                 .external_io_blockers
-                .contains_key(&other.tid)
+                .contains_key(&running.tid)
         );
         assert_eq!(
             rejoin_log::read(dir.path()).unwrap(),
             std::collections::VecDeque::from([Rejoin {
                 turn: 12,
                 wakes: 0,
-                calls: vec![(child.tid, 4)],
+                calls: vec![(other.tid, 9), (child.tid, 4)],
             }])
         );
+    }
+
+    /// A finished poll beside runnable work: record readmits it at the turn a
+    /// pass finds it finished and logs that turn, and a replay of that log,
+    /// with the same work runnable, keeps it parked until that turn and
+    /// readmits it there.
+    #[test]
+    fn a_finished_poll_beside_runnable_work_is_readmitted_at_the_logged_turn() {
+        let poll = ExternalOpId::new(DetTid::from_raw(9), 3);
+        let sleeper = DetTid::from_raw(5);
+        let make = || {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.recordreplay_modes = true;
+            background(&mut scheduler, poll, true);
+            queue_worker(&mut scheduler, sleeper);
+            scheduler
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut recording = make();
+        recording.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+        recording.turn = 40;
+        assert!(recording.step2c_process_io_blockers().is_ok());
+        assert!(recording.run_queue.contains_tid(poll.tid));
+        let logged = rejoin_log::read(dir.path()).unwrap();
+        assert_eq!(
+            logged,
+            std::collections::VecDeque::from([Rejoin {
+                turn: 40,
+                wakes: 0,
+                calls: vec![(poll.tid, 3)],
+            }])
+        );
+
+        let mut replay = make();
+        replaying(&mut replay, &Vec::from(logged));
+        replay.turn = 39;
+        assert!(replay.step2c_process_io_blockers().is_ok());
+        assert!(replay.blocked.external_io_blockers.contains_key(&poll.tid));
+        assert!(!replay.run_queue.contains_tid(poll.tid));
+        replay.turn = 40;
+        assert!(replay.step2c_process_io_blockers().is_ok());
+        assert!(replay.run_queue.contains_tid(poll.tid));
+        assert!(replay.rejoin_replay.as_ref().unwrap().is_empty());
+        assert!(replay.rejoin_refusal.is_none());
+    }
+
+    /// A replay that waited with nothing queued and no readmission due
+    /// (`rejoin_stalled_since`) ends that wait once a thread is queued, so a
+    /// readmission due later waits the whole `REJOIN_STALL_VALVE` for its calls
+    /// rather than what an earlier wait left of it.
+    #[test]
+    fn replay_ends_a_stalled_wait_once_a_thread_is_queued() {
+        let running = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let mut replay = Scheduler::new(&Config::default());
+        replay.recordreplay_modes = true;
+        background(&mut replay, running, false);
+        replaying(
+            &mut replay,
+            &[Rejoin {
+                turn: 50,
+                wakes: 0,
+                calls: vec![(running.tid, 9)],
+            }],
+        );
+        replay.turn = 40;
+        assert!(replay.step2c_process_io_blockers().is_err());
+        assert!(replay.rejoin_stalled_since.is_some());
+
+        queue_worker(&mut replay, DetTid::from_raw(5));
+        assert!(replay.step2c_process_io_blockers().is_ok());
+        assert!(replay.rejoin_stalled_since.is_none());
+        assert!(replay.rejoin_refusal.is_none());
     }
 
     /// A middle child of a nested vfork (P vforks C, C vforks G) is backgrounded
@@ -24089,6 +26111,303 @@ mod test {
         (global_time, deadline)
     }
 
+    /// A scheduler replaying a schedule whose next event is `next`'s `phase`
+    /// of `recorded`, with dtid 3 polling a `recvfrom` it entered (its
+    /// prehook is the schedule's first event, already observed).
+    fn replaying_a_recvfrom_retry(
+        next: DetTid,
+        recorded: Sysno,
+        phase: SyscallPhase,
+    ) -> (Scheduler, DetTid) {
+        let poller = DetTid::from_raw(3);
+        let mut scheduler = Scheduler::new(&Config::default());
+        register_known_thread(&mut scheduler, poller);
+        scheduler
+            .priorities
+            .insert(poller, runqueue::FIRST_PRIORITY + 2);
+        scheduler.runqueue_push_back(poller);
+        let entered = SchedEvent::syscall(poller, Sysno::recvfrom, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let mut replayer = replayer::Replayer::new(vec![
+            entered.clone(),
+            SchedEvent::syscall(next, recorded, phase).with_time(LogicalTime::from_nanos(20_000)),
+        ]);
+        let _ = replayer.observe_event(&entered);
+        scheduler.replayer = Some(replayer);
+        (scheduler, poller)
+    }
+
+    /// Run `poller`'s retry `request` through `step4_resource_block` and say
+    /// whether it was backed off as a poller (rather than kept runnable).
+    fn retry_is_backed_off(scheduler: &mut Scheduler, poller: DetTid, request: &Resources) -> bool {
+        let turn = scheduler.next_turns.get(&poller).unwrap();
+        if turn.req.try_read().is_none() {
+            turn.req.put(Ok(request.clone()));
+        }
+        let response = turn.resp.clone();
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
+        assert!(
+            scheduler
+                .step4_resource_block(poller, request, &response)
+                .is_err(),
+            "a retry that has not been remade runnable grants no turn"
+        );
+        !scheduler.run_queue.contains_non_polling_tid(poller)
+    }
+
+    /// A polling thread's retry keeps its turn when the replayed schedule's
+    /// next event is that retry: it is queued as an ordinary runnable thread
+    /// rather than backed off as a poller, which would hand another thread the
+    /// turn the recording gave it. It is backed off as before when the
+    /// schedule names another thread next, or another syscall than the one
+    /// the thread has in flight, or names the retry's completion
+    /// while the retry is a second one after an attempt that moved nothing on
+    /// guest state alone (only another thread can make it succeed). A retry
+    /// whose outcome the host can change keeps the turn, and so does a
+    /// recorded unsuccessful attempt.
+    #[test]
+    fn a_replayed_retry_is_not_backed_off_as_a_poller() {
+        let poller = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let (completion, attempt) = (SyscallPhase::Posthook, SyscallPhase::Polling);
+        let (same, different) = (Sysno::recvfrom, Sysno::read);
+        for (next, recorded, phase, retry, made_progress, guest_state_only, backed_off) in [
+            (poller, same, completion, 1, false, true, false),
+            (other, same, completion, 1, false, true, true),
+            (poller, same, completion, 2, false, true, true),
+            (poller, same, completion, 2, false, false, false),
+            (poller, same, completion, 2, true, true, false),
+            (poller, same, attempt, 2, false, true, false),
+            (poller, different, completion, 1, false, true, true),
+            (poller, different, completion, 2, false, false, true),
+            (poller, different, attempt, 2, false, true, true),
+        ] {
+            let (mut scheduler, poller) = replaying_a_recvfrom_retry(next, recorded, phase);
+            let mut request = Resources::new(poller);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.poll_attempt = retry;
+            request.previous_attempt_made_progress = made_progress;
+            request.polls_guest_state_only = guest_state_only;
+            assert_eq!(
+                retry_is_backed_off(&mut scheduler, poller, &request),
+                backed_off,
+                "the schedule's next event is dtid {next}'s {recorded} {phase:?}, retry {retry}, \
+                 progress {made_progress}, guest state only {guest_state_only}"
+            );
+        }
+    }
+
+    /// A retry whose outcome the host can change keeps its turn for at most
+    /// `REPLAY_KEPT_RETRY_LIMIT` retries in a row while the replayed schedule
+    /// does not advance, then backs off as a poller, so a drifted replay
+    /// cannot spin forever on a poll nothing in the run will satisfy.
+    #[test]
+    fn a_replayed_retry_backs_off_once_it_has_kept_the_turn_too_often() {
+        let poller = DetTid::from_raw(3);
+        let (mut scheduler, poller) =
+            replaying_a_recvfrom_retry(poller, Sysno::recvfrom, SyscallPhase::Posthook);
+        let mut request = Resources::new(poller);
+        request.insert(ResourceID::InternalIOPolling, Permission::W);
+        request.polls_guest_state_only = false;
+        for retry in 1..=replayer::REPLAY_KEPT_RETRY_LIMIT {
+            request.poll_attempt = retry;
+            assert!(
+                !retry_is_backed_off(&mut scheduler, poller, &request),
+                "retry {retry} keeps the turn"
+            );
+        }
+        for retry in replayer::REPLAY_KEPT_RETRY_LIMIT + 1..=replayer::REPLAY_KEPT_RETRY_LIMIT + 3 {
+            request.poll_attempt = retry;
+            assert!(
+                retry_is_backed_off(&mut scheduler, poller, &request),
+                "retry {retry} is past the cap"
+            );
+            // Back in the queue as a poller for the next retry.
+            scheduler.run_queue.remove_tid(poller);
+            scheduler.runqueue_push_back(poller);
+        }
+    }
+
+    /// A schedule replay whose next recorded event resumes a thread asleep in
+    /// virtual time moves global time to that thread's deadline and holds the
+    /// pass for its wake. A replay that resumes another thread, or a run that
+    /// is not replaying, leaves time alone. A replay with callback checkpoints
+    /// never moves time, but holds the pass while another due timed event
+    /// pops ahead of the replayed thread's due wake.
+    #[test]
+    fn a_replay_resuming_a_sleeper_moves_time_to_its_deadline() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(5);
+        let other = DetTid::from_raw(7);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        let before = global_time.lock().unwrap().as_nanos();
+
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "not replaying"
+        );
+        let resume_other = SchedEvent::syscall(other, Sysno::getpid, SyscallPhase::Prehook);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![resume_other]));
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the replay resumes another thread"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+
+        let wake = SchedEvent::syscall(sleeper, Sysno::clock_nanosleep, SyscallPhase::Posthook);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![wake.clone()]));
+        assert!(scheduler.replay_fast_forward_to_recorded_wake(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert!(
+            scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the pass keeps waiting until committed time reaches the deadline"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        // An earlier timed waiter pops first, then the sleeper's wake is due:
+        // the ordinary pass pops it and goes on to its turn.
+        let early = DetTid::from_raw(9);
+        let early_deadline = deadline - LogicalTime::from_nanos(10);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(early_deadline, early);
+        scheduler.committed_time = deadline;
+        assert!(
+            scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "an earlier deadline is still waiting to pop"
+        );
+        scheduler.blocked.timed_waiters.remove(early);
+        // A thread ordered ahead at the same deadline pops first too.
+        let tied = DetTid::from_raw(3);
+        scheduler.blocked.timed_waiters.insert(deadline, tied);
+        assert!(
+            scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "a tie ordered ahead is still waiting to pop"
+        );
+        scheduler.blocked.timed_waiters.remove(tied);
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the wake is due, so the pass runs"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        // A schedule with callback checkpoints keeps the recording's time:
+        // a wake that is not yet due moves nothing and holds nothing.
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(11);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        let before = global_time.lock().unwrap().as_nanos();
+        scheduler.committed_time = before;
+        scheduler.callback_history_active = true;
+        scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
+            sleeper,
+            Sysno::clock_nanosleep,
+            SyscallPhase::Posthook,
+        )]));
+        assert!(!scheduler.replay_fast_forward_to_recorded_wake(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+        // Nor does another event that is due when the replayed wake is not.
+        let due_first = DetTid::from_raw(13);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(deadline - LogicalTime::from_nanos(10), due_first);
+        scheduler.committed_time = deadline - LogicalTime::from_nanos(10);
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the replayed wake is not due yet"
+        );
+        scheduler.blocked.timed_waiters.remove(due_first);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+        // Once the wake is due, the pass still waits while another due event
+        // pops ahead of it: an earlier deadline, then the same deadline
+        // ordered first. Time never moves.
+        scheduler.committed_time = deadline;
+        for (other, other_deadline) in [
+            (DetTid::from_raw(13), deadline - LogicalTime::from_nanos(10)),
+            (DetTid::from_raw(3), deadline),
+        ] {
+            scheduler
+                .blocked
+                .timed_waiters
+                .insert(other_deadline, other);
+            assert!(
+                scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+                "dtid {other} pops before the replayed wake"
+            );
+            scheduler.blocked.timed_waiters.remove(other);
+        }
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the replayed wake pops next, so the pass runs"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+    }
+
+    /// A scheduler pass under a schedule replay whose next recorded event
+    /// resumes a thread asleep in virtual time holds for that thread's wake:
+    /// it moves global time to the sleeper's deadline and ends without a
+    /// turn although another thread is runnable, popping one due timed event
+    /// per pass. Once committed time reaches the
+    /// deadline, the ordinary pass wakes the sleeper and goes on to a turn.
+    #[test]
+    fn a_replay_pass_holds_for_the_recorded_wake_of_a_sleeper() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(5);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        let now = global_time.lock().unwrap().as_nanos();
+        let early = [DetTid::from_raw(9), DetTid::from_raw(11)];
+        for (tid, offset) in early.iter().zip([1, 2]) {
+            register_known_thread(&mut scheduler, *tid);
+            scheduler
+                .blocked
+                .timed_waiters
+                .insert(now + LogicalTime::from_nanos(offset), *tid);
+        }
+        let worker = DetTid::from_raw(7);
+        queue_worker(&mut scheduler, worker);
+        scheduler.committed_time = now + LogicalTime::from_nanos(5);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
+            sleeper,
+            Sysno::clock_nanosleep,
+            SyscallPhase::Posthook,
+        )]));
+        let woken = |scheduler: &Scheduler, tids: &[DetTid]| {
+            tids.iter()
+                .filter(|tid| scheduler.run_queue.contains_tid(**tid))
+                .count()
+        };
+
+        for pass in 1..=2 {
+            assert!(
+                scheduler.step2_process_blocked(&global_time).is_err(),
+                "pass {pass} holds for the replayed wake although dtid {worker} is runnable"
+            );
+            assert_eq!(
+                global_time.lock().unwrap().as_nanos(),
+                deadline,
+                "global time moved to the sleeper's deadline"
+            );
+            assert_eq!(woken(&scheduler, &early), pass, "one due event per pass");
+            assert!(!scheduler.run_queue.contains_tid(sleeper));
+        }
+        assert!(
+            scheduler.step2_process_blocked(&global_time).is_err(),
+            "committed time is still short of the deadline"
+        );
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+
+        // Step 1 of the next pass brings committed time up to global time.
+        scheduler.committed_time = deadline;
+        assert!(
+            scheduler.step2_process_blocked(&global_time).is_ok(),
+            "the wake is due, so the pass goes on to a turn"
+        );
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
     /// With a backgrounded call unfinished and nothing queued, record wakes a
     /// thread sleeping in virtual time instead of spinning: the call may wait
     /// on that thread (https://github.com/rrnewton/hermit/issues/3881).
@@ -24275,6 +26594,276 @@ mod test {
         assert_eq!(&v, &[p3, p4, p5]);
         let s = tree.pretty_print();
         assert!(!s.is_empty());
+    }
+
+    /// A process whose threads come and go: its live threads are those with
+    /// turn state, from any depth of the creation tree and whichever thread
+    /// created them, and never a thread of a child process.
+    #[test]
+    fn the_live_thread_group_is_the_tree_walk_less_exited_threads() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw;
+        let (leader, first, second, third, child) =
+            (tid(100), tid(101), tid(102), tid(103), tid(104));
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, first, false);
+        scheduler.thread_tree.add_child(first, second, false);
+        scheduler.thread_tree.add_child(second, third, false);
+        scheduler.thread_tree.add_child(third, child, true);
+        for thread in [leader, second, third, child] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        // `first` exited; `third` hangs below it in the tree.
+        let walked: Vec<DetTid> = {
+            let mut group = scheduler.thread_tree.my_thread_group(&leader);
+            group.retain(|thread| scheduler.next_turns.contains_key(thread));
+            group.sort();
+            group
+        };
+        assert_eq!(walked, [leader, second, third]);
+        for member in [leader, first, third] {
+            assert_eq!(
+                scheduler.live_thread_group(&member).collect::<Vec<_>>(),
+                walked
+            );
+        }
+        assert_eq!(scheduler.process_signal_targets(leader), walked);
+        assert_eq!(
+            scheduler.live_thread_group(&child).collect::<Vec<_>>(),
+            [child]
+        );
+    }
+
+    /// The tree keeps the edge to an exited thread, so after Linux gives its
+    /// ID to a thread of another process the tree lists that thread under
+    /// both. Its live group is only the one it belongs to now.
+    #[test]
+    fn a_reused_thread_id_is_live_only_in_its_current_group() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw;
+        let (parent, old_leader, reused, new_leader) = (tid(37), tid(38), tid(39), tid(50));
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, old_leader, true);
+        scheduler.thread_tree.add_child(old_leader, reused, false);
+        scheduler.thread_tree.add_child(parent, new_leader, true);
+        scheduler.thread_tree.add_child(new_leader, reused, false);
+        for thread in [old_leader, new_leader, reused] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        assert!(
+            scheduler
+                .thread_tree
+                .my_thread_group(&old_leader)
+                .contains(&reused),
+            "the stale edge this test is about must exist"
+        );
+        assert_eq!(scheduler.process_signal_targets(old_leader), [old_leader]);
+        assert_eq!(
+            scheduler.process_signal_targets(new_leader),
+            [reused, new_leader]
+        );
+    }
+
+    /// An ID that once led a process, given later to a thread of another
+    /// process, belongs to that process: its live group is that process's.
+    #[test]
+    fn a_former_leaders_id_reused_as_a_thread_joins_its_new_group() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw;
+        let (parent, former_leader, new_leader) = (tid(37), tid(38), tid(50));
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, former_leader, true);
+        // Process 38 has exited; Linux gives 38 to a thread of process 50.
+        scheduler.thread_tree.add_child(parent, new_leader, true);
+        scheduler
+            .thread_tree
+            .add_child(new_leader, former_leader, false);
+        for thread in [parent, new_leader, former_leader] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        let group = [former_leader, new_leader];
+        for member in [former_leader, new_leader] {
+            assert_eq!(
+                scheduler.live_thread_group(&member).collect::<Vec<_>>(),
+                group
+            );
+        }
+        // A signal to 38 goes to the process it is a thread of, as Linux's
+        // kill(2) of a thread ID reaches that thread's group.
+        assert_eq!(scheduler.process_signal_targets(former_leader), group);
+    }
+
+    /// Process 38 has exited and been reaped, Linux has given 38 to a thread
+    /// of process 50, and that thread has exited too. No task 38 exists, so
+    /// Linux's kill(38, sig) answers ESRCH (kill_pid_info finds no task). 38
+    /// names neither the process it once led nor process 50: a kill gets no
+    /// target. Detcore holds no zombie record for 38 here, so kill(38, 0) is
+    /// passed to the host kernel, which finds no task 38 either.
+    #[test]
+    fn a_dead_former_leaders_id_names_no_process() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw;
+        let (parent, former_leader, new_leader) = (tid(37), tid(38), tid(50));
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, former_leader, true);
+        scheduler.thread_tree.add_child(parent, new_leader, true);
+        scheduler
+            .thread_tree
+            .add_child(new_leader, former_leader, false);
+        for thread in [parent, new_leader] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        assert_eq!(scheduler.signal_target_process(former_leader), None);
+        assert_eq!(
+            scheduler.process_signal_targets(former_leader),
+            Vec::<DetTid>::new()
+        );
+        assert_eq!(scheduler.exited_process_is_zombie(former_leader), None);
+        // While the thread 38 lived, 38 named its process, 50.
+        register_known_thread(&mut scheduler, former_leader);
+        assert_eq!(
+            scheduler.signal_target_process(former_leader),
+            Some(new_leader)
+        );
+    }
+
+    /// Grants `thread` a raw `exit` (not `exit_group`) naming `process`.
+    fn grant_raw_exit(scheduler: &mut Scheduler, thread: DetTid, process: DetPid) {
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    thread,
+                    &ResourceID::Exit {
+                        group: false,
+                        process,
+                        mm: MmId::initial(process),
+                    },
+                    &Permission::RW,
+                    Option::None,
+                    Option::None,
+                    &Ivar::new(),
+                )
+                .is_ok()
+        );
+    }
+
+    /// A raw `exit` grant ends its process, and fixes the process's exit
+    /// (`granted_exits`), only for the process's last live thread: not while
+    /// a sibling still lives, and not because an exited one is in the tree.
+    #[test]
+    fn a_raw_exit_grant_ends_its_process_only_at_its_last_live_thread() {
+        let tid = DetTid::from_raw;
+        let (root, process, sibling) = (tid(1), tid(2), tid(3));
+        let setup = |live: &[DetTid]| {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.thread_tree.add_child(root, root, true);
+            scheduler.thread_tree.add_child(root, process, true);
+            scheduler.thread_tree.add_child(process, sibling, false);
+            for thread in live {
+                register_known_thread(&mut scheduler, *thread);
+            }
+            scheduler
+        };
+        let mut scheduler = setup(&[root, process, sibling]);
+        grant_raw_exit(&mut scheduler, sibling, process);
+        assert!(!scheduler.thread_tree.granted_exits.contains(&process));
+
+        // The sibling has exited: the leader is the last live thread.
+        let mut scheduler = setup(&[root, process]);
+        grant_raw_exit(&mut scheduler, process, process);
+        assert!(scheduler.thread_tree.granted_exits.contains(&process));
+    }
+
+    /// Process 38's thread 39 exited and Linux gave 39 to a thread of process
+    /// 50. The tree keeps the edge from 38 to 39, but the exit paths that
+    /// take a process's live threads (exec teardown, the consumption of an
+    /// unreported exit, the SIGKILL reservation) take only 38's own.
+    #[test]
+    fn exit_paths_do_not_take_a_reused_thread_for_its_old_process() {
+        let tid = DetTid::from_raw;
+        let (parent, process, reused, other) = (tid(37), tid(38), tid(39), tid(50));
+        let setup = || {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.thread_tree.add_child(parent, parent, true);
+            scheduler.thread_tree.add_child(parent, process, true);
+            scheduler.thread_tree.add_child(process, reused, false);
+            scheduler.thread_tree.add_child(parent, other, true);
+            scheduler.thread_tree.add_child(other, reused, false);
+            for thread in [parent, process, reused, other] {
+                register_known_thread(&mut scheduler, thread);
+                scheduler.record_thread_mm(thread, MmId::initial(thread));
+            }
+            assert!(
+                scheduler
+                    .thread_tree
+                    .my_thread_group(&process)
+                    .contains(&reused),
+                "the stale edge this test is about must exist"
+            );
+            scheduler
+        };
+
+        let mut scheduler = setup();
+        let mm = MmId::initial(process);
+        assert!(scheduler.prepare_exec_teardown(process, process, mm));
+        assert!(!scheduler.defer_exec_sibling_retirement(reused, process, mm));
+
+        let mut scheduler = setup();
+        assert!(scheduler.has_unreported_exit(process));
+        assert!(scheduler.consume_unreported_exit(process));
+        assert!(scheduler.deregistration_accounted.contains(&process));
+        assert!(!scheduler.deregistration_accounted.contains(&reused));
+
+        let mut scheduler = setup();
+        let reserved = scheduler.reserve_sigkill(parent, process, 0).unwrap();
+        let victims = scheduler.commit_sigkill(reserved.token, true);
+        assert_eq!(
+            victims.iter().map(|victim| victim.tid).collect::<Vec<_>>(),
+            [process]
+        );
+    }
+
+    /// Process 38 has gone and Linux has given 38 to a live thread of
+    /// process 50. The exit paths that name process 38 find no live thread
+    /// of it, and none of process 50's.
+    #[test]
+    fn exit_paths_find_no_threads_for_a_former_leaders_reused_id() {
+        let tid = DetTid::from_raw;
+        let (parent, former_leader, new_leader) = (tid(37), tid(38), tid(50));
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, former_leader, true);
+        scheduler.thread_tree.add_child(parent, new_leader, true);
+        scheduler
+            .thread_tree
+            .add_child(new_leader, former_leader, false);
+        for thread in [parent, new_leader, former_leader] {
+            register_known_thread(&mut scheduler, thread);
+            scheduler.record_thread_mm(thread, MmId::initial(thread));
+        }
+        assert!(!scheduler.has_unreported_exit(former_leader));
+        assert_eq!(
+            scheduler.reserve_sigkill(parent, former_leader, 0),
+            Err(sigkill_retirement::SigkillRefusal::NoTarget)
+        );
+        assert!(!scheduler.consume_unreported_exit(former_leader));
+        assert!(scheduler.deregistration_accounted.is_empty());
+        // A process reaped automatically keeps its wait metadata, process
+        // group included. A SIGKILL to that group reaches process 50, whose
+        // thread 38 is, and not a process 38.
+        let group = DetPid::from_raw(77);
+        assert!(
+            scheduler
+                .thread_tree
+                .set_process_group(former_leader, group)
+        );
+        assert!(scheduler.thread_tree.set_process_group(new_leader, group));
+        let reserved = scheduler.reserve_sigkill_group(parent, group, 0).unwrap();
+        let victims = scheduler.commit_sigkill(reserved.token, true);
+        assert_eq!(
+            victims.iter().map(|victim| victim.tid).collect::<Vec<_>>(),
+            [former_leader, new_leader]
+        );
     }
 
     /// A cross-task signal must interrupt a precise-mode futex waiter, which sleeps
@@ -25249,7 +27838,10 @@ mod test {
         let to = FutexID::private(mm, 0x404120);
         let on_to = park_futex_waiters(&mut scheduler, to, 100, 1, u32::MAX);
         let on_from = park_futex_waiters(&mut scheduler, from, 101, 4, u32::MAX);
-        assert_eq!(scheduler.requeue_futex_waiters(from, to, 1, 2), (1, 2));
+        assert_eq!(
+            scheduler.requeue_futex_waiters(from, to, 1, 2),
+            (1, 2, false)
+        );
         assert!(scheduler.run_queue.contains_tid(on_from[0]));
         assert_eq!(futex_waiter_order(&scheduler, from), vec![on_from[3]]);
         assert_eq!(
@@ -25274,10 +27866,10 @@ mod test {
         let from = FutexID::private(mm, 0x404110);
         let to = FutexID::private(mm, 0x404120);
         for (nr_wake, nr_requeue, expected) in [
-            (0, 0, (0, 0)),
-            (0, 1, (0, 1)),
-            (2, 0, (2, 0)),
-            (5, 5, (3, 0)),
+            (0, 0, (0, 0, false)),
+            (0, 1, (0, 1, false)),
+            (2, 0, (2, 0, false)),
+            (5, 5, (3, 0, false)),
         ] {
             let mut scheduler = Scheduler::new(&Config::default());
             let waiters = park_futex_waiters(&mut scheduler, from, 100, 3, 0b01);
@@ -25286,7 +27878,7 @@ mod test {
                 expected,
                 "nr_wake {nr_wake} nr_requeue {nr_requeue}"
             );
-            let (woken, moved) = expected;
+            let (woken, moved, _) = expected;
             let (woken, moved) = (woken as usize, moved as usize);
             for (index, &waiter) in waiters.iter().enumerate() {
                 assert_eq!(
@@ -25311,10 +27903,13 @@ mod test {
         let waiters = park_futex_waiters(&mut scheduler, futex, 100, 3, u32::MAX);
         assert_eq!(
             scheduler.requeue_futex_waiters(futex, futex, 0, i32::MAX as usize),
-            (0, 3)
+            (0, 3, false)
         );
         assert_eq!(futex_waiter_order(&scheduler, futex), waiters);
-        assert_eq!(scheduler.requeue_futex_waiters(futex, futex, 1, 1), (1, 1));
+        assert_eq!(
+            scheduler.requeue_futex_waiters(futex, futex, 1, 1),
+            (1, 1, false)
+        );
         assert_eq!(futex_waiter_order(&scheduler, futex), waiters[1..].to_vec());
     }
 
@@ -25395,6 +27990,563 @@ mod test {
         );
         assert!(!scheduler.is_parked_futex_waiter(waiters[1]));
         assert!(scheduler.is_parked_futex_waiter(waiters[2]));
+    }
+
+    fn pi_futex(address: usize) -> FutexID {
+        FutexID::private(MmId::initial(DetPid::from_raw(99)), address)
+    }
+
+    fn contended(owner: DetTid, next_owner: Option<DetTid>) -> PiFutexState {
+        PiFutexState::Contended {
+            owner,
+            next_owner,
+            queueing_deadlocks: false,
+        }
+    }
+
+    fn unqueued(alive: bool) -> PiFutexState {
+        PiFutexState::Unqueued {
+            named_owner_alive: alive,
+            queueing_deadlocks: false,
+        }
+    }
+
+    /// FUTEX_LOCK_PI waiters queue behind the owner the first one found and are
+    /// handed the lock first in, first out (`wake_futex_pi` takes the rt_mutex
+    /// top waiter, and every guest thread has the same rt_mutex priority). A
+    /// waiter handed the lock owns the state until it takes the lock, learning
+    /// it came from an unlock, and the state goes when nobody is queued or
+    /// about to take it.
+    #[test]
+    fn pi_futex_waiters_are_handed_the_lock_first_in_first_out() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let waiters = [100, 101, 102].map(DetTid::from_raw);
+        let futex = pi_futex(0x404110);
+        for tid in std::iter::once(owner).chain(waiters) {
+            register_known_thread(&mut scheduler, tid);
+        }
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 99, waiters[0]),
+            unqueued(true)
+        );
+        for waiter in waiters {
+            scheduler.sleep_pi_futex_waiter(waiter, futex, None, None, owner);
+        }
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 99, waiters[2]),
+            contended(owner, Some(waiters[0]))
+        );
+        // The owner itself would queue behind itself.
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 99, owner),
+            PiFutexState::Contended {
+                owner,
+                next_owner: Some(waiters[0]),
+                queueing_deadlocks: true,
+            }
+        );
+        for (i, &waiter) in waiters.iter().enumerate() {
+            assert_eq!(scheduler.hand_off_pi_futex(futex), Some(waiter));
+            assert!(!scheduler.is_parked_futex_waiter(waiter));
+            assert!(scheduler.run_queue.contains_tid(waiter));
+            assert_eq!(
+                scheduler.pi_futex_state(futex, waiter.as_raw() as u32, owner),
+                contended(waiter, waiters.get(i + 1).copied())
+            );
+            assert_eq!(
+                scheduler.take_handed_pi_futex(futex, waiter),
+                Some(PiHandOver::Unlock)
+            );
+            assert_eq!(scheduler.take_handed_pi_futex(futex, waiter), None);
+        }
+        assert_eq!(scheduler.hand_off_pi_futex(futex), None);
+        assert_eq!(scheduler.pi_futex_state(futex, 102, owner), unqueued(true));
+        assert!(scheduler.blocked.pi_futex_owners.is_empty());
+    }
+
+    /// A word whose first waiter is a plain FUTEX_WAIT waiter has no PI state
+    /// (`attach_to_pi_state` [3]), and a word nobody waits on names a thread that
+    /// is alive or not (`attach_to_pi_owner`).
+    #[test]
+    fn pi_futex_state_reports_plain_waiters_and_dead_owners() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let live = DetTid::from_raw(100);
+        let plain = DetTid::from_raw(101);
+        register_known_thread(&mut scheduler, live);
+        register_known_thread(&mut scheduler, plain);
+        let futex = pi_futex(0x404110);
+        for (named, alive) in [(100, true), (0, false), (12345, false), (u32::MAX, false)] {
+            assert_eq!(
+                scheduler.pi_futex_state(futex, named, plain),
+                unqueued(alive),
+                "named {named}"
+            );
+        }
+        scheduler.sleep_futex_waiter(&plain, futex, None, u32::MAX, None);
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 100, live),
+            PiFutexState::PlainWaiters
+        );
+    }
+
+    /// A plain wake walks the queue in order and stops at the first PI waiter,
+    /// as Linux's `futex_wake` does: the plain waiters before it are woken, and
+    /// the wake reports that it met one unless it woke its count first. The
+    /// wakes a thread's exit makes stop there too.
+    #[test]
+    fn a_plain_wake_stops_at_the_first_pi_waiter() {
+        for fuzz in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.fuzz_futexes = fuzz;
+            let owner = DetTid::from_raw(99);
+            let [plain, pi_waiter, late_plain] = [100, 101, 102].map(DetTid::from_raw);
+            for tid in [owner, plain, pi_waiter, late_plain] {
+                register_known_thread(&mut scheduler, tid);
+            }
+            let futex = pi_futex(0x404110);
+            scheduler.sleep_futex_waiter(&plain, futex, None, u32::MAX, None);
+            scheduler.sleep_pi_futex_waiter(pi_waiter, futex, None, None, owner);
+            scheduler.sleep_futex_waiter(&late_plain, futex, None, u32::MAX, None);
+            assert!(scheduler.has_pi_waiters(futex));
+            // Its count reached at the plain waiter first: no EINVAL.
+            assert_eq!(
+                scheduler.wake_futex_waiters_until_pi(owner, futex, 1, u32::MAX),
+                (1, false)
+            );
+            assert!(scheduler.run_queue.contains_tid(plain));
+            // The PI waiter heads the queue now.
+            assert_eq!(
+                scheduler.wake_futex_waiters_until_pi(owner, futex, 2, u32::MAX),
+                (0, true)
+            );
+            assert_eq!(
+                scheduler.wake_futex_waiters_after_exit(&[(owner, futex)]),
+                vec![0]
+            );
+            assert!(scheduler.is_parked_futex_waiter(pi_waiter));
+            assert!(scheduler.is_parked_futex_waiter(late_plain));
+        }
+    }
+
+    /// `futex_requeue` checks its counts before it looks at a waiter, and stops
+    /// with EINVAL at a PI waiter, keeping what it did before.
+    #[test]
+    fn a_plain_requeue_stops_at_the_first_pi_waiter() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let [plain, pi_waiter] = [100, 101].map(DetTid::from_raw);
+        for tid in [owner, plain, pi_waiter] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let from = pi_futex(0x404110);
+        let to = pi_futex(0x404120);
+        scheduler.sleep_futex_waiter(&plain, from, None, u32::MAX, None);
+        scheduler.sleep_pi_futex_waiter(pi_waiter, from, None, None, owner);
+        assert_eq!(
+            scheduler.requeue_futex_waiters(from, to, 0, 0),
+            (0, 0, false)
+        );
+        assert_eq!(
+            scheduler.requeue_futex_waiters(from, to, 0, 5),
+            (0, 1, true)
+        );
+        assert_eq!(futex_waiter_order(&scheduler, to), vec![plain]);
+        assert_eq!(futex_waiter_order(&scheduler, from), vec![pi_waiter]);
+    }
+
+    /// A waiter handed the lock and not yet running still heads the queue in
+    /// Linux (after FUTEX_UNLOCK_PI, which hands over only when a PI waiter is
+    /// first): a plain wake or requeue meets it first, and a later FUTEX_LOCK_PI
+    /// finds the state even when only plain waiters are queued behind it.
+    #[test]
+    fn a_waiter_handed_the_lock_still_heads_the_queue() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let [heir, plain] = [100, 101].map(DetTid::from_raw);
+        for tid in [owner, heir, plain] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let futex = pi_futex(0x404110);
+        scheduler.sleep_pi_futex_waiter(heir, futex, None, None, owner);
+        assert_eq!(scheduler.hand_off_pi_futex(futex), Some(heir));
+        scheduler.sleep_futex_waiter(&plain, futex, None, u32::MAX, None);
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 100, owner),
+            contended(heir, None)
+        );
+        assert_eq!(
+            scheduler.wake_futex_waiters_until_pi(owner, futex, 1, u32::MAX),
+            (0, true)
+        );
+        assert_eq!(
+            scheduler.requeue_futex_waiters(futex, pi_futex(0x404120), 1, 0),
+            (0, 0, true)
+        );
+        assert_eq!(
+            scheduler.requeue_futex_waiters(futex, pi_futex(0x404120), 0, 0),
+            (0, 0, false)
+        );
+        assert_eq!(
+            scheduler.take_handed_pi_futex(futex, heir),
+            Some(PiHandOver::Unlock)
+        );
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 100, owner),
+            PiFutexState::PlainWaiters
+        );
+        assert_eq!(scheduler.wake_futex_waiters(owner, futex, 1, u32::MAX), 1);
+    }
+
+    /// A FUTEX_LOCK_PI waiter whose owner waits, through PI futexes, for a lock
+    /// the waiter owns would deadlock (`rt_mutex_adjust_prio_chain`'s
+    /// `EDEADLK`), as would one waiting behind itself; a chain that ends at a
+    /// running thread does not. The state answers it for the caller.
+    #[test]
+    fn a_pi_futex_wait_that_closes_a_cycle_deadlocks() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let [a, b, c] = [100, 101, 102].map(DetTid::from_raw);
+        for tid in [a, b, c] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let held_by_a = pi_futex(0x404110);
+        let held_by_b = pi_futex(0x404120);
+        // B owns another word and waits behind A.
+        scheduler.sleep_pi_futex_waiter(b, held_by_a, None, None, a);
+        assert!(scheduler.pi_futex_wait_deadlocks(b, a));
+        assert!(scheduler.pi_futex_wait_deadlocks(a, a));
+        assert!(!scheduler.pi_futex_wait_deadlocks(b, c));
+        assert!(!scheduler.pi_futex_wait_deadlocks(a, c));
+        assert_eq!(
+            scheduler.pi_futex_state(held_by_b, 101, a),
+            PiFutexState::Unqueued {
+                named_owner_alive: true,
+                queueing_deadlocks: true,
+            }
+        );
+        assert_eq!(
+            scheduler.pi_futex_state(held_by_a, 100, c),
+            contended(a, Some(b))
+        );
+    }
+
+    /// The deadlock walk stops where Linux's `rt_mutex_adjust_prio_chain`
+    /// does (kernel/locking/rtmutex.c:704 at v6.16). Linux checks the direct
+    /// owner before the walk (`task_blocks_on_rt_mutex`), then the next owner
+    /// at each of depths 1 to `max_lock_depth`, and answers `EDEADLK` when
+    /// the owner it reached at depth 1024 is itself blocked. So a chain of
+    /// 1025 owners whose last runs is no deadlock, and the same chain whose
+    /// last owner waits on a 1026th is one, though nobody in it is the caller.
+    #[test]
+    fn the_pi_futex_deadlock_walk_stops_at_linuxs_lock_depth() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let caller = DetTid::from_raw(99);
+        let owners: Vec<DetTid> = (1..=1026).map(|n| DetTid::from_raw(1000 + n)).collect();
+        register_known_thread(&mut scheduler, caller);
+        for &owner in &owners {
+            register_known_thread(&mut scheduler, owner);
+        }
+        // Owner i waits on a word owner i + 1 holds, for owners 1 to 1024.
+        for (i, pair) in owners.windows(2).take(1024).enumerate() {
+            scheduler.sleep_pi_futex_waiter(
+                pair[0],
+                pi_futex(0x500000 + 4 * i),
+                None,
+                None,
+                pair[1],
+            );
+        }
+        assert!(!scheduler.pi_futex_wait_deadlocks(owners[0], caller));
+        // Owner 1025 waits on a word owner 1026 holds.
+        scheduler.sleep_pi_futex_waiter(owners[1024], pi_futex(0x600000), None, None, owners[1025]);
+        assert!(scheduler.pi_futex_wait_deadlocks(owners[0], caller));
+    }
+
+    /// A thread whose own `Exit` was granted has not deregistered yet, which
+    /// it does at a host-timed moment; a word naming it already names a dead
+    /// owner, as Linux answers `ESRCH` once the exiting owner is gone
+    /// (`handle_exit_race`).
+    #[test]
+    fn a_pi_futex_word_naming_a_thread_whose_exit_was_granted_names_a_dead_owner() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let [owner, caller] = [100, 101].map(DetTid::from_raw);
+        for tid in [owner, caller] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let futex = pi_futex(0x404110);
+        assert_eq!(scheduler.pi_futex_state(futex, 100, caller), unqueued(true));
+        scheduler.commit_own_exit(owner);
+        assert!(scheduler.next_turns.contains_key(&owner));
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 100, caller),
+            unqueued(false)
+        );
+    }
+
+    /// An owner's PI futexes go to their longest waiters at its own `Exit`
+    /// grant, before it deregisters, and its later deregistration hands over
+    /// nothing more.
+    #[test]
+    fn an_exit_grant_hands_the_exiting_owners_pi_futexes_to_their_waiters() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let detpid = DetPid::from_raw(99);
+        let [first, second] = [100, 101].map(DetTid::from_raw);
+        scheduler.thread_tree.add_child(owner, owner, true);
+        for tid in [owner, first, second] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let futex = pi_futex(0x404110);
+        scheduler.sleep_pi_futex_waiter(first, futex, None, None, owner);
+        scheduler.sleep_pi_futex_waiter(second, futex, None, None, owner);
+
+        scheduler.commit_own_exit(owner);
+        assert!(scheduler.admission_pending(first));
+        assert!(scheduler.is_parked_futex_waiter(second));
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 0, second),
+            contended(first, Some(second))
+        );
+
+        scheduler.logically_kill_thread(&owner, &detpid, MmId::initial(detpid));
+        assert!(scheduler.is_parked_futex_waiter(second));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(futex, first),
+            Some(PiHandOver::OwnerDeath)
+        );
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 100, second),
+            contended(first, Some(second))
+        );
+    }
+
+    /// Wake the parked `tid` for a signal, as the scheduler's signal paths do.
+    fn wake_pi_waiter_for_a_signal(scheduler: &mut Scheduler, tid: DetTid) {
+        let mut signal = Resources::new(tid);
+        signal.insert(
+            ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)),
+            Permission::W,
+        );
+        assert!(scheduler.force_unblock_thread_at(tid, signal, true));
+    }
+
+    /// `tid`, woken, has run its turn and asks again.
+    fn finish_woken_turn(scheduler: &mut Scheduler, tid: DetTid) {
+        assert!(scheduler.run_queue.remove_tid(tid));
+        let turn = scheduler.next_turns.get_mut(&tid).unwrap();
+        turn.req = Ivar::new();
+        turn.resp = Ivar::new();
+    }
+
+    /// A FUTEX_LOCK_PI waiter the scheduler woke for a signal stays queued in
+    /// its place, as Linux's rt_mutex waiter does, and sleeps again there when
+    /// it finds nothing pending. When its call ends (a restart after the
+    /// signal), it leaves the queue, and the next call queues at the tail.
+    #[test]
+    fn a_pi_waiter_woken_for_a_signal_it_did_not_find_keeps_its_place() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let [a, b, c] = [100, 101, 102].map(DetTid::from_raw);
+        for tid in [owner, a, b, c] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let futex = pi_futex(0x404110);
+        for tid in [a, b, c] {
+            scheduler.sleep_pi_futex_waiter(tid, futex, None, None, owner);
+        }
+
+        wake_pi_waiter_for_a_signal(&mut scheduler, b);
+        assert!(!scheduler.is_parked_futex_waiter(b));
+        assert_eq!(scheduler.futex_waiters_for_test(futex), vec![a, b, c]);
+        finish_woken_turn(&mut scheduler, b);
+        scheduler.sleep_pi_futex_waiter(b, futex, None, None, owner);
+        assert!(scheduler.is_parked_futex_waiter(b));
+        assert_eq!(scheduler.futex_waiters_for_test(futex), vec![a, b, c]);
+
+        wake_pi_waiter_for_a_signal(&mut scheduler, b);
+        finish_woken_turn(&mut scheduler, b);
+        scheduler.leave_pi_futex_queue(b);
+        assert_eq!(scheduler.futex_waiters_for_test(futex), vec![a, c]);
+        scheduler.sleep_pi_futex_waiter(b, futex, None, None, owner);
+        assert_eq!(scheduler.futex_waiters_for_test(futex), vec![a, c, b]);
+    }
+
+    /// An unlock, or the owner's death, while the longest PI waiter is woken
+    /// for a signal and has not yet run hands that waiter the lock, which it
+    /// takes in its turn; it is already runnable, so nothing wakes it again.
+    #[test]
+    fn a_pi_waiter_woken_for_a_signal_is_still_handed_the_lock() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let detpid = DetPid::from_raw(99);
+        let [a, b, c] = [100, 101, 102].map(DetTid::from_raw);
+        scheduler.thread_tree.add_child(owner, owner, true);
+        for tid in [owner, a, b, c] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let [unlocked, abandoned] = [0x404110, 0x404120].map(pi_futex);
+        scheduler.sleep_pi_futex_waiter(a, unlocked, None, None, owner);
+        scheduler.sleep_pi_futex_waiter(b, unlocked, None, None, owner);
+        scheduler.sleep_pi_futex_waiter(c, abandoned, None, None, owner);
+
+        wake_pi_waiter_for_a_signal(&mut scheduler, a);
+        assert_eq!(
+            scheduler.pi_futex_state(unlocked, 99, owner),
+            PiFutexState::Contended {
+                owner,
+                next_owner: Some(a),
+                queueing_deadlocks: true,
+            }
+        );
+        assert_eq!(scheduler.hand_off_pi_futex(unlocked), Some(a));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(unlocked, a),
+            Some(PiHandOver::Unlock)
+        );
+        assert_eq!(scheduler.futex_waiters_for_test(unlocked), vec![b]);
+        assert!(scheduler.is_parked_futex_waiter(b));
+
+        wake_pi_waiter_for_a_signal(&mut scheduler, c);
+        scheduler.logically_kill_thread(&owner, &detpid, MmId::initial(detpid));
+        assert!(!scheduler.admission_pending(c));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(abandoned, c),
+            Some(PiHandOver::OwnerDeath)
+        );
+    }
+
+    /// A committed SIGKILL dooms its process's threads for PI futexes before
+    /// they deregister, which comes at a host-timed moment: a word naming one
+    /// names a dead owner, the futexes they own go to their waiters at the
+    /// kill's commit, and a doomed waiter is passed over. A process-group
+    /// kill's notice before its send dooms nothing.
+    #[test]
+    fn a_sigkilled_process_is_dead_to_pi_futexes_from_the_kill() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let [killed, doomed, live] = [90, 91, 92].map(DetTid::from_raw);
+        let [waiter, other, caller] = [100, 101, 102].map(DetTid::from_raw);
+        for process in [killed, doomed] {
+            scheduler.thread_tree.add_child(process, process, true);
+        }
+        for tid in [killed, doomed, live, waiter, other, caller] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let [held, unqueued_word, shared] = [0x404110, 0x404120, 0x404130].map(pi_futex);
+        scheduler.sleep_pi_futex_waiter(waiter, held, None, None, killed);
+        scheduler.sleep_pi_futex_waiter(doomed, shared, None, None, live);
+        scheduler.sleep_pi_futex_waiter(other, shared, None, None, live);
+        assert_eq!(
+            scheduler.pi_futex_state(unqueued_word, 90, caller),
+            unqueued(true)
+        );
+
+        // A process-group kill's notice comes before its send, while a victim
+        // may still run and unlock: it dooms nothing for PI futexes.
+        let group = DetPid::from_raw(77);
+        assert!(
+            scheduler
+                .thread_tree
+                .set_process_group(DetPid::from_raw(90), group)
+        );
+        scheduler.record_unresolved_sigkill(Some(group));
+        assert!(scheduler.sigkill_recorded(DetPid::from_raw(90)).0);
+        assert_eq!(
+            scheduler.pi_futex_state(unqueued_word, 90, caller),
+            unqueued(true)
+        );
+        assert!(!scheduler.admission_pending(waiter));
+
+        scheduler.record_committed_sigkill(killed, Some(DetPid::from_raw(90)));
+        assert!(scheduler.next_turns.contains_key(&killed));
+        assert_eq!(
+            scheduler.pi_futex_state(unqueued_word, 90, caller),
+            unqueued(false)
+        );
+        assert!(scheduler.admission_pending(waiter));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(held, waiter),
+            Some(PiHandOver::OwnerDeath)
+        );
+
+        scheduler.record_committed_sigkill(doomed, Some(DetPid::from_raw(91)));
+        assert_eq!(
+            scheduler.pi_futex_state(shared, 92, caller),
+            contended(live, Some(other))
+        );
+        assert_eq!(scheduler.hand_off_pi_futex(shared), Some(other));
+    }
+
+    /// A thread's retirement hands each PI futex it owns to that futex's longest
+    /// waiter, admitted at the next drain and told the owner died, as Linux's
+    /// `exit_pi_state_list` does; a futex whose waiters all left is dropped.
+    #[test]
+    fn a_retired_pi_futex_owner_hands_its_futexes_to_their_longest_waiters() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let detpid = DetPid::from_raw(99);
+        let [first, second, other] = [100, 101, 102].map(DetTid::from_raw);
+        scheduler.thread_tree.add_child(owner, owner, true);
+        for tid in [owner, first, second, other] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let [futex, other_futex, abandoned] = [0x404110, 0x404120, 0x404130].map(pi_futex);
+        scheduler.sleep_pi_futex_waiter(first, futex, None, None, owner);
+        scheduler.sleep_pi_futex_waiter(second, futex, None, None, owner);
+        scheduler.sleep_pi_futex_waiter(other, other_futex, None, None, owner);
+        // A record whose waiter has left (a timeout or a kill).
+        scheduler.set_pi_futex_owner(abandoned, owner, None);
+
+        scheduler.logically_kill_thread(&owner, &detpid, MmId::initial(detpid));
+
+        for (tid, parked) in [(first, false), (second, true), (other, false)] {
+            assert_eq!(scheduler.is_parked_futex_waiter(tid), parked, "{tid}");
+            assert_eq!(scheduler.admission_pending(tid), !parked, "{tid}");
+        }
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 0, second),
+            contended(first, Some(second))
+        );
+        assert_eq!(
+            scheduler.pi_futex_state(other_futex, 99, second),
+            contended(other, None)
+        );
+        assert!(!scheduler.blocked.pi_futex_owners.contains_key(&abandoned));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(other_futex, other),
+            Some(PiHandOver::OwnerDeath)
+        );
+        assert_eq!(
+            scheduler.pi_futex_state(other_futex, 102, second),
+            unqueued(true)
+        );
+    }
+
+    /// A waiter handed the lock that dies before it takes it passes the lock on,
+    /// as `exit_pi_state_list` releases a state the dying task owns.
+    #[test]
+    fn a_successor_killed_before_it_takes_the_lock_passes_it_on() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let [heir, next] = [100, 101].map(DetTid::from_raw);
+        let detpid = DetPid::from_raw(100);
+        scheduler.thread_tree.add_child(heir, heir, true);
+        for tid in [owner, heir, next] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let futex = pi_futex(0x404110);
+        scheduler.sleep_pi_futex_waiter(heir, futex, None, None, owner);
+        scheduler.sleep_pi_futex_waiter(next, futex, None, None, owner);
+        assert_eq!(scheduler.hand_off_pi_futex(futex), Some(heir));
+
+        scheduler.logically_kill_thread(&heir, &detpid, MmId::initial(detpid));
+
+        assert!(!scheduler.is_parked_futex_waiter(next));
+        assert!(scheduler.admission_pending(next));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(futex, next),
+            Some(PiHandOver::OwnerDeath)
+        );
+        assert_eq!(scheduler.take_handed_pi_futex(futex, heir), None);
     }
 
     /// Under `--futex-wake-yields` a waker that woke a waiter goes
@@ -25586,6 +28738,91 @@ mod test {
             scheduler.step6_reenquue(last, requeue);
         }
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tids[0]));
+    }
+
+    /// A replay that lets go of its schedule drops each thread's recorded
+    /// callback checkpoints with it, at the reply that tells the thread so
+    /// (`Scheduler::schedule_replay_reply`), when the thread drops its own
+    /// copy: another thread's copy stays until its own reply. The run summary
+    /// records the release and what it dropped.
+    #[test]
+    fn a_released_schedule_drops_its_callback_checkpoints() {
+        use crate::preemptions::callback_history::Checkpoint;
+        use crate::preemptions::callback_history::Origin;
+        use crate::preemptions::callback_history::Site;
+        use crate::slice_boundary::callbacks::Callback;
+        let thread = DetTid::from_raw(3);
+        let event = |rip: usize| SchedEvent {
+            dettid: thread,
+            op: detcore_model::schedule::Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: std::num::NonZeroUsize::new(rip),
+            end_time: Some(LogicalTime::from_nanos(0)),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let schedule = directory.path().join("schedule.json");
+        let recorded = vec![event(100), event(100)];
+        std::fs::write(
+            &schedule,
+            serde_json::json!({ "per_thread": {}, "global": recorded }).to_string(),
+        )
+        .unwrap();
+        let mut scheduler = Scheduler::new(&Config {
+            replay_schedule_from: Some(schedule),
+            ..Config::default()
+        });
+        let origin = Origin {
+            callback: Callback::PmuTimer,
+            site: Site::Prehook,
+            progress: 1,
+            last_op: None,
+            time: LogicalTime::from_nanos(0),
+            rcbs: 0,
+        };
+        let other = DetTid::from_raw(4);
+        for tid in [thread, other] {
+            scheduler.callback_checkpoints.insert(
+                tid,
+                [Checkpoint {
+                    history_index: 0,
+                    origin: origin.clone(),
+                }]
+                .into(),
+            );
+        }
+        for _ in 1..replayer::UNMATCHED_EVENTS_BEFORE_RELEASE {
+            assert!(scheduler.consume_schedevent(&event(200)).keep_running);
+        }
+        assert_eq!(scheduler.schedule_replay_reply(thread), (false, false));
+        assert!(scheduler.callback_checkpoints[&thread].len() == 1);
+        assert!(scheduler.consume_schedevent(&event(200)).keep_running);
+        assert!(scheduler.schedule_released());
+        assert!(scheduler.callback_checkpoints[&thread].len() == 1);
+        assert_eq!(scheduler.schedule_replay_reply(thread), (true, true));
+        assert!(scheduler.callback_checkpoints[&thread].is_empty());
+        assert!(scheduler.callback_checkpoints[&other].len() == 1);
+        let text = scheduler
+            .generate_partial_run_summary(None)
+            .unwrap()
+            .desync_descrip
+            .unwrap();
+        assert!(
+            text.contains(&format!(
+                "RELEASED replayed schedule at event #{}: {} observed events in a row matched \
+                 none of it; 2 recorded events left unreplayed; callback checkpoints dropped \
+                 with it: dtid 3: 1\n",
+                replayer::UNMATCHED_EVENTS_BEFORE_RELEASE - 1,
+                replayer::UNMATCHED_EVENTS_BEFORE_RELEASE,
+            )),
+            "{text}"
+        );
+        // The thread that has not heard of the release still holds its
+        // checkpoint, and the summary names it as unconsumed.
+        assert!(
+            text.contains("DESYNC incomplete callback history for 4: 1 unconsumed"),
+            "{text}"
+        );
     }
 
     /// A `SchedYield` turn opens or joins a yield epoch only under `--chaos`,
@@ -26146,6 +29383,236 @@ mod test {
         scheduler.step2e_process_signal_deferred();
         assert!(!scheduler.blocked.sigchld_deferred.contains(&signaled));
         assert!(scheduler.run_queue.contains_tid(signaled));
+    }
+
+    /// Under a schedule replay whose next record, after the thread's
+    /// `SignalReceived`, is the thread's own, a host-async `SIGCHLD` delivery is
+    /// not parked behind a polling retry the replay holds in the deferred band:
+    /// the recording did not run that retry first, or its polling attempt would
+    /// be the next record. It is still parked behind genuine work, here a
+    /// queued kernel-run blocking call, which records no event and so keeps its
+    /// run-queue order, and step 2e readmits it past the poller once that call
+    /// has left the queue; and behind the poller when the schedule runs the
+    /// poller next.
+    #[test]
+    fn a_replayed_sigchld_waits_behind_genuine_work_but_not_a_replay_held_poller() {
+        let poller = DetTid::from_raw(3);
+        let blocker = DetTid::from_raw(5);
+        let signaled = DetTid::from_raw(7);
+        let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
+        let polling = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request
+        };
+        let deferred = |next: SchedEvent, with_blocker: bool| {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let mut queued = vec![(poller, polling(poller))];
+            if with_blocker {
+                let mut request = Resources::new(blocker);
+                request.insert(
+                    ResourceID::BlockingExternalIO(ExternalOpId::new(blocker, 1)),
+                    Permission::W,
+                );
+                queued.push((blocker, request));
+            }
+            for (tid, request) in &queued {
+                register_known_thread(&mut scheduler, *tid);
+                scheduler.next_turns.get_mut(tid).unwrap().req = Ivar::full(Ok(request.clone()));
+                scheduler.priorities.insert(*tid, REPLAY_DEFERRED_PRIORITY);
+                // A replay requeues a polling thread as an ordinary entry at
+                // the priority it gives the threads it does not want to run.
+                scheduler.runqueue_push_back(*tid);
+            }
+            register_known_thread(&mut scheduler, signaled);
+            scheduler
+                .priorities
+                .insert(signaled, REPLAY_FOREGROUND_PRIORITY);
+            let received = SchedEvent {
+                op: detcore_model::schedule::Op::SignalReceived(SigWrapper(libc::SIGCHLD)),
+                ..SchedEvent::branches(signaled, 1)
+            }
+            .with_time(LogicalTime::from_nanos(10_000));
+            scheduler.replayer = Some(Replayer::new(vec![received.clone(), next]));
+            let _ = scheduler.consume_schedevent(&received);
+            assert!(scheduler.run_queue.has_runnable_besides(signaled));
+            scheduler.runqueue_push_back(signaled);
+            assert_eq!(
+                scheduler.run_queue.tentative_pop_tid(signaled),
+                Some(signaled)
+            );
+            let granted = scheduler
+                .block_for_one_resource(
+                    signaled,
+                    &inbound,
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_ok();
+            assert_eq!(
+                granted,
+                !scheduler.blocked.sigchld_deferred.contains(&signaled)
+            );
+            (scheduler, !granted)
+        };
+        // The schedule runs the signaled thread next: the poller does not
+        // hold the delivery back.
+        assert!(!deferred(SchedEvent::branches(signaled, 76), false).1);
+
+        // A queued kernel-run blocking call still does. Once it has left the
+        // queue, step 2e readmits the delivery past the poller, which counts
+        // as work for `only_pollers`.
+        let (mut behind_blocker, parked) = deferred(SchedEvent::branches(signaled, 76), true);
+        assert!(parked);
+        behind_blocker.step2e_process_signal_deferred();
+        assert!(behind_blocker.blocked.sigchld_deferred.contains(&signaled));
+        assert!(behind_blocker.run_queue.remove_tid(blocker));
+        behind_blocker.step2e_process_signal_deferred();
+        assert!(!behind_blocker.blocked.sigchld_deferred.contains(&signaled));
+        assert!(behind_blocker.blocked.sigchld_ready.contains(&signaled));
+        assert!(behind_blocker.run_queue.contains_tid(signaled));
+
+        // The schedule runs the poller next: deferred as before, and step 2e
+        // keeps it parked.
+        let (mut poller_next, parked) = deferred(SchedEvent::branches(poller, 3), false);
+        assert!(parked);
+        poller_next.step2e_process_signal_deferred();
+        assert!(poller_next.blocked.sigchld_deferred.contains(&signaled));
+
+        // With another delivery parked too, the replay readmits only the one
+        // the schedule runs next while the poller is queued, and the other
+        // stays parked; once the queue is empty, step 2e's own gate admits
+        // every parked delivery at once, as before.
+        let other = DetTid::from_raw(9);
+        let (mut two_parked, parked) = deferred(SchedEvent::branches(signaled, 76), true);
+        assert!(parked);
+        register_known_thread(&mut two_parked, other);
+        two_parked.blocked.sigchld_deferred.insert(other);
+        assert!(two_parked.run_queue.remove_tid(blocker));
+        two_parked.step2e_process_signal_deferred();
+        assert!(two_parked.run_queue.contains_tid(signaled));
+        assert!(two_parked.blocked.sigchld_deferred.contains(&other));
+        assert!(two_parked.run_queue.remove_tid(signaled));
+        assert!(two_parked.run_queue.remove_tid(poller));
+        two_parked.blocked.sigchld_deferred.insert(signaled);
+        two_parked.step2e_process_signal_deferred();
+        assert!(two_parked.blocked.sigchld_deferred.is_empty());
+        assert!(two_parked.run_queue.contains_tid(signaled));
+        assert!(two_parked.run_queue.contains_tid(other));
+    }
+
+    /// A polling request with `poll_attempt > 0` is a pending backoff: step 4
+    /// requeues it without a grant and records nothing. So a replay counts it
+    /// as work for a SIGCHLD delivery to the thread its schedule runs next,
+    /// both when the delivery arrives and in step 2e's rescue. Once the backoff
+    /// has run, the poller sits in the last band, and step 2e's own gate admits
+    /// the delivery (Codex review of the readmission change).
+    #[test]
+    fn a_pending_poll_backoff_keeps_a_replayed_sigchld_parked() {
+        let poller = DetTid::from_raw(3);
+        let signaled = DetTid::from_raw(7);
+        let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
+        let mut scheduler = Scheduler::new(&Config::default());
+        let mut backoff = Resources::new(poller);
+        backoff.insert(ResourceID::InternalIOPolling, Permission::W);
+        backoff.poll_attempt = 1;
+        register_known_thread(&mut scheduler, poller);
+        let next = scheduler.next_turns.get_mut(&poller).unwrap();
+        next.req = Ivar::full(Ok(backoff.clone()));
+        let response = next.resp.clone();
+        scheduler
+            .priorities
+            .insert(poller, REPLAY_DEFERRED_PRIORITY);
+        scheduler.runqueue_push_back(poller);
+        register_known_thread(&mut scheduler, signaled);
+        scheduler
+            .priorities
+            .insert(signaled, REPLAY_FOREGROUND_PRIORITY);
+        let received = SchedEvent {
+            op: detcore_model::schedule::Op::SignalReceived(SigWrapper(libc::SIGCHLD)),
+            ..SchedEvent::branches(signaled, 1)
+        }
+        .with_time(LogicalTime::from_nanos(10_000));
+        scheduler.replayer = Some(Replayer::new(vec![
+            received.clone(),
+            SchedEvent::branches(signaled, 76),
+        ]));
+        let _ = scheduler.consume_schedevent(&received);
+
+        // The delivery waits behind the pending backoff.
+        scheduler.runqueue_push_back(signaled);
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(signaled),
+            Some(signaled)
+        );
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    signaled,
+                    &inbound,
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_err()
+        );
+        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+        assert_eq!(scheduler.replay_readmits_parked_sigchld(), None);
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+
+        // The real backoff path grants nothing and moves the poller to the
+        // last band; step 2e's own gate then admits the delivery.
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
+        assert!(
+            scheduler
+                .step4_resource_block(poller, &backoff, &response)
+                .is_err()
+        );
+        assert!(response.try_read().is_none());
+        assert!(scheduler.run_queue.only_pollers());
+        scheduler.step2e_process_signal_deferred();
+        assert!(!scheduler.blocked.sigchld_deferred.contains(&signaled));
+        assert!(scheduler.run_queue.contains_tid(signaled));
+    }
+
+    /// Step 2e's own gate still admits every parked SIGCHLD delivery at once
+    /// where it is eligible, with an empty queue or one of real pollers, also
+    /// under a schedule replay whose next record is one of their threads. The
+    /// replay's rescue of the next-scheduled thread applies only where that
+    /// gate keeps the deliveries parked (Codex review of the readmission
+    /// change).
+    #[test]
+    fn a_replay_keeps_step2e_batch_admission_of_parked_sigchlds() {
+        let first = DetTid::from_raw(7);
+        let second = DetTid::from_raw(9);
+        let poller = DetTid::from_raw(3);
+        for real_pollers in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.replayer = Some(Replayer::new(vec![SchedEvent::branches(first, 76)]));
+            for tid in [first, second] {
+                register_known_thread(&mut scheduler, tid);
+                scheduler.priorities.insert(tid, REPLAY_DEFERRED_PRIORITY);
+                scheduler.blocked.sigchld_deferred.insert(tid);
+            }
+            if real_pollers {
+                register_known_thread(&mut scheduler, poller);
+                scheduler
+                    .run_queue
+                    .push_poller(poller, DEFAULT_PRIORITY, u32::MAX);
+                assert!(scheduler.run_queue.only_pollers());
+            }
+            scheduler.step2e_process_signal_deferred();
+            assert!(
+                scheduler.blocked.sigchld_deferred.is_empty(),
+                "real pollers: {real_pollers}"
+            );
+            assert!(scheduler.run_queue.contains_tid(first));
+            assert!(scheduler.run_queue.contains_tid(second));
+        }
     }
 
     /// The control for the two tests above: a queue of real pollers alone still
@@ -32326,6 +35793,206 @@ mod test {
         assert!(scheduler.take_terminal_deadlock().is_some());
     }
 
+    /// Process 3 at a fatal delivery: its leader and thread 5 parked in futex
+    /// waits on one word, and thread 7 holding the turn that delivers.
+    fn fatal_delivery_scheduler(config: &Config) -> (Scheduler, MmId) {
+        let mut scheduler = Scheduler::new(config);
+        let [leader, parked, sender] = [3, 5, 7].map(DetTid::from_raw);
+        let mm = MmId::initial(leader);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        for thread in [parked, sender] {
+            scheduler.thread_tree.add_child(leader, thread, false);
+        }
+        for tid in [leader, parked, sender] {
+            register_known_thread(&mut scheduler, tid);
+            scheduler.record_thread_mm(tid, mm);
+        }
+        let waiters = scheduler
+            .blocked
+            .futex_waiters
+            .entry(FutexID::private(mm, 0x404100))
+            .or_default();
+        waiters.push(futex_waiter(3, u32::MAX));
+        waiters.push(futex_waiter(5, u32::MAX));
+        scheduler.set_running_for_test(sender);
+        (scheduler, mm)
+    }
+
+    /// A delivery whose default action ends the process retires the
+    /// process's other threads in the delivering turn, as Linux kills them at
+    /// that delivery (`do_group_exit`): their requests are never answered
+    /// again, their exit reports only account them, and turn selection waits
+    /// until every one is in. When the sender's own exit report then comes,
+    /// nothing is left. Without the retirement, the threads parked in futex
+    /// waits outlive the sender's report, and the empty run queue reads as a
+    /// deadlock: Hermit ended a guest's abort with its internal-failure
+    /// status, and no recording.
+    #[test]
+    fn a_fatal_delivery_retires_the_threads_parked_in_futex_waits() {
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let [leader, parked, sender] = [3, 5, 7].map(DetTid::from_raw);
+        let process = DetPid::from_raw(3);
+
+        // The sender's exit reported first, with nothing committed.
+        let (mut scheduler, mm) = fatal_delivery_scheduler(&config);
+        scheduler.logically_kill_thread(&sender, &process, mm);
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("futex waiters that outlive the sender read as a deadlock");
+        assert!(report.contains("waiting on futex"), "{report}");
+
+        let (mut scheduler, mm) = fatal_delivery_scheduler(&config);
+        assert!(scheduler.commit_fatal_delivery(sender, true));
+        assert_eq!(
+            scheduler.next_turns.keys().copied().collect::<Vec<_>>(),
+            [sender]
+        );
+        assert!(scheduler.blocked.no_futex_waiters());
+        assert!(scheduler.fatal_signal_doomed.contains(&process));
+        for tid in [leader, parked] {
+            assert!(scheduler.is_unaccounted_sigkill_victim(tid), "{tid}");
+        }
+        assert!(scheduler.sigkill_fence_holds());
+        // ptrace reports the leader's exit after its siblings'.
+        for tid in [parked, leader] {
+            assert_eq!(
+                scheduler.route_sigkill_receipt(tid),
+                sigkill_retirement::SigkillReceipt::Committed,
+                "{tid}"
+            );
+        }
+        assert!(!scheduler.sigkill_fence_holds());
+        // The sender's report ends the process; nothing waits.
+        scheduler.logically_kill_thread(&sender, &process, mm);
+        assert!(scheduler.next_turns.is_empty());
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+    }
+
+    /// The thread tree never drops an edge, so a thread id that a thread of
+    /// the dying process once had, and another process now reuses, is still
+    /// listed under the dying process. The delivery retires the dying
+    /// process's own threads only: the reused thread stays registered, is
+    /// no victim, and holds no fence.
+    #[test]
+    fn a_fatal_delivery_does_not_take_a_reused_thread_id_from_another_process() {
+        let config = Config::default();
+        let (mut scheduler, _) = fatal_delivery_scheduler(&config);
+        let [leader, parked, sender] = [3, 5, 7].map(DetTid::from_raw);
+        let reused = DetTid::from_raw(9);
+        let other = DetTid::from_raw(11);
+        scheduler.thread_tree.add_child(leader, reused, false);
+        scheduler.thread_tree.add_child(other, other, true);
+        scheduler.thread_tree.add_child(other, reused, false);
+        for tid in [other, reused] {
+            register_known_thread(&mut scheduler, tid);
+            scheduler.record_thread_mm(tid, MmId::initial(other));
+        }
+        assert!(
+            scheduler
+                .thread_tree
+                .my_thread_group(&DetPid::from_raw(3))
+                .contains(&reused),
+            "the stale edge this test is about must exist"
+        );
+
+        assert!(scheduler.commit_fatal_delivery(sender, true));
+        for tid in [leader, parked] {
+            assert!(scheduler.is_unaccounted_sigkill_victim(tid), "{tid}");
+        }
+        assert!(scheduler.next_turns.contains_key(&reused));
+        assert!(!scheduler.is_unaccounted_sigkill_victim(reused));
+        for tid in [parked, leader] {
+            scheduler.route_sigkill_receipt(tid);
+        }
+        assert!(!scheduler.sigkill_fence_holds());
+    }
+
+    /// Nothing is retired where Linux does not end the group at the delivery
+    /// (a PID namespace's init, `SIGNAL_UNKILLABLE`; an exec in flight, whose
+    /// `de_thread` kills the others), where the caller could not establish
+    /// that the kernel carries the default action out at the resume (a
+    /// blocked signal, an attached gdbserver), on a backend that does not
+    /// retire a kill's victims at the kill turn (DBT ends the group with its
+    /// own `Exit` grant), for a sender that does not hold the turn, or, under
+    /// record, beside a thread with a background operation in flight, whose
+    /// recorded result's rejoin must still be consumed.
+    #[test]
+    fn a_fatal_delivery_retires_nothing_where_it_cannot_commit_the_group_end() {
+        let process = DetPid::from_raw(3);
+        let sender = DetTid::from_raw(7);
+        let parked = DetTid::from_raw(5);
+        let plain = Config::default();
+        let dbt = Config::default().with_backend(|backend| {
+            *backend = reverie::BackendCapabilities::DBT;
+        });
+        type Setup = fn(&mut Scheduler);
+        let cases: [(&str, &Config, Setup, bool, bool); 6] = [
+            (
+                "namespace init",
+                &plain,
+                |s| s.thread_tree.mark_pid_namespace_init(DetPid::from_raw(3)),
+                true,
+                false,
+            ),
+            (
+                "exec in flight",
+                &plain,
+                |s| {
+                    let leader = DetPid::from_raw(3);
+                    s.exec_teardowns.insert(
+                        leader,
+                        ExecTeardown {
+                            caller: leader,
+                            mm: MmId::initial(leader),
+                            siblings: Default::default(),
+                            observed: Default::default(),
+                        },
+                    );
+                },
+                true,
+                false,
+            ),
+            ("kernel does not carry it out", &plain, |_| {}, false, true),
+            ("DBT", &dbt, |_| {}, true, true),
+            (
+                "turn not held",
+                &plain,
+                |s| s.parked.running = None,
+                true,
+                true,
+            ),
+            (
+                "background operation under record",
+                &plain,
+                |s| {
+                    let parked = DetTid::from_raw(5);
+                    s.recordreplay_modes = true;
+                    s.blocked
+                        .external_io_blockers
+                        .insert(parked, crate::resources::ExternalOpId::new(parked, 1));
+                },
+                true,
+                true,
+            ),
+        ];
+        for (case, config, setup, retire, doomed) in cases {
+            let (mut scheduler, _) = fatal_delivery_scheduler(config);
+            setup(&mut scheduler);
+            assert!(!scheduler.commit_fatal_delivery(sender, retire), "{case}");
+            assert_eq!(scheduler.next_turns.len(), 3, "{case}");
+            assert!(!scheduler.is_unaccounted_sigkill_victim(parked), "{case}");
+            assert!(!scheduler.sigkill_fence_holds(), "{case}");
+            assert_eq!(
+                scheduler.fatal_signal_doomed.contains(&process),
+                doomed,
+                "{case}"
+            );
+        }
+    }
+
     /// A namespace whose init exited, with its member `child` in `pause(2)`
     /// and nothing else left: the state `note_pid_namespace_end` leaves.
     fn ended_namespace_with_a_paused_member(child: DetTid) -> Scheduler {
@@ -32633,6 +36300,109 @@ mod test {
             report.contains("thread(s) waiting on futex"),
             "unexpected report:\n{report}"
         );
+    }
+
+    /// A thread that died of a fatal signal no guest sent through the
+    /// scheduler (a fault, a debugger's `kill`, the OOM killer) took its whole
+    /// group with it. Its leader, blocked in a futex wait no exit wakes, has
+    /// its exit reported only after every other thread is reaped; until then
+    /// the empty run queue waits for that death instead of reporting a
+    /// deadlock, and past the valve it names the process.
+    #[test]
+    fn a_fatal_signal_death_waits_for_its_group_so_a_blocked_leader_is_no_deadlock() {
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let parent = DetTid::from_raw(1);
+        let leader = DetTid::from_raw(3);
+        let worker = DetTid::from_raw(5);
+        let process = DetPid::from_raw(3);
+        let mm = MmId::initial(leader);
+        let futex = FutexID::private(mm, 0x4040e8);
+        let scheduler = || {
+            let mut scheduler = Scheduler::new(&config);
+            scheduler.thread_tree.add_child(parent, parent, true);
+            scheduler.thread_tree.add_child(parent, leader, true);
+            scheduler.thread_tree.add_child(leader, worker, false);
+            let mut wait = Resources::new(leader);
+            wait.insert(ResourceID::FutexWait, Permission::R);
+            for (thread, request) in [(leader, Ivar::full(Ok(wait))), (worker, Ivar::new())] {
+                scheduler.next_turns.insert(
+                    thread,
+                    ThreadNextTurn {
+                        dettid: thread,
+                        child_tid_addr: 0,
+                        req: request,
+                        resp: Ivar::new(),
+                        protocol: Default::default(),
+                    },
+                );
+            }
+            scheduler
+                .blocked
+                .futex_waiters
+                .entry(futex)
+                .or_default()
+                .push(futex_waiter(3, u32::MAX));
+            scheduler
+        };
+
+        // Retiring only the dead worker leaves the leader blocked.
+        let mut worker_only = scheduler();
+        worker_only.retire_deregistered_thread(worker, process, mm);
+        assert!(worker_only.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(
+            worker_only.take_terminal_deadlock().is_some(),
+            "the blocked leader reads as a deadlock"
+        );
+
+        let mut killed = scheduler();
+        killed.retire_deregistered_thread(worker, process, mm);
+        killed.note_signal_killed_group(worker, process);
+        assert!(
+            killed.next_turns.contains_key(&leader),
+            "the leader is retired at its own deregistration"
+        );
+        assert!(killed.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(
+            killed.take_terminal_deadlock(),
+            None,
+            "the empty run queue waits for the leader's death"
+        );
+        killed.retire_deregistered_thread(leader, process, mm);
+        assert!(killed.futex_waiters_for_test(futex).is_empty());
+        let _ = killed.step2d_handle_empty_queue(&global_time);
+        assert_eq!(killed.take_terminal_deadlock(), None);
+
+        // A leader that never dies is a deadlock after all, at the valve.
+        let mut stuck = scheduler();
+        stuck.namespace_zap_valve = Duration::ZERO;
+        stuck.retire_deregistered_thread(worker, process, mm);
+        stuck.note_signal_killed_group(worker, process);
+        assert!(stuck.step2d_handle_empty_queue(&global_time).is_err());
+        let _ = stuck.step2d_handle_empty_queue(&global_time);
+        let report = stuck
+            .take_terminal_deadlock()
+            .expect("past the valve the wait is reported");
+        assert!(report.contains("which a fatal signal ends"), "{report}");
+
+        // A guest's SIGKILL the scheduler could not reserve (a fallback send)
+        // is recorded after the physical send but retires nothing: the
+        // worker's death is still awaited, so the blocked leader is no
+        // deadlock until its own death arrives.
+        let mut fallback = scheduler();
+        fallback.record_committed_sigkill(worker, Some(process));
+        fallback.retire_deregistered_thread(worker, process, mm);
+        fallback.note_signal_killed_group(worker, process);
+        assert!(fallback.signal_death_victim(process));
+        assert!(fallback.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(
+            fallback.take_terminal_deadlock(),
+            None,
+            "after a fallback SIGKILL the empty run queue waits for the leader's death"
+        );
+        fallback.retire_deregistered_thread(leader, process, mm);
+        let _ = fallback.step2d_handle_empty_queue(&global_time);
+        assert_eq!(fallback.take_terminal_deadlock(), None);
     }
 
     /// The positive half of the bracket: refusing to fast-forward onto an
@@ -37919,6 +41689,39 @@ mod strict_boundary_admission_tests {
             };
             assert!(std::panic::catch_unwind(|| Scheduler::new(&cfg)).is_err());
         }
+    }
+
+    /// A `--stacktrace-event` index at or past the end of a replayed legacy
+    /// schedule names an event the run makes after the schedule runs out, so
+    /// building the scheduler takes it as it is instead of indexing the
+    /// recording with it, which panicked.
+    #[test]
+    fn a_stacktrace_index_past_a_legacy_schedule_is_kept_for_the_run_after_it() {
+        use reverie::syscalls::Sysno;
+
+        use crate::preemptions::PreemptionRecord;
+        use crate::preemptions::boundary_recording::Recording;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schedule.json");
+        let tid = DetTid::from_raw(3);
+        Recording::Legacy(PreemptionRecord::from_sched_events(vec![
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook),
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook),
+        ]))
+        .write(&path)
+        .unwrap();
+        let cfg = Config {
+            replay_schedule_from: Some(path),
+            stacktrace_event: vec![(7, None), (2, None)],
+            ..Config::default()
+        };
+        let scheduler = Scheduler::new(&cfg);
+        let positions: Vec<u64> = scheduler
+            .stacktrace_events
+            .unwrap()
+            .map(|(position, _, _)| position)
+            .collect();
+        assert_eq!(positions, vec![2, 7]);
     }
 }
 

@@ -121,6 +121,9 @@ impl InterceptedCpuid {
     }
 
     pub fn cpuid(&self, leaf: u32, subleaf: u32) -> Option<CpuIdResult> {
+        // The host profile reads the native CPUID instruction, which only x86
+        // has; launch admission refuses the profile elsewhere.
+        #[cfg(target_arch = "x86_64")]
         if self.profile == CpuProfile::HostNoRdrand {
             // Launch admission binds the tracer to the lowest originally
             // allowed CPU, including after container placement or worker reuse.
@@ -309,6 +312,7 @@ pub(crate) fn on_virtual_cpu(leaf: u32, mut result: CpuIdResult, cpu: u32) -> Cp
 /// real TSC_AUX without trapping, so it must not be advertised. Leaf 0xD is
 /// deliberately unchanged, including subleaf 1 and components beyond PKRU:
 /// native XGETBV/XSAVE instructions need the host kernel's complete layout.
+#[cfg(target_arch = "x86_64")]
 fn mask_host_cpuid(leaf: u32, subleaf: u32, mut r: CpuIdResult) -> CpuIdResult {
     match (leaf, subleaf) {
         (1, _) => {
