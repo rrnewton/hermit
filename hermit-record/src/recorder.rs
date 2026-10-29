@@ -1653,6 +1653,7 @@ mod finish_tests {
             stream_id: EventStreamId::root().child(3),
             child_stream_ids: ChildEventStreamIds::default(),
             pending_exec: None,
+            interrupted_poll: None,
             bootstrapped: true,
             outputs: ContainerOutputs::default(),
             output_descriptions: Default::default(),
