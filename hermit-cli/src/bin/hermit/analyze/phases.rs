@@ -2273,7 +2273,7 @@ impl AnalyzeOpts {
             stack1.map(|(stack, _)| stack),
             stack2.map(|(stack, _)| stack),
         );
-        let target_met = target.finished && target.met_target;
+        let target_met = target.met_target;
         let racing_accesses = match (target.traced.take(), baseline.traced.take()) {
             (Some(target), Some(baseline)) => {
                 let realized = target.realized_path.clone();
@@ -3031,6 +3031,7 @@ mod tests {
                 &dir.path().join("candidate.json"),
                 &[],
                 1,
+                None,
                 |run| {
                     assert!(!run.has_launched());
                     for extension in ["stack1", "stack2"] {
@@ -3245,7 +3246,7 @@ mod tests {
             assert!(!run.has_launched());
 
             let error = options
-                .replay_for_stacks("final", Path::new("schedule.json"), &[], 1, |run| {
+                .replay_for_stacks("final", Path::new("schedule.json"), &[], 1, None, |run| {
                     std::fs::write(run.root_path().with_extension("stack2"), "retained stack")?;
                     Err(stopped_trial(kind))
                 })
@@ -3344,15 +3345,17 @@ mod tests {
         options.tmp_dir = Some(dir.path().to_path_buf());
         let schedule = PreemptionRecord::from_sched_events(Vec::new());
         let error = options
-            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, |_| Ok(false))
+            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, None, |_| {
+                Ok(false)
+            })
             .err()
             .expect("a missing record must not stand in for an observed empty trace");
         assert!(
             error.to_string().contains("no readable recorded schedule"),
             "{error:#}"
         );
-        let (completed, _) = options
-            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, |run| {
+        let (completed, _, _) = options
+            .prefix_continuation("final_baseline_schedule", &schedule, 0, None, None, |run| {
                 schedule
                     .write_to_disk(run.sched_path_out())
                     .map_err(anyhow::Error::msg)?;
@@ -3422,7 +3425,7 @@ mod tests {
                     decision: 1,
                     continuation: None,
                 },
-                |runname, _, prefix, position| {
+                |runname, _, prefix, position, _| {
                     stacks += 1;
                     assert_eq!((prefix, position), (2, 1));
                     let target_met = if runname == "final_target_for_stacktraces" {
@@ -3431,10 +3434,10 @@ mod tests {
                         baseline
                     };
                     target_met
-                        .map(|met| (met, None))
+                        .map(|met| (met, None, None))
                         .ok_or_else(|| Error::new(RunTimeoutMarker))
                 },
-                |_, prefix| {
+                |_, prefix, _| {
                     continuations += 1;
                     assert_eq!(prefix, 1);
                     Ok((
@@ -3443,6 +3446,7 @@ mod tests {
                             schedule: continued[..len].to_vec(),
                         },
                         PathBuf::from("final_baseline_schedule.preempts"),
+                        None,
                     ))
                 },
             );
