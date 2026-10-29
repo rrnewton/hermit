@@ -38351,10 +38351,11 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// out are not found by a lookup either, however it is spelled: absolutely,
 /// below the entry, relative to a directory descriptor, through
 /// `/sys/bus/cpu/devices`, with stat, access and readlink. cpu0 and node0 stay
-/// found. rseq fails with ENOSYS and leaves its area untouched, under the
-/// default policy at bitwise parity and under `--allow-unsupported-syscalls`
-/// too: the kernel would write the host CPU into the area (Linux v6.16
-/// `rseq_update_cpu_node_id`).
+/// found, under the default policy at bitwise parity and under
+/// `--allow-unsupported-syscalls` too. Under the default policy rseq fails
+/// with ENOSYS and leaves its area untouched; under
+/// `--allow-unsupported-syscalls` it reaches the kernel, as on main, so its
+/// lines there are the host's and are not compared.
 #[test]
 fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
     let guest = futex_c_guest(&ABSENT_CPU_LOOKUPS_GUEST, "absent_cpu_lookups")
@@ -38417,7 +38418,13 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
     ];
     let output = hermit(&allowed);
     assert_success(&output, &allowed);
-    assert_eq!(stdout(&output), expected);
+    let lookups = |out: &str| -> String {
+        out.lines()
+            .filter(|line| !line.starts_with("rseq"))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    };
+    assert_eq!(lookups(&stdout(&output)), lookups(expected));
 }
 
 /// A vfork child that waits for a thread other than its own vfork child

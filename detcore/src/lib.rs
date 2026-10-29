@@ -368,14 +368,6 @@ pub fn is_strict_only_deterministic_refusal_syscall(sysno: Sysno) -> bool {
     syscall_classification::is_strict_only_deterministic_refusal_syscall(sysno)
 }
 
-/// Returns whether `sysno` is refused with ENOSYS under every policy because
-/// the kernel would hand the guest the host CPU it runs on (`rseq`). A
-/// backend that runs a guest syscall outside the dispatcher answers ENOSYS
-/// for it, as the dispatcher does.
-pub fn is_cpu_identity_refused_syscall(sysno: Sysno) -> bool {
-    syscall_classification::is_cpu_identity_refused_syscall(sysno)
-}
-
 use tool_local::PosixTimers;
 use tool_local::ProcessCpuTime;
 pub use tool_local::ThreadState;
@@ -5383,14 +5375,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.
-            // Always ENOSYS, also under `--allow-unsupported-syscalls`: a
-            // registered area receives the host CPU and NUMA node the thread
-            // runs on (Linux v6.16 `rseq_update_cpu_node_id`,
-            // kernel/rseq.c), which `getcpu` and `sched_getaffinity` hide,
-            // and its critical sections abort on preemptions Detcore does not
-            // place. glibc runs without one when registration fails.
             SyscallClassification::Determinized if call.number() == Sysno::rseq => {
-                Err(Error::Errno(Errno::ENOSYS))
+                if panic_on_unsupported_syscalls {
+                    Err(Error::Errno(Errno::ENOSYS))
+                } else {
+                    self.passthrough(guest, call).await
+                }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)

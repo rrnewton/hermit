@@ -747,13 +747,15 @@ counterparts and `cpufreq` show only number 0, and a lookup of any other `cpuN`,
 node0's `cpuN` links, the processor driver's and a memory block's `nodeN`
 link. A spelling with `..` or another symbolic link that reaches one of them
 is the kernel's to resolve and is not refused. Under record and replay the
-listings and lookups are the host's. `rseq` is
-refused with ENOSYS under every policy, `--allow-unsupported-syscalls`
-included: the kernel writes the CPU and node a thread runs on into a registered
-area (Linux v6.16 `rseq_update_cpu_node_id`, kernel/rseq.c).
+listings and lookups are the host's. `rseq` is refused with ENOSYS under the
+default policy, as a kernel without rseq answers. Under
+`--allow-unsupported-syscalls` it reaches the kernel, which writes the CPU and
+node a thread runs on into a registered area (Linux v6.16
+`rseq_update_cpu_node_id`, kernel/rseq.c), so a guest that registers one there
+sees the host CPU.
 
-One source remains under the ptrace backend. The kernel loads the CPU and node
-numbers into the limit of a per-CPU segment and into `TSC_AUX` (v6.16
+The ptrace backend also cannot trap one more source. The kernel loads the CPU
+and node numbers into the limit of a per-CPU segment and into `TSC_AUX` (v6.16
 `setup_getcpu`, arch/x86/kernel/cpu/common.c, through `vdso_encode_cpunode`),
 and an `lsl` of that segment, or RDPID where the CPU has it, reads them back
 (`vdso_read_cpunode`, arch/x86/include/asm/segment.h). Neither instruction

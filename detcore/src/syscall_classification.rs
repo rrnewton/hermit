@@ -1321,21 +1321,13 @@ pub(crate) const fn is_host_kernel_probe_syscall(sysno: Sysno) -> bool {
 pub(crate) const fn is_strict_only_deterministic_refusal_syscall(sysno: Sysno) -> bool {
     // These families preserve native behavior only under the explicit
     // compatibility opt-out, and fail closed otherwise.
-    is_zero_copy_pipe_syscall(sysno) || is_kernel_keyring_syscall(sysno)
-}
-
-/// Calls refused with ENOSYS under every policy, the compatibility opt-out
-/// included, because the kernel would hand the guest the host CPU it runs
-/// on: `rseq`, whose registered area receives the CPU and NUMA node numbers
-/// (Linux v6.16 `rseq_update_cpu_node_id`, kernel/rseq.c), which `getcpu`
-/// and `sched_getaffinity` hide.
-pub(crate) const fn is_cpu_identity_refused_syscall(sysno: Sysno) -> bool {
     matches!(sysno, Sysno::rseq)
+        || is_zero_copy_pipe_syscall(sysno)
+        || is_kernel_keyring_syscall(sysno)
 }
 
 pub(crate) const fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
     is_strict_only_deterministic_refusal_syscall(sysno)
-        || is_cpu_identity_refused_syscall(sysno)
         || is_unimplemented_enosys_syscall(sysno)
         || is_futex2_enosys_syscall(sysno)
         || is_privileged_admin_refused_syscall(sysno)
@@ -2781,6 +2773,7 @@ mod tests {
         }
 
         for sysno in [
+            Sysno::rseq,
             Sysno::splice,
             Sysno::tee,
             Sysno::vmsplice,
@@ -2790,17 +2783,9 @@ mod tests {
         ] {
             assert!(is_strict_only_deterministic_refusal_syscall(sysno));
         }
-        // rseq is refused under every policy: the kernel writes the host CPU
-        // into a registered area.
-        for sysno in [
-            Sysno::rseq,
-            Sysno::openat2,
-            Sysno::perf_event_open,
-            Sysno::clock_settime,
-        ] {
+        for sysno in [Sysno::openat2, Sysno::perf_event_open, Sysno::clock_settime] {
             assert!(!is_strict_only_deterministic_refusal_syscall(sysno));
         }
-        assert!(is_cpu_identity_refused_syscall(Sysno::rseq));
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

@@ -9,8 +9,8 @@
 // Looks up the CPUs and NUMA nodes other than number 0 that the sysfs
 // listings leave out, and registers an rseq area, and prints what each call
 // returns. Under Hermit, which presents one CPU and one node, every lookup
-// fails with ENOENT and rseq with ENOSYS; natively, on a host with more than
-// one CPU, the cpu1 lookups succeed.
+// fails with ENOENT, and rseq fails with ENOSYS under the default policy;
+// natively, on a host with more than one CPU, the cpu1 lookups succeed.
 //
 // The lookups name the absent entry absolutely, below it, relative to a
 // directory descriptor, through /sys/bus (including the processor driver's

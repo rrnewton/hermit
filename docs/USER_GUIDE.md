@@ -749,7 +749,7 @@ reproducible target condition.
 | Option | Effect |
 | --- | --- |
 | `--strict` | Uses the current deterministic defaults and refuses a run that would draw an input from the host: pass `--epoch` (or set `HERMIT_EPOCH`), and do not use `--seed-from=SystemRandom`. |
-| `--allow-unsupported-syscalls` | Run-only compatibility escape hatch that permits Unsupported syscalls to reach Linux and prints a warning. A successful exit does not establish complete deterministic execution. `rseq` stays refused with ENOSYS, because the kernel would write the host CPU into its area. |
+| `--allow-unsupported-syscalls` | Run-only compatibility escape hatch that permits Unsupported syscalls to reach Linux and prints a warning. A successful exit does not establish complete deterministic execution. |
 | `--passthru-opt` | Use the reduced syscall subscription set for performance. Requires `--allow-unsupported-syscalls`; unlisted PassThrough syscalls bypass Detcore, weakening deterministic accounting. Unsupported syscalls remain subscribed so the explicit policy is observable. |
 | `--no-sequentialize-threads` | Lets Linux schedule guest threads concurrently. This weakens schedule reproducibility. |
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |
