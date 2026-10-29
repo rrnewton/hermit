@@ -1781,6 +1781,33 @@ mod tests {
         assert!(!help.contains("[default: 2026-01-01T00:00:00Z]"), "{help}");
     }
 
+    /// `--stacktrace-event` indexes two different streams: the traced events
+    /// of a recorded or replayed schedule, polling retries included, and the
+    /// stored boundary stream under `--strict-schedule-boundaries`. The help
+    /// names both, and says a release's number is not such an index.
+    #[test]
+    fn run_stacktrace_event_help_names_both_index_streams() {
+        let mut command = command_without_epoch_env();
+        let run = command.find_subcommand_mut("run").unwrap();
+        // Compare whitespace-normalized text so terminal wrapping cannot matter.
+        let help = run
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for expected in [
+            "N counts every traced event, polling retries and events the schedule does not hold \
+             included",
+            "the event number a schedule release reports leaves polling retries out, so it is \
+             not such an index",
+            "Under `--strict-schedule-boundaries`, N is instead a position in the stored boundary \
+             stream, `TimesliceEnd` records included",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
     #[test]
     fn top_level_help_states_what_the_defaults_actually_are() {
         let mut command = command_without_epoch_env();
