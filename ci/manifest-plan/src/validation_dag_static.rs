@@ -4493,7 +4493,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second,
     // a_thread_that_has_run_still_waits_behind_a_short_sleep_loop and
     // a_worker_is_not_held_off_by_futex_waits_that_time_out, need the PMU
-    // timer, which the hosted runner lacks, so they are skipped by exact name
+    // timer, which the hosted runner lacks, so they are skipped by full name
     // here and run in privileged-test.pmu_cli_cases with the fifth,
     // a_thread_that_has_run_does_not_wait_behind_a_zero_length_sleep_loop,
     // restored after train 7 dropped them: 744 - 4 = 740, listed.
@@ -5073,7 +5073,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
     // The same four PMU chaos cases of
-    // https://github.com/rrnewton/hermit/pull/4658, skipped by exact name
+    // https://github.com/rrnewton/hermit/pull/4658, skipped by full name
     // here as in test.cli, with the fifth: 663 - 4 = 659, listed.
     ("test.cli_on_host", 659),
     ("test.hermit_modes_on_host", 21),
