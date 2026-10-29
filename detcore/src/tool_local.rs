@@ -4874,6 +4874,16 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) passed_descriptors_out_reported: bool,
 
+    /// Set by the nonblocking retry loop when the call it completed returned
+    /// a result Detcore rewrote for the guest
+    /// (`NonblockableSyscall::normalize_nonblocking_result`): a retried
+    /// `connect` whose `EISCONN` reads as success. Such an attempt saw only
+    /// that the socket was connected, by an earlier attempt or by another
+    /// thread's connect of the same open file, not where to; `handle_connect`
+    /// clears it before the call and reads it after.
+    #[serde(default)]
+    pub(crate) nonblocking_result_normalized: bool,
+
     /// Set by the syscall handler when a `FUTEX_WAKE` woke a waiter and
     /// [`Config::yields_after_futex_wake`] holds, so that the
     /// syscall's post-hook takes a yield turn. A logically killed waker gets
@@ -5805,6 +5815,7 @@ impl<T> ThreadState<T> {
             in_uncharged_bootstrap_syscall: false,
             passed_descriptors_out_unreported: false,
             passed_descriptors_out_reported: false,
+            nonblocking_result_normalized: false,
             yield_after_futex_wake: false,
             pipe_handoff_due: None,
             own_signal_turn_hold: None,

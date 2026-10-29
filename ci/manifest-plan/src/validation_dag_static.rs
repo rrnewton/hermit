@@ -3079,7 +3079,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the outside-the-turn unit replaced in place): 2885.
     // And io_buffers' two connect units and scm_rights'
     // a_connection_is_guest_made_only_when_both_of_its_ends_are: 2888, listed.
-    ("test.detcore_unit", 2894),
+    // a_connection_is_guest_made_only_when_both_of_its_ends_are: 2888.
+    // And io_buffers' a_retried_connect_that_finds_its_socket_connected_pairs_nothing:
+    // 2889, listed.
+    ("test.detcore_unit", 2895),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5407,7 +5410,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fd unit: 2885, listed.
     // And the same fd unit: 2885.
     // And the same three connect and pairing units: 2888, listed.
-    ("test.detcore_unit_on_host", 2894),
+    // And the same three connect and pairing units: 2888.
+    // And the same retried-connect unit: 2889, listed.
+    ("test.detcore_unit_on_host", 2895),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

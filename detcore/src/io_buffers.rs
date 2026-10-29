@@ -1193,6 +1193,8 @@ mod event_tests {
         /// `Resources::passes_descriptors_out` of each resource request, in
         /// the order the requests arrive, the empty ones included.
         passes_out: Mutex<Vec<bool>>,
+        /// What a `connect`'s second attempt returns.
+        connect_completes: Result<i64, Errno>,
     }
 
     impl EventGuest {
@@ -1208,35 +1210,61 @@ mod event_tests {
         }
     }
 
-    struct UnusedStack;
     struct UnusedStackGuard;
 
-    impl Drop for UnusedStackGuard {
-        fn drop(&mut self) {}
+    /// Where the fixture's guest stack starts, and where it ends.
+    const STACK_BASE: usize = 0x3c00;
+    const STACK_END: usize = 0x4000;
+    /// The process id the fixture's injected `getpid` and `SO_PEERCRED`
+    /// report.
+    const EVENT_PID: i32 = 4242;
+
+    /// A guest stack in the fixture's memory, for the injections that need
+    /// one (`socket_option`): values are written as they are pushed.
+    struct EventStack {
+        memory: EventMemory,
+        top: usize,
     }
 
-    impl reverie::Stack for UnusedStack {
+    impl reverie::Stack for EventStack {
         type StackGuard = UnusedStackGuard;
 
         fn size(&self) -> usize {
-            panic!("readv event must not use a guest stack")
+            self.top - STACK_BASE
         }
 
         fn capacity(&self) -> usize {
-            panic!("readv event must not use a guest stack")
+            STACK_END - STACK_BASE
         }
 
-        fn push<'stack, T>(&mut self, _value: T) -> Addr<'stack, T> {
-            panic!("readv event must not use a guest stack")
+        fn push<'stack, T>(&mut self, value: T) -> Addr<'stack, T> {
+            let at = self.reserve::<T>();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&value as *const T).cast::<u8>(),
+                    std::mem::size_of::<T>(),
+                )
+            };
+            let start = at.as_raw();
+            self.memory.0.lock().unwrap()[start..start + bytes.len()].copy_from_slice(bytes);
+            Addr::from_raw(start).unwrap()
         }
 
         fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
-            panic!("readv event must not use a guest stack")
+            let align = std::mem::align_of::<T>();
+            let at = self.top.div_ceil(align) * align;
+            self.top = at + std::mem::size_of::<T>();
+            assert!(self.top <= STACK_END, "the fixture's stack overflowed");
+            AddrMut::from_raw(at).unwrap()
         }
 
         fn commit(self) -> Result<Self::StackGuard, Errno> {
-            panic!("readv event must not use a guest stack")
+            Ok(UnusedStackGuard)
         }
+    }
+
+    impl Drop for UnusedStackGuard {
+        fn drop(&mut self) {}
     }
 
     #[reverie::tool]
@@ -1330,7 +1358,7 @@ mod event_tests {
     #[reverie::tool]
     impl Guest<Detcore> for EventGuest {
         type Memory = EventMemory;
-        type Stack = UnusedStack;
+        type Stack = EventStack;
 
         fn tid(&self) -> Pid {
             Pid::from_raw(self.thread.dettid.as_raw())
@@ -1395,7 +1423,10 @@ mod event_tests {
         }
 
         async fn stack(&mut self) -> Self::Stack {
-            panic!("readv event must not use a guest stack")
+            EventStack {
+                memory: self.memory.clone(),
+                top: STACK_BASE,
+            }
         }
 
         async fn daemonize(&mut self) {
@@ -1417,17 +1448,38 @@ mod event_tests {
                 // boundary even when the reported errno remains unchanged.
                 return Err(Errno::ENOSYS);
             }
-            if matches!(
-                Syscall::from_raw(number, args),
-                Syscall::Sendmsg(_) | Syscall::Sendmmsg(_) | Syscall::Connect(_)
-            ) {
-                self.send_attempts += 1;
-                let connect = matches!(Syscall::from_raw(number, args), Syscall::Connect(_));
-                return match self.send_attempts {
-                    1 => Err(Errno::EAGAIN),
-                    2 => Ok(if connect { 0 } else { 1 }),
-                    attempt => panic!("unexpected extra send or connect attempt {attempt}"),
-                };
+            match Syscall::from_raw(number, args) {
+                Syscall::Sendmsg(_) | Syscall::Sendmmsg(_) | Syscall::Connect(_) => {
+                    self.send_attempts += 1;
+                    let connect = matches!(Syscall::from_raw(number, args), Syscall::Connect(_));
+                    return match self.send_attempts {
+                        1 => Err(Errno::EAGAIN),
+                        2 if connect => self.connect_completes,
+                        2 => Ok(1),
+                        attempt => panic!("unexpected extra send or connect attempt {attempt}"),
+                    };
+                }
+                // A connected stream socket whose peer is this process
+                // (`classify_guest_held_peer`).
+                Syscall::Getsockopt(call) => {
+                    let value: Vec<u8> = match call.optname() {
+                        libc::SO_TYPE => libc::SOCK_STREAM.to_ne_bytes().to_vec(),
+                        libc::SO_ACCEPTCONN => 0i32.to_ne_bytes().to_vec(),
+                        libc::SO_PEERCRED => [EVENT_PID, 0, 0]
+                            .iter()
+                            .flat_map(|field| field.to_ne_bytes())
+                            .collect(),
+                        other => panic!("unexpected socket option {other}"),
+                    };
+                    let mut arena = self.memory.0.lock().unwrap();
+                    let at = call.optval().unwrap().as_raw();
+                    arena[at..at + value.len()].copy_from_slice(&value);
+                    let length = call.optlen().unwrap().as_raw();
+                    arena[length..length + 4].copy_from_slice(&(value.len() as u32).to_ne_bytes());
+                    return Ok(0);
+                }
+                Syscall::Getpid(_) => return Ok(EVENT_PID as i64),
+                _ => {}
             }
             if let Syscall::Read(call) = Syscall::from_raw(number, args) {
                 assert_eq!(call.len(), 0);
@@ -1563,6 +1615,7 @@ mod event_tests {
             report_memory_regions: false,
             send_attempts: 0,
             passes_out: Mutex::new(Vec::new()),
+            connect_completes: Ok(0),
         };
         (tool, guest)
     }
@@ -1895,33 +1948,59 @@ mod event_tests {
         family.len() + name.len()
     }
 
-    /// Runs one `connect` of `FD`, a stream socket, to `NAME_A`, both names
-    /// bound by a guest beforehand. In the turn (`in_turn`), the connect is
-    /// polled and a sibling rewrites the address to `NAME_B` between its two
-    /// attempts; outside it, the socket blocks in the kernel and the one
-    /// attempt connects. Returns how many connections wait on each name,
-    /// `None` where their order is unknown.
-    async fn connect_rewritten_while_it_waits(in_turn: bool) -> (Option<usize>, Option<usize>) {
+    /// How a `connect` in [`connect_rewritten_while_it_waits`] runs.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ConnectRun {
+        /// Polled in the caller's turns; the second attempt connects.
+        Polled,
+        /// Polled; the second attempt finds the socket already connected
+        /// (`EISCONN`), which reads as success.
+        PolledFoundConnected,
+        /// Outside the turn: the socket blocks in the kernel, and the one
+        /// attempt connects.
+        OutsideTheTurn,
+    }
+
+    /// Runs one `connect` of `FD`, a stream socket a guest made, to
+    /// `NAME_A`, both names bound by a guest beforehand, `NAME_B` to a socket
+    /// a guest made. Polled, a sibling rewrites the address to `NAME_B`
+    /// between the two attempts. Returns how many connections wait on each
+    /// name, `None` where their order is unknown, and whether the socket was
+    /// marked guest-held.
+    async fn connect_rewritten_while_it_waits(
+        run: ConnectRun,
+    ) -> (Option<usize>, Option<usize>, bool) {
         let (parked_tx, parked_rx) = oneshot::channel();
         let (resume_tx, resume_rx) = oneshot::channel();
         let (tool, mut guest) = event_guest(FdType::Socket, Some((parked_tx, resume_rx)));
+        let polled = run != ConnectRun::OutsideTheTurn;
         guest
             .thread
             .with_detfd(FD, |detfd| {
                 detfd.set_unix_type(libc::SOCK_STREAM);
-                if in_turn {
+                detfd.set_guest_created();
+                if polled {
                     detfd.set_physically_nonblocking();
                 }
             })
             .unwrap();
-        if !in_turn {
-            // The one attempt connects.
-            guest.send_attempts = 1;
+        match run {
+            ConnectRun::OutsideTheTurn => guest.send_attempts = 1,
+            ConnectRun::PolledFoundConnected => guest.connect_completes = Err(Errno::EISCONN),
+            ConnectRun::Polled => {}
         }
+        // The second name's listener: a socket a guest made, kept open.
+        let listener = DetFd::new(
+            9,
+            OFlag::O_RDWR,
+            FdType::Socket,
+            OpenFileId::new(DetPid::from_raw(1), 97),
+        );
+        listener.set_guest_created();
         {
             let mut connections = guest.thread.unix_connections.lock().unwrap();
             connections.bound(NAME_A, crate::fd::OpenFileHandle::dangling());
-            connections.bound(NAME_B, crate::fd::OpenFileHandle::dangling());
+            connections.bound(NAME_B, listener.open_file_handle());
         }
         let length = put_unix_name(&guest.memory, NAME_A);
         let memory = guest.memory.clone();
@@ -1932,7 +2011,7 @@ mod event_tests {
             .into();
         let event = tool.handle_syscall_event(&mut guest, call);
         let sibling = async {
-            if in_turn {
+            if polled {
                 parked_rx.await.unwrap();
                 put_unix_name(&memory, NAME_B);
                 resume_tx.send(()).unwrap();
@@ -1944,8 +2023,16 @@ mod event_tests {
         .await
         .expect("the connect did not finish");
         assert_eq!(result.unwrap(), 0);
+        let marked = guest
+            .thread
+            .with_detfd(FD, |detfd| detfd.is_guest_held())
+            .unwrap();
         let connections = guest.thread.unix_connections.lock().unwrap();
-        (connections.waiting(NAME_A), connections.waiting(NAME_B))
+        (
+            connections.waiting(NAME_A),
+            connections.waiting(NAME_B),
+            marked,
+        )
     }
 
     /// A connect polled in the caller's turns queues its socket for the
@@ -1955,11 +2042,27 @@ mod event_tests {
     /// it, and the first listener's `accept` cannot take this socket's place
     /// for another connector's connection (Codex review of
     /// https://github.com/rrnewton/hermit/pull/4862).
+    /// It is marked guest-held from the listener it reached, both ends being
+    /// sockets guests made (`Detcore::classify_guest_held_peer`).
     #[tokio::test(flavor = "current_thread")]
     async fn a_connect_rewritten_between_attempts_queues_for_the_name_it_reached() {
         assert_eq!(
-            connect_rewritten_while_it_waits(true).await,
-            (Some(0), Some(1))
+            connect_rewritten_while_it_waits(ConnectRun::Polled).await,
+            (Some(0), Some(1), true)
+        );
+    }
+
+    /// A retried attempt that finds the socket already connected
+    /// (`EISCONN`, which the guest sees as success) saw neither where the
+    /// socket was connected nor the address now in memory: the connect is
+    /// paired with nothing, every name's order becomes unknown, and the socket
+    /// is not marked, though the address now names a guest-made listener
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4862).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_connect_that_finds_its_socket_connected_pairs_nothing() {
+        assert_eq!(
+            connect_rewritten_while_it_waits(ConnectRun::PolledFoundConnected).await,
+            (None, None, false)
         );
     }
 
@@ -1968,7 +2071,10 @@ mod event_tests {
     /// queue is trusted afterwards (`Detcore::note_unix_connect`).
     #[tokio::test(flavor = "current_thread")]
     async fn a_connect_outside_the_turn_leaves_every_name_unpaired() {
-        assert_eq!(connect_rewritten_while_it_waits(false).await, (None, None));
+        assert_eq!(
+            connect_rewritten_while_it_waits(ConnectRun::OutsideTheTurn).await,
+            (None, None, false)
+        );
     }
 
     fn readv(count: usize) -> Syscall {
