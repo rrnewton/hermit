@@ -3069,7 +3069,7 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 353ffffbaff8adae42a573a9d2654d36c2d3cd9b (2026-10-29): from a469b534be5d93d6d3fbbfba124a5196003e2d95.
+# CARRY TO 7789af9e78f7967067e81c7369f7305555ba7d10 (2026-10-29): from a469b534be5d93d6d3fbbfba124a5196003e2d95.
 # Interval: Counter2 lifecycle reports in the global owner (96a9ddb5),
 # generic command cases through actual DBT Tools (958575f9), the shared
 # ChromeTrace caller with inherited stdin (e1ef57aa) and ChunkyPrint caller
@@ -3077,6 +3077,11 @@ fi
 # (353ffffb). The reverie-dbt tree changed and the committed
 # inventory is 1043. The existing SDK budget carries, not runtime
 # equivalence.
+# CARRY TO 7789af9e78f7967067e81c7369f7305555ba7d10 (2026-10-29): from 7789af9e78f7967067e81c7369f7305555ba7d10.
+# Interval: gdb signal/exit stops and interrupt stop (reverie 1104/1109).
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs and third-party/ are
+# byte-identical by git object id between the pins (4e4afaa7, 3f2abba1,
+# fb49c0ba), so the existing SDK budget carries, not runtime equivalence.
 # CARRY TO 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 (2026-10-28): from 688a542d75af8310c4ddd97eadbf2434abb067ff.
 # Interval: KVM initial-FPU signal handlers (6276eee1), DBT executable-selection
 # reland (90f9928c), private-libc errno translation (940407c8, e99426e3),
@@ -3084,7 +3089,7 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=353ffffbaff8adae42a573a9d2654d36c2d3cd9b
+expected_pin=7789af9e78f7967067e81c7369f7305555ba7d10
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
