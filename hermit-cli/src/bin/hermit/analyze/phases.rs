@@ -2371,8 +2371,14 @@ mod tests {
 
         // A record without an epoch keeps the default.
         let analysis = prepared_analysis(dir, None, None, &[]).unwrap();
-        // No `--epoch` is added; `--expired-wait-charge` always is.
-        assert_eq!(analysis.run_arg, ["--expired-wait-charge=each"]);
+        // No `--epoch` is added; `--expired-wait-charge` and `--sleep-registration` always are.
+        assert_eq!(
+            analysis.run_arg,
+            [
+                "--expired-wait-charge=each",
+                "--sleep-registration=when-chosen"
+            ]
+        );
         assert_eq!(analysis.trial_epoch_for_test(), "2026-01-01T00:00:00+00:00");
 
         // The recorded epoch reaches the trials, from either record.
@@ -2384,8 +2390,14 @@ mod tests {
         // An explicit epoch equal to the recorded one adds no second --epoch.
         let analysis =
             prepared_analysis(dir, Some(RECORDED), None, &["--epoch", RECORDED]).unwrap();
-        // No `--epoch` is added; `--expired-wait-charge` always is.
-        assert_eq!(analysis.run_arg, ["--expired-wait-charge=each"]);
+        // No `--epoch` is added; `--expired-wait-charge` and `--sleep-registration` always are.
+        assert_eq!(
+            analysis.run_arg,
+            [
+                "--expired-wait-charge=each",
+                "--sleep-registration=when-chosen"
+            ]
+        );
         assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
 
         // A different explicit epoch is refused, naming the remedy.

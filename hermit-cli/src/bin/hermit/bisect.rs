@@ -693,8 +693,14 @@ mod tests {
 
         // The default epoch, for schedules that carry none.
         let trials = prepared_trials(dir, None, None, &[]).unwrap();
-        // No `--epoch` is added; `--expired-wait-charge` always is.
-        assert_eq!(trials.run_arg, ["--expired-wait-charge=each"]);
+        // No `--epoch` is added; `--expired-wait-charge` and `--sleep-registration` always are.
+        assert_eq!(
+            trials.run_arg,
+            [
+                "--expired-wait-charge=each",
+                "--sleep-registration=when-chosen"
+            ]
+        );
         assert_eq!(trials.trial_epoch_for_test(), "2026-01-01T00:00:00+00:00");
 
         // The recorded epoch, from either schedule or both.
@@ -714,8 +720,14 @@ mod tests {
         // An explicit epoch equal to the recorded one adds no second --epoch.
         let trials =
             prepared_trials(dir, Some(RECORDED), Some(RECORDED), &["--epoch", RECORDED]).unwrap();
-        // No `--epoch` is added; `--expired-wait-charge` always is.
-        assert_eq!(trials.run_arg, ["--expired-wait-charge=each"]);
+        // No `--epoch` is added; `--expired-wait-charge` and `--sleep-registration` always are.
+        assert_eq!(
+            trials.run_arg,
+            [
+                "--expired-wait-charge=each",
+                "--sleep-registration=when-chosen"
+            ]
+        );
         assert_eq!(trials.trial_epoch_for_test(), RECORDED_RFC3339);
 
         // An explicit epoch that differs is refused, naming the remedy.
