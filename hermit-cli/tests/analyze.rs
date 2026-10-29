@@ -979,12 +979,13 @@ fn analyze_explains_a_target_the_scheduler_meets_alone() {
     }
 }
 
-/// An analysis that ends with an error removes its workspace too, and with
-/// `--keep-tmp` keeps it: the target run here misses a target nothing prints,
-/// and without `--search` analyze ends there.
+/// An analysis that ends with an error keeps its workspace, with or without
+/// `--keep-tmp`, since the error can name trial files in it (main's
+/// `incomplete_trial` says they are retained): the target run here misses a
+/// target nothing prints, and without `--search` analyze ends there.
 #[test]
 #[ignore = "slow: runs a chaos trial; requires PMU branch counters and working mount namespaces"]
-fn analyze_removes_its_workspace_unless_kept() {
+fn analyze_keeps_its_workspace_after_an_error() {
     for keep in [false, true] {
         let label = format!("analyze hello_race, target never met, keep: {keep}");
         let _guard = analyze_lock();
@@ -1010,22 +1011,18 @@ fn analyze_removes_its_workspace_unless_kept() {
             output.status
         );
         let left = left_in(&tmp_dir);
-        if keep {
-            assert!(
-                left.len() == 1 && left[0].join("run1_target.repro").is_file(),
-                "{label}: {left:?}\n{combined}"
-            );
-            assert!(
-                combined.contains("Kept the workspace"),
-                "{label}\n{combined}"
-            );
-        } else {
-            assert_no_workspace_left(&label, &tmp_dir, &combined);
-            assert!(
-                combined.contains("Removed the workspace"),
-                "{label}\n{combined}"
-            );
-        }
+        assert!(
+            left.len() == 1 && left[0].join("run1_target.repro").is_file(),
+            "{label}: {left:?}\n{combined}"
+        );
+        assert!(
+            combined.contains(if keep {
+                "Kept the workspace at"
+            } else {
+                "(the error above can name files in it)"
+            }),
+            "{label}\n{combined}"
+        );
     }
 }
 
