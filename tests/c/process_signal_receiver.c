@@ -28,8 +28,27 @@
  *               it, and the child exits before the spinning worker prints,
  *               so the chosen thread must be resumed before any other
  *               runnable thread.
+ *   usr1-after-failed
+ *               in the child, the main thread and workers 1 and 3 block
+ *               SIGUSR1 and worker 2 does not. The parent's
+ *               pidfd_send_signal of SIGUSR1 with a siginfo whose si_code is
+ *               SI_USER fails with EPERM before anything is sent (a code only
+ *               the target itself may use), so it moves no curr_target.
+ *               Worker 1 then unblocks SIGUSR1, and the parent's
+ *               kill(child, SIGUSR1) names the main thread, which blocks it:
+ *               the walk from curr_target, still the main thread, reaches
+ *               worker 1, which takes it, ahead of worker 2.
  *   usr1-self   worker 1's kill(getpid(), SIGUSR1) in a four-thread process
  *               whose threads all leave it unblocked: the main thread takes it.
+ *   term-after-walk
+ *               in the child, the main thread and worker 3 block SIGUSR1 and
+ *               SIGTERM, worker 1 blocks SIGUSR1 alone and worker 2 neither.
+ *               Worker 2's kill(getpid(), SIGUSR1) names the main thread,
+ *               which blocks it, so the walk from curr_target (the main
+ *               thread) reaches worker 2, which takes it and becomes
+ *               curr_target. The parent's kill(child, SIGTERM) names the main
+ *               thread, which blocks it too, and the walk starts at worker 2,
+ *               which takes it, ahead of worker 1.
  *   segv-pidfd  a two-thread child whose worker sends its own process SIGSEGV
  *               with pidfd_send_signal, at its default disposition: the whole
  *               child dies of SIGSEGV.
@@ -123,6 +142,10 @@ static void raise_flag(int* flag) {
  * process SIGUSR1 (usr1-self). */
 /* In term-busy, worker 1 spins instead of parking (busy_worker). */
 static int busy_worker;
+/* The worker that unblocks every signal once told to, and the flag it raises
+ * when it has (usr1-after-failed waits for it). */
+static int unblock_role = 2;
+static int unblocked;
 
 static void* worker(void* arg) {
   role = (int)(long)arg;
@@ -141,10 +164,11 @@ static void* worker(void* arg) {
     fflush(stdout);
   }
   wait_for(&go, 1);
-  if (role == 2) {
+  if (role == unblock_role) {
     sigset_t none;
     sigemptyset(&none);
     pthread_sigmask(SIG_SETMASK, &none, NULL);
+    raise_flag(&unblocked);
   }
   if (role == usr1_sender && kill(getpid(), SIGUSR1) != 0) {
     die("kill");
@@ -256,6 +280,141 @@ static int term_busy(void) {
   return term(0, 0);
 }
 
+/* The child of usr1-after-failed. */
+static void failed_child(int to_parent, int from_parent) {
+  sigset_t usr1;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  worker_masks[1] = usr1;
+  sigemptyset(&worker_masks[2]);
+  worker_masks[3] = usr1;
+  unblock_role = 1;
+  if (pthread_sigmask(SIG_SETMASK, &usr1, NULL) != 0) {
+    die("pthread_sigmask");
+  }
+  start_workers();
+  char byte = 'r';
+  if (write(to_parent, &byte, 1) != 1) {
+    die("write ready");
+  }
+  if (read(from_parent, &byte, 1) != 1) {
+    die("read failed send");
+  }
+  raise_flag(&go);
+  wait_for(&unblocked, 1);
+  if (write(to_parent, &byte, 1) != 1) {
+    die("write unblocked");
+  }
+  print_report(getppid());
+  fflush(stdout);
+  _exit(0);
+}
+
+static int usr1_after_failed(void) {
+  int to_parent[2], from_parent[2];
+  if (pipe(report_pipe) != 0 || pipe(to_parent) != 0 || pipe(from_parent) != 0) {
+    die("pipe");
+  }
+  catch(SIGUSR1);
+  fflush(stdout);
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    failed_child(to_parent[1], from_parent[0]);
+  }
+  char byte;
+  if (read(to_parent[0], &byte, 1) != 1) {
+    die("read ready");
+  }
+  int pidfd = (int)syscall(SYS_pidfd_open, child, 0);
+  if (pidfd < 0) {
+    die("pidfd_open");
+  }
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  info.si_signo = SIGUSR1;
+  info.si_code = SI_USER;
+  long rc = syscall(SYS_pidfd_send_signal, pidfd, SIGUSR1, &info, 0);
+  printf("forged pidfd_send_signal: %ld %s\n", rc,
+         rc == 0 ? "-" : errno == EPERM ? "EPERM" : "other");
+  fflush(stdout);
+  if (write(from_parent[1], "f", 1) != 1) {
+    die("write failed send");
+  }
+  if (read(to_parent[0], &byte, 1) != 1) {
+    die("read unblocked");
+  }
+  if (kill(child, SIGUSR1) != 0) {
+    die("kill");
+  }
+  int status;
+  if (waitpid(child, &status, 0) != child) {
+    die("waitpid");
+  }
+  printf("child exit status: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  return 0;
+}
+
+/* The child of term-after-walk. */
+static void walk_child(int to_parent) {
+  sigset_t usr1, both;
+  sigemptyset(&usr1);
+  sigaddset(&usr1, SIGUSR1);
+  both = usr1;
+  sigaddset(&both, SIGTERM);
+  worker_masks[1] = usr1;
+  sigemptyset(&worker_masks[2]);
+  worker_masks[3] = both;
+  if (pthread_sigmask(SIG_SETMASK, &both, NULL) != 0) {
+    die("pthread_sigmask");
+  }
+  usr1_sender = 2;
+  start_workers();
+  raise_flag(&go);
+  printf("own-process SIGUSR1:\n");
+  print_report(getpid());
+  char byte = 'r';
+  if (write(to_parent, &byte, 1) != 1) {
+    die("write ready");
+  }
+  printf("parent's SIGTERM:\n");
+  print_report(getppid());
+  fflush(stdout);
+  _exit(0);
+}
+
+static int term_after_walk(void) {
+  int to_parent[2];
+  if (pipe(report_pipe) != 0 || pipe(to_parent) != 0) {
+    die("pipe");
+  }
+  catch(SIGTERM);
+  catch(SIGUSR1);
+  fflush(stdout);
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    walk_child(to_parent[1]);
+  }
+  char byte;
+  if (read(to_parent[0], &byte, 1) != 1) {
+    die("read ready");
+  }
+  if (kill(child, SIGTERM) != 0) {
+    die("kill");
+  }
+  int status;
+  if (waitpid(child, &status, 0) != child) {
+    die("waitpid");
+  }
+  printf("child exit status: %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  return 0;
+}
+
 /* The main thread tells the workers to go only once it is past
  * pthread_create, which blocks every signal while it runs. */
 static int usr1_self(void) {
@@ -336,9 +495,17 @@ int main(int argc, char** argv) {
   if (strcmp(mode, "usr1-self") == 0) {
     return usr1_self();
   }
+  if (strcmp(mode, "usr1-after-failed") == 0) {
+    return usr1_after_failed();
+  }
+  if (strcmp(mode, "term-after-walk") == 0) {
+    return term_after_walk();
+  }
   if (strcmp(mode, "segv-pidfd") == 0) {
     return segv_pidfd();
   }
-  fprintf(stderr, "usage: %s term|term-one|term-queued|term-busy|usr1-self|segv-pidfd\n", argv[0]);
+  fprintf(stderr,
+          "usage: %s term|term-one|term-queued|term-busy|usr1-self|usr1-after-failed|term-after-walk|segv-pidfd\n",
+          argv[0]);
   return 2;
 }

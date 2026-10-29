@@ -38279,11 +38279,21 @@ fn a_process_directed_signal_to_a_sleeping_sibling_is_refused_by_name() {
 ///   of parked: the main thread still takes it, and the child exits before
 ///   the spinning worker can print, so this case fails if the chosen thread
 ///   is not resumed before any other runnable thread;
+/// - `usr1-after-failed`: the parent's `pidfd_send_signal` with a siginfo
+///   whose `si_code` is `SI_USER` fails with EPERM before anything is sent,
+///   so it moves no `curr_target`; once worker 1 unblocks SIGUSR1, the
+///   parent's `kill`, which the main thread blocks, goes to worker 1, where a
+///   walk from the thread the failed call would have chosen gives worker 2;
+/// - `term-after-walk`: worker 2's `kill(getpid(), SIGUSR1)`, which the main
+///   thread and the other workers block, is forwarded as it is, and Linux's
+///   walk makes worker 2 `curr_target`; the parent's SIGTERM, which the main
+///   thread blocks, then goes to worker 2 and not to worker 1, which would
+///   take it from a walk that started at the main thread;
 /// - `segv-pidfd`: a worker's `pidfd_send_signal` of SIGSEGV to its own
 ///   two-thread process, at its default disposition, ends the whole process.
 ///
-/// Every one is `SI_USER` from the sender's pid, as Linux delivers it. The
-/// first three run under `--strict --verify --verify-strict` at bitwise
+/// Every one is `SI_USER` from the sender's pid, as Linux delivers it. All but
+/// `segv-pidfd` run under `--strict --verify --verify-strict` at bitwise
 /// parity. `segv-pidfd` runs under `--strict` alone: the deaths of a group a
 /// fatal signal ends are retired at host-timed moments until
 /// https://github.com/rrnewton/hermit/pull/4589 and the change stacked on it
@@ -38303,6 +38313,20 @@ fn a_process_directed_signal_goes_to_the_thread_linux_chooses() {
             true,
         ),
         ("term-busy", receiver("main thread") + exited, true),
+        (
+            "usr1-after-failed",
+            "forged pidfd_send_signal: -1 EPERM\n".to_owned() + &receiver("worker 1") + exited,
+            true,
+        ),
+        (
+            "term-after-walk",
+            "own-process SIGUSR1:\n".to_owned()
+                + &receiver("worker 2")
+                + "parent's SIGTERM:\n"
+                + &receiver("worker 2")
+                + exited,
+            true,
+        ),
         (
             "segv-pidfd",
             "child killed by signal 11\n".to_owned(),
