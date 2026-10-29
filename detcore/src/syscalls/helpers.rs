@@ -1273,20 +1273,31 @@ pub fn ioaction_based_on_fd_status<
 ) -> Result<IOAction, Errno> {
     let wrapped: Syscall = call.into();
     let fd = get_fd(wrapped).unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
-    let error_queue_never_waits = guest
+    let (phys, virt, error_queue_never_waits) = guest
         .thread_state()
-        .with_detfd(fd, |detfd| detfd.error_queue_never_waits())?;
-    match ioaction_based_on_fd(guest, fd)? {
-        // FT, but the call itself does not wait (MSG_DONTWAIT, or MSG_ERRQUEUE
-        // on a socket whose protocol reads that queue without waiting), so
-        // firing once is what Linux does.
-        IOAction::NonblockizeRetry
-            if call.flags_forbid_waiting()
-                || (error_queue_never_waits && call.reads_error_queue()) =>
-        {
-            Ok(IOAction::PassThru)
-        }
-        action => Ok(action),
+        .with_detfd(fd, |detfd| {
+            (
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.error_queue_never_waits(),
+            )
+        })?;
+    tracing::trace!(
+        "Checking FD {} for nonblocking: physical {} / virtual {}",
+        fd,
+        phys,
+        virt
+    );
+    let action = ioaction_for_fd_status(fd, virt, phys, call.flags_forbid_waiting());
+    // A receive with MSG_ERRQUEUE on a socket whose protocol reads that
+    // queue without waiting also runs once, as Linux does.
+    if action == IOAction::NonblockizeRetry
+        && error_queue_never_waits
+        && call.reads_error_queue()
+    {
+        Ok(IOAction::PassThru)
+    } else {
+        Ok(action)
     }
 }
 
@@ -1300,18 +1311,7 @@ pub(crate) fn ioaction_based_on_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     let (phys, virt) = guest.thread_state().with_detfd(fd, |detfd| {
         (detfd.physically_nonblocking(), detfd.is_nonblocking())
     })?;
-    tracing::trace!(
-        "Checking FD {} for nonblocking: physical {} / virtual {}",
-        fd,
-        phys,
-        virt
-    );
-    Ok(ioaction_for_fd_status(
-        fd,
-        virt,
-        phys,
-        call.flags_forbid_waiting(),
-    ))
+    Ok(ioaction_for_fd_status(fd, virt, phys, false))
 }
 
 /// The decision of [`ioaction_based_on_fd_status`] from the descriptor's
@@ -2562,6 +2562,38 @@ pub(crate) enum RestartCall {
     InKernel(Sysno),
 }
 
+/// Where the timeout of a `poll` Detcore runs in the kernel ends
+/// (`RestartCall::KernelPoll`), on the host's monotonic clock. That clock is
+/// the one the kernel wait runs on and the one Linux's restart keeps its end
+/// time on (`poll_select_set_timeout`, `do_restart_poll`), while the thread's
+/// logical time stands still as long as it blocks in the kernel, so an end on
+/// logical time would let every restart wait the whole timeout again.
+///
+/// `None` under record and replay: there the restart reruns the poll with the
+/// timeout it was issued with. The recording holds each poll's arguments and
+/// replay checks them, and no clock that replay reproduces moves while the
+/// poll blocks, so a time left is not replayed today.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KernelPollDeadline(pub(crate) Option<std::time::Instant>);
+
+/// The result of an injected `restart_syscall` (`resume_kernel_wait`).
+fn resumed_kernel_wait_result(result: Result<i64, Errno>) -> Result<i64, Errno> {
+    match result {
+        Err(Errno::ERESTARTSYS) => Err(Errno::ERESTART_RESTARTBLOCK),
+        other => other,
+    }
+}
+
+impl RestartBlock {
+    /// The record, if a `restart_syscall` that stopped at `rip` is the kernel's
+    /// restart of the interrupted call. At any other address the guest made the
+    /// call itself.
+    pub(crate) fn resumed_at(self, rip: u64) -> Option<Self> {
+        (self.rip == rip).then_some(self)
+    }
+}
+
 /// Injects `call`, which the kernel runs as the guest made it, and keeps a
 /// record for the kernel's restart when a signal ends it with
 /// `ERESTART_RESTARTBLOCK` (`RestartCall::InKernel`). Linux then restarts the
@@ -2583,6 +2615,7 @@ where
     keep_restart_block(guest, &result, RestartCall::InKernel(sysno), None).await;
     result
 }
+
 
 /// The kernel's restart of a wait Detcore ran in the kernel
 /// (`RestartCall::InKernel`): `restart_syscall` itself, which resumes the wait
@@ -2606,37 +2639,6 @@ where
     result
 }
 
-/// The result of an injected `restart_syscall` (`resume_kernel_wait`).
-fn resumed_kernel_wait_result(result: Result<i64, Errno>) -> Result<i64, Errno> {
-    match result {
-        Err(Errno::ERESTARTSYS) => Err(Errno::ERESTART_RESTARTBLOCK),
-        other => other,
-    }
-}
-
-/// Where the timeout of a `poll` Detcore runs in the kernel ends
-/// (`RestartCall::KernelPoll`), on the host's monotonic clock. That clock is
-/// the one the kernel wait runs on and the one Linux's restart keeps its end
-/// time on (`poll_select_set_timeout`, `do_restart_poll`), while the thread's
-/// logical time stands still as long as it blocks in the kernel, so an end on
-/// logical time would let every restart wait the whole timeout again.
-///
-/// `None` under record and replay: there the restart reruns the poll with the
-/// timeout it was issued with. The recording holds each poll's arguments and
-/// replay checks them, and no clock that replay reproduces moves while the
-/// poll blocks, so a time left is not replayed today.
-#[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct KernelPollDeadline(pub(crate) Option<std::time::Instant>);
-
-impl RestartBlock {
-    /// The record, if a `restart_syscall` that stopped at `rip` is the kernel's
-    /// restart of the interrupted call. At any other address the guest made the
-    /// call itself.
-    pub(crate) fn resumed_at(self, rip: u64) -> Option<Self> {
-        (self.rip == rip).then_some(self)
-    }
-}
 
 /// Keeps `deadline` for the kernel's restart of `call` when the wait ended with
 /// `ERESTART_RESTARTBLOCK` (`RestartBlock`).
@@ -6391,6 +6393,14 @@ mod tests {
             ioaction_for_fd_status(3, false, false, true),
             IOAction::Blocking
         );
+    }
+
+    /// `MSG_DONTWAIT` keeps every socket send and receive from waiting,
+    /// whatever else its flags carry, and no other flag does: recvmmsg's
+    /// `MSG_WAITFORONE` still waits for the first datagram. Calls with no
+    /// per-call flags always follow the file.
+    #[test]
+    
     /// The three receive calls read the error queue exactly when their flags
     /// carry `MSG_ERRQUEUE`, which does not by itself keep them from waiting;
     /// a send's flags never read it.
