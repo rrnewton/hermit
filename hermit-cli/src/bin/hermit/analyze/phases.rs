@@ -103,20 +103,6 @@ fn stack_pair_sentences(
 pub struct PrefixDecision {
     pub schedule: PreemptionRecord,
     pub decision: usize,
-    /// [`refused_trials_warning`], if any trial was refused.
-    pub refused: Option<String>,
-}
-
-/// What a search with `refused` trials Hermit refused at run time, all
-/// counted as not reaching the target, should say about its result.
-fn refused_trials_warning(refused: usize) -> Option<String> {
-    (refused > 0).then(|| {
-        format!(
-            "{refused} trial(s) were refused by Hermit (exit 122) and counted as not reaching \
-             the target, so the deciding event may separate the target from a path Hermit does \
-             not support rather than from a run that misses the target."
-        )
-    })
 }
 
 /// The outcome and recorded schedule of a trial that completed.
@@ -387,7 +373,6 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<PrefixDecision> {
         let target = target_record.schedevents();
         let mut trial = 0;
-        let mut refused = 0;
         let mut meets_target = |len: usize| -> anyhow::Result<bool> {
             trial += 1;
             let is_match = launch(trial, len)?;
@@ -414,10 +399,6 @@ impl AnalyzeOpts {
                  diagnostics and stabilize replay before retrying analysis."
             );
         }
-        let refused = refused_trials_warning(refused);
-        if let Some(warning) = &refused {
-            eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
-        }
         eprintln!(
             ":: The scheduling decision at event #{passing} of {} decides the outcome: {}",
             target.len(),
@@ -426,7 +407,6 @@ impl AnalyzeOpts {
         Ok(PrefixDecision {
             schedule: target_record.clone(),
             decision: passing,
-            refused,
         })
     }
 
@@ -511,11 +491,7 @@ impl AnalyzeOpts {
         ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
         continuation: impl FnOnce(&PreemptionRecord, usize) -> anyhow::Result<CompletedScheduleTrial>,
     ) -> anyhow::Result<Report> {
-        let PrefixDecision {
-            schedule,
-            decision,
-            refused,
-        } = found;
+        let PrefixDecision { schedule, decision } = found;
         let (target_met, chosen) = stack(
             "final_target_for_stacktraces",
             &schedule,
@@ -580,7 +556,6 @@ impl AnalyzeOpts {
             decision,
             &continued,
             [chosen, instead],
-            refused.as_deref(),
         );
         println!("{}", prefix_report_banner(&report));
         println!("{}", report.header);
@@ -597,7 +572,6 @@ impl AnalyzeOpts {
         decision: usize,
         continued: &[SchedEvent],
         [chosen, instead]: [Option<PrettyBacktrace>; 2],
-        refused: Option<&str>,
     ) -> Report {
         let mut header = format!(
             "The scheduling decision at event #{decision} of the target schedule decides the \
@@ -610,9 +584,6 @@ impl AnalyzeOpts {
             schedule[decision].dettid,
             continued.get(decision).map(|event| event.dettid),
         ));
-        if let Some(refused) = refused {
-            header.push_str(&format!("Note: {refused}\n"));
-        }
         let context = Self::generate_context(schedule, decision.max(1), self.execution_context);
 
         Report {
@@ -2126,7 +2097,7 @@ mod tests {
                 .unwrap();
             assert_eq!(warnings.len(), usize::from(inexact));
             let expected = warnings.first().map(|line| line.trim_end());
-            let report = options.prefix_report(&schedule, 0, &schedule, [None, None], None);
+            let report = options.prefix_report(&schedule, 0, &schedule, [None, None]);
             let json = serde_json::to_value(&report).unwrap();
             assert_eq!(
                 json.get("branch_counter_warning")

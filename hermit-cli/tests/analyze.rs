@@ -636,29 +636,26 @@ fn analyze_reproducer_runs_from_another_directory() {
 
 /// Every prefix trial in which thread a wins the race asks for something
 /// Hermit refuses at run time (exit 122), the run without chaos (the prefix
-/// search's baseline) among them. Each counts as the baseline condition, with
-/// a warning, and the report says how many were refused. Before, the first
-/// refused trial ended the whole analysis with exit 122. The refusal is
-/// Detcore's for a process-directed signal while several threads live
-/// (https://github.com/rrnewton/hermit/issues/4034); once that is supported,
-/// the fixture needs another refused operation.
+/// search's first trial) among them. A refused trial has no outcome, so the
+/// analysis ends there with Hermit's refusal and writes no report. The
+/// refusal is Detcore's for a process-directed signal while several threads
+/// live (https://github.com/rrnewton/hermit/issues/4034); once that is
+/// supported, the fixture needs another refused operation.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
-fn analyze_counts_a_refused_trial_as_the_baseline() {
+fn analyze_ends_at_a_refused_trial() {
     let label = "analyze --prefix-search analyze_race_then refuse";
-    let (combined, report) = analyze_race_then(label, "refuse", &["--prefix-search"]);
+    let (output, report) = analyze_race_then_with("refuse", &["--prefix-search"], &[]);
+    let combined = combined_output(&output);
+    assert_eq!(output.status.code(), Some(122), "{label}\n{combined}");
     assert!(
-        combined.contains(
-            "Hermit refused this trial when the guest reached an operation it does not support"
-        ),
-        "{label}: no trial was refused\n{combined}"
+        combined.contains("HERMIT_POLICY_REFUSAL")
+            && combined.contains("no program outcome was established"),
+        "{label}\n{combined}"
     );
     assert!(
-        report["header"]
-            .as_str()
-            .unwrap()
-            .contains("trial(s) were refused by Hermit (exit 122) and counted as not reaching"),
-        "{label}: {report}"
+        report.is_none(),
+        "{label}: a refused trial gave a report\n{combined}"
     );
 }
 
