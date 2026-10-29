@@ -244,6 +244,12 @@ pub struct DetFd {
 pub(crate) struct OpenFileHandle(std::sync::Weak<Mutex<OpenFileState>>);
 
 impl OpenFileHandle {
+    /// A handle that reaches no description, for tests.
+    #[cfg(test)]
+    pub(crate) fn dangling() -> Self {
+        Self(std::sync::Weak::new())
+    }
+
     /// Descriptor `fd` of the description, if any modeled descriptor still
     /// refers to it: an alias, sharing its cursor, snapshot and status flags,
     /// with `FD_CLOEXEC` as `cloexec` says.
@@ -256,6 +262,13 @@ impl OpenFileHandle {
         };
         detfd.set_cloexec(cloexec);
         Some(detfd)
+    }
+
+    /// Whether the description is a socket a guest made in this run and
+    /// never passed out of the guest ([`DetFd::is_guest_created`]); false once
+    /// no modeled descriptor refers to it.
+    pub(crate) fn is_guest_created(&self) -> bool {
+        self.with_description(|d| d.guest_created).unwrap_or(false)
     }
 
     /// Runs `f` on the description's model, as [`DetFd::with_description`]
@@ -1048,6 +1061,17 @@ struct OpenFileDescription {
     /// `is_guest_held`.
     #[serde(default)]
     guest_held: bool,
+    /// True when a guest made this socket with `socket(2)` or
+    /// `socketpair(2)` in this run and has not passed it out of the guest
+    /// since, so only guests hold it. Never set for a received, inherited or
+    /// accepted description. A connection is marked guest-held only when both
+    /// its connecting socket and its listener have this flag
+    /// (`Detcore::classify_guest_held_peer`): a socket's peer credentials name
+    /// its peer, not every holder of its open file. Cleared, permanently,
+    /// when a guest passes it over `SCM_RIGHTS` on a socket that is not
+    /// guest-held. See `is_guest_created`.
+    #[serde(default)]
+    guest_created: bool,
     /// True when record/replay runs a blocking `accept(2)` on this socket in
     /// the caller's turn, one nonblocking attempt at a time. `socket(2)` sets
     /// it for a stream socket the container created. See
@@ -1224,6 +1248,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("guest_peer", &self.guest_peer);
         debug.field("accepted_connection", &self.accepted_connection);
         debug.field("guest_held", &self.guest_held);
+        debug.field("guest_created", &self.guest_created);
         debug.field("accept_in_turn_eligible", &self.accept_in_turn_eligible);
         debug.field("read_shutdown_requested", &self.read_shutdown_requested);
         debug.field("exported", &self.exported);
@@ -1498,6 +1523,7 @@ impl DetFd {
                 accepted_connection: false,
                 error_queue_never_waits: false,
                 guest_held: false,
+                guest_created: false,
                 accept_in_turn_eligible: false,
                 read_shutdown_requested: false,
                 exported: false,
@@ -3197,6 +3223,25 @@ impl DetFd {
         self.with_description(|d| d.guest_held)
     }
 
+    /// Mark this socket as one a guest made in this run (see
+    /// `is_guest_created`), for its open file description.
+    pub(crate) fn set_guest_created(&self) {
+        self.with_description(|d| d.guest_created = true);
+    }
+
+    /// Withdraw `set_guest_created`, permanently: the socket was passed out
+    /// of the guest.
+    pub(crate) fn clear_guest_created(&self) {
+        self.with_description(|d| d.guest_created = false);
+    }
+
+    /// Whether a guest made this socket with `socket(2)` or `socketpair(2)`
+    /// in this run and never passed it out of the guest, so only guests hold
+    /// it.
+    pub(crate) fn is_guest_created(&self) -> bool {
+        self.with_description(|d| d.guest_created)
+    }
+
     /// Mark this open file as a connection returned by `accept(2)` or
     /// `accept4(2)`. It applies to the open file description, so dup and fork
     /// aliases are covered too.
@@ -4527,6 +4572,36 @@ mod tests {
         assert!(
             !open(7, FdType::Pipe, 3).is_guest_held(),
             "a description of its own starts unmarked"
+        );
+    }
+
+    /// The provenance a connection needs to be guest-held
+    /// (`DetFd::is_guest_created`) lives on the open file too: a duplicate or
+    /// a join shares it and its withdrawal, a handle reads it while the
+    /// description is modeled, and a description of its own, such as a
+    /// received socket that joined nothing, starts without it.
+    #[test]
+    fn a_socket_is_guest_created_only_through_its_own_open_file() {
+        let owner = DetTid::from_raw(10);
+        let made = DetFd::new(3, OFlag::O_RDWR, FdType::Socket, OpenFileId::new(owner, 0));
+        assert!(!made.is_guest_created(), "nothing starts guest-created");
+        made.set_guest_created();
+        let handle = made.open_file_handle();
+        let joined = handle.descriptor(4, false).expect("still modeled");
+        assert!(joined.is_guest_created(), "a join shares it");
+        assert!(handle.is_guest_created(), "and a handle reads it");
+        joined.clear_guest_created();
+        assert!(!made.is_guest_created(), "and its withdrawal");
+        assert!(!handle.is_guest_created());
+        let received = DetFd::new(5, OFlag::O_RDWR, FdType::Socket, OpenFileId::new(owner, 1));
+        assert!(
+            !received.is_guest_created(),
+            "a description of its own starts without it"
+        );
+        drop((made, joined));
+        assert!(
+            !OpenFileHandle::dangling().is_guest_created(),
+            "a description no longer modeled is not guest-created"
         );
     }
 

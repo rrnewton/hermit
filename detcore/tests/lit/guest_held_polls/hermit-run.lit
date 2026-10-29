@@ -20,7 +20,7 @@ CONNECT-NEXT: classified polls: some
 CONNECT-NEXT: marks revoked: no
 RUN: %hermit --log info run -- %me listener-export |& awk '/^listener-export:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=LEXPORT %s
 LEXPORT: listener-export: readable 1
-LEXPORT-NEXT: classified polls: some
+LEXPORT-NEXT: classified polls: none
 LEXPORT-NEXT: marks revoked: yes
 RUN: %hermit --log info run -- %me dgram-named |& awk '/^dgram-named:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=DGRAM %s
 DGRAM: dgram-named: revents 0x1
@@ -58,3 +58,15 @@ RUN: %hermit --log info run -- %me forwarded-socket |& awk '/^forwarded-socket:/
 FORWARDED: forwarded-socket: revents 0x1
 FORWARDED-NEXT: classified polls: none
 FORWARDED-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me received-connect |& awk '/^received-connect:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=RECVCONN %s
+RECVCONN: received-connect: revents 0x1 0x1
+RECVCONN-NEXT: classified polls: none
+RECVCONN-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me received-listener |& awk '/^received-listener:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=RECVLISTEN %s
+RECVLISTEN: received-listener: revents 0x1 0x1
+RECVLISTEN-NEXT: classified polls: none
+RECVLISTEN-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me exported-listener-kept |& awk '/^exported-listener-kept:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=LKEPT %s
+LKEPT: exported-listener-kept: revents 0x1 0x1
+LKEPT-NEXT: classified polls: none
+LKEPT-NEXT: marks revoked: yes

@@ -925,6 +925,8 @@ struct PendingConnections {
     /// the connections on the listener for `accept` to take: at the tail
     /// (`unix_stream_connect`), from the head (`unix_accept`).
     sockets: VecDeque<OpenFileHandle>,
+    /// The socket a guest bound to the name, its listener once it listens.
+    listener: Option<OpenFileHandle>,
     /// A `connect` or `accept` on the name completed outside its caller's
     /// turn, a connect Detcore could not attribute may have reached it, or
     /// too many connections waited: which connection an `accept` takes is
@@ -971,18 +973,24 @@ pub(crate) struct UnixConnections {
 }
 
 impl UnixConnections {
-    /// A guest bound a socket to `name`: its listener's queue starts empty.
-    /// Which bind of the name it was, for the listener to keep.
-    fn bound(&mut self, name: &[u8]) -> u64 {
+    /// A guest bound `listener` to `name`: its listener's queue starts
+    /// empty. Which bind of the name it was, for the listener to keep.
+    fn bound(&mut self, name: &[u8], listener: OpenFileHandle) -> u64 {
         self.binds += 1;
         self.names.insert(
             name.into(),
             PendingConnections {
                 generation: self.binds,
+                listener: Some(listener),
                 ..Default::default()
             },
         );
         self.binds
+    }
+
+    /// The socket the last guest bind of `name` bound, if a guest bound it.
+    fn listener(&self, name: &[u8]) -> Option<&OpenFileHandle> {
+        self.names.get(name)?.listener.as_ref()
     }
 
     /// A guest's `connect` to `name` completed: `socket` is the connecting
@@ -2889,11 +2897,41 @@ impl<T: RecordOrReplay> Detcore<T> {
         // An absolute path names another file from a task whose root may not
         // be the container's: such a listener is not tracked.
         if self.pairs_unix_sockets(guest) && !Self::path_names_another_file(guest, name) {
-            let generation = with_connections(guest, |connections| connections.bound(name));
+            let Ok(listener) = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.open_file_handle())
+            else {
+                return;
+            };
+            let generation =
+                with_connections(guest, |connections| connections.bound(name, listener));
             let _ = guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.set_unix_name(name.into(), generation));
         }
+    }
+
+    /// Whether `address`, the address a `connect` just used, names a socket
+    /// a guest made in this run and never passed out of the guest
+    /// (`DetFd::is_guest_created`), as the last guest bind of that name
+    /// bound it. False for any address Detcore cannot name, one no guest
+    /// bound here, or an absolute path the caller may resolve against another
+    /// root.
+    pub(crate) fn names_a_guest_created_listener<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        address: &UnixAddress,
+    ) -> bool {
+        let UnixAddress::Named(name) = address else {
+            return false;
+        };
+        self.pairs_unix_sockets(guest)
+            && !Self::path_names_another_file(guest, name)
+            && with_connections(guest, |connections| {
+                connections
+                    .listener(name)
+                    .is_some_and(OpenFileHandle::is_guest_created)
+            })
     }
 
     /// A `connect` of socket `fd` to `address` succeeded, in the caller's
@@ -2974,22 +3012,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// An `accept` on `listener` made the connection `fd`, in the caller's
     /// turn or not (`in_turn`): it is a socket of the listener's type, and
     /// the peer of the socket whose `connect` it took, where Detcore knows
-    /// which ([`UnixConnections`]).
+    /// which ([`UnixConnections`]). Returns that socket, if known.
     pub(crate) fn note_unix_accept<G: Guest<Self>>(
         &self,
         guest: &mut G,
         listener: RawFd,
         fd: RawFd,
         in_turn: bool,
-    ) {
+    ) -> Option<OpenFileHandle> {
         if !self.pairs_unix_sockets(guest) {
-            return;
+            return None;
         }
         let Ok(Some((name, generation, kind))) = guest
             .thread_state()
             .with_detfd(listener, |detfd| detfd.unix_name_and_type())
         else {
-            return;
+            return None;
         };
         let peer = with_connections(guest, |connections| {
             connections.accepted(&name, generation, in_turn)
@@ -3000,6 +3038,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.pair_with(peer, kind == libc::SOCK_STREAM);
             }
         });
+        peer
     }
 
     /// What descriptor `fd` of the calling thread links to, or `None` where
@@ -3516,7 +3555,7 @@ mod tests {
         };
 
         connections.connected(name, Some(first.open_file_handle()));
-        let bind = connections.bound(name);
+        let bind = connections.bound(name, OpenFileHandle::dangling());
         assert_eq!(
             taken(connections.accepted(name, bind, true)),
             None,
@@ -3542,7 +3581,7 @@ mod tests {
             "after a connect outside the turn"
         );
 
-        let bind = connections.bound(name);
+        let bind = connections.bound(name, OpenFileHandle::dangling());
         connections.connected(name, Some(second.open_file_handle()));
         assert_eq!(taken(connections.accepted(name, bind, false)), None);
         connections.connected(name, Some(first.open_file_handle()));
@@ -3592,14 +3631,17 @@ mod tests {
         ];
         for unattributed in unattributed {
             let mut connections = UnixConnections::default();
-            let (bind, other_bind) = (connections.bound(path), connections.bound(other));
+            let (bind, other_bind) = (
+                connections.bound(path, OpenFileHandle::dangling()),
+                connections.bound(other, OpenFileHandle::dangling()),
+            );
             unattributed(&mut connections);
             connections.connected(path, Some(second.open_file_handle()));
             connections.connected(other, Some(first.open_file_handle()));
             assert_eq!(taken(connections.accepted(path, bind, true)), None);
             assert_eq!(taken(connections.accepted(other, other_bind, true)), None);
 
-            let bind = connections.bound(path);
+            let bind = connections.bound(path, OpenFileHandle::dangling());
             connections.connected(path, Some(first.open_file_handle()));
             assert_eq!(
                 taken(connections.accepted(path, bind, true)),
@@ -3626,8 +3668,8 @@ mod tests {
         );
         let path = &b"/tmp/rebound"[..];
         let mut connections = UnixConnections::default();
-        let earlier = connections.bound(path);
-        let later = connections.bound(path);
+        let earlier = connections.bound(path, OpenFileHandle::dangling());
+        let later = connections.bound(path, OpenFileHandle::dangling());
         connections.connected(path, Some(socket.open_file_handle()));
         assert!(connections.accepted(path, earlier, true).is_none());
         assert!(

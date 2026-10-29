@@ -361,6 +361,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrcs.blocked_signal_mask = blocked_signal_mask;
             rsrcs.blocked_signal_mask_unknown = blocked_signal_mask_unknown;
             rsrcs.replay_served_from_log = replay_served_from_log;
+            // A send leaving the turn reports a possible pass-out with this
+            // request (`Detcore::passes_descriptors_out_outside_the_turn`).
+            Detcore::<T>::passes_descriptors_out_outside_the_turn(guest, call);
             resource_request(guest, rsrcs).await;
         }
         after_grant(guest);

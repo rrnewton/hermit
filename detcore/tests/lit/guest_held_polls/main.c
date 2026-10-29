@@ -27,7 +27,14 @@
 //               poll is classified.
 //   listener-export a second listener, passed to a forked child over a
 //               plain connection, which accepts this process's connection
-//               to it: classified, and the export revokes every mark.
+//               to it: the export revokes every mark, and the listener is no
+//               longer one only guests hold, so the connection is never
+//               classified.
+//   exported-listener-kept a third listener, passed to a forked child over
+//               a plain connection, which this process keeps, connects to and
+//               accepts from itself: the export revokes every mark, and the
+//               listener is no longer one only guests hold, so neither end of
+//               the connection is classified.
 //   dgram-named a same-process pair, polled after the process passes an
 //               eventfd on a datagram socketpair end to a named socket of a
 //               forked child: a datagram end is never guest-held, since it can
@@ -54,6 +61,15 @@
 //               to it, so its poll is never classified.
 //   joined-listener the same, with the original kept open, so the received
 //               copy joins it: neither copy's poll is classified.
+//   received-connect an unconnected socket a forked child made and passed
+//               over a socketpair, closing its copy, so the received socket
+//               is not one this process made: this process connects it to
+//               its own listener, and neither its poll nor the accepted
+//               end's is classified, since its maker could have kept a copy.
+//   received-listener a socket received the same way, which this process
+//               binds and listens on: neither a client this process makes
+//               and connects to it nor the accepted end is classified, since
+//               the listener's maker could have kept a copy and accepted.
 //   forwarded-socket a client socket a forked child connected to this
 //               process's listener, passed over a socketpair (a guest-held
 //               channel) after the child closed its own copy, so the received
@@ -262,6 +278,31 @@ static int receive_descriptor(int fd) {
   return received;
 }
 
+static void reap(pid_t child);
+
+// A stream socket a forked child made and passed over a socketpair, which
+// the child closes, exiting, before this process receives it: the received
+// socket joins nothing.
+static int receive_a_childs_socket(void) {
+  int pair[2];
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+  pid_t child = fork();
+  assert(child >= 0);
+  if (child == 0) {
+    assert(close(pair[0]) == 0);
+    int made = socket(AF_UNIX, SOCK_STREAM, 0);
+    assert(made >= 0);
+    pass_descriptor(pair[1], made);
+    assert(close(made) == 0);
+    _exit(0);
+  }
+  assert(close(pair[1]) == 0);
+  reap(child);
+  int received = receive_descriptor(pair[0]);
+  assert(close(pair[0]) == 0);
+  return received;
+}
+
 static void reap(pid_t child) {
   int status;
   assert(waitpid(child, &status, 0) == child && WIFEXITED(status));
@@ -351,6 +392,35 @@ int main(int argc, char** argv) {
     // The acceptor may also have exited by then: report readability only.
     printf("listener-export: readable %d\n", (poll_one(connecting) & POLLIN) != 0);
     reap(child);
+  } else if (strcmp(mode, "exported-listener-kept") == 0) {
+    struct sockaddr_un third_address;
+    socklen_t third_length;
+    int third = listen_on("hermit-guest-held-polls-6", &third_address, &third_length);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+      assert(close(third) == 0);
+      int passed = receive_descriptor(connect_to_listener());
+      assert(close(passed) == 0);
+      _exit(0);
+    }
+    int to_child = accept(listener, NULL, NULL);
+    assert(to_child >= 0);
+    pass_descriptor(to_child, third);
+    reap(child);
+    int connecting = connect_to(&third_address, third_length);
+    int accepted = accept(third, NULL, NULL);
+    assert(accepted >= 0);
+    struct peer writer = {accepted, 0};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, act_later, &writer) == 0);
+    short connected = poll_one(connecting);
+    assert(pthread_join(thread, NULL) == 0);
+    struct peer other_writer = {connecting, 0};
+    assert(pthread_create(&thread, NULL, act_later, &other_writer) == 0);
+    short accepted_end = poll_one(accepted);
+    assert(pthread_join(thread, NULL) == 0);
+    printf("exported-listener-kept: revents %#x %#x\n", connected, accepted_end);
   } else if (strcmp(mode, "dgram-named") == 0) {
     // A named datagram socket in a child, which takes one message.
     struct sockaddr_un named;
@@ -471,6 +541,44 @@ int main(int argc, char** argv) {
     short first = poll_listener(received, &target);
     short original = poll_listener(second, &target);
     printf("joined-listener: revents %#x %#x\n", first, original);
+  } else if (strcmp(mode, "received-connect") == 0) {
+    int received = receive_a_childs_socket();
+    assert(connect(received, (const struct sockaddr*)&address, address_length) == 0);
+    int accepted = accept(listener, NULL, NULL);
+    assert(accepted >= 0);
+    struct peer writer = {accepted, 0};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, act_later, &writer) == 0);
+    short connected = poll_one(received);
+    assert(pthread_join(thread, NULL) == 0);
+    struct peer other_writer = {received, 0};
+    assert(pthread_create(&thread, NULL, act_later, &other_writer) == 0);
+    short accepted_end = poll_one(accepted);
+    assert(pthread_join(thread, NULL) == 0);
+    printf("received-connect: revents %#x %#x\n", connected, accepted_end);
+  } else if (strcmp(mode, "received-listener") == 0) {
+    int received = receive_a_childs_socket();
+    const char* name = "hermit-guest-held-polls-5";
+    struct sockaddr_un at;
+    memset(&at, 0, sizeof(at));
+    at.sun_family = AF_UNIX;
+    memcpy(at.sun_path + 1, name, strlen(name));
+    socklen_t at_length = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name);
+    assert(bind(received, (struct sockaddr*)&at, at_length) == 0);
+    assert(listen(received, 4) == 0);
+    int client = connect_to(&at, at_length);
+    int accepted = accept(received, NULL, NULL);
+    assert(accepted >= 0);
+    struct peer writer = {accepted, 0};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, act_later, &writer) == 0);
+    short connected = poll_one(client);
+    assert(pthread_join(thread, NULL) == 0);
+    struct peer other_writer = {client, 0};
+    assert(pthread_create(&thread, NULL, act_later, &other_writer) == 0);
+    short accepted_end = poll_one(accepted);
+    assert(pthread_join(thread, NULL) == 0);
+    printf("received-listener: revents %#x %#x\n", connected, accepted_end);
   } else if (strcmp(mode, "forwarded-socket") == 0) {
     int pair[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
