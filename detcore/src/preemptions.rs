@@ -398,6 +398,7 @@ impl PreemptionRecord {
             replay_departed_at,
             format_version,
             time_skips,
+            rejoins,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -468,6 +469,16 @@ impl PreemptionRecord {
                         .collect::<Vec<_>>()
                 })
                 .filter(|skips| !skips.is_empty()),
+            // The readmissions name points of the recorded run, as the
+            // checkpoints do. A prefix of the whole schedule keeps them; a
+            // shorter one drops them, as an edited record does
+            // (`forget_run_points`), so its replay readmits a finished call
+            // when it finds it finished.
+            rejoins: if followed {
+                Vec::new()
+            } else {
+                rejoins.clone()
+            },
         }
     }
 
@@ -2150,6 +2161,37 @@ mod tests {
             assert_eq!(
                 record.schedule_prefix(len).chaos_timeslice,
                 Some(4321),
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// The readmissions of backgrounded calls name points of the recorded
+    /// run, as the callback checkpoints do: a prefix of the whole schedule
+    /// keeps them, and a shorter one drops them, so its replay readmits a
+    /// finished call when it finds it finished.
+    #[test]
+    fn a_schedule_prefix_keeps_the_readmissions_only_for_the_whole_schedule() {
+        let tid = DetTid::from_raw(3);
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ]);
+        record.rejoins.push(crate::scheduler::rejoin_log::Rejoin {
+            turn: 4,
+            wakes: 0,
+            calls: vec![(tid, 1)],
+        });
+        for len in [2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).rejoins,
+                record.rejoins,
+                "prefix of {len} events"
+            );
+        }
+        for len in [0, 1] {
+            assert!(
+                record.schedule_prefix(len).rejoins.is_empty(),
                 "prefix of {len} events"
             );
         }
