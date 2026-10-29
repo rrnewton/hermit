@@ -808,7 +808,7 @@
       ]
     },
     "test.isolation_matrix_ptrace_runtime": {
-      "owner": "patching",
+      "owner": "core",
       "labels": [
         "full"
       ],
@@ -821,7 +821,7 @@
       ]
     },
     "test.isolation_matrix_dbt_in_guest": {
-      "owner": "dynamorio",
+      "owner": "core",
       "labels": [
         "full"
       ],
@@ -5003,6 +5003,9 @@
     },
     "test.inherited_terminal_read": {
       "check.dbt_runtime_abi": "dynamorio-test.inherited_terminal_read"
+    },
+    "test.isolation_matrix_dbt_in_guest": {
+      "check.dbt_runtime_abi": "dynamorio-test.isolation_matrix_dbt_in_guest"
     },
     "privileged-e2e.manifest_applications": {
       "check.dbt_runtime_abi": "dynamorio-privileged-e2e.manifest_applications"
