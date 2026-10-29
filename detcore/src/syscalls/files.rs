@@ -14576,14 +14576,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Guests alone hold both ends only where the listener and the socket
         // whose connection this took are sockets guests made and never passed
         // out (`Detcore::classify_guest_held_peer`).
-        let guest_created = completes_in_turn
-            && guest
-                .thread_state()
-                .with_detfd(call.sockfd(), |listener| listener.is_guest_created())
-                .unwrap_or(false)
-            && peer
-                .as_ref()
-                .is_some_and(crate::fd::OpenFileHandle::is_guest_created);
+        let listener = guest
+            .thread_state()
+            .with_detfd(call.sockfd(), |listener| listener.open_file_handle())
+            .ok();
+        let guest_created = crate::syscalls::scm_rights::both_ends_guest_made(
+            completes_in_turn,
+            peer.as_ref(),
+            listener.as_ref(),
+        );
         self.classify_guest_held_peer(guest, fd, guest_created)
             .await;
 

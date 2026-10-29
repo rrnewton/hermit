@@ -1419,13 +1419,14 @@ mod event_tests {
             }
             if matches!(
                 Syscall::from_raw(number, args),
-                Syscall::Sendmsg(_) | Syscall::Sendmmsg(_)
+                Syscall::Sendmsg(_) | Syscall::Sendmmsg(_) | Syscall::Connect(_)
             ) {
                 self.send_attempts += 1;
+                let connect = matches!(Syscall::from_raw(number, args), Syscall::Connect(_));
                 return match self.send_attempts {
                     1 => Err(Errno::EAGAIN),
-                    2 => Ok(1),
-                    attempt => panic!("unexpected extra send attempt {attempt}"),
+                    2 => Ok(if connect { 0 } else { 1 }),
+                    attempt => panic!("unexpected extra send or connect attempt {attempt}"),
                 };
             }
             if let Syscall::Read(call) = Syscall::from_raw(number, args) {
@@ -1874,6 +1875,100 @@ mod event_tests {
                 "batched: {batched}"
             );
         }
+    }
+
+    /// Where a connect's address sits in the fixture's memory.
+    const ADDRESS: usize = 0x1a00;
+    /// Two abstract `AF_UNIX` names of one length, as `unix_address` names
+    /// them (the leading NUL included).
+    const NAME_A: &[u8] = b"\0hermit-name-a";
+    const NAME_B: &[u8] = b"\0hermit-name-b";
+
+    /// Writes an abstract `AF_UNIX` address naming `name` at `ADDRESS`;
+    /// returns its length.
+    fn put_unix_name(memory: &EventMemory, name: &[u8]) -> usize {
+        let family = (libc::AF_UNIX as libc::sa_family_t).to_ne_bytes();
+        let mut arena = memory.0.lock().unwrap();
+        arena[ADDRESS..ADDRESS + family.len()].copy_from_slice(&family);
+        let path = ADDRESS + family.len();
+        arena[path..path + name.len()].copy_from_slice(name);
+        family.len() + name.len()
+    }
+
+    /// Runs one `connect` of `FD`, a stream socket, to `NAME_A`, both names
+    /// bound by a guest beforehand. In the turn (`in_turn`), the connect is
+    /// polled and a sibling rewrites the address to `NAME_B` between its two
+    /// attempts; outside it, the socket blocks in the kernel and the one
+    /// attempt connects. Returns how many connections wait on each name,
+    /// `None` where their order is unknown.
+    async fn connect_rewritten_while_it_waits(in_turn: bool) -> (Option<usize>, Option<usize>) {
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (tool, mut guest) = event_guest(FdType::Socket, Some((parked_tx, resume_rx)));
+        guest
+            .thread
+            .with_detfd(FD, |detfd| {
+                detfd.set_unix_type(libc::SOCK_STREAM);
+                if in_turn {
+                    detfd.set_physically_nonblocking();
+                }
+            })
+            .unwrap();
+        if !in_turn {
+            // The one attempt connects.
+            guest.send_attempts = 1;
+        }
+        {
+            let mut connections = guest.thread.unix_connections.lock().unwrap();
+            connections.bound(NAME_A, crate::fd::OpenFileHandle::dangling());
+            connections.bound(NAME_B, crate::fd::OpenFileHandle::dangling());
+        }
+        let length = put_unix_name(&guest.memory, NAME_A);
+        let memory = guest.memory.clone();
+        let call: Syscall = reverie::syscalls::Connect::new()
+            .with_fd(FD)
+            .with_uservaddr(AddrMut::from_raw(ADDRESS))
+            .with_addrlen(length as i32)
+            .into();
+        let event = tool.handle_syscall_event(&mut guest, call);
+        let sibling = async {
+            if in_turn {
+                parked_rx.await.unwrap();
+                put_unix_name(&memory, NAME_B);
+                resume_tx.send(()).unwrap();
+            }
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(event, sibling)
+        })
+        .await
+        .expect("the connect did not finish");
+        assert_eq!(result.unwrap(), 0);
+        let connections = guest.thread.unix_connections.lock().unwrap();
+        (connections.waiting(NAME_A), connections.waiting(NAME_B))
+    }
+
+    /// A connect polled in the caller's turns queues its socket for the
+    /// `accept` of the name its connecting attempt read, not the name the
+    /// address held when the call began: a sibling that rewrote the address
+    /// between attempts sent it to the other listener, whose `accept` takes
+    /// it, and the first listener's `accept` cannot take this socket's place
+    /// for another connector's connection (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4862).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connect_rewritten_between_attempts_queues_for_the_name_it_reached() {
+        assert_eq!(
+            connect_rewritten_while_it_waits(true).await,
+            (Some(0), Some(1))
+        );
+    }
+
+    /// A connect that runs outside the caller's turn read its address at a
+    /// host-chosen moment, so it may have reached any name: no name's
+    /// queue is trusted afterwards (`Detcore::note_unix_connect`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connect_outside_the_turn_leaves_every_name_unpaired() {
+        assert_eq!(connect_rewritten_while_it_waits(false).await, (None, None));
     }
 
     fn readv(count: usize) -> Syscall {
