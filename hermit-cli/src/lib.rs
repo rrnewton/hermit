@@ -4600,8 +4600,14 @@ async fn run_dbt(
 /// stack itself: launching from a thread spawned with 4 MiB
 /// (`std::thread::Builder::stack_size`) is recommended for them, and Rust's
 /// default 2 MiB for a spawned thread or a test is not enough in a debug build
-/// with the `third-party-backends` feature. Optimised builds need much less:
-/// in the `validate` profile a 512 KiB thread was enough.
+/// with the `third-party-backends` feature. On KVM the calling thread also
+/// runs the guest's first process, the whole of it, which used 2,269 KiB in a
+/// debug build: launch KVM from a thread with 16 MiB, the stack the KVM backend
+/// gives every later guest process and thread (reverie-kvm-core's
+/// `KVM_SUPERVISOR_THREAD_STACK_BYTES`). Running KVM launches on a thread of
+/// Hermit's own, as ptrace's are, is
+/// <https://github.com/rrnewton/hermit/issues/4927>. Optimised builds need
+/// much less: in the `validate` profile a 512 KiB thread was enough.
 pub fn run(
     command: Command,
     config: DetConfig,
@@ -4619,7 +4625,9 @@ pub fn run(
 
 /// Run the given command using the selected instrumentation backend.
 ///
-/// On ptrace it needs no particular stack from the calling thread; see [`run`].
+/// On ptrace it needs no particular stack from the calling thread. On KVM the
+/// calling thread runs the guest's first process, which needs more than Rust's
+/// 2 MiB default for a spawned thread in a debug build; see [`run`].
 pub fn run_with_backend(
     command: Command,
     config: DetConfig,
@@ -4639,7 +4647,9 @@ pub fn run_with_backend(
 
 /// [`run_with_backend`] with a hermit-enforced wall-clock bound on the guest.
 ///
-/// On ptrace it needs no particular stack from the calling thread; see [`run`].
+/// On ptrace it needs no particular stack from the calling thread. On KVM the
+/// calling thread runs the guest's first process, which needs more than Rust's
+/// 2 MiB default for a spawned thread in a debug build; see [`run`].
 ///
 /// This library never installs a process alarm. Ordinary ptrace keeps the
 /// original runtime, operation, failed GlobalState and backing guards when a
@@ -5233,7 +5243,9 @@ pub fn run_with_output(
 
 /// Variant of [`run_with_backend`] that also captures stdout/stderr.
 ///
-/// On ptrace it needs no particular stack from the calling thread; see [`run`].
+/// On ptrace it needs no particular stack from the calling thread. On KVM the
+/// calling thread runs the guest's first process, which needs more than Rust's
+/// 2 MiB default for a spawned thread in a debug build; see [`run`].
 pub fn run_with_output_backend(
     command: Command,
     config: DetConfig,
@@ -5257,7 +5269,9 @@ pub fn run_with_output_backend(
 /// [`run_with_output_backend`] with a hermit-enforced wall-clock bound.
 ///
 /// See [`run_with_backend_timeout`]; the teardown semantics are identical. On
-/// ptrace it needs no particular stack from the calling thread; see [`run`].
+/// ptrace it needs no particular stack from the calling thread. On KVM the
+/// calling thread runs the guest's first process, which needs more than Rust's
+/// 2 MiB default for a spawned thread in a debug build; see [`run`].
 pub fn run_with_output_backend_timeout(
     command: Command,
     config: DetConfig,

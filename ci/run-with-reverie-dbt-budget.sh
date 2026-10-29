@@ -3101,7 +3101,25 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=0afcb66a0d7ed157c3b5f324cb8f2e60cb20f5e2
+# CARRY TO 0c35d21fca4485fac3194071b13b6e34f6573f1b (2026-10-29): from
+# 0afcb66a0d7ed157c3b5f324cb8f2e60cb20f5e2. Four commits: 03ee5074 and
+# 0a6ba213 (the KVM preemption timer is armed with slack, in reverie-kvm
+# only); 056f5d84 (the typed Guest::memory_map fact, in reverie,
+# reverie-ptrace, the KVM crates and one LiteInst source-catalog row;
+# nothing calls it yet); then the KVM thread-stack change: every Rust
+# thread that reverie-kvm-core, reverie-kvm and reverie-linuxemu make
+# outside tests comes from one builder with a 16 MiB stack, checked by
+# clippy, and reverie-process's clone stack for its children goes from
+# 8 MiB to the same 16 MiB. git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, and the repository inputs to the DynamoRIO content
+# key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4e4afaa7cb1a -> 4e4afaa7cb1a
+#     reverie-dbt/build.rs          3f2abba1b74a -> 3f2abba1b74a
+#     reverie-dbt/native            c1f267db81c8 -> c1f267db81c8
+# so the inventory (1043), SDK and native inputs, calibrated budget, job
+# width and limits carry unchanged from the 0afcb66a entry.
+expected_pin=0c35d21fca4485fac3194071b13b6e34f6573f1b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
