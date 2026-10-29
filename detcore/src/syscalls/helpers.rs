@@ -1273,15 +1273,13 @@ pub fn ioaction_based_on_fd_status<
 ) -> Result<IOAction, Errno> {
     let wrapped: Syscall = call.into();
     let fd = get_fd(wrapped).unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
-    let (phys, virt, error_queue_never_waits) = guest
-        .thread_state()
-        .with_detfd(fd, |detfd| {
-            (
-                detfd.physically_nonblocking(),
-                detfd.is_nonblocking(),
-                detfd.error_queue_never_waits(),
-            )
-        })?;
+    let (phys, virt, error_queue_never_waits) = guest.thread_state().with_detfd(fd, |detfd| {
+        (
+            detfd.physically_nonblocking(),
+            detfd.is_nonblocking(),
+            detfd.error_queue_never_waits(),
+        )
+    })?;
     tracing::trace!(
         "Checking FD {} for nonblocking: physical {} / virtual {}",
         fd,
@@ -1291,10 +1289,7 @@ pub fn ioaction_based_on_fd_status<
     let action = ioaction_for_fd_status(fd, virt, phys, call.flags_forbid_waiting());
     // A receive with MSG_ERRQUEUE on a socket whose protocol reads that
     // queue without waiting also runs once, as Linux does.
-    if action == IOAction::NonblockizeRetry
-        && error_queue_never_waits
-        && call.reads_error_queue()
-    {
+    if action == IOAction::NonblockizeRetry && error_queue_never_waits && call.reads_error_queue() {
         Ok(IOAction::PassThru)
     } else {
         Ok(action)
@@ -2616,7 +2611,6 @@ where
     result
 }
 
-
 /// The kernel's restart of a wait Detcore ran in the kernel
 /// (`RestartCall::InKernel`): `restart_syscall` itself, which resumes the wait
 /// from the thread's restart block. A signal that ends the resumed wait
@@ -2638,7 +2632,6 @@ where
     keep_restart_block(guest, &result, RestartCall::InKernel(sysno), None).await;
     result
 }
-
 
 /// Keeps `deadline` for the kernel's restart of `call` when the wait ended with
 /// `ERESTART_RESTARTBLOCK` (`RestartBlock`).

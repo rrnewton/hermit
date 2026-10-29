@@ -809,7 +809,8 @@ mod tests {
         }
     }
 
-fn bisect_replays_under_the_bad_schedules_sleep_registration() {
+    #[test]
+    fn bisect_replays_under_the_bad_schedules_sleep_registration() {
         use detcore_model::config::SleepRegistration;
         let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
         let dir = tempfile::tempdir().unwrap();

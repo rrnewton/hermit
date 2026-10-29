@@ -2065,7 +2065,8 @@ mod tests {
         }
     }
 
-fn analyze_runs_every_trial_under_the_targets_sleep_registration() {
+    #[test]
+    fn analyze_runs_every_trial_under_the_targets_sleep_registration() {
         use detcore_model::config::SleepRegistration;
         let dir = tempfile::tempdir().unwrap();
         let record = |name: &str, first_pass: bool| {
