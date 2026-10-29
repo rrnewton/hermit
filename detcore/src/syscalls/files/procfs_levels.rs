@@ -30,6 +30,7 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
@@ -235,6 +236,50 @@ fn absent_prefix(path: &Path, level: detcore_model::config::ProcLevel) -> Option
         }
     }
     None
+}
+
+/// The spelling the kernel is given in place of `named`, whose component
+/// ending `prefix` names nothing: `parent` (`prefix`'s directory, in the
+/// guest's view), then that component replaced by as many dashes, then the
+/// rest of `named`. What follows the omitted name stays: the kernel's walk
+/// ends at it, before them, but which name is the last decides how a call
+/// treats it (rename looks up the last one's directory first). So does a
+/// trailing slash in the guest's spelling `bytes` (O_CREAT then fails with
+/// EISDIR).
+fn dashed_spelling(parent: &Path, prefix: &Path, named: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
+    let name_length = prefix.file_name()?.len();
+    let mut substituted = parent.as_os_str().as_bytes().to_vec();
+    if !substituted.ends_with(b"/") {
+        substituted.push(b'/');
+    }
+    substituted.resize(substituted.len() + name_length, b'-');
+    let rest = named.strip_prefix(prefix).ok()?;
+    if !rest.as_os_str().is_empty() {
+        substituted.push(b'/');
+        substituted.extend_from_slice(rest.as_os_str().as_bytes());
+    }
+    if bytes.ends_with(b"/") {
+        substituted.push(b'/');
+    }
+    Some(substituted)
+}
+
+/// Whether the directory `path`, in the tool's view, is on sysfs: not a
+/// user bind or another file system mounted over part of `/sys`, whose
+/// `cpuN` and `nodeN` names are the guest's own.
+fn is_on_sysfs(path: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut buffer = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `buffer` has room for a `statfs`,
+    // which the call fills when it returns 0.
+    if unsafe { libc::statfs(path.as_ptr(), buffer.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: filled by the successful call above.
+    let buffer = unsafe { buffer.assume_init() };
+    buffer.f_type == libc::SYSFS_MAGIC
 }
 
 /// The pathname in an `AF_UNIX` socket address, as its bytes; `None` for
@@ -766,25 +811,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(root) if !guest_view => Path::new("/").join(parent.strip_prefix(root).ok()?),
                 _ => parent.to_path_buf(),
             };
-            let name_length = prefix.file_name()?.len();
-            let mut substituted = parent.as_os_str().as_bytes().to_vec();
-            if !substituted.ends_with(b"/") {
-                substituted.push(b'/');
+            dashed_spelling(&parent, &prefix, named, bytes)
+        });
+        // A CPU or node that the virtual CPUs and single node leave out, below
+        // the sysfs directories that list them
+        // (`crate::procfs::absent_cpu_entry_prefix`), as the guest named it
+        // before any `chroot`: the listings leave it out, so a lookup finds
+        // nothing either. Not under record and replay, where the listings keep
+        // every entry (`Detcore::drop_absent_entries`).
+        let substituted = substituted.or_else(|| {
+            if root.is_some() || self.cfg.recordreplay_modes {
+                return None;
             }
-            substituted.resize(substituted.len() + name_length, b'-');
-            // What follows the omitted name stays: the kernel's walk ends at
-            // it, before them, but which name is the last decides how a call
-            // treats it (rename looks up the last one's directory first).
-            let rest = named.strip_prefix(&prefix).ok()?;
-            if !rest.as_os_str().is_empty() {
-                substituted.push(b'/');
-                substituted.extend_from_slice(rest.as_os_str().as_bytes());
+            let prefix =
+                crate::procfs::absent_cpu_entry_prefix(&observed, self.cfg.virtual_cpu_count())?;
+            let parent = prefix.parent()?;
+            if !is_on_sysfs(parent) {
+                return None;
             }
-            // So does a trailing slash (O_CREAT then fails with EISDIR).
-            if bytes.ends_with(b"/") {
-                substituted.push(b'/');
-            }
-            Some(substituted)
+            dashed_spelling(parent, &prefix, &observed, bytes)
         });
         Decision {
             substituted,
@@ -1118,7 +1163,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let device = identity.or(entry).map(|(dev, _)| dev);
         let on_procfs = match (device, rendered_procfs::proc_device()) {
             (Some(device), Some(proc_device)) => device == proc_device,
-            _ => self.descriptor_is_on_procfs(guest, fd).await,
+            _ => self
+                .descriptor_is_on_filesystem(guest, fd, libc::PROC_SUPER_MAGIC)
+                .await
+                .unwrap_or(false),
         };
         if !on_procfs {
             return false;
@@ -1176,27 +1224,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                 == libc::PROC_SUPER_MAGIC
     }
 
-    /// Whether the descriptor `fd` is on procfs, as the descriptor says
-    /// (`fstatfs`, into a transient page); `false` where it cannot say.
-    async fn descriptor_is_on_procfs<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> bool {
+    /// Whether the descriptor `fd` is on the named filesystem, as the
+    /// descriptor says (`fstatfs`, into a transient page). A failed probe
+    /// remains an error, not evidence of another filesystem. The descriptor
+    /// identifies the opened object even when a user mount covers a
+    /// conventional procfs or sysfs pathname.
+    pub(super) async fn descriptor_is_on_filesystem<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        magic: i64,
+    ) -> Result<bool, Errno> {
         const LENGTH: usize = std::mem::size_of::<libc::statfs>();
-        let Some(page) = map_transient(guest, LENGTH).await else {
-            return false;
-        };
+        let page = map_transient(guest, LENGTH).await.ok_or(Errno::ENOMEM)?;
         let mut contents = [0u8; LENGTH];
         let answered = guest
-            .inject(Syscall::from_raw(
+            .inject_with_retry(Syscall::from_raw(
                 Sysno::fstatfs,
                 raw_args([fd as usize, page.as_raw(), 0, 0, 0, 0]),
             ))
             .await
-            .is_ok()
-            && guest.memory().read_exact(page, &mut contents).is_ok();
+            .and_then(|_| guest.memory().read_exact(page, &mut contents));
         unmap_transient(guest, page, LENGTH).await;
+        answered?;
         // `f_type` is the first field.
-        answered
-            && i64::from_ne_bytes(contents[..8].try_into().expect("8 bytes"))
-                == libc::PROC_SUPER_MAGIC
+        Ok(i64::from_ne_bytes(contents[..8].try_into().expect("8 bytes")) == magic)
     }
 
     /// Whether the open `call`, which the kernel refused for permission,

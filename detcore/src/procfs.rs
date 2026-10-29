@@ -3249,14 +3249,33 @@ impl CpuConstantFile {
 /// Whether `name`, an entry of the directory at the canonical path
 /// `directory`, is a CPU or cpufreq policy numbered `cpus` or more, or a node
 /// other than number 0, which a machine with `cpus` CPUs on one node does not
-/// have. glibc's `get_nprocs_conf` (`sysconf(_SC_NPROCESSORS_CONF)`, `nproc
+/// have: in the CPU and node directories and their `/sys/bus` counterparts, and
+/// as the links node0, the processor driver and a memory block hold to them.
+/// glibc's `get_nprocs_conf` (`sysconf(_SC_NPROCESSORS_CONF)`, `nproc
 /// --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`, and
 /// libnuma counts them and the `nodeN` entries of `/sys/devices/system/node`.
 pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> bool {
     let (prefix, present): (&[u8], u32) = match directory.to_str() {
-        Some("/sys/devices/system/cpu" | "/sys/bus/cpu/devices") => (b"cpu", cpus),
+        Some(
+            "/sys/devices/system/cpu"
+            | "/sys/bus/cpu/devices"
+            // node0's link to each of its CPUs, and the processor driver's
+            // link to each CPU it binds.
+            | "/sys/devices/system/node/node0"
+            | "/sys/bus/cpu/drivers/processor",
+        ) => (b"cpu", cpus),
         Some("/sys/devices/system/node" | "/sys/bus/node/devices") => (b"node", 1),
         Some("/sys/devices/system/cpu/cpufreq") => (b"policy", cpus),
+        // A memory block's link to the node it belongs to.
+        Some(directory)
+            if directory
+                .strip_prefix("/sys/devices/system/memory/memory")
+                .is_some_and(|block| {
+                    !block.is_empty() && block.bytes().all(|byte| byte.is_ascii_digit())
+                }) =>
+        {
+            (b"node", 1)
+        }
         _ => return false,
     };
     name.strip_prefix(prefix)
@@ -3268,6 +3287,35 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
                 .and_then(|number| number.parse::<u64>().ok())
                 .is_none_or(|number| number >= u64::from(present))
         })
+}
+
+/// The prefix of the absolute `path` that ends at the first component
+/// [`is_absent_cpu_entry`] leaves out of its directory, walking `path`'s
+/// normal components from the left: `/sys/devices/system/node/node1` for
+/// `/sys/devices/system/node/node1/cpulist`. `None` where no component is
+/// absent, for a relative path, and at a `..` (the kernel's to resolve,
+/// through any link before it). A lookup of the prefix, or of a name below
+/// it, finds nothing, as on the machine with `cpus` CPUs on one node that the
+/// listings, `online` and `sched_getaffinity` describe.
+pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf> {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return None;
+    }
+    let mut prefix = PathBuf::from("/");
+    for component in components {
+        let name = match component {
+            Component::Normal(name) => name,
+            Component::CurDir => continue,
+            _ => return None,
+        };
+        if is_absent_cpu_entry(&prefix, name.as_encoded_bytes(), cpus) {
+            prefix.push(name);
+            return Some(prefix);
+        }
+        prefix.push(name);
+    }
+    None
 }
 
 fn is_numa_node_file(path: &str, filename: &str) -> bool {
@@ -8169,6 +8217,21 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ),
             ("/sys/bus/node/devices", &["node1"], &["node0"]),
             (
+                "/sys/devices/system/node/node0",
+                &["cpu1", "cpu57"],
+                &["cpu0", "cpulist", "meminfo", "memory12"],
+            ),
+            (
+                "/sys/bus/cpu/drivers/processor",
+                &["cpu3"],
+                &["cpu0", "bind"],
+            ),
+            (
+                "/sys/devices/system/memory/memory12",
+                &["node1"],
+                &["node0", "online"],
+            ),
+            (
                 "/sys/devices/system/cpu/cpufreq",
                 &["policy1", "policy315"],
                 &["policy0", "boost"],
@@ -8214,6 +8277,68 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 !is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
                 "{directory}/{name}"
             );
+        }
+    }
+
+    #[test]
+    fn a_lookup_below_an_absent_cpu_or_node_finds_its_prefix() {
+        for (path, prefix) in [
+            (
+                "/sys/devices/system/node/node1/cpulist",
+                "/sys/devices/system/node/node1",
+            ),
+            (
+                "/sys/devices/system/node/node1",
+                "/sys/devices/system/node/node1",
+            ),
+            (
+                "/sys/devices/system/cpu/cpu1/topology/core_id",
+                "/sys/devices/system/cpu/cpu1",
+            ),
+            (
+                "/sys/devices/system/cpu/./cpu12/online",
+                "/sys/devices/system/cpu/cpu12",
+            ),
+            ("/sys/bus/cpu/devices/cpu3", "/sys/bus/cpu/devices/cpu3"),
+            (
+                "/sys/bus/node/devices/node1/meminfo",
+                "/sys/bus/node/devices/node1",
+            ),
+            (
+                "/sys/devices/system/cpu/cpufreq/policy2/scaling_cur_freq",
+                "/sys/devices/system/cpu/cpufreq/policy2",
+            ),
+            (
+                "/sys/devices/system/node/node0/cpu1/topology/core_id",
+                "/sys/devices/system/node/node0/cpu1",
+            ),
+            (
+                "/sys/bus/cpu/drivers/processor/cpu1/online",
+                "/sys/bus/cpu/drivers/processor/cpu1",
+            ),
+            (
+                "/sys/devices/system/memory/memory3/node1/cpulist",
+                "/sys/devices/system/memory/memory3/node1",
+            ),
+        ] {
+            assert_eq!(
+                absent_cpu_entry_prefix(Path::new(path), 1).as_deref(),
+                Some(Path::new(prefix)),
+                "{path}"
+            );
+        }
+        for path in [
+            "/sys/devices/system/node/node0/cpulist",
+            "/sys/devices/system/cpu/cpu0/topology/core_id",
+            "/sys/devices/system/cpu/online",
+            "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
+            // A `..` is the kernel's to resolve.
+            "/sys/devices/system/cpu/../cpu/cpu1",
+            // Relative spellings are judged once placed.
+            "sys/devices/system/cpu/cpu1",
+            "/tmp/cpu1/x",
+        ] {
+            assert_eq!(absent_cpu_entry_prefix(Path::new(path), 1), None, "{path}");
         }
     }
 

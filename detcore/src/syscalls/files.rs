@@ -15260,14 +15260,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// replay, where the replayer's descriptor does not name the recorded
     /// directory, so the two runs would not drop alike; Detcore names no
     /// procfs entry there either (see [`Self::procfs_entry`]).
-    fn drop_absent_entries<G: Guest<Self>>(
+    async fn drop_absent_entries<G: Guest<Self>>(
         &self,
-        guest: &G,
+        guest: &mut G,
         fd: RawFd,
         entries: &mut Vec<DirEntry>,
-    ) {
+    ) -> Result<(), Error> {
         if self.cfg.recordreplay_modes {
-            return;
+            return Ok(());
         }
         let link = format!("{}/fd/{fd}", self.caller_proc_directory(guest));
         // Names are dropped as outside the level only from a directory the
@@ -15313,11 +15313,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(directory) = directory {
             let level = self.cfg.proc_level;
             let cpus = self.cfg.virtual_cpu_count();
+            // A user bind over a sysfs path keeps its own names. Ask the
+            // opened descriptor, not its path in the tool's mount namespace.
+            let has_absent_cpu = entries
+                .iter()
+                .any(|entry| is_absent_cpu_entry(&directory, &entry.name, cpus));
+            let on_sysfs = has_absent_cpu
+                && self
+                    .descriptor_is_on_filesystem(guest, fd, libc::SYSFS_MAGIC)
+                    .await?;
             entries.retain(|entry| {
-                !is_absent_cpu_entry(&directory, &entry.name, cpus)
+                !(on_sysfs && is_absent_cpu_entry(&directory, &entry.name, cpus))
                     && !(on_procfs && levels::absent_entry(&directory, &entry.name, level))
             });
         }
+        Ok(())
     }
 
     /// Whether the opened procfs object names the caller's own descriptor
@@ -15493,7 +15503,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             };
             if virtualize {
-                self.drop_absent_entries(guest, call.fd, &mut entries);
+                if let Err(error) = self.drop_absent_entries(guest, call.fd, &mut entries).await {
+                    // The kernel already wrote these names. A failed identity
+                    // probe must not leave omitted CPUs visible in the buffer.
+                    guest.memory().write_exact(call.buf, &vec![0; written])?;
+                    return Err(error);
+                }
             } else {
                 let original = entries.len();
                 entries.retain(|entry| {
@@ -15620,7 +15635,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         unmapped?;
         let mut snapshot = snapshot?;
         if let Some(entries) = &mut snapshot {
-            self.drop_absent_entries(guest, call.fd, entries);
+            self.drop_absent_entries(guest, call.fd, entries).await?;
         }
         Ok(snapshot)
     }
