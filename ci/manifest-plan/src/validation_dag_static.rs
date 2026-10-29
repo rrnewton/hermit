@@ -3250,14 +3250,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same nineteen units on #4892's head 83050eb31 (3074): 3093.
     // And scheduler's a_switch_in_is_neither_progress_nor_an_attempt and
     // a_first_retry_after_an_ordinary_grant_jumps_at_its_second_retry, from
-    // the port onto #4892: 3095, listed.
+    // the port onto #4892: 3095.
     // And scheduler's
     // past_its_list_a_driven_replay_makes_no_fifo_open_jump_a_legacy_one_makes:
     // 3096.
     // And a_jump_past_its_records_stream_is_refused and
     // a_boundary_recordings_jumps_lie_within_its_records: 3098.
     // And this change's two unit tests: 2758.
-    // The same two on main 32f85d391 with #4862 and #4863 (2906): 2908, listed.
+    // The same two on main 32f85d391 with #4862 and #4863 (2906): 2908.
+    // The same two on main dc85ec16a with #4862 and #4863 (3062): 3064.
+    // The same two on #4892's head 83050eb31 with #4863 (3098): 3100, listed.
     ("test.detcore_unit", 3100),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
@@ -5721,11 +5723,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same units on main dc85ec16a (3043): 3060.
     // And the same two record serde round trips: 3062.
     // The same units on #4892's head 83050eb31 (3074): 3093.
-    // And the same two units from the port onto #4892: 3095, listed.
+    // And the same two units from the port onto #4892: 3095.
     // And the same driven-against-legacy unit: 3096.
     // And the same two position units: 3098.
     // And the same tests: 2758.
-    // The same two on main 32f85d391 (2906): 2908, listed.
+    // The same two on main 32f85d391 (2906): 2908.
+    // The same two on main dc85ec16a (3062): 3064.
+    // The same two on #4892's head 83050eb31 with #4863 (3098): 3100, listed.
     ("test.detcore_unit_on_host", 3100),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
