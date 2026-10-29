@@ -586,6 +586,23 @@ class HostedAdapterTests(unittest.TestCase):
             ADAPTER.fetch_ledger(cold, folded_head)
         self.assertTrue(ADAPTER._is_ancestor_or_folded(cold, summarized, folded_head))
 
+        # Two successive squashes: the proof chain follows the second
+        # trailer to the first tip, then the first trailer to the summary.
+        second = sh(origin, "commit-tree", folded_head + "^{tree}", "-m",
+                    "ledger snapshot\n\nLedger-Snapshot-Of: " + folded_head)
+        sh(origin, "checkout", "-q", "--detach", second)
+        (origin / "series.jsonl").write_text("second squash\n")
+        sh(origin, "add", "series.jsonl")
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": summarized}}))
+        sh(origin, "commit", "-q", "-am", "scorecard after the second squash")
+        second_head = sh(origin, "rev-parse", "HEAD")
+        cold2 = self.root / "cold-ledger-2"
+        sh(self.root, "clone", "-q", "--depth", "1", f"file://{origin}", str(cold2))
+        with patch.dict(os.environ, env):
+            ADAPTER.fetch_ledger(cold2, second_head)
+        self.assertTrue(ADAPTER._is_ancestor_or_folded(cold2, summarized, second_head))
+
     def test_ledger_capture_is_exact_and_invocation_failures_refuse(self):
         captured = "a" * 40
         with patch.object(
