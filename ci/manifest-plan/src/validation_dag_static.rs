@@ -3191,7 +3191,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3053.
     // And a_control_answer_leaves_the_replay_pair_staged_together and
     // an_envelope_states_its_format_only_inside_it: 3058.
-    ("test.detcore_unit", 3058),
+    // And a_schedule_prefix_keeps_its_sources_record_format, for main's
+    // prefix records: 3059.
+    ("test.detcore_unit", 3059),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5614,7 +5616,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same replay-grant unit: 3052.
     // And the same malformed boundary-recording unit: 3053.
     // And the same control-answer and envelope-format units: 3058.
-    ("test.detcore_unit_on_host", 3058),
+    // And the same prefix-record unit: 3059.
+    ("test.detcore_unit_on_host", 3059),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
