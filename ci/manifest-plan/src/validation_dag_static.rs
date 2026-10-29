@@ -3148,7 +3148,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4897 adds two detcore units: 2979 + 2 = 2981, re-measured at this integration head.
     // The 4843 overshoot fix adds eighteen detcore units: 2981 + 18 = 2999, re-measured at this integration head.
     // The socketpair readiness increment adds one detcore unit: 2999 + 1 = 3000, re-measured at this integration head.
-    ("test.detcore_unit", 3000),
+    // And https://github.com/rrnewton/hermit/pull/4911's
+    // scheduler::test::a_stacktrace_index_the_run_never_reaches_is_reported_at_its_end
+    // and scheduler::test::a_replay_stop_reports_every_pending_stacktrace_index:
+    // 3000 + 2 = 3002, listed.
+    ("test.detcore_unit", 3002),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5537,7 +5541,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4897 units: 2979 + 2 = 2981.
     // The same eighteen 4843 overshoot fix units: 2981 + 18 = 2999.
     // The same socketpair readiness unit: 2999 + 1 = 3000.
-    ("test.detcore_unit_on_host", 3000),
+    // And the same two stack-trace report units of
+    // https://github.com/rrnewton/hermit/pull/4911: 3000 + 2 = 3002, listed.
+    ("test.detcore_unit_on_host", 3002),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
