@@ -234,7 +234,7 @@ pub struct AnalyzeOpts {
     ///
     /// By default the workspace is created in the system's temporary directory: $TMPDIR, or
     /// /tmp when TMPDIR is unset. Analyze removes the workspace when it exits, unless
-    /// --keep-tmp or --verbose; this directory itself stays.
+    /// --keep-tmp or --verbose or an error ended it; this directory itself stays.
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
@@ -272,11 +272,12 @@ pub struct AnalyzeOpts {
     /// Keep the workspace (see --tmp-dir) when analyze exits.
     ///
     /// The workspace holds every run's schedules, logs, output and reproducer command, and the
-    /// paths analyze prints name it. By default analyze removes it when it exits: after its
-    /// report, after an error, and when SIGTERM, SIGINT or SIGHUP stops it. A stop signal ends
-    /// the run in progress and starts no other; analyze then removes the workspace and dies of
-    /// that signal (a shell reports 128 plus its number, 143 for SIGTERM). --verbose keeps the
-    /// workspace too. The report file (--report-file) is never removed.
+    /// paths analyze prints name it. By default analyze removes it when it exits after its
+    /// report, and when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since
+    /// the error can name trial files in it. A stop signal ends the run in progress and starts
+    /// no other; analyze then removes the workspace and dies of that signal (a shell reports
+    /// 128 plus its number, 143 for SIGTERM). --verbose keeps the workspace too. The report file
+    /// (--report-file) is never removed.
     ///
     /// Analyze cannot clean up after SIGKILL, nor after a stop signal it does not handle: one it
     /// inherits as ignored stays ignored, and an analyze that is PID 1 of its PID namespace

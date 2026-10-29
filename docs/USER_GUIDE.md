@@ -868,11 +868,12 @@ reproducible target condition.
 Analyze keeps every run's schedules, logs, output and reproducer command in a
 workspace, a `hermit_analyze*` directory it creates in `--tmp-dir`, or else in
 `$TMPDIR` (`/tmp` when TMPDIR is unset); the paths it prints name that
-directory. Analyze removes the workspace when it exits: after its report,
-after an error, and when SIGTERM, SIGINT or SIGHUP stops it. A stop signal
-ends the run in progress and starts no other; analyze then removes the
-workspace and that run's own temporary directories, and dies of the signal,
-so a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
+directory. Analyze removes the workspace when it exits after its report, and
+when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since the
+error can name trial files in it (a trial that did not finish, say). A stop
+signal ends the run in progress and starts no other; analyze then removes the
+workspace and that run's own temporary directories, and dies of the signal, so
+a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
 keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
 too, since the per-run logs it adds are written there. The report file
 (`--report-file`) and the `--tmp-dir` directory itself are never removed.
