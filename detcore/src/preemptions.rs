@@ -230,6 +230,7 @@ impl PreemptionRecord {
             pipe_wake_latency,
             signal_state_copy,
             cap_preemption_charge,
+            chaos_timeslice,
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
@@ -277,6 +278,7 @@ impl PreemptionRecord {
             pipe_wake_latency: *pipe_wake_latency,
             signal_state_copy: *signal_state_copy,
             cap_preemption_charge: *cap_preemption_charge,
+            chaos_timeslice: *chaos_timeslice,
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
@@ -1536,6 +1538,26 @@ mod tests {
                     &prefix.host_inputs,
                 ),
                 (true, Some(1234567), true, &record.host_inputs),
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// The timeslice a `--chaos-timeslice-draw=run` run drew is a setting of
+    /// the whole run, as the other run settings are: a prefix of the
+    /// schedule keeps it, whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_drawn_timeslice() {
+        let tid = DetTid::from_raw(3);
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_chaos_timeslice(Some(4321));
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).chaos_timeslice,
+                Some(4321),
                 "prefix of {len} events"
             );
         }

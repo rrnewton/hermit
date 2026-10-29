@@ -3084,7 +3084,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
     // And tool_local a_chaos_timeslice_range_draws_slices_of_every_scale_up_to_its_max and a_schedule_replay_draws_nothing_from_the_chaos_timeslice_range: 2900.
     // And preemptions::tests::a_drawn_chaos_timeslice_is_seeded_log_uniform_and_recorded: 2901.
-    ("test.detcore_unit", 2901),
+    // And a_schedule_prefix_keeps_the_drawn_timeslice,
+    // for main's prefix records: 2902.
+    ("test.detcore_unit", 2902),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5427,7 +5429,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same TracerPid unit: 2898.
     // And the same two units: 2900.
     // And preemptions::tests::a_drawn_chaos_timeslice_is_seeded_log_uniform_and_recorded: 2901.
-    ("test.detcore_unit_on_host", 2901),
+    // And the same prefix-record unit: 2902.
+    ("test.detcore_unit_on_host", 2902),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
