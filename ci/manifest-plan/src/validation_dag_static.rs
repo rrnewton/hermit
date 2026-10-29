@@ -3240,7 +3240,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::replayer::tests::untaken_background_starts_name_their_place_in_the_record
     // and scheduler::test::the_summary_names_each_untaken_background_start
     // (https://github.com/rrnewton/hermit/issues/4876): 3379.
-    ("test.detcore_unit", 3379),
+    // And a_schedule_prefix_keeps_the_background_starts_only_for_the_whole_schedule,
+    // for main's prefix records: 3380.
+    ("test.detcore_unit", 3380),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5754,7 +5756,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two prehook-handoff scheduler units: 3302, listed.
     // And the same six background-start units: 3308, listed.
     // And the same two untaken-background-start units: 3379.
-    ("test.detcore_unit_on_host", 3379),
+    // And the same prefix-record unit: 3380.
+    ("test.detcore_unit_on_host", 3380),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
