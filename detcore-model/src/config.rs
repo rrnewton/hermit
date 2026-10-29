@@ -1759,6 +1759,10 @@ impl Config {
         !self.recordreplay_modes
             && match self.expired_wait_charge {
                 Some(charge) => charge == ExpiredWaitCharge::Once,
+                None => !self.chaos && self.sched_heuristic.is_priority_ordered(),
+            }
+    }
+
     /// Whether a queued plain sleep is registered as a timed waiter at the first quiescent pass
     /// that finds it queued (`--sleep-registration`): the explicit value, or by default outside
     /// race search (`--chaos`, or a `--sched-heuristic` that does not select by priority). Never
@@ -1983,6 +1987,7 @@ impl fmt::Display for Config {
         }
         if let Some(charge) = self.expired_wait_charge {
             write!(f, " --expired-wait-charge={}", charge.as_str())?;
+        }
         if let Some(registration) = self.sleep_registration {
             write!(f, " --sleep-registration={}", registration.as_str())?;
         }
@@ -2202,7 +2207,6 @@ impl FromStr for BlockingMode {
 
 /// How a run of consecutive scheduler turns that each end an expired timed wait is charged while
 /// another thread is queued (`--expired-wait-charge`).
-/// When a queued plain sleep becomes a timed waiter (`--sleep-registration`).
 #[derive(
     Debug,
     Clone,
@@ -2234,6 +2238,22 @@ impl ExpiredWaitCharge {
         match self {
             Self::Each => "each",
             Self::Once => "once",
+        }
+    }
+}
+
+/// When a queued plain sleep becomes a timed waiter (`--sleep-registration`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum SleepRegistration {
     /// At the first quiescent scheduler pass that finds the sleep queued.
@@ -3229,10 +3249,9 @@ mod legacy_backend_json {
     /// `eager_lone_preemptions` came after it too. DBT has no PMU timer, so
     /// the option has no effect there; it is never written and reads as
     /// false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 34] = [
     /// `sleep_registration` too: the scheduler registers sleeps, not the
     /// runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 30] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 35] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4495,11 +4514,9 @@ mod tests {
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
-        // `pipe_wake_latency`, `expired_wait_charge`, `replaying`, `scheduler_turn_cost`,
+        // `pipe_wake_latency`, `expired_wait_charge`, `sleep_registration`, `replaying`, `scheduler_turn_cost`,
         // `cap_preemption_charge`, `inherited_seccomp`, `cpu_profile`,
         // `cpu_profile_host`, `cpu_profile_source`,
-        // `pipe_wake_latency`, `sleep_registration`, `replaying`, `scheduler_turn_cost`,
-        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `directory_placeholder`,
         // `container_procfs`, `signal_delivery_check_fatal`,
@@ -4507,15 +4524,10 @@ mod tests {
         // `annotated_priority_replay`, `virtual_cpus`, `replay_edited_preemptions`,
         // `notice_host_network_abstract_binds`, `eager_lone_preemptions` and
         // `strict_schedule_boundaries`
-        // none: fourteen more keys and thirty-three fewer, so nineteen keys fewer
+        // none: fourteen more keys and thirty-four fewer, so twenty keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 19);
-        // `annotated_priority_replay`, `virtual_cpus` and
-        // `strict_schedule_boundaries` none: fifteen more keys and
-        // twenty-eight fewer, so fifteen keys fewer than fields.
-        assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 15);
+        assert_eq!(fields.len(), keys.len() + 20);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6425,11 +6437,7 @@ mod tests {
         assert!(config.to_string().contains(" --runs-post-fork=random"));
     }
 
-    /// `--expired-wait-charge` is unset by default, parses both values, is
-    /// printed by `Display` (reproducer commands are built from it) only when
-    /// set, round-trips through serde, and never enters the legacy form.
-    #[test]
-    fn the_expired_wait_charge_is_printed_when_set_and_never_enters_the_legacy_form() {
+fn the_expired_wait_charge_is_printed_when_set_and_never_enters_the_legacy_form() {
         assert_eq!(Config::default().expired_wait_charge, None);
         assert!(
             !Config::default()
@@ -6447,11 +6455,23 @@ mod tests {
             assert!(
                 set.to_string()
                     .contains(&format!(" --expired-wait-charge={value}")),
-    /// `--sleep-registration` is unset by default, parses both values, is
-    /// printed by `Display` (reproducer commands are built from it) only when
-    /// set, round-trips through serde, and never enters the legacy form.
-    #[test]
-    fn the_sleep_registration_is_printed_when_set_and_never_enters_the_legacy_form() {
+                "{set}"
+            );
+            let reparsed: Config =
+                serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+            assert_eq!(reparsed.expired_wait_charge, Some(charge));
+            let legacy = to_legacy_backend_json(&set).unwrap();
+            assert!(!legacy.contains("expired_wait_charge"), "{legacy}");
+            assert_eq!(
+                from_legacy_backend_json(&legacy)
+                    .unwrap()
+                    .expired_wait_charge,
+                None
+            );
+        }
+    }
+
+fn the_sleep_registration_is_printed_when_set_and_never_enters_the_legacy_form() {
         assert_eq!(Config::default().sleep_registration, None);
         assert!(
             !Config::default()
@@ -6472,13 +6492,6 @@ mod tests {
             );
             let reparsed: Config =
                 serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
-            assert_eq!(reparsed.expired_wait_charge, Some(charge));
-            let legacy = to_legacy_backend_json(&set).unwrap();
-            assert!(!legacy.contains("expired_wait_charge"), "{legacy}");
-            assert_eq!(
-                from_legacy_backend_json(&legacy)
-                    .unwrap()
-                    .expired_wait_charge,
             assert_eq!(reparsed.sleep_registration, Some(registration));
             let legacy = to_legacy_backend_json(&set).unwrap();
             assert!(!legacy.contains("sleep_registration"), "{legacy}");
