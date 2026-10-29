@@ -3221,7 +3221,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-derived with the node's own selection at the head of the aarch64
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 3392, listed.
-    ("test.detcore_unit", 3392),
+    // And a_schedule_prefix_keeps_the_in_memory_exclusive_rewrite_setting,
+    // for main's prefix records: 3393.
+    ("test.detcore_unit", 3393),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5733,7 +5735,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-derived with the node's own selection at the head of the aarch64
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 3392, listed.
-    ("test.detcore_unit_on_host", 3392),
+    // And the same prefix-record unit: 3393.
+    ("test.detcore_unit_on_host", 3393),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -368,6 +368,7 @@ impl PreemptionRecord {
             replay_departed_at,
             format_version,
             time_skips,
+            rewrite_exclusives_in_memory,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -438,6 +439,8 @@ impl PreemptionRecord {
                         .collect::<Vec<_>>()
                 })
                 .filter(|skips| !skips.is_empty()),
+            // A setting of the recorded run, which a replay must share.
+            rewrite_exclusives_in_memory: *rewrite_exclusives_in_memory,
         }
     }
 
@@ -2152,6 +2155,28 @@ mod tests {
                 Some(4321),
                 "prefix of {len} events"
             );
+        }
+    }
+
+    /// Whether the recorded run rewrote exclusive loops in memory is a setting
+    /// a replay of the record must share, so a prefix record keeps it, for
+    /// any length.
+    #[test]
+    fn a_schedule_prefix_keeps_the_in_memory_exclusive_rewrite_setting() {
+        let tid = DetTid::from_raw(3);
+        for on in [false, true] {
+            let record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ])
+            .with_rewrite_exclusives_in_memory(on);
+            for len in [0, 1, 2, 9] {
+                assert_eq!(
+                    record.schedule_prefix(len).rewrite_exclusives_in_memory(),
+                    on,
+                    "prefix of {len} events"
+                );
+            }
         }
     }
 
