@@ -1231,7 +1231,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and split_branches_in_file_leaves_an_offset_batch_whole: 1934.
     // And hermit-verify's
     // interpolation_refuses_a_newer_record_before_reading_its_settings: 1935.
-    ("test.regular_crates", 1935),
+    // And detcore-model's stacktrace_at_schedule_positions_never_enters_the_legacy_form and
+    // stacktrace_at_schedule_positions_needs_a_replayed_schedule_and_round_trips
+    // (https://github.com/rrnewton/hermit/issues/4917): 1937.
+    ("test.regular_crates", 1937),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1923,7 +1926,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_spliced_branch_batch_keeps_its_instruction_offset_with_its_end: 1294.
     // And bisect_replays_offset_schedules_without_chaos and
     // an_offset_batch_is_not_split: 1296.
-    ("test.hermit_unit", 1296),
+    // And analyze::phases' a_prefix_stack_trial_requests_its_stack_by_schedule_position
+    // (https://github.com/rrnewton/hermit/issues/4917): 1297.
+    ("test.hermit_unit", 1297),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3197,7 +3202,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // for main's record serde: 3060.
     // And a_marked_record_states_its_format_inside_its_envelope: 3061.
     // And an_unread_stated_format_survives_every_format_raise: 3062.
-    ("test.detcore_unit", 3062),
+    // And https://github.com/rrnewton/hermit/issues/4917's four schedule-position stack units
+    // (two replayer::tests, two scheduler::test): 3066.
+    ("test.detcore_unit", 3066),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4535,7 +4542,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (tests/c/branch_free_race.c, x86_64 only): 746.
     // And an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints
     // (tests/c/branch_free_race.c, x86_64 only): 747.
-    ("test.cli", 747),
+    // And a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries
+    // (https://github.com/rrnewton/hermit/issues/4917): 748.
+    ("test.cli", 748),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5109,7 +5118,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
     // And the same two --chaos-instruction-offset tests, not excluded: 665.
     // And the same schedule-replay and analyze offset test, not excluded: 666.
-    ("test.cli_on_host", 666),
+    // And the same schedule-position stack test, not excluded: 667.
+    ("test.cli_on_host", 667),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5624,7 +5634,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same record-serde unit: 3060.
     // And the same marked-record format unit: 3061.
     // And the same stated-format unit: 3062.
-    ("test.detcore_unit_on_host", 3062),
+    // And the same four schedule-position stack units of
+    // https://github.com/rrnewton/hermit/issues/4917: 3066.
+    ("test.detcore_unit_on_host", 3066),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6020,7 +6032,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --chaos-instruction-offset run units: 1285.
     // And the same three analyze offset units: 1288.
     // And the same bisect and splitting units: 1290.
-    ("test.hermit_unit_on_host", 1290),
+    // And the same prefix stack trial unit of
+    // https://github.com/rrnewton/hermit/issues/4917: 1291.
+    ("test.hermit_unit_on_host", 1291),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6252,7 +6266,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same schedule-event offset unit: 1918.
     // And the same two hermit-verify splitting units: 1920.
     // And the same hermit-verify interpolation unit: 1921.
-    ("test.regular_crates_on_host", 1921),
+    // And the same two detcore-model units of
+    // https://github.com/rrnewton/hermit/issues/4917: 1923.
+    ("test.regular_crates_on_host", 1923),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

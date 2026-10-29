@@ -2394,9 +2394,15 @@ pub struct Scheduler {
     pub recorded_event_count: u64,
 
     /// A copy of the `Config::stacktrace_event` vector.  This is MUTABLE,
-    /// because we pop events off as we handle them.  The u64 is an index into
-    /// the (original) replay_cursor trace.
+    /// because we pop events off as we handle them. The u64 is a traced event
+    /// index, or, under `--stacktrace-at-schedule-positions`, a position of the
+    /// replayed schedule (`stacktrace_at_schedule_positions`).
     pub stacktrace_events: Option<StacktraceEventsIter>,
+
+    /// Under a schedule replay, take `stacktrace_events` indices as positions
+    /// of the replayed schedule (`Config::stacktrace_at_schedule_positions`,
+    /// for `hermit analyze`) rather than traced event counts.
+    stacktrace_at_schedule_positions: bool,
 
     /// PRNG to drive any fuzzing of OS semantics (other than scheduling).
     fuzz_prng: Pcg64Mcg,
@@ -4704,6 +4710,22 @@ pub struct ConsumeResult {
 /// a response that further includes a path means print to a file at that location.
 pub type MaybePrintStack = Option<Option<PathBuf>>;
 
+/// What the schedule replayer reports for one observed event, read right
+/// after `Replayer::observe_event` (`Scheduler::consume_schedevent`).
+struct ReplayStep {
+    /// The event's traced index.
+    traced_ix: u64,
+    action: replayer::ReplayAction,
+    /// Where the timer of the slice the action's timeslice runs to was armed
+    /// past its branch target (`Replayer::next_instruction_offset`).
+    instruction_offset: Option<detcore_model::schedule::InstructionOffset>,
+    /// The schedule position of the recorded event the event consumed, for
+    /// `--stacktrace-at-schedule-positions` (`Replayer::stacktrace_position`).
+    position: Option<u64>,
+    /// Whether this event made the replay release the rest of its schedule.
+    released_now: bool,
+}
+
 /// How many chaos timer-slice change points may pass a runnable thread over,
 /// since its last committed turn, before the changing thread moves behind it
 /// ([`Scheduler::bound_chaos_starvation`]). Each pass ends a slice, capped by
@@ -4998,6 +5020,7 @@ impl Scheduler {
             released_callback_checkpoints: BTreeMap::new(),
             recorded_event_count: 0,
             stacktrace_events,
+            stacktrace_at_schedule_positions: cfg.stacktrace_at_schedule_positions,
             stop_after_turn: cfg.stop_after_turn,
             signal_at: cfg.signal_at,
             last_committed_turn: None,
@@ -6052,6 +6075,31 @@ impl Scheduler {
         result
     }
 
+    /// Under `--stacktrace-at-schedule-positions`, a released schedule
+    /// (`Replayer::release_schedule`) consumes no further position: report
+    /// every requested position still pending as missed, at the release,
+    /// rather than drop it silently.
+    fn report_schedule_positions_a_release_drops(&mut self) {
+        let Some(iter) = &mut self.stacktrace_events else {
+            return;
+        };
+        for (position, _, m_path) in iter.by_ref() {
+            let destination = m_path
+                .as_ref()
+                .map_or_else(|| "stderr".to_string(), |p| p.display().to_string());
+            tracing::warn!(
+                "No stack trace for scheduled event #{} (requested for {}): the replay released its schedule before consuming that position",
+                position,
+                destination,
+            );
+            crate::util::capped_eprintln!(
+                "\nMissed stack trace for scheduled event #{} (requested for {}): the replay released its schedule before consuming that position",
+                position,
+                destination,
+            );
+        }
+    }
+
     /// Under `--replay-schedule-from`, wake the thread the trace switches to
     /// now if it is still in a timed wait whose deadline has passed, so it is
     /// runnable when the next turn is chosen.
@@ -6105,14 +6153,34 @@ impl Scheduler {
         debug_assert!(self.replayer.is_some());
         let mytid = observed.dettid;
 
-        if let Some((ix, action, instruction_offset)) = self.replayer.as_mut().map(|r| {
-            let current_ix = r.traced_event_count;
+        if let Some(ReplayStep {
+            traced_ix: ix,
+            action,
+            instruction_offset,
+            position,
+            released_now,
+        }) = self.replayer.as_mut().map(|r| {
+            let traced_ix = r.traced_event_count;
+            let was_released = r.released();
             let action = r.observe_event(observed);
-            // Read at once: the offset of the event the action's timeslice
-            // comes from.
-            (current_ix, action, r.next_instruction_offset())
+            ReplayStep {
+                traced_ix,
+                action,
+                // Read at once: the offset of the event the action's
+                // timeslice comes from.
+                instruction_offset: r.next_instruction_offset(),
+                position: r.stacktrace_position(traced_ix),
+                released_now: !was_released && r.released(),
+            }
         }) {
-            let print_stack = self.try_pop_stacktrace_event(ix, observed);
+            let print_stack = if self.stacktrace_at_schedule_positions {
+                if released_now {
+                    self.report_schedule_positions_a_release_drops();
+                }
+                position.and_then(|position| self.try_pop_stacktrace_event(position, observed))
+            } else {
+                self.try_pop_stacktrace_event(ix, observed)
+            };
             debug!("Next ReplayAction = {:?}", action);
             self.release_replay_priorities_if_exhausted();
 
@@ -19347,7 +19415,15 @@ impl Scheduler {
             .expect("trace_schedevent should be called only when preemption_writer is set");
         pw.insert_schedevent(ev.clone());
 
-        let print_stack = self.try_pop_stacktrace_event(self.recorded_event_count, ev);
+        // A run that records while it replays a schedule takes its stacks in
+        // `consume_schedevent`. Under `--stacktrace-at-schedule-positions`
+        // their indices are schedule positions there, which this recording's
+        // count is not.
+        let print_stack = if self.stacktrace_at_schedule_positions && self.replayer.is_some() {
+            None
+        } else {
+            self.try_pop_stacktrace_event(self.recorded_event_count, ev)
+        };
         self.recorded_event_count += 1;
         print_stack
     }
@@ -21929,6 +22005,92 @@ mod test {
             "the skipped index #1 was reported and discarded"
         );
         assert_eq!(sched.consume_schedevent(&schedule[3]).print_stack, None);
+    }
+
+    /// Under `--stacktrace-at-schedule-positions` (as `hermit analyze`'s
+    /// prefix trials request a stack) an index names a position of the
+    /// replayed schedule: the stack prints where the replay consumes the
+    /// recorded event there, however many events the run observed before it.
+    /// A polling retry the recording did not make shifts the traced index,
+    /// not the position (https://github.com/rrnewton/hermit/issues/4917).
+    #[test]
+    fn a_schedule_position_stack_prints_at_its_recorded_event() {
+        let tid = DetTid::from_raw(3);
+        let at = LogicalTime::from_nanos;
+        let schedule: Vec<SchedEvent> = [Sysno::getpid, Sysno::getppid, Sysno::getuid]
+            .into_iter()
+            .zip(1..)
+            .map(|(sysno, n)| {
+                SchedEvent::syscall(tid, sysno, SyscallPhase::Prehook).with_time(at(n * 10_000))
+            })
+            .collect();
+        let retry =
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Polling).with_time(at(15_000));
+        for (positions, printed_at) in [(true, 3), (false, 2)] {
+            let mut sched = Scheduler::new(&Config::default());
+            sched.stacktrace_at_schedule_positions = positions;
+            sched.replayer = Some(Replayer::new(schedule.clone()));
+            sched.stacktrace_events = Some(vec![(2, None, None)].into_iter().peekable());
+            let observed = [
+                schedule[0].clone(),
+                retry.clone(),
+                schedule[1].clone(),
+                schedule[2].clone(),
+            ];
+            let printed: Vec<usize> = observed
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| sched.consume_schedevent(event).print_stack.is_some())
+                .map(|(observed_ix, _)| observed_ix)
+                .collect();
+            assert_eq!(
+                printed,
+                vec![printed_at],
+                "positions: {positions}; #2 is schedule position 2 (getuid), but traced event #2 \
+                 (getppid) when the retry counts"
+            );
+        }
+    }
+
+    /// Under `--stacktrace-at-schedule-positions` a release consumes no
+    /// further position, so every requested position still pending is
+    /// reported, and discarded, at the release.
+    #[test]
+    fn a_release_reports_the_schedule_positions_it_drops() {
+        let mut sched = Scheduler::new(&Config::default());
+        sched.stacktrace_at_schedule_positions = true;
+        let tid = DetTid::from_raw(3);
+        let at = LogicalTime::from_nanos;
+        let schedule: Vec<SchedEvent> = [Sysno::getpid, Sysno::getppid]
+            .into_iter()
+            .zip(1..)
+            .map(|(sysno, n)| {
+                SchedEvent::syscall(tid, sysno, SyscallPhase::Prehook).with_time(at(n * 10_000))
+            })
+            .collect();
+        sched.replayer = Some(Replayer::new(schedule.clone()));
+        sched.stacktrace_events = Some(
+            vec![(1, None, None), (5, None, None)]
+                .into_iter()
+                .peekable(),
+        );
+        assert_eq!(sched.consume_schedevent(&schedule[0]).print_stack, None);
+        let other = SchedEvent::syscall(
+            DetTid::from_raw(5),
+            Sysno::sched_yield,
+            SyscallPhase::Prehook,
+        )
+        .with_time(at(15_000));
+        for _ in 1..replayer::UNMATCHED_EVENTS_BEFORE_RELEASE {
+            let _ = sched.consume_schedevent(&other);
+        }
+        assert!(sched.stacktrace_events.as_mut().unwrap().peek().is_some());
+        let _ = sched.consume_schedevent(&other);
+        assert!(sched.schedule_released());
+        assert!(
+            sched.stacktrace_events.as_mut().unwrap().peek().is_none(),
+            "positions 1 and 5 were reported at the release"
+        );
     }
 
     /// A thread queued at the deferred replay priority when the recording

@@ -880,7 +880,10 @@ loop), no single swap may separate the outcomes. `--prefix-search` searches
 within the failing schedule instead: each trial replays its first K events and
 then schedules without chaos, and a binary search finds the event at which the
 outcome flips. The report shows the stack of the thread the failing schedule
-runs at that event and of the thread that runs there otherwise:
+runs at that event and of the thread that runs there otherwise. Each stack is
+taken where the trial's replay consumes the recorded event at that schedule
+position, so a trial that makes more or fewer polling retries before it than
+the recording did still shows that event's stack:
 
 ```bash
 hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
