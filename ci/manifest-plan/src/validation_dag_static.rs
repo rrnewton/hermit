@@ -3258,7 +3258,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
     // And the_uncapped_slices_mark_is_written_only_when_set, an_uncapped_records_backstop_outlasts_its_latest_event and an_uncapped_replay_ends_slices_at_its_backstop_while_the_record_lasts: 3384 + 3 = 3387.
     // Rebased onto main fcd62385f: 3465 + 3 = 3468.
-    ("test.detcore_unit", 3468),
+    // And the_uncapped_slices_mark_is_written_only_when_set, an_uncapped_records_backstop_outlasts_its_latest_event and an_uncapped_replay_ends_slices_at_its_backstop_while_the_record_lasts: 3245.
+    // And a_schedule_prefix_keeps_the_uncapped_slices_mark, for main's prefix
+    // records: 3387 + 1 = 3388.
+    // Rebased onto main fcd62385f: 3468 + 1 = 3469.
+    ("test.detcore_unit", 3469),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5822,7 +5826,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
     // And the same three uncapped-slices units: 3384 + 3 = 3387.
     // Rebased onto main fcd62385f: 3465 + 3 = 3468.
-    ("test.detcore_unit_on_host", 3468),
+    // And the same three uncapped-slices units: 3245.
+    // And the same prefix-record unit: 3387 + 1 = 3388.
+    // Rebased onto main fcd62385f: 3468 + 1 = 3469.
+    ("test.detcore_unit_on_host", 3469),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
