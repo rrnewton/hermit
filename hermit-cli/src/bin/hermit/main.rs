@@ -1761,8 +1761,9 @@ mod tests {
     }
 
     /// `--stacktrace-event` indexes two different streams: the traced events
-    /// of a recorded or replayed schedule, polling retries included, and the
-    /// stored boundary stream under `--strict-schedule-boundaries`. The help
+    /// of a recorded or replayed schedule, polling retries included, and,
+    /// under `--strict-schedule-boundaries`, the complete boundary stream,
+    /// stored for a replay and written as it goes by a recording. The help
     /// names both, and says a release's number is not such an index.
     #[test]
     fn run_stacktrace_event_help_names_both_index_streams() {
@@ -1780,8 +1781,10 @@ mod tests {
              included",
             "the event number a schedule release reports leaves polling retries out, so it is \
              not such an index",
-            "Under `--strict-schedule-boundaries`, N is instead a position in the stored boundary \
-             stream, `TimesliceEnd` records included",
+            "Under `--strict-schedule-boundaries`, N is instead a position in the complete \
+             boundary stream, `TimesliceEnd` records included",
+            "a replay requires it to lie inside the stored stream, while a recording counts the \
+             stream as it writes it",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
         }

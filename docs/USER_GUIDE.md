@@ -574,9 +574,11 @@ or before a replay stops the run under `--replay-exhausted-panic` or
 backend's `--timeout`, does not report.
 
 Under `--strict-schedule-boundaries` a `--stacktrace-event` index is a
-position in the stored boundary stream instead, `TimesliceEnd` records
-included. An index outside that stream is refused when the run starts, and
-the reports above do not apply.
+position in the complete boundary stream instead, `TimesliceEnd` records
+included. A replay refuses an index outside its stored stream when the run
+starts, and the reports above do not apply to it. A recording counts the
+stream as it writes it and, like any recording, reports an unreached index
+in its run summary.
 
 A replay reproduces the recording only if the guest reads the same host
 files. The recorded schedule therefore keeps the set of host files the run

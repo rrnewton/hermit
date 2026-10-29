@@ -828,8 +828,9 @@ pub struct Config {
     /// counts every traced event, polling retries and events the schedule does not hold included,
     /// as the desync and missed-stack-trace lines do; the event number a schedule release reports
     /// leaves polling retries out, so it is not such an index. Under
-    /// `--strict-schedule-boundaries`, N is instead a position in the stored boundary stream,
-    /// `TimesliceEnd` records included, and must lie inside it.
+    /// `--strict-schedule-boundaries`, N is instead a position in the complete boundary stream,
+    /// `TimesliceEnd` records included: a replay requires it to lie inside the stored stream,
+    /// while a recording counts the stream as it writes it.
     #[clap(long,
            short = 's',
            value_name = "index[,path]",
