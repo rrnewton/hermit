@@ -1982,13 +1982,90 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if once {
                 value["expired_wait_runs_charged_once"] = serde_json::Value::from(true);
-    /// included, under the `--sleep-registration` of its target: the run
-    /// arguments' own, or else `--run1-preemptions`'s rule, or else
-    /// `when-chosen` for the chaos target it records itself. The value is put
-    /// in the run arguments, every record analyze writes carries it, and a
-    /// `--run2-preemptions` record under the other rule is refused.
-    #[test]
-    fn analyze_runs_every_trial_under_the_targets_sleep_registration() {
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let prepare = |run1: Option<&Path>, run2: Option<&Path>, run_args: &[&str]| {
+            let run1 = run1.map(|path| format!("--run1-preemptions={}", path.display()));
+            let run2 = run2.map(|path| format!("--run2-preemptions={}", path.display()));
+            let mut argv = vec!["hermit", "analyze"];
+            argv.extend(run1.as_deref());
+            argv.extend(run2.as_deref());
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.prepare(&args.global).map(|_| options)
+        };
+        let each = record("each", false);
+        let once = record("once", true);
+        let written = |options: &AnalyzeOpts| {
+            let (failing, passing, trial) = (
+                dir.path().join("final-failing.json"),
+                dir.path().join("final-passing.json"),
+                dir.path().join("trial.json"),
+            );
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            [failing, passing, trial].map(|path| {
+                detcore::preemptions::read_recorded_expired_wait_runs_charged_once(&path).unwrap()
+            })
+        };
+        for (run1, run2, run_args, expected) in [
+            (None, None, vec![], ExpiredWaitCharge::Each),
+            (
+                None,
+                None,
+                vec!["--expired-wait-charge=once"],
+                ExpiredWaitCharge::Once,
+            ),
+            (Some(&each), None, vec![], ExpiredWaitCharge::Each),
+            (Some(&once), None, vec![], ExpiredWaitCharge::Once),
+            (Some(&once), Some(&once), vec![], ExpiredWaitCharge::Once),
+            (Some(&each), Some(&each), vec![], ExpiredWaitCharge::Each),
+        ] {
+            let case = format!("{run1:?} {run2:?} {run_args:?}");
+            let options = prepare(
+                run1.map(|p| p.as_path()),
+                run2.map(|p| p.as_path()),
+                &run_args,
+            )
+            .unwrap_or_else(|error| panic!("{case}: {error:#}"));
+            assert_eq!(options.trial_expired_wait_charge(), expected, "{case}");
+            assert_eq!(
+                written(&options),
+                [expected == ExpiredWaitCharge::Once; 3],
+                "{case}"
+            );
+        }
+        // Without --run1-preemptions the trials use `each`, so a plain
+        // (`once`) --run2-preemptions baseline is refused.
+        assert_eq!(
+            prepare(None, Some(&each), &[])
+                .unwrap()
+                .trial_expired_wait_charge(),
+            ExpiredWaitCharge::Each
+        );
+        assert!(prepare(None, Some(&once), &[]).is_err());
+        for (run1, run2, run_args) in [
+            (&once, Some(&each), vec![]),
+            (&each, Some(&once), vec![]),
+            (&once, None, vec!["--expired-wait-charge=each"]),
+        ] {
+            let case = format!("{run1:?} {run2:?} {run_args:?}");
+            let error = prepare(Some(run1), run2.map(|p| p.as_path()), &run_args).expect_err(&case);
+            assert!(
+                format!("{error:#}").contains("--expired-wait-charge"),
+                "{case}: {error:#}"
+            );
+        }
+    }
+
+fn analyze_runs_every_trial_under_the_targets_sleep_registration() {
         use detcore_model::config::SleepRegistration;
         let dir = tempfile::tempdir().unwrap();
         let record = |name: &str, first_pass: bool| {
@@ -2016,8 +2093,6 @@ mod tests {
             };
             options.prepare(&args.global).map(|_| options)
         };
-        let each = record("each", false);
-        let once = record("once", true);
         let chosen = record("when-chosen", false);
         let first = record("first-pass", true);
         let written = |options: &AnalyzeOpts| {
@@ -2029,21 +2104,6 @@ mod tests {
             options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
             options.write_trial_schedule(Vec::new(), &trial).unwrap();
             [failing, passing, trial].map(|path| {
-                detcore::preemptions::read_recorded_expired_wait_runs_charged_once(&path).unwrap()
-            })
-        };
-        for (run1, run2, run_args, expected) in [
-            (None, None, vec![], ExpiredWaitCharge::Each),
-            (
-                None,
-                None,
-                vec!["--expired-wait-charge=once"],
-                ExpiredWaitCharge::Once,
-            ),
-            (Some(&each), None, vec![], ExpiredWaitCharge::Each),
-            (Some(&once), None, vec![], ExpiredWaitCharge::Once),
-            (Some(&once), Some(&once), vec![], ExpiredWaitCharge::Once),
-            (Some(&each), Some(&each), vec![], ExpiredWaitCharge::Each),
                 detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(&path)
                     .unwrap()
             })
@@ -2078,26 +2138,6 @@ mod tests {
                 &run_args,
             )
             .unwrap_or_else(|error| panic!("{case}: {error:#}"));
-            assert_eq!(options.trial_expired_wait_charge(), expected, "{case}");
-            assert_eq!(
-                written(&options),
-                [expected == ExpiredWaitCharge::Once; 3],
-                "{case}"
-            );
-        }
-        // Without --run1-preemptions the trials use `each`, so a plain
-        // (`once`) --run2-preemptions baseline is refused.
-        assert_eq!(
-            prepare(None, Some(&each), &[])
-                .unwrap()
-                .trial_expired_wait_charge(),
-            ExpiredWaitCharge::Each
-        );
-        assert!(prepare(None, Some(&once), &[]).is_err());
-        for (run1, run2, run_args) in [
-            (&once, Some(&each), vec![]),
-            (&each, Some(&once), vec![]),
-            (&once, None, vec!["--expired-wait-charge=each"]),
             assert_eq!(options.trial_sleep_registration(), expected, "{case}");
             assert_eq!(
                 written(&options),
@@ -2122,7 +2162,6 @@ mod tests {
             let case = format!("{run1:?} {run2:?} {run_args:?}");
             let error = prepare(Some(run1), run2.map(|p| p.as_path()), &run_args).expect_err(&case);
             assert!(
-                format!("{error:#}").contains("--expired-wait-charge"),
                 format!("{error:#}").contains("--sleep-registration"),
                 "{case}: {error:#}"
             );
@@ -2333,8 +2372,6 @@ mod tests {
         let analysis = prepared_analysis(dir, None, None, &[]).unwrap();
         // No `--epoch` is added; `--expired-wait-charge` always is.
         assert_eq!(analysis.run_arg, ["--expired-wait-charge=each"]);
-        // No `--epoch` is added; `--sleep-registration` always is.
-        assert_eq!(analysis.run_arg, ["--sleep-registration=when-chosen"]);
         assert_eq!(analysis.trial_epoch_for_test(), "2026-01-01T00:00:00+00:00");
 
         // The recorded epoch reaches the trials, from either record.
@@ -2348,8 +2385,6 @@ mod tests {
             prepared_analysis(dir, Some(RECORDED), None, &["--epoch", RECORDED]).unwrap();
         // No `--epoch` is added; `--expired-wait-charge` always is.
         assert_eq!(analysis.run_arg, ["--expired-wait-charge=each"]);
-        // No `--epoch` is added; `--sleep-registration` always is.
-        assert_eq!(analysis.run_arg, ["--sleep-registration=when-chosen"]);
         assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
 
         // A different explicit epoch is refused, naming the remedy.
