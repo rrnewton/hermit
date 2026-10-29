@@ -100,6 +100,17 @@ pub struct PreemptionRecord {
     /// replayed with it) keeps its recorded virtual times.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     expired_wait_runs_charged_once: bool,
+    /// Whether the run that produced this record registered a queued plain
+    /// sleep as a timed waiter at the first scheduler pass that found it
+    /// queued (`Scheduler::queued_sleeps_registered_at_first_pass`): a run
+    /// under `--sleep-registration=first-pass`, by default one outside race
+    /// search. `false`, which writes the record exactly as before the field
+    /// existed and is what a record without it means, is the rule of every
+    /// run before it and of `when-chosen` runs: a sleep is registered only
+    /// when its thread is chosen before its deadline. A replay that leaves
+    /// `--sleep-registration` unset registers as its record says.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    queued_sleeps_registered_at_first_pass: bool,
     /// The host files the recorded run's guest opened
     /// (`detcore_model::host_input::HostInputSet`), so that a replay can
     /// report one that changed since (`HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING`).
@@ -141,17 +152,6 @@ impl Eq for HostObservedCount {}
 
 impl std::hash::Hash for HostObservedCount {
     fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
-    /// Whether the run that produced this record registered a queued plain
-    /// sleep as a timed waiter at the first scheduler pass that found it
-    /// queued (`Scheduler::queued_sleeps_registered_at_first_pass`): a run
-    /// under `--sleep-registration=first-pass`, by default one outside race
-    /// search. `false`, which writes the record exactly as before the field
-    /// existed and is what a record without it means, is the rule of every
-    /// run before it and of `when-chosen` runs: a sleep is registered only
-    /// when its thread is chosen before its deadline. A replay that leaves
-    /// `--sleep-registration` unset registers as its record says.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    queued_sleeps_registered_at_first_pass: bool,
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -174,6 +174,7 @@ impl PreemptionRecord {
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
+            queued_sleeps_registered_at_first_pass: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
         }
@@ -190,6 +191,20 @@ impl PreemptionRecord {
     /// expired timed waits.
     pub fn with_expired_wait_runs_charged_once(mut self, once: bool) -> Self {
         self.expired_wait_runs_charged_once = once;
+        self
+    }
+
+    /// Whether the run this record came from registered queued sleeps at the
+    /// first pass (`false` for registration when chosen, and for records that
+    /// do not say).
+    pub fn queued_sleeps_registered_at_first_pass(&self) -> bool {
+        self.queued_sleeps_registered_at_first_pass
+    }
+
+    /// The same record, stating how the run it came from registered queued
+    /// sleeps.
+    pub fn with_queued_sleeps_registered_at_first_pass(mut self, first_pass: bool) -> Self {
+        self.queued_sleeps_registered_at_first_pass = first_pass;
         self
     }
 
@@ -235,6 +250,7 @@ impl PreemptionRecord {
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
+            queued_sleeps_registered_at_first_pass,
             host_inputs,
             store_exclusive_failures: _,
         } = self;
@@ -282,6 +298,7 @@ impl PreemptionRecord {
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
+            queued_sleeps_registered_at_first_pass: *queued_sleeps_registered_at_first_pass,
             host_inputs: host_inputs.clone(),
             // A count of this run's host, not part of the preemptions.
             store_exclusive_failures: HostObservedCount::default(),
@@ -297,24 +314,6 @@ impl PreemptionRecord {
         let mut record = self.clone();
         record.global = events;
         record.validate().is_ok().then_some(record)
-    }
-
-            queued_sleeps_registered_at_first_pass: false,
-        }
-    }
-
-    /// Whether the run this record came from registered queued sleeps at the
-    /// first pass (`false` for registration when chosen, and for records that
-    /// do not say).
-    pub fn queued_sleeps_registered_at_first_pass(&self) -> bool {
-        self.queued_sleeps_registered_at_first_pass
-    }
-
-    /// The same record, stating how the run it came from registered queued
-    /// sleeps.
-    pub fn with_queued_sleeps_registered_at_first_pass(mut self, first_pass: bool) -> Self {
-        self.queued_sleeps_registered_at_first_pass = first_pass;
-        self
     }
 
     /// The same record, stating the `--pipe-wake-latency` of the trials it
@@ -444,10 +443,10 @@ impl PreemptionRecord {
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
+            queued_sleeps_registered_at_first_pass: self.queued_sleeps_registered_at_first_pass,
             host_inputs: self.host_inputs.clone(),
             // A count of this run's host, not part of the preemptions.
             store_exclusive_failures: HostObservedCount::default(),
-            queued_sleeps_registered_at_first_pass: self.queued_sleeps_registered_at_first_pass,
         }
     }
 
@@ -511,9 +510,9 @@ impl PreemptionRecord {
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
+            queued_sleeps_registered_at_first_pass: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
-            queued_sleeps_registered_at_first_pass: false,
         }
     }
 
@@ -1054,6 +1053,15 @@ mod tests {
             assert_eq!(
                 read_recorded_expired_wait_runs_charged_once(&path),
                 Ok(once)
+            );
+        }
+        std::fs::write(&path, serde_json::to_string(&unsaid).unwrap()).unwrap();
+        assert_eq!(
+            read_recorded_expired_wait_runs_charged_once(&path),
+            Ok(false)
+        );
+    }
+
     /// How a run registered queued sleeps rides in a preemption record only
     /// when it registered them at the first pass
     /// (`--sleep-registration=first-pass`, by default outside race search),
@@ -1090,7 +1098,6 @@ mod tests {
         }
         std::fs::write(&path, serde_json::to_string(&unsaid).unwrap()).unwrap();
         assert_eq!(
-            read_recorded_expired_wait_runs_charged_once(&path),
             read_recorded_queued_sleeps_registered_at_first_pass(&path),
             Ok(false)
         );
@@ -1880,6 +1887,14 @@ impl PreemptionWriter {
         self
     }
 
+    /// Store whether the run registered queued sleeps at the first pass
+    /// (`Scheduler::queued_sleeps_registered_at_first_pass`; `false` leaves
+    /// the record as it was before the field existed).
+    pub fn with_queued_sleeps_registered_at_first_pass(mut self, first_pass: bool) -> Self {
+        self.inner.queued_sleeps_registered_at_first_pass = first_pass;
+        self
+    }
+
     /// Store whether the run capped preemption charges
     /// (`--cap-preemption-charge`; off leaves the record as it was before
     /// the field existed).
@@ -1898,14 +1913,6 @@ impl PreemptionWriter {
     /// once every thread has exited.
     pub fn record_store_exclusive_failures(&mut self, failures: u64) {
         self.inner.store_exclusive_failures = HostObservedCount(failures);
-    }
-
-    /// Store whether the run registered queued sleeps at the first pass
-    /// (`Scheduler::queued_sleeps_registered_at_first_pass`; `false` leaves
-    /// the record as it was before the field existed).
-    pub fn with_queued_sleeps_registered_at_first_pass(mut self, first_pass: bool) -> Self {
-        self.inner.queued_sleeps_registered_at_first_pass = first_pass;
-        self
     }
 
     /// Does the record have zero entries?
@@ -2334,6 +2341,34 @@ pub fn expired_wait_charge_mismatch(
 ) -> Option<String> {
     let replay = replay?;
     let recorded = detcore_model::config::ExpiredWaitCharge::from_charged_once(recorded_once);
+    (recorded != replay).then(|| {
+        let remedy = if search {
+            format!(
+                "A search replays every trial under one rule, its target's unless its run \
+                 arguments give one. Re-record this one under that rule \
+                 (`hermit run --expired-wait-charge={} --record-preemptions-to=...`), or, if \
+                 it is the target, pass --expired-wait-charge={} in the run arguments.",
+                replay.as_str(),
+                recorded.as_str()
+            )
+        } else {
+            format!(
+                "Replay with --expired-wait-charge={}, or leave the option out to take the \
+                 record's.",
+                recorded.as_str()
+            )
+        };
+        format!(
+            "{source} was recorded with --expired-wait-charge={} and would be replayed with \
+             --expired-wait-charge={}. The rule decides how much virtual time expired timed \
+             waits cost, and so which thread runs next, so the replay cannot reproduce the run. \
+             {remedy}",
+            recorded.as_str(),
+            replay.as_str(),
+        )
+    })
+}
+
 /// Read only whether the run that wrote a preemption record file registered
 /// queued sleeps at the first pass, as [`read_recorded_epoch`] reads the
 /// epoch. `Ok(false)` for a record that does not say: one written before the
@@ -2371,8 +2406,6 @@ pub fn sleep_registration_mismatch(
             format!(
                 "A search replays every trial under one rule, its target's unless its run \
                  arguments give one. Re-record this one under that rule \
-                 (`hermit run --expired-wait-charge={} --record-preemptions-to=...`), or, if \
-                 it is the target, pass --expired-wait-charge={} in the run arguments.",
                  (`hermit run --sleep-registration={} --record-preemptions-to=...`), or, if it \
                  is the target, pass --sleep-registration={} in the run arguments.",
                 replay.as_str(),
@@ -2380,17 +2413,12 @@ pub fn sleep_registration_mismatch(
             )
         } else {
             format!(
-                "Replay with --expired-wait-charge={}, or leave the option out to take the \
                 "Replay with --sleep-registration={}, or leave the option out to take the \
                  record's.",
                 recorded.as_str()
             )
         };
         format!(
-            "{source} was recorded with --expired-wait-charge={} and would be replayed with \
-             --expired-wait-charge={}. The rule decides how much virtual time expired timed \
-             waits cost, and so which thread runs next, so the replay cannot reproduce the run. \
-             {remedy}",
             "{source} was recorded with --sleep-registration={} and would be replayed with \
              --sleep-registration={}. The rule decides when a sleeping thread's wake enters the \
              timed events, and so which timed event fires in each pass, so the replay cannot \
