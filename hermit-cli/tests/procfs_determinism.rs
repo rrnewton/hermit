@@ -2192,10 +2192,20 @@ fn ignored_bind_outside_tmp_does_not_discard_private_mount_provenance() {
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     assert!(
         text.lines().any(|line| {
-            line.split(' ').nth(4) == Some("/etc") && line.contains("/tmpvol/.hermit/etc")
+            line.split(' ').nth(4) == Some("/etc/group")
+                && line.contains("/tmpvol/.hermit/etc/group")
         }),
-        "ignored bind incorrectly removed the active private /etc provenance"
+        "ignored bind incorrectly removed the active private /etc/group provenance"
     );
+    if std::path::Path::new("/etc/ld.so.cache").exists() {
+        assert!(
+            text.lines().any(|line| {
+                line.split(' ').nth(4) == Some("/etc/ld.so.cache")
+                    && line.contains("/tmpvol/.hermit/etc/ld.so.cache")
+            }),
+            "ignored bind incorrectly removed the active private /etc/ld.so.cache provenance"
+        );
+    }
 }
 
 fn fdinfo_and_mountinfo_ids() -> (u64, u64, u64, u64) {

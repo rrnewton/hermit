@@ -1264,7 +1264,10 @@ fn independent_mountinfo_recordings_are_canonical() {
         "independent mountinfo recordings",
     );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
-    assert!(text.contains("/tmpvol/.hermit/etc"));
+    assert!(text.contains("/tmpvol/.hermit/etc/group"));
+    if std::path::Path::new("/etc/ld.so.cache").exists() {
+        assert!(text.contains("/tmpvol/.hermit/etc/ld.so.cache"));
+    }
     assert!(!text.contains("/.tmp"));
 }
 

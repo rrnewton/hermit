@@ -9467,12 +9467,19 @@ fn detcore_renders_the_mount_table_on_every_backend() {
             "{first_backend} lacks {line:?}: {first}"
         );
     }
-    // The container's own mounts, as the guest names them: Hermit's /tmp and
-    // /etc, and /proc.
-    for row in [" /tmp ", " /etc ", " /proc "] {
+    // The container's own mounts, as the guest names them: Hermit's /tmp,
+    // the frozen /etc/group (and the frozen /etc/ld.so.cache when the host
+    // has one), and /proc.
+    for row in [" /tmp ", " /etc/group ", " /proc "] {
         assert!(
             first.contains(row),
             "{first_backend} shows no{row}row: {first}"
+        );
+    }
+    if Path::new("/etc/ld.so.cache").exists() {
+        assert!(
+            first.contains(" /etc/ld.so.cache "),
+            "{first_backend} shows no /etc/ld.so.cache row: {first}"
         );
     }
     for (backend, output) in &outputs[1..] {
