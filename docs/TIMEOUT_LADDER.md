@@ -262,11 +262,65 @@ greppable marker, and that marker — not the status — is what a caller keys o
 | `safehermit: bound.wall=APPLIED` … then a kill | the outermost cgroup deadline reaped the tree | the run escaped every inner bound |
 | a nextest-named test with wrapper exit 100 | the test **process** exceeded its per-test cap | `.config/nextest.toml` |
 | exit 124 with **no marker at all** | something outside hermit killed it — `timeout(1)` on the cell, or a harness | the cell's `timeout_seconds`, or a missing inner bound |
+| `HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model`, exit **121** | **no rung fired**: no wake Hermit models can reach any remaining thread, and the scheduler ended the run (see below) | the guest's synchronization, or a gap in Hermit's model; the report above the line names every blocked thread |
 
 That last row is the useful one. **A cell that times out with no class line means
 no inner bound fired**, which is either a missing `--timeout` or an inner bound
 set larger than the outer one. Both are configuration errors, and the marker's
 absence is what distinguishes them from a genuinely slow guest.
+
+## A deadlock under Hermit's model is not a timeout
+
+Under Hermit every remaining thread can be blocked on something no later
+scheduler turn can supply, so "no thread can be woken now" is also "no thread
+can ever be woken" by anything Hermit models. The scheduler prints its
+`Deadlock detected: ...` report and the run ends at once, in virtual time and
+without waiting for any bound.
+
+⚠️ **THAT IS A VERDICT OF HERMIT'S MODEL, NOT THE GUEST'S RESULT.** When the
+model covers every wake the program relies on, Linux would leave it hung
+forever. When it does not, the deadlock is Hermit's bug: robust-futex owner
+death, dash's `sigsuspend` after `wait4(WNOHANG)`, a raw exit, KVM's `kill`
+and happens-before re-admission each once produced this report (their
+regression tests in `hermit-cli/tests/cli.rs` and
+`hermit-cli/tests/robust_futex_owner_death.rs` say so). So it is neither a
+guest status nor `HERMIT_INTERNAL_FAILURE`: it has its own status and class
+line, `HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model`, exit **121**
+(allocated in `hermit-cli/src/lib.rs` beside 122-127). To tell the two cases
+apart, run the program natively (or under `--strace-only`) and see whether it
+hangs.
+
+On ptrace the run is unwound the way `--timeout` unwinds one, by publishing a
+termination that tears the parked guest down, and then finished: its output so
+far is kept, `--summary` is printed and names the deadlock, and a recording is
+committed and replays to the same deadlock. Nothing takes it as a guest
+result by default. `--verify` applies `--verify-allow` to it as to any status
+that is not success: the default `success` refuses run 1 (`no_result`,
+`first_run_rejected`, `verified: false`), and only an explicit `failure` or
+`both` compares the runs, in which case `verified` says the deadlock repeats
+at the same point, not that it is native. The report records
+`guest_exit_code: 121`. `hermit-verify chaos-stress` stops on it as on any
+other outcome of Hermit's own, and an `analyze` trial that ends on it fails
+with it rather than counting as on or off target. A
+teardown that records a failure of its own (a capture drain or cleanup error)
+is Hermit's failure instead, `HERMIT_INTERNAL_FAILURE`, because the kept output
+may then be incomplete. Library callers receive `hermit::GuestDeadlocked`,
+carrying the output when the run captured it. Reverie still logs each tracee
+the unwind kills (`guest terminated by signal ... SIGKILL`), as it does for
+`--timeout`.
+
+Only ptrace unwinds the guest, and only ptrace is measured. On the other
+backends the scheduler still exits with 121 from the process it runs in. From
+a container child the parent reports that exit the same way, without a
+summary. A scheduler that runs elsewhere hands 121 to Hermit as an ordinary
+exit status, without the class line: DBT drives its scheduler in Hermit's own
+process (see `TerminalDeadlockRecording` in `hermit-cli/src/bin/hermit/verify.rs`),
+whose `--verify` records `run_failed` with failure `deadlock` as before.
+
+The scheduler's own `HERMIT_DEADLOCK: ...` verdicts are not this. They say
+Hermit cannot go on (a broken invariant, or a death the backend never
+reported), and stay `HERMIT_INTERNAL_FAILURE class=container-child-exit`,
+exit 125.
 
 ## `--timeout` is qualified per backend, and refuses elsewhere
 

@@ -229,6 +229,12 @@ pub struct RunSummary {
     /// the run replayed nothing. Not part of the human-readable summary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_inputs_changed: Vec<HostInputChange>,
+    /// The run ended on a deadlock under Hermit's model: every remaining thread
+    /// was blocked with no wake Detcore models. Its status is then
+    /// `HERMIT_GUEST_DEADLOCK_EXIT`, not one the guest exited with. Absent
+    /// (false) for every other run and in older summaries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guest_deadlock: bool,
     /// aarch64: the load/store exclusive pairs (LL/SC retry loops) in the
     /// guest's executable file mappings, by guest path. A function of the
     /// files' bytes, so it is in the INFO view. Empty elsewhere.
@@ -369,6 +375,7 @@ impl RunSummary {
             exclusive_pairs,
             store_exclusives,
             store_exclusives_unavailable,
+            guest_deadlock,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -378,6 +385,12 @@ impl RunSummary {
         )?;
         if let Some(syscalls) = syscalls {
             writeln!(f, "Guest threads completed {syscalls} syscalls.")?;
+        }
+        if *guest_deadlock {
+            writeln!(
+                f,
+                "Deadlock under Hermit's model: no remaining thread can be woken by anything Hermit models."
+            )?;
         }
         if include_report_metadata {
             writeln!(

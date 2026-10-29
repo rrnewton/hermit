@@ -247,7 +247,7 @@ impl RunData {
         self.runopts.write_debug_options_dump()?;
 
         let started = Instant::now();
-        let (_, output) = self
+        let (_, output, guest_deadlock) = self
             .runopts
             .run(&gopts, true)
             .map_err(|error| self.name_the_trial_bound(error))?;
@@ -274,7 +274,7 @@ impl RunData {
             self.runopts.det_opts.det_config.record_preemptions_to = final_record_path;
         }
 
-        self.is_a_match = Some(self.analyze_opts.output_matches(&output));
+        self.is_a_match = Some(self.analyze_opts.trial_matches(&output, guest_deadlock)?);
         // Only a completed, successfully recorded run contributes a measurement.
         self.wall = Some(started.elapsed());
 

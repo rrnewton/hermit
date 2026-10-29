@@ -643,6 +643,54 @@ impl Scheduler {
         }
     }
 
+    /// Retire every thread still registered, in DetTid order, as a committed
+    /// victim of a kill the scheduler does not send itself: the termination
+    /// that unwinds a deadlocked guest (`unwind_guest_deadlock`) kills every
+    /// guest thread, and their deaths reach the scheduler as deregistrations
+    /// in the order the host reports them. Retired here, each death is then
+    /// only accounted ([`Self::route_sigkill_receipt`]), so the log the run
+    /// ends with, and the scheduler's state, do not depend on that order. The
+    /// scheduler grants no turn after this. As for a committed SIGKILL
+    /// ([`Self::commit_sigkill`]), every victim process is marked dying and
+    /// its exit granted before any is retired, so re-parenting passes over a
+    /// subreaper that dies too, and a parent-death signal is held, not sent,
+    /// as at any committed exit (nothing drains it before the guest is gone).
+    ///
+    /// Not retired here: every thread on a backend that does not retire a
+    /// kill's victims at the kill turn, and one with no recorded process or
+    /// address-space identity (a named determinism loss), which keep their
+    /// host-timed deregistrations, and a thread reserved by a send, whose
+    /// deregistration is a held receipt that retires nothing.
+    pub(crate) fn retire_threads_at_unwind(&mut self) -> Vec<DetTid> {
+        if !retires_sigkill_at_the_kill_turn(&self.backend) {
+            return Vec::new();
+        }
+        let mut victims = Vec::new();
+        for &tid in self.next_turns.keys() {
+            if self.sigkill.reserved.contains_key(&tid) {
+                continue;
+            }
+            let (Some(process), Some(mm)) = (self.registered_process(tid), self.thread_mm(tid))
+            else {
+                crate::detlog::write_loss_notice(&format!(
+                    "thread {tid}, killed by the unwind of a deadlocked guest, has no recorded process or address-space identity, so its death is retired at its host-timed deregistration"
+                ));
+                continue;
+            };
+            victims.push(SigkillVictim { tid, process, mm });
+        }
+        for victim in &victims {
+            self.sigkill.dying.insert(victim.process);
+            self.thread_tree.granted_exits.insert(victim.process);
+        }
+        for victim in &victims {
+            self.sigkill.unaccounted.insert(victim.tid);
+            self.logically_kill_thread(&victim.tid, &victim.process, victim.mm);
+        }
+        self.sigkill.dying.clear();
+        victims.into_iter().map(|victim| victim.tid).collect()
+    }
+
     /// Whether a committed victim's physical exit is still unaccounted, so no
     /// turn may be selected yet.
     pub(crate) fn sigkill_fence_holds(&self) -> bool {

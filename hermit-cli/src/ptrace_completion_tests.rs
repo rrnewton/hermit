@@ -797,3 +797,79 @@ async fn finalization_secondary_preserves_nested_cleanup_kind_and_stage() {
     assert!(diagnostic.contains("Incomplete"));
     assert!(diagnostic.contains("another output failure"));
 }
+
+/// A run torn down for a guest deadlock completes with the deadlock's status
+/// in place of a guest status it never had, keeping the output the guest
+/// wrote. It does only when the deadlock is the run's primary cause and the
+/// teardown recorded no failure of its own; an output run with no captured
+/// bytes has nothing honest to report and stays a failure too.
+#[test]
+fn a_guest_deadlock_completes_with_its_status_and_the_captured_output() {
+    let deadlocked = || reverie::Error::Tool(Error::new(GuestDeadlocked::new(None)));
+    assert!(is_clean_guest_deadlock(&deadlocked(), 0));
+    assert!(
+        !is_clean_guest_deadlock(&deadlocked(), 1),
+        "a teardown failure"
+    );
+    assert!(!is_clean_guest_deadlock(
+        &reverie::Error::Tool(Error::msg("an earlier failure")),
+        0
+    ));
+
+    let deadlock = reverie::ExitStatus::Exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT);
+    assert_eq!(
+        <reverie::ExitStatus as GuestDeadlockResult>::guest_deadlock(None),
+        Some(deadlock)
+    );
+    let output = <reverie::process::Output as GuestDeadlockResult>::guest_deadlock(Some(
+        &CapturedPrefix::default(),
+    ))
+    .expect("captured bytes make an output");
+    assert_eq!(output.status, deadlock);
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    assert!(<reverie::process::Output as GuestDeadlockResult>::guest_deadlock(None).is_none());
+}
+
+/// A deadlock whose teardown recorded a failure of its own (a secondary: a
+/// capture drain or cleanup error) does not complete with the deadlock's
+/// status, with or without captured output: the run stays a failed ptrace run,
+/// and its primary classifies as Hermit's failure (`FailureKind::Error`,
+/// reported as `HERMIT_INTERNAL_FAILURE` and 125), not as the deadlock. Only a
+/// clean teardown completes with 121.
+#[test]
+fn a_deadlock_whose_teardown_failed_stays_hermits_failure() {
+    let primary = reverie::Error::Tool(Error::new(GuestDeadlocked::new(None)));
+    let captured = CapturedPrefix::default();
+    for secondaries in [1, 2] {
+        assert!(
+            completed_guest_deadlock::<reverie::ExitStatus>(&primary, secondaries, None).is_none(),
+            "{secondaries} teardown failure(s)"
+        );
+        assert!(
+            completed_guest_deadlock::<reverie::process::Output>(
+                &primary,
+                secondaries,
+                Some(&captured)
+            )
+            .is_none(),
+            "{secondaries} teardown failure(s), with output"
+        );
+    }
+    assert_eq!(
+        crate::error::classify_ptrace_primary(&primary),
+        FailureKind::Error
+    );
+    assert_eq!(
+        completed_guest_deadlock::<reverie::ExitStatus>(&primary, 0, None),
+        Some(reverie::ExitStatus::Exited(
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT
+        ))
+    );
+    assert_eq!(
+        completed_guest_deadlock::<reverie::process::Output>(&primary, 0, Some(&captured))
+            .map(|output| output.status),
+        Some(reverie::ExitStatus::Exited(
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT
+        ))
+    );
+}

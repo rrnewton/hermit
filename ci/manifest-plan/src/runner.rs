@@ -4334,15 +4334,17 @@ pub fn accepted_guest_disposition(
     expected.map_or((Some(0), None), |expected| (expected.code, expected.signal))
 }
 
-/// The prefixes of the one-line classifications Hermit prints when it stops
-/// for a reason of its own: a policy refusal, an internal failure, a signal
-/// death or a run timeout. A skid attempt's stderr may carry exactly one kind
-/// of these, its own skid refusal; any other is a second failure.
-pub const HERMIT_CLASSIFICATION_PREFIXES: [&str; 4] = [
+/// The prefixes of the one-line classifications Hermit prints when a run does
+/// not end with the guest's own status: a policy refusal, an internal failure,
+/// a signal death, a run timeout or a deadlock under Hermit's model. A skid attempt's stderr
+/// may carry exactly one kind of these, its own skid refusal; any other is a
+/// second failure.
+pub const HERMIT_CLASSIFICATION_PREFIXES: [&str; 5] = [
     "HERMIT_POLICY_REFUSAL",
     "HERMIT_INTERNAL_FAILURE",
     "HERMIT_SIGNAL_DEATH",
     "HERMIT_RUN_TIMEOUT",
+    "HERMIT_MODEL_DEADLOCK",
 ];
 
 /// The line Hermit's log comparator prints when it declines to compare two
@@ -14983,6 +14985,7 @@ fi
                 status,
                 skid_overshoots: 0,
                 forwarded_syscalls: None,
+                guest_deadlock: false,
             };
             fs::write(
                 root.join("record.json"),

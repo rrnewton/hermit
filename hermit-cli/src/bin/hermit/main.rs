@@ -186,6 +186,7 @@ use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
+use self::container::GuestDeadlock;
 use self::container::LogCapExceeded;
 use self::container::PolicyRefusal;
 use self::container::RunTimeoutMarker;
@@ -878,6 +879,14 @@ fn block_write_signals_until_exit() {
     }
 }
 
+/// A guest deadlock reported across the container boundary
+/// ([`GuestDeadlock`]) or returned by a run in this process
+/// ([`hermit::GuestDeadlocked`]).
+fn is_guest_deadlock(error: &Error) -> bool {
+    error.downcast_ref::<GuestDeadlock>().is_some()
+        || error.downcast_ref::<hermit::GuestDeadlocked>().is_some()
+}
+
 /// Machine-readable classification of a hermit-internal failure, on stderr.
 ///
 /// ⚠️ WHY A STDERR MARKER AND NOT A SECOND EXIT CODE. Every value in `0..=255`
@@ -955,6 +964,13 @@ fn failure_exit_code(error: &Error) -> i32 {
     if error.downcast_ref::<LogCapExceeded>().is_some() {
         return hermit::HERMIT_LOG_CAP_EXIT;
     }
+    // A deadlock under Hermit's model: nothing Detcore models can wake any
+    // remaining thread. Neither the guest's own status nor proof of a native
+    // hang (that model has been wrong before), so it has its own code and
+    // class line rather than 125 or a guest status.
+    if is_guest_deadlock(error) {
+        return detcore_model::HERMIT_GUEST_DEADLOCK_EXIT;
+    }
     match error.downcast_ref::<GuestProgramFault>() {
         Some(fault) => fault.exit_code(),
         None => HERMIT_INTERNAL_FAILURE_EXIT,
@@ -996,6 +1012,14 @@ fn classify_failure(error: &Error) -> String {
     // best effort and may be missing.
     if error.downcast_ref::<LogCapExceeded>().is_some() {
         return "HERMIT_LOG_CAP class=log-cap".to_string();
+    }
+    // A deadlock UNDER HERMIT'S MODEL, not a guest result: no wake Detcore
+    // models can reach any remaining thread. The scheduler's report naming
+    // every blocked thread is above this line; this one is what a caller keys
+    // on to tell 121 from a guest's own. Whether the program also hangs
+    // natively is for the caller to check (`docs/ERROR_CATALOG.md`).
+    if is_guest_deadlock(error) {
+        return detcore_model::HERMIT_MODEL_DEADLOCK_LINE.to_string();
     }
     // ONE discriminant, read once, covering all three flattenings.
     if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {
@@ -1112,8 +1136,10 @@ mod tests {
     use hermit::Backend;
     use hermit::BackendUnavailable;
     use hermit::Error;
+    use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 
     use super::Args;
+    use super::GuestDeadlock;
     use super::Subcommand;
     use super::args_from_matches_with_clock;
     use super::classify_failure;
@@ -1900,6 +1926,53 @@ mod tests {
             "HERMIT_INTERNAL_FAILURE class=cli-error",
             "changing only prose must not manufacture the typed class"
         );
+    }
+
+    /// A deadlock under Hermit's model has its own exit status and class line,
+    /// and neither is an internal failure's: the line a caller keys on, and
+    /// 121 rather than 125. The line names the model and claims no guest
+    /// outcome.
+    #[test]
+    fn guest_deadlock_uses_its_own_exit_and_marker() {
+        for error in [
+            Error::new(GuestDeadlock),
+            Error::new(hermit::GuestDeadlocked::new(None)),
+        ] {
+            assert_eq!(
+                failure_exit_code(&error),
+                detcore_model::HERMIT_GUEST_DEADLOCK_EXIT
+            );
+            assert_ne!(failure_exit_code(&error), HERMIT_INTERNAL_FAILURE_EXIT);
+            assert_eq!(
+                classify_failure(&error),
+                "HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("Hermit's model") && !message.contains("not a hermit failure"),
+                "{message}"
+            );
+        }
+    }
+
+    /// A deadlock whose teardown recorded its own failure stays a failed
+    /// ptrace run (`ptrace_completion::completed_guest_deadlock`), which the
+    /// container child reports with kind `Error`. The CLI reports that as
+    /// Hermit's failure, 125 and `HERMIT_INTERNAL_FAILURE`, never with the
+    /// deadlock's class line or 121.
+    #[test]
+    fn a_deadlock_whose_teardown_failed_exits_as_an_internal_failure() {
+        let reported = hermit::SerializableError::from(Error::msg(
+            "Deadlock under Hermit's model (ptrace teardown at pid=4, tid=4); \
+             cleanup: the capture drain failed",
+        ));
+        assert_eq!(reported.kind(), hermit::FailureKind::Error);
+        let error =
+            super::container::classify_container_result::<()>(Ok(Err(reported))).unwrap_err();
+        assert_eq!(failure_exit_code(&error), HERMIT_INTERNAL_FAILURE_EXIT);
+        let class = classify_failure(&error);
+        assert!(class.starts_with("HERMIT_INTERNAL_FAILURE "), "{class}");
+        assert_ne!(class, detcore_model::HERMIT_MODEL_DEADLOCK_LINE);
     }
 
     #[test]

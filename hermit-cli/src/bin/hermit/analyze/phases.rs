@@ -1580,6 +1580,21 @@ impl AnalyzeOpts {
         }
     }
 
+    /// Does a finished trial meet the criteria? A trial that ended on a
+    /// deadlock under Hermit's model has no guest status to judge (its 121 is
+    /// Hermit's), and the deadlock may be a gap in Hermit's model rather than
+    /// the guest's behaviour, so it is counted neither on nor off target: the
+    /// trial fails with the deadlock's own outcome.
+    pub fn trial_matches(&self, out: &Output, guest_deadlock: bool) -> anyhow::Result<bool> {
+        if guest_deadlock {
+            return Err(Error::new(crate::container::GuestDeadlock).context(
+                "an analyze trial ended on a deadlock under Hermit's model, which is \
+                 neither on nor off target",
+            ));
+        }
+        Ok(self.output_matches(out))
+    }
+
     /// Does the run meet the criteria we are looking for (e.g. a particular error message).
     pub fn output_matches(&self, out: &Output) -> bool {
         let mut answer = true;
@@ -2303,6 +2318,36 @@ mod tests {
             parse(&["/bin/true"]).small_trial_max_timeslice_notice(margin),
             None
         );
+    }
+
+    /// A trial that deadlocked under Hermit's model is neither on nor off
+    /// target, under the default nonzero target or any other: it fails with
+    /// the deadlock's outcome, while the same output from a guest that exited
+    /// 121 itself is judged as usual.
+    #[test]
+    fn a_deadlocked_trial_is_neither_on_nor_off_target() {
+        let output = Output {
+            status: ExitStatus::Exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        for target in [None, Some("--target-exit-code=any")] {
+            let mut argv = vec!["analyze", "--analyze-seed=7"];
+            argv.extend(target);
+            argv.extend(["--", "/bin/true"]);
+            let options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let error = options.trial_matches(&output, true).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::container::GuestDeadlock>()
+                    .is_some(),
+                "{target:?}: {error:#}"
+            );
+            assert!(
+                options.trial_matches(&output, false).unwrap(),
+                "{target:?}: a guest's own 121 is judged as usual"
+            );
+        }
     }
 
     /// A search round whose trial `--max-log-bytes` ended stops the `--search`

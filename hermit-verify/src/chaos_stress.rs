@@ -15,6 +15,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use colored::Colorize;
+use detcore_model::HERMIT_GUEST_DEADLOCK_EXIT;
+use detcore_model::HERMIT_MODEL_DEADLOCK_LINE;
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use rand::RngExt as _;
 
@@ -34,8 +36,11 @@ const SKID_OVERSHOOT_REFUSAL_PREFIX: &str =
 /// Hermit's own outcomes that no guest produced, each the exit status from the
 /// allocation table in hermit-cli/src/lib.rs with the stderr marker that tells
 /// it apart from a guest choosing the same status. A run that ends in one of
-/// these says nothing about the guest.
-const HERMIT_OUTCOMES: [(i32, &str); 5] = [
+/// these says nothing certain about the guest. That includes a deadlock under
+/// Hermit's model: no wake Detcore models can reach the guest, which is a
+/// native hang only when that model is complete for the program.
+const HERMIT_OUTCOMES: [(i32, &str); 6] = [
+    (HERMIT_GUEST_DEADLOCK_EXIT, HERMIT_MODEL_DEADLOCK_LINE),
     (HERMIT_POLICY_REFUSAL_EXIT, "HERMIT_POLICY_REFUSAL "),
     (123, "HERMIT_LOG_CAP "),
     (124, "HERMIT_RUN_TIMEOUT "),
@@ -233,6 +238,24 @@ mod tests {
         assert_eq!(classify(exited(122), "").unwrap(), RunOutcome::Failed);
         assert_eq!(
             classify(exited(1), "HERMIT_INTERNAL_FAILURE class=cli-error\n").unwrap(),
+            RunOutcome::Failed
+        );
+        // A deadlock under Hermit's model is not counted as the guest
+        // failing: Hermit's model, not the guest, decided it. A guest that
+        // exits 121 itself, with no class line, still fails.
+        let deadlock = classify(
+            exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.\n\
+             HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            deadlock.contains("HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model"),
+            "{deadlock}"
+        );
+        assert_eq!(
+            classify(exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT), "").unwrap(),
             RunOutcome::Failed
         );
     }

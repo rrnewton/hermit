@@ -1669,11 +1669,15 @@ pub struct Scheduler {
     /// or signal observation, so nothing new waits on a guest.
     terminal_clock_exhaustion: Option<String>,
 
-    /// Set when `terminal_deadlock` is a policy refusal of the happens-before
-    /// spec (a gate that can never open, or a hold inside a vfork child) rather
-    /// than a scheduler failure: the run then exits with
-    /// `HERMIT_POLICY_REFUSAL_EXIT` instead of the fatal status.
-    terminal_is_refusal: bool,
+    /// What `terminal_deadlock` means, which decides the status the run ends
+    /// with ([`TerminalKind`]). Set with the report it describes, so the first
+    /// verdict keeps its kind.
+    terminal_kind: TerminalKind,
+
+    /// The run ended with a guest deadlock that its backend unwound
+    /// (`unwind_guest_deadlock`): the teardown that follows is that outcome,
+    /// not a failure, and the run summary says so.
+    guest_deadlocked: bool,
 
     /// The scheduler turn at which the shared logical-empty observation last
     /// logged "zero threads left anywhere, fizzling.", while that state lasts.
@@ -3539,23 +3543,24 @@ async fn sched_loop_inner(
         // Printed with `eprintln!` rather than `tracing::error!` on purpose: the
         // tracing writer prefixes a real wall-clock timestamp, and this report
         // is required to be byte-identical across runs of the same program.
-        let terminal = {
-            let mut sched = sched.lock().unwrap();
-            let is_refusal = sched.terminal_is_refusal;
-            sched
-                .take_terminal_deadlock()
-                .map(|report| (report, is_refusal))
-        };
-        if let Some((report, is_refusal)) = terminal {
+        //
+        // The status says which kind of verdict this was (`TerminalKind`): it
+        // is all the parent's classifier sees of it.
+        let terminal = sched.lock().unwrap().take_terminal_verdict();
+        if let Some((report, kind)) = terminal {
             crate::host_timed_producers::emit_run_end_log();
             eprintln!("{}", report);
-            if is_refusal {
-                // A happens-before spec the guest cannot satisfy: a policy
-                // refusal, distinct from the guest's status and from a failure.
-                std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
+            // A backend that can unwind the parked guest ends the run itself,
+            // so the guest's output, the log and any recording are finished as
+            // for a run that exited. The scheduler grants nothing more; if
+            // another cause ended the run first, that cause's path finishes it.
+            if kind == TerminalKind::GuestDeadlock && unwind_guest_deadlock(&sched).is_some() {
+                return;
             }
-            report_terminal_deadlock_to_hook(&report);
-            immediate_fatal_exit(); // We don't want a backtrace of this thread.
+            if kind != TerminalKind::Refusal {
+                report_terminal_deadlock_to_hook(&report);
+            }
+            std::process::exit(kind.exit_status());
         }
         // Virtual time ran out under a configured --scheduler-turn-cost: end
         // the run the same way, rather than saturate the clock.
@@ -4298,6 +4303,42 @@ fn is_futex_request(nextturn: &ThreadNextTurn) -> bool {
     }
 }
 
+/// What a pending terminal report (`Scheduler::terminal_deadlock`) means. It
+/// decides the status `sched_loop_inner` ends the run with, which is the only
+/// thing that crosses the container boundary, so it is what keeps a deadlock
+/// under Hermit's model, a refusal and a Hermit failure apart for the parent's
+/// classifier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TerminalKind {
+    /// Hermit itself cannot go on: one of the scheduler's `HERMIT_DEADLOCK:`
+    /// invariants broke, or a backend never reported a death the kernel owed
+    /// (`report_terminal_deadlock_unless_zap_pending`). Exits 1, which the
+    /// parent reports as an internal failure. The default, so a verdict that
+    /// names no kind can never be read as the guest's.
+    #[default]
+    HermitStall,
+    /// Every remaining guest thread is blocked with no wake this scheduler
+    /// models (`report_terminal_deadlock`): a deadlock under Hermit's model,
+    /// not a guest result, exiting `HERMIT_GUEST_DEADLOCK_EXIT`.
+    GuestDeadlock,
+    /// The happens-before spec can never be satisfied (a gate that can never
+    /// open, or a hold inside a vfork child): a policy refusal, exiting
+    /// `HERMIT_POLICY_REFUSAL_EXIT`.
+    Refusal,
+}
+
+impl TerminalKind {
+    /// The status the scheduler ends the process with for a report of this
+    /// kind.
+    pub(crate) fn exit_status(self) -> i32 {
+        match self {
+            Self::HermitStall => FATAL_EXIT_STATUS,
+            Self::GuestDeadlock => detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
+            Self::Refusal => detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+        }
+    }
+}
+
 /// What a process that drives the scheduler in-process does with a terminal
 /// deadlock report before the scheduler exits the process.
 pub type TerminalDeadlockHook = Box<dyn Fn(&str) + Send + Sync>;
@@ -4324,10 +4365,94 @@ fn report_terminal_deadlock_to_hook(report: &str) {
     }
 }
 
+/// The status [`immediate_fatal_exit`] ends the process with: one the parent
+/// cannot account for, so it reports an internal failure.
+const FATAL_EXIT_STATUS: i32 = 1;
+
+/// How a run whose backend can unwind a deadlocked guest ends it, in place of
+/// the scheduler exiting the process: it asks the backend to tear the parked
+/// guest down and finish the run (the ptrace owner publishes a termination, as
+/// `--timeout` does), and returns whether that request became the run's cause.
+/// Called once, from the scheduler task with no scheduler lock held, after the
+/// report is printed; it must not block.
+pub type GuestDeadlockUnwind = Box<dyn FnOnce() -> bool>;
+
+thread_local! {
+    /// The unwind of the run this thread drives. Per thread because a run's
+    /// scheduler task runs on the thread that drives the run (ptrace's
+    /// current-thread runtime on its tracer thread), and concurrent runs have
+    /// threads of their own.
+    static GUEST_DEADLOCK_UNWIND: std::cell::RefCell<Option<GuestDeadlockUnwind>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs a run's [`GuestDeadlockUnwind`] on the calling thread while it
+/// lives. Without one a guest deadlock exits the process with
+/// `HERMIT_GUEST_DEADLOCK_EXIT`, which the parent recognises the same way.
+/// Whether the run's guest deadlocked is then [`GlobalState::guest_deadlocked`].
+///
+/// [`GlobalState::guest_deadlocked`]: crate::GlobalState::guest_deadlocked
+#[must_use = "the unwind is removed when the guard drops"]
+pub struct GuestDeadlockUnwindGuard(());
+
+impl GuestDeadlockUnwindGuard {
+    /// Install `unwind` for the run this thread drives, replacing any other.
+    pub fn install(unwind: GuestDeadlockUnwind) -> Self {
+        GUEST_DEADLOCK_UNWIND.with(|slot| *slot.borrow_mut() = Some(unwind));
+        Self(())
+    }
+}
+
+impl Drop for GuestDeadlockUnwindGuard {
+    fn drop(&mut self) {
+        GUEST_DEADLOCK_UNWIND.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+/// Hand a guest deadlock to the unwind installed on this thread, if any:
+/// `None` without one, else whether the unwind's request won. The run is
+/// marked deadlocked only when it did, so a run that ended for another cause
+/// first keeps that cause's outcome. Finding none, as a scheduler moved off
+/// the thread that drives its run would, falls back to exiting with
+/// `HERMIT_GUEST_DEADLOCK_EXIT`.
+fn unwind_guest_deadlock(sched: &Mutex<Scheduler>) -> Option<bool> {
+    let unwind = GUEST_DEADLOCK_UNWIND.with(|slot| slot.borrow_mut().take())?;
+    let failed_before = {
+        let mut sched = sched.lock().unwrap();
+        // Set before the request, whose teardown reports to the scheduler
+        // synchronously (`report_backend_failure_location`): a teardown the
+        // run's outcome asked for is logged at DEBUG, out of the INFO records
+        // `--verify` compares.
+        sched.guest_deadlocked = true;
+        // The request kills every remaining guest thread, and their deaths
+        // arrive in host order: retire them now, in DetTid order.
+        sched.retire_threads_at_unwind();
+        sched.backend_failure.is_some()
+    };
+    let won = unwind();
+    let mut sched = sched.lock().unwrap();
+    sched.guest_deadlocked = won;
+    // The request lost to another cause, so a backend failure reported
+    // during it belongs to that cause and is logged as any other is, rather
+    // than staying at DEBUG.
+    if !won
+        && !failed_before
+        && let Some(event) = &sched.backend_failure
+    {
+        tracing::error!(
+            "backend failure for process {}, task {:?}, phase {}",
+            event.pid,
+            event.tid,
+            event.phase
+        );
+    }
+    Some(won)
+}
+
 /// Until panics are escalated properly, this encapsulates a way to exit the hermit container
 /// entirely.
 pub fn immediate_fatal_exit() {
-    std::process::exit(1);
+    std::process::exit(FATAL_EXIT_STATUS);
 }
 
 /// The result of consuming a SchedEvent during --replay-preemptions-from.  This represents some
@@ -4658,7 +4783,8 @@ impl Scheduler {
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             terminal_clock_exhaustion: None,
-            terminal_is_refusal: false,
+            terminal_kind: TerminalKind::default(),
+            guest_deadlocked: false,
             empty_queue_kick_turn: None,
             backend_failure: None,
             backend_failure_sender: Some(backend_failure_sender),
@@ -5297,7 +5423,7 @@ impl Scheduler {
                  or on a call that is not interrupted.",
                 dettid, anchors, count, code
             ));
-            self.terminal_is_refusal = true;
+            self.terminal_kind = TerminalKind::Refusal;
         }
         self.skip_turn_blocked(dettid)
     }
@@ -5359,7 +5485,7 @@ impl Scheduler {
                          before the vfork or after the child's exec.",
                         reached, dettid
                     ));
-                    self.terminal_is_refusal = true;
+                    self.terminal_kind = TerminalKind::Refusal;
                 }
             }
             let now_ns = self.committed_time.as_nanos();
@@ -5455,7 +5581,7 @@ impl Scheduler {
         };
         if self.terminal_deadlock.is_none() {
             self.terminal_deadlock = Some(refusal);
-            self.terminal_is_refusal = true;
+            self.terminal_kind = TerminalKind::Refusal;
         }
         Err(SkipTurn)
     }
@@ -6619,7 +6745,7 @@ impl Scheduler {
             && self.terminal_deadlock.is_none()
         {
             self.terminal_deadlock = Some(refusal);
-            self.terminal_is_refusal = true;
+            self.terminal_kind = TerminalKind::Refusal;
         }
 
         self.thread_tree
@@ -7169,12 +7295,25 @@ impl Scheduler {
         if self.run_queue.tentative_pop_in_progress() {
             self.run_queue.undo_tentative_pop();
         }
-        tracing::error!(
-            "backend failure for process {}, task {:?}, phase {}",
-            event.pid,
-            event.tid,
-            event.phase
-        );
+        if self.guest_deadlocked {
+            // The backend tearing down the deadlocked guest it was handed
+            // (`GuestDeadlockUnwind`): the run's outcome, not a failure. Kept
+            // out of the INFO records `--verify` compares, which a host pid
+            // (`--no-namespace`) must not reach.
+            tracing::debug!(
+                "unwinding the deadlocked guest: process {}, task {:?}, phase {}",
+                event.pid,
+                event.tid,
+                event.phase
+            );
+        } else {
+            tracing::error!(
+                "backend failure for process {}, task {:?}, phase {}",
+                event.pid,
+                event.tid,
+                event.phase
+            );
+        }
         self.backend_failure = Some(event);
         self.backend_failure_sender.take()
     }
@@ -14472,23 +14611,30 @@ impl Scheduler {
         out
     }
 
-    /// Report a permanently blocked guest and abort the run.
+    /// Report a guest that is permanently blocked under Hermit's model, and
+    /// abort the run.
     ///
     /// Reached only when the run queue is empty *and* every remaining thread is
     /// blocked on something no future scheduler turn can supply. In a
     /// sequentialized deterministic run the scheduler is the only source of
-    /// wakeups, so "no thread can be woken now" is also "no thread can ever be
-    /// woken": the condition is permanent, not transient. Linux would leave such
-    /// a process hung forever; reporting it is strictly more useful than
-    /// reproducing the hang, and it is the established Detcore behaviour for the
-    /// futex case (`docs/ERROR_CATALOG.md`).
+    /// wakeups it models, so "no thread can be woken now" is also "no thread can
+    /// ever be woken by anything Hermit models": the condition is permanent, not
+    /// transient. It is a deadlock under Hermit's model, not a guest result:
+    /// Linux would leave such a process hung forever only if Hermit models every
+    /// wake the program relies on (a wake Hermit fails to model, such as a past
+    /// robust-futex owner death, reads the same way; `docs/TIMEOUT_LADDER.md`).
+    /// Reporting it is strictly more useful than reproducing the hang, and it is
+    /// the established Detcore behaviour for the futex case
+    /// (`docs/ERROR_CATALOG.md`).
     ///
     /// `waiters` names *what* is blocked; everything else is shared, so every
     /// deadlock class prints the same reproducible shape.
     ///
-    /// Records the report and returns [`SkipTurn`] rather than panicking.
-    /// `sched_loop_inner` picks it up and exits the container, next to the two
-    /// existing `--stop-after-*` fatal exits. A panic here would NOT end the
+    /// Records the report as [`TerminalKind::GuestDeadlock`] and returns
+    /// [`SkipTurn`] rather than panicking. `sched_loop_inner` picks it up and
+    /// hands it to the backend's [`GuestDeadlockUnwind`], or exits the container
+    /// with `HERMIT_GUEST_DEADLOCK_EXIT` next to the two existing
+    /// `--stop-after-*` fatal exits. A panic here would NOT end the
     /// run: the scheduler is a `tokio::spawn`ed task whose panic the harness
     /// captures, leaving every guest thread parked forever on an
     /// `Ivar<SchedResponse>` only the scheduler could fill, so the process hangs
@@ -14508,9 +14654,12 @@ impl Scheduler {
         if self.terminal_deadlock.is_none() {
             if let Some(refusal) = refusal {
                 self.terminal_deadlock = Some(format!("{}\n{}", refusal, report));
-                self.terminal_is_refusal = true;
+                self.terminal_kind = TerminalKind::Refusal;
             } else {
+                // A deadlock under Hermit's model: natively the guest hangs
+                // here forever if the model covers every wake it relies on.
                 self.terminal_deadlock = Some(report);
+                self.terminal_kind = TerminalKind::GuestDeadlock;
             }
         }
         SkipTurn
@@ -14541,11 +14690,13 @@ impl Scheduler {
             return SkipTurn;
         }
         // Past the valve: stop by name. The line carries only DetPids and
-        // the configured bound, so it is the same on every run.
+        // the configured bound, so it is the same on every run. The backend
+        // never reported a death the kernel owed, so this is Hermit's
+        // failure, not the guest's deadlock.
         let first_verdict = self.terminal_deadlock.is_none();
         let skip = self.report_terminal_deadlock();
         if first_verdict
-            && !self.terminal_is_refusal
+            && self.terminal_kind != TerminalKind::Refusal
             && let Some(report) = self.terminal_deadlock.as_mut()
         {
             *report = if self.namespace_zap_victims.is_empty() {
@@ -14559,6 +14710,7 @@ impl Scheduler {
                     self.namespace_zap_victims, self.namespace_zap_valve, report
                 )
             };
+            self.terminal_kind = TerminalKind::HermitStall;
         }
         skip
     }
@@ -14566,6 +14718,17 @@ impl Scheduler {
     /// Take the pending terminal-deadlock report, if the scheduler produced one.
     fn take_terminal_deadlock(&mut self) -> Option<String> {
         self.terminal_deadlock.take()
+    }
+
+    /// Take the pending terminal report with its kind, leaving neither behind.
+    fn take_terminal_verdict(&mut self) -> Option<(String, TerminalKind)> {
+        let kind = std::mem::take(&mut self.terminal_kind);
+        self.take_terminal_deadlock().map(|report| (report, kind))
+    }
+
+    /// Whether the run ended with a guest deadlock its backend unwound.
+    pub(crate) fn guest_deadlocked(&self) -> bool {
+        self.guest_deadlocked
     }
 
     /// Test seam: see [`SchedLoopPoint`].
@@ -18384,6 +18547,7 @@ impl Scheduler {
                 exclusive_pairs: Default::default(),
                 store_exclusives: None,
                 store_exclusives_unavailable: None,
+                guest_deadlock: self.guest_deadlocked,
             },
             info_reprio_descrip,
         ))
@@ -36051,6 +36215,220 @@ mod test {
         );
     }
 
+    /// Each terminal verdict carries the kind that decides the run's status,
+    /// the only thing the parent's classifier sees: threads that all wait with
+    /// no possible wake are the guest's deadlock (`HERMIT_GUEST_DEADLOCK_EXIT`);
+    /// the same wait reached past the namespace-kill valve is Hermit's stall
+    /// (exit 1, an internal failure), because the backend never reported a
+    /// death it owed; a `HERMIT_DEADLOCK:` invariant names no kind and stays a
+    /// stall. A guest deadlock reaches the unwind installed on the thread, and
+    /// marks the run deadlocked only when the unwind's request won.
+    #[test]
+    fn terminal_verdicts_carry_the_kind_that_decides_the_status() {
+        assert_eq!(
+            TerminalKind::GuestDeadlock.exit_status(),
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT
+        );
+        assert_eq!(
+            TerminalKind::Refusal.exit_status(),
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+        );
+        assert_eq!(TerminalKind::HermitStall.exit_status(), FATAL_EXIT_STATUS);
+        assert_eq!(TerminalKind::default(), TerminalKind::HermitStall);
+
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let child = DetTid::from_raw(7);
+        let mut guest = Scheduler::new(&Config::default());
+        register_known_thread(&mut guest, child);
+        guest
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, child);
+        assert!(guest.step2d_handle_empty_queue(&global_time).is_err());
+        let (report, kind) = guest.take_terminal_verdict().expect("a deadlock");
+        assert!(report.starts_with("Deadlock detected:"), "{report}");
+        assert_eq!(kind, TerminalKind::GuestDeadlock);
+        assert_eq!(guest.terminal_kind, TerminalKind::HermitStall, "taken");
+
+        let mut stalled = ended_namespace_with_a_paused_member(child);
+        stalled.namespace_zap_valve = Duration::ZERO;
+        assert!(stalled.step2d_handle_empty_queue(&global_time).is_err());
+        let (report, kind) = stalled.take_terminal_verdict().expect("a stall");
+        assert!(report.starts_with("HERMIT_DEADLOCK: processes"), "{report}");
+        assert_eq!(kind, TerminalKind::HermitStall);
+
+        let mut invariant = Scheduler::new(&Config::default());
+        invariant
+            .terminal_deadlock
+            .get_or_insert_with(|| "HERMIT_DEADLOCK: an invariant".to_owned());
+        assert_eq!(
+            invariant.take_terminal_verdict().map(|(_, kind)| kind),
+            Some(TerminalKind::HermitStall)
+        );
+
+        // Without an unwind on this thread the scheduler exits. With one it
+        // hands the deadlock over once, and the run reads as deadlocked only
+        // when the unwind's request became the run's cause.
+        let sched = Mutex::new(Scheduler::new(&Config::default()));
+        assert_eq!(unwind_guest_deadlock(&sched), None);
+        for won in [true, false] {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counted = std::rc::Rc::clone(&calls);
+            let guard = GuestDeadlockUnwindGuard::install(Box::new(move || {
+                counted.set(counted.get() + 1);
+                won
+            }));
+            assert_eq!(unwind_guest_deadlock(&sched), Some(won));
+            assert_eq!(unwind_guest_deadlock(&sched), None, "called once");
+            drop(guard);
+            assert_eq!(calls.get(), 1);
+            assert_eq!(sched.lock().unwrap().guest_deadlocked(), won);
+        }
+        // A removed unwind is not called.
+        drop(GuestDeadlockUnwindGuard::install(Box::new(|| {
+            panic!("a removed unwind must not run")
+        })));
+        assert_eq!(unwind_guest_deadlock(&sched), None);
+    }
+
+    /// A backend failure reported while the unwind's request runs is the
+    /// deadlock's teardown, logged at DEBUG, when the request becomes the
+    /// run's cause; when it loses to another cause, the same report is that
+    /// cause's failure and is logged at ERROR. A failure reported before the
+    /// unwind was logged at ERROR when it arrived, and a losing unwind does not
+    /// log it a second time.
+    #[test]
+    fn a_teardown_report_during_a_losing_unwind_is_logged_as_a_failure() {
+        #[derive(Clone)]
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+
+        // (whether the unwind's request wins, whether the failure was
+        // reported before the unwind)
+        for (won, failed_before) in [(true, false), (false, false), (false, true)] {
+            let output = Writer(Arc::new(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(output.clone())
+                .finish();
+            let sched = Arc::new(Mutex::new(Scheduler::new(&Config::default())));
+            let reporter = Arc::clone(&sched);
+            let report = move |sched: &Mutex<Scheduler>| {
+                sched
+                    .lock()
+                    .unwrap()
+                    .report_backend_failure_location(BackendFailureLocation {
+                        pid: reverie::Pid::from_raw(4),
+                        tid: Some(reverie::Tid::from_raw(4)),
+                        phase: "teardown",
+                    });
+            };
+            tracing::subscriber::with_default(subscriber, || {
+                if failed_before {
+                    report(&sched);
+                }
+                let guard = GuestDeadlockUnwindGuard::install(Box::new(move || {
+                    report(&reporter);
+                    won
+                }));
+                assert_eq!(unwind_guest_deadlock(&sched), Some(won));
+                drop(guard);
+            });
+            let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            let failure = format!(
+                "backend failure for process {}, task {:?}, phase teardown",
+                reverie::Pid::from_raw(4),
+                Some(reverie::Tid::from_raw(4))
+            );
+            let lines: Vec<&str> = log
+                .lines()
+                .filter(|line| line.contains(failure.as_str()))
+                .collect();
+            if won {
+                assert!(lines.is_empty(), "won: {log}");
+                assert!(log.contains("unwinding the deadlocked guest"), "won: {log}");
+            } else {
+                let label = if failed_before {
+                    "lost after an earlier failure"
+                } else {
+                    "lost"
+                };
+                assert_eq!(lines.len(), 1, "{label}: {log}");
+                assert!(lines[0].contains("ERROR"), "{label}: {log}");
+            }
+        }
+    }
+
+    /// The unwind of a deadlocked guest kills every remaining thread, and the
+    /// host reports their deaths in any order. They are retired before the
+    /// unwind's request, in DetTid order, as committed victims: each death
+    /// report that follows, in whatever order, is only accounted. On a backend
+    /// that does not retire a kill's victims at the kill turn (DBT), nothing
+    /// is retired early.
+    #[test]
+    fn a_deadlock_unwind_retires_the_remaining_threads_in_tid_order() {
+        use sigkill_retirement::SigkillReceipt;
+
+        let threads = [3, 5, 7].map(DetTid::from_raw);
+        let deadlocked = |config: &Config| {
+            let mut sched = Scheduler::new(config);
+            let leader = threads[0];
+            for tid in threads {
+                sched.thread_tree.add_child(leader, tid, tid == leader);
+                register_known_thread(&mut sched, tid);
+                sched.record_thread_mm(tid, MmId::initial(leader));
+            }
+            Mutex::new(sched)
+        };
+        let unwound = |sched: &Mutex<Scheduler>| {
+            let guard = GuestDeadlockUnwindGuard::install(Box::new(|| true));
+            assert_eq!(unwind_guest_deadlock(sched), Some(true));
+            drop(guard);
+        };
+
+        let sched = deadlocked(&Config::default());
+        unwound(&sched);
+        let mut sched = sched.into_inner().unwrap();
+        assert!(sched.next_turns.is_empty());
+        assert!(sched.thread_tree.granted_exits.contains(&threads[0]));
+        assert!(sched.sigkill_fence_holds());
+        for tid in [threads[2], threads[0], threads[1]] {
+            assert!(sched.is_unaccounted_sigkill_victim(tid), "{tid}");
+            assert_eq!(sched.route_sigkill_receipt(tid), SigkillReceipt::Committed);
+        }
+        assert!(!sched.sigkill_fence_holds());
+
+        let mut direct = deadlocked(&Config::default()).into_inner().unwrap();
+        assert_eq!(direct.retire_threads_at_unwind(), threads);
+
+        let dbt = Config::default().with_backend(|backend| {
+            *backend = reverie::BackendCapabilities::DBT;
+        });
+        let sched = deadlocked(&dbt);
+        unwound(&sched);
+        let mut sched = sched.into_inner().unwrap();
+        assert_eq!(sched.next_turns.len(), 3);
+        for tid in threads {
+            assert_eq!(sched.route_sigkill_receipt(tid), SigkillReceipt::Ordinary);
+        }
+    }
+
     /// A process forked into the namespace after its init's Exit grant, but
     /// before Linux starts killing the namespace, dies with it too, so it is
     /// waited for like the members named at the grant. A process outside the
@@ -38124,7 +38502,7 @@ mod test {
         assert!(scheduler.terminal_deadlock.is_none());
         assert!(!interrupt(&mut scheduler, &anchors));
         assert!(!scheduler.run_queue.contains_tid(source));
-        assert!(scheduler.terminal_is_refusal);
+        assert_eq!(scheduler.terminal_kind, TerminalKind::Refusal);
         assert!(scheduler.happens_before.as_ref().unwrap().fired.is_empty());
         assert!(!hb_reach(&mut scheduler, DetTid::from_raw(5), 43, 100));
         assert_eq!(
@@ -38237,7 +38615,7 @@ mod test {
         assert!(scheduler.take_terminal_deadlock().is_none());
         scheduler.committed_time = LogicalTime::from_nanos(6001);
         assert!(scheduler.step2_drain_prefix().is_err());
-        assert!(scheduler.terminal_is_refusal);
+        assert_eq!(scheduler.terminal_kind, TerminalKind::Refusal);
         let report = scheduler.take_terminal_deadlock().unwrap();
         assert_eq!(
             report,
@@ -38331,7 +38709,11 @@ mod test {
             } else {
                 reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
             }
-            assert!(sched.terminal_is_refusal, "transferred: {transferred}");
+            assert_eq!(
+                sched.terminal_kind,
+                TerminalKind::Refusal,
+                "transferred: {transferred}"
+            );
             let report = sched.take_terminal_deadlock().unwrap();
             assert!(
                 report.starts_with(
@@ -38347,7 +38729,7 @@ mod test {
         let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
         reconnect_nonleader_exec(&mut sched, leader, leader, detpid, pre_exec_mm);
         assert!(sched.take_terminal_deadlock().is_none());
-        assert!(!sched.terminal_is_refusal);
+        assert_ne!(sched.terminal_kind, TerminalKind::Refusal);
     }
 
     /// Once the exec reconnect has recorded the identity refusal, the next
@@ -38371,7 +38753,7 @@ mod test {
         let other_response = sched.next_turns[&other].resp.clone();
 
         reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
-        assert!(sched.terminal_deadlock.is_some() && sched.terminal_is_refusal);
+        assert!(sched.terminal_deadlock.is_some() && sched.terminal_kind == TerminalKind::Refusal);
         sched.next_turns[&leader]
             .req
             .put(Ok(Resources::new(leader)));

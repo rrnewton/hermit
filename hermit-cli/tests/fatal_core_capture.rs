@@ -337,11 +337,15 @@ fn a_multithreaded_crash_keeps_the_faulting_threads_registers() {
 
 /// A thread's fault ends the whole process even while its main thread waits on
 /// a condition variable nothing signals, whose futex wait no thread's exit
-/// wakes. The run ends as the native run does, by SIGSEGV; before, Hermit saw
-/// the leader still waiting after the other threads were reaped and refused
-/// the run as a deadlock (exit 125).
+/// wakes. The run ends as the native run does, by SIGSEGV (shell status 139);
+/// before, Hermit saw the leader still waiting after the other threads were
+/// reaped and refused the run as a deadlock (exit 125). With a deadlock under
+/// Hermit's model reported as its own outcome, that same race would read as
+/// exit 121 and `HERMIT_MODEL_DEADLOCK`, so neither may appear.
 #[test]
 fn a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable() {
+    use std::os::unix::process::ExitStatusExt as _;
+
     let (guest, _root) = guest("leader-waits");
     let mut native = Command::new("timeout");
     native
@@ -349,10 +353,22 @@ fn a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable() {
         .arg(&guest)
         .arg("leader-waits");
     let native = native.output().expect("failed to run the guest natively");
+    assert_eq!(
+        native.status.signal(),
+        Some(libc::SIGSEGV),
+        "the native run must end by SIGSEGV: {:?}",
+        native.status
+    );
     let output = hermit(&[], &guest, &["leader-waits"]);
     assert!(
         !stderr(&output).contains("Deadlock detected"),
         "hermit refused the run as a deadlock:\n{}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains(detcore_model::HERMIT_MODEL_DEADLOCK_LINE)
+            && output.status.code() != Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        "a signal death read as a deadlock under Hermit's model:\n{}",
         stderr(&output)
     );
     assert_eq!(

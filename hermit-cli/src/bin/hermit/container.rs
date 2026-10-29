@@ -5324,6 +5324,37 @@ impl std::fmt::Display for LogCapExceeded {
 
 impl std::error::Error for LogCapExceeded {}
 
+/// The container child exited [`detcore_model::HERMIT_GUEST_DEADLOCK_EXIT`]:
+/// Detcore's scheduler found every remaining guest thread blocked with no
+/// wake it models, printed its "Deadlock detected" report, and ended the run.
+///
+/// ⚠️ A DEADLOCK UNDER HERMIT'S MODEL, NOT A GUEST RESULT, and not a
+/// [`ContainerChildExit`] either. That type means "the child died with a status
+/// it did not pick"; this status was picked. It says no wake Hermit models can
+/// reach a remaining thread, which is a native hang only when the model is
+/// complete for the program; past modeling gaps produced exactly this report
+/// (see [`detcore_model::HERMIT_GUEST_DEADLOCK_EXIT`]).
+///
+/// A unit struct for the reason [`PolicyRefusal`] is one: the status is
+/// `HERMIT_GUEST_DEADLOCK_EXIT` by construction, and the report itself is
+/// already on stderr, written by the child before it exited.
+#[derive(Debug)]
+pub struct GuestDeadlock;
+
+impl std::fmt::Display for GuestDeadlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Deadlock under Hermit's model: no remaining thread can be woken by anything \
+             Hermit models; the deadlock report is above. This is not a guest result. It is \
+             a native hang only if Hermit models every wake the program relies on: if the \
+             program does not hang natively, report it as a hermit bug."
+        )
+    }
+}
+
+impl std::error::Error for GuestDeadlock {}
+
 /// Carries the signal, unlike [`PolicyRefusal`], because there is more than one
 /// and the number is the whole content of the report.
 #[derive(Debug)]
@@ -5412,6 +5443,10 @@ pub fn classify_container_result<T>(
                 // operator sees the bound; only the machine-readable class is
                 // reconstructed here.
                 FailureKind::RunTimeout => error.context(RunTimeoutMarker),
+                // The same deadlock under Hermit's model as the
+                // `HERMIT_GUEST_DEADLOCK_EXIT` status arm below, reported once the child had unwound the
+                // guest and finished the run; the report is above either way.
+                FailureKind::GuestDeadlock => Error::new(GuestDeadlock),
                 // The marker goes UNDER the child's message, as it was in the
                 // child: the first `Error:` line keeps naming the failure.
                 FailureKind::BackendRunFailure => {
@@ -5448,6 +5483,14 @@ pub fn classify_container_result<T>(
         Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_LOG_CAP_EXIT) => {
             super::tracing::bound_log_cap_exit();
             Err(Error::new(LogCapExceeded))
+        }
+        // A deadlock under Hermit's model, reported before exiting. Without
+        // this arm it falls through to `ContainerChildExit` and reads as an
+        // unchosen child exit instead of the scheduler's named verdict.
+        Err(RunError::ExitStatus(status))
+            if status.code() == Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT) =>
+        {
+            Err(Error::new(GuestDeadlock))
         }
         // A signal death, before the catch-all for the same reason the refusal arm
         // is: falling through would report a signal-terminated run as an
@@ -6315,6 +6358,33 @@ mod tests {
                 .expect_err("an unaccounted exit is not a success");
         assert!(unchosen.downcast_ref::<ContainerChildExit>().is_some());
         assert!(unchosen.downcast_ref::<SignalDeath>().is_none());
+    }
+
+    /// The scheduler's deadlock status is its own outcome at the container
+    /// boundary, and the status of its other terminal verdicts (a
+    /// Hermit stall exits 1) is still an unchosen child exit. Delete the
+    /// guest-deadlock arm in `classify_container_result` and the first half
+    /// fails; widen it to the stall's status and the second does.
+    #[test]
+    fn a_container_child_exiting_guest_deadlock_is_a_guest_outcome() {
+        use reverie::process::ExitStatus;
+
+        let deadlock = classify_container_result::<()>(Err(RunError::ExitStatus(
+            ExitStatus::Exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        )))
+        .expect_err("a deadlocked guest is not a success");
+        assert!(deadlock.downcast_ref::<GuestDeadlock>().is_some());
+        assert!(
+            deadlock.downcast_ref::<ContainerChildExit>().is_none(),
+            "a guest deadlock must not also read as an unaccounted container exit"
+        );
+        assert!(deadlock.downcast_ref::<PolicyRefusal>().is_none());
+
+        let stall =
+            classify_container_result::<()>(Err(RunError::ExitStatus(ExitStatus::Exited(1))))
+                .expect_err("a Hermit stall is not a success");
+        assert!(stall.downcast_ref::<ContainerChildExit>().is_some());
+        assert!(stall.downcast_ref::<GuestDeadlock>().is_none());
     }
 
     #[test]

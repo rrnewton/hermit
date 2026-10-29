@@ -690,6 +690,32 @@ fn paired_verify_runs_keep_logs_and_need_no_run_two_after_a_rejected_run_one() {
     assert_eq!(retained(&logs), ["run1"]);
 }
 
+/// A deadlock under Hermit's model is not a guest result, so `log-diff
+/// --verify-json` refuses a deadlocked run 1 under the default
+/// `--verify-allow=success`, as `run --verify` does: the same `no_result`
+/// report (`first_run_rejected`, `verified: false`), exit code and stdout
+/// (ptrace, `--strict`). Before, the comparison skipped the `--verify-allow`
+/// check for a deadlocked run 1 and compared the two runs, reporting
+/// `matched` and `verified: true` where `run --verify` reports `no_result`.
+#[test]
+fn paired_verify_runs_refuse_a_deadlocked_run_one_like_run_verify() {
+    let _guard = hermit_run_guard();
+    let guest = super::condvar_join_deadlock_guest().to_str().unwrap();
+    let rejected = assert_paired_matches_run_verify(
+        "deadlock",
+        &[],
+        &["--strict", "--base-env=minimal", "--verify-strict"],
+        "success",
+        &[guest],
+    );
+    assert_eq!(rejected["verdict"], "no_result", "{rejected}");
+    assert_eq!(rejected["verified"], false, "{rejected}");
+    assert_eq!(
+        rejected["no_result_reason"]["kind"], "first_run_rejected",
+        "{rejected}"
+    );
+}
+
 /// `hermit record start --verify-run`, then the same with
 /// `--verify-replay-of` the first, then `log-diff --verify-json`, against
 /// `record start --verify --verify-json`: the same report, exit code and

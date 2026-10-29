@@ -260,6 +260,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/condvar_join_deadlock.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/condvar_join_deadlock.c is owned by hermit-cli/tests/cli.rs: main prints a marker and joins a thread waiting on a condition variable nobody signals (with a count argument, the first of that many waiters), so the run must end with the deadlock-under-Hermit's-model outcome (exit 121 and HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model after Detcore's deadlock report) with the marker kept, never as an internal failure, and with four waiters must still verify at bitwise parity. It remains a fixture because the integration test checks the exit code, the class line's place after the report, and stdout, which a generic manifest cell cannot express."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/copied_priority_query.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/copied_priority_query.c is owned by hermit-cli/tests/cli.rs: dbt_refuses_a_vfork_childs_priority_query_by_name checks the shared priority model and exact named strict copied-child refusal, including guest status and stderr."

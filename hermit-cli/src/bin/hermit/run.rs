@@ -71,6 +71,7 @@ use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
+use super::container::GuestDeadlock;
 use super::container::HostLayout;
 use super::container::IdentityGuard;
 use super::container::LogCapExceeded;
@@ -948,6 +949,12 @@ pub(super) struct VerificationRunOutput {
     pub(super) output: Output,
     pub(super) skid_overshoots: u64,
     pub(super) latches: RunLatches,
+    /// The run ended in a deadlock under Hermit's model (not a guest result,
+    /// and a native hang only if Hermit models every wake the program relies
+    /// on) and the backend unwound it: `output` is what the guest wrote before
+    /// the deadlock, and its status is `HERMIT_GUEST_DEADLOCK_EXIT`, not one the
+    /// guest exited with.
+    pub(super) guest_deadlock: bool,
     #[cfg(feature = "dbt")]
     pub(super) dbt: Option<super::backends::DbtRunCompletion>,
 }
@@ -9473,7 +9480,7 @@ impl RunOpts {
         } else if let Some(directory) = &self.verify_run {
             self.verify_run(directory, global)
         } else {
-            let (status, _) = self.run(global, false)?;
+            let (status, _, _) = self.run(global, false)?;
             self.write_backend_engagement_after_run()?;
             drop(private_engagement_summary);
             Ok(status)
@@ -11118,11 +11125,15 @@ impl RunOpts {
         }
     }
 
+    /// Run the guest once. With `capture_output` the guest's output is
+    /// returned, and the flag says whether the run ended on a deadlock under
+    /// Hermit's model, whose status `HERMIT_GUEST_DEADLOCK_EXIT` is then not
+    /// the guest's own; without it a deadlock is returned as its error.
     pub fn run(
         &self,
         global: &GlobalOpts,
         capture_output: bool,
-    ) -> Result<(ExitStatus, Option<Output>), Error> {
+    ) -> Result<(ExitStatus, Option<Output>, bool), Error> {
         self.refuse_unready_exec_stop()?;
         let mut options = self.clone();
         options.det_opts.det_config.annotated_priority_replay =
@@ -11530,16 +11541,17 @@ impl RunOpts {
                 mut output,
                 skid_overshoots,
                 latches,
+                guest_deadlock,
                 #[cfg(feature = "dbt")]
                     dbt: _,
             } = completed;
             latches.refuse_comparison("run")?;
             let forwarded_syscalls =
                 self.take_forwarded_detlogs(&log_path, &mut output.stderr, socket)?;
-            Ok((output, skid_overshoots, forwarded_syscalls))
+            Ok((output, skid_overshoots, forwarded_syscalls, guest_deadlock))
         });
         let (outcome, result) = match completed {
-            Ok((output, skid_overshoots, forwarded_syscalls)) => {
+            Ok((output, skid_overshoots, forwarded_syscalls, guest_deadlock)) => {
                 writer.write(verify_run::STDOUT, &output.stdout)?;
                 writer.write(verify_run::STDERR, &output.stderr)?;
                 (
@@ -11547,8 +11559,13 @@ impl RunOpts {
                         status: verify_run::recorded_status(output.status),
                         skid_overshoots,
                         forwarded_syscalls: forwarded_syscalls.map(|count| count as u64),
+                        guest_deadlock,
                     },
-                    Ok(output.status),
+                    if guest_deadlock {
+                        Err(Error::new(GuestDeadlock))
+                    } else {
+                        Ok(output.status)
+                    },
                 )
             }
             Err(error) => (verify_run_outcome_of(&error), Err(error)),
@@ -11785,6 +11802,7 @@ impl RunOpts {
             output: out1,
             skid_overshoots: skid_overshoots_run1,
             latches: latches1,
+            guest_deadlock: guest_deadlock1,
             #[cfg(feature = "dbt")]
                 dbt: dbt1,
         } = match run_verification_execution(
@@ -11877,6 +11895,8 @@ impl RunOpts {
             echo_first_run_log(&log1_path)?;
         }
 
+        // A deadlock under Hermit's model passes `--verify-allow` like any
+        // other non-success status (`rejected_first_run`).
         if let Some(error) = reject_first_run(
             self.verify_json.as_deref(),
             self.verify_allow,
@@ -11887,6 +11907,7 @@ impl RunOpts {
                 .and_then(read_verify_summary)
                 .as_ref(),
         ) {
+            let error = rejected_first_run(error, guest_deadlock1);
             // Queued here; `main` writes it after everything else.
             drop(signal_reports);
             if self.keep_logs {
@@ -11973,6 +11994,7 @@ impl RunOpts {
             output: out2,
             skid_overshoots: skid_overshoots_run2,
             latches: latches2,
+            guest_deadlock: guest_deadlock2,
             #[cfg(feature = "dbt")]
                 dbt: dbt2,
         } = match run_verification_execution(
@@ -12163,6 +12185,13 @@ impl RunOpts {
             eprintln!(":: Backend: {backend_banner}");
         }
         emit_compared_guest_output(true, &out1, &out2)?;
+        // Both runs deadlocked at the same point under Hermit's model, which
+        // `main` reports by its class line and status. Only an explicit
+        // `--verify-allow` of failure or both reaches here with a deadlock, and
+        // then `verified` says the deadlock repeats, not that it is native.
+        if guest_deadlock1 && guest_deadlock2 {
+            return Err(Error::new(GuestDeadlock));
+        }
         Ok(status)
     }
 
@@ -12609,10 +12638,11 @@ impl RunOpts {
             )
         })
         .map(
-            |((output, skid_overshoots, latches), _guards)| VerificationRunOutput {
+            |((output, skid_overshoots, latches, guest_deadlock), _guards)| VerificationRunOutput {
                 output,
                 skid_overshoots,
                 latches,
+                guest_deadlock,
                 #[cfg(feature = "dbt")]
                 dbt: None,
             },
@@ -13694,7 +13724,7 @@ impl RunOpts {
         capture_output: bool,
         identity_sources: Option<&IdentityGuard>,
         image: &super::mapped_first_admission::RetainedImage,
-    ) -> Result<(ExitStatus, Option<Output>), Error> {
+    ) -> Result<(ExitStatus, Option<Output>, bool), Error> {
         anyhow::ensure!(
             !capture_output,
             "exec-stop direct-run path requires external bounded stdout capture"
@@ -13751,7 +13781,7 @@ impl RunOpts {
             detcore::detlog::determinism_loss().is_none(),
             "actual mapped DETLOG reports determinism loss"
         );
-        Ok((status, None))
+        Ok((status, None, false))
     }
 
     fn run_in_container(
@@ -13759,7 +13789,7 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
         identity_sources: Option<&IdentityGuard>,
-    ) -> Result<(ExitStatus, Option<Output>), Error> {
+    ) -> Result<(ExitStatus, Option<Output>, bool), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
         hermit::proc_mount::warn_if_readonly_proc();
 
@@ -13775,29 +13805,34 @@ impl RunOpts {
 
         let timeout = self.run_timeout();
         let summary_json = self.summary_json.clone();
+        // A guest deadlock the backend unwound is a finished run that returns
+        // `hermit::GuestDeadlocked`. A plain run reports it by its class line;
+        // a caller that captures the output (analyze) keeps the output, whose
+        // status is `HERMIT_GUEST_DEADLOCK_EXIT`, with the flag that says the
+        // guest did not exit with it.
         let result = if capture_output {
-            let out = hermit::run_with_output_backend_timeout(
+            hermit::GuestDeadlocked::output_of(hermit::run_with_output_backend_timeout(
                 command,
                 config,
                 self.summary,
                 &summary_json,
                 backend,
                 timeout,
-            )?;
-            (out.status, Some(out))
+            ))
+            .map(|(out, deadlocked)| (out.status, Some(out), deadlocked))
         } else {
-            let status = hermit::run_with_backend_timeout(
+            hermit::run_with_backend_timeout(
                 command,
                 config,
                 self.summary,
                 &summary_json,
                 backend,
                 timeout,
-            )?;
-            (status, None)
+            )
+            .map(|status| (status, None, false))
         };
         self.relabel_e9patch_dispatch_stats(&summary_json)?;
-        Ok(result)
+        result
     }
 
     /// The e9patch spelling runs on the ptrace runtime, which records its
@@ -13832,7 +13867,7 @@ impl RunOpts {
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped: Option<
             &MappedVerificationRun,
         >,
-    ) -> Result<(Output, u64, RunLatches), Error> {
+    ) -> Result<(Output, u64, RunLatches, bool), Error> {
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
         if let Some(mapped) = mapped {
             anyhow::ensure!(
@@ -13854,7 +13889,9 @@ impl RunOpts {
                     forwarded: forwarded_detlogs,
                 },
             );
-            return finish_mapped_verification_log(result, log);
+            return finish_mapped_verification_log(result, log).map(
+                |(output, skid_overshoots, latches)| (output, skid_overshoots, latches, false),
+            );
         }
         let mut forwarded_detlogs = forwarded_detlogs.open_in_container()?;
         hermit::proc_mount::warn_if_readonly_proc();
@@ -13902,7 +13939,7 @@ impl RunOpts {
                 determinism_loss: detcore::detlog::determinism_loss(),
                 log_sink_failure: log.failure(),
             };
-            return Ok((output, 0, latches));
+            return Ok((output, 0, latches, false));
         }
         #[cfg(not(feature = "native-exec"))]
         let _ = native;
@@ -13922,7 +13959,13 @@ impl RunOpts {
             // Records sent after the guest's last request, then close the socket.
             detcore::detlog::clear_forwarded_source();
         }
-        let (output, skid_overshoots) = result?;
+        // A deadlocked run carries its output in `hermit::GuestDeadlocked`;
+        // one that also overshot its skid stays that refusal.
+        let (output, skid_overshoots, guest_deadlock) =
+            match hermit::GuestDeadlocked::split(result)? {
+                Ok((output, skid_overshoots)) => (output, skid_overshoots, false),
+                Err(deadlock) => (deadlock.into_output()?, 0, true),
+            };
         self.relabel_e9patch_dispatch_stats(&self.summary_json)?;
         // A flush error counts too.
         let _ = log.clone().flush();
@@ -13930,7 +13973,7 @@ impl RunOpts {
             determinism_loss: detcore::detlog::determinism_loss(),
             log_sink_failure: log.failure(),
         };
-        Ok((output, skid_overshoots, latches))
+        Ok((output, skid_overshoots, latches, guest_deadlock))
     }
 }
 
@@ -13983,6 +14026,20 @@ fn finish_mapped_verification_log(
 /// disposition, so it is not mistaken for a run that never started. Shared by
 /// `run --verify`, which then does not start a second run, and `hermit
 /// log-diff --verify-json`, which then does not compare.
+/// The error `run --verify` and `log-diff` end with when [`reject_first_run`]
+/// refused run 1. A deadlock under Hermit's model is not a guest result, so it
+/// gets no exemption from `--verify-allow`: the default `success` refuses it
+/// as it refuses a guest that failed, and the report is not `verified`. It
+/// still ends with its own class line and status rather than a CLI error. A
+/// skid overshoot keeps its refusal.
+pub(super) fn rejected_first_run(error: Error, guest_deadlock: bool) -> Error {
+    if guest_deadlock && error.downcast_ref::<SkidOvershootError>().is_none() {
+        error.context(GuestDeadlock)
+    } else {
+        error
+    }
+}
+
 pub(super) fn reject_first_run(
     verify_json: Option<&Path>,
     verify_allow: VerifyAllow,
