@@ -104,6 +104,8 @@ mod tests {
         // Adds `GlobalResponse::WithLoneGrant`
         // (https://github.com/rrnewton/hermit/pull/4662).
         (9, "ebfd2b59a97e1d7a", "dafaa96d8b8cb3ad"),
+        // Adds `GlobalRequest::SigkillDyingThreads`, `GlobalRequest::RecordSigkillRobustLists`, `GlobalRequest::TakeSigkillRobustList`, `GlobalResponse::SigkillDyingThreads`, `GlobalResponse::RecordSigkillRobustLists` and `GlobalResponse::TakeSigkillRobustList` (#4760).
+        (10, "2fe20c85f7d8b272", "dafaa96d8b8cb3ad"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
