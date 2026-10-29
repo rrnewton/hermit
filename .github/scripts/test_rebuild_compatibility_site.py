@@ -562,6 +562,21 @@ class HostedAdapterTests(unittest.TestCase):
         with patch.dict(os.environ, env):
             self.assertEqual(ADAPTER.fetch_ledger(ledger, squashed), 51)
 
+        # A snapshot carrying the ledger's trailer folds the old tip in: a
+        # summary written before the squash names a commit folded into the
+        # snapshot, which the fetch treats as reachable. Without the trailer
+        # (above) it does not, and an unrelated commit never does.
+        folded = sh(origin, "commit-tree", newest + "^{tree}", "-m",
+                    "ledger snapshot\n\nLedger-Snapshot-Of: " + newest)
+        sh(origin, "checkout", "-q", "--detach", folded)
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": summarized}}))
+        sh(origin, "commit", "-q", "-am", "scorecard after the folded squash")
+        folded_head = sh(origin, "rev-parse", "HEAD")
+        self.assertFalse(ADAPTER._is_ancestor(origin, summarized, folded_head))
+        self.assertTrue(ADAPTER._is_ancestor_or_folded(origin, summarized, folded_head))
+        self.assertFalse(ADAPTER._is_ancestor_or_folded(origin, folded_head, summarized))
+
     def test_ledger_capture_is_exact_and_invocation_failures_refuse(self):
         captured = "a" * 40
         with patch.object(
