@@ -9246,6 +9246,16 @@ mod tests {
             // trampolines keep the original syscall instruction), whose
             // rt_sigreturns reach the seccomp stop that reports them.
             "reports_sigreturns": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // ptrace (and so e9patch) sets DR0-DR3 on x86-64; every other
+            // backend sets no hardware watchpoints.
+            "hardware_watchpoints": if cfg!(target_arch = "x86_64") {
+                match backend {
+                    Backend::Ptrace | Backend::E9patch => 4,
+                    _ => 0,
+                }
+            } else {
+                0
+            },
         })
     }
 
@@ -9390,6 +9400,9 @@ mod tests {
             config.backend.supports_blocked_wait_signal_interruption = false;
             config.backend.delivers_preemption_timer_events = false;
             config.backend.runs_guest_code_between_injections = false;
+            // The legacy form carries no width for `hardware_watchpoints`;
+            // it reads back as 0.
+            config.backend.hardware_watchpoints = 0;
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
                 before,
