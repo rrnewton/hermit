@@ -3157,7 +3157,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And preemptions::tests::poll_skips_are_recorded_after_their_events_and_version_the_record
     // and replayer::tests::a_recorded_poll_skip_is_the_next_decision_after_the_events_it_follows: 3244.
     // And replayer::tests::a_failed_attempt_hands_over_after_the_thread_blocks: 3245.
-    ("test.detcore_unit", 3245),
+    // And a_schedule_prefix_keeps_the_poll_skips_only_for_the_whole_schedule,
+    // for main's prefix records: 3246.
+    ("test.detcore_unit", 3246),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5579,7 +5581,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // on main. 3037 -> 3242 to match that measured recount.
     // And the same two poll-skip units: 3244.
     // And replayer::tests::a_failed_attempt_hands_over_after_the_thread_blocks: 3245.
-    ("test.detcore_unit_on_host", 3245),
+    // And the same prefix-record unit: 3246.
+    ("test.detcore_unit_on_host", 3246),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

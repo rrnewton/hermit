@@ -383,6 +383,7 @@ impl PreemptionRecord {
             replay_departed_at,
             format_version,
             time_skips,
+            poll_skips,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -453,6 +454,16 @@ impl PreemptionRecord {
                         .collect::<Vec<_>>()
                 })
                 .filter(|skips| !skips.is_empty()),
+            // The poll skips name points of the recorded run, as the
+            // checkpoints do. A prefix of the whole schedule keeps them; a
+            // shorter one drops them, as an edit of the schedule does
+            // (`drop_poll_skips`), so its replay takes no skip it cannot
+            // place. The format, a rule of the recorded run, is copied above.
+            poll_skips: if followed {
+                Vec::new()
+            } else {
+                poll_skips.clone()
+            },
         }
     }
 
@@ -2220,6 +2231,43 @@ mod tests {
             assert_eq!(
                 record.schedule_prefix(len).chaos_timeslice,
                 Some(4321),
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// The poll skips name points of the recorded run, as the callback
+    /// checkpoints do: a prefix of the whole schedule keeps them, and a
+    /// shorter one drops them, as an edit of the schedule does. Every prefix
+    /// keeps the record's format.
+    #[test]
+    fn a_schedule_prefix_keeps_the_poll_skips_only_for_the_whole_schedule() {
+        let tid = DetTid::from_raw(3);
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ]);
+        record.poll_skips.push(PollSkip {
+            after: 1,
+            thread: DetTid::from_raw(5),
+        });
+        record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        for len in [2, 9] {
+            let prefix = record.schedule_prefix(len);
+            assert_eq!(
+                prefix.poll_skips(),
+                record.poll_skips(),
+                "prefix of {len} events"
+            );
+            assert_eq!(prefix.format_version, Some(PREEMPTION_RECORD_FORMAT));
+            prefix.validate().unwrap();
+        }
+        for len in [0, 1] {
+            let prefix = record.schedule_prefix(len);
+            assert!(prefix.poll_skips().is_empty(), "prefix of {len} events");
+            assert_eq!(
+                prefix.format_version,
+                Some(PREEMPTION_RECORD_FORMAT),
                 "prefix of {len} events"
             );
         }
