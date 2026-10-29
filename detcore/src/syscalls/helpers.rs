@@ -3092,6 +3092,17 @@ where
             )
             .await;
         }
+        // A send reads its `SCM_RIGHTS` descriptors again right before each
+        // attempt too: a sibling may have rewritten its messages to pass a
+        // descriptor out of the guest since the handler read them, or while
+        // an earlier attempt waited. A pass-out this thread has not reported
+        // is reported in a request of its own before the attempt runs, so the
+        // scheduler stops trusting every guest-held mark first
+        // (`Detcore::passes_descriptors_out_now`).
+        if Detcore::<T>::passes_descriptors_out_now(guest, call.into()) {
+            let dettid = guest.thread_state().dettid;
+            let _ = resource_request(guest, Resources::new(dettid)).await;
+        }
         // Read actual metadata after reinstatement and all earlier awaits.
         // Observation adds no reads or allocation when buffer logging is off.
         let attempt_observation =

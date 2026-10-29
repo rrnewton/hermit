@@ -9383,8 +9383,10 @@ where
     // A descriptor this thread may have passed out of the guest reaches the
     // scheduler with its next request, before it makes another decision
     // (`Resources::passes_descriptors_out`).
-    r.passes_descriptors_out |=
-        std::mem::take(&mut guest.thread_state_mut().passed_descriptors_out_unreported);
+    if std::mem::take(&mut guest.thread_state_mut().passed_descriptors_out_unreported) {
+        r.passes_descriptors_out = true;
+        guest.thread_state_mut().passed_descriptors_out_reported = true;
+    }
     // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;

@@ -1314,6 +1314,12 @@ mod event_tests {
         hb_requests: Mutex<Vec<ResourceID>>,
         /// Report the fixture's memory regions without the user-copy audit.
         report_memory_regions: bool,
+        /// The `sendmsg` and `sendmmsg` attempts injected: the first would
+        /// block, the second sends.
+        send_attempts: usize,
+        /// `Resources::passes_descriptors_out` of each resource request, in
+        /// the order the requests arrive, the empty ones included.
+        passes_out: Mutex<Vec<bool>>,
     }
 
     impl EventGuest {
@@ -1382,7 +1388,20 @@ mod event_tests {
                         .extend(request.resources.keys().cloned());
                     GlobalResponse::RequestResources(ResumeStatus::Normal)
                 }
+                GlobalRequest::RequestResources(request, _) if request.resources.is_empty() => {
+                    // A send's report of a pass-out before an attempt
+                    // (`Detcore::passes_descriptors_out_now`).
+                    self.passes_out
+                        .lock()
+                        .unwrap()
+                        .push(request.passes_descriptors_out);
+                    GlobalResponse::RequestResources(ResumeStatus::Normal)
+                }
                 GlobalRequest::RequestResources(request, _) => {
+                    self.passes_out
+                        .lock()
+                        .unwrap()
+                        .push(request.passes_descriptors_out);
                     assert_eq!(request.resources.len(), 1);
                     assert_eq!(
                         request.resources.get(&ResourceID::InternalIOPolling),
@@ -1396,7 +1415,9 @@ mod event_tests {
                     match request.poll_attempt {
                         0 => {}
                         1 => {
-                            assert_eq!(self.injected_iovecs, [(FIRST_DEST, 8)]);
+                            if self.send_attempts == 0 {
+                                assert_eq!(self.injected_iovecs, [(FIRST_DEST, 8)]);
+                            }
                             let (parked, resume) = self.retry_gate.lock().unwrap().take().unwrap();
                             parked.send(()).unwrap();
                             resume.await.unwrap();
@@ -1509,6 +1530,17 @@ mod event_tests {
                 // No host syscall: this fake backend records the invocation
                 // boundary even when the reported errno remains unchanged.
                 return Err(Errno::ENOSYS);
+            }
+            if matches!(
+                Syscall::from_raw(number, args),
+                Syscall::Sendmsg(_) | Syscall::Sendmmsg(_)
+            ) {
+                self.send_attempts += 1;
+                return match self.send_attempts {
+                    1 => Err(Errno::EAGAIN),
+                    2 => Ok(1),
+                    attempt => panic!("unexpected extra send attempt {attempt}"),
+                };
             }
             if let Syscall::Read(call) = Syscall::from_raw(number, args) {
                 assert_eq!(call.len(), 0);
@@ -1643,6 +1675,8 @@ mod event_tests {
             user_address_limit_queries: Mutex::new(0),
             hb_requests: Mutex::new(Vec::new()),
             report_memory_regions: false,
+            send_attempts: 0,
+            passes_out: Mutex::new(Vec::new()),
         };
         (tool, guest)
     }
@@ -1779,6 +1813,151 @@ mod event_tests {
         fn exit(&self, span: &Id) {
             self.messages.exit(span);
         }
+    }
+
+    /// Where a send's message header (an `mmsghdr` for `sendmmsg`) and its
+    /// control data sit in the fixture's memory.
+    const MESSAGE: usize = 0x1800;
+    const CONTROL: usize = 0x1900;
+    /// A guest-held pipe end the rewritten message passes.
+    const MARKED: i32 = 9;
+
+    /// Writes a message header at `MESSAGE` with one iovec at `IOV` and, when
+    /// `control` holds bytes, that control data at `CONTROL`.
+    fn put_message(memory: &EventMemory, control: &[u8]) {
+        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+        header.msg_iov = IOV as *mut libc::iovec;
+        header.msg_iovlen = 1;
+        if !control.is_empty() {
+            header.msg_control = CONTROL as *mut libc::c_void;
+            header.msg_controllen = control.len();
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&header as *const libc::msghdr).cast::<u8>(),
+                std::mem::size_of::<libc::msghdr>(),
+            )
+        };
+        let mut arena = memory.0.lock().unwrap();
+        arena[MESSAGE..MESSAGE + bytes.len()].copy_from_slice(bytes);
+        arena[CONTROL..CONTROL + control.len()].copy_from_slice(control);
+    }
+
+    /// `SCM_RIGHTS` control data that passes descriptor `fd`.
+    fn rights_passing(fd: i32) -> Vec<u8> {
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+        let mut control = vec![0u8; space];
+        let header = libc::cmsghdr {
+            cmsg_len: unsafe { libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) } as usize,
+            cmsg_level: libc::SOL_SOCKET,
+            cmsg_type: libc::SCM_RIGHTS,
+        };
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&header as *const libc::cmsghdr).cast::<u8>(),
+                std::mem::size_of::<libc::cmsghdr>(),
+            )
+        };
+        control[..header_bytes.len()].copy_from_slice(header_bytes);
+        control[header_bytes.len()..header_bytes.len() + 4].copy_from_slice(&fd.to_ne_bytes());
+        control
+    }
+
+    /// Runs one `sendmsg` (or, `batched`, one `sendmmsg` of one message)
+    /// through the real retry loop, on a datagram socketpair end that is not
+    /// guest-held. The message carries no descriptor; with `rewrite`, a
+    /// sibling rewrites it to pass a guest-held pipe end while the send waits
+    /// between its two attempts. Returns each request's
+    /// `Resources::passes_descriptors_out`.
+    async fn send_rewritten_while_it_waits(batched: bool, rewrite: bool) -> Vec<bool> {
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (tool, mut guest) = event_guest(FdType::Socket, Some((parked_tx, resume_rx)));
+        guest
+            .thread
+            .with_detfd(FD, |detfd| {
+                detfd.set_socketpair_endpoint();
+                detfd.set_physically_nonblocking();
+            })
+            .unwrap();
+        let pid = DetPid::from_raw(1);
+        let marked = DetFd::new(
+            MARKED,
+            OFlag::O_RDONLY,
+            FdType::Pipe,
+            OpenFileId::new(pid, 98),
+        );
+        marked.set_guest_held();
+        guest
+            .thread
+            .file_metadata
+            .lock()
+            .unwrap()
+            .file_handles
+            .insert(MARKED, marked);
+        guest.memory.put_iovec(0, FIRST_DEST, 8);
+        put_message(&guest.memory, &[]);
+        let memory = guest.memory.clone();
+        let call: Syscall = if batched {
+            reverie::syscalls::Sendmmsg::new()
+                .with_sockfd(FD)
+                .with_msgvec(Addr::from_raw(MESSAGE))
+                .with_vlen(1)
+                .into()
+        } else {
+            reverie::syscalls::Sendmsg::new()
+                .with_fd(FD)
+                .with_msg(Addr::from_raw(MESSAGE))
+                .into()
+        };
+        let event = tool.handle_syscall_event(&mut guest, call);
+        let sibling = async {
+            parked_rx.await.unwrap();
+            if rewrite {
+                put_message(&memory, &rights_passing(MARKED));
+            }
+            resume_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(event, sibling)
+        })
+        .await
+        .expect("the send did not cross its retry resource wait");
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(guest.send_attempts, 2);
+        guest.passes_out.lock().unwrap().clone()
+    }
+
+    /// A `sendmsg` polled in the caller's turns reads its messages again
+    /// before every attempt (`Detcore::passes_descriptors_out_now`). Rewritten
+    /// by a sibling to pass a guest-held pipe end while it waits, it reports
+    /// the pass-out in a request of its own before the attempt that passes it,
+    /// so the scheduler revokes every guest-held mark first; left alone, it
+    /// files no extra request (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4862).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sendmsg_rewritten_to_pass_a_descriptor_while_it_waits_revokes_every_mark() {
+        assert_eq!(
+            send_rewritten_while_it_waits(false, true).await,
+            [false, false, true]
+        );
+        assert_eq!(
+            send_rewritten_while_it_waits(false, false).await,
+            [false, false]
+        );
+    }
+
+    /// The same for a `sendmmsg` of one message.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sendmmsg_rewritten_to_pass_a_descriptor_while_it_waits_revokes_every_mark() {
+        assert_eq!(
+            send_rewritten_while_it_waits(true, true).await,
+            [false, false, true]
+        );
+        assert_eq!(
+            send_rewritten_while_it_waits(true, false).await,
+            [false, false]
+        );
     }
 
     fn readv(count: usize) -> Syscall {

@@ -4179,7 +4179,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(refusal) => return refusal,
         };
         let in_turn = self.completes_in_turn(guest, call);
-        self.note_descriptors_passed_out(guest, call.fd(), &headers);
+        self.note_descriptors_passed_out(guest, call.fd(), &headers, outside_turn)
+            .await;
         self.note_sockets_passed_out(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
@@ -4269,11 +4270,21 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// for `mark_exported_listeners`, this runs before the send and whatever
     /// it returns, and a message whose control data Detcore cannot read counts
     /// as passing descriptors.
-    fn note_descriptors_passed_out<G: Guest<Self>>(
+    ///
+    /// This reads the messages once, before the call. A send polled in the
+    /// caller's turns reads them again before every attempt
+    /// (`passes_descriptors_out_now`). A send that may run outside the turn
+    /// (`outside_turn`, as `nonblockable_call_runs_outside_turn` decides) is
+    /// read by the kernel at a host-chosen moment, after a sibling may have
+    /// rewritten them, so it counts as passing descriptors whenever its
+    /// socket is, or may be, `AF_UNIX`, the one family whose sends carry
+    /// `SCM_RIGHTS` (Codex review of https://github.com/rrnewton/hermit/pull/4862).
+    async fn note_descriptors_passed_out<G: Guest<Self>>(
         &self,
         guest: &mut G,
         sockfd: RawFd,
         headers: &[usize],
+        outside_turn: bool,
     ) {
         let reaches_a_guest = guest
             .thread_state()
@@ -4285,7 +4296,68 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (sent, unread) = sent_descriptors(guest, headers);
         if !sent.is_empty() || unread {
             guest.thread_state_mut().passed_descriptors_out_unreported = true;
+            return;
         }
+        // Only plain sequentialized runs read the marks
+        // (`classify_guest_held_peer`).
+        if outside_turn && self.cfg.sequentialize_threads && !self.cfg.recordreplay_modes {
+            let domain = socket_option::<libc::c_int, _, _>(guest, sockfd, libc::SO_DOMAIN).await;
+            if domain.is_none_or(|domain| domain == libc::AF_UNIX) {
+                guest.thread_state_mut().passed_descriptors_out_unreported = true;
+            }
+        }
+    }
+
+    /// Whether `call`, a `sendmsg` or `sendmmsg` about to make an attempt in
+    /// the caller's turn, would pass descriptors out of the guest that this
+    /// thread has not reported yet (`note_descriptors_passed_out`), read from
+    /// its messages as they are now: a sibling may have rewritten them since
+    /// the handler read them, or while an earlier attempt waited. If so, the
+    /// pass-out is noted (`ThreadState::passed_descriptors_out_unreported`),
+    /// and the caller reports it in a request of its own before the attempt
+    /// runs. Only plain sequentialized runs read the marks, so only they
+    /// check; once this thread has reported a pass-out the scheduler trusts no
+    /// mark again, so it checks no more (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4862).
+    pub(crate) fn passes_descriptors_out_now<G: Guest<Self>>(guest: &mut G, call: Syscall) -> bool {
+        let config = guest.config();
+        if !config.sequentialize_threads || config.recordreplay_modes {
+            return false;
+        }
+        if guest.thread_state().passed_descriptors_out_reported {
+            return false;
+        }
+        let (sockfd, headers): (RawFd, Vec<usize>) = match call {
+            Syscall::Sendmsg(call) => (
+                call.fd(),
+                call.msg()
+                    .map(|header| header.as_raw())
+                    .into_iter()
+                    .collect(),
+            ),
+            Syscall::Sendmmsg(call) => (
+                call.sockfd(),
+                call.msgvec().map_or_else(Vec::new, |vector| {
+                    (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
+                        .map(|index| vector.as_raw() + index * std::mem::size_of::<Mmsghdr>())
+                        .collect()
+                }),
+            ),
+            _ => return false,
+        };
+        let reaches_a_guest = guest
+            .thread_state()
+            .with_detfd(sockfd, |detfd| detfd.is_guest_held())
+            .unwrap_or(false);
+        if reaches_a_guest {
+            return false;
+        }
+        let (sent, unread) = sent_descriptors(guest, &headers);
+        if sent.is_empty() && !unread {
+            return false;
+        }
+        guest.thread_state_mut().passed_descriptors_out_unreported = true;
+        true
     }
 
     /// Mark every accept-in-turn listener (`DetFd::is_accept_in_turn_eligible`)
@@ -4492,7 +4564,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(refusal) => return refusal,
         };
         let in_turn = self.completes_in_turn(guest, call);
-        self.note_descriptors_passed_out(guest, call.sockfd(), &headers);
+        self.note_descriptors_passed_out(guest, call.sockfd(), &headers, outside_turn)
+            .await;
         self.note_sockets_passed_out(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
