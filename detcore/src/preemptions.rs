@@ -367,6 +367,7 @@ impl PreemptionRecord {
             replay_departed_at,
             format_version,
             time_skips,
+            sched_seed,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -437,6 +438,7 @@ impl PreemptionRecord {
                         .collect::<Vec<_>>()
                 })
                 .filter(|skips| !skips.is_empty()),
+            sched_seed: *sched_seed,
         }
     }
 
@@ -2118,6 +2120,26 @@ mod tests {
             assert_eq!(
                 record.schedule_prefix(len).chaos_timeslice,
                 Some(4321),
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// The scheduler seed of the recorded run is a setting of the whole run,
+    /// as the guest random seed is: a prefix of the schedule keeps it,
+    /// whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_scheduler_seed() {
+        let tid = DetTid::from_raw(3);
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ]);
+        record.sched_seed = Some(7654321);
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).sched_seed,
+                Some(7654321),
                 "prefix of {len} events"
             );
         }

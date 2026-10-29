@@ -3162,7 +3162,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The inotify fault-boundary repair adds three detcore units: 3034 + 3 = 3037, by nextest list.
     // And scheduler::test::a_recorded_schedule_stores_the_scheduler_seed: 3243,
     // listed.
-    ("test.detcore_unit", 3243),
+    // And a_schedule_prefix_keeps_the_scheduler_seed, for main's prefix
+    // records: 3244.
+    ("test.detcore_unit", 3244),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5581,7 +5583,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // twin's pin stayed 3037, so the hosted/local count invariant failed
     // on main. 3037 -> 3242 to match that measured recount.
     // And the same recorded scheduler-seed unit: 3243, listed.
-    ("test.detcore_unit_on_host", 3243),
+    // And the same prefix scheduler-seed unit: 3244.
+    ("test.detcore_unit_on_host", 3244),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
