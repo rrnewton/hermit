@@ -28166,7 +28166,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1273",
+        "NEXTEST_EXPECTED_EXECUTED": "1275",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -35087,11 +35087,11 @@
       "group": "super",
       "job": "pmu_analyze_hello_race_stress_calibrated_skid",
       "desc": "PMU analyze hello-race stress (calibrated skid)",
-      "description": "Calibrates the PMU skid margin on the host, then runs the ignored analyze_hello_race and bisect_rejects_a_timed_out_replay tests. The shell command checks four positive-integer settings (ANALYZE_SKID_CALIBRATION_ITERATIONS, default 64; ANALYZE_SKID_CALIBRATION_PERIOD, 1000000; ANALYZE_SKID_MINIMUM_MARGIN, 20000; ANALYZE_SKID_CALIBRATION_TIMEOUT, 30 seconds), compiles tests/util/pmu_skid.c into target/ci-pmu-skid, runs it to read \"Recommended margin: N RCB\", and passes the larger of N and the floor as HERMIT_ANALYZE_SKID_MARGIN. analyze_hello_race (hermit-cli/tests/analyze.rs) then runs `hermit analyze --run-arg=--base-env=host --run-arg=--skid-margin=<margin> --analyze-seed=0 --search -- --chaos --summary --max-timeslice=400000 -- hello_race`, which must exit 0, print a guest stack trace and name flaky-tests/hello_race.rs:37. It checks that hermit analyze pinpoints the hello_race race with PMU-driven chaos preemption sized to this host's measured skid. The bisect timeout regression runs an endless guest with a one-second Hermit timeout and a 30-second outer bound; it requires exit 124 with the typed run-timeout marker and no successful report or causal claim. A missing calibration line exits with an error before the tests; a different pinpointed line or a lost timeout classification fails the tests. A failure is blocking for the super validation.",
+      "description": "Calibrates the PMU skid margin on the host, then runs the ignored analyze_hello_race, bisect_rejects_a_timed_out_replay, analyze_stops_on_a_refused_trial and analyze_ends_with_a_refused_target_run tests. The shell command checks four positive-integer settings (ANALYZE_SKID_CALIBRATION_ITERATIONS, default 64; ANALYZE_SKID_CALIBRATION_PERIOD, 1000000; ANALYZE_SKID_MINIMUM_MARGIN, 20000; ANALYZE_SKID_CALIBRATION_TIMEOUT, 30 seconds), compiles tests/util/pmu_skid.c into target/ci-pmu-skid, runs it to read \"Recommended margin: N RCB\", and passes the larger of N and the floor as HERMIT_ANALYZE_SKID_MARGIN. analyze_hello_race (hermit-cli/tests/analyze.rs) then runs `hermit analyze --run-arg=--base-env=host --run-arg=--skid-margin=<margin> --analyze-seed=0 --search -- --chaos --summary --max-timeslice=400000 -- hello_race`, which must exit 0, print a guest stack trace and name flaky-tests/hello_race.rs:37. It checks that hermit analyze pinpoints the hello_race race with PMU-driven chaos preemption sized to this host's measured skid. The bisect timeout regression runs an endless guest with a one-second Hermit timeout and a 30-second outer bound; it requires exit 124 with the typed run-timeout marker and no successful report or causal claim. The refusal cases require a named restart_syscall refusal, exact policy-refusal exit 122 and no causal report, while distinguishing an ordinary completed guest exit 122. A missing calibration line exits with an error before the tests; a different pinpointed line or a lost timeout classification fails the tests. A failure is blocking for the super validation.",
       "labels": [
         "super"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -u\niters=${ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}\nperiod=${ANALYZE_SKID_CALIBRATION_PERIOD:-1000000}\nfloor=${ANALYZE_SKID_MINIMUM_MARGIN:-20000}\ncal_timeout=${ANALYZE_SKID_CALIBRATION_TIMEOUT:-30}\nfor name in iters period floor cal_timeout; do\n    eval \"v=\\$$name\"\n    case \"$v\" in\n        ''|*[!0-9]*|0*) echo \"Analyze PMU calibration error: $name must be a positive integer, got $v\" >&2; exit 2 ;;\n    esac\ndone\nbin=$PWD/target/ci-pmu-skid\nmkdir -p \"$(dirname \"$bin\")\" || exit 1\ncc -O2 -Wall -Wextra -Werror -std=gnu11 tests/util/pmu_skid.c -o \"$bin\" || {\n    echo \"Analyze PMU calibration error: failed to build tests/util/pmu_skid.c\" >&2; exit 1; }\nout=$(timeout \"$cal_timeout\" \"$bin\" --iterations \"$iters\" --period \"$period\" 2>&1) || {\n    status=$?; printf 'Analyze PMU calibration failed (exit %s):\\n%s\\n' \"$status\" \"$out\" >&2; exit \"$status\"; }\nprintf '%s\\n' \"$out\"\nrec=$(printf '%s\\n' \"$out\" | sed -n 's/^Recommended margin: \\([0-9][0-9]*\\) RCB.*/\\1/p')\ncase \"$rec\" in\n    ''|*[!0-9]*|0*) echo \"Analyze PMU calibration error: output omitted a valid recommended margin\" >&2; exit 1 ;;\nesac\nmargin=$rec\nif [ \"$margin\" -lt \"$floor\" ]; then margin=$floor; fi\nprintf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\\n' \\\n    \"$rec\" \"$floor\" \"$margin\"\nHERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test analyze -j 1 -E 'test(=analyze_hello_race) | test(=bisect_rejects_a_timed_out_replay)' -- --ignored",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -u\niters=${ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}\nperiod=${ANALYZE_SKID_CALIBRATION_PERIOD:-1000000}\nfloor=${ANALYZE_SKID_MINIMUM_MARGIN:-20000}\ncal_timeout=${ANALYZE_SKID_CALIBRATION_TIMEOUT:-30}\nfor name in iters period floor cal_timeout; do\n    eval \"v=\\$$name\"\n    case \"$v\" in\n        ''|*[!0-9]*|0*) echo \"Analyze PMU calibration error: $name must be a positive integer, got $v\" >&2; exit 2 ;;\n    esac\ndone\nbin=$PWD/target/ci-pmu-skid\nmkdir -p \"$(dirname \"$bin\")\" || exit 1\ncc -O2 -Wall -Wextra -Werror -std=gnu11 tests/util/pmu_skid.c -o \"$bin\" || {\n    echo \"Analyze PMU calibration error: failed to build tests/util/pmu_skid.c\" >&2; exit 1; }\nout=$(timeout \"$cal_timeout\" \"$bin\" --iterations \"$iters\" --period \"$period\" 2>&1) || {\n    status=$?; printf 'Analyze PMU calibration failed (exit %s):\\n%s\\n' \"$status\" \"$out\" >&2; exit \"$status\"; }\nprintf '%s\\n' \"$out\"\nrec=$(printf '%s\\n' \"$out\" | sed -n 's/^Recommended margin: \\([0-9][0-9]*\\) RCB.*/\\1/p')\ncase \"$rec\" in\n    ''|*[!0-9]*|0*) echo \"Analyze PMU calibration error: output omitted a valid recommended margin\" >&2; exit 1 ;;\nesac\nmargin=$rec\nif [ \"$margin\" -lt \"$floor\" ]; then margin=$floor; fi\nprintf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\\n' \\\n    \"$rec\" \"$floor\" \"$margin\"\nHERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test analyze -j 1 -E 'test(=analyze_hello_race) | test(=bisect_rejects_a_timed_out_replay) | test(=analyze_stops_on_a_refused_trial) | test(=analyze_ends_with_a_refused_target_run)' -- --ignored",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -35111,7 +35111,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "2",
+        "NEXTEST_EXPECTED_EXECUTED": "4",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends\",\"--test\",\"analyze\"]"
       },
       "networkonly": false,
@@ -54099,7 +54099,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1267",
+        "NEXTEST_EXPECTED_EXECUTED": "1269",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,

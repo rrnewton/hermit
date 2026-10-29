@@ -119,6 +119,12 @@ fn incomplete_trial(error: Error, root: &Path) -> Error {
          for hermit analyze's trial bound, increase --trial-timeout; for a run timeout, \
          use a larger --timeout in the run arguments. The smaller configured bound still \
          applies. Otherwise investigate why the replay does not finish."
+    } else if error
+        .downcast_ref::<crate::container::PolicyRefusal>()
+        .is_some()
+    {
+        "Inspect the named refusal and trial diagnostics; use a supported operation or \
+         configuration before retrying. A refusal cannot establish a target or baseline outcome."
     } else {
         "Resolve the reported run error before retrying analysis."
     };
@@ -1755,10 +1761,66 @@ mod tests {
         assert_eq!(trials, 3, "no trial may follow the unfinished midpoint");
     }
 
+    /// A refusal after completed endpoint observations must not become a
+    /// replacement baseline with a requested trace presented as realized.
+    #[test]
+    fn a_refused_midpoint_cannot_replace_the_completed_baseline() {
+        use detcore::types::DetTid;
+        use detcore::types::SyscallPhase;
+        use reverie::syscalls::Sysno;
+
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let a = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let b = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let c = SchedEvent::syscall(DetTid::from_raw(7), Sysno::getpid, SyscallPhase::Prehook);
+        let baseline = vec![a.clone(), b.clone(), c.clone()];
+        let target = vec![c, b, a];
+        for contextual in [false, true] {
+            let mut trials = 0;
+            let result =
+                options.phase5_bisect_traces_with(&target, &baseline, |trial, requested| {
+                    trials = trial;
+                    match trial {
+                        1 => {
+                            assert_eq!(requested, baseline);
+                            Ok(CompletedScheduleTrial {
+                                target_met: false,
+                                schedule: baseline.clone(),
+                            })
+                        }
+                        2 => {
+                            assert_eq!(requested, target);
+                            Ok(CompletedScheduleTrial {
+                                target_met: true,
+                                schedule: target.clone(),
+                            })
+                        }
+                        3 => Err(if contextual {
+                            Error::new(PolicyRefusal)
+                                .context("unsupported operation: restart_syscall")
+                        } else {
+                            Error::new(PolicyRefusal)
+                        }),
+                        _ => bail!(
+                            "the search launched another trial after the midpoint was refused"
+                        ),
+                    }
+                });
+            let error = result.expect_err("a refused midpoint cannot supply a completed candidate");
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            assert_eq!(trials, 3, "no trial may follow the refused midpoint");
+            if contextual {
+                assert!(format!("{error:#}").contains("unsupported operation: restart_syscall"));
+            }
+        }
+    }
+
     fn stopped_trial(kind: &str) -> Error {
         match kind {
             "timeout" => Error::new(RunTimeoutMarker),
             "refusal" => Error::new(PolicyRefusal),
+            "contextual refusal" => Error::new(PolicyRefusal)
+                .context("unsupported operation: restart_syscall without an interrupted wait"),
             "log limit" => Error::new(LogCapExceeded),
             _ => unreachable!(),
         }
@@ -1768,7 +1830,9 @@ mod tests {
         assert!(
             match kind {
                 "timeout" => error.downcast_ref::<RunTimeoutMarker>().is_some(),
-                "refusal" => error.downcast_ref::<PolicyRefusal>().is_some(),
+                "refusal" | "contextual refusal" => {
+                    error.downcast_ref::<PolicyRefusal>().is_some()
+                }
                 "log limit" => error.downcast_ref::<LogCapExceeded>().is_some(),
                 _ => unreachable!(),
             },
@@ -1810,7 +1874,7 @@ mod tests {
         assert_eq!(completed.passing_schedule, baseline);
         assert_eq!(completed.failing_schedule, target);
 
-        for kind in ["timeout", "refusal", "log limit"] {
+        for kind in ["timeout", "refusal", "contextual refusal", "log limit"] {
             let mut trials = 0;
             let error = options
                 .phase5_bisect_traces_with(&target, &baseline, |_, _| {
@@ -1828,7 +1892,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         options.tmp_dir = Some(dir.path().to_path_buf());
-        for kind in ["timeout", "refusal", "log limit"] {
+        for kind in ["timeout", "refusal", "contextual refusal", "log limit"] {
             let mut run = RunData::new_baseline(&options, "prefix".to_owned()).unwrap();
             let error = options
                 .launch_prefix_trial(&mut run, |_| Err(stopped_trial(kind)))
@@ -1867,6 +1931,24 @@ mod tests {
                 assert!(
                     remedy.contains("The smaller configured bound still applies"),
                     "{remedy}"
+                );
+            }
+            if kind.contains("refusal") {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("use a supported operation or configuration before retrying"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("A refusal cannot establish a target or baseline outcome"),
+                    "{message}"
+                );
+            }
+            if kind == "contextual refusal" {
+                assert!(
+                    message.contains("restart_syscall without an interrupted wait"),
+                    "{message}"
                 );
             }
             assert_eq!(

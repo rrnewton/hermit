@@ -50,6 +50,7 @@ struct AnalyzeWorkloads {
     racewrite_nostdlib: PathBuf,
     nanosleep_nocrash: PathBuf,
     race_then: PathBuf,
+    refusal_after_race: PathBuf,
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
@@ -152,11 +153,18 @@ fn workloads() -> &'static AnalyzeWorkloads {
             &race_then,
         );
 
+        let refusal_after_race = build_root.join("analyze_refusal_after_race");
+        compile_c_pthread(
+            &repository.join("hermit-cli/tests/fixtures/analyze_refusal_after_race.c"),
+            &refusal_after_race,
+        );
+
         AnalyzeWorkloads {
             hello_race,
             racewrite_nostdlib,
             nanosleep_nocrash,
             race_then,
+            refusal_after_race,
         }
     })
 }
@@ -631,5 +639,183 @@ fn analyze_reproducer_runs_from_another_directory() {
         repro.display(),
         elsewhere.path().display(),
         String::from_utf8_lossy(&there.stderr),
+    );
+}
+
+fn combined_output(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn assert_no_refusal_report(output: &Output, report: &Path) -> String {
+    let combined = combined_output(output);
+    assert_eq!(output.status.code(), Some(122), "{combined}");
+    assert!(
+        combined.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("no program outcome was established"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("use a supported operation or configuration before retrying"),
+        "{combined}"
+    );
+    assert!(
+        !report.exists(),
+        "a refused trial wrote a report: {combined}"
+    );
+    for claim in [
+        "counted as the baseline condition",
+        "counted as not reaching",
+        "Completed analysis successfully",
+        "Critical events found which exercise race bug",
+        "reproduces the good outcome",
+        "determines the program outcome",
+        "decides the outcome",
+        "hermit analyze report",
+    ] {
+        assert!(!combined.contains(claim), "{claim}: {combined}");
+    }
+    combined
+}
+
+/// Discovery uses a mode in which either race order completes; the actual
+/// refused-mode target must independently complete under analyze before its
+/// later trial may be tested.
+fn completed_refusal_fixture_seed(guest: &Path) -> u64 {
+    for seed in 0..40 {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--signal=KILL", "30s"])
+            .arg(hermit_test::hermit_binary())
+            .args(["run", "--chaos", "--timeout=3"])
+            .arg(format!("--seed={seed}"));
+        if let Some(margin) = std::env::var_os(ANALYZE_SKID_MARGIN_ENV) {
+            command.arg(format!("--skid-margin={}", margin.to_string_lossy()));
+        }
+        command.args(["--"]).arg(guest).arg("finish");
+        let output =
+            hermit_test::hermit_output("find completed refusal-fixture seed", &mut command);
+        let combined = combined_output(&output);
+        assert!(!combined.contains("HERMIT_POLICY_REFUSAL"), "{combined}");
+        match output.status.code() {
+            Some(0) => {
+                assert!(combined.contains("b-first"), "{combined}");
+                return seed;
+            }
+            Some(122) => assert!(combined.contains("a-first"), "{combined}"),
+            status => panic!("seed {seed}: unexpected setup status {status:?}\n{combined}"),
+        }
+    }
+    panic!("no completed b-first target found in 40 bounded fixture runs");
+}
+
+/// A completed target does not turn a refused prefix trial into a baseline.
+#[test]
+#[ignore = "requires PMU and mount namespaces; selected by the calibrated analyze validation node"]
+fn analyze_stops_on_a_refused_trial() {
+    let _guard = analyze_lock();
+    let guest = &workloads().refusal_after_race;
+    let seed = completed_refusal_fixture_seed(guest);
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report.json");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=KILL", "30s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "analyze",
+            "--prefix-search",
+            "--target-stdout=b-first",
+            "--target-exit-code=0",
+        ])
+        .arg(format!("--run1-seed={seed}"))
+        .arg(format!("--report-file={}", report.display()));
+    add_calibrated_skid_margin(&mut command, "analyze refused prefix trial");
+    command
+        .args(["--", "--chaos", "--timeout=3", "--"])
+        .arg(guest)
+        .arg("refuse");
+    let output = hermit_test::hermit_output("analyze refused prefix trial", &mut command);
+    let combined = assert_no_refusal_report(&output, &report);
+    assert!(
+        combined.contains("First run matched target criteria"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("Hermit refused analysis run prefix_round_001"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("unsupported syscall: restart_syscall"),
+        "{combined}"
+    );
+    assert!(combined.contains("Hermit's stderr above"), "{combined}");
+}
+
+/// A refused target has no outcome, while a guest's ordinary exit 122 does.
+/// With verbose logging the error must name the actual retained trial log.
+#[test]
+#[ignore = "requires PMU and mount namespaces; selected by the calibrated analyze validation node"]
+fn analyze_ends_with_a_refused_target_run() {
+    let _guard = analyze_lock();
+    let mut ordinary = Command::new("timeout");
+    ordinary
+        .args(["--signal=KILL", "30s"])
+        .arg(hermit_test::hermit_binary())
+        .args(["run", "--timeout=3", "--", "/bin/sh", "-c", "exit 122"]);
+    let ordinary = hermit_test::hermit_output("ordinary guest exit 122", &mut ordinary);
+    assert_eq!(ordinary.status.code(), Some(122));
+    assert!(!combined_output(&ordinary).contains("HERMIT_POLICY_REFUSAL"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace_parent = dir.path().join("workspace");
+    let report = dir.path().join("report.json");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=KILL", "30s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "analyze",
+            "--verbose",
+            "--prefix-search",
+            "--target-stdout=a-first",
+        ])
+        .arg(format!("--tmp-dir={}", workspace_parent.display()))
+        .arg(format!("--report-file={}", report.display()));
+    add_calibrated_skid_margin(&mut command, "analyze refused target");
+    command
+        .args(["--", "--timeout=3", "--"])
+        .arg(&workloads().refusal_after_race)
+        .arg("refuse");
+    let output = hermit_test::hermit_output("analyze refused target", &mut command);
+    let combined = assert_no_refusal_report(&output, &report);
+    assert!(
+        combined.contains("Hermit refused analysis run run1_target"),
+        "{combined}"
+    );
+    assert!(
+        !combined.contains("First run matched target criteria"),
+        "{combined}"
+    );
+    let workspaces: Vec<_> = fs::read_dir(&workspace_parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(workspaces.len(), 1);
+    let log = workspaces[0].join("run1_target.log");
+    assert!(
+        combined.contains(&format!("the trial log {}", log.display())),
+        "{combined}"
+    );
+    let diagnostics = fs::read_to_string(log).unwrap();
+    assert!(
+        diagnostics.contains("unsupported syscall: restart_syscall"),
+        "{diagnostics}"
     );
 }

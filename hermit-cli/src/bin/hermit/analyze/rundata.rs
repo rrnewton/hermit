@@ -247,10 +247,9 @@ impl RunData {
         self.runopts.write_debug_options_dump()?;
 
         let started = Instant::now();
-        let (_, output, terminal_outcome) = self
-            .runopts
-            .run(&gopts, true)
-            .map_err(|error| self.name_the_trial_bound(error))?;
+        let (_, output, terminal_outcome) = self.runopts.run(&gopts, true).map_err(|error| {
+            self.run_error(self.name_the_trial_bound(error), gopts.log_file.as_deref())
+        })?;
         let output: Output = output.context("expected captured output")?;
 
         File::create(root.with_extension("stdout"))
@@ -342,6 +341,27 @@ impl RunData {
     /// This run's name in the workspace.
     pub fn name(&self) -> &str {
         &self.runname
+    }
+
+    /// Keep every failure typed. A policy refusal has no completed guest
+    /// outcome, whether its reason arrived as context or was logged separately.
+    fn run_error(&self, error: anyhow::Error, log: Option<&Path>) -> anyhow::Error {
+        if error
+            .downcast_ref::<crate::container::PolicyRefusal>()
+            .is_none()
+        {
+            return error;
+        }
+        let diagnostics = log.map_or_else(
+            || "Hermit's stderr above".to_owned(),
+            |path| format!("the trial log {}", path.display()),
+        );
+        error.context(format!(
+            "Hermit refused analysis run {}; no program outcome was established. \
+             Inspect the refusal below and {diagnostics}; use a supported operation or \
+             configuration before retrying.",
+            self.runname,
+        ))
     }
 
     /// Any post-processing that needs to be applied to a recorded file of SchedEvents
@@ -2673,6 +2693,60 @@ mod tests {
                 config.record_preemptions_to.as_ref(),
                 Some(&workspace.path().join("replay_out.preempts")),
             );
+        }
+    }
+
+    #[test]
+    fn a_refused_run_keeps_its_type_reason_and_log_location() {
+        use crate::container::LogCapExceeded;
+        use crate::container::PolicyRefusal;
+        use crate::container::RunTimeoutMarker;
+
+        for (verbose, selfcheck) in [(false, false), (true, false), (false, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+            options.tmp_dir = Some(dir.path().to_path_buf());
+            options.verbose = verbose;
+            options.selfcheck = selfcheck;
+            let run = RunData::new_baseline(&options, "refused_trial".to_owned()).unwrap();
+            let mut global = run.trial_global_opts();
+            global.open_log_file().unwrap();
+            for error in [
+                anyhow::Error::new(PolicyRefusal),
+                anyhow::Error::new(PolicyRefusal).context("unsupported operation: restart_syscall"),
+                anyhow::Error::msg("unsupported operation: restart_syscall").context(PolicyRefusal),
+                anyhow::Error::new(PolicyRefusal).context("unsupported configuration at admission"),
+            ] {
+                let reason = format!("{error:#}");
+                let error = run.run_error(error, global.log_file.as_deref());
+                assert!(error.downcast_ref::<PolicyRefusal>().is_some());
+                let message = format!("{error:#}");
+                assert!(message.contains(&reason), "{message}");
+                assert!(message.contains("Hermit refused analysis run refused_trial"));
+                assert!(message.contains("no program outcome was established"));
+                assert!(
+                    message.contains("use a supported operation or configuration before retrying")
+                );
+                if let Some(path) = &global.log_file {
+                    assert!(path.exists());
+                    assert!(message.contains(&format!("the trial log {}", path.display())));
+                } else {
+                    assert!(message.contains("Hermit's stderr above"));
+                }
+                assert!(!run.has_launched());
+            }
+            for error in [
+                anyhow::Error::new(RunTimeoutMarker),
+                anyhow::Error::new(LogCapExceeded),
+            ] {
+                let before = format!("{error:#}");
+                let error = run.run_error(error, global.log_file.as_deref());
+                assert_eq!(format!("{error:#}"), before);
+                assert!(
+                    error.downcast_ref::<RunTimeoutMarker>().is_some()
+                        || error.downcast_ref::<LogCapExceeded>().is_some()
+                );
+            }
         }
     }
 

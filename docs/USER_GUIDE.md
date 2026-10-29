@@ -806,6 +806,14 @@ endpoint log), within `HERMIT_LOG_MAX_BYTES`; setting that variable to `0`
 lifts both file caps. These host resource limits may stop a trial on a slow
 machine; they never change a stopped trial into a completed outcome.
 
+A trial refused by Hermit (`HERMIT_POLICY_REFUSAL`, exit 122) stops the search
+without establishing a program outcome for that trial. It cannot replace a
+completed baseline or certify a causal report. The error names the trial and
+its log file, or stderr when no file was requested. Inspect the named refusal
+and use a supported operation or configuration before retrying. An ordinary
+guest exit 122 remains a completed guest outcome, classified by the target
+criteria; its numeric status alone is not a refusal.
+
 By default analyze bisects between the failing schedule and a passing one from
 another run. When the two runs differ in events only one of them executed (for
 example timeslices that end at other points, or extra iterations of a polling
