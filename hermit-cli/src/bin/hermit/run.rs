@@ -77,7 +77,6 @@ use super::container::PlannedMount;
 use super::container::PolicyRefusal;
 use super::container::apply_affinity;
 use super::container::container_proc_mount;
-use super::container::identity_hardening_mounts;
 use super::container::image_container;
 use super::container::namespace_container;
 use super::global_opts::GlobalOpts;
@@ -1750,6 +1749,12 @@ pub struct RunOpts {
     /// (https://github.com/rrnewton/hermit/issues/4693).
     #[clap(skip)]
     ld_so_cache_snapshot: Option<super::container::LdSoCacheSnapshot>,
+    /// The one sealed `/etc` copy both runs of an in-process verification
+    /// bind (see `container::EtcSnapshot`): captured once by
+    /// `run --verify`, never for a single run or an external
+    /// `--verify-run` pair (separate processes; see the snapshot's doc).
+    #[clap(skip)]
+    etc_snapshot: Option<super::container::EtcSnapshot>,
     /// Exact original package for both verification runs: inherited from the
     /// shared-input holder, or opened once by inline verification.
     #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
@@ -3333,7 +3338,11 @@ fn verification_runs_bind_one_shared_ld_so_cache_snapshot() {
             .contains("verification run run2 has no shared /etc/ld.so.cache snapshot"),
         "{refused:#}"
     );
-    let shared = ro.with_verification_ld_so_cache().unwrap();
+    let shared = ro
+        .with_verification_ld_so_cache()
+        .unwrap()
+        .with_verification_etc_snapshot()
+        .unwrap();
     assert_eq!(
         shared.ld_so_cache_snapshot,
         Some(super::container::LdSoCacheSnapshot::of_host().unwrap())
@@ -3347,6 +3356,44 @@ fn verification_runs_bind_one_shared_ld_so_cache_snapshot() {
             .unwrap()
             .ld_so_cache_snapshot,
         Some(sealed)
+    );
+}
+
+// Both runs of an in-process `--verify` bind the SAME sealed /etc view
+// directory (captured once), not a recopy per run; a run refuses without it.
+#[test]
+fn verification_runs_bind_one_shared_sealed_etc_snapshot() {
+    let tmpfs = tempfile::tempdir().unwrap();
+    let mut ro = run_opts_for(&["hermit", "run", "/bin/true"]);
+    ro.fatal_core_run_label = Some("run1");
+    ro.ld_so_cache_snapshot = Some(super::container::LdSoCacheSnapshot::of_host().unwrap());
+    let refused = ro
+        .mounts(tmpfs.path())
+        .err()
+        .expect("run 1 without the sealed /etc snapshot");
+    assert!(
+        refused
+            .to_string()
+            .contains("verification run run1 has no shared sealed /etc snapshot"),
+        "{refused:#}"
+    );
+    let shared = ro.with_verification_etc_snapshot().unwrap();
+    let etc_source = |options: &RunOpts| {
+        options
+            .mounts(tmpfs.path())
+            .unwrap()
+            .mounts
+            .iter()
+            .find(|planned| planned.mount.get_target() == Path::new("/etc"))
+            .and_then(|planned| planned.mount.get_source().map(Path::to_path_buf))
+    };
+    let first = etc_source(&shared);
+    let second = etc_source(&shared);
+    assert_eq!(first, second, "both verify runs bind the same /etc view");
+    assert_eq!(
+        first.as_deref(),
+        shared.etc_snapshot.as_ref().map(|snapshot| snapshot.view()),
+        "the bound view is the captured snapshot's directory"
     );
 }
 
@@ -10817,6 +10864,7 @@ impl RunOpts {
         // copies these options -- the DBT adapter keeps its own copy and runs
         // both executions from it (https://github.com/rrnewton/hermit/issues/4693).
         self.with_verification_ld_so_cache()?
+            .with_verification_etc_snapshot()?
             .verify_sharing_ld_so_cache(global, _dbt_stdin)
     }
 
@@ -10961,11 +11009,20 @@ impl RunOpts {
             .with_verification_ld_so_cache()?
             .ld_so_cache_snapshot
             .expect("with_verification_ld_so_cache always sets the snapshot");
+        // Both runs also bind the one sealed /etc copy captured for the
+        // pair (not a recopy per run): a host /etc change between runs
+        // can then reach neither. See `container::EtcSnapshot`.
+        let etc_snapshot = self
+            .with_verification_etc_snapshot()?
+            .etc_snapshot
+            .expect("with_verification_etc_snapshot always sets the snapshot");
         let mut run1_options = self.clone();
         run1_options.summary_json = summary1_path.clone();
         run1_options.ld_so_cache_snapshot = Some(ld_so_cache.clone());
+        run1_options.etc_snapshot = Some(etc_snapshot.clone());
         let mut run2_options = self.clone();
         run2_options.ld_so_cache_snapshot = Some(ld_so_cache);
+        run2_options.etc_snapshot = Some(etc_snapshot);
         run2_options.summary_json = summary2_path.map(Path::to_owned);
 
         // Each run records the host files its guest opens, so that a
@@ -11465,6 +11522,19 @@ impl RunOpts {
         Ok(shared)
     }
 
+    /// These options with the one sealed `/etc` snapshot both runs of an
+    /// in-process verification bind: the one already captured, else a
+    /// capture of the host `/etc` now (using the shared cache snapshot).
+    fn with_verification_etc_snapshot(&self) -> Result<Self, Error> {
+        let mut shared = self.clone();
+        if shared.etc_snapshot.is_none() {
+            shared.etc_snapshot = Some(super::container::EtcSnapshot::capture(
+                shared.ld_so_cache_snapshot.as_ref(),
+            )?);
+        }
+        Ok(shared)
+    }
+
     /// Returns the mounts to be used with the container, in the order they are
     /// installed: the identity-hardening mounts, the caller's `--mount`s and
     /// `--bind`s (a backend adapter's own last, marked as a backend's), the
@@ -11480,6 +11550,12 @@ impl RunOpts {
             "verification run {} has no shared /etc/ld.so.cache snapshot",
             self.fatal_core_run_label.unwrap_or_default()
         );
+        anyhow::ensure!(
+            !matches!(self.fatal_core_run_label, Some("run1" | "run2"))
+                || self.etc_snapshot.is_some(),
+            "verification run {} has no shared sealed /etc snapshot",
+            self.fatal_core_run_label.unwrap_or_default()
+        );
         // And a `--verify-run` whose holder sealed the cache binds that copy,
         // never the host's (`adopt_shared_ld_so_cache`).
         anyhow::ensure!(
@@ -11491,7 +11567,10 @@ impl RunOpts {
             "the shared inputs seal /etc/ld.so.cache, but this run did not adopt it"
         );
         let (mut identity_mounts, identity_sources) =
-            identity_hardening_mounts(self.ld_so_cache_snapshot.as_ref())?;
+            super::container::identity_hardening_mounts_with_etc(
+                self.ld_so_cache_snapshot.as_ref(),
+                self.etc_snapshot.as_ref(),
+            )?;
         let mut identity_sources = identity_sources;
         let mut explicit_tmp_mount = false;
         let mut user_mounts = Vec::with_capacity(self.mount.len() + self.bind.len());

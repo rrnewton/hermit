@@ -11,13 +11,13 @@ use std::ffi::CString;
 use std::fs;
 use std::fs::File;
 use std::io;
-#[cfg(any(test, feature = "native-exec"))]
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::panic;
 use std::path::Path;
@@ -61,6 +61,8 @@ const GROUP_FILE: &str = "/etc/group";
 const LD_SO_CACHE: &str = "/etc/ld.so.cache";
 const NSCD_DIR: &str = "/var/run/nscd";
 const DETERMINISTIC_ETC_ROOT: &[u8] = b"/tmpvol/.hermit/etc";
+const DETERMINISTIC_GROUP_ROOT: &[u8] = b"/tmpvol/.hermit/etc/group";
+const DETERMINISTIC_LD_SO_CACHE_ROOT: &[u8] = b"/tmpvol/.hermit/etc/ld.so.cache";
 const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
 const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
 
@@ -630,7 +632,9 @@ impl EtcViewGuard {
 // caller until after `Container::run` returns so the backing directories
 // still exist when the child mounts them.
 pub(super) struct IdentityGuard {
-    _etc_view: Option<EtcViewGuard>,
+    _etc_view: Option<std::sync::Arc<EtcViewGuard>>,
+    _frozen_group: Option<std::sync::Arc<tempfile::NamedTempFile>>,
+    _frozen_ld_so_cache: Option<std::sync::Arc<tempfile::NamedTempFile>>,
     _nscd_dir: Option<tempfile::TempDir>,
     mountinfo_roots: Vec<MountInfoRootSource>,
     user_mount_targets: Vec<PathBuf>,
@@ -722,6 +726,8 @@ impl IdentityGuard {
     pub(super) fn empty() -> Self {
         Self {
             _etc_view: None,
+            _frozen_group: None,
+            _frozen_ld_so_cache: None,
             _nscd_dir: None,
             mountinfo_roots: Vec::new(),
             user_mount_targets: Vec::new(),
@@ -1213,56 +1219,118 @@ fn frozen_group_contents() -> Result<Vec<u8>, Error> {
     Ok(contents.into_bytes())
 }
 
+/// Write `contents` into a private temp file (mode 0444, set through
+/// its descriptor after the write): the guard-held source a readonly
+/// bind mounts over a frozen `/etc` file. The mode matches the copy's
+/// frozen files, so a guest `stat` sees 0444 as well as the ro mount.
+fn frozen_temp_file(contents: &[u8], what: &str) -> Result<tempfile::NamedTempFile, Error> {
+    let mut file = tempfile::NamedTempFile::new()
+        .with_context(|| format!("Failed to create the frozen {what} for the guest"))?;
+    file.write_all(contents)
+        .with_context(|| format!("Failed to populate the frozen {what} for the guest"))?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o444))
+        .with_context(|| format!("Failed to set permissions on the frozen {what}"))?;
+    Ok(file)
+}
+
 /// Snapshot the host group database into a private temp file: the frozen
 /// copy a declared-input root seals. The guest's `/etc/group` itself is
-/// the `/etc` copy [`hermit_etc_view`] makes of these bytes.
+/// the `/etc` copy [`hermit_etc_view`] makes of these bytes, plus the
+/// readonly bind of a temp file with the same bytes.
 #[cfg(feature = "native-exec")]
 fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
-    let contents = frozen_group_contents()?;
-    let mut group_file = tempfile::NamedTempFile::new()
-        .context("Failed to create the frozen group database for the guest")?;
-    group_file
-        .write_all(&contents)
-        .context("Failed to populate the frozen group database for the guest")?;
-    group_file
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o644))
-        .context("Failed to set permissions on the frozen guest group database")?;
-    Ok(group_file)
+    frozen_temp_file(&frozen_group_contents()?, "guest group database")
 }
 
 fn write_frozen_file(path: &Path, contents: &[u8], what: &str) -> Result<(), Error> {
-    fs::write(path, contents).with_context(|| format!("Failed to populate the frozen {what}"))?;
-    // Read-only like the old per-file readonly binds: a guest write to the
-    // frozen group/cache must fail. (A mapped-root guest may still bypass
-    // the bits via CAP_DAC_OVERRIDE over its own files — the bits are the
-    // contract, asserted in tests.)
-    fs::set_permissions(path, fs::Permissions::from_mode(0o444))
+    // The copy may have left a placeholder, or a symlink: never follow a
+    // link (following one could truncate/chmod a host file outside the
+    // view). Unlink whatever entry is there, then exclusively create a
+    // regular file and write/chmod only through its descriptor.
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            fs::remove_file(path)
+                .with_context(|| format!("Failed to replace the frozen {what} entry"))?;
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir(path)
+                .with_context(|| format!("Failed to replace the frozen {what} directory"))?;
+        }
+        Ok(_) => {
+            fs::remove_file(path)
+                .with_context(|| format!("Failed to replace the frozen {what} entry"))?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect the frozen {what} entry"));
+        }
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("Failed to create the frozen {what}"))?;
+    file.write_all(contents)
+        .with_context(|| format!("Failed to populate the frozen {what}"))?;
+    // Read-only in the copy as well as under the readonly bind mounted
+    // over it: a guest write to the frozen group/cache must fail. (A
+    // mapped-root guest may still bypass the bits via CAP_DAC_OVERRIDE
+    // over its own files — the bind is the hard contract.)
+    file.set_permissions(fs::Permissions::from_mode(0o444))
         .with_context(|| format!("Failed to set permissions on the frozen {what}"))?;
     Ok(())
 }
 
-/// Best-effort copy of a regular file's atime/mtime onto its copy.
-/// Symlink times are ignored (best-effort): the guest cares about the
-/// target's times, and `File::set_times` on a link would follow it.
-fn preserve_file_times(metadata: &fs::Metadata, to: &Path) {
-    let (Ok(atime), Ok(mtime)) = (metadata.accessed(), metadata.modified()) else {
-        return;
-    };
-    let Ok(file) = File::open(to) else {
-        return;
-    };
+/// Best-effort copy of a file's or directory's atime/mtime onto its copy,
+/// via an already-open descriptor of the copy.
+/// Symlink times are deliberately skipped (documented): the guest cares
+/// about the target's times, and `File::set_times` on a link would follow
+/// it, so copied links keep the copy time.
+fn preserve_times(file: &File, metadata: &fs::Metadata, what: &Path) -> Result<(), Error> {
+    let atime = metadata.accessed().with_context(|| {
+        format!(
+            "Failed to read times of {} for the guest's /etc copy",
+            what.display()
+        )
+    })?;
+    let mtime = metadata.modified().with_context(|| {
+        format!(
+            "Failed to read times of {} for the guest's /etc copy",
+            what.display()
+        )
+    })?;
     let times = fs::FileTimes::new().set_accessed(atime).set_modified(mtime);
-    let _ = file.set_times(times);
+    file.set_times(times).with_context(|| {
+        format!(
+            "Failed to preserve times of {} for the guest's /etc copy",
+            what.display()
+        )
+    })
+}
+
+fn preserve_file_times(metadata: &fs::Metadata, to: &Path) -> Result<(), Error> {
+    let file = File::open(to).with_context(|| {
+        format!(
+            "Failed to open the copy of {} to preserve its times",
+            to.display()
+        )
+    })?;
+    preserve_times(&file, metadata, to)
 }
 
 /// Copy the tree at `source` into the empty directory `view`, without
 /// following symbolic links. An entry Hermit cannot read (a root-owned
 /// directory on the host, which the guest's mapped root could not read
 /// through the host `/etc` either) is left as an empty placeholder with
-/// the source's mode, and a special file (socket, fifo, device) is
-/// skipped: neither can be recreated by an unprivileged copy, and no
-/// `/etc` on a supported host needs one for the guest to function.
+/// the source's mode. A special file (socket, fifo, device) is refused
+/// with a named error: silently dropping one would make a successful
+/// copy not mean a complete snapshot. Directory iteration errors and
+/// permission/timestamp failures likewise propagate as named refusals;
+/// only an entry that vanishes mid-copy (`NotFound`) may be skipped.
 /// Directory modes gain owner write so the copy can be populated and
 /// later removed, and so a guest can write in its own `/etc`.
 ///
@@ -1280,38 +1348,90 @@ fn preserve_file_times(metadata: &fs::Metadata, to: &Path) {
 /// files. The frozen `group`/`ld.so.cache` are written authoritatively
 /// by [`hermit_etc_view`] after the copy, so a vanished or stale copy
 /// of either is overwritten and cannot leave the view incomplete.
+///
+/// Regular-file content is copied only from a descriptor opened with
+/// `O_NOFOLLOW`, and the world-readable decision is made from that
+/// descriptor's metadata (`fstat` of the opened fd, copied with
+/// `io::copy` from that same fd) — never from a path re-opened after
+/// `symlink_metadata`. A host swap of the path for a symlink (to a
+/// secret outside the tree, say) therefore yields `ELOOP` and the entry
+/// is recreated as a symlink, not followed. Directory traversal is
+/// descriptor-relative too: each directory is opened once with
+/// `O_NOFOLLOW|O_DIRECTORY` and its children are reached through
+/// `/proc/self/fd/<dirfd>`, so renaming a directory after it is opened
+/// cannot redirect the copy. Directory mtimes are preserved post-order
+/// (after their children are copied, via the directory descriptor);
+/// symlink times are skipped (see [`preserve_times`]).
+///
+/// Symlinks are preserved verbatim. A link whose target is inside
+/// `/etc` (absolute `/etc/...` or relative) resolves in the guest to
+/// the bound copy, so it is sealed with the snapshot. A link pointing
+/// outside `/etc` (e.g. `/etc/localtime` -> `/usr/share/zoneinfo/...`)
+/// resolves in the guest outside the copy and therefore to guest-live
+/// state outside this snapshot — that is accepted and documented here:
+/// sealing it would require copying arbitrary target trees, and the
+/// resulting guest path is the same one a live `/etc` would give.
 fn copy_etc_tree(source: &Path, view: &Path) -> Result<(), Error> {
-    let entries = match fs::read_dir(source) {
-        Ok(entries) => entries,
+    // Open the directory once with O_NOFOLLOW; all traversal below goes
+    // through /proc/self/fd/<dirfd>, i.e. the opened inode, so a host
+    // rename/swap of `source` after this point cannot redirect the copy.
+    let dir = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(source)
+    {
+        Ok(dir) => dir,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(()),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "Failed to read {} for the guest's /etc copy",
+                    "Failed to open {} for the guest's /etc copy",
                     source.display()
                 )
             });
         }
     };
-    let mut names: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+    copy_etc_tree_dir(&dir, source, view)
+}
+
+fn copy_etc_tree_dir(dir: &File, source: &Path, view: &Path) -> Result<(), Error> {
+    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let entries = fs::read_dir(&fd_path).with_context(|| {
+        format!(
+            "Failed to read {} for the guest's /etc copy",
+            source.display()
+        )
+    })?;
+    // Iteration errors are loud (named), not silently dropped: success
+    // must mean a complete snapshot. Only an entry that then vanishes
+    // (NotFound below) may be skipped.
+    let mut names: Vec<_> = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to iterate {} for the guest's /etc copy",
+                source.display()
+            )
+        })?;
+        names.push(entry);
+    }
     names.sort_by_key(|entry| entry.file_name());
     for entry in names {
-        let from = entry.path();
-        let to = view.join(entry.file_name());
+        let name = entry.file_name();
+        let from = fd_path.join(&name);
+        let display = source.join(&name);
+        let to = view.join(&name);
         let metadata = match fs::symlink_metadata(&from) {
             Ok(metadata) => metadata,
-            // Vanished mid-copy (concurrent host mutation): skip it; see
-            // the doc comment. The frozen files are rewritten afterwards.
+            // Vanished mid-copy (concurrent host mutation): the only
+            // silently-skipped case; see the doc comment. The frozen
+            // files are rewritten afterwards.
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                let _ = File::create(&to);
-                continue;
-            }
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
                         "Failed to inspect {} for the guest's /etc copy",
-                        from.display()
+                        display.display()
                     )
                 });
             }
@@ -1326,7 +1446,7 @@ fn copy_etc_tree(source: &Path, view: &Path) -> Result<(), Error> {
                     return Err(error).with_context(|| {
                         format!(
                             "Failed to read the link {} for the guest's /etc copy",
-                            from.display()
+                            display.display()
                         )
                     });
                 }
@@ -1336,7 +1456,10 @@ fn copy_etc_tree(source: &Path, view: &Path) -> Result<(), Error> {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!("Failed to copy the link {} for the guest", from.display())
+                        format!(
+                            "Failed to copy the link {} for the guest",
+                            display.display()
+                        )
                     });
                 }
             }
@@ -1344,55 +1467,202 @@ fn copy_etc_tree(source: &Path, view: &Path) -> Result<(), Error> {
             fs::create_dir(&to).with_context(|| {
                 format!(
                     "Failed to copy the directory {} for the guest",
-                    from.display()
+                    display.display()
                 )
             })?;
             // Not world-readable+executable: placeholder only, no recursion
             // into (potentially sensitive) contents.
             if mode & 0o005 == 0o005 {
-                copy_etc_tree(&from, &to)?;
-            }
-            let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode | 0o200));
-        } else if file_type.is_file() {
-            // Not world-readable: empty placeholder, no content copied.
-            if mode & 0o004 == 0 {
-                File::create(&to).with_context(|| {
-                    format!(
-                        "Failed to place {} in the guest's /etc copy",
-                        from.display()
-                    )
-                })?;
-                preserve_file_times(&metadata, &to);
-                let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode));
-                continue;
-            }
-            match fs::copy(&from, &to) {
-                Ok(_) => {
-                    preserve_file_times(&metadata, &to);
-                    let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode));
+                match fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .open(&from)
+                {
+                    Ok(child) => copy_etc_tree_dir(&child, &display, &to)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                    Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                        return Err(error).with_context(|| {
+                            format!("Failed to open the directory {} for the guest's /etc copy: it became a symlink during the copy", display.display())
+                        });
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "Failed to open the directory {} for the guest's /etc copy",
+                                display.display()
+                            )
+                        });
+                    }
                 }
+            }
+            fs::set_permissions(&to, fs::Permissions::from_mode(mode | 0o200)).with_context(
+                || {
+                    format!(
+                        "Failed to set permissions on the copy of the directory {}",
+                        display.display()
+                    )
+                },
+            )?;
+            // Post-order: copying children bumps the directory's mtime,
+            // so restore it only after they are done, via its descriptor.
+            preserve_file_times(&metadata, &to)?;
+        } else if file_type.is_file() {
+            // Open once, without following a symlink swapped in after the
+            // `symlink_metadata` above, and decide from the descriptor.
+            let mut opened = match fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&from)
+            {
+                Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                    // Swapped for a symlink since the metadata check:
+                    // recreate it as a link, never follow it for content.
+                    let target = match fs::read_link(&from) {
+                        Ok(target) => target,
+                        Err(read_error) if read_error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(read_error) => {
+                            return Err(read_error).with_context(|| {
+                                format!(
+                                    "Failed to read the swapped link {} for the guest's /etc copy",
+                                    display.display()
+                                )
+                            });
+                        }
+                    };
+                    match std::os::unix::fs::symlink(&target, &to) {
+                        Ok(()) => {}
+                        Err(link_error) if link_error.kind() == io::ErrorKind::NotFound => continue,
+                        Err(link_error) => {
+                            return Err(link_error).with_context(|| {
+                                format!(
+                                    "Failed to copy the link {} for the guest",
+                                    display.display()
+                                )
+                            });
+                        }
+                    }
+                    continue;
+                }
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                    File::create(&to).with_context(|| {
+                    // Unreadable here (e.g. root-owned 0400 whose content
+                    // the mode check would redact anyway): empty
+                    // placeholder from the descriptor-era metadata.
+                    let dest = File::create(&to).with_context(|| {
                         format!(
                             "Failed to place {} in the guest's /etc copy",
-                            from.display()
+                            display.display()
                         )
                     })?;
-                    preserve_file_times(&metadata, &to);
-                    let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode));
+                    preserve_times(&dest, &metadata, &display)?;
+                    dest.set_permissions(fs::Permissions::from_mode(mode))
+                        .with_context(|| {
+                            format!(
+                                "Failed to set permissions on the copy of {}",
+                                display.display()
+                            )
+                        })?;
+                    continue;
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!("Failed to copy {} for the guest's /etc", from.display())
+                        format!(
+                            "Failed to open {} for the guest's /etc copy",
+                            display.display()
+                        )
+                    });
+                }
+            };
+            let fd_metadata = opened.metadata().with_context(|| {
+                format!(
+                    "Failed to inspect {} for the guest's /etc copy",
+                    display.display()
+                )
+            })?;
+            if !fd_metadata.is_file() {
+                anyhow::bail!(
+                    "Refusing to copy {} for the guest's /etc copy: it became a non-regular file during the copy",
+                    display.display()
+                );
+            }
+            let fd_mode = fd_metadata.permissions().mode();
+            // Not world-readable (per the descriptor): empty placeholder.
+            if fd_mode & 0o004 == 0 {
+                let dest = File::create(&to).with_context(|| {
+                    format!(
+                        "Failed to place {} in the guest's /etc copy",
+                        display.display()
+                    )
+                })?;
+                preserve_times(&dest, &fd_metadata, &display)?;
+                dest.set_permissions(fs::Permissions::from_mode(fd_mode))
+                    .with_context(|| {
+                        format!(
+                            "Failed to set permissions on the copy of {}",
+                            display.display()
+                        )
+                    })?;
+                continue;
+            }
+            let mut dest = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&to)
+                .with_context(|| {
+                    format!(
+                        "Failed to place {} in the guest's /etc copy",
+                        display.display()
+                    )
+                })?;
+            match io::copy(&mut opened, &mut dest) {
+                Ok(_) => {
+                    preserve_times(&dest, &fd_metadata, &display)?;
+                    dest.set_permissions(fs::Permissions::from_mode(fd_mode))
+                        .with_context(|| {
+                            format!(
+                                "Failed to set permissions on the copy of {}",
+                                display.display()
+                            )
+                        })?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    drop(dest);
+                    match fs::remove_file(&to) {
+                        Ok(()) => {}
+                        Err(remove_error) if remove_error.kind() == io::ErrorKind::NotFound => {}
+                        Err(remove_error) => {
+                            return Err(remove_error).with_context(|| {
+                                format!(
+                                    "Failed to remove the vanished copy of {}",
+                                    display.display()
+                                )
+                            });
+                        }
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to copy {} for the guest's /etc", display.display())
                     });
                 }
             }
+        } else {
+            // Special files (socket, fifo, device) cannot be recreated by
+            // an unprivileged copy and silently dropping one would make
+            // success not mean a complete snapshot: refuse, naming it.
+            anyhow::bail!(
+                "Refusing to copy special file {} for the guest's /etc copy: only regular files, directories and symlinks are supported",
+                display.display()
+            );
         }
     }
     Ok(())
 }
-
 /// A private copy of `source_etc` holding the frozen `group` (and the
 /// frozen dynamic-linker `cache`, when the host has one), plus the guard
 /// that owns the copy. `identity_hardening_mounts` binds the copy over
@@ -1446,9 +1716,15 @@ fn hermit_etc_view(
             cache,
             "guest dynamic-linker cache",
         )?,
-        None => {
-            let _ = fs::remove_file(view.join("ld.so.cache"));
-        }
+        None => match fs::remove_file(view.join("ld.so.cache")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context(
+                    "Failed to remove the copied dynamic-linker cache from the guest's /etc copy",
+                );
+            }
+        },
     }
     Ok((view.clone(), EtcViewGuard { _dir: dir, view }))
 }
@@ -1482,38 +1758,162 @@ impl LdSoCacheSnapshot {
     }
 }
 
+/// One sealed, coherent copy of the host `/etc` (plus the frozen
+/// group/cache temp files readonly-bound over it), captured once and
+/// shared — by `Arc` — across both runs of an in-process verification.
+/// Before this, only the `ld.so.cache` bytes were shared: every physical
+/// run recopied the whole tree, so a host change between the two copies
+/// could give run 1 and run 2 different guest `/etc` content. Both runs
+/// now bind the *same* copied view directory (created once here), so
+/// they observe identical bytes, metadata and dentries for the whole
+/// tree. Note the shared view is also the runs' writable `/etc`: a
+/// guest that writes `/etc` in run 1 leaves that write visible to
+/// run 2. That is the documented cost of one shared view for the
+/// verify pair (the alternative — recopying per run — is exactly the
+/// incoherence this snapshot removes); ordinary single runs still get
+/// a fresh copy. External (`--verify-run`, separate processes) pairs do
+/// not share this snapshot: sealing a whole tree through the
+/// verify-inputs holder is follow-up work, so an external pair still
+/// recopies per process while sharing the sealed cache bytes.
+#[derive(Clone)]
+pub(super) struct EtcSnapshot {
+    // Manual Debug below: the guard/temp files are not Debug-meaningful.
+    view: std::sync::Arc<EtcViewGuard>,
+    frozen_group: std::sync::Arc<tempfile::NamedTempFile>,
+    frozen_cache: Option<std::sync::Arc<tempfile::NamedTempFile>>,
+    cache: LdSoCacheSnapshot,
+}
+
+impl std::fmt::Debug for EtcSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EtcSnapshot")
+            .field("view", &self.view.view())
+            .field("cache", &self.cache)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EtcSnapshot {
+    /// Capture the host `/etc` once, using `ld_so_cache` (or the host's
+    /// cache now) as the frozen cache bytes.
+    pub(super) fn capture(ld_so_cache: Option<&LdSoCacheSnapshot>) -> Result<Self, Error> {
+        let group = frozen_group_contents()?;
+        Self::capture_from(Path::new("/etc"), &group, ld_so_cache)
+    }
+
+    fn capture_from(
+        source: &Path,
+        group: &[u8],
+        ld_so_cache: Option<&LdSoCacheSnapshot>,
+    ) -> Result<Self, Error> {
+        let cache_snapshot = match ld_so_cache {
+            Some(snapshot) => snapshot.clone(),
+            None => LdSoCacheSnapshot::of_host()?,
+        };
+        let cache: Option<&[u8]> = cache_snapshot
+            .0
+            .as_deref()
+            .map(|bytes: &Vec<u8>| bytes.as_slice());
+        let (_view_path, guard) = hermit_etc_view(source, group, cache)?;
+        let frozen_group = std::sync::Arc::new(frozen_temp_file(group, "guest group database")?);
+        let frozen_cache = match cache {
+            Some(cache) => Some(std::sync::Arc::new(frozen_temp_file(
+                cache,
+                "guest dynamic-linker cache",
+            )?)),
+            None => None,
+        };
+        Ok(Self {
+            view: std::sync::Arc::new(guard),
+            frozen_group,
+            frozen_cache,
+            cache: cache_snapshot,
+        })
+    }
+
+    pub(super) fn view(&self) -> &Path {
+        self.view.view()
+    }
+}
+
 /// Deterministic identity-resolution mounts shared by `run`, `record`, and
 /// `replay`: Hermit's private `/etc` copy ([`hermit_etc_view`], holding a
 /// frozen `/etc/group` and a frozen `/etc/ld.so.cache`) bound over
-/// `/etc`, and an empty directory over the host nscd cache. These keep
+/// `/etc`, guard-held frozen temp files bound readonly over the copy's
+/// `group`/`ld.so.cache` (true read-only, not just 0444 bits a mapped-root
+/// guest could bypass with CAP_DAC_OVERRIDE — the bind targets are
+/// Hermit-owned dentries in the copy, so no host rename can detach them),
+/// and an empty directory over the host nscd cache. These keep
 /// guest NSS lookups from reaching nondeterministic host state (the nscd
 /// cache and the systemd-userdb socket), so record/replay reproduce the
 /// same group/user resolution that `run` mode already enforces. Because
 /// the mounts are built here, before any backend dispatch, every backend
 /// sees the same frozen `/etc` for the whole run. Returns the mounts
-/// plus a guard that must outlive container setup.
+/// plus a guard that must outlive container setup. A user mount at
+/// `/etc` discards all of these (`discard_mounts_shadowed_by`); a user
+/// mount at one frozen file discards only that file's bind, and the
+/// user's later mount layers over the copy there.
 ///
 /// `ld_so_cache`: the snapshot both runs of a verification share, or `None`
 /// to take the host's cache now.
 pub(super) fn identity_hardening_mounts(
     ld_so_cache: Option<&LdSoCacheSnapshot>,
 ) -> Result<(Vec<Mount>, IdentityGuard), Error> {
-    let group = frozen_group_contents()?;
-    let snapshot = match ld_so_cache {
-        Some(snapshot) => snapshot.clone(),
-        None => LdSoCacheSnapshot::of_host()?,
+    identity_hardening_mounts_with_etc(ld_so_cache, None)
+}
+
+/// [`identity_hardening_mounts`] over a pre-captured [`EtcSnapshot`]:
+/// both runs of an in-process verification pass the same snapshot, so
+/// they bind the same copied view directory instead of recopying.
+pub(super) fn identity_hardening_mounts_with_etc(
+    ld_so_cache: Option<&LdSoCacheSnapshot>,
+    etc_snapshot: Option<&EtcSnapshot>,
+) -> Result<(Vec<Mount>, IdentityGuard), Error> {
+    // A shared snapshot's frozen cache is authoritative for the pair;
+    // otherwise the snapshot's cache must be the caller's snapshot.
+    let owned_snapshot;
+    let etc = match etc_snapshot {
+        Some(snapshot) => snapshot,
+        None => {
+            owned_snapshot = EtcSnapshot::capture(ld_so_cache)?;
+            &owned_snapshot
+        }
     };
-    let cache: Option<&[u8]> = snapshot
-        .0
-        .as_deref()
-        .map(|bytes: &Vec<u8>| bytes.as_slice());
-    let (view, etc_guard) = hermit_etc_view(Path::new("/etc"), &group, cache)?;
-    let mut mountinfo_roots = vec![MountInfoRootSource::new(
-        etc_guard.view(),
-        Path::new("/etc"),
-        DETERMINISTIC_ETC_ROOT,
-    )?];
-    let mut mounts = vec![Mount::bind(&view, Path::new("/etc"))];
+    if let (Some(requested), true) = (ld_so_cache, etc_snapshot.is_some()) {
+        anyhow::ensure!(
+            requested == &etc.cache,
+            "the shared /etc snapshot does not hold the requested /etc/ld.so.cache snapshot"
+        );
+    }
+    let view = etc.view().to_path_buf();
+    let etc_guard = etc.view.clone();
+    // True read-only for the frozen files: readonly binds of guard-held
+    // temp files (same bytes as the copy's 0444 files) over the copy's
+    // dentries. Unlike the pre-copy scheme, the targets are Hermit's own
+    // files, so a host rename in /etc cannot detach them.
+    let frozen_group = etc.frozen_group.clone();
+    let frozen_cache = etc.frozen_cache.clone();
+    let mut mountinfo_roots = vec![
+        MountInfoRootSource::new(etc.view(), Path::new("/etc"), DETERMINISTIC_ETC_ROOT)?,
+        MountInfoRootSource::new(
+            frozen_group.path(),
+            Path::new(GROUP_FILE),
+            DETERMINISTIC_GROUP_ROOT,
+        )?,
+    ];
+    let mut mounts = vec![
+        Mount::bind(&view, Path::new("/etc")),
+        Mount::bind(frozen_group.path(), Path::new(GROUP_FILE)).readonly(),
+    ];
+    if let Some(cache_file) = &frozen_cache {
+        mountinfo_roots.push(MountInfoRootSource::new(
+            cache_file.path(),
+            Path::new(LD_SO_CACHE),
+            DETERMINISTIC_LD_SO_CACHE_ROOT,
+        )?);
+        mounts.push(Mount::bind(cache_file.path(), Path::new(LD_SO_CACHE)).readonly());
+    }
 
     // Host nscd cache readiness is external state and can differ between runs.
     let nscd_dir = if Path::new(NSCD_DIR).is_dir() {
@@ -1540,6 +1940,8 @@ pub(super) fn identity_hardening_mounts(
         mounts,
         IdentityGuard {
             _etc_view: Some(etc_guard),
+            _frozen_group: Some(frozen_group),
+            _frozen_ld_so_cache: frozen_cache,
             _nscd_dir: nscd_dir,
             mountinfo_roots,
             user_mount_targets: Vec::new(),
@@ -6531,6 +6933,26 @@ mod tests {
             0o444,
             "the frozen group must be read-only like the old readonly bind"
         );
+        // True read-only: a readonly bind of the guard-held temp file,
+        // with deterministic mountinfo provenance for its row.
+        let group_mount = mounts
+            .iter()
+            .find(|mount| mount.get_target() == Path::new(GROUP_FILE))
+            .expect("identity hardening must bind the frozen group");
+        assert_eq!(
+            group_mount.clone().flags(MountFlags::MS_RDONLY),
+            *group_mount,
+            "the frozen group bind must be readonly: {group_mount:?}"
+        );
+        assert_eq!(
+            group_mount.get_source(),
+            guard._frozen_group.as_ref().map(|file| file.path()),
+            "the group bind source must be the guard-held temp file"
+        );
+        assert!(guard.mountinfo_roots.iter().any(|root| {
+            root.target == Path::new(GROUP_FILE)
+                && root.deterministic_root.as_deref() == Some(DETERMINISTIC_GROUP_ROOT)
+        }));
         let overflow_gid = overflow_gid();
         assert_eq!(overflow_gid, "65534");
         assert!(
@@ -6576,6 +6998,24 @@ mod tests {
             root.target == Path::new("/etc")
                 && root.deterministic_root.as_deref() == Some(DETERMINISTIC_ETC_ROOT)
         }));
+        let cache_mount = mounts
+            .iter()
+            .find(|mount| mount.get_target() == Path::new(LD_SO_CACHE))
+            .expect("identity hardening must bind the frozen cache");
+        assert_eq!(
+            cache_mount.clone().flags(MountFlags::MS_RDONLY),
+            *cache_mount,
+            "the frozen cache bind must be readonly: {cache_mount:?}"
+        );
+        assert_eq!(
+            cache_mount.get_source(),
+            guard._frozen_ld_so_cache.as_ref().map(|file| file.path()),
+            "the cache bind source must be the guard-held temp file"
+        );
+        assert!(guard.mountinfo_roots.iter().any(|root| {
+            root.target == Path::new(LD_SO_CACHE)
+                && root.deterministic_root.as_deref() == Some(DETERMINISTIC_LD_SO_CACHE_ROOT)
+        }));
     }
 
     // Both runs of a verification take the guest's cache from the one
@@ -6602,7 +7042,14 @@ mod tests {
             1,
             "{mounts:?}"
         );
-        let (_mounts, guard) = identity_hardening_mounts(Some(&LdSoCacheSnapshot(None)))
+        assert!(
+            mounts.iter().any(|mount| {
+                mount.get_target() == Path::new(LD_SO_CACHE)
+                    && mount.clone().flags(MountFlags::MS_RDONLY) == *mount
+            }),
+            "the snapshot cache must get a readonly bind: {mounts:?}"
+        );
+        let (mounts, guard) = identity_hardening_mounts(Some(&LdSoCacheSnapshot(None)))
             .expect("identity hardening mounts should be constructible");
         let view = guard
             ._etc_view
@@ -6611,6 +7058,13 @@ mod tests {
         assert!(
             !view.view().join("ld.so.cache").exists(),
             "a snapshot of a host without a cache puts none in the copy"
+        );
+        assert!(guard._frozen_ld_so_cache.is_none());
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| mount.get_target() != Path::new(LD_SO_CACHE)),
+            "no cache snapshot means no cache bind: {mounts:?}"
         );
     }
 
@@ -6625,20 +7079,34 @@ mod tests {
                 .any(|mount| mount.get_target() == Path::new("/etc")),
             "a mount at /etc/ld.so.cache layers over the /etc copy: {mounts:?}"
         );
-        guard.discard_mounts_shadowed_by(&mut mounts, Path::new("/etc"));
         assert!(
             mounts
                 .iter()
-                .all(|mount| mount.get_target() != Path::new("/etc")),
-            "a mount at /etc shadows the /etc copy: {mounts:?}"
+                .any(|mount| mount.get_target() == Path::new(GROUP_FILE)),
+            "a mount at /etc/ld.so.cache leaves the frozen group bind: {mounts:?}"
         );
         assert!(
-            guard
-                .mountinfo_roots
+            mounts
                 .iter()
-                .all(|root| root.target != Path::new("/etc")),
-            "the shadowed /etc copy keeps no mountinfo provenance"
+                .all(|mount| mount.get_target() != Path::new(LD_SO_CACHE)),
+            "a user mount at /etc/ld.so.cache discards only the frozen cache bind: {mounts:?}"
         );
+        guard.discard_mounts_shadowed_by(&mut mounts, Path::new("/etc"));
+        for target in ["/etc", GROUP_FILE, LD_SO_CACHE] {
+            assert!(
+                mounts
+                    .iter()
+                    .all(|mount| mount.get_target() != Path::new(target)),
+                "a mount at /etc shadows every identity mount ({target}): {mounts:?}"
+            );
+            assert!(
+                guard
+                    .mountinfo_roots
+                    .iter()
+                    .all(|root| root.target != Path::new(target)),
+                "the shadowed identity mount keeps no mountinfo provenance ({target})"
+            );
+        }
     }
 
     // Non-world-readable files/dirs must not leak host secrets into the
@@ -6671,6 +7139,11 @@ mod tests {
         fs::create_dir_all(lower.join("ssl")).unwrap();
         fs::write(lower.join("ssl/cert.pem"), b"CERT\n").unwrap();
         fs::set_permissions(lower.join("ssl"), fs::Permissions::from_mode(0o755)).unwrap();
+        let dir_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_111_111_111);
+        File::open(lower.join("ssl"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(dir_mtime))
+            .unwrap();
 
         let (view, _guard) = hermit_etc_view(&lower, b"frozen:x:2:\n", Some(b"CACHE"))
             .expect("build the /etc copy over the fake root");
@@ -6716,6 +7189,12 @@ mod tests {
             "a non-world-readable directory's contents must not be copied"
         );
         assert_eq!(fs::read(view.join("ssl/cert.pem")).unwrap(), b"CERT\n");
+        assert_eq!(
+            fs::metadata(view.join("ssl")).unwrap().modified().unwrap(),
+            dir_mtime,
+            "a copied directory keeps its source mtime (restored post-order, \
+             after copying its children bumped it)"
+        );
         for frozen in ["group", "ld.so.cache"] {
             assert_eq!(
                 fs::metadata(view.join(frozen))
@@ -6725,6 +7204,183 @@ mod tests {
                     & 0o777,
                 0o444,
                 "frozen {frozen} must be read-only"
+            );
+        }
+    }
+
+    // A symlink in the tree whose target is a non-world-readable secret
+    // outside the fake /etc must be recreated as a symlink — its content
+    // must never be copied into a regular file in the view (the fd-based
+    // copy's O_NOFOLLOW decision, not a path re-open).
+    #[test]
+    fn etc_copy_recreates_a_symlink_to_a_secret_as_a_symlink() {
+        let fake = tempfile::TempDir::new().expect("create fake root");
+        let secret = fake.path().join("secret-outside-etc");
+        fs::write(&secret, b"HOST-SECRET-CONTENT\n").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let lower = fake.path().join("lower");
+        fs::create_dir_all(&lower).expect("create fake /etc");
+        std::os::unix::fs::symlink(&secret, lower.join("leaky-link")).unwrap();
+        fs::write(lower.join("hosts"), b"127.0.0.1 localhost\n").unwrap();
+
+        let (view, _guard) = hermit_etc_view(&lower, b"frozen:x:2:\n", None)
+            .expect("build the /etc copy over the fake root");
+        let copied = view.join("leaky-link");
+        assert!(
+            fs::symlink_metadata(&copied)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a symlink entry must be recreated as a symlink, not copied"
+        );
+        assert_eq!(fs::read_link(&copied).unwrap(), secret);
+        // No regular file anywhere in the view carries the secret bytes.
+        for entry in fs::read_dir(&view).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert!(
+                    !fs::read(entry.path())
+                        .unwrap()
+                        .windows(b"HOST-SECRET-CONTENT".len())
+                        .any(|window| window == b"HOST-SECRET-CONTENT"),
+                    "secret content leaked into {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+
+    // A frozen file whose copied placeholder lacks owner-write (0400)
+    // must still be rewritten authoritatively, ending 0444.
+    #[test]
+    fn write_frozen_file_rewrites_a_non_writable_placeholder() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let path = dir.path().join("group");
+        fs::write(&path, b"stale:x:1:\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        write_frozen_file(&path, b"frozen:x:2:\n", "guest group database")
+            .expect("a 0400 placeholder must not defeat the frozen write");
+        assert_eq!(fs::read(&path).unwrap(), b"frozen:x:2:\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+
+        // Through the full view: a host group entry copied as a 0400
+        // placeholder is likewise replaced by the frozen bytes.
+        let lower = dir.path().join("lower");
+        fs::create_dir_all(&lower).unwrap();
+        fs::write(lower.join("group"), b"host:x:1:\n").unwrap();
+        fs::set_permissions(lower.join("group"), fs::Permissions::from_mode(0o400)).unwrap();
+        let (view, _guard) = hermit_etc_view(&lower, b"frozen:x:2:\n", None)
+            .expect("build the /etc copy over a 0400 group placeholder");
+        assert_eq!(fs::read(view.join("group")).unwrap(), b"frozen:x:2:\n");
+        assert_eq!(
+            fs::metadata(view.join("group"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+    }
+
+    // Finding 1: a frozen entry that is a symlink to a host file outside
+    // the view must be replaced by an exclusively created regular file;
+    // the victim must keep its bytes and mode.
+    #[test]
+    fn write_frozen_file_does_not_follow_a_symlink_to_a_host_file() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, b"HOST-VICTIM\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        let path = dir.path().join("group");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        write_frozen_file(&path, b"frozen:x:2:\n", "guest group database")
+            .expect("replace the frozen symlink");
+        assert_eq!(fs::read(&victim).unwrap(), b"HOST-VICTIM\n");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the symlink target's mode must not be chmodded"
+        );
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the frozen entry must now be a regular file"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"frozen:x:2:\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    // Finding 5: a special file in the tree is a named refusal, not a
+    // silently incomplete copy.
+    #[test]
+    fn etc_copy_refuses_a_special_file_by_name() {
+        let fake = tempfile::TempDir::new().expect("create fake root");
+        let lower = fake.path().join("lower");
+        fs::create_dir_all(&lower).expect("create fake /etc");
+        fs::write(lower.join("hosts"), b"127.0.0.1 localhost\n").unwrap();
+        let fifo = lower.join("a-fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o644) }, 0);
+        let error = hermit_etc_view(&lower, b"frozen:x:2:\n", None)
+            .err()
+            .expect("a fifo must refuse the /etc copy");
+        assert!(
+            error.to_string().contains("a-fifo") && format!("{error:#}").contains("special file"),
+            "{error:#}"
+        );
+    }
+
+    // Finding 4: one EtcSnapshot captured over a fake root serves two
+    // identity-mount builds: same view directory (not a recopy), and a
+    // host change after capture reaches neither.
+    #[test]
+    fn etc_snapshot_is_shared_across_a_verify_pair() {
+        let fake = tempfile::TempDir::new().expect("create fake root");
+        let lower = fake.path().join("lower");
+        fs::create_dir_all(&lower).expect("create fake /etc");
+        fs::write(lower.join("hosts"), b"127.0.0.1 v1\n").unwrap();
+        fs::write(lower.join("group"), b"host:x:1:\n").unwrap();
+        let cache = LdSoCacheSnapshot::from_bytes(b"CACHE-V1".to_vec());
+        let snapshot = EtcSnapshot::capture_from(&lower, b"frozen:x:2:\n", Some(&cache))
+            .expect("capture the sealed /etc snapshot");
+        // Host change after capture.
+        fs::write(lower.join("hosts"), b"127.0.0.1 v2\n").unwrap();
+        let (mounts1, _guard1) = identity_hardening_mounts_with_etc(Some(&cache), Some(&snapshot))
+            .expect("first run mounts");
+        let (mounts2, _guard2) = identity_hardening_mounts_with_etc(Some(&cache), Some(&snapshot))
+            .expect("second run mounts");
+        let etc_source = |mounts: &Vec<Mount>| {
+            mounts
+                .iter()
+                .find(|mount| mount.get_target() == Path::new("/etc"))
+                .and_then(|mount| mount.get_source().map(Path::to_path_buf))
+        };
+        assert_eq!(etc_source(&mounts1), etc_source(&mounts2));
+        assert_eq!(
+            etc_source(&mounts1).as_deref(),
+            Some(snapshot.view()),
+            "both runs bind the snapshot's one copied view directory"
+        );
+        assert_eq!(
+            fs::read(snapshot.view().join("hosts")).unwrap(),
+            b"127.0.0.1 v1\n",
+            "a host change after capture must reach neither run"
+        );
+        for mounts in [&mounts1, &mounts2] {
+            assert!(
+                mounts.iter().any(|mount| {
+                    mount.get_target() == Path::new(GROUP_FILE)
+                        && mount.clone().flags(MountFlags::MS_RDONLY) == *mount
+                }),
+                "each run gets the readonly frozen group bind: {mounts:?}"
             );
         }
     }
@@ -6764,16 +7420,25 @@ mod tests {
             (u64, u64, u64),
             (u64, u64, u64),
             (u32, u32),
+            (bool, bool),
         );
         let (view, guard) = hermit_etc_view(&lower, b"frozen:x:2:\n", Some(b"HOST-CACHE-V1"))
             .expect("build the /etc copy over the fake root");
         assert_eq!(view, guard.view().to_path_buf());
+        // The production readonly binds over the copy's frozen files.
+        let frozen_group = frozen_temp_file(b"frozen:x:2:\n", "guest group database").unwrap();
+        let frozen_cache =
+            frozen_temp_file(b"HOST-CACHE-V1", "guest dynamic-linker cache").unwrap();
         let mount = Mount::bind(&view, &merged);
+        let group_mount = Mount::bind(frozen_group.path(), merged.join("group")).readonly();
+        let cache_mount = Mount::bind(frozen_cache.path(), merged.join("ld.so.cache")).readonly();
         let (lower_in, merged_in) = (lower.clone(), merged.clone());
         let facts = Container::new()
             .map_root()
             .mount(Mount::new("/").rprivate())
             .mount(mount)
+            .mount(group_mount)
+            .mount(cache_mount)
             .checked_run(move || -> Result<EtcCopyFacts, String> {
                 use std::os::unix::fs::MetadataExt as _;
                 let stat = |file: &File| {
@@ -6815,8 +7480,13 @@ mod tests {
                     fs::read(merged_in.join("passwd")).map_err(|error| error.to_string())?;
                 let nested =
                     fs::read(merged_in.join("subdir/nested")).map_err(|error| error.to_string())?;
-                // Mode bits, not a live write: mapped-root may bypass
-                // 0o444 via CAP_DAC_OVERRIDE, the bits are the contract.
+                // A live write, not just mode bits: the readonly bind
+                // must refuse it even for mapped root (which could bypass
+                // the copy's 0o444 bits via CAP_DAC_OVERRIDE).
+                let writes_blocked = (
+                    fs::write(merged_in.join("ld.so.cache"), b"poison").is_err(),
+                    fs::write(merged_in.join("group"), b"poison").is_err(),
+                );
                 use std::os::unix::fs::PermissionsExt as _;
                 let modes = (
                     fs::metadata(merged_in.join("ld.so.cache"))
@@ -6839,11 +7509,17 @@ mod tests {
                     before,
                     after,
                     modes,
+                    writes_blocked,
                 ))
             })
             .expect("run the /etc copy in its own namespace")
             .expect("the /etc copy must keep the frozen cache across a host rename");
-        let (first, second, third, group, passwd, before, after, modes) = facts;
+        let (first, second, third, group, passwd, before, after, modes, writes_blocked) = facts;
+        assert_eq!(
+            writes_blocked,
+            (true, true),
+            "the readonly frozen binds must refuse guest writes"
+        );
         assert_eq!(first, b"HOST-CACHE-V1");
         assert_eq!(second, b"HOST-CACHE-V1");
         assert_eq!(
@@ -6857,6 +7533,140 @@ mod tests {
         assert_eq!(modes, (0o444, 0o444), "frozen files are read-only");
     }
 
+    // Finding 6: the rename is done by the *parent* namespace (this
+    // test thread, outside the container's mount namespace) over the
+    // dentry that hosted the old-style per-file bind, while the guest
+    // waits. Old plan (frozen tempfile bound onto the host cache
+    // dentry): the external rename detaches the bind, so the guest's
+    // reopened cache changes — the original failure. New plan (private
+    // copy bound at a guest /etc, readonly frozen bind over the copy's
+    // dentry): the same external rename over the host cache leaves the
+    // guest's content, open-fd fstat, uid/gid and mount table identical.
+    // Fake roots only; the real /etc is never touched.
+    #[test]
+    fn etc_external_parent_rename_detaches_old_bind_but_not_the_copy_bind() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
+        type Facts = (
+            Vec<u8>,
+            Vec<u8>,
+            (u64, u64, u64),
+            (u64, u64, u64),
+            (u32, u32),
+            bool,
+        );
+        fn scenario(old_style: bool) -> Facts {
+            let fake = tempfile::TempDir::new().expect("create fake root");
+            let host = fake.path().join("host-etc");
+            let guest = fake.path().join("guest-etc");
+            fs::create_dir_all(&host).expect("create fake host /etc");
+            fs::create_dir_all(&guest).expect("create guest /etc target");
+            fs::write(host.join("ld.so.cache"), b"HOST-CACHE-V1").unwrap();
+            fs::write(host.join("group"), b"host:x:1:\n").unwrap();
+            // The external renamer: a separate process (not a thread of
+            // this one, so the container clone stays single-threaded)
+            // that waits for the guest's signal, renames a new cache
+            // over the host dentry, then signals back.
+            let ready = fake.path().join("ready");
+            let renamed = fake.path().join("renamed");
+            let incoming = host.join(".new-cache");
+            fs::write(&incoming, b"HOST-CACHE-V2").unwrap();
+            let mut renamer = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("while [ ! -e \"$1\" ]; do sleep 0.01; done; mv \"$2\" \"$3\"; : > \"$4\"")
+                .arg("renamer")
+                .arg(&ready)
+                .arg(&incoming)
+                .arg(host.join("ld.so.cache"))
+                .arg(&renamed)
+                .spawn()
+                .expect("spawn the external renamer");
+            let frozen = frozen_temp_file(b"HOST-CACHE-V1", "guest dynamic-linker cache").unwrap();
+            let mut container = Container::new();
+            container.map_root();
+            container.mount(Mount::new("/").rprivate());
+            // Keep the view guard alive until checked_run returns.
+            let _view_guard;
+            let target_cache;
+            if old_style {
+                target_cache = host.join("ld.so.cache");
+                container.mount(Mount::bind(frozen.path(), &target_cache));
+            } else {
+                let (view, guard) =
+                    hermit_etc_view(&host, b"frozen:x:2:\n", Some(b"HOST-CACHE-V1"))
+                        .expect("build the /etc copy over the fake root");
+                _view_guard = guard;
+                target_cache = guest.join("ld.so.cache");
+                container.mount(Mount::bind(&view, &guest));
+                container.mount(Mount::bind(frozen.path(), guest.join("ld.so.cache")).readonly());
+            }
+            let facts = container
+                .checked_run(move || -> Result<Facts, String> {
+                    use std::os::unix::fs::MetadataExt as _;
+                    let stat = |file: &File| {
+                        file.metadata()
+                            .map(|meta| (meta.dev(), meta.ino(), meta.nlink()))
+                            .map_err(|error| error.to_string())
+                    };
+                    let cache = File::open(&target_cache).map_err(|e| e.to_string())?;
+                    let before = stat(&cache)?;
+                    let owner = cache
+                        .metadata()
+                        .map(|meta| (meta.uid(), meta.gid()))
+                        .map_err(|e| e.to_string())?;
+                    let first = fs::read(&target_cache).map_err(|e| e.to_string())?;
+                    fs::write(&ready, b"ready").map_err(|e| e.to_string())?;
+                    // Wait for the parent namespace's rename.
+                    for _ in 0..1500 {
+                        if renamed.exists() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    if !renamed.exists() {
+                        return Err("parent rename never happened".to_string());
+                    }
+                    let after = stat(&cache)?;
+                    let second = fs::read(&target_cache).map_err(|e| e.to_string())?;
+                    let mountinfo =
+                        fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?;
+                    let mount_present = mountinfo
+                        .lines()
+                        .any(|line| line.contains(target_cache.to_str().unwrap_or_default()));
+                    Ok((first, second, before, after, owner, mount_present))
+                })
+                .expect("run the rename scenario in its own namespace")
+                .expect("the rename scenario guest must complete");
+            renamer.wait().expect("the external renamer must finish");
+            facts
+        }
+
+        let old = scenario(true);
+        assert_eq!(old.0, b"HOST-CACHE-V1");
+        assert_eq!(
+            old.1, b"HOST-CACHE-V2",
+            "old-style bind: an external rename over its host dentry changes what the guest reopens"
+        );
+        assert!(
+            !old.5,
+            "old-style bind: the external rename detaches it from the guest mount table"
+        );
+
+        let new = scenario(false);
+        assert_eq!(new.0, b"HOST-CACHE-V1");
+        assert_eq!(
+            new.1, b"HOST-CACHE-V1",
+            "copy bind: the same external rename must leave the guest identical"
+        );
+        assert_eq!(new.2, new.3, "the open cache's fstat must not move");
+        assert_eq!(new.2.2, 1, "the frozen cache keeps nlink 1");
+        assert!(
+            new.5,
+            "copy bind: the frozen mount stays in the guest mount table"
+        );
+    }
+
     #[test]
     fn mountinfo_provenance_uses_object_identity_not_temp_name_or_target() {
         let actual = tempfile::NamedTempFile::new().expect("create actual temporary source");
@@ -6865,6 +7675,8 @@ mod tests {
             MountInfoRootSource::new(actual.path(), &target, b"/tmpvol/.hermit/matching").unwrap();
         let guard = IdentityGuard {
             _etc_view: None,
+            _frozen_group: None,
+            _frozen_ld_so_cache: None,
             _nscd_dir: None,
             mountinfo_roots: vec![matching],
             user_mount_targets: Vec::new(),
@@ -6940,6 +7752,8 @@ mod tests {
                 .unwrap();
         let guard = IdentityGuard {
             _etc_view: None,
+            _frozen_group: None,
+            _frozen_ld_so_cache: None,
             _nscd_dir: None,
             mountinfo_roots: vec![same_target_wrong_source],
             user_mount_targets: Vec::new(),
