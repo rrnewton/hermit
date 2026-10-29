@@ -76,6 +76,16 @@ impl Workspace {
         &self.path
     }
 
+    /// Keep the workspace, `because` (said on the line that names it), if it
+    /// was to be removed.
+    pub fn keep(&mut self, because: &'static str) {
+        if self.retention == Retention::Remove {
+            self.retention = Retention::Keep {
+                because: Some(because),
+            };
+        }
+    }
+
     /// Remove the workspace, or keep it, and return the line that says
     /// which, once: the paths analyze printed name the workspace.
     fn close(&mut self) -> Option<String> {
