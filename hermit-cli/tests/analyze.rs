@@ -452,6 +452,13 @@ fn bisect_rejects_a_timed_out_replay() {
 /// same with `spin`; only the behavior after a wins changes. This keeps seed
 /// discovery bounded without waiting for every losing seed to time out.
 fn race_then_target_seed() -> u64 {
+    race_then_target_seed_matching("exit")
+}
+
+/// [`race_then_target_seed`] for a mode argument as long as `stand_in`, which
+/// the fixture does not act on: a terminating run with the same argc and
+/// argument length before the race.
+fn race_then_target_seed_matching(stand_in: &str) -> u64 {
     let guest = &workloads().race_then;
     for seed in 0..40 {
         let mut command = Command::new("timeout");
@@ -463,9 +470,9 @@ fn race_then_target_seed() -> u64 {
         if let Some(margin) = std::env::var_os(ANALYZE_SKID_MARGIN_ENV) {
             command.arg(format!("--skid-margin={}", margin.to_string_lossy()));
         }
-        // Match spin's argc and argument length before the race. The mode is
-        // inspected only after the winning thread is known.
-        command.arg("--").arg(guest).arg("exit");
+        // Match the mode's argc and argument length before the race. The mode
+        // is inspected only after the winning thread is known.
+        command.arg("--").arg(guest).arg(stand_in);
         let output = hermit_test::hermit_output("terminating race seed discovery", &mut command);
         match output.status.code() {
             Some(0) => {
@@ -645,8 +652,35 @@ fn analyze_reproducer_runs_from_another_directory() {
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_ends_at_a_refused_trial() {
     let label = "analyze --prefix-search analyze_race_then refuse";
-    let (output, report) = analyze_race_then_with("refuse", &["--prefix-search"], &[]);
-    let combined = combined_output(&output);
+    let _guard = analyze_lock();
+    // "finish" is as long as "refuse", and the fixture does not act on it.
+    let seed = race_then_target_seed_matching("finish");
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report.json");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=KILL", "60s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "analyze",
+            "--prefix-search",
+            "--target-stdout=b-first",
+            "--target-exit-code=0",
+            "--trial-timeout=30",
+        ])
+        .arg(format!("--run1-seed={seed}"))
+        .arg(format!("--report-file={}", report.display()));
+    add_calibrated_skid_margin(&mut command, label);
+    command
+        .args(["--", "--chaos", "--"])
+        .arg(&workloads().race_then)
+        .arg("refuse");
+    let output = hermit_test::hermit_output(label, &mut command);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     assert_eq!(output.status.code(), Some(122), "{label}\n{combined}");
     assert!(
         combined.contains("HERMIT_POLICY_REFUSAL")
@@ -654,7 +688,7 @@ fn analyze_ends_at_a_refused_trial() {
         "{label}\n{combined}"
     );
     assert!(
-        report.is_none(),
+        !report.exists(),
         "{label}: a refused trial gave a report\n{combined}"
     );
 }
@@ -674,7 +708,11 @@ fn analyze_ends_with_a_refused_target_run() {
         .arg(guest)
         .arg("refuse");
     let output = hermit_test::hermit_output(label, &mut command);
-    let combined = combined_output(&output);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     assert_eq!(output.status.code(), Some(122), "{label}\n{combined}");
     assert!(
         combined.contains("HERMIT_POLICY_REFUSAL"),

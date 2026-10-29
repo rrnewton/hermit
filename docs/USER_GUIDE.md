@@ -807,8 +807,7 @@ lifts both file caps. These host resource limits may stop a trial on a slow
 machine; they never change a stopped trial into a completed outcome.
 A trial that Hermit refuses when its guest reaches an operation Hermit does
 not support (exit 122) has no outcome either, and the analysis ends with the
-refusal; a refused baseline run makes analyze search within the target
-schedule instead, as one the bound ends does.
+refusal, as it does for a refused target run.
 
 By default analyze bisects between the failing schedule and a passing one from
 another run. When the two runs differ in events only one of them executed (for
