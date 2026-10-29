@@ -161,7 +161,9 @@ mod tests {
         // revisions 17 to 19, never on main, became this one when main took
         // 17 to 19).
         (20, "3fb2388350b1a2fa", "f013e36743d8d9e6"),
-        // Adds `GlobalRequest::TakeSleepInterruption` and its response.
+        // Adds `GlobalRequest::TakeSleepInterruption` and its response, and
+        // `ObservationFinish::InterruptForCaught`'s `dequeue`, which the
+        // digest does not cover (https://github.com/rrnewton/hermit/issues/4931).
         (21, "a26a19716aa915db", "f013e36743d8d9e6"),
     ];
 
