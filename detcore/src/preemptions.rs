@@ -367,6 +367,7 @@ impl PreemptionRecord {
             chaos_timeslice,
             guest_ids,
             reserved_input,
+            uncapped_slices,
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
@@ -420,6 +421,7 @@ impl PreemptionRecord {
             chaos_timeslice: *chaos_timeslice,
             guest_ids: *guest_ids,
             reserved_input: reserved_input.clone(),
+            uncapped_slices: *uncapped_slices,
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
@@ -2185,6 +2187,27 @@ mod tests {
             assert_eq!(
                 record.schedule_prefix(len).chaos_timeslice,
                 Some(4321),
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// Whether the run ended its slices without the `--max-timeslice` bound
+    /// is a setting of the whole run, as the other run settings are, and its
+    /// latest logical time still bounds every slice of a prefix: a prefix of
+    /// the schedule keeps the mark, whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_uncapped_slices_mark() {
+        let tid = DetTid::from_raw(3);
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_uncapped_slices(Some(9_400_000));
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).uncapped_slices(),
+                Some(9_400_000),
                 "prefix of {len} events"
             );
         }
