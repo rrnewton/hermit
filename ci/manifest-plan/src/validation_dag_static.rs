@@ -3411,7 +3411,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable (a
     // thread's fault ends the run by its signal while main waits on a
     // condition variable): 287, listed.
-    ("test.hermit_integration_2", 290),
+    // And this change's lit_guest_held_polls_main and
+    // lit_guest_held_polls_hermit_run: 292, listed.
+    ("test.hermit_integration_2", 292),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5500,7 +5502,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two-run syscall-histogram test: 693, listed.
     // And the same random_determinism schedule-replay test: 694, listed.
     // Train 6 recount (measured on 21f770f6 base): 695.
-    ("test.hermit_integration_on_host", 698),
+    // And the same two lit cases: 700, listed.
+    ("test.hermit_integration_on_host", 700),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
