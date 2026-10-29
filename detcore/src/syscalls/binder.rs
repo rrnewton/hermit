@@ -135,6 +135,7 @@ pub(crate) fn delivered<M: MemoryAccess>(
             messages: vec![crate::syscalls::scm_rights::DeliveredMessage {
                 count: fds.len(),
                 truncated: false,
+                bytes: None,
             }],
             fds,
             refused: None,
@@ -424,6 +425,7 @@ mod tests {
                 messages: vec![crate::syscalls::scm_rights::DeliveredMessage {
                     count: 1,
                     truncated: false,
+                    bytes: None,
                 }],
                 refused: None
             }

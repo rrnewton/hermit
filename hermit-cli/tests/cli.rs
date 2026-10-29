@@ -263,6 +263,8 @@ static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CWD_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static ABSENT_CPU_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SCM_RIGHTS_RECEIVED_ANON_INODES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SCM_RIGHTS_EXITED_RECEIVER_PORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -8176,6 +8178,213 @@ fn run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files() {
         return;
     }
     look_up_dotdot_from_received_descriptors("kvm");
+}
+
+/// What `tests/c/scm_rights_received_anon_inodes.c` prints natively (Linux
+/// 7.1.3): a child sends an eventfd holding 5, an `EFD_SEMAPHORE` eventfd
+/// holding 3, a nonblocking eventfd and a signalfd for the parent's blocked,
+/// pending `SIGUSR1`, and exits; every read, write and `fcntl` through the
+/// received descriptors succeeds, as the queued messages kept the open files
+/// alive.
+const SCM_RIGHTS_RECEIVED_ANON_INODES_LINUX: &str = "\
+received eventfd=1 semaphore=1 nonblocking=1 signalfd=1
+eventfd read=8 errno=0
+eventfd value=5
+eventfd write=8 errno=0
+semaphore read 16=8 errno=0
+semaphore value=1
+nonblocking F_GETFL=2050 errno=0
+nonblocking F_SETFL 0=0 errno=0
+nonblocking now=0
+signalfd read 2 records=128 errno=0
+signalfd signo=10
+done
+";
+
+/// The same on KVM, whose executor refuses to donate a signalfd (`ENOSYS`),
+/// so the child sends a message without one and the signalfd lines are
+/// skipped.
+const SCM_RIGHTS_RECEIVED_ANON_INODES_KVM: &str = "\
+sender signalfd sendmsg errno=38
+received eventfd=1 semaphore=1 nonblocking=1 signalfd=0
+eventfd read=8 errno=0
+eventfd value=5
+eventfd write=8 errno=0
+semaphore read 16=8 errno=0
+semaphore value=1
+nonblocking F_GETFL=2050 errno=0
+nonblocking F_SETFL 0=0 errno=0
+nonblocking now=0
+signalfd not received
+done
+";
+
+/// A receipt over `SCM_RIGHTS` from a sender that has exited names the open
+/// files the sender's table modeled, whichever comes first: the release of
+/// the exited sender's descriptor table, which the backend makes when it
+/// runs the end of the sender's exit hook (KVM after the parent can already
+/// wait for the child), or the receipt's decision
+/// (https://github.com/rrnewton/hermit/issues/4930). On `backend`, the
+/// `exit_hook_tail` race probe makes the release late and `receipt_decision`
+/// the decision late (docs/RACE_PROBES.md); under each the guest prints
+/// `expected`, Linux's answer. Before queued messages held the open files
+/// they carry, the `receipt_decision` leg made every call through the
+/// received eventfds fail with `EBADF`; the `exit_hook_tail` leg passed then
+/// too, so it guards only the other order. Both probes exist only in builds
+/// with debug assertions, which every test build has. The probe line on
+/// stderr shows the probe configuration was loaded, not that a probe fired:
+/// the `receipt_decision` leg's output is what tells the two orders apart.
+fn receive_from_an_exited_sender_in_both_orders(backend: &str, expected: &str) {
+    let guest = compiled_c_guest(
+        &SCM_RIGHTS_RECEIVED_ANON_INODES_GUEST,
+        "scm_rights_received_anon_inodes",
+    )
+    .to_str()
+    .expect("guest path is UTF-8");
+    for probe in ["exit_hook_tail=200", "receipt_decision=200"] {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest,
+        ];
+        let mut command = hermit_command(&args);
+        command
+            .env("HERMIT_RACE_PROBE", probe)
+            .env("HERMIT_RACE_PROBE_SEED", "1")
+            .stdin(Stdio::null());
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+        assert!(
+            stderr(&output).contains(&format!("race_probe: HERMIT_RACE_PROBE={probe}")),
+            "{backend} under {probe}: the probe did not run; stderr:\n{}",
+            stderr(&output)
+        );
+        assert_eq!(
+            stdout(&output),
+            expected,
+            "{backend} under {probe}; stderr:\n{}",
+            stderr(&output)
+        );
+    }
+}
+
+/// [`receive_from_an_exited_sender_in_both_orders`] on ptrace.
+#[test]
+fn scm_rights_receipt_is_the_same_whichever_finishes_first() {
+    receive_from_an_exited_sender_in_both_orders("ptrace", SCM_RIGHTS_RECEIVED_ANON_INODES_LINUX);
+}
+
+/// [`receive_from_an_exited_sender_in_both_orders`] on KVM.
+#[test]
+fn run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first() {
+    if kvm_unavailable("run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first") {
+        return;
+    }
+    receive_from_an_exited_sender_in_both_orders("kvm", SCM_RIGHTS_RECEIVED_ANON_INODES_KVM);
+}
+
+/// A loopback address of this test process's own for
+/// `tests/c/scm_rights_exited_receiver_port.c`: the 22 bits of its PID in
+/// 127.192.0.0/10, so that the ports Detcore hands out are free there
+/// whatever else the host binds (Detcore's own tests take 127.64.0.0/10 and
+/// 127.128.0.0/10).
+fn exited_receiver_loopback() -> String {
+    let pid = std::process::id();
+    assert!(pid < 1 << 22, "PID {pid} exceeds Linux's 22-bit limit");
+    format!(
+        "127.{}.{}.{}",
+        0xc0 | (pid >> 16),
+        (pid >> 8) & 0xff,
+        pid & 0xff
+    )
+}
+
+/// A bound UDP socket rides an `SCM_RIGHTS` message queued to a socket a
+/// child holds, or the child inherits the bound socket itself, and the child
+/// exits; the parent then lets go of its own descriptors and binds a new
+/// socket to port 0 (`tests/c/scm_rights_exited_receiver_port.c`'s modes
+/// `alone`, `shared`, `inherited` and `threaded`, where two threads of the
+/// child hold its table and one exits first). Linux releases the child's
+/// descriptors at its exit, so the parent's close is the last reference to
+/// the bound socket, and its port is free again: Detcore hands that port to
+/// the next bind to port 0, as it hands out the port it allocated last once
+/// that one is free again (https://github.com/rrnewton/hermit/issues/4930).
+/// Detcore lets the child's descriptor table go at the exit of its last
+/// holder, in that thread's turn, counting the holders by guest calls alone,
+/// so the answer does not depend on when the backend tears the child's
+/// thread states down: the `exit_hook_tail` race probe, which makes each
+/// teardown late (docs/RACE_PROBES.md), changes nothing. Before, the port of
+/// a socket in flight to the exited child stayed reserved whenever the
+/// teardown came after the parent's close, and a table two threads held was
+/// let go at the exit only where the backend had already torn the first
+/// thread's state down. Linux 7.1.3 rebinds the exact port in every mode
+/// (its own port-0 choice is random, so its output says nothing).
+fn exited_receivers_queue_goes_with_its_exit(backend: &str) {
+    let guest = compiled_c_guest(
+        &SCM_RIGHTS_EXITED_RECEIVER_PORT_GUEST,
+        "scm_rights_exited_receiver_port",
+    )
+    .to_str()
+    .expect("guest path is UTF-8");
+    let address = exited_receiver_loopback();
+    for probe in [None, Some("exit_hook_tail=2000")] {
+        for mode in ["alone", "shared", "inherited", "threaded"] {
+            let args = [
+                "--backend",
+                backend,
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                "--",
+                guest,
+                mode,
+                address.as_str(),
+            ];
+            let mut command = hermit_command(&args);
+            if let Some(probe) = probe {
+                command
+                    .env("HERMIT_RACE_PROBE", probe)
+                    .env("HERMIT_RACE_PROBE_SEED", "1");
+            }
+            command.stdin(Stdio::null());
+            let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+            assert_success(&output, &args);
+            if let Some(probe) = probe {
+                assert!(
+                    stderr(&output).contains(&format!("race_probe: HERMIT_RACE_PROBE={probe}")),
+                    "{backend} {mode} under {probe}: the probe did not run; stderr:\n{}",
+                    stderr(&output)
+                );
+            }
+            assert_eq!(
+                stdout(&output),
+                format!("{mode}: the next bind reuses the first's port\n"),
+                "{backend} {mode} under {probe:?}; stderr:\n{}",
+                stderr(&output)
+            );
+        }
+    }
+}
+
+/// [`exited_receivers_queue_goes_with_its_exit`] on ptrace.
+#[test]
+fn scm_rights_exited_receivers_queue_goes_with_its_exit() {
+    exited_receivers_queue_goes_with_its_exit("ptrace");
+}
+
+/// [`exited_receivers_queue_goes_with_its_exit`] on KVM.
+#[test]
+fn run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit() {
+    if kvm_unavailable("run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit") {
+        return;
+    }
+    exited_receivers_queue_goes_with_its_exit("kvm");
 }
 
 /// The calls on and below a `/proc` directory Detcore serves that Detcore

@@ -10,13 +10,15 @@
  * Anonymous-inode descriptors (eventfd, signalfd) a process receives over
  * SCM_RIGHTS.
  *
- * fstat cannot tell one anonymous inode from another, so Detcore does not
- * record one it receives on ptrace and KVM (a record of the wrong kind would
- * mishandle it: a blocking signalfd read held in the caller's turn, an
- * EFD_SEMAPHORE eventfd read twice). Calls through such a descriptor that
- * consult Detcore's descriptor table therefore fail with EBADF, as they did
- * before Detcore recorded any received descriptor: a known gap, which this
- * program pins and proves does not hang. Natively every call succeeds.
+ * fstat cannot tell one anonymous inode from another, so on ptrace and KVM
+ * Detcore records a received one only as an alias of the open file its
+ * sender's table modeled, which the queued message names and holds until
+ * the receipt, whether or not the sender has exited by then
+ * (https://github.com/rrnewton/hermit/issues/4930); a record of its own, of
+ * the wrong kind, would mishandle it (a blocking signalfd read held in the
+ * caller's turn, an EFD_SEMAPHORE eventfd read twice). So every call through
+ * the received descriptors succeeds, as natively, except where the backend
+ * cannot send one at all (KVM's executor refuses to donate a signalfd).
  *
  * A child creates an eventfd holding 5, an EFD_SEMAPHORE eventfd holding 3,
  * a nonblocking eventfd and a signalfd for SIGUSR1, and sends each to its

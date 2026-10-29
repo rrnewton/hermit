@@ -164,6 +164,38 @@ pub struct FileMetadata {
     /// (`LockLedger::exec_kept`).
     #[serde(default)]
     exec_dropped_lock_tracked: bool,
+    /// Descriptors queued over `SCM_RIGHTS` that Linux released in the
+    /// current call (the queue of a socket whose last reference this table
+    /// dropped, `FileMetadata::release_detfd`, or what a receive or a purge
+    /// handed over), until the call completes and releases what they held
+    /// (`Detcore::settle_released_rights`). Never serialized, and never
+    /// copied.
+    #[serde(skip)]
+    released_rights: ReleasedRights,
+    /// The processes whose threads hold this table, and how many threads of
+    /// each, counted by guest calls alone: its first holder; each thread or
+    /// process made with `CLONE_FILES`, counted as its creator's `clone`
+    /// makes it, before either runs on; and each holder's exit, a thread's
+    /// `exit` counting one out and an `exit_group` its whole process
+    /// ([`Self::leave`]). The count of thread states that share the table
+    /// cannot say which exit is its last: the backend drops an exited
+    /// thread's state at no particular point of the schedule. Empty for a
+    /// table whose holders are not known (one carried across a snapshot),
+    /// which no exit releases.
+    #[serde(default)]
+    holders: BTreeMap<DetPid, usize>,
+}
+
+/// The descriptors of messages queued to sockets a table released
+/// ([`FileMetadata::released_rights`]). A copy of the table, for a fork or an
+/// exec, starts with none: what one table released is released once.
+#[derive(Debug, Default)]
+struct ReleasedRights(Vec<SentDescriptor>);
+
+impl Clone for ReleasedRights {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// `NR_OPEN_DEFAULT` on 64-bit Linux.
@@ -208,23 +240,34 @@ pub(crate) struct CapturedDetFdInstallError {
 
 /// Cleanup required after the kernel created a descriptor but Detcore could not
 /// install its captured open-file-description identity in the current table.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct CapturedDetFdInstallCleanup {
     /// The exact kernel-returned descriptor that must be closed.
     pub(crate) close_fd: RawFd,
     /// A scheduler resource whose final modeled OFD reference was the capture.
     pub(crate) release_open_file: Option<OpenFileId>,
+    /// Where that capture was a receiving socket's last reference, the
+    /// messages queued to it, which go with it as at a close
+    /// ([`FileMetadata::release_detfd`]), for the call to release
+    /// (`ThreadState::defer_released_rights`).
+    pub(crate) released_rights: Vec<SentDescriptor>,
 }
 
 impl CapturedDetFdInstallError {
     /// Abandon the failed capture and preserve both cleanup obligations.
     pub(crate) fn into_cleanup(self) -> CapturedDetFdInstallCleanup {
-        let release_open_file = (self.captured.detfd.open_file_alias_count() == 1)
-            .then(|| self.captured.detfd.open_file_id());
+        let last = self.captured.detfd.is_last_reference();
+        let release_open_file = last.then(|| self.captured.detfd.open_file_id());
+        let released_rights = if last {
+            self.captured.detfd.take_all_queued_rights()
+        } else {
+            Vec::new()
+        };
         drop(self.captured);
         CapturedDetFdInstallCleanup {
             close_fd: self.returned_fd,
             release_open_file,
+            released_rights,
         }
     }
 }
@@ -878,6 +921,8 @@ impl FileMetadata {
             unaccounted_receipts: false,
             descriptor_capacity: default_descriptor_capacity(),
             exec_dropped_lock_tracked: false,
+            released_rights: ReleasedRights::default(),
+            holders: BTreeMap::from([(owner, 1)]),
         }
     }
 
@@ -1121,6 +1166,8 @@ impl FileMetadata {
             unaccounted_receipts: self.unaccounted_receipts,
             descriptor_capacity: self.forked_descriptor_capacity(),
             exec_dropped_lock_tracked: false,
+            released_rights: ReleasedRights::default(),
+            holders: BTreeMap::from([(child, 1)]),
         }
     }
 
@@ -1152,7 +1199,42 @@ impl FileMetadata {
                 .file_handles
                 .values()
                 .any(|detfd| detfd.is_cloexec() && detfd.is_lock_tracked()),
+            released_rights: ReleasedRights::default(),
+            holders: BTreeMap::from([(task, 1)]),
         }
+    }
+
+    /// A thread of `process` made with `CLONE_FILES` holds this table too
+    /// ([`Self::holders`]); a table whose holders are not known stays so.
+    pub(crate) fn join_holder(&mut self, process: DetPid) {
+        if !self.holders.is_empty() {
+            *self.holders.entry(process).or_insert(0) += 1;
+        }
+    }
+
+    /// One thread of `process` holds this table, and nothing else does
+    /// ([`Self::holders`]): a copy made for it, by a `clone` without
+    /// `CLONE_FILES` or by an `exec`.
+    pub(crate) fn hold_alone(&mut self, process: DetPid) {
+        self.holders = BTreeMap::from([(process, 1)]);
+    }
+
+    /// A thread of `process` that holds this table exits, with its whole
+    /// process where `whole_process` (an `exit_group`, which ends every
+    /// thread of it). Returns whether that left the table to no holder: then
+    /// it goes with this exit, as Linux releases a table with its last
+    /// holder's exit (`exit_files`). Never for a table whose holders are not
+    /// known, nor for a process that does not hold it.
+    pub(crate) fn leave(&mut self, process: DetPid, whole_process: bool) -> bool {
+        let Some(count) = self.holders.get_mut(&process) else {
+            return false;
+        };
+        if whole_process || *count <= 1 {
+            self.holders.remove(&process);
+        } else {
+            *count -= 1;
+        }
+        self.holders.is_empty()
     }
 
     /// Read the live table incarnation for an independently owned exec cut.
@@ -1521,7 +1603,12 @@ impl FileMetadata {
         for detfd in self.file_handles.values() {
             let id = detfd.open_file_id();
             let total_aliases = detfd.open_file_alias_count();
-            let entry = open_files.entry(id).or_insert((0, total_aliases, true));
+            // A copy in flight keeps the description open, whatever holds the
+            // copy now (`DetFd::is_last_reference`).
+            let in_flight = detfd.copies_in_flight() > 0;
+            let entry = open_files
+                .entry(id)
+                .or_insert((0, total_aliases, !in_flight));
             debug_assert_eq!(entry.1, total_aliases);
             entry.0 += 1;
             entry.2 &= detfd.is_cloexec();
@@ -1898,7 +1985,43 @@ impl FileMetadata {
     fn remove_fd(&mut self, fd: RawFd) -> Option<OpenFileId> {
         self.present_unmodelled.remove(&fd);
         let detfd = self.file_handles.remove(&fd)?;
-        (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
+        self.release_detfd(detfd)
+    }
+
+    /// `detfd`, gone from this table: the description it names, if this was
+    /// its last reference ([`DetFd::is_last_reference`]: no other modeled
+    /// descriptor, no copy in flight), for the caller to release its port. A
+    /// socket's queued `SCM_RIGHTS` messages go with its last reference, as
+    /// Linux purges a released socket's receive queue (`unix_release_sock`),
+    /// and wait in [`Self::released_rights`] for the call to release what
+    /// they held (`Detcore::settle_released_rights`). A description with a
+    /// copy in flight stays, port and queue included, until a guest call
+    /// receives or releases the copy.
+    fn release_detfd(&mut self, detfd: DetFd) -> Option<OpenFileId> {
+        detfd.is_last_reference().then(|| {
+            self.released_rights
+                .0
+                .extend(detfd.take_all_queued_rights());
+            detfd.open_file_id()
+        })
+    }
+
+    /// Let go of every descriptor of this table, in order, as its last
+    /// holder's exit does (`ThreadState::release_table_at_exit`): a socket
+    /// whose last reference goes takes its queue ([`Self::release_detfd`]).
+    /// No port is released here.
+    fn release_every_descriptor(&mut self) {
+        let mut fds: Vec<RawFd> = self.file_handles.keys().copied().collect();
+        fds.sort_unstable();
+        for fd in fds {
+            let _ = self.remove_fd(fd);
+        }
+    }
+
+    /// What closes in this table took from receiving sockets' queues
+    /// ([`Self::release_detfd`]).
+    fn take_released_rights(&mut self) -> Vec<SentDescriptor> {
+        std::mem::take(&mut self.released_rights.0)
     }
 
     /// Remove every modeled descriptor in an inclusive close_range interval.
@@ -1939,9 +2062,7 @@ impl FileMetadata {
             self.present_unmodelled
                 .insert(newfd, flags.contains(OFlag::O_CLOEXEC));
             let replaced = self.file_handles.remove(&newfd);
-            return Ok(replaced.and_then(|detfd| {
-                (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
-            }));
+            return Ok(replaced.and_then(|detfd| self.release_detfd(detfd)));
         }
 
         let detfd = self.with_detfd(oldfd, |old_detfd| {
@@ -1949,8 +2070,7 @@ impl FileMetadata {
         })?;
         self.note_installed(newfd);
         let replaced = self.file_handles.insert(newfd, detfd);
-        Ok(replaced
-            .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
+        Ok(replaced.and_then(|detfd| self.release_detfd(detfd)))
     }
 
     /// Capture the exact open-file description currently named by `fd`.
@@ -1985,17 +2105,13 @@ impl FileMetadata {
         let detfd = captured.detfd.with_fd(newfd).with_fd_flags(flags);
         self.note_installed(newfd);
         let replaced = self.file_handles.insert(newfd, detfd);
-        Ok(replaced
-            .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
+        Ok(replaced.and_then(|detfd| self.release_detfd(detfd)))
     }
 
     /// Drop a capture that was not installed and report whether it retained the
     /// final reference to the open-file description.
     fn abandon_captured_fd(&mut self, captured: CapturedDetFd) -> Option<OpenFileId> {
-        let release =
-            (captured.detfd.open_file_alias_count() == 1).then(|| captured.detfd.open_file_id());
-        drop(captured);
-        release
+        self.release_detfd(captured.detfd)
     }
 }
 
@@ -2794,6 +2910,161 @@ mod file_metadata_tests {
         assert!(!table.present_unmodelled.contains_key(&6));
         table.remove_fd_range(0, 100);
         assert!(table.descriptor_numbers().is_empty());
+    }
+
+    /// The close that drops a socket's last descriptor takes the messages
+    /// queued to it, for the call to release what they held
+    /// (`FileMetadata::release_detfd`), as Linux purges a released socket's
+    /// receive queue; one that leaves another descriptor of it takes
+    /// nothing, and a copy of the table has nothing to release.
+    #[test]
+    fn the_last_close_of_a_socket_takes_its_queue() {
+        let owner = DetTid::from_raw(9043);
+        let mut table = FileMetadata::new(owner);
+        for (fd, ty) in [
+            (3, FdType::Socket),
+            (4, FdType::Socket),
+            (5, FdType::Regular),
+        ] {
+            table.add_fd(owner, fd, OFlag::empty(), ty, None).unwrap();
+        }
+        let left = table.with_detfd(3, |detfd| detfd.clone()).unwrap();
+        let right = table.with_detfd(4, |detfd| detfd.clone()).unwrap();
+        left.pair_sockets(&right, false);
+        let carried = table
+            .with_detfd(5, |detfd| detfd.in_flight_open_file(true))
+            .unwrap();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 5),
+                    open_file: Some(carried),
+                    lock_copy: None,
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        drop((left, right));
+        table.dup_fd(4, 6, OFlag::empty()).unwrap();
+        assert_eq!(table.remove_fd(4), None, "another descriptor of it remains");
+        assert!(table.take_released_rights().is_empty());
+        let id = table.with_detfd(6, |detfd| detfd.open_file_id()).unwrap();
+        assert_eq!(table.remove_fd(6), Some(id), "its last descriptor");
+        let copy = table.clone();
+        assert_eq!(table.take_released_rights().len(), 1, "its queue, taken");
+        assert!(
+            copy.released_rights.0.is_empty(),
+            "a copy of the table releases nothing"
+        );
+    }
+
+    /// A table let go at its holder's exit takes the queue of each socket
+    /// whose last reference it held, so what those queues carried is
+    /// released by that exit (`ThreadState::release_table_at_exit`), whenever
+    /// the backend tears the exited thread's state down: here a socket the
+    /// parent sent and closed, queued to a socket only the child held, which
+    /// is then the last reference to it.
+    #[test]
+    fn a_table_let_go_at_exit_takes_its_last_sockets_queues() {
+        let parent_id = DetTid::from_raw(9044);
+        let mut parent = FileMetadata::new(parent_id);
+        for fd in [3, 4] {
+            parent
+                .add_fd(parent_id, fd, OFlag::empty(), FdType::Socket, None)
+                .unwrap();
+        }
+        let left = parent.with_detfd(3, |detfd| detfd.clone()).unwrap();
+        let right = parent.with_detfd(4, |detfd| detfd.clone()).unwrap();
+        left.pair_sockets(&right, false);
+        drop(right);
+        let mut child = parent.fork_for(DetTid::from_raw(9045));
+        assert_eq!(parent.remove_fd(4), None, "the child holds the receiver");
+        assert_eq!(child.remove_fd(3), None, "the parent holds the sender");
+        parent
+            .add_fd(parent_id, 5, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        let carried = parent
+            .with_detfd(5, |detfd| detfd.in_flight_open_file(true))
+            .unwrap();
+        let sent_id = parent.with_detfd(5, |detfd| detfd.open_file_id()).unwrap();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 5),
+                    open_file: Some(carried),
+                    lock_copy: None,
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        assert_eq!(parent.remove_fd(5), None, "a copy is in flight");
+        child.release_every_descriptor();
+        assert!(child.file_handles.is_empty());
+        let released: Vec<_> = child
+            .take_released_rights()
+            .into_iter()
+            .filter_map(|sent| {
+                sent.open_file
+                    .and_then(crate::fd::InFlightOpenFile::release)
+            })
+            .map(|(id, ty, _)| (id, ty))
+            .collect();
+        assert_eq!(
+            released,
+            [(sent_id, FdType::Socket)],
+            "the exit released the queued socket, whose last reference it was"
+        );
+        drop(left);
+    }
+
+    /// The exit that leaves a table to no holder lets it go
+    /// (`FileMetadata::leave`), as guest calls alone count its holders: a
+    /// thread's `exit` counts one out and an `exit_group` its whole process;
+    /// a process made with `CLONE_FILES` holds the table too; a copy made for
+    /// a fork or an exec has one holder of its own. A table whose holders are
+    /// not known, or a process that does not hold it, never goes this way.
+    #[test]
+    fn a_table_goes_with_the_exit_that_leaves_it_no_holder() {
+        let process = DetTid::from_raw(9050);
+        let mut table = FileMetadata::new(process);
+        table.join_holder(process);
+        assert!(!table.leave(process, false), "one thread of two exits");
+        assert!(table.leave(process, false), "and then the other");
+
+        let mut table = FileMetadata::new(process);
+        table.join_holder(process);
+        table.join_holder(process);
+        assert!(table.leave(process, true), "an exit_group ends all three");
+
+        let sharer = DetTid::from_raw(9051);
+        let mut table = FileMetadata::new(process);
+        table.join_holder(sharer);
+        assert!(
+            !table.leave(process, true),
+            "a process made with CLONE_FILES"
+        );
+        assert!(
+            !table.leave(process, false),
+            "a process that left holds none"
+        );
+        assert!(table.leave(sharer, false));
+
+        let mut copy = FileMetadata::new(process).fork_for(sharer);
+        assert!(
+            copy.leave(sharer, false),
+            "a fork's copy, its child's alone"
+        );
+        let mut copy = FileMetadata::new(process).for_exec(sharer);
+        copy.hold_alone(process);
+        assert!(!copy.leave(sharer, false));
+        assert!(copy.leave(process, false), "an exec's copy, its process's");
+
+        let mut unknown = FileMetadata::new(process);
+        unknown.holders.clear();
+        unknown.join_holder(process);
+        assert!(!unknown.leave(process, true), "holders not known");
     }
 
     #[test]
@@ -6808,6 +7079,15 @@ impl<T> ThreadState<T> {
         }
     }
 
+    /// Every socket of this table may have been passed to a table that holds
+    /// it as an open file of its own: no pair's queues hold every message
+    /// any more (`DetFd::give_up_pair_completeness`).
+    pub(crate) fn give_up_every_pair_completeness(&self) {
+        for detfd in self.metadata().file_handles.values() {
+            detfd.give_up_pair_completeness();
+        }
+    }
+
     /// Descriptors in this table that name a network record/replay channel,
     /// sorted.
     pub(crate) fn network_channel_fds(&self) -> Vec<RawFd> {
@@ -6862,6 +7142,54 @@ impl<T> ThreadState<T> {
             self.traced_call.note(note);
         }
         metadata.remove_fd(fd)
+    }
+
+    /// This thread is exiting, with its whole process where `whole_process`
+    /// (an `exit_group`): it no longer holds its descriptor table
+    /// (`FileMetadata::leave`). Where no thread holds the table any more, as
+    /// guest calls alone count its holders (`FileMetadata::holders`), the
+    /// table goes with this exit, as Linux releases it with its last
+    /// holder's exit (`exit_files`): every descriptor of it is let go now, in
+    /// this thread's turn, so that whether another table's later close is a
+    /// description's last reference depends on this call and not on when the
+    /// backend tears thread states down. A socket whose last reference goes
+    /// takes its queue, for the exit to release
+    /// ([`Self::take_released_rights`]), as Linux purges a released socket's
+    /// receive queue. The descriptions themselves keep their ports, as an
+    /// exiting process's sockets always have. Returns whether the table was
+    /// let go; a table that another thread still holds is kept.
+    pub(crate) fn release_table_at_exit(&self, whole_process: bool) -> bool {
+        let Some(process) = self.detpid else {
+            return false;
+        };
+        let mut metadata = self.metadata();
+        if !metadata.leave(process, whole_process) {
+            return false;
+        }
+        metadata.release_every_descriptor();
+        true
+    }
+
+    /// What the current call made Linux release from receiving sockets'
+    /// queues, for the call to release when it completes
+    /// (`Detcore::settle_released_rights`): what closes in this thread's
+    /// table took (`FileMetadata::release_detfd`), and what receives and
+    /// purges handed over ([`Self::defer_released_rights`]).
+    pub(crate) fn take_released_rights(&self) -> Vec<SentDescriptor> {
+        self.metadata().take_released_rights()
+    }
+
+    /// Whether the current call holds descriptors to release
+    /// ([`Self::take_released_rights`]).
+    pub(crate) fn holds_released_rights(&self) -> bool {
+        !self.metadata().released_rights.0.is_empty()
+    }
+
+    /// Hold `released`, descriptors queued to a socket that Linux has just
+    /// released with their message, for the current call to release when it
+    /// completes ([`Self::take_released_rights`]).
+    pub(crate) fn defer_released_rights(&self, released: impl IntoIterator<Item = SentDescriptor>) {
+        self.metadata().released_rights.0.extend(released);
     }
 
     /// Remove every modeled descriptor in an inclusive close_range interval.

@@ -4860,12 +4860,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     "[init_thread-state, parent dtid = {}] child thread {}, clone_flags = {:x?}",
                     pts.0, tid, clone_flags
                 );
+                // The table's holders count the child, of its creator's
+                // process if it is a thread and of its own otherwise, here,
+                // as its creator's `clone` makes it
+                // (`tool_local::FileMetadata::holders`).
+                let holder = if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                    pts.1.detpid.unwrap_or(pts.1.dettid)
+                } else {
+                    dettid
+                };
                 let file_metadata = if clone_flags.contains(CloneFlags::CLONE_FILES) {
+                    pts.1.file_metadata.lock().unwrap().join_holder(holder);
                     pts.1.file_metadata.clone()
                 } else {
-                    Arc::new(Mutex::new(
-                        pts.1.file_metadata.lock().unwrap().fork_for(dettid),
-                    ))
+                    let mut copy = pts.1.file_metadata.lock().unwrap().fork_for(dettid);
+                    copy.hold_alone(holder);
+                    Arc::new(Mutex::new(copy))
                 };
                 // A thread is of its creator's process. A new process leads a
                 // thread group of its own, whose table is the one it starts
@@ -6045,9 +6055,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 } else {
                     let result = self.passthrough(guest, call).await;
                     // A forwarded splice from a socket may take a message
-                    // whose descriptors Linux releases unseen.
+                    // whose descriptors Linux releases unseen, and one into a
+                    // socket sends messages Detcore does not count.
                     if let Syscall::Splice(splice) = call {
-                        self.note_receive_without_control(guest, splice.fd_in(), &result);
+                        let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
+                            peek: false,
+                            request: crate::syscalls::scm_rights::Request::Spliced(splice.len()),
+                            returns_at_once_when_empty: true,
+                            address_out: false,
+                            takes: crate::syscalls::scm_rights::Takes::One,
+                            // Forwarded in the caller's turn; its result
+                            // depends on no guest memory either way.
+                            in_turn: true,
+                            noted_by_recordings: true,
+                        };
+                        self.note_receive_without_control(guest, splice.fd_in(), &result, read);
+                        self.note_spliced_send(guest, splice.fd_out(), &result);
                     }
                     result
                 }
@@ -6277,13 +6300,35 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         .await
                         .map(|result| self.project_own_getter_result(guest, call, result))
                 }
-                Syscall::Write(w) => self.handle_write(guest, w).await,
+                Syscall::Write(w) => {
+                    let send = self.send_without_control(
+                        guest,
+                        w.fd(),
+                        |guest| self.completes_in_turn(guest, w),
+                        false,
+                        false,
+                    );
+                    let result = self.handle_write(guest, w).await;
+                    self.note_send_without_control(guest, send, &result);
+                    result
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
                 // The vectored handlers keep the call's entry import
                 // across their retries, so they are boxed like the open
                 // family (`hot_path_futures_stay_small`).
-                Syscall::Writev(w) => Box::pin(self.handle_writev(guest, w)).await,
+                Syscall::Writev(w) => {
+                    let send = self.send_without_control(
+                        guest,
+                        w.fd(),
+                        |guest| self.completes_in_turn(guest, w),
+                        false,
+                        false,
+                    );
+                    let result = Box::pin(self.handle_writev(guest, w)).await;
+                    self.note_send_without_control(guest, send, &result);
+                    result
+                }
                 Syscall::Openat(o) => Box::pin(self.handle_openat(guest, o)).await,
                 #[cfg(target_arch = "x86_64")]
                 Syscall::Open(o) => Box::pin(self.handle_openat(guest, o.into())).await,
@@ -6294,8 +6339,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.handle_sock_diag_read(guest, s).await
                 }
                 Syscall::Read(s) => {
+                    let in_turn = self.receives_in_turn(guest, s.fd(), s);
                     let result = self.handle_read(guest, s).await;
-                    self.note_receive_without_control(guest, s.fd(), &result);
+                    let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
+                        peek: false,
+                        request: crate::syscalls::scm_rights::Request::Bytes(
+                            s.buf().map_or(0, |buf| buf.as_raw()),
+                            s.len(),
+                        ),
+                        returns_at_once_when_empty: true,
+                        address_out: false,
+                        takes: crate::syscalls::scm_rights::Takes::Counted,
+                        in_turn,
+                        noted_by_recordings: true,
+                    };
+                    self.note_receive_without_control(guest, s.fd(), &result, read);
                     result
                 }
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
@@ -6313,10 +6371,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.handle_sock_diag_readv(guest, s).await
                 }
                 Syscall::Readv(s) => {
+                    let in_turn = self.receives_in_turn(guest, s.fd(), s);
                     let result = self
                         .handle_readv_with_output(guest, s, &mut rng_readv_output)
                         .await;
-                    self.note_receive_without_control(guest, s.fd(), &result);
+                    let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
+                        peek: false,
+                        request: crate::syscalls::scm_rights::Request::Iovecs(
+                            s.iov().map_or(0, |iov| iov.as_raw()),
+                            s.len(),
+                        ),
+                        returns_at_once_when_empty: true,
+                        address_out: false,
+                        takes: crate::syscalls::scm_rights::Takes::Counted,
+                        in_turn,
+                        noted_by_recordings: true,
+                    };
+                    self.note_receive_without_control(guest, s.fd(), &result, read);
                     result
                 }
                 Syscall::Preadv(s) => {
@@ -6324,11 +6395,59 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         .await
                 }
                 Syscall::Preadv2(s) => {
-                    self.handle_preadv2_with_output(guest, s, &mut rng_readv_output)
-                        .await
+                    let current = crate::syscalls::vectored_offset(s.pos_l(), s.pos_h()) == -1;
+                    let in_turn = current && self.receives_in_turn(guest, s.fd(), s);
+                    let result = self
+                        .handle_preadv2_with_output(guest, s, &mut rng_readv_output)
+                        .await;
+                    // At the current offset it reads a socket as `readv` does.
+                    if current {
+                        let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
+                            peek: false,
+                            request: crate::syscalls::scm_rights::Request::Iovecs(
+                                s.iov().map_or(0, |iov| iov.as_raw()),
+                                s.iov_len() as usize,
+                            ),
+                            returns_at_once_when_empty: true,
+                            address_out: false,
+                            takes: crate::syscalls::scm_rights::Takes::Counted,
+                            in_turn,
+                            // Recordings made before saw `preadv2` take
+                            // nothing from a socket's queue.
+                            noted_by_recordings: false,
+                        };
+                        self.note_receive_without_control(guest, s.fd(), &result, read);
+                    }
+                    result
                 }
                 Syscall::Pwritev(s) => Box::pin(self.handle_pwritev(guest, s)).await,
-                Syscall::Pwritev2(s) => Box::pin(self.handle_pwritev2(guest, s)).await,
+                Syscall::Pwritev2(s) => {
+                    // At the current offset it writes a socket as `writev`
+                    // does.
+                    let send = (crate::syscalls::vectored_offset(s.pos_l(), s.pos_h()) == -1)
+                        .then(|| {
+                            self.send_without_control(
+                                guest,
+                                s.fd(),
+                                |guest| {
+                                    matches!(
+                                        crate::syscalls::helpers::ioaction_based_on_fd(
+                                            guest,
+                                            s.fd()
+                                        ),
+                                        Ok(crate::syscalls::helpers::IOAction::NonblockizeRetry
+                                            | crate::syscalls::helpers::IOAction::PassThru)
+                                    )
+                                },
+                                false,
+                                false,
+                            )
+                        })
+                        .flatten();
+                    let result = Box::pin(self.handle_pwritev2(guest, s)).await;
+                    self.note_send_without_control(guest, send, &result);
+                    result
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)
                 Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
@@ -6508,7 +6627,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Bind(s) => self.handle_bind(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
-                Syscall::Setsockopt(s) => self.handle_setsockopt(guest, s).await,
+                Syscall::Setsockopt(s) => {
+                    let result = self.handle_setsockopt(guest, s).await;
+                    // Credentials passing names the socket at its next send.
+                    if result.is_ok()
+                        && s.level() == libc::SOL_SOCKET
+                        && matches!(s.optname(), libc::SO_PASSCRED | libc::SO_PASSPIDFD)
+                    {
+                        self.note_unix_socket_reachable(guest, s.fd());
+                    }
+                    result
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#663)
                 Syscall::Listen(s) => self.handle_listen(guest, s).await,
@@ -6668,14 +6797,38 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.handle_sock_diag_recvfrom(guest, s).await
                 }
                 Syscall::Recvfrom(s) => {
+                    let in_turn = self.receives_in_turn(guest, s.fd(), s);
                     let result = self.handle_socket_receive(guest, s, s.fd(), true).await;
-                    self.note_receive_without_control(guest, s.fd(), &result);
+                    let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
+                        peek: s.flags() & libc::MSG_PEEK != 0,
+                        request: crate::syscalls::scm_rights::Request::Bytes(
+                            s.buf().map_or(0, |buf| buf.as_raw()),
+                            s.len(),
+                        ),
+                        returns_at_once_when_empty: false,
+                        address_out: s.addr().is_some(),
+                        takes: crate::syscalls::scm_rights::Takes::Counted,
+                        in_turn,
+                        noted_by_recordings: true,
+                    };
+                    self.note_receive_without_control(guest, s.fd(), &result, read);
                     result
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-901)
                 Syscall::Recvmsg(s) => Box::pin(self.handle_recvmsg(guest, s)).await,
-                Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
+                Syscall::Sendto(s) => {
+                    let send = self.send_without_control(
+                        guest,
+                        s.fd(),
+                        |guest| self.completes_in_turn(guest, s),
+                        s.addr().is_some() && s.addr_len() != 0,
+                        s.flags() & libc::MSG_OOB as u32 != 0,
+                    );
+                    let result = self.handle_sendrecv(guest, s).await;
+                    self.note_send_without_control(guest, send, &result);
+                    result
+                }
                 Syscall::Sendmsg(s) => Box::pin(self.handle_sendmsg(guest, s)).await,
                 Syscall::Sendmmsg(s) => Box::pin(self.handle_sendmmsg(guest, s)).await,
 
@@ -6948,6 +7101,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // backend failure owner, not to this observer fence.
         if res.as_ref().is_err_and(crate::random::is_copy_failure) {
             return res;
+        }
+
+        // A `write`, `writev` or `sendto` through a datagram socket whose
+        // connected peer has gone purged the socket's receive queue
+        // (`Detcore::note_send_refused`; `sendmsg` and `sendmmsg` note it
+        // themselves).
+        if crate::syscalls::scm_rights::found_its_peer_gone(&res) {
+            self.note_send_refused(guest, &call);
+        }
+        // What the call made Linux release from `SCM_RIGHTS` queues (the
+        // close of a receiving socket's last descriptor, a receive, a purge)
+        // is released now, in the call's turn, before any observer, posthook
+        // or turn hand-off (`Detcore::settle_released_rights`).
+        if guest.thread_state().holds_released_rights() {
+            Box::pin(self.settle_released_rights(guest)).await;
         }
 
         if res.is_ok() && !removed_inodes.is_empty() {
@@ -7300,6 +7468,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             )
             .await?;
 
+        // The thread's state is released when this returns, and with it a
+        // descriptor table it may be the last to hold, where Detcore did not
+        // let that table go at the exit (`Detcore::release_table_at_exit`,
+        // docs/RACE_PROBES.md).
+        #[cfg(debug_assertions)]
+        crate::race_probe::delay_on_any_backend(
+            crate::race_probe::EXIT_HOOK_TAIL,
+            self.cfg.backend.tool_shares_guest_descriptor_table,
+        )
+        .await;
         Ok(())
     }
 }

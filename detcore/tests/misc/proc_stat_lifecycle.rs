@@ -704,49 +704,44 @@ fn a_stat_descriptor_sent_to_another_process_continues_the_senders_record() {
     });
 }
 
-/// DECLARED DIFFERENCE. A descriptor that reaches another process with
-/// `SCM_RIGHTS` joins Detcore's state of its open file at the receiver's
-/// first call naming it (`Detcore::adopt_received_placeholders`). If the
-/// sender has closed its every alias before then (the descriptor was still
-/// queued, or received and not yet used), no descriptor Detcore models
-/// refers to the open file, so its state (the buffered record) is gone, as
-/// for every rendered file (`fd::OpenFileHandle`): the receiver rebuilds it
-/// from its placeholder at the shared cursor and renders the record again
-/// (two threads), where Linux, whose queued file keeps its `seq_file`,
-/// continues the sender's record (one thread).
+/// A descriptor that reaches another process with `SCM_RIGHTS` while its
+/// sender closes its every alias (the descriptor still queued) keeps
+/// Detcore's state of its open file (the buffered record): the queued
+/// message holds the description (`fd::InFlightOpenFile`), as Linux's queued
+/// file keeps its `seq_file`, so the receiver continues the sender's record
+/// (one thread), natively and under Detcore. Before, Detcore kept no model
+/// alive for a queued message, and the receiver rebuilt the state from its
+/// placeholder at the shared cursor and rendered the record again (two
+/// threads), whenever the backend had released the sender's table by then
+/// (https://github.com/rrnewton/hermit/issues/4930).
 #[test]
-fn a_queued_stat_descriptor_whose_sender_closed_it_renders_again_under_detcore() {
+fn a_queued_stat_descriptor_whose_sender_closed_it_continues_its_record() {
     if run_in_child_process() {
         return;
     }
-    let check = |buffered: bool| {
-        move || {
-            let pair = socket_pair();
-            let go = pipe();
-            let before: i32 = own_thread_count().parse().unwrap();
-            // SAFETY: a plain identity call.
-            let pid = unsafe { libc::getpid() };
-            let receiver = fork_running(move || {
-                wait_byte(go[0]);
-                let received = recv_fd(pair[1]);
-                let tail = read_rest(received);
-                let expected = if buffered { before } else { before + 1 };
-                assert_eq!(tail_field(&tail, 20), expected.to_string(), "{tail:?}");
-            });
-            let fd = open_stat(&format!("/proc/{pid}/stat"));
-            assert_eq!(read_some(fd, 4).len(), 4);
-            send_fd(pair[0], fd);
-            // SAFETY: the sender's only alias, while the message is queued.
-            unsafe { libc::close(fd) };
-            let (keep, thread) = a_waiting_thread();
-            write_all(go[1], b"g");
-            reap_passing(receiver);
-            drop(keep);
-            thread.join().unwrap();
-        }
-    };
-    natively(check(true));
-    under_detcore(check(false));
+    natively_and_under_detcore(|| {
+        let pair = socket_pair();
+        let go = pipe();
+        let before: i32 = own_thread_count().parse().unwrap();
+        // SAFETY: a plain identity call.
+        let pid = unsafe { libc::getpid() };
+        let receiver = fork_running(move || {
+            wait_byte(go[0]);
+            let received = recv_fd(pair[1]);
+            let tail = read_rest(received);
+            assert_eq!(tail_field(&tail, 20), before.to_string(), "{tail:?}");
+        });
+        let fd = open_stat(&format!("/proc/{pid}/stat"));
+        assert_eq!(read_some(fd, 4).len(), 4);
+        send_fd(pair[0], fd);
+        // SAFETY: the sender's only alias, while the message is queued.
+        unsafe { libc::close(fd) };
+        let (keep, thread) = a_waiting_thread();
+        write_all(go[1], b"g");
+        reap_passing(receiver);
+        drop(keep);
+        thread.join().unwrap();
+    });
 }
 
 /// A forked child reading its parent's `stat` through an inherited

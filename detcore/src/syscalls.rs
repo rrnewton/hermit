@@ -30,6 +30,7 @@ pub(crate) use files::procfs_levels::take_proc_device;
 pub(crate) use files::read_guest_exact;
 pub(crate) use files::read_guest_prefix;
 pub(crate) use files::rendered_procfs;
+pub(crate) use files::vectored_offset;
 pub(crate) use threads::VIRTUAL_CPUSET_BYTES;
 mod io;
 pub(crate) mod memory;

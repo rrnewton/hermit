@@ -4152,6 +4152,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let in_turn = self.completes_in_turn(guest, call);
         self.note_descriptors_passed_out(guest, call.fd(), &headers);
+        self.note_sockets_passed_out(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
         if outside_turn
@@ -4168,13 +4169,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
+        if crate::syscalls::scm_rights::found_its_peer_gone(&result) {
+            let addressed = sends_to_a_name(guest, &headers);
+            self.note_peer_gone(guest, call.fd(), addressed);
+        }
         let result = result?;
         guest.thread_state().forget_flock_modes();
         if let Some(stream) = self.rights_peer_is_stream(guest, call.fd()) {
             if in_turn {
                 // One message, of `result` bytes.
                 let sent = sent_rights(guest, &headers, |_| usize::try_from(result).unwrap_or(0));
-                self.queue_sent_rights(guest, call.fd(), stream, sent)
+                let out_of_band = call.flags() & libc::MSG_OOB != 0;
+                self.queue_sent_rights(guest, call.fd(), stream, sent, out_of_band)
                     .await?;
             } else {
                 self.lose_peer_lockstep(guest, call.fd());
@@ -4327,12 +4333,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 }
 
 /// What the messages at `headers`, which a send completed in the caller's
-/// turn reports sending, passed over `SCM_RIGHTS`: for each that carried
-/// descriptors, those descriptors and the bytes `sent_bytes` says it sent
-/// (`Detcore::queue_sent_rights`). After such a send no other guest thread
-/// has run, so its header and control data are the ones the send read. A
-/// message whose header or control data cannot be read in full marks the
-/// whole as `unread`.
+/// turn reports sending, passed over `SCM_RIGHTS`: for each, the descriptors
+/// it carried (none for a message of data alone) and the bytes `sent_bytes`
+/// says it sent (`Detcore::queue_sent_rights`). After such a send no other
+/// guest thread has run, so its header and control data are the ones the
+/// send read. A message whose header or control data cannot be read in full
+/// marks the whole as `unread`.
 fn sent_rights<T, G>(
     guest: &G,
     headers: &[usize],
@@ -4346,7 +4352,7 @@ where
     for &header in headers {
         match sent_descriptors(guest, &[header]) {
             (_, true) => rights.unread = true,
-            (sent, false) if !sent.is_empty() => {
+            (sent, false) => {
                 // Whether the message named its destination: a header whose
                 // name length cannot be read counts as one that did.
                 let addressed = Addr::<Msghdr>::from_raw(header)
@@ -4354,10 +4360,24 @@ where
                     .is_none_or(|header| header.msg_namelen != 0);
                 rights.messages.push((sent, sent_bytes(header), addressed));
             }
-            _ => {}
         }
     }
     rights
+}
+
+/// Whether the first message at `headers` names its destination (a nonzero
+/// `msg_namelen`); one whose header cannot be read counts as one that did
+/// (`Detcore::note_peer_gone`).
+fn sends_to_a_name<T, G>(guest: &G, headers: &[usize]) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    headers.first().is_none_or(|&header| {
+        Addr::<Msghdr>::from_raw(header)
+            .and_then(|header| guest.memory().read_value::<_, Msghdr>(header).ok())
+            .is_none_or(|header| header.msg_namelen != 0)
+    })
 }
 
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
@@ -4445,6 +4465,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let in_turn = self.completes_in_turn(guest, call);
         self.note_descriptors_passed_out(guest, call.sockfd(), &headers);
+        self.note_sockets_passed_out(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
         if outside_turn
@@ -4453,6 +4474,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Box::pin(self.placeholder_send_after(guest, Sysno::sendmmsg, call.sockfd())).await
         {
             return refusal;
+        }
+        // A batch fails only where its first message did.
+        if crate::syscalls::scm_rights::found_its_peer_gone(&result) {
+            let addressed = sends_to_a_name(guest, &headers[..headers.len().min(1)]);
+            self.note_peer_gone(guest, call.sockfd(), addressed);
         }
         let result = result?;
         if result > 0 {
@@ -4469,7 +4495,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .and_then(|length| guest.memory().read_value(length).ok())
                         .map_or(0, |length: u32| length as usize)
                 });
-                self.queue_sent_rights(guest, call.sockfd(), stream, sent)
+                let out_of_band = call.flags() & libc::MSG_OOB != 0;
+                self.queue_sent_rights(guest, call.sockfd(), stream, sent, out_of_band)
                     .await?;
             } else {
                 self.lose_peer_lockstep(guest, call.sockfd());
@@ -4524,16 +4551,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmsg(call));
         let result = self.receive_one_message(guest, call).await;
         let geometry = guest.thread_state_mut().receive_geometry.take().flatten();
+        let from = ReceivedFrom {
+            socket: call.sockfd(),
+            peek: call.flags() & libc::MSG_PEEK != 0,
+            messages: 1,
+        };
+        // A datagram or seqpacket receive takes its message before it copies
+        // the bytes, and frees it if that copy fails.
+        if let Err(Error::Errno(errno)) = &result {
+            self.note_receive_error(guest, from, *errno, &Syscall::Recvmsg(call), in_turn);
+        }
         let result = result?;
         let delivered = geometry
             .map(|geometry| geometry.delivered(&guest.memory(), result))
             .unwrap_or_default();
         let cloexec =
             Syscall::Recvmsg(call).into_parts().1.arg2 as i32 & libc::MSG_CMSG_CLOEXEC != 0;
-        let from = ReceivedFrom {
-            socket: call.sockfd(),
-            peek: call.flags() & libc::MSG_PEEK != 0,
-        };
         let recorded = self
             .record_received_descriptors(
                 guest,
@@ -4946,16 +4979,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmmsg(call));
         let result = self.receive_message_batch(guest, call).await;
         let geometry = guest.thread_state_mut().receive_geometry.take().flatten();
+        let mut from = ReceivedFrom {
+            socket: call.fd(),
+            peek: call.flags() & libc::MSG_PEEK as u32 != 0,
+            messages: 1,
+        };
+        // As for `recvmsg`: an error before any message is the first
+        // message's.
+        if let Err(Error::Errno(errno)) = &result {
+            self.note_receive_error(guest, from, *errno, &Syscall::Recvmmsg(call), in_turn);
+        }
         let result = result?;
+        from.messages = usize::try_from(result).unwrap_or(0);
         let delivered = geometry
             .map(|geometry| geometry.delivered(&guest.memory(), result))
             .unwrap_or_default();
         let cloexec =
             Syscall::Recvmmsg(call).into_parts().1.arg3 as i32 & libc::MSG_CMSG_CLOEXEC != 0;
-        let from = ReceivedFrom {
-            socket: call.fd(),
-            peek: call.flags() & libc::MSG_PEEK as u32 != 0,
-        };
         let recorded = self
             .record_received_descriptors(
                 guest,
@@ -4968,6 +5008,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         self.classify_received_descriptors(guest, call.fd(), &recorded)
             .await;
+        self.note_short_batch(guest, from, call.vlen() as usize);
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)
             .await?;

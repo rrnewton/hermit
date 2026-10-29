@@ -160,7 +160,9 @@ fn parse_timer_slack_write(bytes: &[u8]) -> Result<u64, Errno> {
     })
 }
 
-fn vectored_offset(low: u64, high: u64) -> i64 {
+/// The file offset a `preadv2` or `pwritev2` passes in two registers: -1
+/// for the current one, at which either acts as `readv` or `writev` would.
+pub(crate) fn vectored_offset(low: u64, high: u64) -> i64 {
     if std::mem::size_of::<usize>() == 8 {
         low as i64
     } else {
@@ -1771,6 +1773,11 @@ pub(crate) enum LockCall {
     /// `ioctl(BINDER_WRITE_READ)` delivering a transaction that carries
     /// descriptors, which adds slots.
     BinderWriteRead,
+    /// A descriptor received over `SCM_RIGHTS` that joined the description
+    /// its sender's table modeled (`Detcore::record_received_facts`): it adds
+    /// this table's slot to a description the ledger may know already, and
+    /// brings no other identity, so it is not marked as received.
+    Joined,
 }
 
 impl LockCall {
@@ -1783,6 +1790,7 @@ impl LockCall {
             Self::Recvmsg => "recvmsg",
             Self::Recvmmsg => "recvmmsg",
             Self::BinderWriteRead => "ioctl(BINDER_WRITE_READ)",
+            Self::Joined => "an SCM_RIGHTS receipt",
         }
     }
 
@@ -12381,6 +12389,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             0
         };
+        // A transaction may pass any descriptor of this table.
+        if crate::syscalls::binder::is_write_read(request) {
+            self.note_binder_transaction(guest);
+        }
         let result = self.record_or_replay(guest, call).await?;
         // `handle_ioctl` runs the call in the caller's turn, so no other
         // task can have closed or replaced a delivered number yet.
@@ -12400,6 +12412,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     crate::syscalls::scm_rights::ReceivedFrom {
                         socket: fd,
                         peek: false,
+                        // No `SCM_RIGHTS` message is queued to a binder
+                        // descriptor, so no count of messages taken matters.
+                        messages: 1,
                     },
                 )
                 .await?;
@@ -13899,6 +13914,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             })
             .flatten();
         let res = self.record_or_replay(guest, call).await;
+        // Named in any form, the socket can be sent to by other sockets.
+        if res.is_ok() && sockaddr_family == libc::AF_UNIX as u16 {
+            self.note_unix_socket_reachable(guest, sock_fd);
+        }
         if res.is_ok()
             && let Some(name) = unix_name
         {
@@ -14751,7 +14770,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(error @ CapturedDetFdInstallError { .. }) => {
                 let expected_files_id = error.expected_files_id;
                 let actual_files_id = error.actual_files_id;
-                let cleanup = error.into_cleanup();
+                let mut cleanup = error.into_cleanup();
+                guest
+                    .thread_state()
+                    .defer_released_rights(std::mem::take(&mut cleanup.released_rights));
                 let close_result = guest
                     .inject(syscalls::Close::new().with_fd(cleanup.close_fd))
                     .await;

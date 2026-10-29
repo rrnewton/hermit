@@ -2728,6 +2728,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
+        // A table's last holder takes it with its exit.
+        self.release_table_at_exit(guest, false).await;
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: false,
@@ -2799,6 +2801,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
+        // Every thread of the process exits with it: a table only they held
+        // goes with this exit.
+        self.release_table_at_exit(guest, true).await;
         // On [`OwnerDeathPath::Barrier`] the walk follows the grant and wakes
         // at once, as an exit does (`Self::run_robust_list_owner_death`):
         // nothing can call the exit_group off, the grant logically kills the
@@ -4220,7 +4225,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let (new_metadata, closed_open_files, exec_fd_blocking) = {
             let metadata = old_metadata.lock().unwrap();
-            let new_metadata = metadata.for_exec(dettid);
+            // The exec'ing thread leads its process from here, alone.
+            let mut new_metadata = metadata.for_exec(dettid);
+            new_metadata.hold_alone(detpid);
             (
                 new_metadata.clone(),
                 metadata.open_files_closed_on_exec(table_is_shared),

@@ -4259,10 +4259,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // time, 64 bits, can hold one. A rebuilt `stat` renders its record
         // again at its next read, at the shared cursor, where Linux continues
         // the buffered one: where one tool process serves every guest
-        // (ptrace, KVM), a descriptor whose every modeled alias closed before
-        // a receiver's first call naming it
-        // (tests/misc/proc_stat_lifecycle.rs
-        // `a_queued_stat_descriptor_whose_sender_closed_it_renders_again_under_detcore`);
+        // (ptrace, KVM), a descriptor received outside the turn, or after a
+        // receive Detcore could not match left its queued message untrusted
+        // (`Detcore::record_received_facts`), whose every modeled alias
+        // closed before the receiver's first call naming it (a queued
+        // message holds the description it carries, so the receiver
+        // continues the sender's record: tests/misc/proc_stat_lifecycle.rs
+        // `a_queued_stat_descriptor_whose_sender_closed_it_continues_its_record`);
         // where the tool runs in each guest process, a descriptor another
         // process receives when it holds no alias of the open file Detcore
         // models, and the image after `exec`

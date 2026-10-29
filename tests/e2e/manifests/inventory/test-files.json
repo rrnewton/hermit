@@ -2533,6 +2533,12 @@
       "why": "tests/c/scheduler_signal_waiting.c is owned by hermit-cli/tests/cli.rs: The integration tests a_scheduler_child_exit_signal_removed_without_a_delivery_arms_no_call and a_scheduler_timer_signal_removed_without_a_delivery_arms_no_call run each of its eleven modes under run --strict, with the scheduler's SIGCHLD from a child exit and its SIGALRM from ITIMER_REAL, require the line Linux prints, and record and replay one mode each: a signal every thread blocked that SIG_DFL, SIG_IGN, sigwaitinfo, a signalfd read, a handler or a sibling removed must not arm a later sigsuspend, a shared copy left after a thread took its own must still end one, a signal still pending after another ended the call armed for it must arm the next, and an idle or closed signalfd must not stop the arming (https://github.com/rrnewton/hermit/pull/4314); a generic manifest cannot assert per-mode output or the replay verdict."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/scm_rights_exited_receiver_port.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/scm_rights_exited_receiver_port.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests scm_rights_exited_receivers_queue_goes_with_its_exit (ptrace) and run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit (KVM) compile this guest, in which a bound UDP socket rides an SCM_RIGHTS message queued to a datagram socket a child holds (modes alone and shared) or the child inherits the bound socket itself (mode inherited), the child exits, and the parent binds a new socket to port 0 at a loopback address of the test's own; they require, with and without the exit_hook_tail race probe, that the next bind reuses the first port, which shows that Detcore released the child's descriptor table at its exit rather than when the backend tore the child's state down; it remains a guest fixture because a generic manifest cannot pass the per-test address, set the race probe, or compare Detcore's port-0 choice, which native Linux makes at random."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/scm_rights_received_anon_inodes.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",

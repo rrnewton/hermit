@@ -811,6 +811,401 @@ fn shared_own_getters_preserve_record_replay_stream() {
     assert_eq!(outputs.left.stderr_bytes, 0);
 }
 
+/// A guest that connects a socket to its own listener, sends that socket
+/// over a `socketpair` and closes its descriptor, so that only the queued
+/// message holds it, then accepts the connection and sends another
+/// descriptor through the accepted socket before it receives the connecting
+/// one, and through it the other descriptor. It prints the numbers of the
+/// accepted socket, the descriptor it sent through it, the connecting
+/// socket received and the descriptor received through that.
+const QUEUED_CONNECTION_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static void die(const char* what) {
+  fprintf(stderr, "queued-connection: %s: %s\n", what, strerror(errno));
+  exit(1);
+}
+
+static void send_descriptor(int socket, int fd) {
+  char byte = 'x';
+  char control[CMSG_SPACE(sizeof(int))];
+  memset(control, 0, sizeof(control));
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+  if (sendmsg(socket, &message, 0) != 1) {
+    die("sendmsg");
+  }
+}
+
+static int receive_descriptor(int socket) {
+  char byte = 0;
+  char control[CMSG_SPACE(sizeof(int))];
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  if (recvmsg(socket, &message, 0) != 1) {
+    die("recvmsg");
+  }
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  if (header == NULL || header->cmsg_type != SCM_RIGHTS) {
+    die("no descriptor");
+  }
+  int received;
+  memcpy(&received, CMSG_DATA(header), sizeof(received));
+  return received;
+}
+
+int main(void) {
+  static const char abstract[] = "\0hermit-record-replay-queued-connection";
+  struct sockaddr_un name = {.sun_family = AF_UNIX};
+  memcpy(name.sun_path, abstract, sizeof(abstract) - 1);
+  socklen_t length = offsetof(struct sockaddr_un, sun_path) + sizeof(abstract) - 1;
+  int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (listener < 0 || bind(listener, (struct sockaddr*)&name, length) != 0 ||
+      listen(listener, 1) != 0) {
+    die("listener");
+  }
+  int connecting = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (connecting < 0 || connect(connecting, (struct sockaddr*)&name, length) != 0) {
+    die("connect");
+  }
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+    die("socketpair");
+  }
+  send_descriptor(pair[0], connecting);
+  close(connecting);
+  int accepted = accept(listener, NULL, NULL);
+  if (accepted < 0) {
+    die("accept");
+  }
+  int carried = open("/dev/null", O_RDONLY);
+  if (carried < 0) {
+    die("open");
+  }
+  send_descriptor(accepted, carried);
+  int connection = receive_descriptor(pair[1]);
+  int received = receive_descriptor(connection);
+  printf("accepted=%d carried=%d connection=%d received=%d\n", accepted, carried, connection,
+         received);
+  return 0;
+}
+"#;
+
+/// Under record and replay a queued `SCM_RIGHTS` message keeps the ownership
+/// the existing recordings were made with, which keeps nothing alive
+/// (https://github.com/rrnewton/hermit/issues/4930). In
+/// [`QUEUED_CONNECTION_SOURCE`] only the queued message holds the connecting
+/// socket when the listener accepts its connection, so the accepted socket is
+/// not paired with it, as before, and the send through the accepted socket
+/// queues nothing: it takes no `fstat` through the recording, an event no
+/// recording made before would hold, and its replay would then diverge. The
+/// receipt through the connecting socket still takes its own `fstat`, and
+/// the recording replays, at L2. Each run's log names the calls and the
+/// `fstat` each took between them.
+#[test]
+fn record_replay_keeps_the_ownership_recordings_were_made_with() {
+    let _guard = hermit_record_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let source = build.path().join("queued_connection.c");
+    fs::write(&source, QUEUED_CONNECTION_SOURCE).expect("write the guest's source");
+    let guest = build.path().join("queued_connection");
+    let compilation = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile the queued-connection guest");
+    assert!(compilation.status.success(), "{compilation:?}");
+
+    let data = tempfile::tempdir().unwrap();
+    let verdict = data.path().join("verify.json");
+    let mut command = Command::new("timeout");
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg(format!("--data-dir={}", data.path().display()))
+        .arg("--")
+        .arg(&guest);
+    let output =
+        hermit_test::hermit_output_attempts("record/replay queued connection", 1, &mut command);
+    assert!(output.status.success(), "{command:?}: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Success: replay matched recording."),
+        "{output:?}"
+    );
+    let report: hermit::canonical_verdict::VerificationReport =
+        serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
+    assert_eq!(report.verdict, hermit::canonical_verdict::Verdict::Matched);
+    assert!(report.verified && report.bitwise_parity);
+
+    // The events each run took through the recording, from their logs.
+    let recording = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let record_log = logs.path().join("record.log");
+    let replay_log = logs.path().join("replay.log");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=info", "--backend=ptrace"])
+        .arg(format!("--log-file={}", record_log.display()))
+        .args(["record", "start", "--strict", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", recording.path().display()))
+        .arg("--")
+        .arg(&guest);
+    let recorded = command_output(record, "recording of the queued-connection guest");
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg("--log=info")
+        .arg(format!("--log-file={}", replay_log.display()))
+        .args(["replay", "--autopilot"])
+        .arg(format!("--data-dir={}", recording.path().display()));
+    let replayed = command_output(replay, "replay of the queued-connection guest");
+    let stdout = String::from_utf8_lossy(&recorded.stdout).into_owned();
+    assert_eq!(String::from_utf8_lossy(&replayed.stdout), stdout);
+    let number = |key: &str| {
+        stdout
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(key))
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("no {key} in the guest's output: {stdout}"))
+    };
+    let accepted = number("accepted=");
+    let connection = number("connection=");
+    let received = number("received=");
+    for (label, log) in [("recording", &record_log), ("replay", &replay_log)] {
+        let log = fs::read_to_string(log).unwrap_or_else(|error| panic!("{label} log: {error}"));
+        // The `fstat`s a call took through the recording: the lines from its
+        // entry to its result.
+        let fstats_of = |call: &str| -> Vec<&str> {
+            let mut lines = log
+                .lines()
+                .skip_while(|line| !line.contains(&format!("inbound syscall: {call}")));
+            let entry = lines
+                .next()
+                .unwrap_or_else(|| panic!("the {label} log has no {call}...:\n{log}"));
+            assert!(entry.contains("inbound syscall"));
+            lines
+                .take_while(|line| !line.contains("finish syscall"))
+                .filter(|line| line.contains("Taking fstat through the recording"))
+                .collect()
+        };
+        let receipt = fstats_of(&format!("recvmsg({connection}, "));
+        assert!(
+            receipt.len() == 1 && receipt[0].ends_with(&format!("classify fd {received}.")),
+            "the {label}'s receipt through the connecting socket took one fstat, of the \
+             descriptor it received: {receipt:?}"
+        );
+        assert_eq!(
+            fstats_of(&format!("sendmsg({accepted}, ")),
+            Vec::<&str>::new(),
+            "the {label}'s send through the accepted socket took an fstat through the \
+             recording, which recordings made before lack"
+        );
+    }
+}
+
+/// A guest that sends a message of data alone and then one carrying an
+/// eventfd holding 5, which it keeps, over a datagram `socketpair`, reads the
+/// data with `preadv2` at the current offset, receives the eventfd and reads
+/// it. It prints the bytes the `preadv2` read and what the eventfd's read
+/// returned; Linux 7.1.3 prints `data=1 read=8 value=5`.
+const PREADV2_DATA_THEN_EVENTFD_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+static void die(const char* what) {
+  fprintf(stderr, "preadv2-data-then-eventfd: %s: %s\n", what, strerror(errno));
+  exit(1);
+}
+
+int main(void) {
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0) {
+    die("socketpair");
+  }
+  int counter = eventfd(5, 0);
+  if (counter < 0 || write(pair[0], "d", 1) != 1) {
+    die("eventfd");
+  }
+  char byte = 'x';
+  char control[CMSG_SPACE(sizeof(int))];
+  memset(control, 0, sizeof(control));
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &counter, sizeof(counter));
+  if (sendmsg(pair[0], &message, 0) != 1) {
+    die("sendmsg");
+  }
+  char data = 0;
+  struct iovec into = {.iov_base = &data, .iov_len = 1};
+  ssize_t read_data = preadv2(pair[1], &into, 1, -1, 0);
+  memset(control, 0, sizeof(control));
+  message.msg_controllen = sizeof(control);
+  if (recvmsg(pair[1], &message, 0) != 1) {
+    die("recvmsg");
+  }
+  header = CMSG_FIRSTHDR(&message);
+  if (header == NULL || header->cmsg_type != SCM_RIGHTS) {
+    die("no descriptor");
+  }
+  int received;
+  memcpy(&received, CMSG_DATA(header), sizeof(received));
+  uint64_t value = 0;
+  ssize_t read_value = read(received, &value, sizeof(value));
+  printf("data=%zd read=%zd value=%llu\n", read_data, read_value, (unsigned long long)value);
+  return 0;
+}
+"#;
+
+/// Under record and replay the receive rules are those existing recordings
+/// were made with (https://github.com/rrnewton/hermit/issues/4930): a
+/// `preadv2` at the current offset leaves a socket's queue in lockstep, as
+/// it did, so in [`PREADV2_DATA_THEN_EVENTFD_SOURCE`] the receipt joins the
+/// eventfd its sender keeps, which reads 8 bytes holding 5, as on Linux, and
+/// takes no step a recording made before lacks: a recording made before this
+/// change replays after it. Where the `preadv2` put the queue out of lockstep
+/// instead, the received eventfd joined nothing, was refused, and the read
+/// failed, and a replay of an older recording diverged at that receipt. The
+/// run records and replays at L2.
+#[test]
+fn record_replay_keeps_the_receive_rules_recordings_were_made_with() {
+    let _guard = hermit_record_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let source = build.path().join("preadv2_data_then_eventfd.c");
+    fs::write(&source, PREADV2_DATA_THEN_EVENTFD_SOURCE).expect("write the guest's source");
+    let guest = build.path().join("preadv2_data_then_eventfd");
+    let compilation = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile the preadv2 guest");
+    assert!(compilation.status.success(), "{compilation:?}");
+
+    let data = tempfile::tempdir().unwrap();
+    let verdict = data.path().join("verify.json");
+    let mut command = Command::new("timeout");
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg(format!("--data-dir={}", data.path().display()))
+        .arg("--")
+        .arg(&guest);
+    let output = hermit_test::hermit_output_attempts("record/replay preadv2", 1, &mut command);
+    assert!(output.status.success(), "{command:?}: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Success: replay matched recording."),
+        "{output:?}"
+    );
+    let report: hermit::canonical_verdict::VerificationReport =
+        serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
+    assert_eq!(report.verdict, hermit::canonical_verdict::Verdict::Matched);
+    assert!(report.verified && report.bitwise_parity);
+
+    let recording = tempfile::tempdir().unwrap();
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--data-dir={}", recording.path().display()))
+        .arg("--")
+        .arg(&guest);
+    let recorded = command_output(record, "recording of the preadv2 guest");
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["replay", "--autopilot"])
+        .arg(format!("--data-dir={}", recording.path().display()));
+    let replayed = command_output(replay, "replay of the preadv2 guest");
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.stdout),
+        "data=1 read=8 value=5\n",
+        "the recording's receipt joins the sender's eventfd"
+    );
+    assert_eq!(
+        recorded.stdout, replayed.stdout,
+        "the replay prints the same"
+    );
+}
+
 /// `canonical_record_replay_command`, repeated only when an attempt ends in a
 /// typed PMU skid-overshoot refusal (`skid_overshoot_refusal`), at most
 /// `max_attempts` times in all (https://github.com/rrnewton/hermit/issues/1845).

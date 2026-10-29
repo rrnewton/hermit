@@ -236,9 +236,10 @@ pub struct DetFd {
 /// keep it alive: once no modeled descriptor refers to the description, the
 /// handle reaches nothing. Where one tool process serves every guest process
 /// (ptrace, KVM), a rendered procfs descriptor that reaches the same Linux
-/// `struct file` over `SCM_RIGHTS` joins the description through it, as a
-/// `dup` would, when it is received (`Detcore::record_received_descriptors`)
-/// or first named (`Detcore::adopt_received_placeholders`).
+/// `struct file` over `SCM_RIGHTS` joins the description through it where no
+/// queued message Detcore can trust names it ([`InFlightOpenFile`] covers
+/// those): when it is received outside the turn, or after a receive Detcore
+/// could not match, or first named (`Detcore::adopt_received_placeholders`).
 #[derive(Clone, Debug)]
 pub(crate) struct OpenFileHandle(std::sync::Weak<Mutex<OpenFileState>>);
 
@@ -269,6 +270,143 @@ impl OpenFileHandle {
     }
 }
 
+/// An open file description that a queued `SCM_RIGHTS` message carries
+/// (`crate::syscalls::scm_rights`), made by [`DetFd::in_flight_open_file`].
+#[derive(Clone, Debug)]
+pub(crate) struct InFlightOpenFile(InFlight);
+
+/// How an [`InFlightOpenFile`] refers to its description.
+#[derive(Clone, Debug)]
+enum InFlight {
+    /// Held as Linux holds the `struct file` of each descriptor a message
+    /// carries: from the send until the receive installs it or Linux
+    /// releases the message. It keeps the description alive, so the receipt
+    /// names the description the sender's table modeled even when every
+    /// modeled descriptor of it has been closed by then, or lives only in the
+    /// table of a sender that has exited, whose state the backend releases
+    /// at no particular point of the guest's schedule. Whether it still
+    /// holds the description decides nothing: the description's count of
+    /// copies in flight does ([`OpenFileDescription::in_flight`]), which only
+    /// guest calls change.
+    Held(Arc<Mutex<OpenFileState>>),
+    /// Under record and replay: the ownership existing recordings were made
+    /// with, which keeps nothing alive ([`OpenFileHandle`]). A receipt there
+    /// joins only a description the receiving table holds anyway, and no
+    /// other decision may see a description only a queued message keeps.
+    Legacy(std::sync::Weak<Mutex<OpenFileState>>),
+}
+
+impl InFlightOpenFile {
+    /// Descriptor `fd` of the description: an alias, sharing its cursor,
+    /// snapshot and status flags, with `FD_CLOEXEC` as `cloexec` says. `None`
+    /// only for a legacy reference (`InFlight::Legacy`) whose description is
+    /// gone.
+    pub(crate) fn descriptor(&self, fd: RawFd, cloexec: bool) -> Option<DetFd> {
+        let open_file = match &self.0 {
+            InFlight::Held(open_file) => Arc::clone(open_file),
+            InFlight::Legacy(open_file) => open_file.upgrade()?,
+        };
+        let mut detfd = DetFd {
+            fd,
+            fd_flags: 0,
+            open_file,
+        };
+        detfd.set_cloexec(cloexec);
+        Some(detfd)
+    }
+
+    /// A queue took this copy in flight (`DetFd::queue_rights_to_peer`):
+    /// the description counts it until a guest call receives or releases
+    /// it ([`OpenFileDescription::in_flight`]).
+    fn enter_flight(&self) {
+        if let InFlight::Held(open_file) = &self.0 {
+            with_state_description(open_file, |d| d.in_flight += 1);
+        }
+    }
+
+    /// A receive installed this copy in the receiving table, which now holds
+    /// the description as a descriptor of its own: it is no longer in
+    /// flight. A peek leaves the message, and its copy, queued.
+    pub(crate) fn land(&self) {
+        if let InFlight::Held(open_file) = &self.0 {
+            with_state_description(open_file, |d| d.in_flight = d.in_flight.saturating_sub(1));
+        }
+    }
+
+    /// Release this copy in flight, as a guest call made Linux release it
+    /// (`Detcore::settle_released_rights`): the description no longer counts
+    /// it. If no copy is in flight any more and no modeled descriptor names
+    /// the description (this is its last reference), the description goes
+    /// with it, as Linux's last `fput` releases the `struct file`: its
+    /// identity and type, and the descriptors of the messages queued to it,
+    /// which go with it in turn. A description that still counts a copy in
+    /// flight is never released, whether or not anything still holds that
+    /// copy: one that went with a table the backend released, or past
+    /// [`MAX_QUEUED_RIGHTS_MESSAGES`], stays counted for the rest of the run.
+    pub(crate) fn release(self) -> Option<(OpenFileId, FdType, Vec<SentDescriptor>)> {
+        let InFlight::Held(open_file) = self.0 else {
+            return None;
+        };
+        let in_flight = with_state_description(&open_file, |d| {
+            d.in_flight = d.in_flight.saturating_sub(1);
+            d.in_flight
+        });
+        if in_flight > 0 {
+            return None;
+        }
+        let state = Arc::into_inner(open_file)?;
+        let state = state.into_inner().expect("open file mutex poisoned");
+        match state {
+            OpenFileState::Local(mut description) => {
+                let queued = std::mem::take(&mut description.rights.queued);
+                let descriptors = queued
+                    .into_iter()
+                    .flat_map(|message| message.descriptors)
+                    .collect();
+                Some((description.id, description.ty, descriptors))
+            }
+            OpenFileState::Shared(shared) => {
+                let ty = with_shared_description(shared.id, |description| description.ty);
+                Some((shared.id, ty, Vec::new()))
+            }
+        }
+    }
+
+    /// Let go of this copy without any guest call to say Linux released it:
+    /// its queue went with a table the backend released, or with a
+    /// description that went that way. The description keeps counting the
+    /// copy in flight, so nothing is released in the model; if this was its
+    /// last reference, the messages queued to it, for the caller to take
+    /// apart in turn without recursing.
+    fn into_queue_if_last(self) -> Vec<QueuedMessage> {
+        let InFlight::Held(open_file) = self.0 else {
+            return Vec::new();
+        };
+        let Some(state) = Arc::into_inner(open_file) else {
+            return Vec::new();
+        };
+        match state.into_inner().expect("open file mutex poisoned") {
+            OpenFileState::Local(mut description) => {
+                std::mem::take(&mut description.rights.queued).into()
+            }
+            OpenFileState::Shared(_) => Vec::new(),
+        }
+    }
+}
+
+/// Runs `f` on the model of the description `open_file` names, as
+/// [`DetFd::with_description`] does.
+fn with_state_description<R>(
+    open_file: &Arc<Mutex<OpenFileState>>,
+    f: impl FnOnce(&mut OpenFileDescription) -> R,
+) -> R {
+    let mut state = open_file.lock().expect("open file mutex poisoned");
+    match &mut *state {
+        OpenFileState::Local(description) => f(description),
+        OpenFileState::Shared(shared) => with_shared_description(shared.id, f),
+    }
+}
+
 /// The kernel's name for the file behind a descriptor: `(st_dev, st_ino)`, as
 /// `fstat` reports it. Every descriptor of one open file description has it.
 pub(crate) type FileIdentity = (u64, u64);
@@ -279,21 +417,43 @@ pub(crate) type FileIdentity = (u64, u64);
 pub(crate) struct SentDescriptor {
     /// The file it names.
     pub(crate) file: FileIdentity,
-    /// The open file description the sender's table modeled for it, if any.
-    /// It does not keep the description alive.
-    pub(crate) open_file: Option<OpenFileHandle>,
+    /// The open file description the sender's table modeled for it, if any
+    /// ([`InFlightOpenFile`]).
+    pub(crate) open_file: Option<InFlightOpenFile>,
+    /// The description, where `procfs::locks::LockLedger` counts this
+    /// descriptor as a copy in flight of a description whose locks it
+    /// follows, which keeps those locks while the message is queued, as
+    /// Linux's in-flight reference keeps them: the receipt
+    /// (`PlaceholderCopies::Received`) or the release of this descriptor
+    /// (`Detcore::settle_released_rights`) uncounts it.
+    pub(crate) lock_copy: Option<OpenFileId>,
 }
 
 /// The most messages kept queued to one socket ([`SocketRights::queued`]):
 /// far more than a receiver leaves unread in practice. Beyond it the oldest
-/// is forgotten, and its receipt names no open file.
+/// is dropped from the queue, and its receipt names no open file. Linux still
+/// holds that message, so nothing it carries is released: its descriptions
+/// keep counting their copies in flight ([`OpenFileDescription::in_flight`])
+/// for the rest of the run.
 const MAX_QUEUED_RIGHTS_MESSAGES: usize = 4096;
+
+/// One message queued to a socket ([`SocketRights::queued`]).
+#[derive(Debug, Default)]
+pub(crate) struct QueuedMessage {
+    /// The descriptors its `SCM_RIGHTS` carried, in the order sent: none for
+    /// a message of data alone, which only a queue that holds every message
+    /// keeps (`SocketRights::complete`).
+    pub(crate) descriptors: Vec<SentDescriptor>,
+    /// The bytes it carried; for a stream socket's message, those no read has
+    /// taken yet.
+    pub(crate) bytes: usize,
+}
 
 /// The `SCM_RIGHTS` bookkeeping of one `AF_UNIX` socket: its peer, where
 /// Detcore knows it (the other socket of a `socketpair`, or of a connection
 /// it saw made and accepted), and the descriptors queued to it
 /// (`crate::syscalls::scm_rights`).
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct SocketRights {
     /// The socket's type (`SOCK_STREAM`, `SOCK_SEQPACKET`, `SOCK_DGRAM`), as
     /// `socket` or `accept` made it; `None` for one Detcore did not see made.
@@ -307,18 +467,54 @@ struct SocketRights {
     /// Whether the pair is `SOCK_STREAM`, where a send of no bytes carries
     /// no descriptor.
     stream: bool,
-    /// The descriptors of each message sent to this socket with
-    /// `SCM_RIGHTS` and not yet known to be received, oldest first.
-    queued: VecDeque<Vec<SentDescriptor>>,
-    /// Set once the queue may no longer follow the socket's messages one for
-    /// one: a message was sent to it without being queued, or a call took a
-    /// message from it that Detcore could not match while some were queued.
-    /// From then on only order could tell an anonymous inode's queued
-    /// descriptor from another's, as every anonymous inode has one file
-    /// identity, so none is joined (`Detcore::record_received_facts`). Never
-    /// regained: a message sent without being queued may still be in flight
-    /// however the queue looks.
+    /// Each message sent to this socket with `SCM_RIGHTS`, and, where the
+    /// queue holds every message (`Self::complete`), each one of data alone,
+    /// not yet known to be received, oldest first. Each holds the
+    /// descriptions its message carries ([`InFlightOpenFile`]) until a
+    /// receive takes the message or a later one (`DetFd::take_queued_rights`,
+    /// `DetFd::take_head_message`), Linux purges the queue
+    /// (`DetFd::unpair_rights_peer`), or this socket's description goes with
+    /// its last reference (`DetFd::take_all_queued_rights`).
+    queued: VecDeque<QueuedMessage>,
+    /// Set once a message may have reached this socket without being
+    /// queued: one sent to it out of Detcore's sight, out of the queue's
+    /// order, or past its bound (`DetFd::lose_peer_lockstep`), or one a
+    /// receive took that names no queued message, or a later one than Linux
+    /// can have delivered (`DetFd::take_queued_rights`). A call that took
+    /// messages Detcore could not match does not set it: those messages are
+    /// suspect instead (`Self::suspects`), except under record and replay,
+    /// where such a call sets it, as existing recordings were made with
+    /// (`DetFd::lose_lockstep_if_queued`). While it is set, only order could
+    /// tell an anonymous inode's queued descriptor from an unqueued one's, as
+    /// every anonymous inode has one file identity, so none is joined
+    /// (`Detcore::record_received_facts`). Never regained: a message sent
+    /// without being queued may still be in flight however the queue looks.
     lockstep_lost: bool,
+    /// How many messages at the front of the queue a call may have taken
+    /// without Detcore matching them, so that Linux may have released them
+    /// already ([`DetFd::lose_lockstep_if_queued`]). Each such call takes one
+    /// message, the oldest Linux holds, so only the first of these can be
+    /// gone after one call, the first two after two, and so on: a message
+    /// past them is still queued in Linux. A receipt that matches one of
+    /// them is trusted only where no later one among them names the same
+    /// files ([`DetFd::take_queued_rights`]), so a message Linux released
+    /// is never joined.
+    suspects: usize,
+    /// Whether the queue holds every message Linux queued to this socket,
+    /// those of data alone included, oldest first, so that a call that takes
+    /// one message without naming its descriptors (a `read`) took the
+    /// oldest queued one (`DetFd::take_head_message`), or on a stream socket
+    /// the bytes it reports from the oldest messages on
+    /// (`DetFd::take_stream_bytes`): set for both sockets of a `socketpair`,
+    /// which nothing but each other can reach while neither is bound to a
+    /// name, and only where Detcore notes every send of data alone (not under
+    /// record and replay, `Detcore::note_send_without_control`).
+    /// Cleared for good ([`give_up_completeness`]) when the queue loses
+    /// lockstep, when the socket gets a name another socket can send to (a
+    /// `bind`, or `SO_PASSCRED`, which names it at its next send), and when
+    /// either socket of the pair is passed to another table, which may hold
+    /// it as an open file of its own (`DetFd::give_up_pair_completeness`).
+    complete: bool,
 }
 
 /// Whether `received`, the identities of the descriptors one receive
@@ -332,6 +528,166 @@ fn names_sent_rights(sent: &[SentDescriptor], received: &[FileIdentity], truncat
             .iter()
             .zip(sent)
             .all(|(received, sent)| *received == sent.file)
+}
+
+/// Where a stream read of some bytes from a queue that holds every message
+/// (`SocketRights::complete`) leaves it ([`stream_walk`]).
+struct StreamWalk {
+    /// How many messages, from the oldest, it takes in full.
+    taken: usize,
+    /// Of the message after those, how many bytes it takes.
+    part: usize,
+    /// The message whose descriptors it detaches, if any: the first it
+    /// reaches that still carries some.
+    detached: Option<usize>,
+}
+
+/// How a stream read of `read` bytes takes from `rights`'s queue, which holds
+/// every message, as Linux takes it (`unix_stream_read_generic`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.17#n3067>):
+/// bytes from the oldest messages on, a message's descriptors detached with
+/// the first of its bytes a read takes, and no byte past a message whose
+/// descriptors it detached. A read of no bytes that reached the socket (a
+/// `recvfrom` of none) detaches the oldest message's descriptors and takes
+/// nothing. `None` where the queue cannot be what Linux read from: it holds
+/// fewer bytes, or the read went past a message whose descriptors it
+/// detached.
+fn stream_walk(rights: &SocketRights, read: usize) -> Option<StreamWalk> {
+    if read == 0 {
+        let detached = rights
+            .queued
+            .front()
+            .filter(|head| !head.descriptors.is_empty())
+            .map(|_| 0);
+        return Some(StreamWalk {
+            taken: 0,
+            part: 0,
+            detached,
+        });
+    }
+    let mut left = read;
+    let mut detached = None;
+    for (index, message) in rights.queued.iter().enumerate() {
+        if detached.is_some() {
+            return None;
+        }
+        if !message.descriptors.is_empty() {
+            detached = Some(index);
+        }
+        if message.bytes > left {
+            return Some(StreamWalk {
+                taken: index,
+                part: left,
+                detached,
+            });
+        }
+        left -= message.bytes;
+        if left == 0 {
+            return Some(StreamWalk {
+                taken: index + 1,
+                part: 0,
+                detached,
+            });
+        }
+    }
+    None
+}
+
+/// How many bytes a stream read that asked for `asked` takes from `rights`'s
+/// queue, which holds every message, as Linux takes them
+/// (`unix_stream_read_generic`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.17#n3067>):
+/// bytes from the oldest messages on, until it has `asked`, or has taken
+/// bytes of a message that carried descriptors (it stops after the message
+/// whose descriptors it detached), or the queue holds no more.
+fn stream_read_count(rights: &SocketRights, asked: usize) -> usize {
+    let mut read = 0;
+    for message in &rights.queued {
+        let part = message.bytes.min(asked - read);
+        read += part;
+        if read == asked || part < message.bytes || !message.descriptors.is_empty() {
+            break;
+        }
+    }
+    read
+}
+
+/// Takes from `rights`'s queue what `walk` says a stream read took, and
+/// returns the descriptors it detached.
+fn apply_stream_walk(rights: &mut SocketRights, walk: StreamWalk) -> Vec<SentDescriptor> {
+    let detached = walk
+        .detached
+        .and_then(|index| rights.queued.get_mut(index))
+        .map(|message| std::mem::take(&mut message.descriptors))
+        .unwrap_or_default();
+    rights.queued.drain(..walk.taken);
+    if let Some(partly) = rights.queued.front_mut() {
+        partly.bytes -= walk.part;
+    }
+    detached
+}
+
+/// The queue of `rights` no longer holds every message Linux queued to its
+/// socket (`SocketRights::complete`): it keeps only the messages that carried
+/// descriptors, the only ones a receipt can name, and the suspects among them.
+fn give_up_completeness(rights: &mut SocketRights) {
+    if !rights.complete {
+        return;
+    }
+    rights.complete = false;
+    let suspects = rights.suspects;
+    let mut position = 0;
+    let mut kept_suspects = 0;
+    rights.queued.retain(|message| {
+        let keep = !message.descriptors.is_empty();
+        if keep && position < suspects {
+            kept_suspects += 1;
+        }
+        position += 1;
+        keep
+    });
+    rights.suspects = kept_suspects;
+}
+
+/// A socket queued on a socket that is itself queued makes a chain of held
+/// descriptions, as long as a guest cares to build. Dropped recursively, a
+/// long one would overflow the tool thread's stack, so the queue is drained
+/// here and each description it held last is taken apart in turn, its own
+/// queue joining the work, as Linux defers each `fput` rather than recursing.
+///
+/// A queue dropped this way goes with a table the backend released, or with a
+/// description that went that way, at no particular point of the guest's
+/// schedule: it releases nothing in the model, so the descriptions it held
+/// keep counting their copies in flight ([`InFlightOpenFile::into_queue_if_last`]).
+impl Drop for SocketRights {
+    fn drop(&mut self) {
+        let mut pending: Vec<QueuedMessage> = self.queued.drain(..).collect();
+        while let Some(message) = pending.pop() {
+            for sent in message.descriptors {
+                if let Some(open_file) = sent.open_file {
+                    pending.extend(open_file.into_queue_if_last());
+                }
+            }
+        }
+    }
+}
+
+/// What a receive took from a socket's queue ([`DetFd::take_queued_rights`]).
+#[derive(Debug)]
+pub(crate) struct TakenRights {
+    /// The descriptors of the message the receive took, in the order sent.
+    pub(crate) sent: Vec<SentDescriptor>,
+    /// Whether the queue still followed the socket's messages one for one
+    /// (`SocketRights::lockstep_lost`).
+    pub(crate) lockstep: bool,
+    /// Whether the receipt may join the descriptions the message holds: it
+    /// is a message Linux can still have held when the receive ran
+    /// (`SocketRights::suspects`). Otherwise the receipt may be of another
+    /// message that names the same files, and joins nothing.
+    pub(crate) joinable: bool,
+    /// The descriptors of the messages queued before it, which calls Detcore
+    /// could not match took, for their descriptions to be released.
+    pub(crate) forgotten: Vec<SentDescriptor>,
 }
 
 /// A socket's receive timeout (`SO_RCVTIMEO`, socket(7)), as the guest set it.
@@ -812,6 +1168,18 @@ struct OpenFileDescription {
     /// (ptrace, KVM), so it is never serialized. Not printed.
     #[serde(skip)]
     rights: SocketRights,
+    /// How many copies of this description the `SCM_RIGHTS` messages
+    /// Detcore queued carry in flight, counted by guest calls alone: the send
+    /// that queues a copy adds it, and the receive that installs it or the
+    /// call that makes Linux release it takes it away
+    /// ([`InFlightOpenFile::release`]). A copy whose queue went any other way
+    /// (with a table the backend released, at no particular point of the
+    /// guest's schedule, or past [`MAX_QUEUED_RIGHTS_MESSAGES`]) stays
+    /// counted for the rest of the run. While any is counted, the
+    /// description is never released, nor its socket's port, nor its queue
+    /// ([`DetFd::is_last_reference`]). Not printed.
+    #[serde(skip)]
+    in_flight: usize,
 }
 /// Written out, not derived, so that `channel` is printed only when it is set:
 /// a run without `--pipe-wake-latency` logs every description exactly as
@@ -1141,6 +1509,7 @@ impl DetFd {
                 received_for_locks: false,
                 may_hold_ofd_lock: false,
                 rights: SocketRights::default(),
+                in_flight: 0,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             }))),
@@ -1164,6 +1533,17 @@ impl DetFd {
     /// keep it alive ([`OpenFileHandle`]).
     pub(crate) fn open_file_handle(&self) -> OpenFileHandle {
         OpenFileHandle(Arc::downgrade(&self.open_file))
+    }
+
+    /// This descriptor's open file description, for an `SCM_RIGHTS` message
+    /// that carries it ([`InFlightOpenFile`]): `held` while the message is
+    /// queued, or with the legacy ownership that keeps nothing alive.
+    pub(crate) fn in_flight_open_file(&self, held: bool) -> InFlightOpenFile {
+        InFlightOpenFile(if held {
+            InFlight::Held(Arc::clone(&self.open_file))
+        } else {
+            InFlight::Legacy(Arc::downgrade(&self.open_file))
+        })
     }
 
     /// update fd
@@ -1316,9 +1696,35 @@ impl DetFd {
         }
     }
 
-    /// Number of modeled descriptor slots that retain this open file description.
+    /// Number of references that retain this open file description: the
+    /// modeled descriptor slots of every table that names it, and the queued
+    /// `SCM_RIGHTS` messages that still hold it ([`InFlightOpenFile`]). A
+    /// table of an exited process, and a queue that goes with one, count
+    /// until the backend releases that table, at no particular point of the
+    /// guest's schedule; see [`Self::is_last_reference`] for the decision
+    /// that does not depend on it for queued copies.
     pub(crate) fn open_file_alias_count(&self) -> usize {
         Arc::strong_count(&self.open_file)
+    }
+
+    /// Whether this descriptor is the description's last reference, so that
+    /// its going releases the description, as Linux's last `fput` releases
+    /// the `struct file` (a socket's port, a receiving socket's queue): no
+    /// other modeled descriptor names it, and no copy of it is in flight
+    /// ([`OpenFileDescription::in_flight`]). The copies in flight are those
+    /// guest calls queued and have not received or released, whatever holds
+    /// them now, so the backend's release of an exited process's table never
+    /// decides it for a copy in flight: only the other tables' descriptors
+    /// do, as a forked child's table, which counts until the backend releases
+    /// it, always did.
+    pub(crate) fn is_last_reference(&self) -> bool {
+        Arc::strong_count(&self.open_file) == 1 && self.with_description(|d| d.in_flight == 0)
+    }
+
+    /// How many copies of this description are in flight
+    /// ([`OpenFileDescription::in_flight`]).
+    pub(crate) fn copies_in_flight(&self) -> usize {
+        self.with_description(|d| d.in_flight)
     }
 
     /// File type attached to the open file description.
@@ -2223,7 +2629,52 @@ impl DetFd {
     /// Record the name a `bind` gave this `AF_UNIX` socket, and which bind
     /// of that name it was (`generation`).
     pub(crate) fn set_unix_name(&self, name: Box<[u8]>, generation: u64) {
-        self.with_description(|d| d.rights.unix_name = Some((name, generation)));
+        self.with_description(|d| {
+            d.rights.unix_name = Some((name, generation));
+            // Any socket can now send to it by name, unseen by the queue.
+            give_up_completeness(&mut d.rights);
+        });
+    }
+
+    /// This socket and `peer`, the two sockets of a datagram or seqpacket
+    /// `socketpair`, which nothing but each other can reach, start with
+    /// queues that hold every message (`SocketRights::complete`).
+    pub(crate) fn mark_complete_pair(&self, peer: &DetFd) {
+        self.with_description(|d| d.rights.complete = true);
+        peer.with_description(|d| d.rights.complete = true);
+    }
+
+    /// Messages Detcore does not see sent may now reach this socket: a
+    /// `bind` gave it a name, or it set `SO_PASSCRED`, which gives it one at
+    /// its next send (`unix_autobind`). Its queue no longer holds every
+    /// message (`SocketRights::complete`).
+    pub(crate) fn give_up_completeness(&self) {
+        self.with_description(|d| give_up_completeness(&mut d.rights));
+    }
+
+    /// Another descriptor table may now hold this socket without Detcore
+    /// modeling it as this description: it was passed over `SCM_RIGHTS` or
+    /// binder, where the receipt may record an open file of its own. A send
+    /// through that copy reaches this socket's peer unseen, and a receive
+    /// through it takes from this socket's queue unseen, so neither queue
+    /// holds every message any more (`SocketRights::complete`).
+    pub(crate) fn give_up_pair_completeness(&self) {
+        let peer = self.with_description(|d| {
+            give_up_completeness(&mut d.rights);
+            d.rights.peer.clone()
+        });
+        if let Some(peer) = peer {
+            peer.with_description(|d| give_up_completeness(&mut d.rights));
+        }
+    }
+
+    /// Whether this socket's peer has a queue that holds every message
+    /// (`SocketRights::complete`), which a send of data alone through this
+    /// socket must join (`Detcore::note_send_without_control`).
+    pub(crate) fn peer_queue_is_complete(&self) -> bool {
+        self.with_description(|d| d.rights.peer.clone())
+            .and_then(|peer| peer.with_description(|d| d.rights.complete))
+            .unwrap_or(false)
     }
 
     /// The name a `bind` gave this `AF_UNIX` socket, which bind of that name
@@ -2245,18 +2696,48 @@ impl DetFd {
     /// the old peer can still name this socket, and this socket the old peer.
     /// A connect to the socket that already is its peer changes nothing in
     /// Linux; Detcore forgets the queue then too, which costs only joins.
-    pub(crate) fn unpair_rights_peer(&self) {
-        let peer = self.with_description(|d| {
-            d.rights.queued.clear();
+    /// The same holds when a send through it finds its peer gone
+    /// (`unix_dgram_sendmsg` purges the queue, `ECONNREFUSED`). The messages
+    /// forgotten, for their descriptions to be released
+    /// (`Detcore::settle_released_rights`).
+    pub(crate) fn unpair_rights_peer(&self) -> Vec<SentDescriptor> {
+        let (peer, purged) = self.with_description(|d| {
             d.rights.lockstep_lost = true;
-            d.rights.peer.take()
+            d.rights.suspects = 0;
+            d.rights.complete = false;
+            (
+                d.rights.peer.take(),
+                d.rights
+                    .queued
+                    .drain(..)
+                    .flat_map(|message| message.descriptors)
+                    .collect::<Vec<_>>(),
+            )
         });
         if let Some(peer) = peer {
             peer.with_description(|d| {
                 d.rights.peer = None;
                 d.rights.lockstep_lost = true;
+                give_up_completeness(&mut d.rights);
             });
         }
+        purged
+    }
+
+    /// Every message queued to this socket, taken as its description goes
+    /// with its last reference (`FileMetadata::remove_fd`), for their
+    /// descriptions to be released (`Detcore::settle_released_rights`), as
+    /// Linux releases them when the receiving socket closes
+    /// (`unix_release_sock`).
+    pub(crate) fn take_all_queued_rights(&self) -> Vec<SentDescriptor> {
+        self.with_description(|d| {
+            d.rights.suspects = 0;
+            d.rights
+                .queued
+                .drain(..)
+                .flat_map(|message| message.descriptors)
+                .collect()
+        })
     }
 
     /// Whether this socket has a peer Detcore knows (`pair_sockets`,
@@ -2265,76 +2746,409 @@ impl DetFd {
         self.with_description(|d| d.rights.peer.is_some().then_some(d.rights.stream))
     }
 
-    /// Queue on this socket's peer the descriptors one message sent through
-    /// this socket carried, in order. Whether it was queued: not when this
-    /// socket has no peer Detcore knows, or the peer is gone.
-    pub(crate) fn queue_rights_to_peer(&self, sent: Vec<SentDescriptor>) -> bool {
+    /// Queue on this socket's peer one message of `bytes` bytes sent through
+    /// this socket, with the descriptors it carried, in order (`sent`): `Ok`
+    /// once queued, each copy now counted in flight
+    /// ([`OpenFileDescription::in_flight`]), or, for a message of data alone,
+    /// also once passed over because the peer's queue does not hold every
+    /// message (`SocketRights::complete`), where data alone has no place to
+    /// keep; `Err` with the descriptors back when this socket has no peer
+    /// Detcore knows, or the peer is gone.
+    ///
+    /// A stream's message of data alone after another joins it, as a stream's
+    /// reads count bytes only. At [`MAX_QUEUED_RIGHTS_MESSAGES`] the queue
+    /// gives up its messages of data alone, if it held any
+    /// ([`give_up_completeness`]), and no longer holds every message; if it is
+    /// still full, it drops the oldest message, unreleased, as Linux still
+    /// holds it, and no longer follows its messages one for one.
+    pub(crate) fn queue_rights_to_peer(
+        &self,
+        sent: Vec<SentDescriptor>,
+        bytes: usize,
+    ) -> Result<(), Vec<SentDescriptor>> {
         let Some(peer) = self.with_description(|d| d.rights.peer.clone()) else {
-            return false;
+            return Err(sent);
         };
-        peer.with_description(|d| {
-            if d.rights.queued.len() >= MAX_QUEUED_RIGHTS_MESSAGES {
-                d.rights.queued.pop_front();
-                d.rights.lockstep_lost = true;
+        // Counted outside the peer's lock: a copy may be of the peer itself.
+        let copies: Vec<InFlightOpenFile> = sent
+            .iter()
+            .filter_map(|sent| sent.open_file.clone())
+            .collect();
+        let mut message = Some(QueuedMessage {
+            descriptors: sent,
+            bytes,
+        });
+        let outcome = peer.with_description(|d| {
+            let rights = &mut d.rights;
+            let message = message.take().expect("a message is queued once");
+            if rights.queued.len() >= MAX_QUEUED_RIGHTS_MESSAGES {
+                // No room to keep messages of data alone: none carried a
+                // descriptor, so the queue stays in lockstep without them.
+                give_up_completeness(rights);
             }
-            d.rights.queued.push_back(sent);
-        })
-        .is_some()
-    }
-
-    /// A message this socket sent may have carried descriptors that were not
-    /// queued on its peer (`SocketRights::lockstep_lost`).
-    pub(crate) fn lose_peer_lockstep(&self) {
-        if let Some(peer) = self.with_description(|d| d.rights.peer.clone()) {
-            peer.with_description(|d| d.rights.lockstep_lost = true);
+            if message.descriptors.is_empty() {
+                if !rights.complete {
+                    return (false, None);
+                }
+                // A stream's reads count bytes, not messages: data alone that
+                // follows data alone joins it.
+                if rights.stream
+                    && let Some(newest) = rights.queued.back_mut()
+                    && newest.descriptors.is_empty()
+                {
+                    newest.bytes += message.bytes;
+                    return (true, None);
+                }
+            }
+            let dropped = (rights.queued.len() >= MAX_QUEUED_RIGHTS_MESSAGES)
+                .then(|| {
+                    rights.lockstep_lost = true;
+                    rights.suspects = rights.suspects.saturating_sub(1);
+                    rights.queued.pop_front()
+                })
+                .flatten();
+            rights.queued.push_back(message);
+            (true, dropped)
+        });
+        match outcome {
+            Some((queued, dropped)) => {
+                if queued {
+                    for copy in &copies {
+                        copy.enter_flight();
+                    }
+                }
+                // Linux still holds the message dropped to make room: what
+                // it carried stays counted in flight.
+                drop(dropped);
+                Ok(())
+            }
+            None => Err(message
+                .take()
+                .map(|message| message.descriptors)
+                .unwrap_or_default()),
         }
     }
 
-    /// A call took a message from this socket that Detcore could not match
-    /// to its queue (`SocketRights::lockstep_lost`); nothing is lost while
-    /// nothing is queued.
-    pub(crate) fn lose_lockstep_if_queued(&self) {
-        self.with_description(|d| {
-            if !d.rights.queued.is_empty() {
+    /// A message this socket sent may have carried descriptors that were not
+    /// queued on its peer, or reached the peer out of the queue's order
+    /// (`SocketRights::lockstep_lost`).
+    pub(crate) fn lose_peer_lockstep(&self) {
+        if let Some(peer) = self.with_description(|d| d.rights.peer.clone()) {
+            peer.with_description(|d| {
                 d.rights.lockstep_lost = true;
+                give_up_completeness(&mut d.rights);
+            });
+        }
+    }
+
+    /// A call took up to `taken` messages from this socket that Detcore
+    /// could not match to its queue. The queue is kept: Detcore cannot tell
+    /// whether the messages the call took carried descriptors, and Linux
+    /// still delivers the others, in order. The call may have taken as many
+    /// of the oldest queued messages, which are suspect from now on
+    /// (`SocketRights::suspects`), and forgotten when a receive takes a later
+    /// one (`Self::take_queued_rights`). Where the queue holds every message
+    /// (`SocketRights::complete`) but holds none, the call took one it never
+    /// held, which may have carried descriptors: the queue is out of
+    /// lockstep. Under record and replay (`legacy`), the rule existing
+    /// recordings were made with: any such call while something is queued
+    /// puts the queue out of lockstep. A stream socket's queue no longer holds
+    /// every message after such a call (`give_up_completeness`), as one stream
+    /// read takes messages of data alone along with at most one that carried
+    /// descriptors.
+    pub(crate) fn lose_lockstep_if_queued(&self, taken: usize, legacy: bool) {
+        self.with_description(|d| {
+            let rights = &mut d.rights;
+            if rights.stream && !rights.queued.is_empty() {
+                // A stream read takes any number of messages of data alone
+                // before the one whose descriptors it detaches: the suspects
+                // count only messages that carried descriptors.
+                give_up_completeness(rights);
+            }
+            if !rights.queued.is_empty() {
+                if legacy {
+                    rights.lockstep_lost = true;
+                }
+                rights.suspects = rights
+                    .suspects
+                    .saturating_add(taken)
+                    .min(rights.queued.len());
+            } else if rights.complete {
+                rights.lockstep_lost = true;
+                give_up_completeness(rights);
             }
         });
+    }
+
+    /// Whether a message is queued to this socket.
+    pub(crate) fn has_queued_rights(&self) -> bool {
+        self.with_description(|d| !d.rights.queued.is_empty())
+    }
+
+    /// A call took the oldest message Linux held for this datagram or
+    /// seqpacket socket without naming its descriptors: a read with no
+    /// control buffer, or a receive whose message Linux delivered with none.
+    /// Where the queue holds every message (`SocketRights::complete`) and has
+    /// nothing suspect, that is the oldest queued message, which `fits` (what
+    /// the call reports of it) must agree with: it is taken, and its
+    /// descriptors returned for their descriptions to be released, as Linux
+    /// releases them. `None` otherwise, for the caller to count the call as
+    /// one that may have taken a message unseen
+    /// ([`Self::lose_lockstep_if_queued`]); a queue whose oldest message does
+    /// not fit, or that holds none, missed a message, so it is out of
+    /// lockstep and no longer holds every message.
+    pub(crate) fn take_head_message(
+        &self,
+        fits: impl FnOnce(&QueuedMessage) -> bool,
+    ) -> Option<Vec<SentDescriptor>> {
+        self.with_description(|d| {
+            let rights = &mut d.rights;
+            if !rights.complete || rights.suspects > 0 {
+                return None;
+            }
+            match rights.queued.front() {
+                Some(head) if fits(head) => rights.queued.pop_front().map(|head| head.descriptors),
+                _ => {
+                    rights.lockstep_lost = true;
+                    give_up_completeness(rights);
+                    None
+                }
+            }
+        })
+    }
+
+    /// A receive took one message of data alone from this datagram or
+    /// seqpacket socket, delivered without descriptors and without
+    /// `MSG_CTRUNC`. A queue of descriptors alone loses nothing to it. One
+    /// that holds every message (`SocketRights::complete`) takes its oldest,
+    /// which must be of data alone ([`Self::take_head_message`]), or, while
+    /// some are suspect, counts one more message that may be gone.
+    pub(crate) fn take_data_only_message(&self) {
+        let suspect = self.with_description(|d| d.rights.complete && d.rights.suspects > 0);
+        if suspect {
+            self.lose_lockstep_if_queued(1, false);
+        } else {
+            let _ = self.take_head_message(|head| head.descriptors.is_empty());
+        }
+    }
+
+    /// A stream read took `read` bytes from this socket without naming the
+    /// descriptors it detached: a read with no control buffer, or a receive
+    /// that installed none. Where the queue holds every message
+    /// (`SocketRights::complete`) and has nothing suspect, the bytes come
+    /// from the oldest messages on ([`stream_walk`]), and `fits` must agree
+    /// with the descriptors they detach, if any: then they are taken, and the
+    /// descriptors returned for their descriptions to be released, as Linux
+    /// releases them. `None` otherwise, for the caller to count the call as
+    /// one that may have taken a message unseen
+    /// ([`Self::lose_lockstep_if_queued`]); a queue the read does not fit
+    /// missed a message, so it is out of lockstep and no longer holds every
+    /// message.
+    pub(crate) fn take_stream_bytes(
+        &self,
+        read: usize,
+        fits: impl FnOnce(Option<&[SentDescriptor]>) -> bool,
+    ) -> Option<Vec<SentDescriptor>> {
+        self.with_description(|d| {
+            let rights = &mut d.rights;
+            if !rights.complete || !rights.stream || rights.suspects > 0 {
+                return None;
+            }
+            match stream_walk(rights, read) {
+                Some(walk)
+                    if fits(
+                        walk.detached
+                            .map(|index| rights.queued[index].descriptors.as_slice()),
+                    ) =>
+                {
+                    Some(apply_stream_walk(rights, walk))
+                }
+                _ => {
+                    rights.lockstep_lost = true;
+                    give_up_completeness(rights);
+                    None
+                }
+            }
+        })
+    }
+
+    /// How many bytes a stream read of this socket that asked for `asked`
+    /// took, where Linux does not report it: one that took its bytes and then
+    /// failed copying an output out (`EFAULT`). Where the queue holds every
+    /// message (`SocketRights::complete`) and has nothing suspect, Linux took
+    /// what [`stream_read_count`] says, provided it copied every byte; `None`
+    /// otherwise.
+    pub(crate) fn stream_read_count(&self, asked: usize) -> Option<usize> {
+        self.with_description(|d| {
+            let rights = &d.rights;
+            (rights.complete && rights.stream && rights.suspects == 0)
+                .then(|| stream_read_count(rights, asked))
+        })
     }
 
     /// The descriptors of the message queued to this socket that a receive,
     /// which installed descriptors whose identities are `received` from one
     /// message (`truncated` when Linux set `MSG_CTRUNC` for it), took: the
     /// oldest queued message they name ([`names_sent_rights`]), or `None`;
-    /// and whether the queue still follows the socket's messages one for one
-    /// (`SocketRights::lockstep_lost`).
+    /// whether the queue still follows the socket's messages one for one
+    /// (`SocketRights::lockstep_lost`); and whether the receipt may join the
+    /// descriptions that message holds ([`TakenRights::joinable`]).
     ///
     /// Linux delivers a socket's messages in order, so the messages queued
     /// before it were taken by calls Detcore could not match: they are
-    /// forgotten with it, and the queue is no longer in lockstep. A
-    /// `MSG_PEEK` receive (`peek`) leaves every message queued, as Linux
-    /// does.
+    /// forgotten with it ([`TakenRights::forgotten`]). A `MSG_PEEK` receive
+    /// (`peek`) leaves every message queued, as Linux does.
+    ///
+    /// The message the receive took is the oldest Linux still held, so it is
+    /// at most the first past the suspects (`SocketRights::suspects`). A
+    /// match there or among them is trusted only where no later suspect, nor
+    /// the first message past them, names the same files: otherwise the
+    /// receive may have taken that later one after the matched one was
+    /// released unseen, and the matched message is a stale entry, which is
+    /// not joined; the messages that may be that receive's own stay suspect.
+    /// A match beyond the first message past the suspects names a message
+    /// Linux cannot have delivered yet, so this receive took one that was
+    /// never queued here, naming the same files, or one a call Detcore did
+    /// not count took: `None`, and every message up to the matched one stays
+    /// queued, as Linux still holds them, suspect from now on, with the queue
+    /// out of lockstep. A peek may name a later message (`SO_PEEK_OFF`): it
+    /// is trusted wherever it is, where the queue is in lockstep and no other
+    /// queued message names the same files, so that no other message can be
+    /// the one peeked. A receipt that names no queued message took one never
+    /// queued here: the queue is out of lockstep.
+    ///
+    /// A stream receive of `bytes` bytes from a queue that holds every
+    /// message (`SocketRights::complete`) took those bytes from the oldest
+    /// messages on ([`stream_walk`]): the message whose descriptors they
+    /// detached is the one taken, where the received descriptors name it; a
+    /// queue the receive does not fit missed a message, and is out of lockstep
+    /// and no longer holds every message.
+    ///
+    /// Under record and replay (`legacy`) the rule existing recordings were
+    /// made with holds: a match anywhere takes the matched message and
+    /// forgets those before it, and a match past the first puts the queue out
+    /// of lockstep.
     pub(crate) fn take_queued_rights(
         &self,
         received: &[FileIdentity],
         truncated: bool,
         peek: bool,
-    ) -> Option<(Vec<SentDescriptor>, bool)> {
+        legacy: bool,
+        bytes: Option<usize>,
+    ) -> Option<TakenRights> {
         self.with_description(|d| {
-            let index = d
-                .rights
+            let rights = &mut d.rights;
+            let names =
+                |sent: &QueuedMessage| names_sent_rights(&sent.descriptors, received, truncated);
+            // A stream receive whose queue holds every message took its bytes
+            // from the oldest messages on, and the descriptors it installed are
+            // those of the message whose descriptors those bytes detached.
+            if rights.stream
+                && rights.complete
+                && rights.suspects == 0
+                && !peek
+                && !legacy
+                && let Some(read) = bytes
+            {
+                match stream_walk(rights, read) {
+                    Some(walk)
+                        if walk
+                            .detached
+                            .is_some_and(|index| names(&rights.queued[index])) =>
+                    {
+                        return Some(TakenRights {
+                            sent: apply_stream_walk(rights, walk),
+                            lockstep: !rights.lockstep_lost,
+                            joinable: true,
+                            forgotten: Vec::new(),
+                        });
+                    }
+                    _ => {
+                        rights.lockstep_lost = true;
+                        give_up_completeness(rights);
+                    }
+                }
+            }
+            let Some(index) = rights.queued.iter().position(names) else {
+                if !legacy && !peek {
+                    rights.lockstep_lost = true;
+                    give_up_completeness(rights);
+                }
+                return None;
+            };
+            // Where each call takes one message, a message's place is its
+            // index; a stream read takes messages of data alone along with one
+            // that carried descriptors, so there a message's place counts only
+            // those that carried some (the suspects count them alike).
+            let stream = rights.stream;
+            let mut carried = 0;
+            let places: Vec<usize> = rights
                 .queued
                 .iter()
-                .position(|sent| names_sent_rights(sent, received, truncated))?;
-            if index > 0 {
-                d.rights.lockstep_lost = true;
+                .enumerate()
+                .map(|(index, message)| {
+                    let place = if stream { carried } else { index };
+                    carried += usize::from(!message.descriptors.is_empty());
+                    place
+                })
+                .collect();
+            let place = places[index];
+            let suspects = rights.suspects;
+            let ambiguous = rights
+                .queued
+                .iter()
+                .zip(&places)
+                .skip(index + 1)
+                .take_while(|(_, later)| **later <= suspects)
+                .any(|(sent, _)| names(sent));
+            let unique = !rights.lockstep_lost && !rights.queued.iter().skip(index + 1).any(names);
+            let joinable = (place <= suspects && !ambiguous) || (peek && unique);
+            if legacy {
+                if index > 0 {
+                    rights.lockstep_lost = true;
+                }
+            } else if place > suspects && !peek {
+                // Up to the match, every message stays, suspect. Where messages
+                // of data alone go first, a stream's places are its indices.
+                if stream {
+                    give_up_completeness(rights);
+                    rights.suspects = (place + 1).min(rights.queued.len());
+                } else {
+                    rights.suspects = (index + 1).min(rights.queued.len());
+                    give_up_completeness(rights);
+                }
+                rights.lockstep_lost = true;
+                return None;
             }
-            let sent = if peek {
-                d.rights.queued.get(index).cloned()
+            let (sent, forgotten) = if peek {
+                (
+                    rights
+                        .queued
+                        .get(index)
+                        .map(|message| message.descriptors.clone()),
+                    Vec::new(),
+                )
             } else {
-                d.rights.queued.drain(..index);
-                d.rights.queued.pop_front()
+                rights.suspects = if joinable || place > suspects {
+                    0
+                } else {
+                    suspects - place
+                };
+                let forgotten = rights
+                    .queued
+                    .drain(..index)
+                    .flat_map(|message| message.descriptors)
+                    .collect();
+                let sent = rights.queued.pop_front().map(|message| message.descriptors);
+                rights.suspects = rights.suspects.min(rights.queued.len());
+                (sent, forgotten)
             };
-            sent.map(|sent| (sent, !d.rights.lockstep_lost))
+            sent.map(|sent| TakenRights {
+                sent,
+                lockstep: !rights.lockstep_lost,
+                joinable,
+                forgotten,
+            })
         })
     }
 
@@ -3665,8 +4479,9 @@ mod tests {
     /// The descriptors a socket's messages carried are taken in order
     /// (`DetFd::take_queued_rights`): a peek leaves its message queued, a
     /// receive of fewer descriptors than a message carried names it only where
-    /// Linux set `MSG_CTRUNC`, and a receive that names a later message
-    /// forgets the earlier ones, which receives Detcore could not match took.
+    /// Linux set `MSG_CTRUNC`, a receive that names a message Linux cannot
+    /// have delivered yet takes nothing, leaving every message queued, and one
+    /// that names no queued message puts the queue out of lockstep.
     #[test]
     fn queued_rights_are_taken_in_order() {
         let owner = DetTid::from_raw(10);
@@ -3687,65 +4502,938 @@ mod tests {
                 .map(|&inode| SentDescriptor {
                     file: file(inode),
                     open_file: None,
+                    lock_copy: None,
                 })
                 .collect()
         };
-        let inodes = |taken: Option<(Vec<SentDescriptor>, bool)>| {
-            taken.map(|(sent, _)| sent.iter().map(|sent| sent.file.1).collect::<Vec<_>>())
+        let inodes = |taken: Option<TakenRights>| {
+            taken.map(|taken| {
+                taken
+                    .sent
+                    .iter()
+                    .map(|sent| sent.file.1)
+                    .collect::<Vec<_>>()
+            })
         };
 
         for message in [&[10][..], &[20, 21], &[30], &[40]] {
-            assert!(left.queue_rights_to_peer(sent(message)));
+            assert!(matches!(
+                left.queue_rights_to_peer(sent(message), 1),
+                Ok(())
+            ));
         }
         assert_eq!(
-            inodes(right.take_queued_rights(&[file(10)], false, true)),
+            inodes(right.take_queued_rights(&[file(10)], false, true, false, None)),
             Some(vec![10]),
             "a peek names the first message"
         );
         assert_eq!(
-            inodes(right.take_queued_rights(&[file(10)], false, false)),
+            inodes(right.take_queued_rights(&[file(10)], false, false, false, None)),
             Some(vec![10]),
             "and leaves it queued"
         );
         assert_eq!(
-            inodes(right.take_queued_rights(&[file(20)], false, false)),
-            None
-        );
-        assert_eq!(
             right
-                .take_queued_rights(&[file(20)], true, false)
-                .map(|(sent, lockstep)| (sent.len(), lockstep)),
+                .take_queued_rights(&[file(20)], true, false, false, None)
+                .map(|taken| (taken.sent.len(), taken.lockstep)),
             Some((2, true)),
             "a truncated receive takes the whole message, in lockstep"
         );
         assert!(
-            right.take_queued_rights(&[file(10)], false, true).is_none(),
+            right
+                .take_queued_rights(&[file(10)], false, true, false, None)
+                .is_none(),
             "a message taken is no longer queued"
         );
-        let skipped = right.take_queued_rights(&[file(40)], false, false);
-        assert_eq!(
-            skipped.as_ref().map(|(_, lockstep)| *lockstep),
-            Some(false),
-            "a message taken after an unmatched one leaves the queue out of lockstep"
+        assert!(
+            right
+                .take_queued_rights(&[file(40)], false, false, false, None)
+                .is_none(),
+            "a receipt that names a message Linux cannot have delivered yet (no call \
+             took the one before it) took one never queued here: it takes nothing"
         );
-        assert_eq!(inodes(skipped), Some(vec![40]));
+        let next = right.take_queued_rights(&[file(30)], false, false, false, None);
         assert_eq!(
-            inodes(right.take_queued_rights(&[file(30)], false, false)),
-            None,
-            "the message before the one taken is forgotten"
+            next.as_ref()
+                .map(|taken| (taken.lockstep, taken.joinable, taken.forgotten.len())),
+            Some((false, true, 0)),
+            "Linux still delivers the messages before it, in order, and they are joined"
+        );
+        assert_eq!(inodes(next), Some(vec![30]));
+        assert_eq!(
+            inodes(right.take_queued_rights(&[file(40)], false, false, false, None)),
+            Some(vec![40])
+        );
+
+        // One descriptor of a message that carried two, without MSG_CTRUNC,
+        // names no queued message: the message it came with was never queued
+        // here, and the queue is out of lockstep. A peek changes nothing.
+        let (other_left, other_right) = (socket(5, 3), socket(6, 4));
+        other_left.pair_sockets(&other_right, false);
+        assert!(matches!(
+            other_left.queue_rights_to_peer(sent(&[90, 91]), 1),
+            Ok(())
+        ));
+        assert!(
+            other_right
+                .take_queued_rights(&[file(90)], false, true, false, None)
+                .is_none()
+        );
+        assert_eq!(
+            other_right
+                .take_queued_rights(&[file(90), file(91)], false, true, false, None)
+                .map(|taken| taken.lockstep),
+            Some(true)
+        );
+        assert!(
+            other_right
+                .take_queued_rights(&[file(90)], false, false, false, None)
+                .is_none()
+        );
+        assert_eq!(
+            other_right
+                .take_queued_rights(&[file(90), file(91)], false, false, false, None)
+                .map(|taken| (taken.lockstep, taken.joinable)),
+            Some((false, true))
+        );
+
+        // Under record and replay, such a receipt takes its match and forgets
+        // the messages before it, as recordings were made with.
+        for message in [&[70][..], &[80]] {
+            assert!(matches!(
+                left.queue_rights_to_peer(sent(message), 1),
+                Ok(())
+            ));
+        }
+        let legacy = right.take_queued_rights(&[file(80)], false, false, true, None);
+        assert_eq!(
+            legacy
+                .as_ref()
+                .map(|taken| (taken.joinable, taken.forgotten.len())),
+            Some((false, 1))
         );
 
         // A message sent through `right` reaches `left`; a socket with no
         // known peer queues nothing.
-        assert!(right.queue_rights_to_peer(sent(&[50])));
+        assert!(matches!(right.queue_rights_to_peer(sent(&[50]), 1), Ok(())));
         assert_eq!(
-            inodes(right.take_queued_rights(&[file(50)], false, false)),
+            inodes(right.take_queued_rights(&[file(50)], false, false, false, None)),
             None
         );
         assert_eq!(
-            inodes(left.take_queued_rights(&[file(50)], false, false)),
+            inodes(left.take_queued_rights(&[file(50)], false, false, false, None)),
             Some(vec![50])
         );
-        assert!(!socket(5, 2).queue_rights_to_peer(sent(&[60])));
+        assert!(matches!(
+            socket(5, 2).queue_rights_to_peer(sent(&[60]), 1),
+            Err(back) if back.len() == 1
+        ));
+    }
+
+    /// After calls Detcore could not match took messages, a receipt joins
+    /// none that Linux may have released already: the first message past
+    /// them, or one among them that no later one among them shadows
+    /// (`SocketRights::suspects`).
+    #[test]
+    fn a_message_linux_may_have_released_is_never_joined() {
+        let owner = DetTid::from_raw(10);
+        let socket = |fd, sequence| {
+            DetFd::new(
+                fd,
+                OFlag::O_RDWR,
+                FdType::Socket,
+                OpenFileId::new(owner, sequence),
+            )
+        };
+        let sent = |inode: u64| {
+            vec![SentDescriptor {
+                file: (1, inode),
+                open_file: None,
+                lock_copy: None,
+            }]
+        };
+        let take = |socket: &DetFd, inode: u64, peek: bool| {
+            socket
+                .take_queued_rights(&[(1, inode)], false, peek, false, None)
+                .map(|taken| (taken.joinable, taken.forgotten.len()))
+        };
+
+        // Two messages naming one file, the first taken unseen (an EFAULT
+        // after the dequeue): the receipt of the second matches the first,
+        // which may be the stale one, so neither is joined, and the second,
+        // left in the queue, stays suspect.
+        let (left, right) = (socket(3, 0), socket(4, 1));
+        left.pair_sockets(&right, false);
+        for inode in [10, 10] {
+            assert!(matches!(left.queue_rights_to_peer(sent(inode), 1), Ok(())));
+        }
+        right.lose_lockstep_if_queued(1, false);
+        assert_eq!(take(&right, 10, true), Some((false, 0)), "a peek alike");
+        assert_eq!(take(&right, 10, false), Some((false, 0)));
+        assert!(matches!(left.queue_rights_to_peer(sent(10), 1), Ok(())));
+        assert_eq!(
+            take(&right, 10, false),
+            Some((false, 0)),
+            "the received message's own entry is never joined"
+        );
+
+        // A data-only message taken unseen: the next message names other
+        // files, so its receipt is trusted, and the queue past it is not
+        // suspect any more.
+        let (left, right) = (socket(3, 2), socket(4, 3));
+        left.pair_sockets(&right, false);
+        for inode in [20, 21] {
+            assert!(matches!(left.queue_rights_to_peer(sent(inode), 1), Ok(())));
+        }
+        right.lose_lockstep_if_queued(1, false);
+        assert_eq!(take(&right, 20, false), Some((true, 0)));
+        assert_eq!(take(&right, 21, false), Some((true, 0)));
+
+        // Two calls took messages unseen; the third message is the first
+        // Linux can still hold, and its receipt forgets the two before it.
+        let (left, right) = (socket(3, 4), socket(4, 5));
+        left.pair_sockets(&right, false);
+        for inode in [30, 31, 32, 33] {
+            assert!(matches!(left.queue_rights_to_peer(sent(inode), 1), Ok(())));
+        }
+        right.lose_lockstep_if_queued(1, false);
+        right.lose_lockstep_if_queued(1, false);
+        assert_eq!(take(&right, 32, false), Some((true, 2)));
+        assert_eq!(
+            take(&right, 33, false),
+            Some((true, 0)),
+            "after a trusted receipt nothing is suspect"
+        );
+
+        // With one call unmatched, a receipt that names the third message
+        // names one Linux cannot have delivered yet: it takes nothing, and
+        // the messages up to it stay queued, suspect, as Linux still holds
+        // them; the next receipt of the first is trusted.
+        let (left, right) = (socket(3, 6), socket(4, 7));
+        left.pair_sockets(&right, false);
+        for inode in [40, 41, 42] {
+            assert!(matches!(left.queue_rights_to_peer(sent(inode), 1), Ok(())));
+        }
+        right.lose_lockstep_if_queued(1, false);
+        assert_eq!(take(&right, 42, false), None);
+        assert_eq!(take(&right, 40, false), Some((true, 0)));
+        assert_eq!(take(&right, 41, false), Some((true, 0)));
+        assert_eq!(take(&right, 42, false), Some((true, 0)));
+    }
+
+    /// A socketpair of `owner`'s table, and descriptor 5 of a description
+    /// of type `ty` to send through it.
+    fn pair_and_sent(owner: DetTid, ty: FdType) -> (DetFd, DetFd, DetFd) {
+        let detfd =
+            |fd, ty, sequence| DetFd::new(fd, OFlag::O_RDWR, ty, OpenFileId::new(owner, sequence));
+        let (left, right) = (detfd(3, FdType::Socket, 0), detfd(4, FdType::Socket, 1));
+        left.pair_sockets(&right, false);
+        (left, right, detfd(5, ty, 2))
+    }
+
+    /// Queue `sent` through `left` (`held` or with the legacy ownership),
+    /// drop the sender's descriptor, and return a handle that tells whether
+    /// the description is still alive.
+    fn queue_and_close(left: &DetFd, sent: DetFd, held: bool) -> OpenFileHandle {
+        let handle = sent.open_file_handle();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 50),
+                    open_file: Some(sent.in_flight_open_file(held)),
+                    lock_copy: None,
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        drop(sent);
+        handle
+    }
+
+    /// A queued message keeps the descriptions it carries alive, as Linux's
+    /// in-flight reference keeps each `struct file`: the receipt names the
+    /// sender's description after the sender's last descriptor of it went,
+    /// by a close or with the table of a sender that exited, whenever the
+    /// backend releases that table
+    /// (https://github.com/rrnewton/hermit/issues/4930). The description
+    /// counts the copy in flight until the receipt lands it in the
+    /// receiving table (`OpenFileDescription::in_flight`).
+    #[test]
+    fn a_queued_message_keeps_its_descriptions_alive() {
+        let (left, right, sent) = pair_and_sent(DetTid::from_raw(10), FdType::Eventfd);
+        let id = sent.open_file_id();
+        let alias = sent.clone();
+        let handle = queue_and_close(&left, sent, true);
+        assert_eq!(
+            alias.open_file_alias_count(),
+            2,
+            "the queue's reference holds it"
+        );
+        assert_eq!(alias.copies_in_flight(), 1, "and counts in flight");
+        assert!(!alias.is_last_reference(), "so no close releases it");
+        drop(alias);
+        assert!(
+            handle.descriptor(5, false).is_some(),
+            "the queued message holds the description"
+        );
+        let taken = right
+            .take_queued_rights(&[(1, 50)], false, false, false, None)
+            .unwrap();
+        assert!(taken.lockstep && taken.forgotten.is_empty());
+        let copy = taken.sent[0].open_file.as_ref().unwrap();
+        let received = copy.descriptor(7, true).unwrap();
+        copy.land();
+        assert_eq!(received.copies_in_flight(), 0, "landed");
+        assert_eq!(
+            received.open_file_id(),
+            id,
+            "the receipt is the sender's description"
+        );
+        drop(taken);
+        assert!(
+            handle.descriptor(5, false).is_some(),
+            "the received descriptor holds it now"
+        );
+        drop(received);
+        assert!(
+            handle.descriptor(5, false).is_none(),
+            "and nothing else does"
+        );
+    }
+
+    /// Under record and replay a queued message keeps the ownership existing
+    /// recordings were made with: it holds nothing, so a description only it
+    /// names is gone for every decision, a receipt's join and a pending
+    /// connection's pairing alike.
+    #[test]
+    fn a_legacy_queued_message_keeps_nothing_alive() {
+        let (left, right, sent) = pair_and_sent(DetTid::from_raw(10), FdType::Socket);
+        let handle = queue_and_close(&left, sent, false);
+        assert!(
+            handle.descriptor(5, false).is_none(),
+            "the description is gone"
+        );
+        let taken = right
+            .take_queued_rights(&[(1, 50)], false, false, false, None)
+            .unwrap();
+        assert!(
+            taken.sent[0]
+                .open_file
+                .as_ref()
+                .unwrap()
+                .descriptor(7, false)
+                .is_none(),
+            "and the receipt cannot name it"
+        );
+    }
+
+    /// A receive Detcore could not match, a peek among them, keeps every
+    /// queued message, and with it the descriptions it holds: Linux still
+    /// delivers them. The queue lets go where Linux releases a message: a
+    /// later message taken after calls Detcore could not match forgets the
+    /// ones before it, a datagram `connect` (or a send that finds the peer
+    /// gone) purges the queue, and the receiving socket's last reference
+    /// takes the queue with it. Each release by a guest call uncounts the
+    /// copy in flight ([`InFlightOpenFile::release`]).
+    #[test]
+    fn a_queue_lets_go_only_where_linux_releases_the_messages() {
+        let owner = DetTid::from_raw(10);
+        let release = |sent: Vec<SentDescriptor>| {
+            sent.into_iter()
+                .filter_map(|sent| sent.open_file.and_then(InFlightOpenFile::release))
+                .count()
+        };
+
+        // A receive Detcore could not match keeps the queue, the message it
+        // may have taken suspect, in lockstep: no message reached the socket
+        // unqueued. Under record and replay it puts the queue out of
+        // lockstep, as recordings were made with.
+        for legacy in [false, true] {
+            let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+            let handle = queue_and_close(&left, sent, true);
+            right.lose_lockstep_if_queued(1, legacy);
+            assert!(handle.descriptor(5, false).is_some(), "kept with the queue");
+            assert!(matches!(
+                right.take_queued_rights(&[(1, 50)], false, false, legacy, None),
+                Some(taken) if taken.sent.len() == 1
+                    && taken.lockstep == !legacy
+                    && taken.joinable
+            ));
+        }
+
+        // A later message taken after a call Detcore could not match forgets
+        // the earlier one, which that call took.
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        let handle = queue_and_close(&left, sent, true);
+        let later = |inode| SentDescriptor {
+            file: (1, inode),
+            open_file: None,
+            lock_copy: None,
+        };
+        assert!(matches!(
+            left.queue_rights_to_peer(vec![later(60)], 1),
+            Ok(())
+        ));
+        right.lose_lockstep_if_queued(1, false);
+        let taken = right
+            .take_queued_rights(&[(1, 60)], false, false, false, None)
+            .unwrap();
+        assert_eq!(release(taken.forgotten), 1, "the last reference goes");
+        assert!(handle.descriptor(5, false).is_none(), "released with it");
+
+        // A datagram `connect` of the receiving socket purges its queue.
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        let handle = queue_and_close(&left, sent, true);
+        let purged = right.unpair_rights_peer();
+        assert_eq!(purged.len(), 1);
+        assert!(handle.descriptor(5, false).is_some(), "until released");
+        assert_eq!(release(purged), 1);
+        assert!(
+            handle.descriptor(5, false).is_none(),
+            "purged with the queue"
+        );
+
+        // The receiving socket's last reference takes its queue.
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        let handle = queue_and_close(&left, sent, true);
+        let taken = right.take_all_queued_rights();
+        assert_eq!(release(taken), 1);
+        assert!(
+            handle.descriptor(5, false).is_none(),
+            "gone with the socket"
+        );
+
+        // A release keeps a description another descriptor still names.
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        let alias = sent.clone();
+        queue_and_close(&left, sent, true);
+        assert_eq!(release(right.take_all_queued_rights()), 0);
+        assert!(alias.is_last_reference(), "now the last reference");
+        drop(left);
+    }
+
+    /// Whether a descriptor is its description's last reference, which
+    /// decides a socket's port and queue at its close, depends only on what
+    /// guest calls did, not on when the backend releases a table that holds
+    /// a queue (https://github.com/rrnewton/hermit/issues/4930): a copy in
+    /// flight in the queue of a socket whose only holder exited counts
+    /// whether or not the backend has dropped that holder's table yet, and
+    /// for the rest of the run, as does one dropped past the queue's bound.
+    #[test]
+    fn a_copy_in_flight_decides_the_last_reference_whatever_drops_its_queue() {
+        let owner = DetTid::from_raw(10);
+        for teardown_first in [false, true] {
+            let (left, right, sent) = pair_and_sent(owner, FdType::Socket);
+            let alias = sent.clone();
+            queue_and_close(&left, sent, true);
+            if teardown_first {
+                // The receiving socket went with a table the backend released.
+                drop(right);
+                assert_eq!(alias.open_file_alias_count(), 1, "nothing holds the copy");
+            }
+            assert!(
+                !alias.is_last_reference(),
+                "teardown_first={teardown_first}: the copy in flight counts either way"
+            );
+            assert_eq!(alias.copies_in_flight(), 1);
+        }
+
+        // Past the bound, the oldest message is dropped from the queue, and
+        // what it carried stays counted.
+        let (left, _right, sent) = pair_and_sent(owner, FdType::Socket);
+        let alias = sent.clone();
+        queue_and_close(&left, sent, true);
+        let filler = || SentDescriptor {
+            file: (1, 60),
+            open_file: None,
+            lock_copy: None,
+        };
+        for _ in 0..MAX_QUEUED_RIGHTS_MESSAGES {
+            assert!(matches!(
+                left.queue_rights_to_peer(vec![filler()], 1),
+                Ok(())
+            ));
+        }
+        assert_eq!(alias.open_file_alias_count(), 1, "dropped from the queue");
+        assert!(!alias.is_last_reference(), "but never released");
+    }
+
+    /// Where a socket's queue holds every message (the two sockets of a
+    /// datagram `socketpair`), a call that takes one without naming its
+    /// descriptors (a `read`) takes the oldest queued one, data alone or not,
+    /// and releases what it carried, as Linux does
+    /// ([`DetFd::take_head_message`]); a queue that may miss a message (a
+    /// bound socket, or one out of lockstep) takes nothing.
+    #[test]
+    fn a_complete_queue_gives_up_the_message_a_read_takes() {
+        let owner = DetTid::from_raw(10);
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        left.mark_complete_pair(&right);
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 3), Ok(())));
+        let alias = sent.clone();
+        queue_and_close(&left, sent, true);
+        let data_only = right.take_head_message(|head| head.bytes == 3);
+        assert!(matches!(data_only, Some(ref sent) if sent.is_empty()));
+        let carried = right.take_head_message(|head| head.bytes == 1).unwrap();
+        assert_eq!(carried.len(), 1);
+        assert!(!alias.is_last_reference());
+        assert_eq!(
+            carried
+                .into_iter()
+                .filter_map(|sent| sent.open_file.and_then(InFlightOpenFile::release))
+                .count(),
+            0
+        );
+        assert!(alias.is_last_reference(), "released at the read");
+
+        // A message that does not fit what the call reports leaves the queue
+        // out of lockstep, taking nothing.
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        left.mark_complete_pair(&right);
+        queue_and_close(&left, sent, true);
+        assert!(right.take_head_message(|head| head.bytes == 2).is_none());
+        assert!(right.take_head_message(|_| true).is_none(), "for good");
+
+        // A bound socket can be sent to by name: its queue may miss one.
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        left.mark_complete_pair(&right);
+        right.set_unix_name(Box::from(&b"\0bound"[..]), 1);
+        queue_and_close(&left, sent, true);
+        assert!(right.take_head_message(|_| true).is_none());
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(())));
+        assert!(
+            right
+                .take_queued_rights(&[(1, 50)], false, false, false, None)
+                .is_some()
+                && !right.has_queued_rights(),
+            "and data alone is not queued"
+        );
+    }
+
+    /// A queue that no longer holds every message keeps only the messages
+    /// that carried descriptors, and the suspects among them
+    /// (`give_up_completeness`): here two calls took messages unseen, the
+    /// message of data alone and the first descriptor's, so a receipt of the
+    /// second descriptor's message forgets the first. At the queue's bound, a
+    /// queue that held every message gives up the messages of data alone
+    /// first, before it drops anything Linux still holds, and stays in
+    /// lockstep. A stream's runs of data alone are one message.
+    #[test]
+    fn a_queue_that_gives_up_completeness_keeps_its_descriptors() {
+        let owner = DetTid::from_raw(10);
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        left.mark_complete_pair(&right);
+        let carried = |inode| {
+            vec![SentDescriptor {
+                file: (1, inode),
+                open_file: None,
+                lock_copy: None,
+            }]
+        };
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(())));
+        queue_and_close(&left, sent, true);
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(carried(60), 1), Ok(())));
+        right.lose_lockstep_if_queued(1, false);
+        right.lose_lockstep_if_queued(1, false);
+        left.give_up_pair_completeness();
+        let taken = right
+            .take_queued_rights(&[(1, 60)], false, false, false, None)
+            .unwrap();
+        assert!(taken.joinable && taken.lockstep);
+        assert_eq!(
+            taken
+                .forgotten
+                .iter()
+                .map(|sent| sent.file)
+                .collect::<Vec<_>>(),
+            [(1, 50)],
+            "the suspect message that carried a descriptor is forgotten"
+        );
+
+        let (left, right, _) = pair_and_sent(owner, FdType::Pipe);
+        left.mark_complete_pair(&right);
+        for _ in 1..MAX_QUEUED_RIGHTS_MESSAGES {
+            assert!(matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(())));
+        }
+        assert!(matches!(left.queue_rights_to_peer(carried(70), 1), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(carried(80), 1), Ok(())));
+        assert_eq!(
+            right
+                .take_queued_rights(&[(1, 70)], false, false, false, None)
+                .map(|taken| (taken.lockstep, taken.joinable)),
+            Some((true, true)),
+            "nothing that carried a descriptor was dropped, and the queue stays in lockstep"
+        );
+        assert!(
+            right
+                .take_queued_rights(&[(1, 80)], false, false, false, None)
+                .is_some()
+        );
+
+        let (left, right, _) = pair_and_sent(owner, FdType::Pipe);
+        left.pair_sockets(&right, true);
+        left.mark_complete_pair(&right);
+        for _ in 0..2 * MAX_QUEUED_RIGHTS_MESSAGES {
+            assert!(matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(())));
+        }
+        assert_eq!(
+            right
+                .take_stream_bytes(2 * MAX_QUEUED_RIGHTS_MESSAGES, |detached| detached
+                    .is_none())
+                .map(|released| released.len()),
+            Some(0),
+            "a stream's data alone is one run of bytes, held whole"
+        );
+    }
+
+    /// A receive that took one message of data alone from a datagram or
+    /// seqpacket socket (`DetFd::take_data_only_message`) loses nothing from a
+    /// queue of descriptors alone; from a queue that holds every message it
+    /// takes the oldest, which must be of data alone, or, while some are
+    /// suspect, counts one more message that may be gone.
+    #[test]
+    fn a_receipt_of_data_alone_takes_only_from_a_complete_queue() {
+        let owner = DetTid::from_raw(10);
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        queue_and_close(&left, sent, true);
+        right.take_data_only_message();
+        assert!(matches!(
+            right.take_queued_rights(&[(1, 50)], false, false, false, None),
+            Some(taken) if taken.joinable && taken.lockstep
+        ));
+
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        left.mark_complete_pair(&right);
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(())));
+        queue_and_close(&left, sent, true);
+        right.take_data_only_message();
+        assert!(
+            right
+                .take_head_message(|head| !head.descriptors.is_empty())
+                .is_some(),
+            "the message of data alone went first"
+        );
+
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        left.mark_complete_pair(&right);
+        queue_and_close(&left, sent, true);
+        right.take_data_only_message();
+        assert!(
+            right.take_head_message(|_| true).is_none(),
+            "a queue whose oldest message carried a descriptor missed one"
+        );
+
+        let (left, right, sent) = pair_and_sent(owner, FdType::Pipe);
+        left.mark_complete_pair(&right);
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(())));
+        queue_and_close(&left, sent, true);
+        right.lose_lockstep_if_queued(1, false);
+        right.take_data_only_message();
+        assert!(matches!(
+            right.take_queued_rights(&[(1, 50)], false, false, false, None),
+            Some(taken) if taken.joinable && taken.forgotten.is_empty()
+        ));
+    }
+
+    /// A stream socket's queue that holds every message gives up bytes from
+    /// its oldest messages on (`DetFd::take_stream_bytes`): a message's
+    /// descriptors go with the first of its bytes a read takes, a read of no
+    /// bytes that reached the socket detaches the oldest message's descriptors
+    /// alone, and a read that takes more bytes than the queue holds, or goes
+    /// past a message whose descriptors it detached, misses a message, leaving
+    /// the queue out of lockstep without the messages of data alone. A
+    /// receipt of descriptors takes the message its bytes reach
+    /// (`DetFd::take_queued_rights` with the receive's bytes), and a peek the
+    /// first message that carried descriptors.
+    #[test]
+    fn a_stream_queue_gives_up_bytes_from_its_oldest_messages() {
+        let owner = DetTid::from_raw(10);
+        let stream_pair = |sequence| {
+            let socket = |fd, sequence| {
+                DetFd::new(
+                    fd,
+                    OFlag::O_RDWR,
+                    FdType::Socket,
+                    OpenFileId::new(owner, sequence),
+                )
+            };
+            let (left, right) = (socket(3, sequence), socket(4, sequence + 1));
+            left.pair_sockets(&right, true);
+            left.mark_complete_pair(&right);
+            (left, right)
+        };
+        let carried = |inode| {
+            vec![SentDescriptor {
+                file: (1, inode),
+                open_file: None,
+                lock_copy: None,
+            }]
+        };
+        let inodes = |taken: Option<Vec<SentDescriptor>>| {
+            taken.map(|taken| taken.iter().map(|sent| sent.file.1).collect::<Vec<_>>())
+        };
+
+        let (left, right) = stream_pair(0);
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 3), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(carried(50), 2), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 4), Ok(())));
+        assert_eq!(inodes(right.take_stream_bytes(2, |_| true)), Some(vec![]));
+        assert_eq!(
+            inodes(right.take_stream_bytes(2, |_| true)),
+            Some(vec![50]),
+            "the descriptors go with the first of their message's bytes"
+        );
+        assert_eq!(inodes(right.take_stream_bytes(5, |_| true)), Some(vec![]));
+        assert!(!right.has_queued_rights(), "every byte read");
+        assert!(
+            right.take_stream_bytes(1, |_| true).is_none(),
+            "more than it held"
+        );
+        assert!(
+            matches!(left.queue_rights_to_peer(Vec::new(), 1), Ok(()))
+                && !right.has_queued_rights(),
+            "no longer holds every message"
+        );
+
+        let (left, right) = stream_pair(2);
+        assert!(matches!(left.queue_rights_to_peer(carried(60), 1), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 5), Ok(())));
+        assert!(
+            right.take_stream_bytes(3, |_| true).is_none(),
+            "no read goes past a message whose descriptors it detached"
+        );
+        assert!(
+            right
+                .take_queued_rights(&[(1, 60)], false, false, false, None)
+                .is_some()
+        );
+
+        let (left, right) = stream_pair(4);
+        assert!(matches!(left.queue_rights_to_peer(carried(70), 2), Ok(())));
+        assert_eq!(
+            inodes(right.take_stream_bytes(0, |detached| detached.is_some())),
+            Some(vec![70]),
+            "a read of no bytes detaches the oldest message's descriptors"
+        );
+        assert_eq!(inodes(right.take_stream_bytes(2, |_| true)), Some(vec![]));
+
+        let (left, right) = stream_pair(6);
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 3), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(carried(80), 1), Ok(())));
+        let taken = right
+            .take_queued_rights(&[(1, 80)], false, false, false, Some(4))
+            .unwrap();
+        assert!(taken.joinable && taken.lockstep && taken.forgotten.is_empty());
+        assert_eq!(
+            taken
+                .sent
+                .iter()
+                .map(|sent| sent.file.1)
+                .collect::<Vec<_>>(),
+            [80]
+        );
+        assert!(!right.has_queued_rights());
+
+        // A peek reads past data alone to the first message that carried
+        // descriptors, which is first among those that did, even where a later
+        // one names the same files.
+        let (left, right) = stream_pair(8);
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 3), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(carried(90), 1), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(carried(90), 1), Ok(())));
+        assert_eq!(
+            right
+                .take_queued_rights(&[(1, 90)], false, true, false, None)
+                .map(|taken| taken.joinable),
+            Some(true)
+        );
+    }
+
+    /// A stream read that reports no count (it failed copying an output out
+    /// after it took its bytes) took what Linux takes for the bytes it asked
+    /// for (`DetFd::stream_read_count`): bytes from the oldest messages on,
+    /// stopping where it has them all, after the message whose descriptors
+    /// it detached, or where the queue runs out. A queue that does not hold
+    /// every message, or holds a suspect one, cannot say.
+    #[test]
+    fn a_stream_read_takes_what_linux_takes_for_what_it_asked() {
+        let owner = DetTid::from_raw(10);
+        let stream_pair = |sequence| {
+            let socket = |fd, sequence| {
+                DetFd::new(
+                    fd,
+                    OFlag::O_RDWR,
+                    FdType::Socket,
+                    OpenFileId::new(owner, sequence),
+                )
+            };
+            let (left, right) = (socket(3, sequence), socket(4, sequence + 1));
+            left.pair_sockets(&right, true);
+            left.mark_complete_pair(&right);
+            (left, right)
+        };
+        let carried = |inode| {
+            vec![SentDescriptor {
+                file: (1, inode),
+                open_file: None,
+                lock_copy: None,
+            }]
+        };
+
+        let (left, right) = stream_pair(0);
+        assert_eq!(right.stream_read_count(4), Some(0), "an empty queue");
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 3), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(carried(50), 2), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(Vec::new(), 4), Ok(())));
+        assert_eq!(right.stream_read_count(0), Some(0));
+        assert_eq!(right.stream_read_count(2), Some(2), "all it asked for");
+        assert_eq!(
+            right.stream_read_count(4),
+            Some(4),
+            "into the message that carried descriptors"
+        );
+        assert_eq!(
+            right.stream_read_count(100),
+            Some(5),
+            "no further than the message whose descriptors it detached"
+        );
+        assert_eq!(
+            right.take_stream_bytes(5, |_| true).map(|sent| sent.len()),
+            Some(1)
+        );
+        assert_eq!(right.stream_read_count(100), Some(4), "the queue runs out");
+
+        let (left, right) = stream_pair(2);
+        assert!(matches!(left.queue_rights_to_peer(carried(60), 2), Ok(())));
+        assert!(matches!(left.queue_rights_to_peer(carried(61), 2), Ok(())));
+        assert_eq!(right.stream_read_count(1), Some(1), "part of a message");
+        right.lose_lockstep_if_queued(1, false);
+        assert_eq!(
+            right.stream_read_count(1),
+            None,
+            "after a read that may have taken a message unseen"
+        );
+
+        let (left, right) = stream_pair(4);
+        assert!(matches!(left.queue_rights_to_peer(carried(70), 2), Ok(())));
+        right.give_up_completeness();
+        assert_eq!(
+            right.stream_read_count(1),
+            None,
+            "a queue that no longer holds every message"
+        );
+    }
+
+    /// A peek may reach a later message (`SO_PEEK_OFF`). It is trusted
+    /// wherever it is while the queue is in lockstep and no other queued
+    /// message names the same files; otherwise only within the suspects.
+    #[test]
+    fn a_peek_may_name_a_later_message() {
+        let owner = DetTid::from_raw(10);
+        let socket = |fd, sequence| {
+            DetFd::new(
+                fd,
+                OFlag::O_RDWR,
+                FdType::Socket,
+                OpenFileId::new(owner, sequence),
+            )
+        };
+        let carried = |inode| {
+            vec![SentDescriptor {
+                file: (1, inode),
+                open_file: None,
+                lock_copy: None,
+            }]
+        };
+        let peek = |socket: &DetFd, inode| {
+            socket
+                .take_queued_rights(&[(1, inode)], false, true, false, None)
+                .map(|taken| taken.joinable)
+        };
+        let (left, right) = (socket(3, 0), socket(4, 1));
+        left.pair_sockets(&right, false);
+        for inode in [10, 20] {
+            assert!(matches!(
+                left.queue_rights_to_peer(carried(inode), 1),
+                Ok(())
+            ));
+        }
+        assert_eq!(peek(&right, 20), Some(true), "unique, in lockstep");
+        assert!(matches!(left.queue_rights_to_peer(carried(20), 1), Ok(())));
+        assert_eq!(peek(&right, 20), Some(false), "another message names it");
+
+        let (left, right) = (socket(5, 2), socket(6, 3));
+        left.pair_sockets(&right, false);
+        for inode in [10, 20] {
+            assert!(matches!(
+                left.queue_rights_to_peer(carried(inode), 1),
+                Ok(())
+            ));
+        }
+        left.lose_peer_lockstep();
+        assert_eq!(peek(&right, 20), Some(false), "out of lockstep");
+    }
+
+    /// The last held reference to a queued socket lets go of it with its own
+    /// queue ([`InFlightOpenFile::into_queue_if_last`]), and a long chain of
+    /// sockets each queued on the one before is dropped without recursing,
+    /// so no guest can overflow the tool thread's stack by building one.
+    #[test]
+    fn a_chain_of_queued_sockets_is_released_without_recursion() {
+        let owner = DetTid::from_raw(10);
+        let socket = |sequence| {
+            DetFd::new(
+                3,
+                OFlag::O_RDWR,
+                FdType::Socket,
+                OpenFileId::new(owner, sequence),
+            )
+        };
+        let first = socket(0);
+        let (mut left, mut right) = (socket(1), socket(2));
+        left.pair_sockets(&right, false);
+        // `first` is queued on `right`; each later pair's receiving socket is
+        // queued on the pair after it.
+        let sentinel = first.open_file_handle();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 0),
+                    open_file: Some(first.in_flight_open_file(true)),
+                    lock_copy: None,
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        drop(first);
+        for sequence in 0..50_000 {
+            let (next_left, next_right) = (socket(3 + 2 * sequence), socket(4 + 2 * sequence));
+            next_left.pair_sockets(&next_right, false);
+            assert!(matches!(
+                next_left.queue_rights_to_peer(
+                    vec![SentDescriptor {
+                        file: (1, 1),
+                        open_file: Some(right.in_flight_open_file(true)),
+                        lock_copy: None,
+                    }],
+                    1
+                ),
+                Ok(())
+            ));
+            drop(left);
+            drop(right);
+            left = next_left;
+            right = next_right;
+        }
+        assert!(
+            sentinel.descriptor(3, false).is_some(),
+            "the chain holds the first socket"
+        );
+        drop(left);
+        drop(right);
+        assert!(sentinel.descriptor(3, false).is_none(), "and lets it go");
     }
 }

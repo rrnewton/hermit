@@ -992,6 +992,10 @@ fn host_locks_stay_out_of_the_guests_proc_locks_on_dbt() {
 /// - `transfer DIR`: the parent OFD-locks a file it opened after forking,
 ///   sends the descriptor over `SCM_RIGHTS` and closes it; the child holds it,
 ///   then closes it;
+/// - `in-flight-sender-closes DIR` and `in-flight-sender-exits DIR`: the
+///   child OFD-locks a file, sends the descriptor and closes it or exits
+///   before the parent receives it; the parent looks while the message is in
+///   flight, after it receives it, and after it closes it;
 /// - `write-only DIR`: an OFD lock whose `struct flock` is on a page mapped
 ///   `PROT_WRITE` only, which the kernel reads and a tracer's
 ///   `process_vm_readv` cannot;
@@ -1330,6 +1334,55 @@ static int receive_descriptor(int socket) {
   int received;
   memcpy(&received, CMSG_DATA(header), sizeof(received));
   return received;
+}
+
+// The sender (the child) locks `path`, opened after forking so that only it
+// holds it, sends the descriptor, and lets go of its own before the
+// receiver takes the message: it closes it, or with `sender_exits` exits
+// holding it. The open file and its OFD lock ride the message meanwhile, as
+// Linux's in-flight reference holds them; the receiver then takes the
+// descriptor and closes it.
+static int in_flight_scenario(const char* path, int sender_exits) {
+  int pair[2];
+  int closed[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0 || pipe(closed) != 0) {
+    die("socketpair");
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    close(pair[0]);
+    close(closed[0]);
+    int file = open_path(path, O_RDWR);
+    ofd(file, F_WRLCK, 0, 1);
+    send_descriptor(pair[1], file);
+    if (sender_exits) {
+      _exit(0);
+    }
+    close(file);
+    byte_out(closed[1]);
+    byte_in(pair[1]);
+    _exit(0);
+  }
+  close(pair[1]);
+  close(closed[1]);
+  if (sender_exits) {
+    wait_for(child);
+  } else {
+    byte_in(closed[0]);
+  }
+  snapshot("in-flight");
+  int received = receive_descriptor(pair[0]);
+  snapshot("received");
+  close(received);
+  snapshot("closed");
+  if (!sender_exits) {
+    byte_out(pair[0]);
+    wait_for(child);
+  }
+  return 0;
 }
 
 // The parent locks and sends its descriptor to the child, which unlocks
@@ -1766,6 +1819,14 @@ int main(int argc, char** argv) {
     }
     return transfer_scenario(path, F_WRLCK, 1);
   }
+  if (strcmp(mode, "in-flight-sender-closes") == 0 ||
+      strcmp(mode, "in-flight-sender-exits") == 0) {
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/in-flight-ofd", where) >= (int)sizeof(path)) {
+      die("path");
+    }
+    return in_flight_scenario(path, strcmp(mode, "in-flight-sender-exits") == 0);
+  }
   if (strcmp(mode, "write-only") == 0) {
     return write_only_scenario(where);
   }
@@ -1910,6 +1971,11 @@ fn expected(sections: Vec<(&str, Vec<&str>)>) -> Sections {
 ///   shown, as Linux shows it, because Detcore models the receiver's
 ///   descriptor on every backend (recorded as it arrives on ptrace,
 ///   `Detcore::record_received_descriptors`; discovered on DBT);
+/// - it stays shown while the message is in flight after the sender closed
+///   its descriptor or exited, as Linux's in-flight reference keeps the open
+///   file and its lock (https://github.com/rrnewton/hermit/issues/4930), then
+///   while the receiver holds it, and goes with the receiver's close; on DBT,
+///   which queues nothing, it is not shown in flight (a named residual);
 /// - an OFD lock whose argument is on a write-only page is shown.
 fn lock_rows_follow_the_guests_descriptions(backend: &str) {
     let root = tempfile::Builder::new()
@@ -1937,7 +2003,25 @@ fn lock_rows_follow_the_guests_descriptions(backend: &str) {
     // is modelled and registered on reception on every backend, so the row
     // survives the sender's close, as on Linux.
     let after_sender_close = vec!["OFDLCK"];
-    let scenarios: [(&str, &OsStr, Sections); 5] = [
+    // In flight, the message holds the open file and its lock where Detcore
+    // queues the descriptions a send carries (ptrace,
+    // `Detcore::queue_sent_rights`). DBT discovers received descriptors
+    // lazily and queues nothing, so there the lock leaves the rows with the
+    // sender's close or exit and comes back with the receipt: a named
+    // residual of the in-guest backends.
+    let in_flight = || {
+        let in_flight = if backend == "dbt" {
+            vec![]
+        } else {
+            vec!["OFDLCK"]
+        };
+        expected(vec![
+            ("in-flight", in_flight),
+            ("received", vec!["OFDLCK"]),
+            ("closed", vec![]),
+        ])
+    };
+    let scenarios: [(&str, &OsStr, Sections); 7] = [
         (
             "unlock",
             shared.as_os_str(),
@@ -1969,6 +2053,8 @@ fn lock_rows_follow_the_guests_descriptions(backend: &str) {
                 ("closed", vec![]),
             ]),
         ),
+        ("in-flight-sender-closes", own.as_os_str(), in_flight()),
+        ("in-flight-sender-exits", own.as_os_str(), in_flight()),
     ];
     for (scenario, argument, want) in scenarios {
         let label = format!("{backend} {scenario}");

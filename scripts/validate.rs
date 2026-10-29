@@ -18687,7 +18687,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "103");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "105");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -18778,16 +18778,19 @@ mod nextest_timeout_tests {
         // (https://github.com/rrnewton/hermit/issues/4541): 101. And
         // run_kvm_signal_permits_are_per_thread
         // (https://github.com/rrnewton/hermit/issues/4899): 102. And
-        // run_kvm_virtual_timeout_is_reported_from_the_childs_note: 103.
+        // run_kvm_virtual_timeout_is_reported_from_the_childs_note: 103. And
+        // run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first and
+        // run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit
+        // (https://github.com/rrnewton/hermit/issues/4930): 105.
         // The spinner is retained but ignored and excluded because its explicit
-        // maximum requests an unavailable timer: 102 selected CLI tests remain.
+        // maximum requests an unavailable timer: 104 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            103,
+            105,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 102);
+        assert_eq!(names.len(), 104);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -18823,6 +18826,8 @@ mod nextest_timeout_tests {
             "run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files",
             "run_kvm_signal_permits_are_per_thread",
             "run_kvm_virtual_timeout_is_reported_from_the_childs_note",
+            "run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first",
+            "run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -19925,8 +19930,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_signal_permits_are_per_thread
         // (https://github.com/rrnewton/hermit/issues/4899): 102 selected.
         // run_kvm_virtual_timeout_is_reported_from_the_childs_note adds the
-        // 103rd selected test, including the non-CLI setup case.
-        ("privileged-only-test.cli_kvm", 103usize),
+        // 103rd selected test, including the non-CLI setup case. And
+        // run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first and
+        // run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit
+        // (https://github.com/rrnewton/hermit/issues/4930): 105 selected.
+        ("privileged-only-test.cli_kvm", 105usize),
     ] {
         let step = privileged
             .steps

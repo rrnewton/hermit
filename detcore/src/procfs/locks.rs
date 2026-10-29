@@ -405,7 +405,12 @@ type Table = u64;
 ///   changes nothing;
 /// - a table any of whose processes has exited, reaped or not, counts no
 ///   longer for `/proc/locks`, and goes once every process that holds it has
-///   exited ([`LockLedger::prune`]).
+///   exited ([`LockLedger::prune`]);
+/// - a copy of a description in flight over `SCM_RIGHTS` holds it as a table
+///   does, as Linux's in-flight reference holds the `struct file` and its
+///   locks, from the send that queued it until the receipt, which hands it
+///   to the receiver's table, or the release of its message
+///   ([`LockLedger::placeholder_copies`]).
 ///
 /// A description whose fdinfo could not be read is followed the same way,
 /// with its locks unknown ([`LockLedger::note_unknown`]) until a later read
@@ -469,26 +474,32 @@ pub(crate) struct LockLedger {
     /// description their tables reference holds is refused by name rather
     /// than answered ([`PlaceholderFlockOutcome::Unfollowable`]).
     tainted: BTreeSet<DetPid>,
-    /// Copies of placeholder descriptions in flight: sent over `SCM_RIGHTS`
-    /// and not received yet, by description ([`LockLedger::placeholder_copies`]).
-    /// Linux keeps a description, and its `flock` locks, while a message
-    /// that holds it is queued; the ledger lets no description hold a
-    /// placeholder `flock` while a copy of it is in flight (a send of a
-    /// locked one, and a lock of one in flight, are refused by name), so no
-    /// lock rests on a reference only a queued message holds.
+    /// Copies in flight: sent over `SCM_RIGHTS` and not received or released
+    /// yet, by description ([`LockLedger::placeholder_copies`]). Linux keeps
+    /// a description, and its locks, while a message that holds it is
+    /// queued, so a copy holds the description's locks as a table reference
+    /// does: they count for `/proc/locks` after the sender closes its last
+    /// descriptor of the description, or exits, until the receipt hands the
+    /// copy to the receiver's table or its message is released. The ledger
+    /// lets no placeholder description hold a placeholder `flock` while a
+    /// copy of it is in flight (a send of a locked one, and a lock of one in
+    /// flight, are refused by name).
     in_flight: BTreeMap<OpenFileId, u32>,
     /// The write hint of each placeholder directory's inode whose hint a
     /// guest set (`F_SET_RW_HINT`, [`LockLedger::placeholder_write_hint`]).
     placeholder_write_hints: BTreeMap<crate::procfs::fd_directory::PlaceholderLockKey, u64>,
 }
 
-/// A change to the copies of placeholder descriptions in flight over
-/// `SCM_RIGHTS` ([`LockLedger::placeholder_copies`]).
+/// A change to the copies in flight over `SCM_RIGHTS`
+/// ([`LockLedger::placeholder_copies`]): of placeholder descriptions, and of
+/// descriptions whose locks the ledger follows (`DetFd::is_lock_tracked`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlaceholderCopies {
-    /// A send of these descriptions is about to be made (one per copy).
+    /// A send of these descriptions is about to be made, or was made and
+    /// queued (one per copy).
     Sending(Vec<OpenFileId>),
-    /// That send failed: its copies are not in flight.
+    /// That send failed, or its queued copies were released unreceived:
+    /// they are not in flight.
     Unsent(Vec<OpenFileId>),
     /// A receive delivered a copy of this description.
     Received(OpenFileId),
@@ -570,7 +581,10 @@ impl LockLedger {
         }
         if references.is_empty() {
             self.references.remove(&open_file);
-            self.locks.remove(&open_file);
+            // A copy in flight still holds the description's locks.
+            if !self.in_flight.contains_key(&open_file) {
+                self.locks.remove(&open_file);
+            }
             // Linux releases a description's `flock` locks with its last
             // reference (`locks_remove_file`, from `__fput`).
             self.placeholder_flocks.retain(|_, holders| {
@@ -671,13 +685,15 @@ impl LockLedger {
         })
     }
 
-    /// A change to the copies of placeholder descriptions in flight over
-    /// `SCM_RIGHTS` ([`Self::in_flight`]): a send counts its copies, unless a
-    /// description it sends holds a placeholder `flock`, which it names
-    /// (`Err`) for the sender to refuse by name; a failed send uncounts them,
-    /// and a receive its copy. A copy that is never received stays counted,
-    /// so that its description takes no placeholder lock for the rest of the
-    /// run (refused by name).
+    /// A change to the copies in flight over `SCM_RIGHTS` ([`Self::in_flight`]):
+    /// a send counts its copies, unless a description it sends holds a
+    /// placeholder `flock`, which it names (`Err`) for the sender to refuse
+    /// by name; a failed send, or the release of a queued copy, uncounts
+    /// them, and a receive its copy, after the receiver's table took its
+    /// reference ([`Self::note_locks`]). A placeholder copy that is never
+    /// received stays counted, so that its description takes no placeholder
+    /// lock for the rest of the run (refused by name). The last copy of a
+    /// description no table references takes its locks with it.
     pub(crate) fn placeholder_copies(
         &mut self,
         change: PlaceholderCopies,
@@ -709,8 +725,30 @@ impl LockLedger {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.in_flight.remove(&open_file);
+                if !self.references.contains_key(&open_file) {
+                    self.locks.remove(&open_file);
+                }
             }
         }
+    }
+
+    /// Whether `open_file`'s locks count: a table references it that has not
+    /// departed, or a copy of it is in flight, and no table that references
+    /// it is one of `opaque_tables` (`Self::held`; `None` there for
+    /// `Self::unknown`, which no opaque table excludes).
+    fn counts(&self, open_file: &OpenFileId, opaque_tables: Option<&BTreeSet<Table>>) -> bool {
+        let tables = self
+            .references
+            .get(open_file)
+            .map(|references| {
+                references
+                    .keys()
+                    .filter(|table| !self.departed.contains(table))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (!tables.is_empty() || self.in_flight.contains_key(open_file))
+            && opaque_tables.is_none_or(|opaque| tables.iter().all(|table| !opaque.contains(table)))
     }
 
     /// Set the write hint of the inode of the placeholder directory `key` to
@@ -1031,16 +1069,7 @@ impl LockLedger {
             .collect::<BTreeSet<_>>();
         self.locks
             .iter()
-            .filter(|(open_file, _)| {
-                self.references.get(*open_file).is_some_and(|references| {
-                    let counted = references
-                        .keys()
-                        .filter(|table| !self.departed.contains(table))
-                        .collect::<Vec<_>>();
-                    !counted.is_empty()
-                        && counted.iter().all(|table| !opaque_tables.contains(table))
-                })
-            })
+            .filter(|(open_file, _)| self.counts(open_file, Some(&opaque_tables)))
             .filter_map(|(_, locks)| locks.as_ref().ok())
             .flat_map(|locks| locks.iter().cloned())
             .filter(|lock| {
@@ -1071,13 +1100,7 @@ impl LockLedger {
         }
         self.locks
             .iter()
-            .filter(|(open_file, _)| {
-                self.references.get(*open_file).is_some_and(|references| {
-                    references
-                        .keys()
-                        .any(|table| !self.departed.contains(table))
-                })
-            })
+            .filter(|(open_file, _)| self.counts(open_file, None))
             .find_map(|(_, locks)| locks.as_ref().err())
             .map(String::as_str)
     }
@@ -1524,6 +1547,53 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         // A release from a table the ledger never saw changes nothing.
         ledger.release(DetPid::from_raw(9), description(0), 1);
         assert!(ledger.held().is_empty());
+    }
+
+    /// A copy of a description in flight over `SCM_RIGHTS` holds its locks
+    /// as a table does (https://github.com/rrnewton/hermit/issues/4930): they
+    /// count after the sender's last close or its exit, the receipt hands
+    /// the copy to the receiver's table, and a copy released unreceived
+    /// takes them with it when no table references the description.
+    #[test]
+    fn a_copy_in_flight_holds_its_descriptions_locks() {
+        let [sender, receiver] = [3, 4].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        let copies = |open_file| PlaceholderCopies::Sending(vec![open_file]);
+
+        // The sender closes first: the copy keeps the lock until the receiver
+        // takes it, and the receiver's last close lets it go.
+        ledger.note_locks(sender, description(0), vec![lock("0")], 1);
+        ledger.placeholder_copies(copies(description(0))).unwrap();
+        ledger.release(sender, description(0), 0);
+        assert_eq!(ledger.held(), [lock("0")], "held in flight");
+        ledger.note_locks(receiver, description(0), vec![lock("0")], 1);
+        ledger
+            .placeholder_copies(PlaceholderCopies::Received(description(0)))
+            .unwrap();
+        assert_eq!(ledger.held(), [lock("0")], "held by the receiver");
+        ledger.release(receiver, description(0), 0);
+        assert!(ledger.held().is_empty(), "released with the last reference");
+
+        // The sender exits first: the same.
+        ledger.note_locks(sender, description(1), vec![lock("1")], 1);
+        ledger.placeholder_copies(copies(description(1))).unwrap();
+        ledger.prune(|process| process != sender);
+        assert_eq!(ledger.held(), [lock("1")], "held in flight after the exit");
+
+        // A copy released unreceived takes the lock with it.
+        ledger
+            .placeholder_copies(PlaceholderCopies::Unsent(vec![description(1)]))
+            .unwrap();
+        assert!(ledger.held().is_empty(), "released with the message");
+
+        // While a table still references the description, a release of the
+        // copy leaves its locks.
+        ledger.note_locks(receiver, description(2), vec![lock("2")], 1);
+        ledger.placeholder_copies(copies(description(2))).unwrap();
+        ledger
+            .placeholder_copies(PlaceholderCopies::Unsent(vec![description(2)]))
+            .unwrap();
+        assert_eq!(ledger.held(), [lock("2")]);
     }
 
     /// `flock` through placeholder descriptors locks each directory apart,
