@@ -3555,6 +3555,7 @@ mod tests {
                     &dir.path().join("candidate.json"),
                     &[],
                     1,
+                    None,
                     |run| {
                         assert!(!run.has_launched());
                         let output = Output {
