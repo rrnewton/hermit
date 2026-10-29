@@ -3274,8 +3274,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3384 + 15 = 3399, listed.
     // Rebased onto main ffe313b16: 3395 + 15 = 3410.
     // Rebased onto main fbf9d5f0c: 3439 + 15 = 3454.
-    // Rebased onto main fcd62385f: 3465 + 15 = 3480.
-    ("test.detcore_unit", 3480),
+    // 3294, listed.
+    // And a_schedule_prefix_keeps_the_post_crash_bound_and_the_switches_only_for_the_whole_schedule,
+    // for main's prefix records: 3399 + 1 = 3400.
+    // Rebased onto main ffe313b16: 3410 + 1 = 3411.
+    // Rebased onto main fbf9d5f0c: 3454 + 1 = 3455.
+    // Rebased onto main fcd62385f: 3465 + 16 = 3481.
+    ("test.detcore_unit", 3481),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5900,8 +5905,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fifteen post-crash units: 3384 + 15 = 3399, listed.
     // Rebased onto main ffe313b16: 3395 + 15 = 3410.
     // Rebased onto main fbf9d5f0c: 3439 + 15 = 3454.
-    // Rebased onto main fcd62385f: 3465 + 15 = 3480.
-    ("test.detcore_unit_on_host", 3480),
+    // And the same fifteen post-crash units: 3294, listed.
+    // And the same prefix-record unit: 3399 + 1 = 3400.
+    // Rebased onto main ffe313b16: 3410 + 1 = 3411.
+    // Rebased onto main fbf9d5f0c: 3454 + 1 = 3455.
+    // Rebased onto main fcd62385f: 3465 + 16 = 3481.
+    ("test.detcore_unit_on_host", 3481),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
