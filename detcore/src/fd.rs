@@ -3237,7 +3237,8 @@ impl DetFd {
 
     /// Whether a guest made this socket with `socket(2)` or `socketpair(2)`
     /// in this run and never passed it out of the guest, so only guests hold
-    /// it.
+    /// it. Production code reads it through an `OpenFileHandle`.
+    #[cfg(test)]
     pub(crate) fn is_guest_created(&self) -> bool {
         self.with_description(|d| d.guest_created)
     }

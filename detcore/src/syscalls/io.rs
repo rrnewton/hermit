@@ -3908,9 +3908,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, req).await;
         }
 
-        // What the address names, read before the call as Linux reads it,
-        // and whether the connection completes in this turn.
-        let unix_address = uservaddr.map_or(
+        // Whether the connection completes in this turn.
+        let in_turn = self.completes_in_turn(guest, call);
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        // What the address names, as the attempt that connected read it. A
+        // connect that completes in its turn made that attempt in this turn,
+        // after the last request it filed, so no other thread has rewritten
+        // the address since; an earlier read could name another socket than
+        // the one it reached, if another thread rewrote the address between
+        // attempts (Codex review of
+        // https://github.com/rrnewton/hermit/pull/4862). A connect outside its
+        // turn may have reached any name (`Detcore::note_unix_connect`).
+        let connected_to = uservaddr.map_or(
             crate::syscalls::scm_rights::UnixAddress::Unnamed,
             |address| {
                 crate::syscalls::scm_rights::unix_address(
@@ -3920,10 +3929,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
             },
         );
-        let in_turn = self.completes_in_turn(guest, call);
-        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         if let Ok(0) = &result {
-            self.note_unix_connect(guest, fd, &unix_address, in_turn);
+            self.note_unix_connect(guest, fd, &connected_to, in_turn);
         }
         if self.cfg.backend.loopback_pollers_yield_to_peers
             && connect_result_allows_peer_classification(&result)
@@ -3985,25 +3992,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     detfd.clear_guest_held();
                 }
             });
-            // The address as the attempt that connected read it: a connect
-            // that completes in its turn ran that attempt in this turn, so no
-            // other thread has rewritten it since.
-            let connected_to = uservaddr.map_or(
-                crate::syscalls::scm_rights::UnixAddress::Unnamed,
-                |address| {
-                    crate::syscalls::scm_rights::unix_address(
-                        &guest.memory(),
-                        address.as_raw(),
-                        usize::try_from(addrlen).unwrap_or(0),
-                    )
-                },
+            let connecting = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.open_file_handle())
+                .ok();
+            let listener = self.listener_named(guest, &connected_to);
+            let guest_created = crate::syscalls::scm_rights::both_ends_guest_made(
+                in_turn,
+                connecting.as_ref(),
+                listener.as_ref(),
             );
-            let guest_created = in_turn
-                && guest
-                    .thread_state()
-                    .with_detfd(fd, |detfd| detfd.is_guest_created())
-                    .unwrap_or(false)
-                && self.names_a_guest_created_listener(guest, &connected_to);
             self.classify_guest_held_peer(guest, fd, guest_created)
                 .await;
         }
