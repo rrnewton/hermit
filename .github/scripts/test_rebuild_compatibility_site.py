@@ -577,6 +577,15 @@ class HostedAdapterTests(unittest.TestCase):
         self.assertTrue(ADAPTER._is_ancestor_or_folded(origin, summarized, folded_head))
         self.assertFalse(ADAPTER._is_ancestor_or_folded(origin, folded_head, summarized))
 
+        # A cold checkout holds only post-squash history: fetching the
+        # squashed head must also acquire the detached old tip the trailer
+        # names, or the folding proof cannot be checked locally at all.
+        cold = self.root / "cold-ledger"
+        sh(self.root, "clone", "-q", "--depth", "1", f"file://{origin}", str(cold))
+        with patch.dict(os.environ, env):
+            ADAPTER.fetch_ledger(cold, folded_head)
+        self.assertTrue(ADAPTER._is_ancestor_or_folded(cold, summarized, folded_head))
+
     def test_ledger_capture_is_exact_and_invocation_failures_refuse(self):
         captured = "a" * 40
         with patch.object(
