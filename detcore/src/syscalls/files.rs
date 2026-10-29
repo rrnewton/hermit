@@ -13067,6 +13067,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.mark_sock_diag_fd(guest, fd, &call);
             self.note_unix_socket(guest, fd, call.family(), call.r#type());
             self.mark_error_queue_reads(guest, fd, &call)?;
+            // A guest made it (`DetFd::is_guest_created`).
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_guest_created())?;
 
             Ok(fd as i64)
         }
@@ -13189,6 +13193,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                     });
                 }
+            }
+            // A guest made both ends (`DetFd::is_guest_created`).
+            for fd in fds {
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_guest_created());
             }
             self.note_socketpair(guest, fds, call.family(), call.r#type());
 
@@ -14558,12 +14568,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.set_accepted_connection())?;
-        self.note_unix_accept(guest, call.sockfd(), fd, completes_in_turn);
+        let peer = self.note_unix_accept(guest, call.sockfd(), fd, completes_in_turn);
         guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_accepted_connection();
             detfd.set_error_queue_never_waits(error_queue_never_waits);
         })?;
-        self.classify_guest_held_peer(guest, fd).await;
+        // Guests alone hold both ends only where the listener and the socket
+        // whose connection this took are sockets guests made and never passed
+        // out (`Detcore::classify_guest_held_peer`).
+        let guest_created = completes_in_turn
+            && guest
+                .thread_state()
+                .with_detfd(call.sockfd(), |listener| listener.is_guest_created())
+                .unwrap_or(false)
+            && peer
+                .as_ref()
+                .is_some_and(crate::fd::OpenFileHandle::is_guest_created);
+        self.classify_guest_held_peer(guest, fd, guest_created)
+            .await;
 
         if physically_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);

@@ -1270,6 +1270,19 @@ mod event_tests {
                         .push(request.passes_descriptors_out);
                     GlobalResponse::RequestResources(ResumeStatus::Normal)
                 }
+                GlobalRequest::RequestResources(request, _)
+                    if !request
+                        .resources
+                        .contains_key(&ResourceID::InternalIOPolling) =>
+                {
+                    // A blocking call's requests: the one that leaves the
+                    // turn and the one that rejoins it.
+                    self.passes_out
+                        .lock()
+                        .unwrap()
+                        .push(request.passes_descriptors_out);
+                    GlobalResponse::RequestResources(ResumeStatus::Normal)
+                }
                 GlobalRequest::RequestResources(request, _) => {
                     self.passes_out
                         .lock()
@@ -1817,29 +1830,48 @@ mod event_tests {
         );
     }
 
-    /// A send that may run outside the caller's turn counts as passing
-    /// descriptors out of the guest whatever its descriptor and messages are
-    /// when the handler looks (`Detcore::note_descriptors_passed_out`): other
+    /// A send that leaves the caller's turn counts as passing descriptors out
+    /// of the guest whatever its descriptor and messages name, decided where
+    /// it leaves (`Detcore::passes_descriptors_out_outside_the_turn`): other
     /// threads run before the kernel imports them, and one may replace the
     /// descriptor with an `AF_UNIX` socket that is not guest-held and rewrite
-    /// a message to pass a guest-held pipe. Here the descriptor is a
-    /// guest-held socket and the message carries no descriptor, which a send
-    /// in the turn does not report; the header is a `sendmsg`'s and a
-    /// `sendmmsg`'s first entry alike (Codex review of
-    /// https://github.com/rrnewton/hermit/pull/4862).
-    #[test]
-    fn a_send_outside_the_turn_counts_as_passing_descriptors_whatever_it_names_now() {
-        for outside_turn in [false, true] {
+    /// a message to pass a guest-held pipe. Here the real handler runs on a
+    /// guest-held socket that blocks in the kernel too, so the call takes the
+    /// external blocking path, and its message carries no descriptor, which
+    /// the handler's own reading does not report: the request that takes the
+    /// call out of the turn carries the report, whatever came before it
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4862).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_send_leaving_the_turn_reports_a_pass_out_with_the_request_that_leaves_it() {
+        for batched in [false, true] {
             let (tool, mut guest) = event_guest(FdType::Socket, None);
             guest
                 .thread
                 .with_detfd(FD, |detfd| detfd.set_guest_held())
                 .unwrap();
+            // The one attempt sends.
+            guest.send_attempts = 1;
+            guest.memory.put_iovec(0, FIRST_DEST, 8);
             put_message(&guest.memory, &[]);
-            tool.note_descriptors_passed_out(&mut guest, FD, &[MESSAGE], outside_turn);
+            let call: Syscall = if batched {
+                reverie::syscalls::Sendmmsg::new()
+                    .with_sockfd(FD)
+                    .with_msgvec(Addr::from_raw(MESSAGE))
+                    .with_vlen(1)
+                    .into()
+            } else {
+                reverie::syscalls::Sendmsg::new()
+                    .with_fd(FD)
+                    .with_msg(Addr::from_raw(MESSAGE))
+                    .into()
+            };
+            let result = tool.handle_syscall_event(&mut guest, call).await;
+            assert_eq!(result.unwrap(), 1, "batched: {batched}");
+            // The request that leaves the turn, then the one that rejoins.
             assert_eq!(
-                guest.thread.passed_descriptors_out_unreported, outside_turn,
-                "outside the turn: {outside_turn}"
+                *guest.passes_out.lock().unwrap(),
+                [true, false],
+                "batched: {batched}"
             );
         }
     }
