@@ -563,6 +563,16 @@ binaries. Unmarked legacy bytes and their admission policy remain unchanged;
 a missing marker does not prove historical completeness. Marked records cannot
 be serialized through an unversioned non-human format. No appended-data
 detection or generic legacy binary roundtrip guarantee is implied.
+A schedule replay (`--replay-schedule-from`) whose next recorded event goes
+unmatched for a thousand observed events in a row releases the rest of the
+schedule and runs on unguided. Its warning and the run summary's
+`RELEASED replayed schedule at event #N` line number events without polling
+retries, whose count can depend on host timing. `--stacktrace-event` indices,
+and the desync and `Missed stack trace` lines, count every traced event,
+polling retries included, so a release's number is not a `--stacktrace-event`
+index. A requested index the run never reaches is reported, not dropped: at
+the end of a run that records or replays a schedule, or before a replay stops
+the run under `--replay-exhausted-panic` or `--die-on-desync`.
 
 A replay reproduces the recording only if the guest reads the same host
 files. The recorded schedule therefore keeps the set of host files the run
