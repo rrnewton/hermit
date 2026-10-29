@@ -10150,6 +10150,41 @@ fn no_namespace_in_own_pid_namespace(args: &[&str], guest_args: &[&str]) -> Outp
     hermit_test::hermit_output(&label, &mut command)
 }
 
+fn native_chosen_ids_fixture(guest_args: &[&str]) -> Output {
+    let mut command = Command::new("unshare");
+    command
+        .args(OWN_PID_NAMESPACE)
+        .arg(chosen_guest_ids_guest())
+        .args(guest_args);
+    let label = format!("native {command:?}");
+    hermit_test::hermit_output(&label, &mut command)
+}
+
+/// Establish a collision after launch with a task outside Detcore. The
+/// guest requests the next ID and waits for the native supervisor's ack.
+fn no_namespace_with_external_id_holder(args: &[&str]) -> Output {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let request = directory.path().join("request");
+    let ack = directory.path().join("ack");
+    let mut command = Command::new("unshare");
+    command
+        .args(OWN_PID_NAMESPACE)
+        .arg(chosen_guest_ids_guest())
+        .arg("external-holder")
+        .arg(&request)
+        .arg(&ack)
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--no-namespace", "--base-env=minimal"])
+        .args(args)
+        .arg("--")
+        .arg(chosen_guest_ids_guest())
+        .arg("collide-external")
+        .arg(&request)
+        .arg(&ack);
+    let label = format!("{command:?}");
+    hermit_test::hermit_output(&label, &mut command)
+}
+
 /// `unshare`'s arguments for a user, PID, mount and network namespace of the
 /// test's own: its PIDs are its own to choose, and so are the abstract socket
 /// names `--no-namespace` reserves ID windows by, which concurrent tests would
@@ -10163,6 +10198,84 @@ const OWN_PID_NAMESPACE: [&str; 7] = [
     "--mount-proc",
     "--net",
 ];
+
+#[test]
+fn no_namespace_records_distinct_ids_after_a_guest_chosen_child() {
+    for (offset, automatic) in [("1", 2), ("100", 1)] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let path = directory.path().join("schedule.json");
+        let output = no_namespace_in_own_pid_namespace(
+            &[
+                "--pid-base=5000",
+                "--record-preemptions-to",
+                path.to_str().unwrap(),
+            ],
+            &["explicit-then-fork", offset],
+        );
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("explicit reaped +{offset}\n")),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("automatic reaped +{automatic}\n")),
+            "{stdout}"
+        );
+        assert!(stdout.contains("distinct IDs: 1\n"), "{stdout}");
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(!record["global"].as_array().unwrap().is_empty());
+        assert_eq!(record["guest_ids"]["Chosen"]["base"], 5000);
+    }
+    // A live guest-chosen ID is reserved too, rather than treated as an
+    // unpredictable external collision. Keep a genuine external opponent in
+    // no_namespace_refuses_a_taken_chosen_id_only_when_asked.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = directory.path().join("live-choice.json");
+    let output = no_namespace_in_own_pid_namespace(
+        &[
+            "--pid-base=5000",
+            "--record-preemptions-to",
+            path.to_str().unwrap(),
+        ],
+        &["collide"],
+    );
+    assert_success(&output, &["collide"]);
+    assert!(
+        stdout(&output).contains("holder +3\nfork returned +4\n"),
+        "{output:?}"
+    );
+    assert!(stdout(&output).contains("0 mismatches\n"), "{output:?}");
+    assert!(!stderr(&output).contains("got a host ID"), "{output:?}");
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(record["guest_ids"]["Chosen"]["base"], 5000);
+}
+
+#[test]
+fn no_namespace_validates_parent_signal_before_choosing_an_id() {
+    for (signal, created, error) in [("65", 0, libc::EINVAL), ("17", 1, 0)] {
+        let output =
+            no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["parent-signal", signal]);
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!(
+                "parent signal {signal}: created={created} errno={error}\n"
+            )),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "parent signal {signal}: reaped probe=1 clone={created}\n"
+            )),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("after signal returned +{}\n", 2 + created)),
+            "{stdout}"
+        );
+    }
+}
 
 /// Two `--no-namespace` runs started together in one PID namespace reserve
 /// different windows of IDs, so neither collides with the other: both
@@ -10280,15 +10393,15 @@ fn no_namespace_reports_its_guest_numbering() {
 }
 
 /// A chosen ID that a task holds when the guest creates the task it was
-/// chosen for (here a process of the guest's own, made with clone3's set_tid
-/// on the next ID) ends a run that gave `--pid-base` with the policy-refusal
+/// chosen for (here an external process, made by a native supervisor after
+/// the guest's request) ends a run that gave `--pid-base` with the policy-refusal
 /// status, naming the ID and its holder, before any task gets a host ID. A
 /// run that did not give it warns, that one task gets a host ID, the summary
 /// says the run's IDs are not deterministic, and its preemption record says
 /// its IDs came from the host, so a replay refuses it.
 #[test]
 fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
-    let refused = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["collide"]);
+    let refused = no_namespace_with_external_id_holder(&["--pid-base=5000"]);
     assert_eq!(
         refused.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
@@ -10306,12 +10419,17 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
         "{}",
         stdout(&refused)
     );
+    assert!(
+        stdout(&refused).contains("external holder +3\n"),
+        "{}",
+        stdout(&refused)
+    );
 
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let record = directory.path().join("preemptions.json");
     let record_arg = format!("--record-preemptions-to={}", record.display());
-    let warned = no_namespace_in_own_pid_namespace(&["--summary", &record_arg], &["collide"]);
-    assert_success(&warned, &["collide"]);
+    let warned = no_namespace_with_external_id_holder(&["--summary", &record_arg]);
+    assert_success(&warned, &["collide-external"]);
     assert!(
         stderr(&warned).contains("got a host ID, not a chosen one: ID ")
             && stderr(&warned).contains(
@@ -10321,6 +10439,11 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
         "stdout:\n{}\nstderr:\n{}",
         stdout(&warned),
         stderr(&warned)
+    );
+    assert!(
+        stdout(&warned).contains("external holder +3\n"),
+        "{}",
+        stdout(&warned)
     );
     // The record says its IDs came from the host, so a replay refuses it.
     let written = fs::read_to_string(&record).expect("read the preemption record");
@@ -10555,7 +10678,7 @@ fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
 
 /// A call that cannot carry a chosen ID is refused by an explicit base
 /// before its task exists, even where Linux would refuse it too: a raw clone
-/// with exit signal 65, which clone accepts and clone3 does not (also with
+/// with exit signal 65, which older kernels accept in clone but clone3 refuses (also with
 /// `CLONE_VFORK`, whose host ID a default run reports before the call); a
 /// clone3 whose `set_tid` array Detcore cannot read (on a page mapped
 /// writable, not readable), which the kernel reads all the same; one with new
@@ -10598,29 +10721,58 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         );
         assert_eq!(stdout(&output), before, "{call}: {}", stderr(&output));
     }
-    for (call, expected) in [
-        ("signal65", "clone signal65: created\n".to_owned()),
-        // A vfork parent returns only once its child has exited, so its host
-        // ID is reported before the call.
-        ("vfork65", "clone vfork65: created\n".to_owned()),
-        (
-            "newpid-fork",
-            format!(
-                "{newpid_child}newpid child's clone3: created\nclone3 newpid-fork: child +1, exit 0\n"
-            ),
-        ),
-    ] {
+    for call in ["signal65", "vfork65"] {
+        let native = native_chosen_ids_fixture(&[call]);
+        assert_success(&native, &["native", call]);
+        let observed = stdout(&native);
+        let created = if observed == format!("clone {call}: created\n") {
+            true
+        } else {
+            assert_eq!(observed, format!("clone {call}: Invalid argument\n"));
+            false
+        };
         let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &[call]);
         assert_success(&tolerant, &[call]);
-        assert!(
-            stdout(&tolerant) == expected
-                && stderr(&tolerant).contains("1 task(s) got a host ID instead")
-                && (call != "vfork65" || stderr(&tolerant).contains("reported before the call")),
-            "{call}: stdout:\n{}\nstderr:\n{}",
-            stdout(&tolerant),
+        assert_eq!(stdout(&tolerant), observed, "{call}: {}", stderr(&tolerant));
+        // Ordinary failed clones created no task. A vfork fallback reports
+        // conservatively before injection, then corrects the warning on error.
+        assert_eq!(
+            stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+            created || call == "vfork65",
+            "{call}: {}",
             stderr(&tolerant)
         );
+        if call == "vfork65" {
+            assert!(
+                stderr(&tolerant).contains("reported before the call"),
+                "{}",
+                stderr(&tolerant)
+            );
+            if !created {
+                assert!(stderr(&tolerant).contains("failed with EINVAL and created no task; the run's count of host-ID tasks includes it"), "{}", stderr(&tolerant));
+            }
+        } else if !created {
+            assert!(
+                !stderr(&tolerant).contains("got a host ID"),
+                "{}",
+                stderr(&tolerant)
+            );
+        }
     }
+    let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &["newpid-fork"]);
+    assert_success(&tolerant, &["newpid-fork"]);
+    assert_eq!(
+        stdout(&tolerant),
+        format!(
+            "{newpid_child}newpid child's clone3: created\nclone3 newpid-fork: child +1, exit 0\n"
+        )
+    );
+    assert!(
+        stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+        "newpid-fork: stdout:\n{}\nstderr:\n{}",
+        stdout(&tolerant),
+        stderr(&tolerant)
+    );
     // A struct the kernel reads but Detcore cannot (a page mapped writable,
     // not readable), which could carry a set_tid Detcore cannot check
     // against the run's earlier tasks, is refused by name in every kind of
@@ -10806,10 +10958,10 @@ fn no_namespace_preemption_records_replay_under_their_base() {
         stderr(&elsewhere)
     );
 
-    // The collide case's host-ID task marks its record `Host`.
+    // A genuinely external collision marks its record `Host`.
     let host_record_arg = format!("--record-preemptions-to={}", path("host.json"));
-    let host = no_namespace_in_own_pid_namespace(&[epoch, &host_record_arg], &["collide"]);
-    assert_success(&host, &["collide"]);
+    let host = no_namespace_with_external_id_holder(&[epoch, &host_record_arg]);
+    assert_success(&host, &["collide-external"]);
     let host_replay_arg = format!("--replay-preemptions-from={}", path("host.json"));
     let refused = no_namespace_in_own_pid_namespace(&[epoch, &host_replay_arg], &["collide"]);
     assert_eq!(

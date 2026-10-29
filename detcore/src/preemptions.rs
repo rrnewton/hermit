@@ -385,6 +385,13 @@ impl PreemptionRecord {
         self.guest_ids
     }
 
+    /// The same record, retaining the guest numbering of schedules used to
+    /// construct it. Namespace numbering keeps the legacy omitted field.
+    pub fn with_guest_ids(mut self, ids: detcore_model::pid::GuestIds) -> Self {
+        self.guest_ids = (ids != detcore_model::pid::GuestIds::Namespace).then_some(ids);
+        self
+    }
+
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
     pub fn extract_all(&self) -> BTreeMap<DetTid, ThreadHistory> {
         self.per_thread.clone()

@@ -232,17 +232,25 @@ pub struct InterpolateOpts {
 
 impl InterpolateOpts {
     pub fn run(&self, _common_args: &CommonOpts) -> anyhow::Result<bool> {
-        let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;
-        let copy = Self::common_signal_state_copy(&self.file_a, &self.file_b)?;
-        let charged_once = Self::common_expired_wait_charge(&self.file_a, &self.file_b)?;
-        let first_schedule = legacy_schedule(&self.file_a, "schedule diff/interpolation")?;
-        let second_schedule = legacy_schedule(&self.file_b, "schedule diff/interpolation")?;
-        // let i = 0;
+        let next_sched = self.interpolated_record()?;
         let dir = tempfile::Builder::new()
             .prefix("hermit_internal")
             .tempdir()?;
         let tmpdir_path = dir.keep();
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
+        let sched_path = tmpdir_path.join(format!("interpolate_{}.events", self.interpolate));
+        next_sched.write_to_disk(&sched_path).unwrap();
+
+        Ok(true)
+    }
+
+    fn interpolated_record(&self) -> anyhow::Result<PreemptionRecord> {
+        let guest_ids = Self::common_guest_ids(&self.file_a, &self.file_b)?;
+        let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;
+        let copy = Self::common_signal_state_copy(&self.file_a, &self.file_b)?;
+        let charged_once = Self::common_expired_wait_charge(&self.file_a, &self.file_b)?;
+        let first_schedule = legacy_schedule(&self.file_a, "schedule diff/interpolation")?;
+        let second_schedule = legacy_schedule(&self.file_b, "schedule diff/interpolation")?;
         let (_swap_dist, _edit_dist, requested_schedule) = {
             let mut bubbles = iterable_bubble_sort(&first_schedule, &second_schedule);
             (
@@ -254,14 +262,35 @@ impl InterpolateOpts {
                     .collect::<Vec<_>>(),
             )
         };
-        let sched_path = tmpdir_path.join(format!("interpolate_{}.events", self.interpolate));
         let next_sched = PreemptionRecord::from_sched_events(requested_schedule)
+            .with_guest_ids(guest_ids)
             .with_pipe_wake_latency(latency)
             .with_signal_state_copy(copy)
             .with_expired_wait_runs_charged_once(charged_once);
-        next_sched.write_to_disk(&sched_path).unwrap();
+        Ok(next_sched)
+    }
 
-        Ok(true)
+    /// Numbering must agree just as it must for replay. The refusal policy
+    /// does not change the IDs; retain the first input's policy when the
+    /// chosen bases agree. Host-numbered inputs remain marked as such.
+    fn common_guest_ids(
+        file_a: &std::path::Path,
+        file_b: &std::path::Path,
+    ) -> anyhow::Result<detcore_model::pid::GuestIds> {
+        let read = |path: &std::path::Path| {
+            detcore::preemptions::read_recorded_guest_ids(path).map_err(anyhow::Error::msg)
+        };
+        let (a, b) = (read(file_a)?, read(file_b)?);
+        if !a.numbers_like(&b) {
+            anyhow::bail!(
+                "{} and {} were recorded with incompatible guest process IDs ({a} and {b}); \
+                 no interpolation of them can be replayed. Use schedules recorded with the \
+                 same guest ID mode and --pid-base.",
+                file_a.display(),
+                file_b.display(),
+            );
+        }
+        Ok(a)
     }
 
     /// The `--pipe-wake-latency` both schedules were recorded under, which
@@ -415,6 +444,127 @@ fn print_boundaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_interpolation_preserves_chosen_guest_ids() {
+        use detcore_model::pid::GuestIds;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chosen.json");
+        let ids = GuestIds::Chosen {
+            base: 5000,
+            refuse_host_ids: true,
+        };
+        let events = vec![
+            SchedEvent::branches(DetTid::from_raw(5000), 3),
+            SchedEvent::branches(DetTid::from_raw(5001), 2),
+        ];
+        let mut input =
+            serde_json::to_value(PreemptionRecord::from_sched_events(events.clone())).unwrap();
+        input["guest_ids"] = serde_json::to_value(ids).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(
+            detcore::preemptions::read_recorded_guest_ids(&path).unwrap(),
+            ids
+        );
+        for interpolate in [0, 50, 100] {
+            let record = InterpolateOpts {
+                interpolate,
+                file_a: path.clone(),
+                file_b: path.clone(),
+            }
+            .interpolated_record()
+            .unwrap();
+            assert_eq!(record.guest_ids(), Some(ids));
+            assert_eq!(record.into_global(), events);
+        }
+    }
+
+    #[test]
+    fn interpolation_requires_compatible_guest_numbering_before_output() {
+        use detcore_model::pid::GuestIds;
+        let directory = tempfile::tempdir().unwrap();
+        let events = vec![SchedEvent::branches(DetTid::from_raw(5000), 3)];
+        let inputs = [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::to_value(GuestIds::Namespace).unwrap()),
+            Some(serde_json::to_value(GuestIds::Host).unwrap()),
+            Some(
+                serde_json::to_value(GuestIds::Chosen {
+                    base: 5000,
+                    refuse_host_ids: false,
+                })
+                .unwrap(),
+            ),
+            Some(
+                serde_json::to_value(GuestIds::Chosen {
+                    base: 5000,
+                    refuse_host_ids: true,
+                })
+                .unwrap(),
+            ),
+            Some(
+                serde_json::to_value(GuestIds::Chosen {
+                    base: 6000,
+                    refuse_host_ids: true,
+                })
+                .unwrap(),
+            ),
+        ];
+        let paths: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, ids)| {
+                let path = directory.path().join(format!("{index}.json"));
+                let mut record =
+                    serde_json::to_value(PreemptionRecord::from_sched_events(events.clone()))
+                        .unwrap();
+                if let Some(ids) = ids {
+                    record["guest_ids"] = ids.clone();
+                }
+                std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+                path
+            })
+            .collect();
+        let options = CommonOpts::parse_from(["test"]);
+        for (a, file_a) in paths.iter().enumerate() {
+            for (b, file_b) in paths.iter().enumerate() {
+                // Explicit oracle, including both input orders: omission,
+                // null and Namespace agree; Chosen policies at one base agree.
+                let compatible =
+                    a == b || (a < 3 && b < 3) || ([4, 5].contains(&a) && [4, 5].contains(&b));
+                let interpolation = InterpolateOpts {
+                    interpolate: 50,
+                    file_a: file_a.clone(),
+                    file_b: file_b.clone(),
+                };
+                let before = (
+                    std::fs::read(file_a).unwrap(),
+                    std::fs::read(file_b).unwrap(),
+                );
+                if compatible {
+                    let record = interpolation.interpolated_record().unwrap();
+                    assert_eq!(
+                        record.guest_ids().unwrap_or_default(),
+                        detcore::preemptions::read_recorded_guest_ids(file_a).unwrap()
+                    );
+                    assert_eq!(record.into_global(), events);
+                } else {
+                    let error = interpolation.run(&options).unwrap_err();
+                    assert!(
+                        error.to_string().contains("incompatible guest process IDs"),
+                        "{error}"
+                    );
+                }
+                assert_eq!(std::fs::read(file_a).unwrap(), before.0);
+                assert_eq!(std::fs::read(file_b).unwrap(), before.1);
+                assert_eq!(
+                    std::fs::read_dir(directory.path()).unwrap().count(),
+                    paths.len()
+                );
+            }
+        }
+    }
 
     #[test]
     fn boundary_inspection_keeps_every_record_index_and_editors_refuse_the_format() {

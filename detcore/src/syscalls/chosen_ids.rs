@@ -94,6 +94,9 @@ pub(crate) enum ChosenIdCall {
     /// shorter than its first version), so no ID is needed, and `clone3`
     /// could refuse it with another error.
     Unchanged,
+    /// The original legacy call fails validation before conversion. Return
+    /// this errno without allocating an ID or issuing a rewritten syscall.
+    Invalid(Errno),
     /// A guest `clone3` that passes `set_tid` itself, with its `struct
     /// clone_args` (the first 88 bytes, zero extended) and the size to pass:
     /// its ID is the guest's choice if the array reaches Hermit's PID
@@ -140,8 +143,10 @@ impl ChosenIdCall {
 /// - A new stack pointer `sp` becomes `stack = sp - 1, stack_size = 1`:
 ///   `clone3_stack_valid` starts the child at `stack + stack_size`.
 ///
-/// An exit signal above 64 is inexpressible: `clone` accepts it and `clone3`
-/// does not. A `clone3` call is rewritten only when it passes no `set_tid` of
+/// An exit signal above 64 is inexpressible on kernels that accept it in
+/// legacy `clone`. Beside `CLONE_PARENT`/`CLONE_THREAD`, return EINVAL before
+/// discarding the original signal, matching Linux v7.1.3 `kernel_clone`.
+/// A `clone3` call is rewritten only when it passes no `set_tid` of
 /// its own and its size is one of the three versions; Detcore then fills in
 /// `set_tid`, extending a first-version struct to the second.
 pub(crate) fn clone3_form(
@@ -240,6 +245,15 @@ impl LegacyClone {
     }
 
     fn as_clone3(self) -> ChosenIdCall {
+        let shares_parent = (libc::CLONE_THREAD | libc::CLONE_PARENT) as u64;
+        // Linux v7.1.3 kernel/fork.c:2702, kernel_clone, validates the
+        // original signal before copy_process replaces it for these flags:
+        // https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v7.1.3#n2702
+        // v6.16 validated only clone3's signal. This conversion follows the
+        // newer rule; Namespace/Host calls bypass it and retain native results.
+        if self.flags & shares_parent != 0 && self.exit_signal > 64 {
+            return ChosenIdCall::Invalid(Errno::EINVAL);
+        }
         let detached = libc::CLONE_DETACHED as u64;
         let pidfd = libc::CLONE_PIDFD as u64;
         // copy_process: CLONE_PIDFD beside CLONE_DETACHED is EINVAL, before
@@ -249,7 +263,6 @@ impl LegacyClone {
         if self.flags & pidfd != 0 && self.flags & detached != 0 {
             return ChosenIdCall::Unchanged;
         }
-        let shares_parent = (libc::CLONE_THREAD | libc::CLONE_PARENT) as u64;
         let exit_signal = if self.flags & shares_parent != 0 {
             0
         } else {
@@ -463,6 +476,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let restarted = guest.thread_state_mut().restarted_clone_id.take();
         let tid = guest.tid().as_raw();
         let (args, size, set_tid, guest_entries) = match form {
+            ChosenIdCall::Invalid(errno) => return Err(errno.into()),
             ChosenIdCall::Clone3 { args, size } => {
                 let flags = u64::from_ne_bytes(args[..8].try_into().unwrap());
                 // The new task's ID in each namespace inside Hermit's: none,
@@ -1659,6 +1673,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn invalid_original_signals_are_not_normalized_into_valid_clones() {
+        for shared in [
+            libc::CLONE_PARENT,
+            libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM,
+        ] {
+            for signal in [65, 128, 255] {
+                let call = clone3_form(
+                    Sysno::clone,
+                    &clone_args(shared as u64 | signal, 0, 0, 0, 0),
+                    None,
+                );
+                assert_eq!(call, ChosenIdCall::Invalid(Errno::EINVAL));
+            }
+            for signal in [0, libc::SIGCHLD as u64, 64] {
+                let (valid, _) = fields(&clone3_form(
+                    Sysno::clone,
+                    &clone_args(shared as u64 | signal, 0, 0, 0, 0),
+                    None,
+                ));
+                assert_eq!((valid[0], valid[4]), (shared as u64, 0));
+            }
+        }
+    }
+
     /// Bits above the low 32 never reach the kernel from clone; neither does
     /// CLONE_DETACHED, which clone3 refuses.
     #[test]
@@ -1676,7 +1715,7 @@ mod tests {
     /// CLONE_PIDFD beside CLONE_THREAD, which only kernels before 6.9 refuse,
     /// is rewritten, and its clone3 fails as the call would. An exit signal
     /// clone3 cannot carry is inexpressible, except beside CLONE_THREAD or
-    /// CLONE_PARENT, where copy_process ignores it.
+    /// CLONE_PARENT, where original-signal validation must precede conversion.
     #[test]
     fn refused_and_inexpressible_calls() {
         let detached = (libc::CLONE_PIDFD | libc::CLONE_DETACHED) as u64;
@@ -1697,12 +1736,10 @@ mod tests {
             ChosenIdCall::Inexpressible(_)
         ));
         let thread = (libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM) as u64;
-        let (thread_fields, _) = fields(&clone3_form(
-            Sysno::clone,
-            &clone_args(thread | 0x80, 0, 0, 0, 0),
-            None,
-        ));
-        assert_eq!((thread_fields[0], thread_fields[4]), (thread, 0));
+        assert_eq!(
+            clone3_form(Sysno::clone, &clone_args(thread | 0x80, 0, 0, 0, 0), None),
+            ChosenIdCall::Invalid(Errno::EINVAL)
+        );
     }
 
     /// clone's last two arguments are the child TID address and the TLS on

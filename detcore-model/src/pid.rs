@@ -106,8 +106,9 @@ pub enum GuestIds {
     /// tasks.
     Host,
     /// Detcore chooses every ID (`--no-namespace`): the guest's first process
-    /// gets `base`, and each later process or thread the next ID in creation
-    /// order, through `clone3`'s `set_tid`. No ID is given out twice in a run,
+    /// gets `base`, and automatic choices take the next ID in creation order,
+    /// skipping IDs already used by guest-authored `set_tid` calls. Linux
+    /// assigns the choices through `clone3`'s `set_tid`. No ID is given out twice in a run,
     /// so the IDs depend only on `base` and the guest's own creation order.
     Chosen {
         /// The first process's ID.

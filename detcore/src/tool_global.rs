@@ -3013,12 +3013,28 @@ impl GlobalTool for GlobalState {
 impl GlobalState {
     /// The ID for the next guest task, when Detcore chooses the IDs: each
     /// call takes the next one, whether or not the clone that asked succeeds,
-    /// so an ID is never given out twice. Asked in the caller's turn, so the
+    /// skipping IDs any guest task already used, including an explicit
+    /// `clone3(set_tid)` choice. Registration survives exit and reaping, so
+    /// an ID is never given out twice. Asked in the caller's turn, so the
     /// order of the takes is the guest's own order of clone-family calls.
     /// `None` when the kernel numbers the guest.
-    fn take_guest_id(&self) -> Option<i32> {
+    async fn take_guest_id(&self) -> Option<i32> {
         self.cfg.guest_ids.base()?;
-        Some(self.next_guest_id.fetch_add(1, SeqCst))
+        loop {
+            let (id, registered) = {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let id = self.next_guest_id.fetch_add(1, SeqCst);
+                (id, sched.thread_was_registered(DetTid::from_raw(id)))
+            };
+            let clocked = self
+                .global_time
+                .lock()
+                .unwrap()
+                .contains_thread(DetTid::from_raw(id));
+            if !registered && !clocked {
+                return Some(id);
+            }
+        }
     }
 
     /// Evaluate a brk predicate in the controller's unchanged procfs view.
@@ -4321,7 +4337,7 @@ impl GlobalState {
                         .collect(),
                 )
             }
-            GlobalRequest::NextGuestId => R::NextGuestId(self.take_guest_id()),
+            GlobalRequest::NextGuestId => R::NextGuestId(self.take_guest_id().await),
             GlobalRequest::GaveHostId => {
                 self.host_id_tasks.fetch_add(1, SeqCst);
                 // The run's IDs now depend on the host: a record of it says
@@ -11924,6 +11940,28 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn automatic_guest_ids_skip_registered_guest_choices() {
+        let config = Config {
+            guest_ids: detcore_model::pid::GuestIds::Chosen {
+                base: 5000,
+                refuse_host_ids: true,
+            },
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let root = DetTid::from_raw(5000);
+        let explicit = DetTid::from_raw(5001);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(root, root, true);
+            sched.thread_tree.add_child(root, explicit, true);
+            assert!(sched.thread_was_registered(explicit));
+        }
+        assert_eq!(state.take_guest_id().await, Some(5002));
+        assert_eq!(state.take_guest_id().await, Some(5003));
+    }
+
     /// `response` as `receive_rpc` returns it after a turn was granted
     /// (`GlobalResponse::Granted`).
     fn granted(response: super::GlobalResponse) -> super::GlobalResponse {

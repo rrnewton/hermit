@@ -25,7 +25,11 @@
  * its own with clone3's set_tid naming the ID three after its first (the ID
  * Hermit would choose next), which it needs CAP_CHECKPOINT_RESTORE or
  * CAP_SYS_ADMIN for, and keeps it alive across the fork, so that Hermit's
- * choice for the fork is taken.
+ * automatic allocator must skip that accepted guest choice.
+ * `collide-external REQUEST ACK` instead asks a native supervisor outside
+ * Hermit to hold that ID and acknowledges it before the fork, exercising a
+ * genuine external collision. `external-holder REQUEST ACK COMMAND...` runs
+ * that supervisor and bounds/reaps its children.
  *
  * With one of these arguments it makes one call instead and prints its
  * outcome:
@@ -63,8 +67,9 @@
  * - `bad-size`: a clone3 with set_tid but set_tid_size 0 (EINVAL);
  * - `seccomp`: a fork after the guest installs a seccomp filter of its own
  *   (one that allows everything);
- * - `signal65`: a raw clone with exit signal 65, which clone accepts and
- *   clone3 does not; `vfork65` the same with CLONE_VFORK, whose parent waits
+ * - `signal65`: a raw clone with exit signal 65, accepted by some older
+ *   kernels and refused with EINVAL by newer ones; `vfork65` the same with
+ *   CLONE_VFORK, whose parent waits
  *   for its child's exit;
  * - `sp1`: a raw clone with new stack pointer 1, which clone3 cannot express
  *   (its child would fault at once).
@@ -78,11 +83,13 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/capability.h>
 #include <linux/filter.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sched.h>
 #include <sys/mman.h>
 #include <signal.h>
@@ -92,6 +99,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -147,10 +155,150 @@ static pid_t hold(pid_t id) {
   return (pid_t)holder;
 }
 
+/* Native supervisor, outside Hermit: the guest requests the ID only after
+ * startup admission checked the initial window. Acknowledgement proves the
+ * external holder exists before the guest attempts its next fork. */
+static int external_holder(int argc, char** argv) {
+  if (argc < 5) return 99;
+  const char* request_path = argv[2];
+  const char* ack_path = argv[3];
+  int request = -1, ack = -1, result = 99;
+  pid_t hermit = -1, holder = -1;
+  if (mkfifo(request_path, 0600) != 0 || mkfifo(ack_path, 0600) != 0) goto done;
+  request = open(request_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+  ack = open(ack_path, O_RDWR | O_CLOEXEC);
+  if (request < 0 || ack < 0) goto done;
+  hermit = fork();
+  if (hermit < 0) goto done;
+  if (hermit == 0) {
+    execv(argv[4], argv + 4);
+    _exit(99);
+  }
+  // At most 150 polls of 100 ms; the enclosing test runner owns its unchanged
+  // CPU/wall bounds. Every failure kills and reaps both direct children.
+  for (int turn = 0; turn < 150; turn++) {
+    int status;
+    pid_t ended = waitpid(hermit, &status, WNOHANG);
+    if (ended == hermit) {
+      hermit = -1;
+      result = WIFEXITED(status) ? WEXITSTATUS(status) : 99;
+      goto done;
+    }
+    if (ended < 0) goto done;
+    if (holder > 0) {
+      if (poll(NULL, 0, 100) < 0 && errno != EINTR) goto done;
+      continue;
+    }
+    struct pollfd ready = {.fd = request, .events = POLLIN};
+    int polled = poll(&ready, 1, 100);
+    if (polled < 0 && errno == EINTR) continue;
+    if (polled < 0) goto done;
+    if (polled == 0) continue;
+    if (!(ready.revents & POLLIN)) goto done;
+    pid_t id;
+    if (read(request, &id, sizeof id) != (ssize_t)sizeof id || id <= 0) goto done;
+    struct clone_args args = {0};
+    args.exit_signal = SIGCHLD;
+    args.set_tid = (uint64_t)(uintptr_t)&id;
+    args.set_tid_size = 1;
+    holder = syscall(SYS_clone3, &args, sizeof args);
+    if (holder == 0) {
+      for (;;) pause();
+    }
+    if (holder != id) goto done;
+    if (write(ack, &id, sizeof id) != (ssize_t)sizeof id) goto done;
+  }
+done:
+  if (hermit > 0) {
+    kill(hermit, SIGKILL);
+    while (waitpid(hermit, NULL, 0) < 0 && errno == EINTR) {}
+  }
+  if (holder > 0) {
+    int status;
+    if (kill(holder, SIGKILL) != 0) result = 99;
+    pid_t reaped;
+    do { reaped = waitpid(holder, &status, 0); } while (reaped < 0 && errno == EINTR);
+    if (reaped != holder || !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) result = 99;
+  }
+  if (request >= 0) close(request);
+  if (ack >= 0) close(ack);
+  unlink(request_path);
+  unlink(ack_path);
+  if (result == 99) fprintf(stderr, "external holder setup or cleanup failed\n");
+  return result;
+}
+
+static int request_external_holder(const char* request_path, const char* ack_path) {
+  int request = open(request_path, O_WRONLY);
+  int ack = open(ack_path, O_RDONLY);
+  pid_t id = first + 3, answer = 0;
+  if (request < 0 || ack < 0) {
+    if (request >= 0) close(request);
+    if (ack >= 0) close(ack);
+    return 1;
+  }
+  int failed = write(request, &id, sizeof id) != (ssize_t)sizeof id ||
+      read(ack, &answer, sizeof answer) != (ssize_t)sizeof answer || answer != id;
+  close(request);
+  close(ack);
+  if (failed) return 1;
+  show("external holder", answer);
+  return 0;
+}
+
 /* One call, as the arguments `sighand`, `own-tid N`, `bad-tid` and
  * `bad-size` ask, and its outcome. */
 static int one_call(int argc, char** argv) {
   const char* what = argv[1];
+  if (strcmp(what, "explicit-then-fork") == 0) {
+    if (argc != 3) return 1;
+    pid_t chosen = first + atoi(argv[2]);
+    pid_t holder = hold(chosen);
+    if (kill(holder, SIGKILL) != 0) return 1;
+    int status = 0;
+    if (waitpid(holder, &status, 0) != holder ||
+        !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) return 1;
+    show("explicit reaped", holder);
+    pid_t child = fork();
+    if (child < 0) return 1;
+    if (child == 0) _exit(23);
+    if (waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 23) return 1;
+    show("automatic reaped", child);
+    printf("distinct IDs: %d\n", child != chosen);
+    return child == chosen;
+  }
+  if (strcmp(what, "parent-signal") == 0) {
+    if (argc != 3) return 1;
+    int signal = atoi(argv[2]);
+    pid_t probe = fork();
+    if (probe < 0) return 1;
+    if (probe == 0) {
+      errno = 0;
+      long child = syscall(SYS_clone, (unsigned long)(CLONE_PARENT | signal),
+                           0L, 0L, 0L, 0L);
+      int error = errno;
+      if (child == 0) _exit(23);
+      printf("parent signal %d: created=%d errno=%d\n", signal, child > 0, error);
+      _exit(child < 0 && error != EINVAL ? 1 : 0);
+    }
+    int probes = 0, clones = 0, status = 0;
+    pid_t reaped;
+    while ((reaped = waitpid(-1, &status, __WALL)) > 0) {
+      if (reaped == probe && WIFEXITED(status) && WEXITSTATUS(status) == 0) probes++;
+      else if (WIFEXITED(status) && WEXITSTATUS(status) == 23) clones++;
+      else return 1;
+    }
+    if (errno != ECHILD || probes != 1 || clones > 1) return 1;
+    printf("parent signal %d: reaped probe=%d clone=%d\n", signal, probes, clones);
+    pid_t after = fork();
+    if (after < 0) return 1;
+    if (after == 0) _exit(0);
+    if (waitpid(after, &status, 0) != after ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 1;
+    show("after signal returned", after);
+    return 0;
+  }
   if (strcmp(what, "vfork-detached") == 0 ||
       strcmp(what, "untraced-detached") == 0) {
 #ifndef CLONE_DETACHED
@@ -217,10 +365,13 @@ static int one_call(int argc, char** argv) {
     if (child == 0) {
       syscall(SYS_exit, 0);
     }
+    int error = errno;
     if (child > 0) {
-      waitpid((pid_t)child, NULL, __WALL);
+      int status;
+      if (waitpid((pid_t)child, &status, __WALL) != child) return 1;
+      if (!sp1 && (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) return 1;
     }
-    printf("clone %s: %s\n", what, child < 0 ? strerror(errno) : "created");
+    printf("clone %s: %s\n", what, child < 0 ? strerror(error) : "created");
     return 0;
   }
   pid_t tids[2] = {1, first + 100};
@@ -375,7 +526,11 @@ static void* call_after_the_leader(void* arg) {
 }
 
 int main(int argc, char** argv) {
+  if (argc > 1 && strcmp(argv[1], "external-holder") == 0) {
+    return external_holder(argc, argv);
+  }
   int collide = argc > 1 && strcmp(argv[1], "collide") == 0;
+  int external = argc == 4 && strcmp(argv[1], "collide-external") == 0;
   setvbuf(stdout, NULL, _IONBF, 0);
   first = getpid();
   if (argc > 2 && strcmp(argv[1], "leader-gone") == 0) {
@@ -389,7 +544,7 @@ int main(int argc, char** argv) {
     }
     pthread_exit(NULL);
   }
-  if (argc > 1 && !collide) {
+  if (argc > 1 && !collide && !external) {
     return one_call(argc, argv);
   }
   printf("first process %d\n", first);
@@ -415,6 +570,7 @@ int main(int argc, char** argv) {
   }
 
   pid_t holder = collide ? hold(first + 3) : 0;
+  if (external && request_external_holder(argv[2], argv[3]) != 0) return 1;
   pid_t forked = fork();
   if (forked == 0) {
     _exit(0);

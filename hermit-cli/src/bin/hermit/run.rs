@@ -1603,7 +1603,8 @@ pub struct RunOpts {
     no_namespace: bool,
 
     /// With `--no-namespace`, the process ID of the guest's first process. Every later process
-    /// or thread the guest creates gets the next ID, in the guest's own order of creation, and no
+    /// or thread Hermit numbers gets the next ID not already used by the guest (including its
+    /// own clone3 set_tid choices), in the guest's own order of creation, and no
     /// ID is given out twice, so the guest's process and thread IDs depend only on this base and
     /// the guest itself, as a PID namespace's would. The kernel hands out exactly these IDs
     /// (`clone3` with `set_tid`), so they are what the guest's own calls, `/proc` and futex owner
@@ -1638,7 +1639,7 @@ pub struct RunOpts {
     ///
     /// Only the window or windows the IDs start in are checked and reserved. IDs are never given
     /// out twice in a run, so every task the guest ever creates (each process and thread,
-    /// including those that exited) takes the next one, and a guest that creates more tasks than
+    /// including those that exited) reserves its ID, and a guest that creates more tasks than
     /// those windows hold goes on into IDs that nobody checked or reserved, where a host task or
     /// another run may already be. Its outcome then depends on the host, though never silently:
     /// a task that cannot have its ID ends a run with an explicit base, or gets a host ID with a
