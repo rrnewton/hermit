@@ -487,9 +487,9 @@
       "timeout": 0,
       "synthetic": "calibrated_analyze_tests",
       "argv": [
-        "analyze_hello_race",
+        "-E",
+        "test(=analyze_hello_race) | test(=bisect_rejects_a_timed_out_replay)",
         "--",
-        "--exact",
         "--ignored",
         "--test-threads=1"
       ]

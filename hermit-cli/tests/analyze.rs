@@ -340,3 +340,77 @@ fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
         &["--run-arg=--base-env=empty", "--target-exit-code=0"],
     );
 }
+
+/// A stopped replay establishes neither a baseline outcome nor a realized
+/// schedule. The outer bound is distinct from Hermit's own timeout marker.
+#[test]
+#[ignore = "requires working mount namespaces; selected by the calibrated analyze validation node"]
+fn bisect_rejects_a_timed_out_replay() {
+    use detcore::preemptions::PreemptionRecord;
+    use detcore::types::DetTid;
+    use detcore::types::SchedEvent;
+    use detcore::types::SyscallPhase;
+    use reverie::syscalls::Sysno;
+
+    let _guard = analyze_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good.json");
+    let bad = dir.path().join("bad.json");
+    let report = dir.path().join("report.json");
+    for (path, syscall) in [(&good, Sysno::getpid), (&bad, Sysno::getppid)] {
+        let record = PreemptionRecord::from_sched_events(vec![SchedEvent::syscall(
+            DetTid::from_raw(3),
+            syscall,
+            SyscallPhase::Prehook,
+        )]);
+        record.validate().unwrap();
+        record.write_to_disk(path).unwrap();
+    }
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=KILL", "30s"])
+        .arg(hermit_test::hermit_binary())
+        .arg("bisect")
+        .arg(format!("--good={}", good.display()))
+        .arg(format!("--bad={}", bad.display()))
+        .arg(format!("--report-file={}", report.display()))
+        .args([
+            "--",
+            "--timeout=1",
+            "--no-rcb-time",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/sh",
+            "-c",
+            "while :; do :; done",
+        ]);
+    let output = hermit_test::hermit_output("bisect timed-out replay", &mut command);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(124), "{combined}");
+    assert!(
+        combined.contains("HERMIT_RUN_TIMEOUT class=run-timeout"),
+        "{combined}"
+    );
+    assert!(combined.contains("larger --timeout"), "{combined}");
+    assert!(
+        !report.exists(),
+        "an unfinished replay wrote a report: {combined}"
+    );
+    for unsupported_claim in [
+        "counted as the baseline condition",
+        "Completed analysis successfully",
+        "reproduces the good outcome",
+        "determines the program outcome",
+        "decides the outcome",
+        "hermit analyze report",
+    ] {
+        assert!(
+            !combined.contains(unsupported_claim),
+            "{unsupported_claim}: {combined}"
+        );
+    }
+}

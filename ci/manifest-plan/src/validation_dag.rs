@@ -3118,9 +3118,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // The second PMU integration shard adds one.
     // sabrecompat.sabre_examples, the archived SaBRe suite outside the smoke
     // pair, adds one.
-    if expected_counts.len() != 51 {
+    if expected_counts.len() != 52 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 51",
+            "Nextest expected-count registry has {} entries, expected 52",
             expected_counts.len()
         ));
     }

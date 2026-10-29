@@ -289,6 +289,7 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 /// an empty or narrowed run refuse. Update these only after enumerating the
 /// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
+    ("super.pmu_analyze_hello_race_stress_calibrated_skid", 2),
     // Measured 189 - 185 embedded qualifier tests = four allocator/source-copy
     // cases. The same 185 qualifier identities now run once through the existing
     // allocator producer's script-test harness, with none dropped or ignored.
@@ -1202,7 +1203,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Trains since then add four (measured with `cargo nextest list` at
     // 11c35a504a6; the full validate at 24fbff99c7a also saw 1912):
     // 1908 + 4 = 1912.
-    ("test.regular_crates", 1910),    // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
+    ("test.regular_crates", 1910),
+    // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
     // Two proc-fallback container tests and one broken-stderr warning test
@@ -1858,7 +1860,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 11c35a504a6, less the five real_random_ skips: 1230 - 5; the full
     // validate at 24fbff99c7a saw 1224 before 11c35a504a6 added one):
     // 1202 + 23 = 1225.
-    ("test.hermit_unit", 1221),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
+    // Six analyze outcome controls replace the timeout-as-baseline warning test: +5.
+    ("test.hermit_unit", 1226),
+    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
@@ -4385,7 +4389,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 700 + 2 = 702.
     // And 11c35a504a6's two --base-env=minimal cli tests: 702 + 2 = 704,
     // measured with `cargo nextest list` at 11c35a504a6.
-    ("test.cli", 703),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    ("test.cli", 703),
+    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -5783,7 +5788,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
-    ("test.hermit_unit_on_host", 1215),
+    // The same six analyze outcome controls replace one obsolete warning test: +5.
+    ("test.hermit_unit_on_host", 1220),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -11109,7 +11115,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"super"########,
         job: r########"pmu_analyze_hello_race_stress_calibrated_skid"########,
         desc: r########"PMU analyze hello-race stress (calibrated skid)"########,
-        description: r########"Calibrates the PMU skid margin on the host, then runs the ignored analyze_hello_race test. The shell command checks four positive-integer settings (ANALYZE_SKID_CALIBRATION_ITERATIONS, default 64; ANALYZE_SKID_CALIBRATION_PERIOD, 1000000; ANALYZE_SKID_MINIMUM_MARGIN, 20000; ANALYZE_SKID_CALIBRATION_TIMEOUT, 30 seconds), compiles tests/util/pmu_skid.c into target/ci-pmu-skid, runs it to read "Recommended margin: N RCB", and passes the larger of N and the floor as HERMIT_ANALYZE_SKID_MARGIN. analyze_hello_race (hermit-cli/tests/analyze.rs) then runs `hermit analyze --run-arg=--base-env=host --run-arg=--skid-margin=<margin> --analyze-seed=0 --search -- --chaos --summary --max-timeslice=400000 -- hello_race`, which must exit 0, print a guest stack trace and name flaky-tests/hello_race.rs:37. It checks that hermit analyze pinpoints the hello_race race with PMU-driven chaos preemption sized to this host's measured skid. A missing calibration line exits with an error before the test; a different pinpointed line fails the test. A failure is blocking for the super validation."########,
+        description: r########"Calibrates the PMU skid margin on the host, then runs the ignored analyze_hello_race and bisect_rejects_a_timed_out_replay tests. The shell command checks four positive-integer settings (ANALYZE_SKID_CALIBRATION_ITERATIONS, default 64; ANALYZE_SKID_CALIBRATION_PERIOD, 1000000; ANALYZE_SKID_MINIMUM_MARGIN, 20000; ANALYZE_SKID_CALIBRATION_TIMEOUT, 30 seconds), compiles tests/util/pmu_skid.c into target/ci-pmu-skid, runs it to read "Recommended margin: N RCB", and passes the larger of N and the floor as HERMIT_ANALYZE_SKID_MARGIN. analyze_hello_race (hermit-cli/tests/analyze.rs) then runs `hermit analyze --run-arg=--base-env=host --run-arg=--skid-margin=<margin> --analyze-seed=0 --search -- --chaos --summary --max-timeslice=400000 -- hello_race`, which must exit 0, print a guest stack trace and name flaky-tests/hello_race.rs:37. It checks that hermit analyze pinpoints the hello_race race with PMU-driven chaos preemption sized to this host's measured skid. The bisect timeout regression runs an endless guest with a one-second Hermit timeout and a 30-second outer bound; it requires exit 124 with the typed run-timeout marker and no successful report or causal claim. A missing calibration line exits with an error before the tests; a different pinpointed line or a lost timeout classification fails the tests. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -u
 iters=${ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}
@@ -11137,7 +11143,7 @@ margin=$rec
 if [ "$margin" -lt "$floor" ]; then margin=$floor; fi
 printf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\n' \
     "$rec" "$floor" "$margin"
-HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test analyze -j 1 analyze_hello_race -- --exact --ignored"########,
+HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test analyze -j 1 -E 'test(=analyze_hello_race) | test(=bisect_rejects_a_timed_out_replay)' -- --ignored"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"analyze"########]),

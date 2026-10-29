@@ -3,6 +3,7 @@
 analyze	analyze_hello_race	slow schedule bisection; requires PMU and mount namespaces
 analyze	analyze_nanosleep_threads_rejects_indistinguishable_baseline	slow schedule bisection; requires PMU and mount namespaces
 analyze	analyze_racewrite_nostdlib	slow schedule bisection; requires PMU and mount namespaces
+analyze	bisect_rejects_a_timed_out_replay	requires mount namespaces; selected with a 30-second outer bound by super.pmu_analyze_hello_race_stress_calibrated_skid
 app_strict_verify	go_goroutines_are_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and the Go toolchain
 app_strict_verify	go_hello_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and the Go toolchain
 app_strict_verify	java_hello_is_deterministic_under_strict_verify	e2e requires PMU, mount namespaces, and a JDK
