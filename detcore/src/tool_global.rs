@@ -4561,6 +4561,18 @@ impl GlobalState {
                         .process_signal_receiver(process, named, dtid, signo),
                 )
             }
+            GlobalRequest::OwnProcessSignalChoice(named, signo) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .own_process_signal_choice(dtid, named, signo);
+                R::OwnProcessSignalChoice(())
+            }
+            GlobalRequest::ProcessSignalSent(process) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .process_signal_sent(dtid, process);
+                R::ProcessSignalSent(())
+            }
             GlobalRequest::SetChildTidAddress(address) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -7202,7 +7214,11 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 16;
+<<<<<<< HEAD
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 18;
+=======
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 11;
+>>>>>>> b83e97818fc (Move a process's curr_target only when Linux's walk does)
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -7385,6 +7401,16 @@ pub enum GlobalRequest {
     /// calling thread sends naming a task of it
     /// (`Scheduler::process_signal_receiver`).
     ProcessSignalReceiver(DetPid, DetTid, i32),
+
+    /// The calling thread's forwarded process-directed send to this process,
+    /// whose receiver the scheduler chose, succeeded
+    /// (`Scheduler::process_signal_sent`).
+    ProcessSignalSent(DetPid),
+
+    /// The calling thread is about to forward a send of this signal to its own
+    /// process, naming this task, that Linux gives to it
+    /// (`Scheduler::own_process_signal_choice`).
+    OwnProcessSignalChoice(DetTid, i32),
 
     /// The calling thread sends SIGSTKFLT (`Scheduler::record_guest_marker_signal`).
     RecordGuestMarkerSignal,
@@ -8018,6 +8044,8 @@ pub enum GlobalResponse {
     SetSigtimedwaitSet(()),
     OwnProcessSignalInputs(OwnProcessSignalInputs),
     ProcessSignalReceiver(ProcessSignalReceiver),
+    ProcessSignalSent(()),
+    OwnProcessSignalChoice(()),
     RecordGuestMarkerSignal(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
@@ -8976,6 +9004,38 @@ where
     {
         GlobalResponse::ProcessSignalReceiver(receiver) => receiver,
         response => unreachable!("unexpected response to ProcessSignalReceiver: {response:?}"),
+    }
+}
+
+/// The calling thread's forwarded process-directed send to `process`, whose
+/// receiver the scheduler chose, succeeded (`Scheduler::process_signal_sent`).
+pub(crate) async fn process_signal_sent<G, T>(guest: &mut G, process: DetPid)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::ProcessSignalSent(process))
+        .await
+        .1
+    {
+        GlobalResponse::ProcessSignalSent(()) => {}
+        response => unreachable!("unexpected response to ProcessSignalSent: {response:?}"),
+    }
+}
+
+/// The calling thread is about to forward `signo` to its own process, naming
+/// `named`, as Linux gives it to the caller (`Scheduler::own_process_signal_choice`).
+pub(crate) async fn own_process_signal_choice<G, T>(guest: &mut G, named: DetTid, signo: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::OwnProcessSignalChoice(named, signo))
+        .await
+        .1
+    {
+        GlobalResponse::OwnProcessSignalChoice(()) => {}
+        response => unreachable!("unexpected response to OwnProcessSignalChoice: {response:?}"),
     }
 }
 

@@ -2287,6 +2287,13 @@ pub struct Scheduler {
     /// Linux starts it.
     signal_curr_targets: BTreeMap<DetPid, DetTid>,
 
+    /// The `curr_target` move the last process-directed choice decided, as
+    /// (sender, process, thread), until the sender's forwarded call succeeds
+    /// (`process_signal_sent`). Linux moves `curr_target` only when the send
+    /// reaches `complete_signal`, which a call the kernel fails first (a bad
+    /// siginfo, a forged `si_code`) never does.
+    pending_signal_curr_target: Option<(DetTid, DetPid, DetTid)>,
+
     /// For each thread, the signals it was chosen to take of the
     /// process-directed copies a guest sent and the scheduler left in its
     /// process's shared queue (`process_signal_receiver`). Step 3 resumes
@@ -5324,6 +5331,7 @@ impl Scheduler {
             thread_timer_copies: Default::default(),
             guest_sent_marker_signal: false,
             signal_curr_targets: Default::default(),
+            pending_signal_curr_target: None,
             process_signal_takers: Default::default(),
             #[cfg(test)]
             test_signal_masks: Default::default(),
@@ -33048,6 +33056,204 @@ mod test {
         assert_eq!(selected, vfork_child);
         scheduler.run_queue.undo_tentative_pop();
         assert!(!scheduler.blocked.sigchld_takers.contains(&target));
+    }
+
+    /// A process (`leader` first) of `members`, each with the signal state
+    /// `state(blocked)`: SIGUSR1 caught, and `blocked` its mask.
+    fn signal_process(
+        scheduler: &mut Scheduler,
+        leader: DetTid,
+        members: &[(DetTid, u64)],
+        caught: u64,
+    ) {
+        scheduler.thread_tree.add_child(leader, leader, true);
+        for &(tid, blocked) in members {
+            if tid != leader {
+                scheduler.thread_tree.add_child(leader, tid, false);
+            }
+            register_known_thread(scheduler, tid);
+            scheduler.test_kernel_signal_states.insert(
+                tid,
+                KernelSignalState {
+                    caught,
+                    blocked,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// The walk's choice becomes the process's `curr_target` only once the
+    /// forwarded call has succeeded (`process_signal_sent`), as Linux moves it
+    /// only for a send that reaches `complete_signal`: not when the kernel
+    /// fails the call first (no success is reported, and the next choice
+    /// discards the move), not when the choice is the named task's (no walk),
+    /// and not when the send is refused because the sender would take it
+    /// (`SenderTakesIt`).
+    #[test]
+    fn curr_target_moves_only_for_a_walk_choice_whose_send_succeeds() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let mut scheduler = gated_scheduler();
+        let leader = DetTid::from_raw(100);
+        let first = DetTid::from_raw(101);
+        let second = DetTid::from_raw(102);
+        let process = DetPid::from_raw(100);
+        signal_process(
+            &mut scheduler,
+            leader,
+            &[(leader, usr1), (first, 0), (second, usr1)],
+            usr1,
+        );
+        let walk = process_signal_receiver::ProcessSignalReceiver::Thread {
+            thread: first,
+            sole: true,
+        };
+        // A send whose forwarded call fails: nothing reports, nothing moves,
+        // and the next choice walks from the leader again.
+        assert_eq!(
+            scheduler.process_signal_receiver(process, leader, leader, libc::SIGUSR1),
+            walk
+        );
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+        assert_eq!(
+            scheduler.process_signal_receiver(process, leader, leader, libc::SIGUSR1),
+            walk
+        );
+        // This one succeeds: the walk's choice becomes curr_target.
+        scheduler.process_signal_sent(leader, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), Some(&first));
+        // A success reported for no pending choice moves nothing.
+        scheduler.signal_curr_targets.clear();
+        scheduler.process_signal_sent(leader, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+        // The named task takes it (no walk): its success moves nothing.
+        assert_eq!(
+            scheduler.process_signal_receiver(process, first, leader, libc::SIGUSR1),
+            walk
+        );
+        scheduler.process_signal_sent(leader, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+
+        // `second` sends with SIGUSR1 unblocked while the walk chooses
+        // `first`: the sender would take the copy, so the send is refused,
+        // and curr_target stays where it was.
+        scheduler
+            .test_kernel_signal_states
+            .get_mut(&second)
+            .unwrap()
+            .blocked = 0;
+        assert_eq!(
+            scheduler.process_signal_receiver(process, leader, second, libc::SIGUSR1),
+            process_signal_receiver::ProcessSignalReceiver::SenderTakesIt
+        );
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+        scheduler.process_signal_sent(second, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+    }
+
+    /// The sequence of the Codex review of #4625's second revision: a process
+    /// with leader 10 (blocking SIGUSR1 and SIGUSR2), thread 11 (blocking
+    /// SIGUSR1) and thread 12 (blocking neither). Thread 12's `kill(10,
+    /// SIGUSR1)` is forwarded as it is, since every sibling blocks it, and
+    /// Linux's walk from the leader reaches thread 12, which becomes
+    /// `curr_target` once the call succeeds. A later SIGUSR2 from another
+    /// process names the leader, which blocks it, and the walk starts at
+    /// thread 12, which takes it, ahead of thread 11. Without a reported
+    /// success, or for a send that names the sender (step 1, no walk),
+    /// `curr_target` stays at the leader and thread 11 takes it.
+    #[test]
+    fn an_admitted_own_process_walk_moves_curr_target_for_a_later_foreign_send() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let leader = DetTid::from_raw(10);
+        let eleven = DetTid::from_raw(11);
+        let twelve = DetTid::from_raw(12);
+        let foreign = DetTid::from_raw(20);
+        let process = DetPid::from_raw(10);
+        let setup = || {
+            let mut scheduler = gated_scheduler();
+            signal_process(
+                &mut scheduler,
+                leader,
+                &[(leader, usr1 | usr2), (eleven, usr1), (twelve, 0)],
+                usr1 | usr2,
+            );
+            signal_process(&mut scheduler, foreign, &[(foreign, 0)], usr1 | usr2);
+            scheduler
+        };
+        let foreign_receiver = |scheduler: &mut Scheduler| match scheduler.process_signal_receiver(
+            process,
+            leader,
+            foreign,
+            libc::SIGUSR2,
+        ) {
+            process_signal_receiver::ProcessSignalReceiver::Thread { thread, .. } => thread,
+            other => panic!("no receiver: {other:?}"),
+        };
+
+        let mut scheduler = setup();
+        scheduler.own_process_signal_choice(twelve, leader, libc::SIGUSR1);
+        scheduler.process_signal_sent(twelve, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), Some(&twelve));
+        assert_eq!(foreign_receiver(&mut scheduler), twelve);
+
+        // The own-process send failed: nothing reports, nothing moves.
+        let mut scheduler = setup();
+        scheduler.own_process_signal_choice(twelve, leader, libc::SIGUSR1);
+        assert_eq!(foreign_receiver(&mut scheduler), eleven);
+
+        // It named the sender itself: Linux's step 1 takes it, no walk.
+        let mut scheduler = setup();
+        scheduler.own_process_signal_choice(twelve, twelve, libc::SIGUSR1);
+        scheduler.process_signal_sent(twelve, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+        assert_eq!(foreign_receiver(&mut scheduler), eleven);
+    }
+
+    /// A reported success commits only the pending choice of the sender that
+    /// reports it, for the process it chose in (`process_signal_sent`): a
+    /// report from another thread, or for another process, moves nothing,
+    /// and drops the pending choice.
+    #[test]
+    fn process_signal_sent_commits_only_the_reporting_senders_choice() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let mut scheduler = gated_scheduler();
+        let leader = DetTid::from_raw(100);
+        let first = DetTid::from_raw(101);
+        let other = DetTid::from_raw(102);
+        let process = DetPid::from_raw(100);
+        let elsewhere = DetPid::from_raw(200);
+        signal_process(
+            &mut scheduler,
+            leader,
+            &[(leader, usr1), (first, 0), (other, usr1)],
+            usr1,
+        );
+        let choose = |scheduler: &mut Scheduler| {
+            assert_eq!(
+                scheduler.process_signal_receiver(process, leader, leader, libc::SIGUSR1),
+                process_signal_receiver::ProcessSignalReceiver::Thread {
+                    thread: first,
+                    sole: true
+                }
+            );
+        };
+        choose(&mut scheduler);
+        scheduler.process_signal_sent(other, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+        scheduler.process_signal_sent(leader, process);
+        assert_eq!(
+            scheduler.signal_curr_targets.get(&process),
+            None,
+            "the mismatched report dropped the pending choice"
+        );
+        choose(&mut scheduler);
+        scheduler.process_signal_sent(leader, elsewhere);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), None);
+        assert_eq!(scheduler.signal_curr_targets.get(&elsewhere), None);
+        choose(&mut scheduler);
+        scheduler.process_signal_sent(leader, process);
+        assert_eq!(scheduler.signal_curr_targets.get(&process), Some(&first));
     }
 
     /// The readmission that broke record/replay of make -jN (minibeads

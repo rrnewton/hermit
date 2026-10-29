@@ -14569,6 +14569,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // process with none (a zombie, which Linux still signals
         // successfully).
         let mut receiver = None;
+        // Whether the scheduler chose `receiver` among several threads, so a
+        // successful send moves the process's `curr_target`.
+        let mut chosen = false;
         if signal != 0
             && signal != libc::SIGKILL
             && guest.config().sequentialize_threads
@@ -14588,6 +14591,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
             {
                 Ok(ProcessSignalTarget::Thread(thread)) => receiver = Some((thread, target)),
+                Ok(ProcessSignalTarget::Chosen(thread)) => {
+                    receiver = Some((thread, target));
+                    chosen = true;
+                }
                 // Forwarded below, waking no thread: into the shared queue,
                 // to a zombie, or to a process the kernel answers for.
                 Ok(ProcessSignalTarget::SharedQueue | ProcessSignalTarget::Zombie)
@@ -14616,6 +14623,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.record_or_replay(guest, call).await?
             }
         };
+        if chosen && let Some((_, process)) = receiver {
+            crate::tool_global::process_signal_sent(guest, process).await;
+        }
         if let Some((thread, process)) = receiver {
             // Tell the scheduler, as `kill` does, so a receiver parked in a
             // blocking call (pause(), a futex wait) is woken to take it
