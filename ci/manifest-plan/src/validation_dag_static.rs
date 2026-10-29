@@ -1873,7 +1873,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And PR 4639's schedule-search regression
     // (schedules_without_a_reordering_end_with_no_single_swap): 1227 + 1 = 1228.
     // PR 4771 recount: 1236 listed less five skips = 1231 (1228 + 3).
-    ("test.hermit_unit", 1231),
+    // PR 4606 fix recount: 1245 listed less five skips = 1240 (1231 + 9).
+    ("test.hermit_unit", 1240),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5824,7 +5825,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same PR 4715 trial-input workspace test: 1220 + 1 = 1221.
     // And the same PR 4639 regression: 1221 + 1 = 1222.
     // And the same three: 1222 + 3 = 1225.
-    ("test.hermit_unit_on_host", 1225),
+    // And the same nine: 1225 + 9 = 1234.
+    ("test.hermit_unit_on_host", 1234),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
