@@ -1626,6 +1626,9 @@ pub(crate) enum LockCall {
     Recvmsg,
     /// `recvmmsg` with `SCM_RIGHTS`, which adds slots.
     Recvmmsg,
+    /// `ioctl(BINDER_WRITE_READ)` delivering a transaction that carries
+    /// descriptors, which adds slots.
+    BinderWriteRead,
 }
 
 impl LockCall {
@@ -1637,6 +1640,7 @@ impl LockCall {
             Self::PidfdGetfd => "pidfd_getfd",
             Self::Recvmsg => "recvmsg",
             Self::Recvmmsg => "recvmmsg",
+            Self::BinderWriteRead => "ioctl(BINDER_WRITE_READ)",
         }
     }
 
@@ -11223,7 +11227,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(), Error> {
         let model = guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_lock_tracked();
-            if matches!(call, LockCall::Recvmsg | LockCall::Recvmmsg) {
+            if matches!(
+                call,
+                LockCall::Recvmsg | LockCall::Recvmmsg | LockCall::BinderWriteRead
+            ) {
                 detfd.set_received_for_locks();
             }
             if call == LockCall::Fcntl {
@@ -12120,7 +12127,50 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
+        let request = Syscall::Ioctl(call).into_parts().1.arg1 as u64;
+        let argument = Syscall::Ioctl(call).into_parts().1.arg2;
+        // A binder read can install descriptors the transaction carried, which
+        // no call names as new (`crate::syscalls::binder`). Read the call's
+        // read_consumed before it runs, so only the commands it writes are
+        // parsed; the in-guest backends discover such a descriptor
+        // themselves, and parse nothing here.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // Record/replay restores only the outer ioctl structure, not the
+        // nested command buffer or installed descriptors. Preserve that
+        // existing Binder limitation without adding receipt-probe events.
+        let binder_read = crate::syscalls::binder::is_write_read(request)
+            && !self.cfg.recordreplay_modes
+            && !self.discovers_received_descriptors(guest);
+        let already_consumed = if binder_read {
+            crate::syscalls::binder::consumed_before(&guest.memory(), argument)
+        } else {
+            0
+        };
         let result = self.record_or_replay(guest, call).await?;
+        // `handle_ioctl` runs the call in the caller's turn, so no other
+        // task can have closed or replaced a delivered number yet.
+        // TODO-HUMAN-REVIEW(PR-4736)
+        if binder_read && result >= 0 {
+            let delivered =
+                crate::syscalls::binder::delivered(&guest.memory(), argument, already_consumed);
+            let recorded = self
+                .record_received_descriptors(
+                    guest,
+                    &delivered,
+                    crate::syscalls::scm_rights::Channel::Binder,
+                    true,
+                    // Binder installs every descriptor it delivers
+                    // close-on-exec (`binder_apply_fd_fixups`).
+                    true,
+                    crate::syscalls::scm_rights::ReceivedFrom {
+                        socket: fd,
+                        peek: false,
+                    },
+                )
+                .await?;
+            self.refresh_received_locks(guest, &recorded, LockCall::BinderWriteRead)
+                .await?;
+        }
         // A descriptor Detcore lists without modelling keeps its
         // close-on-exec flag too (`FileMetadata::present_unmodelled`).
         let unmodelled =
@@ -18405,6 +18455,8 @@ mod inject_fstat_scratch {
         private_retired: bool,
         private_validations: std::sync::atomic::AtomicUsize,
         maps_reads: std::collections::VecDeque<Vec<u8>>,
+        /// A successful Binder read publishes this many command bytes.
+        binder_read_consumed: Option<u64>,
     }
 
     impl ScriptedGuest {
@@ -18452,6 +18504,7 @@ mod inject_fstat_scratch {
                 private_retired: false,
                 private_validations: std::sync::atomic::AtomicUsize::new(0),
                 maps_reads: Default::default(),
+                binder_read_consumed: None,
             };
             (tool, guest)
         }
@@ -18643,6 +18696,14 @@ mod inject_fstat_scratch {
             // SAFETY: each arm runs the syscall Detcore asked for against this
             // process, on addresses Detcore obtained from this guest.
             let raw = match Syscall::from_raw(number, args) {
+                Syscall::Ioctl(_) if self.binder_read_consumed.is_some() => {
+                    assert_eq!(args.arg1 as u64, crate::syscalls::binder::BINDER_WRITE_READ);
+                    let address = AddrMut::<[u64; 6]>::from_raw(args.arg2).unwrap();
+                    let mut words: [u64; 6] = self.memory().read_value(address.into())?;
+                    words[4] = self.binder_read_consumed.unwrap();
+                    self.memory().write_value(address, &words)?;
+                    0
+                }
                 Syscall::Lseek(call) if self.private_memory.is_some() => {
                     assert_eq!(call.offset(), 0);
                     assert_eq!(call.whence(), Whence::SEEK_SET);
@@ -18762,6 +18823,49 @@ mod inject_fstat_scratch {
         }
         fn read_clock(&mut self) -> Result<u64, Error> {
             panic!("fd registration must not read a clock")
+        }
+    }
+
+    /// Binder's ioctl recorder does not restore nested transaction bytes or
+    /// installed descriptors. Even valid returned bytes must not add receipt
+    /// probe events in record/replay. Drive the actual handler; ScriptedGuest
+    /// rejects an unexpected F_GETFD, so removing the guard fails this test.
+    #[tokio::test]
+    async fn binder_record_replay_does_not_add_receipt_probe_events() {
+        let mut object = [0u8; 24];
+        object[..4].copy_from_slice(&0x6664_2a85u32.to_ne_bytes()); // BINDER_TYPE_FD
+        object[8..12].copy_from_slice(&123u32.to_ne_bytes());
+        let offsets = [0u64];
+        let mut transaction = [0u8; 64];
+        transaction[40..48].copy_from_slice(&8u64.to_ne_bytes());
+        transaction[48..56].copy_from_slice(&(object.as_ptr() as u64).to_ne_bytes());
+        transaction[56..64].copy_from_slice(&(offsets.as_ptr() as u64).to_ne_bytes());
+        let mut commands = 0x8040_7202u32.to_ne_bytes().to_vec(); // BR_TRANSACTION
+        commands.extend_from_slice(&transaction);
+        for replaying in [false, true] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.recordreplay_modes = true;
+            guest.config.replaying = replaying;
+            guest.binder_read_consumed = Some(commands.len() as u64);
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            let mut words = [0, 0, 0, commands.len() as u64, 0, commands.as_ptr() as u64];
+            let call =
+                syscalls::Ioctl::new()
+                    .with_fd(99)
+                    .with_request(syscalls::ioctl::Request::Other(
+                        crate::syscalls::binder::BINDER_WRITE_READ as usize,
+                        words.as_mut_ptr() as usize,
+                    ));
+            assert_eq!(tool.handle_ioctl(&mut guest, call).await.unwrap(), 0);
+            assert_eq!(words[4], commands.len() as u64);
+            assert_eq!(guest.injected, vec![Sysno::ioctl]);
+            assert!(guest.thread.with_detfd(123, |_| ()).is_err());
+            // Positive payload control: this is a real parseable FD result,
+            // not an empty buffer that would hide an accidentally open gate.
+            assert_eq!(
+                crate::syscalls::binder::delivered(&guest.memory(), words.as_ptr() as usize, 0).fds,
+                vec![123]
+            );
         }
     }
 

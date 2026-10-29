@@ -891,7 +891,27 @@ enum Receipt {
     Unrecorded,
 }
 
-/// How this run handles descriptors received over `SCM_RIGHTS`.
+/// How a receive's descriptors reached the guest, as warnings name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Channel {
+    /// A `recvmsg` or `recvmmsg` control message.
+    ScmRights,
+    /// A binder transaction read with `BINDER_WRITE_READ`
+    /// (`crate::syscalls::binder`).
+    Binder,
+}
+
+impl std::fmt::Display for Channel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ScmRights => "over SCM_RIGHTS",
+            Self::Binder => "in a binder transaction",
+        })
+    }
+}
+
+/// How this run handles descriptors received over `SCM_RIGHTS` or in a
+/// binder transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReceiptMode {
     /// The tool shares the guest's descriptor table and discovers a received
@@ -980,6 +1000,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         delivered: &Delivered,
+        channel: Channel,
         in_turn: bool,
         cloexec: bool,
         from: ReceivedFrom,
@@ -994,8 +1015,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 if !delivered.fds.is_empty() {
                     debug!(
-                        "[detcore] descriptors {:?}, received over SCM_RIGHTS, are not recorded \
-                         ({why})",
+                        "[detcore] descriptors {:?}, received {channel}, are not recorded ({why})",
                         delivered.fds
                     );
                 }
@@ -1006,8 +1026,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(reason) = delivered.refused {
             guest.thread_state().note_unaccounted_receipt();
             warn!(
-                "[detcore] the descriptors a receive got over SCM_RIGHTS, if any, are not \
-                 recorded: {reason}"
+                "[detcore] the descriptors a receive got {channel}, if any, are not recorded: \
+                 {reason}"
             );
             self.lose_lockstep_if_queued(guest, from);
             return Ok(Vec::new());
@@ -1017,9 +1037,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             if !delivered.fds.is_empty() {
                 guest.thread_state().note_unaccounted_receipt();
                 warn!(
-                    "[detcore] descriptors {:?}, received over SCM_RIGHTS on the background \
-                     path, are not recorded: another task may have closed or replaced their \
-                     numbers, or rewritten the control data, before this one resumed",
+                    "[detcore] descriptors {:?}, received {channel} on the background path, are \
+                     not recorded: another task may have closed or replaced their numbers, or \
+                     rewritten the control data, before this one resumed",
                     delivered.fds
                 );
             }
@@ -1038,7 +1058,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             rest = after;
             let mut facts = Vec::with_capacity(fds.len());
             for &fd in fds {
-                match self.received_facts(guest, fd).await {
+                match self.received_facts(guest, fd, channel).await {
                     Err(Error::Tool(error)) => return Err(Error::Tool(error)),
                     taken => facts.push(taken),
                 }
@@ -1054,7 +1074,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // Open, but without its facts: listed, never modelled.
                         guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
                         warn!(
-                            "[detcore] descriptor {fd}, received over SCM_RIGHTS, is not \
+                            "[detcore] descriptor {fd}, received {channel}, is not \
                              recorded: {error}"
                         );
                         continue;
@@ -1062,7 +1082,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 let sent = sent.as_ref().and_then(|sent| sent.get(index));
                 match self
-                    .record_received_facts(guest, fd, &facts, sent, lockstep)
+                    .record_received_facts(guest, fd, &facts, sent, lockstep, channel)
                     .await
                 {
                     Ok(Receipt::New) => recorded.push(fd),
@@ -1072,7 +1092,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // Open, but without its facts: listed, never modelled.
                         guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
                         warn!(
-                            "[detcore] descriptor {fd}, received over SCM_RIGHTS, is not \
+                            "[detcore] descriptor {fd}, received {channel}, is not \
                              recorded: {error}"
                         )
                     }
@@ -1089,6 +1109,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         fd: RawFd,
+        channel: Channel,
     ) -> Result<Option<ReceivedFacts>, Error> {
         if fd < 0 {
             return Ok(None);
@@ -1097,8 +1118,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // describes something Detcore does not know to be gone: kept as it is.
         if guest.thread_state().with_detfd(fd, |_| ()).is_ok() {
             warn!(
-                "[detcore] descriptor {fd}, received over SCM_RIGHTS, already has a record, \
-                 which is kept"
+                "[detcore] descriptor {fd}, received {channel}, already has a record, which is \
+                 kept"
             );
             return Ok(None);
         }
@@ -1206,6 +1227,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         facts: &ReceivedFacts,
         sent: Option<&SentDescriptor>,
         lockstep: bool,
+        channel: Channel,
     ) -> Result<Receipt, Error> {
         let cloexec = facts.descriptor_flags & libc::FD_CLOEXEC != 0;
         // Every anonymous inode has one file identity, so out of lockstep
@@ -1266,13 +1288,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
             match &link {
                 Some(link) => warn!(
-                    "[detcore] descriptor {fd}, received over SCM_RIGHTS, is an anonymous inode \
-                     ({}) that an ordinary record would mishandle: not recorded",
+                    "[detcore] descriptor {fd}, received {channel}, is an anonymous inode ({}) \
+                     that an ordinary record would mishandle: not recorded",
                     String::from_utf8_lossy(link)
                 ),
                 None => warn!(
-                    "[detcore] descriptor {fd}, received over SCM_RIGHTS, is an anonymous inode \
-                     whose link cannot be read, so its kind is unknown: not recorded"
+                    "[detcore] descriptor {fd}, received {channel}, is an anonymous inode whose \
+                     link cannot be read, so its kind is unknown: not recorded"
                 ),
             }
             return Ok(Receipt::Unrecorded);

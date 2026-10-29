@@ -35,6 +35,7 @@ mod misc;
 mod namespace;
 pub(crate) use namespace::anonymous_object_devices;
 pub(crate) use namespace::guest_task_procfs;
+pub(crate) mod binder;
 mod network_trace;
 pub(crate) mod pi_futex;
 pub(crate) mod robust_list;
