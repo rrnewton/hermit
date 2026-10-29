@@ -17329,6 +17329,10 @@ impl Scheduler {
     fn a_committed_doom_is_outstanding(&self) -> bool {
         !self.thread_tree.granted_exits.is_empty()
             || !self.sigkilled_processes.is_empty()
+            // The PI-futex record of committed SIGKILLs: today a subset of
+            // `sigkilled_processes`, read so that the count stays off while
+            // either record holds a process until its reap.
+            || !self.pi_doomed_processes.is_empty()
             || self.unresolved_sigkill
             || !self.exec_teardowns.is_empty()
             || !self.fatal_signals_unreaped.is_empty()
@@ -31700,6 +31704,16 @@ mod test {
             assert!(sched.consume_child_wait(parent, writer), "{name}");
             assert!(counted(&sched), "{name}: reaped");
         }
+        // The PI-futex record of a committed SIGKILL (`pi_doomed_processes`)
+        // stops the count on its own as well, until the reap.
+        let mut sched = Scheduler::new(&ptrace_config());
+        sched.thread_tree.add_child(parent, parent, true);
+        sched.thread_tree.add_child(parent, writer, true);
+        sched.pi_doomed_processes.insert(writer);
+        assert!(!counted(&sched), "PI-futex doom: doomed, not reaped");
+        sched.logically_exited_processes.insert(writer);
+        assert!(sched.consume_child_wait(parent, writer), "PI-futex doom");
+        assert!(counted(&sched), "PI-futex doom: reaped");
         let mut sched = Scheduler::new(&ptrace_config());
         let caller = DetTid::from_raw(writer.as_raw());
         let mm = MmId::initial(writer);
