@@ -442,11 +442,15 @@ mod tests {
 
         // An exactly full command buffer is parsed through its last FD.
         // Cutting a larger one on a command boundary must refuse explicitly:
-        // otherwise its valid BR_NOOP prefix would hide the installed FD.
+        // otherwise its valid completion prefix would hide the installed FD.
         let noop = 0x0000_720cu32; // BR_NOOP, _IO('r', 12)
-        let mut at_limit = noop
-            .to_ne_bytes()
-            .repeat((MAX_COMMAND_BYTES - commands.len()) / 4);
+        let complete = 0x0000_7206u32; // BR_TRANSACTION_COMPLETE, _IO('r', 6)
+        let mut at_limit = noop.to_ne_bytes().to_vec();
+        at_limit.extend(
+            complete
+                .to_ne_bytes()
+                .repeat((MAX_COMMAND_BYTES - commands.len() - 4) / 4),
+        );
         at_limit.extend_from_slice(&commands);
         assert_eq!(at_limit.len(), MAX_COMMAND_BYTES);
         let words = [
@@ -461,7 +465,8 @@ mod tests {
         assert_eq!(expected.fds, vec![12]);
         assert!(expected.refused.is_none());
 
-        let mut over_limit = noop.to_ne_bytes().repeat(MAX_COMMAND_BYTES / 4);
+        let mut over_limit = noop.to_ne_bytes().to_vec();
+        over_limit.extend(complete.to_ne_bytes().repeat(MAX_COMMAND_BYTES / 4 - 1));
         over_limit.extend_from_slice(&commands);
         let words = [
             0,

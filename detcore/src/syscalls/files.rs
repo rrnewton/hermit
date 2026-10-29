@@ -18699,7 +18699,7 @@ mod inject_fstat_scratch {
                 Syscall::Ioctl(_) if self.binder_read_consumed.is_some() => {
                     assert_eq!(args.arg1 as u64, crate::syscalls::binder::BINDER_WRITE_READ);
                     let address = AddrMut::<[u64; 6]>::from_raw(args.arg2).unwrap();
-                    let mut words: [u64; 6] = self.memory().read_value(address.into())?;
+                    let mut words: [u64; 6] = self.memory().read_value(address)?;
                     words[4] = self.binder_read_consumed.unwrap();
                     self.memory().write_value(address, &words)?;
                     0
@@ -18846,6 +18846,8 @@ mod inject_fstat_scratch {
             let (_, mut guest) = ScriptedGuest::new(true, false);
             guest.config.recordreplay_modes = true;
             guest.config.replaying = replaying;
+            guest.config.sequentialize_threads = true;
+            assert!(!guest.config.backend.tool_shares_guest_descriptor_table);
             guest.binder_read_consumed = Some(commands.len() as u64);
             let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
             let mut words = [0, 0, 0, commands.len() as u64, 0, commands.as_ptr() as u64];
