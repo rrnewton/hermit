@@ -9468,8 +9468,8 @@ fn detcore_renders_the_mount_table_on_every_backend() {
         );
     }
     // The container's own mounts, as the guest names them: Hermit's /tmp and
-    // /etc/group, and /proc.
-    for row in [" /tmp ", " /etc/group ", " /proc "] {
+    // /etc, and /proc.
+    for row in [" /tmp ", " /etc ", " /proc "] {
         assert!(
             first.contains(row),
             "{first_backend} shows no{row}row: {first}"

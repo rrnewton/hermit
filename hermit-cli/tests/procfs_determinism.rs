@@ -2192,10 +2192,9 @@ fn ignored_bind_outside_tmp_does_not_discard_private_mount_provenance() {
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
     assert!(
         text.lines().any(|line| {
-            line.split(' ').nth(4) == Some("/etc/group")
-                && line.contains("/tmpvol/.hermit/etc/group")
+            line.split(' ').nth(4) == Some("/etc") && line.contains("/tmpvol/.hermit/etc")
         }),
-        "ignored bind incorrectly removed the active private /etc/group provenance"
+        "ignored bind incorrectly removed the active private /etc provenance"
     );
 }
 

@@ -1264,7 +1264,7 @@ fn independent_mountinfo_recordings_are_canonical() {
         "independent mountinfo recordings",
     );
     let text = std::str::from_utf8(&first).expect("mountinfo should be UTF-8");
-    assert!(text.contains("/tmpvol/.hermit/etc/group"));
+    assert!(text.contains("/tmpvol/.hermit/etc"));
     assert!(!text.contains("/.tmp"));
 }
 
