@@ -4541,6 +4541,13 @@ impl Scheduler {
         let expired_wait_runs_charged_once = match replayed_record {
             Some(path) if cfg.expired_wait_charge.is_none() && !cfg.recordreplay_modes => {
                 crate::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                    // A file that cannot be read fails the replay's own
+                    // loader: the schedule's just above, the preemptions'
+                    // in `tool_global` right after this.
+                    .unwrap_or(false)
+            }
+            _ => cfg.expired_wait_runs_charged_once(),
+        };
         let queued_sleeps_registered_at_first_pass = match replayed_record {
             Some(path) if cfg.sleep_registration.is_none() && !cfg.recordreplay_modes => {
                 crate::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(path)
@@ -4549,7 +4556,6 @@ impl Scheduler {
                     // in `tool_global` right after this.
                     .unwrap_or(false)
             }
-            _ => cfg.expired_wait_runs_charged_once(),
             _ => cfg.queued_sleeps_registered_at_first_pass(),
         };
         // The strict verifier explicitly selects the complete protocol. Ordinary
@@ -4562,7 +4568,7 @@ impl Scheduler {
                 .with_signal_state_copy(cfg.signal_state_copy)
                 .with_rng_seed(cfg.rng_seed())
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
-                .with_cap_preemption_charge(cfg.cap_preemption_charge);
+                .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_queued_sleeps_registered_at_first_pass(
                     queued_sleeps_registered_at_first_pass,
                 );
@@ -9838,6 +9844,8 @@ impl Scheduler {
             readied += 1;
         }
         readied
+    }
+
     /// Register every queued plain sleep (a request for `SleepUntil` alone,
     /// not yet due and not indefinite) as a timed waiter, at the first
     /// quiescent pass that finds it queued, and take its thread out of the run
