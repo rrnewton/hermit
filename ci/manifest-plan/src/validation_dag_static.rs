@@ -2032,7 +2032,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_verdict_under_timing_settings_says_what_the_trial_showed and
     // analyze::phases::tests::a_trial_under_another_setting_drops_the_option and
     // the_alternative_timing_trial_decides_the_cause_by_how_it_ends: 1452.
-    ("test.hermit_unit", 1452),
+    // Less phases::tests::an_empty_prefix_that_meets_the_target_is_a_verdict,
+    // which adopting main's completed-outcome rule drops: 1395.
+    ("test.hermit_unit", 1451),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6177,7 +6179,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same no-gap open test: 1432.
     // And the same eleven verdict and precondition tests: 1443.
     // And the same three timing-semantics verdict tests: 1446.
-    ("test.hermit_unit_on_host", 1446),
+    // Less the same empty-prefix verdict test: 1389.
+    ("test.hermit_unit_on_host", 1445),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
