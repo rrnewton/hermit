@@ -472,6 +472,7 @@ fn race_then_target_seed() -> u64 {
                 assert_eq!(output.stdout, b"b-first\n");
                 return seed;
             }
+            // EXIT-CLASS: guest. The spin guest's exit status is forwarded.
             Some(1) => assert_eq!(output.stdout, b"a-first\n"),
             _ => panic!("seed discovery did not complete: {output:?}"),
         }
