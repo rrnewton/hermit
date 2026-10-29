@@ -3066,7 +3066,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit", 2868),
+    ("test.detcore_unit", 2877),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3168,7 +3168,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // negative_count_on_unrecorded_received_descriptors): 163.
     // And tight_stack_received_inotify's test that an inotify descriptor
     // received and read on a tight stack is recorded and renumbered: 164.
-    ("test.detcore_misc", 172),
+    ("test.detcore_misc", 191),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -3634,7 +3634,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/issues/4262: record_exec_discards_posix_timer_copies_as_on_linux and
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
     // And record_chaos_schedule_replays_under_its_seed: 221.
-    ("test.record_replay", 222),
+    ("test.record_replay", 226),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4362,7 +4362,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 691),
+    ("test.cli", 694),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4909,7 +4909,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 610),
+    ("test.cli_on_host", 613),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4985,7 +4985,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two A+ tests: 159.
     // And the same four F0a readdir_order variants: 163.
     // And the same tight-stack received-inotify test: 164.
-    ("test.detcore_misc_on_host", 172),
+    ("test.detcore_misc_on_host", 191),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5382,7 +5382,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit_on_host", 2868),
+    ("test.detcore_unit_on_host", 2877),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
