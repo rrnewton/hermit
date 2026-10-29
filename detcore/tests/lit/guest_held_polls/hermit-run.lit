@@ -34,3 +34,15 @@ RUN: %hermit --log info run -- %me crossexport |& awk '/^crossexport:/ {print} /
 CROSS: crossexport: readable 1
 CROSS-NEXT: classified polls: some
 CROSS-NEXT: marks revoked: yes
+RUN: %hermit --log info run -- %me self-join |& awk '/^self-join:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=SELFJOIN %s
+SELFJOIN: self-join: revents 0x1
+SELFJOIN-NEXT: classified polls: some
+SELFJOIN-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me export-mmsg |& awk '/^export-mmsg:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=EXPMMSG %s
+EXPMMSG: export-mmsg: revents 0x1
+EXPMMSG-NEXT: classified polls: some
+EXPMMSG-NEXT: marks revoked: yes
+RUN: %hermit --log info run -- %me unspec-pair |& awk '/^unspec-pair:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=UNSPEC %s
+UNSPEC: unspec-pair: revents 0x1
+UNSPEC-NEXT: classified polls: none
+UNSPEC-NEXT: marks revoked: no
