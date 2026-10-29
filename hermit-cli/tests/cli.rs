@@ -10749,7 +10749,15 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
                 stderr(&tolerant)
             );
             if !created {
-                assert!(stderr(&tolerant).contains("failed with EINVAL and created no task; the run's count of host-ID tasks includes it"), "{}", stderr(&tolerant));
+                let warning = format!(
+                    "failed with {} and created no task; the run's count of host-ID tasks includes it",
+                    reverie::Errno::EINVAL
+                );
+                assert!(
+                    stderr(&tolerant).contains(&warning),
+                    "{}",
+                    stderr(&tolerant)
+                );
             }
         } else if !created {
             assert!(
