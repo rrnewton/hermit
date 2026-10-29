@@ -1233,9 +1233,27 @@ fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
 
 fn write_frozen_file(path: &Path, contents: &[u8], what: &str) -> Result<(), Error> {
     fs::write(path, contents).with_context(|| format!("Failed to populate the frozen {what}"))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+    // Read-only like the old per-file readonly binds: a guest write to the
+    // frozen group/cache must fail. (A mapped-root guest may still bypass
+    // the bits via CAP_DAC_OVERRIDE over its own files — the bits are the
+    // contract, asserted in tests.)
+    fs::set_permissions(path, fs::Permissions::from_mode(0o444))
         .with_context(|| format!("Failed to set permissions on the frozen {what}"))?;
     Ok(())
+}
+
+/// Best-effort copy of a regular file's atime/mtime onto its copy.
+/// Symlink times are ignored (best-effort): the guest cares about the
+/// target's times, and `File::set_times` on a link would follow it.
+fn preserve_file_times(metadata: &fs::Metadata, to: &Path) {
+    let (Ok(atime), Ok(mtime)) = (metadata.accessed(), metadata.modified()) else {
+        return;
+    };
+    let Ok(file) = File::open(to) else {
+        return;
+    };
+    let times = fs::FileTimes::new().set_accessed(atime).set_modified(mtime);
+    let _ = file.set_times(times);
 }
 
 /// Copy the tree at `source` into the empty directory `view`, without
@@ -1247,6 +1265,21 @@ fn write_frozen_file(path: &Path, contents: &[u8], what: &str) -> Result<(), Err
 /// `/etc` on a supported host needs one for the guest to function.
 /// Directory modes gain owner write so the copy can be populated and
 /// later removed, and so a guest can write in its own `/etc`.
+///
+/// Sensitive content is never copied: a regular file that is not
+/// world-readable (`mode & 0o004 == 0` — `/etc/shadow`, `gshadow`,
+/// private keys) becomes an empty placeholder preserving its mode, and
+/// a directory that is not world-readable+executable becomes an empty
+/// placeholder directory whose contents are not recursed into. The
+/// guest's mapped root could not read that content through the host
+/// `/etc` either, and host secrets must not leak into a guest-visible
+/// (and verify-logged) private copy.
+///
+/// An entry that vanishes mid-copy (a concurrent host `/etc` mutation)
+/// is skipped: the copy is a best-effort snapshot of the non-frozen
+/// files. The frozen `group`/`ld.so.cache` are written authoritatively
+/// by [`hermit_etc_view`] after the copy, so a vanished or stale copy
+/// of either is overwritten and cannot leave the view incomplete.
 fn copy_etc_tree(source: &Path, view: &Path) -> Result<(), Error> {
     let entries = match fs::read_dir(source) {
         Ok(entries) => entries,
@@ -1267,6 +1300,9 @@ fn copy_etc_tree(source: &Path, view: &Path) -> Result<(), Error> {
         let to = view.join(entry.file_name());
         let metadata = match fs::symlink_metadata(&from) {
             Ok(metadata) => metadata,
+            // Vanished mid-copy (concurrent host mutation): skip it; see
+            // the doc comment. The frozen files are rewritten afterwards.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 let _ = File::create(&to);
                 continue;
@@ -1283,15 +1319,27 @@ fn copy_etc_tree(source: &Path, view: &Path) -> Result<(), Error> {
         let mode = metadata.permissions().mode();
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
-            let target = fs::read_link(&from).with_context(|| {
-                format!(
-                    "Failed to read the link {} for the guest's /etc copy",
-                    from.display()
-                )
-            })?;
-            std::os::unix::fs::symlink(&target, &to).with_context(|| {
-                format!("Failed to copy the link {} for the guest", from.display())
-            })?;
+            let target = match fs::read_link(&from) {
+                Ok(target) => target,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "Failed to read the link {} for the guest's /etc copy",
+                            from.display()
+                        )
+                    });
+                }
+            };
+            match std::os::unix::fs::symlink(&target, &to) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("Failed to copy the link {} for the guest", from.display())
+                    });
+                }
+            }
         } else if file_type.is_dir() {
             fs::create_dir(&to).with_context(|| {
                 format!(
@@ -1299,13 +1347,31 @@ fn copy_etc_tree(source: &Path, view: &Path) -> Result<(), Error> {
                     from.display()
                 )
             })?;
-            copy_etc_tree(&from, &to)?;
+            // Not world-readable+executable: placeholder only, no recursion
+            // into (potentially sensitive) contents.
+            if mode & 0o005 == 0o005 {
+                copy_etc_tree(&from, &to)?;
+            }
             let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode | 0o200));
         } else if file_type.is_file() {
+            // Not world-readable: empty placeholder, no content copied.
+            if mode & 0o004 == 0 {
+                File::create(&to).with_context(|| {
+                    format!(
+                        "Failed to place {} in the guest's /etc copy",
+                        from.display()
+                    )
+                })?;
+                preserve_file_times(&metadata, &to);
+                let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode));
+                continue;
+            }
             match fs::copy(&from, &to) {
                 Ok(_) => {
+                    preserve_file_times(&metadata, &to);
                     let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode));
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                     File::create(&to).with_context(|| {
                         format!(
@@ -1313,6 +1379,7 @@ fn copy_etc_tree(source: &Path, view: &Path) -> Result<(), Error> {
                             from.display()
                         )
                     })?;
+                    preserve_file_times(&metadata, &to);
                     let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode));
                 }
                 Err(error) => {
@@ -1370,6 +1437,8 @@ fn hermit_etc_view(
     let view = dir.path().join("etc");
     fs::create_dir(&view).context("Failed to create Hermit's /etc copy")?;
     copy_etc_tree(source_etc, &view)?;
+    // Authoritative after the copy: these overwrite any placeholder,
+    // vanished or stale entry the best-effort copy left for either name.
     write_frozen_file(&view.join("group"), group, "guest group database")?;
     match cache {
         Some(cache) => write_frozen_file(
@@ -6453,6 +6522,15 @@ mod tests {
             .expect("identity hardening must produce the /etc copy");
         let contents = fs::read_to_string(view.view().join("group"))
             .expect("frozen group database should be readable");
+        assert_eq!(
+            fs::metadata(view.view().join("group"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444,
+            "the frozen group must be read-only like the old readonly bind"
+        );
         let overflow_gid = overflow_gid();
         assert_eq!(overflow_gid, "65534");
         assert!(
@@ -6480,6 +6558,15 @@ mod tests {
             return;
         };
         assert_eq!(fs::read(view.view().join("ld.so.cache")).unwrap(), host);
+        assert_eq!(
+            fs::metadata(view.view().join("ld.so.cache"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444,
+            "the frozen cache must be read-only like the old readonly bind"
+        );
         let etc = mounts
             .iter()
             .filter(|mount| mount.get_target() == Path::new("/etc"))
@@ -6554,11 +6641,105 @@ mod tests {
         );
     }
 
+    // Non-world-readable files/dirs must not leak host secrets into the
+    // guest-visible copy, and copied files must keep their mtimes (a
+    // guest `stat` / `make`-style consumer sees the host file's times).
+    #[test]
+    fn etc_copy_redacts_non_world_readable_content_and_preserves_mtimes() {
+        use std::time::Duration;
+        use std::time::SystemTime;
+
+        let fake = tempfile::TempDir::new().expect("create fake root");
+        let lower = fake.path().join("lower");
+        fs::create_dir_all(&lower).expect("create fake /etc");
+        fs::write(lower.join("shadow"), b"root:SECRET-HASH:19000::::::\n").unwrap();
+        fs::set_permissions(lower.join("shadow"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(lower.join("gshadow"), b"root:SECRET-GROUP-HASH:::\n").unwrap();
+        fs::set_permissions(lower.join("gshadow"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::write(lower.join("hosts"), b"127.0.0.1 localhost\n").unwrap();
+        fs::set_permissions(lower.join("hosts"), fs::Permissions::from_mode(0o644)).unwrap();
+        let hosts_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_234_567_890);
+        File::options()
+            .write(true)
+            .open(lower.join("hosts"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(hosts_mtime))
+            .unwrap();
+        fs::create_dir_all(lower.join("private-dir")).unwrap();
+        fs::write(lower.join("private-dir/inner"), b"SECRET-INNER\n").unwrap();
+        fs::set_permissions(lower.join("private-dir"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir_all(lower.join("ssl")).unwrap();
+        fs::write(lower.join("ssl/cert.pem"), b"CERT\n").unwrap();
+        fs::set_permissions(lower.join("ssl"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (view, _guard) = hermit_etc_view(&lower, b"frozen:x:2:\n", Some(b"CACHE"))
+            .expect("build the /etc copy over the fake root");
+        assert_eq!(view, _guard.view().to_path_buf());
+        for (name, mode) in [("shadow", 0o600), ("gshadow", 0o640)] {
+            let copied = view.join(name);
+            assert!(copied.exists(), "{name} placeholder must exist");
+            assert_eq!(
+                fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+                mode,
+                "{name} placeholder must preserve its mode"
+            );
+            assert_eq!(
+                fs::read(&copied).unwrap(),
+                b"",
+                "{name} content must not be copied"
+            );
+        }
+        assert_eq!(
+            fs::read(view.join("hosts")).unwrap(),
+            b"127.0.0.1 localhost\n",
+            "a world-readable file's content is copied"
+        );
+        assert_eq!(
+            fs::metadata(view.join("hosts"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            hosts_mtime,
+            "a copied file keeps its source mtime"
+        );
+        assert!(view.join("private-dir").is_dir());
+        assert_eq!(
+            fs::metadata(view.join("private-dir"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(
+            !view.join("private-dir/inner").exists(),
+            "a non-world-readable directory's contents must not be copied"
+        );
+        assert_eq!(fs::read(view.join("ssl/cert.pem")).unwrap(), b"CERT\n");
+        for frozen in ["group", "ld.so.cache"] {
+            assert_eq!(
+                fs::metadata(view.join(frozen))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444,
+                "frozen {frozen} must be read-only"
+            );
+        }
+    }
+
     /// The mechanism the /etc copy exists for, over a test-owned fake
     /// root: a new cache (and group) renamed over the fake host `/etc`
     /// while the copy is bound over the guest path must not change what
     /// the guest opens, by content or by `fstat`, and other `/etc` files
-    /// must still be visible. Nothing here touches the real host `/etc`.
+    /// must still be visible. Renaming the lower directory itself away
+    /// and recreating it proves the guest view is pinned to the private
+    /// copy's dentries, not to the lower path: an old-style per-file bind
+    /// sat on the host dentry, so a rename over that dentry detached it
+    /// (see `hermit_etc_view`); the directory rename here is strictly
+    /// stronger, as it replaces every lower dentry at once. Nothing
+    /// here touches the real host `/etc`.
     #[test]
     fn etc_copy_survives_a_host_rename_of_the_cache_and_group() {
         if crate::test_isolation::rerun_alone() {
@@ -6579,8 +6760,10 @@ mod tests {
             Vec<u8>,
             Vec<u8>,
             Vec<u8>,
+            Vec<u8>,
             (u64, u64, u64),
             (u64, u64, u64),
+            (u32, u32),
         );
         let (view, guard) = hermit_etc_view(&lower, b"frozen:x:2:\n", Some(b"HOST-CACHE-V1"))
             .expect("build the /etc copy over the fake root");
@@ -6614,29 +6797,64 @@ mod tests {
                 let after = stat(&cache)?;
                 let second =
                     fs::read(merged_in.join("ld.so.cache")).map_err(|error| error.to_string())?;
+                // Stronger still: rename the whole lower directory away
+                // and recreate it with different content. The view is a
+                // bind of the private copy, independent of the lower
+                // path, so the guest must be unaffected.
+                let moved = lower_in.with_file_name("lower-moved");
+                fs::rename(&lower_in, &moved).map_err(|e| e.to_string())?;
+                fs::create_dir_all(&lower_in).map_err(|e| e.to_string())?;
+                fs::write(lower_in.join("ld.so.cache"), b"HOST-CACHE-V3")
+                    .map_err(|e| e.to_string())?;
+                fs::write(lower_in.join("group"), b"recreated:x:9:\n")
+                    .map_err(|e| e.to_string())?;
+                let third =
+                    fs::read(merged_in.join("ld.so.cache")).map_err(|error| error.to_string())?;
                 let group = fs::read(merged_in.join("group")).map_err(|error| error.to_string())?;
                 let passwd =
                     fs::read(merged_in.join("passwd")).map_err(|error| error.to_string())?;
                 let nested =
                     fs::read(merged_in.join("subdir/nested")).map_err(|error| error.to_string())?;
+                // Mode bits, not a live write: mapped-root may bypass
+                // 0o444 via CAP_DAC_OVERRIDE, the bits are the contract.
+                use std::os::unix::fs::PermissionsExt as _;
+                let modes = (
+                    fs::metadata(merged_in.join("ld.so.cache"))
+                        .map_err(|e| e.to_string())?
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    fs::metadata(merged_in.join("group"))
+                        .map_err(|e| e.to_string())?
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                );
                 Ok((
                     first,
                     second,
+                    third,
                     group,
                     [passwd, nested].concat(),
                     before,
                     after,
+                    modes,
                 ))
             })
             .expect("run the /etc copy in its own namespace")
             .expect("the /etc copy must keep the frozen cache across a host rename");
-        let (first, second, group, passwd, before, after) = facts;
+        let (first, second, third, group, passwd, before, after, modes) = facts;
         assert_eq!(first, b"HOST-CACHE-V1");
         assert_eq!(second, b"HOST-CACHE-V1");
+        assert_eq!(
+            third, b"HOST-CACHE-V1",
+            "renaming the lower dir itself must not change the guest view"
+        );
         assert_eq!(group, b"frozen:x:2:\n");
         assert_eq!(passwd, b"root:x:0:0::/root:/bin/sh\nnested\n");
         assert_eq!(before, after, "the open cache's fstat must not move");
         assert_eq!(before.2, 1, "the frozen cache keeps nlink 1");
+        assert_eq!(modes, (0o444, 0o444), "frozen files are read-only");
     }
 
     #[test]
