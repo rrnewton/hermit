@@ -3076,7 +3076,7 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-# CARRY TO ed26f4760c536a96a7b02415e8174852dad5e446 (2026-10-28): from 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8.
+# CARRY TO d53e189ee1c91ac20c5b2812c1f5854f0e3ee9e1 (2026-10-29): from 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8.
 # The PMU overshoot/timer stack is based on current Reverie main. Exact Git
 # object comparison preserves build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938,
 # vendor/dynamorio 4e4afaa7cb1af0170c89a55f2004821426e88aba and native tree
@@ -3084,7 +3084,7 @@ fi
 # are unchanged. CMAKE/CMAKE_GENERATOR/SOURCE_DATE_EPOCH selection is unchanged.
 # Retain the existing 1050 effective-job-second budget and 16-job clamp.
 # This source-identity carry is not runtime equivalence or a validation receipt.
-expected_pin=ed26f4760c536a96a7b02415e8174852dad5e446
+expected_pin=d53e189ee1c91ac20c5b2812c1f5854f0e3ee9e1
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
