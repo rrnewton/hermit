@@ -3189,7 +3189,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3279 + 16 = 3295.
     // And the #4931 fix's queued-arm timed-signal unit: 3295 + 1 = 3296.
     // And its round-1 units (gate, filing, controlled observation): 3296 + 3 = 3299.
-    ("test.detcore_unit", 3299),
+    // And its round-2 coalescing units: 3299 + 3 = 3302.
+    ("test.detcore_unit", 3302),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5647,7 +5648,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same sixteen #4682 re-land units: 3279 + 16 = 3295.
     // And the #4931 fix's queued-arm timed-signal unit: 3295 + 1 = 3296.
     // And its round-1 units (gate, filing, controlled observation): 3296 + 3 = 3299.
-    ("test.detcore_unit_on_host", 3299),
+    // And its round-2 coalescing units: 3299 + 3 = 3302.
+    ("test.detcore_unit_on_host", 3302),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
