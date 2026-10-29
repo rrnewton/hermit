@@ -153,7 +153,9 @@ mod tests {
         // pair (PR 4860 rework, allocated revision 19 at integration;
         // digests measured at this head).
         (19, "c19f0246a9e94f4a", "f013e36743d8d9e6"),
-        // Adds `GlobalRequest::TakeSleepInterruption` and its response.
+        // Adds `GlobalRequest::TakeSleepInterruption` and its response, and
+        // `ObservationFinish::InterruptForCaught`'s `dequeue`, which the
+        // digest does not cover (https://github.com/rrnewton/hermit/issues/4931).
         (20, "7a7c415e68626e27", "f013e36743d8d9e6"),
     ];
 

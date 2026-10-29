@@ -127,7 +127,7 @@ impl GlobalState {
                 );
             }
             let now = self.global_time.lock().unwrap().as_nanos();
-            sched.apply_signal_dequeue(pid, dequeue, now)
+            sched.apply_signal_dequeue(pid, tid, dequeue, now)
         });
         if let Err(error) = result {
             sched.fail_parked(tid, ProtocolFailure::Timer(error));
@@ -330,7 +330,14 @@ where
                     ObservationFinish::ResumeSameWait
                 }
                 reverie::SignalObservationStop::Caught(selection) => {
-                    ObservationFinish::InterruptForCaught { selection }
+                    ObservationFinish::InterruptForCaught {
+                        selection,
+                        // The removal the selection made.
+                        dequeue: observation.steps.iter().rev().find_map(|step| match step {
+                            reverie::SignalObservationStep::Caught { dequeue } => Some(*dequeue),
+                            _ => None,
+                        }),
+                    }
                 }
                 reverie::SignalObservationStop::Fatal(selection) => {
                     ObservationFinish::Terminate { selection }
