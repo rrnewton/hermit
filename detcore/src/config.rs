@@ -115,7 +115,7 @@ mod tests {
         (12, "ab01c6abb5daa6d7", "dafaa96d8b8cb3ad"),
         // Resources::passes_descriptors_out, which revokes the scheduler's
         // guest-held marks (https://github.com/rrnewton/hermit/pull/4862).
-        (10, "ebfd2b59a97e1d7a", "846052997d97693f"),
+        (12, "8bb87305b1bd45a3", "846052997d97693f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
