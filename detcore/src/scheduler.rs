@@ -2364,8 +2364,13 @@ pub struct Scheduler {
     pub recorded_event_count: u64,
 
     /// A copy of the `Config::stacktrace_event` vector.  This is MUTABLE,
-    /// because we pop events off as we handle them.  The u64 is an index into
-    /// the (original) replay_cursor trace.
+    /// because we pop events off as we handle them. The u64 is a traced event
+    /// index: under a schedule recording, the number of the recorded event;
+    /// under a schedule replay, the number of events observed before it,
+    /// polling retries and events the schedule does not hold included
+    /// (`try_pop_stacktrace_event`). It is not a position in the replayed
+    /// schedule, and not the number a schedule release reports
+    /// (`replayer::Release::event`).
     pub stacktrace_events: Option<StacktraceEventsIter>,
 
     /// Whether the run counts `stacktrace_events` indices at all: it records
@@ -2472,6 +2477,18 @@ pub struct Scheduler {
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
+
+/// Why a requested stack trace index cannot print when a replay stops the run
+/// (`Scheduler::report_stacktrace_events_at_stop`): the stopping event's own
+/// index, `stopping_ix`, stopped before its stack could print; any other was
+/// never reached.
+fn stacktrace_stop_reason(index: u64, stopping_ix: Option<u64>, flag: &str) -> String {
+    if Some(index) == stopping_ix {
+        format!("the replay stopped at that event ({flag}) before its stack could print")
+    } else {
+        format!("the replay stopped ({flag}) before reaching it")
+    }
+}
 
 // type ThreadTree = HashMap<DetTid, Vec<DetTid>>;
 #[derive(Debug, Clone, Default)]
@@ -6049,11 +6066,7 @@ impl Scheduler {
     /// comes before the thread could print its stack.
     fn report_stacktrace_events_at_stop(&mut self, stopping_ix: Option<u64>, flag: &str) {
         self.report_unprintable_stacktrace_events(|index| {
-            if Some(index) == stopping_ix {
-                format!("the replay stopped at that event ({flag}) before its stack could print")
-            } else {
-                format!("the replay stopped ({flag}) before reaching it")
-            }
+            stacktrace_stop_reason(index, stopping_ix, flag)
         });
     }
 
@@ -21857,6 +21870,27 @@ mod test {
         assert!(
             pending(&sched).is_empty(),
             "the index past the run's end was reported at its end"
+        );
+    }
+
+    /// The reason a stop gives for each pending index: the stopping event's
+    /// own index stopped before its stack could print, a later one was never
+    /// reached.
+    #[test]
+    fn a_stop_names_the_stopping_index_apart_from_later_ones() {
+        let flag = "--die-on-desync";
+        assert_eq!(
+            stacktrace_stop_reason(7, Some(7), flag),
+            "the replay stopped at that event (--die-on-desync) before its stack could print"
+        );
+        assert_eq!(
+            stacktrace_stop_reason(8, Some(7), flag),
+            "the replay stopped (--die-on-desync) before reaching it"
+        );
+        assert_eq!(
+            stacktrace_stop_reason(7, None, flag),
+            "the replay stopped (--die-on-desync) before reaching it",
+            "a stop outside a traced event (the checkpoint desync) names no own index"
         );
     }
 

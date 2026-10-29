@@ -824,7 +824,9 @@ pub struct Config {
 
     /// Given schedule events traced on recording or replaying, print the stack trace at the moment
     /// after the Nth event in the trace. Optionally, provide an output file into which the stack
-    /// trace will be printed, otherwise it goes to stderr.
+    /// trace will be printed, otherwise it goes to stderr. N counts every traced event, polling
+    /// retries included, as the desync and missed-stack-trace lines do; the event number a
+    /// schedule release reports leaves polling retries out, so it is not such an index.
     #[clap(long,
            short = 's',
            value_name = "index[,path]",
