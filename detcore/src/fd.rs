@@ -1042,7 +1042,10 @@ struct OpenFileDescription {
     /// socket the process received from itself whose object it already held
     /// through a guest-held description. Cleared, permanently, when a guest passes the
     /// object, or any object while it holds one, over `SCM_RIGHTS` on a
-    /// socket that is not guest-held itself. See `is_guest_held`.
+    /// socket that is not guest-held itself. A received descriptor that joins
+    /// its sender's open file (`crate::syscalls::scm_rights`) shares this
+    /// flag, as a dup does; one that joins nothing starts without it. See
+    /// `is_guest_held`.
     #[serde(default)]
     guest_held: bool,
     /// True when record/replay runs a blocking `accept(2)` on this socket in
@@ -4474,6 +4477,57 @@ mod tests {
         timer.expire_through(at(20));
         assert_eq!(timer.unread, 1);
         assert_eq!(VirtualTimerfd::set(None, 0).unread, 0);
+    }
+
+    /// The guest-held mark (`DetFd::is_guest_held`) lives on the open file, so
+    /// a received descriptor carries it only by joining the open file a
+    /// guest's send queued on the receiving socket (`take_queued_rights`,
+    /// `OpenFileHandle::descriptor`), and then shares the mark and its
+    /// withdrawal with the sender's copy. A receipt nothing queued names, such
+    /// as one from a process outside the guest, is a description of its own
+    /// and starts unmarked.
+    #[test]
+    fn a_received_descriptor_is_guest_held_only_through_its_senders_open_file() {
+        let owner = DetTid::from_raw(10);
+        let open =
+            |fd, ty, sequence| DetFd::new(fd, OFlag::O_RDWR, ty, OpenFileId::new(owner, sequence));
+        let (left, right) = (open(3, FdType::Socket, 0), open(4, FdType::Socket, 1));
+        left.pair_sockets(&right, false);
+        let pipe_end = open(5, FdType::Pipe, 2);
+        pipe_end.set_guest_held();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 50),
+                    open_file: Some(pipe_end.in_flight_open_file(true)),
+                    lock_copy: None,
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        let taken = right
+            .take_queued_rights(&[(1, 50)], false, false, false, None)
+            .expect("the send queued it");
+        let joined = taken.sent[0]
+            .open_file
+            .as_ref()
+            .and_then(|handle| handle.descriptor(6, false))
+            .expect("the sender's open file is still modeled");
+        assert!(joined.is_guest_held(), "a join shares the sender's mark");
+        joined.clear_guest_held();
+        assert!(!pipe_end.is_guest_held(), "and its withdrawal");
+
+        assert!(
+            right
+                .take_queued_rights(&[(1, 60)], false, false, false, None)
+                .is_none(),
+            "nothing queued names a descriptor a guest did not send"
+        );
+        assert!(
+            !open(7, FdType::Pipe, 3).is_guest_held(),
+            "a description of its own starts unmarked"
+        );
     }
 
     /// The descriptors a socket's messages carried are taken in order

@@ -3998,12 +3998,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest-held when this table already names its object, or the other end
     /// of the same pipe, through a guest-held description (the same host
     /// device and inode), or when it is a socket whose peer is this process
-    /// (`classify_guest_held_peer`). A received descriptor is a description
-    /// of its own in Detcore's model (`record_received_descriptor`), so it
-    /// does not share the sender's mark. Marks only ever claim that no
-    /// process outside the guest holds the object; once a descriptor may have
-    /// left the guest, the scheduler stops trusting every mark
-    /// (`Scheduler::polls_only_guest_state`).
+    /// (`classify_guest_held_peer`).
+    ///
+    /// A received descriptor that joins the open file its sender's table
+    /// modeled (`crate::syscalls::scm_rights`) shares that open file's mark,
+    /// set or not, as a dup would. That needs no check here: a join takes
+    /// only what a guest's `sendmsg` or `sendmmsg` queued on the receiving
+    /// socket's known peer (`queue_sent_rights`), so the sender is a guest;
+    /// either the channel was guest-held, so the receiver is a guest too and
+    /// every holder of the open file is one, or the send revoked every mark
+    /// first (`note_descriptors_passed_out`, which both send paths run before
+    /// they send). A descriptor nothing queued names, such as one from a
+    /// process outside the guest, is a description of its own and starts
+    /// unmarked; this function marks it only on a guest-held channel. Marks
+    /// only ever claim that no process outside the guest holds the object;
+    /// once a descriptor may have left the guest, the scheduler stops trusting
+    /// every mark (`Scheduler::polls_only_guest_state`).
     async fn classify_received_descriptors<G: Guest<Self>>(
         &self,
         guest: &mut G,

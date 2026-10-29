@@ -400,8 +400,8 @@ fn every_lit_fixture_is_within_the_supported_subset() {
             checked += 1;
         }
     }
-    // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts 45.
-    assert_eq!(checked, 45);
+    // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts 48.
+    assert_eq!(checked, 48);
 }
 
 /// The `%me` of FIXTURE: its directory's `main.c`, compiled into DIRECTORY

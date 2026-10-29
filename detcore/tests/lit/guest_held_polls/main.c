@@ -37,10 +37,21 @@
 //   crossexport a pipe whose write end a forked child passes, over a plain
 //               connection, to another child that writes: the poll on the
 //               read end is classified, and the export revokes every mark.
+//   self-join   a pipe's read end, passed by this process to itself over a
+//               connection it made (a guest-held channel) and received:
+//               the received descriptor joins the sender's open file and
+//               keeps its mark, so its poll is classified, and nothing is
+//               revoked.
+//   export-mmsg the same pair as exported, but the descriptor leaves the
+//               process through sendmmsg: the export revokes every mark.
+//   unspec-pair a datagram socketpair end that disconnects (connect with
+//               AF_UNSPEC), which its old peer still reaches: its mark is
+//               withdrawn, so its poll is never classified.
 //
 // Use a bogus 'RUN' directive so this test isn't disabled:
 // RUN: true
 
+#define _GNU_SOURCE
 #include <assert.h>
 #include <poll.h>
 #include <pthread.h>
@@ -169,6 +180,29 @@ static void pass_a_descriptor(int fd) {
   int passed = eventfd(0, 0);
   assert(passed >= 0);
   pass_descriptor(fd, passed);
+  assert(close(passed) == 0);
+}
+
+// Passes an eventfd over SCM_RIGHTS on `fd`, through sendmmsg.
+static void pass_a_descriptor_mmsg(int fd) {
+  int passed = eventfd(0, 0);
+  assert(passed >= 0);
+  char control[CMSG_SPACE(sizeof(int))];
+  memset(control, 0, sizeof(control));
+  char byte = 'm';
+  struct iovec iov = {.iov_base = &byte, .iov_len = 1};
+  struct mmsghdr entry;
+  memset(&entry, 0, sizeof(entry));
+  entry.msg_hdr.msg_iov = &iov;
+  entry.msg_hdr.msg_iovlen = 1;
+  entry.msg_hdr.msg_control = control;
+  entry.msg_hdr.msg_controllen = sizeof(control);
+  struct cmsghdr* header = CMSG_FIRSTHDR(&entry.msg_hdr);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &passed, sizeof(int));
+  assert(sendmmsg(fd, &entry, 1, 0) == 1);
   assert(close(passed) == 0);
 }
 
@@ -348,6 +382,37 @@ int main(int argc, char** argv) {
     printf("crossexport: readable %d\n", (poll_one(ends[0]) & POLLIN) != 0);
     reap(sender);
     reap(receiver);
+  } else if (strcmp(mode, "self-join") == 0) {
+    int ends[2];
+    assert(pipe(ends) == 0);
+    struct pair channel = same_process_pair(0);
+    pass_descriptor(channel.connecting.fd, ends[0]);
+    int received = receive_descriptor(channel.accepted);
+    assert(close(ends[0]) == 0);
+    struct peer writer = {ends[1], 0};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, act_later, &writer) == 0);
+    printf("self-join: revents %#x\n", poll_one(received));
+    assert(pthread_join(thread, NULL) == 0);
+  } else if (strcmp(mode, "export-mmsg") == 0) {
+    struct pair pair = same_process_pair(0);
+    int to_child;
+    pid_t child = fork_connected_child(&to_child);
+    pass_a_descriptor_mmsg(to_child);
+    printf("export-mmsg: revents %#x\n", poll_pair(&pair));
+    reap(child);
+  } else if (strcmp(mode, "unspec-pair") == 0) {
+    int ends[2];
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, ends) == 0);
+    struct sockaddr unspec;
+    memset(&unspec, 0, sizeof(unspec));
+    unspec.sa_family = AF_UNSPEC;
+    assert(connect(ends[1], &unspec, sizeof(unspec)) == 0);
+    struct peer writer = {ends[0], 0};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, act_later, &writer) == 0);
+    printf("unspec-pair: revents %#x\n", poll_one(ends[1]));
+    assert(pthread_join(thread, NULL) == 0);
   } else {
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;
