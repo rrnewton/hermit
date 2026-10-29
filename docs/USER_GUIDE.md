@@ -561,14 +561,22 @@ detection or generic legacy binary roundtrip guarantee is implied.
 
 A schedule replay (`--replay-schedule-from`) whose next recorded event goes
 unmatched for a thousand observed events in a row releases the rest of the
-schedule and runs on unguided. Its warning and the run summary's
+schedule and runs on unguided. Unmatched polling retries neither count toward
+that run nor break it. The replay's warning and the run summary's
 `RELEASED replayed schedule at event #N` line number events without polling
-retries, whose count can depend on host timing. `--stacktrace-event` indices,
-and the desync and `Missed stack trace` lines, count every traced event,
+retries, whose count can depend on host timing. A `--stacktrace-event` index,
+like the desync and `Missed stack trace` lines, counts every traced event,
 polling retries included, so a release's number is not a `--stacktrace-event`
-index. A requested index the run never reaches is reported, not dropped: at
-the end of a run that records or replays a schedule, or before a replay stops
-the run under `--replay-exhausted-panic` or `--die-on-desync`.
+index. A requested index the run never reaches is reported, not dropped. The
+report comes in the run summary of a run that records or replays a schedule,
+or before a replay stops the run under `--replay-exhausted-panic` or
+`--die-on-desync`. A run that ends without a summary, such as a non-ptrace
+backend's `--timeout`, does not report.
+
+Under `--strict-schedule-boundaries` a `--stacktrace-event` index is a
+position in the stored boundary stream instead, `TimesliceEnd` records
+included. An index outside that stream is refused when the run starts, and
+the reports above do not apply.
 
 A replay reproduces the recording only if the guest reads the same host
 files. The recorded schedule therefore keeps the set of host files the run

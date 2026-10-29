@@ -824,9 +824,12 @@ pub struct Config {
 
     /// Given schedule events traced on recording or replaying, print the stack trace at the moment
     /// after the Nth event in the trace. Optionally, provide an output file into which the stack
-    /// trace will be printed, otherwise it goes to stderr. N counts every traced event, polling
-    /// retries included, as the desync and missed-stack-trace lines do; the event number a
-    /// schedule release reports leaves polling retries out, so it is not such an index.
+    /// trace will be printed, otherwise it goes to stderr. With a recorded or replayed schedule, N
+    /// counts every traced event, polling retries and events the schedule does not hold included,
+    /// as the desync and missed-stack-trace lines do; the event number a schedule release reports
+    /// leaves polling retries out, so it is not such an index. Under
+    /// `--strict-schedule-boundaries`, N is instead a position in the stored boundary stream,
+    /// `TimesliceEnd` records included, and must lie inside it.
     #[clap(long,
            short = 's',
            value_name = "index[,path]",

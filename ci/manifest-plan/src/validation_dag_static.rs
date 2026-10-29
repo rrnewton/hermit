@@ -1901,7 +1901,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
-    ("test.hermit_unit", 1289),
+    // And https://github.com/rrnewton/hermit/pull/4911's
+    // run_stacktrace_event_help_names_both_index_streams: 1289 + 1 = 1290,
+    // listed.
+    ("test.hermit_unit", 1290),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5939,7 +5942,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
-    ("test.hermit_unit_on_host", 1283),
+    // And the same --stacktrace-event help unit: 1283 + 1 = 1284, listed.
+    ("test.hermit_unit_on_host", 1284),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
