@@ -77,9 +77,8 @@ struct EventLevelSearchResult {
     failing_schedule: Vec<SchedEvent>,
 }
 
-/// The bisection between a passing and a failing schedule cannot separate
-/// them by a single adjacent swap: the outcome depends on events only one of
-/// the two runs executed.
+/// The bisection stopped with unmatched events and has not established an
+/// exact one-swap pair of schedules with opposite outcomes.
 #[derive(Debug)]
 pub struct NoSingleSwap {
     /// How many events only one of the two schedules has, counting both
@@ -100,18 +99,14 @@ impl std::fmt::Display for NoSingleSwap {
             write!(
                 f,
                 "the passing and failing schedules run the events they share in the same order \
-                 and differ only in {} events that one of them lacks, so no reordering of events \
-                 separates the two outcomes: the failure depends on events only one run executed \
-                 (often branch events whose preemption points differ).",
+                 and differ in {} events that only one of them has.",
                 self.unshared_events
             )?;
         } else {
             write!(
                 f,
                 "the search stopped one swap from the passing schedule, but the two schedules \
-                 still differ in {} events that only one of them has{}. The failure depends on \
-                 events only one run executed (often branch events whose preemption points \
-                 differ), so no single adjacent swap separates the two outcomes.",
+                 still differ in {} events that only one of them has{}.",
                 self.unshared_events,
                 if self.trimmed_failing_passed {
                     ", and the failing schedule without the events only it has no longer fails"
@@ -122,7 +117,8 @@ impl std::fmt::Display for NoSingleSwap {
         }
         write!(
             f,
-            " `hermit analyze --prefix-search` needs no baseline schedule and finds the \
+            " The search has not established an exact one-swap pair of schedules with opposite \
+             outcomes. `hermit analyze --prefix-search` needs no baseline schedule and finds the \
              scheduling decision within the failing one."
         )
     }
@@ -1257,6 +1253,44 @@ mod tests {
                 && message.contains("--prefix-search"),
             "{message}"
         );
+
+        // An extra event in the passing schedule need not cause the outcome
+        // difference: reordering the shared events alone can make it pass.
+        let a = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let b = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let passing = vec![a.clone(), extra, b.clone()];
+        let failing = vec![b.clone(), a.clone()];
+        let tester = |schedule: &[SchedEvent]| -> TrialOutcome {
+            let ai = schedule.iter().position(|event| event == &a).unwrap();
+            let bi = schedule.iter().position(|event| event == &b).unwrap();
+            Ok((ai < bi, schedule.to_vec()))
+        };
+        assert!(tester(&passing).unwrap().0);
+        assert!(!tester(&failing).unwrap().0);
+        assert!(tester(&[a.clone(), b.clone()]).unwrap().0);
+        let error =
+            search_for_critical_schedule(tester, passing, failing, &Config::default()).unwrap_err();
+        let no_swap = error
+            .downcast_ref::<NoSingleSwap>()
+            .unwrap_or_else(|| panic!("not NoSingleSwap: {error:#}"));
+        assert_eq!((no_swap.unshared_events, no_swap.swaps_left), (1, 1));
+        assert!(!no_swap.trimmed_failing_passed);
+        let message = error.to_string();
+        assert!(message.contains("the search stopped one swap"), "{message}");
+        assert!(
+            message.contains("has not established an exact one-swap pair"),
+            "{message}"
+        );
+        assert!(message.contains("--prefix-search"), "{message}");
+        assert!(!message.contains("The failure depends on"), "{message}");
+        assert!(
+            !message.contains("no single adjacent swap separates"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("without the events only it has no longer fails"),
+            "{message}"
+        );
     }
 
     /// Schedules that run their shared events in the same order, and differ
@@ -1285,6 +1319,15 @@ mod tests {
         assert!(
             message.contains("run the events they share in the same order")
                 && message.contains("--prefix-search"),
+            "{message}"
+        );
+        assert!(
+            message.contains("has not established an exact one-swap pair"),
+            "{message}"
+        );
+        assert!(!message.contains("the failure depends on"), "{message}");
+        assert!(
+            !message.contains("no reordering of events separates"),
             "{message}"
         );
 
