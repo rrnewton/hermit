@@ -1266,7 +1266,10 @@ impl AnalyzeOpts {
     pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
         let (skips, format) = {
             let sources = self.time_skip_sources.lock().unwrap();
-            (sources.carried(record.schedevents()), sources.trial_format())
+            (
+                sources.carried(record.schedevents()),
+                sources.trial_format(),
+            )
         };
         let record = self.stamp_trial_record(record.with_format(format).with_time_skips(skips));
         record.validate().map_err(anyhow::Error::msg)?;

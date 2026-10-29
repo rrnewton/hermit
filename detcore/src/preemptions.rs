@@ -329,6 +329,8 @@ impl PreemptionRecord {
             host_inputs,
             store_exclusive_failures: _,
             replay_departed_at,
+            format_version,
+            time_skips,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -381,6 +383,23 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             // A prefix of an inexact record is inexact too.
             replay_departed_at: *replay_departed_at,
+            format_version: *format_version,
+            // The jumps the prefix reaches, in stream order, as analyze and
+            // bisect carry them (`hermit-cli`'s `time_skip_carry`): one at its
+            // end still waits there for a FIFO open's poll, and one beyond it
+            // was never reached.
+            time_skips: time_skips
+                .as_ref()
+                .map(|skips| {
+                    skips
+                        .iter()
+                        .take_while(|skip| {
+                            usize::try_from(skip.event).is_ok_and(|event| event <= len)
+                        })
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .filter(|skips| !skips.is_empty()),
         }
     }
 
@@ -1904,6 +1923,40 @@ mod tests {
                     &prefix.host_inputs,
                 ),
                 (true, Some(1234567), true, &record.host_inputs),
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// A schedule prefix keeps the record's format and the jumps of global
+    /// time its events reach, as analyze and bisect carry them: up to and
+    /// including one at the prefix's end, none beyond it.
+    #[test]
+    fn a_schedule_prefix_keeps_the_jumps_its_events_reach() {
+        let tid = DetTid::from_raw(3);
+        let jump = |event: u64| TimeSkip {
+            event,
+            target: LogicalTime::from_nanos(1_000 * (event + 1)),
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+            SchedEvent::branches(tid, 30),
+        ])
+        .with_current_format()
+        .with_time_skips(vec![jump(1), jump(2), jump(3)]);
+        for (len, kept) in [
+            (0, vec![]),
+            (1, vec![jump(1)]),
+            (2, vec![jump(1), jump(2)]),
+            (9, vec![jump(1), jump(2), jump(3)]),
+        ] {
+            let prefix = record.schedule_prefix(len);
+            assert!(prefix.lists_its_time_skips(), "prefix of {len} events");
+            assert_eq!(
+                prefix.time_skips().unwrap_or_default(),
+                kept.as_slice(),
                 "prefix of {len} events"
             );
         }

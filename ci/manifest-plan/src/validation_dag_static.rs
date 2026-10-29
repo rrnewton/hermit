@@ -3235,7 +3235,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler's
     // a_replay_leaves_time_to_a_recorded_jump_it_has_not_made, from the
     // rebase onto main 0e7fd4bdc: 2830, listed.
-    ("test.detcore_unit", 3090),
+    // On main 16a66895f with #4862 (2871), this change's sixteen units and
+    // preemptions' a_schedule_prefix_keeps_the_jumps_its_events_reach: 2888, listed.
+    ("test.detcore_unit", 3091),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5692,7 +5694,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3074, listed.
     // And the same tests: 2756.
     // And the same recorded-jump unit: 2830, listed.
-    ("test.detcore_unit_on_host", 3090),
+    // The same units on main 16a66895f: 2888, listed.
+    ("test.detcore_unit_on_host", 3091),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
