@@ -3167,7 +3167,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and
     // a_preemption_replay_past_its_last_readmission_parks_a_finished_call_only_up_to_the_valve:
     // 3046.
-    ("test.detcore_unit", 3046),
+    // And a_schedule_prefix_keeps_the_readmissions_only_for_the_whole_schedule,
+    // for main's prefix records: 3047.
+    ("test.detcore_unit", 3047),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5584,7 +5586,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
     // And the same blocking-classification unit: 3035.
     // And the same eleven readmission units: 3046.
-    ("test.detcore_unit_on_host", 3046),
+    // And the same prefix-record unit: 3047.
+    ("test.detcore_unit_on_host", 3047),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
