@@ -400,9 +400,11 @@ fn a_started_stat_read_keeps_its_record_and_pread_or_seek_renders_again() {
         assert_eq!(field(&rewound, 20), "2", "{rewound:?}");
         // A seek elsewhere renders it again, and reads on from there: the
         // same record, but for the CPU time the new rendering takes again.
-        seek(fd, 3);
+        // Seek to the pid's last digit: inside the pid at any pid length.
+        let offset = field(&rewound, 1).len() - 1;
+        seek(fd, offset as i64);
         let tail = read_rest(fd);
-        assert_rendered_again_from(&rewound, 3, &tail);
+        assert_rendered_again_from(&rewound, offset, &tail);
         keep.send(()).unwrap();
         thread.join().unwrap();
         // SAFETY: a descriptor this guest opened.
