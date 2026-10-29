@@ -2017,10 +2017,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And its race_report switch adds a_refusal_the_stack_replay_reached_uses_the_stacks_it_took: 1410 + 1 = 1411.
     // And a trial analyze's wall-clock bound stops is no outcome:
     // phases::tests::{a_trial_the_backstop_stopped_runs_again_and_does_not_change_the_answer,
-    // a_trial_stopped_again_ends_the_search_with_a_partial_report,
-    // a_stop_by_the_run_arguments_timeout_still_counts_as_not_meeting_the_target,
+    // a_trial_stopped_again_ends_the_analysis_with_the_bound_error,
+    // a_stop_by_the_run_arguments_timeout_ends_the_analysis,
     // a_bisection_trial_the_backstop_stopped_runs_again_and_does_not_change_the_pair,
-    // a_continuation_with_an_inconclusive_endpoint_trial_ends_the_search,
+    // a_continuation_whose_endpoint_trial_is_stopped_twice_ends_the_analysis,
     // a_baseline_run_the_backstop_stopped_runs_again}
     // and rundata::tests::{the_auto_bound_grows_with_the_slowest_finished_run,
     // a_backstop_stop_is_not_journaled_and_the_key_ignores_the_bound,

@@ -35,7 +35,6 @@ use crate::analyze::checkpoint::Progress;
 use crate::analyze::checkpoint::ProgressHandle;
 use crate::analyze::races::RacingAccesses;
 use crate::analyze::rundata::HermitRun;
-use crate::analyze::rundata::TrialInconclusive;
 use crate::analyze::rundata::TrialRunner;
 use crate::analyze::verdict::Verdict;
 use crate::analyze::verdict::VerdictReason;
@@ -282,10 +281,15 @@ pub struct AnalyzeOpts {
     ///
     /// With `auto`, the initial run and completed target/baseline endpoint runs are measured.
     /// Later runs are bounded at max(60 s, 10 times the slowest measured run, 4 times the
-    /// slowest run that finished so far), rounded up to whole seconds. With `--run1-preemptions`, no initial run is made: automatic bounds wait
-    /// for a measured replay, so use an explicit number to bound trials immediately.
-    /// A trial that reaches its bound stops analysis with exit 124: it establishes no outcome
-    /// and cannot support a successful report. Retry with a larger bound if the guest can
+    /// slowest run that finished so far), rounded up to whole seconds. With
+    /// `--run1-preemptions`, no initial run is made: automatic bounds wait for a measured replay,
+    /// so use an explicit number to bound trials immediately. When this bound fires is the host's,
+    /// so a run it stops has no outcome and is never counted: a `--prefix-search` trial, a
+    /// default-search (bisection) trial or the baseline run runs again at once with 4 times the
+    /// bound (within the run arguments' own `--timeout` and the time budget left), and only a
+    /// rerun that completes counts. A rerun stopped again, or any other trial that reaches its
+    /// bound, stops analysis with exit 124: it establishes no outcome and cannot support a
+    /// successful report. Retry with a larger bound if the guest can
     /// finish. A `--timeout` in the run arguments also bounds the initial run and wins wherever
     /// it is shorter. `off` removes only analyze's bounds, not the run arguments' timeout.
     ///
@@ -566,9 +570,9 @@ pub const TRIAL_TIMEOUT_FACTOR: u32 = 10;
 /// How many times the slowest run that finished so far `--trial-timeout=auto`
 /// gives a trial.
 pub const SLOWEST_RUN_FACTOR: u32 = 4;
-/// How many times its usual `--trial-timeout` bound a search trial gets when
-/// it runs again because that bound stopped it (`decisive_trial` in
-/// phases.rs).
+/// How many times its usual `--trial-timeout` bound a search trial or the
+/// baseline run gets when it runs again because that bound stopped it
+/// (`decisive_trial` in phases.rs).
 pub const CONFIRM_BOUND_FACTOR: u32 = 4;
 /// The least cap on a trial's log file.
 pub const TRIAL_LOG_FLOOR: u64 = 64 << 20;
@@ -736,9 +740,8 @@ pub struct Report {
 /// answer so far, and how to continue it.
 #[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct PartialReport {
-    /// Why the analysis stopped early: the budget that ran out, or a trial
-    /// that stayed inconclusive.
-    pub reason: PartialReason,
+    /// The budget that ran out.
+    pub reason: BudgetKind,
     /// The phase that was running.
     pub phase: Phase,
     /// Wall-clock seconds this invocation ran, and its budget, if any.
@@ -751,10 +754,6 @@ pub struct PartialReport {
     pub runs_from_journal: u64,
     /// The run the time budget cut short, whose outcome was not counted.
     pub cut_run: Option<String>,
-    /// The trial that analyze's wall-clock bound stopped twice, when that
-    /// ended the analysis (`reason` `trial-inconclusive`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inconclusive: Option<TrialInconclusive>,
     /// The default search's interval, if it got that far.
     pub interval: Option<BisectInterval>,
     /// `--prefix-search`'s bracket, if it got that far.
@@ -766,40 +765,6 @@ pub struct PartialReport {
     /// The kept workspace, and the command that continues the analysis.
     pub workspace: PathBuf,
     pub resume_command: String,
-}
-
-/// Why an analysis ended with a partial report ([`PartialReport::reason`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PartialReason {
-    /// `--time-budget` ran out.
-    TimeBudget,
-    /// `--trial-budget` ran out.
-    TrialBudget,
-    /// A search trial that analyze's wall-clock bound stopped was stopped
-    /// again when it ran once more with a longer bound
-    /// ([`TrialInconclusive`]).
-    TrialInconclusive,
-}
-
-impl PartialReason {
-    /// The `class=` value of the stderr class line.
-    pub fn class(self) -> &'static str {
-        match self {
-            PartialReason::TimeBudget => BudgetKind::TimeBudget.class(),
-            PartialReason::TrialBudget => BudgetKind::TrialBudget.class(),
-            PartialReason::TrialInconclusive => "trial-inconclusive",
-        }
-    }
-}
-
-impl From<BudgetKind> for PartialReason {
-    fn from(kind: BudgetKind) -> Self {
-        match kind {
-            BudgetKind::TimeBudget => PartialReason::TimeBudget,
-            BudgetKind::TrialBudget => PartialReason::TrialBudget,
-        }
-    }
 }
 
 /// Runtime context for a critical event included in the analyze report.

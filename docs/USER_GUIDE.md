@@ -890,18 +890,25 @@ without `--mount-proc`) or when it inherited more than 64 children, since it
 could not then find the run to stop. `hermit
 bisect` keeps its workspace and names it when it exits.
 
-A replayed or spliced schedule can leave the guest spinning or waiting indefinitely.
-`--trial-timeout=SECONDS|auto|off` bounds runs after the initial target attempt.
-The default `auto` uses the initial completed run and completed target/baseline
-endpoints: max(60 seconds, 10 times the slowest measured run, 4 times the
-slowest run that finished so far), rounded up to whole seconds. The last term
-lets the bound follow a continuation without chaos, which can run far slower
-than the endpoint runs. Analyze prints the bound when it changes. A shorter `--timeout`
-in the run arguments still wins and also bounds the initial run. With
-`--run1-preemptions`, no initial run is measured, so pass an explicit
+A replayed or spliced schedule can leave the guest spinning or waiting
+indefinitely. `--trial-timeout=SECONDS|auto|off` bounds runs after the initial
+target attempt. The default `auto` uses the initial completed run and completed
+target/baseline endpoints: max(60 seconds, 10 times the slowest measured run, 4
+times the slowest run that finished so far), rounded up to whole seconds. The
+last term lets the bound follow a continuation without chaos, which can run far
+slower than the endpoint runs. Analyze prints the bound when it changes. A
+shorter `--timeout` in the run arguments still wins and also bounds the initial
+run. With `--run1-preemptions`, no initial run is measured, so pass an explicit
 `--trial-timeout` to bound trials before a completed replay is measured. On a
 backend that does not enforce `--timeout`, `auto` gives no bound and an explicit
 number is refused; bound the whole analysis from outside there.
+
+When analyze's own bound stops a `--prefix-search` trial, a default-search
+(bisection) trial or the baseline run, the run runs again at once, as
+`<trial>_retry`, with 4 times the bound (within the run arguments' own
+`--timeout` and the time budget left). When that bound fires is the host's, so
+the stopped run has no outcome and is never counted; only a rerun that
+completes counts, and one stopped again ends the analysis as below.
 
 A timed-out trial cannot certify a causal report: it establishes neither the
 target nor the baseline outcome, even if it captured stacks. Analysis returns
@@ -1000,8 +1007,7 @@ shortened to the time left; a run the budget cuts short is thrown away rather
 than counted as not meeting the target, so the budget decides only when
 analyze stops, never what it finds. When it runs out, analyze exits **120**
 after the stderr line `HERMIT_ANALYZE_PARTIAL class=time-budget` (or
-`class=trial-budget`, or `class=trial-inconclusive` for a trial analyze's
-bound stopped twice) and a report that says it is partial, why, and which
+`class=trial-budget`) and a report that says it is partial, why, and which
 phase was running:
 
 - The default search reports the closest pair of schedules it found, a
