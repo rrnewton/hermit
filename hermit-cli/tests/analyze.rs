@@ -463,7 +463,9 @@ fn race_then_target_seed() -> u64 {
         if let Some(margin) = std::env::var_os(ANALYZE_SKID_MARGIN_ENV) {
             command.arg(format!("--skid-margin={}", margin.to_string_lossy()));
         }
-        command.arg("--").arg(guest);
+        // Match spin's argc and argument length before the race. The mode is
+        // inspected only after the winning thread is known.
+        command.arg("--").arg(guest).arg("exit");
         let output = hermit_test::hermit_output("terminating race seed discovery", &mut command);
         match output.status.code() {
             Some(0) => {
