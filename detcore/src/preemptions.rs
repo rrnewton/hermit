@@ -1707,6 +1707,7 @@ mod tests {
                 },
                 content: Some("cd".repeat(32)),
             }],
+            stdio: None,
         });
         for len in [0, 1, 2, 9] {
             let prefix = record.schedule_prefix(len);
