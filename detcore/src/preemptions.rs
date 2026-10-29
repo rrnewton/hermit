@@ -294,6 +294,7 @@ impl PreemptionRecord {
             cap_preemption_charge,
             chaos_timeslice,
             guest_ids,
+            timed_wait_spread,
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
@@ -345,6 +346,7 @@ impl PreemptionRecord {
             cap_preemption_charge: *cap_preemption_charge,
             chaos_timeslice: *chaos_timeslice,
             guest_ids: *guest_ids,
+            timed_wait_spread: *timed_wait_spread,
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
@@ -1929,6 +1931,30 @@ mod tests {
                 record
                     .schedule_prefix(len)
                     .queued_sleeps_registered_at_first_pass,
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// The timed-wait spread and the seed its draws came from are settings of
+    /// the whole run, as the other run settings are: a prefix of the schedule
+    /// keeps them, whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_timed_wait_spread() {
+        let setting = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: Some(7),
+        };
+        let tid = DetTid::from_raw(3);
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_timed_wait_spread(Some(setting));
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).timed_wait_spread,
+                Some(setting),
                 "prefix of {len} events"
             );
         }
