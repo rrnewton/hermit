@@ -34064,6 +34064,7 @@ mod test {
             start_rip: None,
             end_rip: std::num::NonZeroUsize::new(rip),
             end_time: Some(LogicalTime::from_nanos(0)),
+            strex_fails: Default::default(),
         };
         let directory = tempfile::tempdir().unwrap();
         let schedule = directory.path().join("schedule.json");
