@@ -13556,15 +13556,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
             })
             .flatten();
-        let res = self.record_or_replay(guest, call).await?;
-        if let Some(name) = unix_name {
+        let res = self.record_or_replay(guest, call).await;
+        if res.is_ok()
+            && let Some(name) = unix_name
+        {
             self.note_unix_bind(guest, sock_fd, &name);
         }
         if let Some(name) = &notice_abstract_name {
-            notice_host_network_abstract_bind(name, &Ok(res));
+            notice_host_network_abstract_bind(name, &res);
         }
 
-        Ok(res)
+        Ok(res?)
     }
 
     /// Create and register an event notification counter.

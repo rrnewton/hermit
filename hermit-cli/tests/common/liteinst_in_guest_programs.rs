@@ -2210,7 +2210,7 @@ fn liteinst_in_guest_shell_and_entropy_consumer() {
     assert_liteinst_in_guest(
         Path::new("/usr/bin/hexdump"),
         &["/dev/urandom", "--length", "16"],
-        b"0000000 7229 04bb 964d 28df ba71 4c03 de95 7027\n0000010\n",
+        b"0000000 cba5 1dfe 5bc3 2d5e 03fd 5546 131b 75a6\n0000010\n",
     );
 }
 

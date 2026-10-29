@@ -1220,6 +1220,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .join_sent_open_file(guest, fd, cloexec, open_file)
                 .await?
         {
+            // The copy is no longer in flight: it was received, so its
+            // description may take a placeholder lock again
+            // (`procfs::locks::LockLedger::placeholder_copies`).
+            if let Ok(open_file_id) = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.open_file_id())
+            {
+                let _ = crate::tool_global::placeholder_copies(
+                    guest,
+                    crate::procfs::locks::PlaceholderCopies::Received(open_file_id),
+                )
+                .await;
+            }
             return Ok(Receipt::Joined);
         }
         let stat = &facts.stat;
