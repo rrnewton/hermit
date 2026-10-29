@@ -3254,7 +3254,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
     // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
     // 216dbc929a full validate.
-    ("test.detcore_unit", 3386),
+    // And scheduler::test::the_chaos_bounds_apply_past_the_end_of_a_replayed_schedule
+    // (#4658's bounds past a replayed schedule's end): 3242 + 1 = 3384 + 1 = 3385, listed.
+    // Rebased onto main e8e0f9a1c: 3386 + 1 = 3387.
+    ("test.detcore_unit", 3387),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4628,7 +4631,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // Batch 1 adds one cli case: 787 + 1 = 788, from the batch1 validate
     // at 9baea420 carried through the split rebase.
-    ("test.cli", 789),
+    // And a_new_thread_past_a_replayed_schedule_gets_its_first_turn_within_a_second:
+    // 787 + 1 = 788, listed.
+    // Rebased onto main e8e0f9a1c: 789 + 1 = 790.
+    ("test.cli", 790),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5257,7 +5263,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
     // Batch 1 recount (same growth as test.cli): 706 + 1 = 707.
-    ("test.cli_on_host", 708),
+    // And the same replayed-schedule first-turn test, not excluded: 706 + 1 = 707, listed.
+    // Rebased onto main e8e0f9a1c: 708 + 1 = 709.
+    ("test.cli_on_host", 709),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5810,7 +5818,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
-    ("test.detcore_unit_on_host", 3386),
+    // And the same unit for #4658's bounds past a replayed schedule's end:
+    // 3384 + 1 = 3385, listed.
+    // Rebased onto main e8e0f9a1c: 3386 + 1 = 3387.
+    ("test.detcore_unit_on_host", 3387),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
