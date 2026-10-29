@@ -11,9 +11,12 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::bail;
@@ -30,10 +33,128 @@ use hermit::process::Bind;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
+use crate::analyze::budget::BudgetExpired;
+use crate::analyze::checkpoint::Journal;
+use crate::analyze::checkpoint::JournalEntry;
+use crate::analyze::checkpoint::RecordedEnd;
+use crate::analyze::checkpoint::RecordedFile;
 use crate::analyze::consts::*;
+use crate::analyze::stop;
 use crate::analyze::types::AnalyzeOpts;
+use crate::analyze::types::CONFIRM_BOUND_FACTOR;
+use crate::analyze::types::ContinuationTimeslice;
+use crate::analyze::types::TRIAL_LOG_FACTOR;
+use crate::analyze::types::TRIAL_LOG_FLOOR;
+use crate::analyze::types::TRIAL_TIMEOUT_FACTOR;
+use crate::analyze::types::TRIAL_TIMEOUT_FLOOR;
+use crate::analyze::types::TrialTimeout;
+use crate::container::RunTimeoutMarker;
 use crate::global_opts::GlobalOpts;
 use crate::run::RunOpts;
+
+/// How a trial ended ([`RunData::launch_trial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialEnd {
+    /// It finished and met the target criteria.
+    Met,
+    /// It finished and did not meet them.
+    Missed,
+    /// It stopped before it finished, so it did not reach the target.
+    Unfinished(Stop),
+}
+
+/// What stopped an unfinished trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// A wall-clock bound: `--trial-timeout`, or a `--timeout` in the run
+    /// arguments.
+    Bound,
+    /// Hermit refused it (exit 122) when the guest reached an operation it
+    /// does not support.
+    Refusal,
+}
+
+impl TrialEnd {
+    /// Whether the trial met the target criteria.
+    pub fn reached_target(self) -> bool {
+        self == TrialEnd::Met
+    }
+
+    /// Whether the trial finished.
+    pub fn finished(self) -> bool {
+        !matches!(self, TrialEnd::Unfinished(_))
+    }
+
+    /// How a trial that `launched` with this result ended; any error but a
+    /// wall-clock bound's and a run-time refusal ([`guest_reached_a_refusal`])
+    /// is returned unchanged. `matched` says whether a finished trial met the
+    /// criteria; `log` is the trial's own log file, if it has one, where a
+    /// refusal's reason is.
+    ///
+    /// A trial replays a schedule no endpoint run took, and that can lead
+    /// the guest to an operation Hermit refuses
+    /// (https://github.com/rrnewton/hermit/issues/4034, for example), which
+    /// stops it before it can show either outcome.
+    fn classify(
+        launched: anyhow::Result<()>,
+        matched: impl FnOnce() -> bool,
+        log: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        match launched {
+            Ok(()) if matched() => Ok(TrialEnd::Met),
+            Ok(()) => Ok(TrialEnd::Missed),
+            Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                eprintln!(" => Timed out ({error}); counted as not meeting the target");
+                Ok(TrialEnd::Unfinished(Stop::Bound))
+            }
+            Err(error) if guest_reached_a_refusal(&error) => {
+                eprintln!(
+                    " => {} Hermit refused this trial when the guest reached an operation it \
+                     does not support (exit 122; the reason is in {}); counted as not meeting \
+                     the target",
+                    "WARNING:".yellow().bold(),
+                    log.map_or("hermit's log above".to_owned(), |log| log
+                        .display()
+                        .to_string())
+                );
+                Ok(TrialEnd::Unfinished(Stop::Refusal))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Whether Hermit refused a run after its guest started, at an operation it
+/// does not support. The container's exit-122 arm returns a bare
+/// `PolicyRefusal`, whose reason Detcore logged before exiting. A refusal
+/// decided before the guest starts (an option or a backend Hermit does not
+/// admit) carries its reason as context instead; it is the same for every
+/// trial, so it ends the analysis.
+pub fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
+    error.chain().count() == 1
+        && error
+            .downcast_ref::<crate::container::PolicyRefusal>()
+            .is_some()
+}
+
+/// What runs a trial's guest in place of [`RunData::run_now`]. Production
+/// never sets one: it is a seam for tests, which drive analyze's searches,
+/// the journal and resume through [`RunData::launch`] without a guest.
+pub type TrialFn = dyn Fn(&mut RunData) -> anyhow::Result<()> + Send + Sync;
+
+/// [`AnalyzeOpts::trial_runner`]: unset, or a [`TrialFn`].
+#[derive(Clone, Default)]
+pub struct TrialRunner(pub Option<std::sync::Arc<TrialFn>>);
+
+impl std::fmt::Debug for TrialRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "TrialRunner(set)"
+        } else {
+            "TrialRunner(unset)"
+        })
+    }
+}
 
 /// A single run plus the results of the run, either in memory or on disk.
 pub struct RunData {
@@ -58,6 +179,18 @@ pub struct RunData {
     in_mem_sched_out: Option<PreemptionRecord>,
 
     is_a_match: Option<bool>,
+
+    /// The `--trial-timeout` bound this run took, when it is shorter than the
+    /// run arguments' own `--timeout` ([`AnalyzeOpts::trial_bound`]).
+    trial_bound: Option<NonZeroU64>,
+    /// How long the run took, once it finished.
+    wall: Option<Duration>,
+    /// The log file the run wrote, once it launched (`--verbose` or
+    /// `--selfcheck`).
+    logged_to: Option<PathBuf>,
+    /// The size of that log as the journal recorded it, for a run the
+    /// journal answered.
+    journaled_log_bytes: Option<u64>,
 }
 
 impl RunData {
@@ -159,19 +292,18 @@ impl RunData {
         self.is_a_match.is_some()
     }
 
-    /// Called after the run has been launched, normalize the output preemptions and swap around so
-    /// that our output file points to the normalized version.
-    pub fn normalize_preempts_out(&mut self) {
+    /// Write a normalized copy of the output preemption record, for reading
+    /// only, beside it, and return its path and contents. The run keeps its
+    /// own record: normalization renumbers priorities across the scheduler's
+    /// fixed ones, so the copy can replay another schedule.
+    pub fn write_normalized_preempts(&mut self) -> (PathBuf, PreemptionRecord) {
         assert!(self.has_launched());
-        let preempts_path = self.preempts_path_out();
-        let normalized_path = preempts_path.with_extension("normalized");
-
+        let normalized_path = self.preempts_path_out().with_extension("normalized");
         let normalized = self.preempts_out().normalize();
         normalized
             .write_to_disk(&normalized_path)
             .expect("write of preempts file to succeed");
-        self.in_mem_sched_out = Some(normalized);
-        self.sched_path_out = Some(normalized_path);
+        (normalized_path, normalized)
     }
 
     /// The global options a trial run is launched with. Trials go through
@@ -188,6 +320,11 @@ impl RunData {
                 None
             },
             backend: self.analyze_opts.backend,
+            // A run analyze bounds in time also gets the log bound.
+            log_file_limit: self
+                .analyze_opts
+                .trial_bound(&self.runopts)
+                .and(self.analyze_opts.trial_log_limit()),
             // Every trial charges the invocation's ONE budget, as verify's
             // per-run logs do. Without --verbose/--selfcheck a trial traces to
             // hermit's own stderr -- the public stream the cap exists to bound.
@@ -199,7 +336,223 @@ impl RunData {
     }
 
     /// Execute the run. (Including setting up logging and temp dir binding.)
+    ///
+    /// Once a stop signal has arrived (`stop`), no run starts, and the run it
+    /// ended reports the stop instead of its own outcome.
+    ///
+    /// With the journal on (`checkpoint`), a run the journal already holds,
+    /// with the files it wrote still there, takes its recorded outcome
+    /// instead of running, and a run that finished, or that its own bound or
+    /// a refusal stopped, is journaled before its outcome is read. Once a
+    /// budget has run out no run starts (`BudgetExpired`). A run gets at most
+    /// the time the budget has left as its `--timeout`; one that this
+    /// shortened bound ends is cut: its outcome came from the budget, not the
+    /// guest, so it is not journaled and the analysis stops
+    /// (`BudgetExpired`), to run it again when resumed.
     pub fn launch(&mut self) -> anyhow::Result<()> {
+        stop::check()?;
+        let journal = self.analyze_opts.journal.clone();
+        let key = if journal.is_on() {
+            Some(self.journal_key())
+        } else {
+            None
+        };
+        if let Some(key) = &key
+            && let Some(entry) = journal.lookup(key)
+            && let Some(answered) = self.answer_from_journal(&entry)?
+        {
+            journal.note_answered();
+            return answered;
+        }
+        let own_timeout = self.runopts.run_timeout_seconds();
+        let shortened = self.bound_by_budget()?;
+        let launched = match self.analyze_opts.trial_runner.0.clone() {
+            Some(run) => run(self),
+            None => self.run_now(own_timeout),
+        };
+        self.runopts.set_run_timeout(own_timeout);
+        if shortened
+            && launched
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<RunTimeoutMarker>().is_some())
+        {
+            return Err(self.analyze_opts.budget.cut(&self.runname).into());
+        }
+        if let Some(key) = key {
+            self.journal_outcome(&journal, key, &launched)?;
+        }
+        launched
+    }
+
+    /// Start the budget's count of this run and shorten its `--timeout` to
+    /// the time left; whether it shortened it. `Err` once a budget has run
+    /// out. A backend on which analyze cannot bound a run with `--timeout`
+    /// gets no shorter bound: the budget then stops analyze between runs.
+    fn bound_by_budget(&mut self) -> Result<bool, BudgetExpired> {
+        let Some(left) = self.analyze_opts.budget.start_trial()? else {
+            return Ok(false);
+        };
+        if !self.runopts.accepts_run_timeout()
+            || self
+                .runopts
+                .run_timeout_seconds()
+                .is_some_and(|own| own <= left)
+        {
+            return Ok(false);
+        }
+        self.runopts.bound_run_timeout(left);
+        Ok(true)
+    }
+
+    /// What names this run in the journal: its name, its `hermit run`
+    /// command (with its own `--timeout`, never the budget's), and the
+    /// contents of the schedule or record it replays.
+    fn journal_key(&self) -> String {
+        let mut material = format!("{}\n{}\n", self.runname, self.to_repro());
+        let config = &self.runopts.det_opts.det_config;
+        for input in [
+            &config.replay_schedule_from,
+            &config.replay_preemptions_from,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let digest = detcore::Digest::digest_path(input)
+                .map_or_else(|_| "unreadable".to_owned(), |digest| digest.to_string());
+            material.push_str(&format!("{}={digest}\n", input.display()));
+        }
+        detcore::Digest::new(material.as_bytes()).to_string()
+    }
+
+    /// Take `entry`'s outcome instead of running, as `launch` returns it:
+    /// `None` when a file the run wrote is gone or changed, and the run must
+    /// run again. A recording that analyze removed is restored from the
+    /// schedule it replayed when the two hold the same events.
+    fn answer_from_journal(
+        &mut self,
+        entry: &JournalEntry,
+    ) -> anyhow::Result<Option<anyhow::Result<()>>> {
+        let workspace = self.analyze_opts.get_tmp()?.to_path_buf();
+        let mut restored = None;
+        if let Some((recorded, replayed)) = &entry.recording_replays_input {
+            let (recorded_path, replayed_path) =
+                (workspace.join(recorded), workspace.join(replayed));
+            if !recorded_path.exists() && replayed_path.exists() {
+                std::fs::copy(&replayed_path, &recorded_path).with_context(|| {
+                    format!(
+                        "cannot restore {} from {}",
+                        recorded_path.display(),
+                        replayed_path.display()
+                    )
+                })?;
+                restored = Some(recorded);
+            }
+        }
+        for output in &entry.outputs {
+            if restored == Some(&output.path) {
+                continue;
+            }
+            match detcore::Digest::digest_path(workspace.join(&output.path)) {
+                Ok(digest) if digest.to_string() == output.sha256 => {}
+                _ => return Ok(None),
+            }
+        }
+        self.logged_to = self.trial_global_opts().log_file;
+        self.journaled_log_bytes = entry.log_bytes;
+        eprintln!(
+            ":: {} answered from the journal of an earlier invocation: {}",
+            self.runname,
+            match entry.end {
+                RecordedEnd::Finished { matched: true } => "met the target",
+                RecordedEnd::Finished { matched: false } => "missed the target",
+                RecordedEnd::Timeout => "its bound stopped it",
+                RecordedEnd::Refusal => "Hermit refused it",
+            }
+        );
+        Ok(Some(match entry.end {
+            RecordedEnd::Finished { matched } => {
+                self.is_a_match = Some(matched);
+                self.wall = entry.wall_ms.map(Duration::from_millis);
+                Ok(())
+            }
+            RecordedEnd::Timeout => {
+                Err(self.name_the_trial_bound(anyhow::Error::new(RunTimeoutMarker)))
+            }
+            RecordedEnd::Refusal => Err(anyhow::Error::new(crate::container::PolicyRefusal)),
+        }))
+    }
+
+    /// Journal the run that `launched` as it did, keyed `key`. A run that
+    /// ended any other way than finishing, its own bound or a refusal is not
+    /// journaled: it ends the analysis, and a resume runs it again.
+    fn journal_outcome(
+        &mut self,
+        journal: &Journal,
+        key: String,
+        launched: &anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let end = match launched {
+            Ok(()) => RecordedEnd::Finished {
+                matched: self.is_a_match(),
+            },
+            Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                RecordedEnd::Timeout
+            }
+            Err(error) if guest_reached_a_refusal(error) => RecordedEnd::Refusal,
+            Err(_) => return Ok(()),
+        };
+        let workspace = self.analyze_opts.get_tmp()?.to_path_buf();
+        let relative = |path: &Path| path.strip_prefix(&workspace).unwrap_or(path).to_path_buf();
+        let root = self.root_path();
+        let config = &self.runopts.det_opts.det_config;
+        // Not its log: a trial log can be hundreds of megabytes, and nothing
+        // decides from it; its size is in `log_bytes`.
+        let mut written = vec![root.with_extension("stdout"), root.with_extension("stderr")];
+        written.extend(config.record_preemptions_to.clone());
+        written.extend(
+            config
+                .stacktrace_event
+                .iter()
+                .filter_map(|(_, path)| path.clone()),
+        );
+        let mut outputs = Vec::new();
+        for path in written {
+            if let Ok(digest) = detcore::Digest::digest_path(&path) {
+                outputs.push(RecordedFile {
+                    path: relative(&path),
+                    sha256: digest.to_string(),
+                });
+            }
+        }
+        let recording_replays_input =
+            match (&config.record_preemptions_to, &config.replay_schedule_from) {
+                (Some(recorded), Some(replayed)) if recorded.exists() && replayed.exists() => {
+                    let events = |path: &Path| PreemptionReader::new(path).load_all();
+                    (events(recorded).schedevents() == events(replayed).schedevents())
+                        .then(|| (relative(recorded), relative(replayed)))
+                }
+                _ => None,
+            };
+        journal.record(JournalEntry {
+            run: self.runname.clone(),
+            key,
+            end,
+            wall_ms: self.wall.map(|wall| wall.as_millis() as u64),
+            log_bytes: self
+                .logged_to
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len()),
+            outputs,
+            recording_replays_input,
+        })
+    }
+
+    /// Run it: the part of `launch` that starts the guest. `own_timeout` is
+    /// the run's `--timeout` before the budget shortened it, which its
+    /// reproducer carries.
+    fn run_now(&mut self, own_timeout: Option<NonZeroU64>) -> anyhow::Result<()> {
+        stop::check()?;
         let root = self.root_path();
         let gopts = self.trial_global_opts();
         // Open it HERE, on the host, for the same reason `main` does: `launch` runs
@@ -209,6 +562,7 @@ impl RunData {
         // /tmp -- but the fix is the same and costs nothing.
         let mut gopts = gopts;
         gopts.open_log_file()?;
+        self.logged_to = gopts.log_file.clone();
         let final_record_path = self
             .runopts
             .det_opts
@@ -224,12 +578,15 @@ impl RunData {
 
         self.runopts.validate_args()?;
 
-        let repro_file = self.root_path().with_extension("repro");
-        std::fs::write(repro_file, self.to_repro() + "\n")?;
+        self.write_repro(own_timeout)?;
         self.runopts.write_debug_options_dump()?;
 
-        let (_, output) = self.runopts.run(&gopts, true)?;
+        let started = Instant::now();
+        let ran = self.runopts.run(&gopts, true);
+        stop::check()?;
+        let (_, output) = ran.map_err(|error| self.name_the_trial_bound(error))?;
         let output: Output = output.context("expected captured output")?;
+        self.wall = Some(started.elapsed());
 
         File::create(root.with_extension("stdout"))
             .unwrap()
@@ -267,6 +624,86 @@ impl RunData {
         Ok(())
     }
 
+    /// Write the run's reproducer, `<run>.repro`, with `own_timeout`, its
+    /// `--timeout` before the budget shortened it: a command to replay it
+    /// does not carry the time an invocation happened to have left.
+    fn write_repro(&mut self, own_timeout: Option<NonZeroU64>) -> anyhow::Result<()> {
+        let bounded = self.runopts.run_timeout_seconds();
+        self.runopts.set_run_timeout(own_timeout);
+        let repro = self.to_repro();
+        self.runopts.set_run_timeout(bounded);
+        std::fs::write(self.root_path().with_extension("repro"), repro + "\n")?;
+        Ok(())
+    }
+
+    /// Launch a trial and say how it ended ([`TrialEnd::classify`]).
+    pub fn launch_trial(&mut self) -> anyhow::Result<TrialEnd> {
+        let launched = self.launch();
+        TrialEnd::classify(launched, || self.is_a_match(), self.logged_to.as_deref())
+    }
+
+    /// Bound the run's wall-clock time ([`AnalyzeOpts::trial_bound`]) by the
+    /// endpoint runs measured before it was created.
+    fn apply_trial_bound(&mut self) {
+        let Some(bound) = self.analyze_opts.trial_bound(&self.runopts) else {
+            return;
+        };
+        if self
+            .runopts
+            .run_timeout()
+            .is_none_or(|own| own.as_secs() > bound.get())
+        {
+            self.trial_bound = Some(bound);
+        }
+        self.runopts.bound_run_timeout(bound);
+    }
+
+    /// A run that `--trial-timeout`'s bound ended says so, and how to change
+    /// the bound: the error itself names only the run's `--timeout`, which
+    /// the user did not pass.
+    fn name_the_trial_bound(&self, error: anyhow::Error) -> anyhow::Error {
+        match self.trial_bound {
+            Some(bound) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                error.context(format!(
+                    "{} reached hermit analyze's bound of {bound} s for this run \
+                     (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)",
+                    self.runname
+                ))
+            }
+            _ => error,
+        }
+    }
+
+    /// How long the run took and how large its log file grew, once it
+    /// finished: what an endpoint run contributes to the trials' bounds.
+    pub fn measurement(&self) -> Option<(Duration, Option<u64>)> {
+        let wall = self.wall?;
+        let log_bytes = self.journaled_log_bytes.or_else(|| {
+            self.logged_to
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+        });
+        Some((wall, log_bytes))
+    }
+
+    /// A test's trial runner ([`TrialRunner`]) ends a run as `run_now`
+    /// would: its output written, whether it `matched` and its `wall` time.
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self, matched: bool, wall: Duration) {
+        let root = self.root_path();
+        let said = if matched { "FAILED\n" } else { "PASSED\n" };
+        std::fs::write(root.with_extension("stdout"), said).unwrap();
+        std::fs::write(root.with_extension("stderr"), "").unwrap();
+        self.is_a_match = Some(matched);
+        self.wall = Some(wall);
+    }
+
+    /// This run's name in the workspace.
+    pub fn name(&self) -> &str {
+        &self.runname
+    }
+
     /// Any post-processing that needs to be applied to a recorded file of SchedEvents
     pub fn post_process_events_file(sched_path: &Path, dest: &Path) -> anyhow::Result<()> {
         let _ = strip_times_from_events_file(sched_path, Some(dest.to_owned()))?;
@@ -294,7 +731,16 @@ impl RunData {
         lvl
     }
 
+    /// A run with `runopts`, bounded by the endpoint runs measured so far
+    /// ([`AnalyzeOpts::trial_bound`]).
     pub fn new(aopts: &AnalyzeOpts, runname: String, runopts: RunOpts) -> Self {
+        let mut run = Self::new_unbounded(aopts, runname, runopts);
+        run.apply_trial_bound();
+        run
+    }
+
+    /// A run with `runopts` that no `--trial-timeout` bounds: the target run.
+    fn new_unbounded(aopts: &AnalyzeOpts, runname: String, runopts: RunOpts) -> Self {
         let log_level: LevelFilter = Self::log_level(aopts);
         let mut rd = RunData {
             runname,
@@ -308,6 +754,10 @@ impl RunData {
             in_mem_sched_out: None,
             is_a_match: None,
             log_level,
+            trial_bound: None,
+            wall: None,
+            logged_to: None,
+            journaled_log_bytes: None,
         };
 
         // By default we save the config for every run.
@@ -326,10 +776,11 @@ impl RunData {
         Ok(Self::new(aopts, runname, ro))
     }
 
-    /// Create a run for the initial on-target execution.
+    /// Create a run for the initial on-target execution. It is the first
+    /// run, and the trials' bound derives from it, so nothing bounds it.
     pub fn new_run1_target(aopts: &AnalyzeOpts, runname: String) -> anyhow::Result<Self> {
         let ro = Self::get_run1_runopts(aopts)?;
-        Ok(Self::new(aopts, runname, ro))
+        Ok(Self::new_unbounded(aopts, runname, ro))
     }
 
     /// Replay with the selected run's seeds and the original replay policy.
@@ -348,6 +799,8 @@ impl RunData {
         config.rng_seed = target.rng_seed;
         config.fuzz_seed = target.fuzz_seed;
         config.sched_seed = target.sched_seed;
+        // A replay of the target run is a trial, bounded like the others.
+        replay.apply_trial_bound();
         Ok(replay)
     }
 
@@ -415,6 +868,12 @@ impl RunData {
         }
         runopts.validate_args()?;
         Ok(())
+    }
+
+    /// The run arguments as `hermit run` parses them, before analyze changes
+    /// anything.
+    pub fn raw_runopts(aopts: &AnalyzeOpts) -> RunOpts {
+        Self::get_raw_runopts(aopts)
     }
 
     /// The raw, unvarnished, RunOpts.
@@ -510,6 +969,10 @@ impl RunData {
             in_mem_preempts_in: None,
             // Invariant: minimize should always return an on-target configuration:
             is_a_match: Some(true),
+            trial_bound: None,
+            wall: None,
+            logged_to: None,
+            journaled_log_bytes: None,
         }
     }
 
@@ -534,6 +997,10 @@ impl RunData {
             in_mem_preempts_in: None,
             // Don't claim that it was run:
             is_a_match: None,
+            trial_bound: None,
+            wall: None,
+            logged_to: None,
+            journaled_log_bytes: None,
         }
     }
 
@@ -607,6 +1074,156 @@ impl RunData {
 }
 
 impl AnalyzeOpts {
+    /// The wall-clock bound, in whole seconds, on a run with `trial`'s
+    /// options (`--trial-timeout`): none where `--timeout` cannot be
+    /// enforced, and with `auto` max(60 s, 10 times the slowest endpoint run
+    /// measured so far), none before one was, times
+    /// [`AnalyzeOpts::trial_bound_factor`].
+    pub fn trial_bound(&self, trial: &RunOpts) -> Option<NonZeroU64> {
+        self.trial_bound_times(trial, self.trial_bound_factor)
+    }
+
+    /// [`AnalyzeOpts::trial_bound`] with the bound multiplied by `factor`.
+    fn trial_bound_times(&self, trial: &RunOpts, factor: u32) -> Option<NonZeroU64> {
+        if !trial.accepts_run_timeout() {
+            return None;
+        }
+        match self.trial_timeout {
+            TrialTimeout::Off => None,
+            TrialTimeout::Seconds(seconds) => {
+                NonZeroU64::new(seconds.get().saturating_mul(u64::from(factor)))
+            }
+            TrialTimeout::Auto => {
+                let bound = self
+                    .endpoints
+                    .slowest?
+                    .saturating_mul(TRIAL_TIMEOUT_FACTOR)
+                    .max(TRIAL_TIMEOUT_FLOOR)
+                    .saturating_mul(factor);
+                NonZeroU64::new(bound.as_secs() + u64::from(bound.subsec_nanos() > 0))
+            }
+        }
+    }
+
+    /// The wall-clock bound, in whole seconds, a `--prefix-search` trial gets
+    /// when it runs again to confirm the boundary: [`CONFIRM_BOUND_FACTOR`]
+    /// times `--trial-timeout`'s, within the run arguments' own `--timeout`.
+    /// None unless that is longer than the bound trials get now: none with
+    /// `--trial-timeout=off`, once the bound was raised, or where a shorter
+    /// `--timeout` in the run arguments applies.
+    pub fn confirmation_bound(&self) -> Option<u64> {
+        if self.trial_bound_factor != 1 {
+            return None;
+        }
+        let longer = self.effective_trial_bound_times(CONFIRM_BOUND_FACTOR)?;
+        self.effective_trial_bound_times(1)
+            .is_some_and(|now| longer > now)
+            .then_some(longer)
+    }
+
+    /// The run arguments' own `--timeout`, in whole seconds.
+    pub fn run_args_timeout(&self) -> Option<u64> {
+        RunData::get_raw_runopts(self)
+            .run_timeout()
+            .map(|own| own.as_secs())
+    }
+
+    /// The wall-clock bound, in whole seconds, a trial created now runs
+    /// under: [`AnalyzeOpts::trial_bound`], or the run arguments' own
+    /// `--timeout` where that is shorter.
+    pub fn effective_trial_bound(&self) -> Option<u64> {
+        self.effective_trial_bound_times(self.trial_bound_factor)
+    }
+
+    /// [`AnalyzeOpts::effective_trial_bound`] with `--trial-timeout`'s bound
+    /// multiplied by `factor`.
+    fn effective_trial_bound_times(&self, factor: u32) -> Option<u64> {
+        let trial = RunData::get_raw_runopts(self);
+        let own = trial.run_timeout().map(|own| own.as_secs());
+        let analyze = self.trial_bound_times(&trial, factor).map(NonZeroU64::get);
+        match (own, analyze) {
+            (Some(own), Some(analyze)) => Some(own.min(analyze)),
+            (own, analyze) => own.or(analyze),
+        }
+    }
+
+    /// The cap on a trial's log file while trials are bounded: max(64 MiB,
+    /// 10 times the largest endpoint log), once an endpoint run has written
+    /// one.
+    pub fn trial_log_limit(&self) -> Option<u64> {
+        if self.trial_timeout == TrialTimeout::Off {
+            return None;
+        }
+        let largest = self.endpoints.largest_log?;
+        Some(
+            largest
+                .saturating_mul(TRIAL_LOG_FACTOR)
+                .max(TRIAL_LOG_FLOOR),
+        )
+    }
+
+    /// Record a finished endpoint `run`, and say what bound the runs after it
+    /// now get, when that changed.
+    pub fn record_endpoint(&mut self, run: &RunData) {
+        let Some((wall, log_bytes)) = run.measurement() else {
+            return;
+        };
+        let trial = RunData::get_raw_runopts(self);
+        let first = self.endpoints.slowest.is_none();
+        let before = self.trial_bound(&trial);
+        if !self.endpoints.record(wall, log_bytes) || self.trial_timeout != TrialTimeout::Auto {
+            return;
+        }
+        let Some(bound) = self.trial_bound(&trial) else {
+            if !first {
+                return;
+            }
+            eprintln!(
+                ":: {} the runs' backend does not enforce hermit run --timeout, so analyze \
+                 does not bound them (--trial-timeout). Bound the whole analysis from outside \
+                 instead, for example with timeout(1).",
+                "WARNING:".yellow().bold()
+            );
+            return;
+        };
+        if before == Some(bound) {
+            return;
+        }
+        let shorter = trial
+            .run_timeout()
+            .filter(|own| own.as_secs() < bound.get())
+            .map_or(String::new(), |own| {
+                format!(
+                    "; the run arguments' shorter --timeout={} applies instead",
+                    own.as_secs()
+                )
+            });
+        eprintln!(
+            ":: Runs from here on are bounded at {bound} s of wall-clock time: max(60 s, 10 x \
+             the slowest endpoint run, {} at {:.1} s) (--trial-timeout{shorter}).",
+            run.name(),
+            wall.as_secs_f64(),
+        );
+    }
+
+    /// Refuses (exit 122) an explicit `--trial-timeout=SECONDS` where the
+    /// trials' backend does not enforce `hermit run --timeout`
+    /// (`RunOpts::ensure_timeout_supported`), before any workspace or trial
+    /// exists: the bound could not be kept.
+    pub fn refuse_unenforceable_trial_timeout(&self) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        match self.trial_timeout {
+            TrialTimeout::Seconds(seconds) if !trial.accepts_run_timeout() => Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "--trial-timeout={seconds} cannot be enforced: the trials run on a backend \
+                     on which `hermit run --timeout` is not qualified. Use --trial-timeout=off \
+                     and an outer bound (see docs/TIMEOUT_LADDER.md)."
+                )),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// Refuses `--max-log-bytes` (exit 122) where the cap's `_exit(123)` could
     /// leave a trial's guest running (`RunOpts::log_cap_refusal`). `run` makes
     /// this check in `RunOpts::main`, but trials go straight to `RunOpts::run`,
@@ -768,6 +1385,43 @@ impl AnalyzeOpts {
         )
     }
 
+    /// Refuses (exit 122) a `--continuation-timeslice` that would change the
+    /// replayed prefix, before any workspace or trial: one shorter than the
+    /// run's `--max-timeslice`, which also ends the prefix's slices that its
+    /// schedule does not end, or one for a run without PMU timeslices, whose
+    /// clock it would change.
+    pub fn refuse_unsound_continuation_timeslice(&self) -> anyhow::Result<()> {
+        let ContinuationTimeslice::Nanos(nanos) = self.continuation_timeslice else {
+            return Ok(());
+        };
+        let reason = match self.trial_max_timeslice() {
+            None => "the run arguments disable PMU timeslices, and a continuation timeslice \
+                     would turn them on for the replayed prefix too"
+                .to_owned(),
+            Some(run) if nanos < run => format!(
+                "it is shorter than the run's --max-timeslice={run}, and the trials' timeslice \
+                 also ends the replayed prefix's slices that its schedule does not end, so it \
+                 would change the prefix"
+            ),
+            Some(_) => return Ok(()),
+        };
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "--continuation-timeslice={nanos} is refused: {reason}. Omit it (auto), or pass \
+                 a timeslice at least as long as the run's own."
+            )),
+        )
+    }
+
+    /// The trials' `--max-timeslice`, from their run arguments (`None` for
+    /// disabled).
+    pub fn trial_max_timeslice(&self) -> detcore_model::config::MaybeTimeslice {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .max_timeslice
+    }
+
     /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
     /// for off).
     pub fn trial_pipe_wake_latency(&self) -> Option<u64> {
@@ -853,9 +1507,17 @@ impl AnalyzeOpts {
     }
 
     /// Write the schedule `events` for a trial to replay, stamped
-    /// ([`Self::stamp_trial_record`]).
+    /// ([`Self::stamp_trial_record`]). The events alone carry no callback
+    /// checkpoints: a schedule analyze edits (a swap, a reordering) has no
+    /// recorded slice ends to keep.
     pub fn write_trial_schedule(&self, events: Vec<SchedEvent>, path: &Path) -> anyhow::Result<()> {
-        self.stamp_trial_record(PreemptionRecord::from_sched_events(events))
+        self.write_trial_record(PreemptionRecord::from_sched_events(events), path)
+    }
+
+    /// Write `record` for a trial to replay, stamped
+    /// ([`Self::stamp_trial_record`]).
+    pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
+        self.stamp_trial_record(record)
             .write_to_disk(path)
             .map_err(anyhow::Error::msg)
     }
@@ -2091,6 +2753,665 @@ mod tests {
                 config.record_preemptions_to.as_ref(),
                 Some(&workspace.path().join("replay_out.preempts")),
             );
+        }
+    }
+
+    /// `--trial-timeout=auto` bounds a run at max(60 s, 10 times the
+    /// slowest endpoint run measured so far), rounded up to whole seconds,
+    /// and gives no bound before an endpoint was measured; a number of
+    /// seconds bounds every run but the target run, and `off` none.
+    #[test]
+    fn the_trial_bound_derives_from_the_slowest_endpoint_run() {
+        use std::time::Duration;
+        let options = |extra: &[&str]| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.extend(["--", "/bin/true"]);
+            AnalyzeOpts::try_parse_from(argv).unwrap()
+        };
+        let mut auto = options(&[]);
+        let trial = RunData::get_raw_runopts(&auto);
+        assert_eq!(auto.trial_bound(&trial), None, "nothing measured yet");
+        assert!(auto.endpoints.record(Duration::from_secs(2), None));
+        assert_eq!(auto.trial_bound(&trial), NonZeroU64::new(60), "the floor");
+        assert!(auto.endpoints.record(Duration::from_millis(30_150), None));
+        assert_eq!(auto.trial_bound(&trial), NonZeroU64::new(302));
+        assert!(
+            !auto.endpoints.record(Duration::from_secs(1), None),
+            "a faster endpoint changes nothing"
+        );
+        assert_eq!(auto.trial_bound(&trial), NonZeroU64::new(302));
+
+        let explicit = options(&["--trial-timeout=5"]);
+        assert_eq!(
+            explicit.trial_bound(&trial),
+            NonZeroU64::new(5),
+            "an explicit bound needs no measurement"
+        );
+        let mut off = options(&["--trial-timeout=off"]);
+        off.endpoints.record(Duration::from_secs(30), None);
+        assert_eq!(off.trial_bound(&trial), None);
+        for refused in ["--trial-timeout=0", "--trial-timeout=soon"] {
+            let error = AnalyzeOpts::try_parse_from(["analyze", refused, "--", "/bin/true"])
+                .expect_err(refused);
+            assert!(
+                error.to_string().contains("positive number of seconds"),
+                "{refused}: {error}"
+            );
+        }
+    }
+
+    /// A run created after an endpoint run was measured runs under the
+    /// bound, or under the run arguments' own `--timeout` where that is
+    /// shorter, and so does its printed reproducer; the target run is not
+    /// bounded.
+    #[test]
+    fn runs_take_the_bound_and_the_target_run_does_not() {
+        let created = |run_args: &[&str], explicit: Option<&str>| {
+            let mut argv = vec!["analyze"];
+            argv.extend(explicit);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            options
+                .endpoints
+                .record(std::time::Duration::from_secs(10), None);
+            let trial = RunData::new_baseline(&options, "bounded".to_owned()).unwrap();
+            let target = RunData::new_run1_target(&options, "target".to_owned()).unwrap();
+            let seconds = |run: &RunData| run.runopts.run_timeout().map(|bound| bound.as_secs());
+            assert_eq!(
+                trial.to_repro().contains(" --timeout="),
+                seconds(&trial).is_some(),
+                "{}",
+                trial.to_repro()
+            );
+            (seconds(&trial), seconds(&target), trial.trial_bound)
+        };
+        assert_eq!(created(&[], None), (Some(100), None, NonZeroU64::new(100)));
+        assert_eq!(created(&["--timeout=30"], None), (Some(30), Some(30), None));
+        assert_eq!(
+            created(&["--timeout=300"], None),
+            (Some(100), Some(300), NonZeroU64::new(100))
+        );
+        assert_eq!(
+            created(&[], Some("--trial-timeout=off")),
+            (None, None, None)
+        );
+    }
+
+    /// A `--prefix-search` confirmation runs under 4 times `--trial-timeout`'s
+    /// bound, within the run arguments' own `--timeout`, and once the bound
+    /// is raised the runs created after that take it. `off`, a shorter
+    /// `--timeout` in the run arguments, or a bound raised already leaves
+    /// nothing longer to give.
+    #[test]
+    fn a_confirmation_lengthens_the_trial_bound() {
+        let options = |extra: &[&str], run_args: &[&str]| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            options
+                .endpoints
+                .record(std::time::Duration::from_millis(10_400), None);
+            options
+        };
+        assert_eq!(options(&[], &[]).confirmation_bound(), Some(416));
+        assert_eq!(
+            options(&[], &["--timeout=120"]).confirmation_bound(),
+            Some(120)
+        );
+        assert_eq!(options(&[], &["--timeout=30"]).confirmation_bound(), None);
+        assert_eq!(
+            options(&["--trial-timeout=5"], &[]).confirmation_bound(),
+            Some(20)
+        );
+        assert_eq!(
+            options(&["--trial-timeout=off"], &[]).confirmation_bound(),
+            None
+        );
+        let mut raised = options(&[], &[]);
+        assert_eq!(raised.effective_trial_bound(), Some(104));
+        raised.trial_bound_factor = CONFIRM_BOUND_FACTOR;
+        assert_eq!(raised.confirmation_bound(), None);
+        assert_eq!(raised.effective_trial_bound(), Some(416));
+        let workspace = tempfile::tempdir().unwrap();
+        raised.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_baseline(&raised, "prefix_round_002".to_owned()).unwrap();
+        assert_eq!(
+            run.runopts.run_timeout().map(|bound| bound.as_secs()),
+            Some(416)
+        );
+        assert_eq!(run.trial_bound, NonZeroU64::new(416));
+    }
+
+    /// A run that the bound ended says which bound it was and how to change
+    /// it; one that its own `--timeout` ended, or that failed otherwise, is
+    /// left as it was.
+    #[test]
+    fn a_run_the_trial_bound_ends_names_the_bound() {
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        options
+            .endpoints
+            .record(std::time::Duration::from_secs(1), None);
+        let run = RunData::new_baseline(&options, "run2_baseline".to_owned()).unwrap();
+        let timed_out = run.name_the_trial_bound(anyhow::Error::new(RunTimeoutMarker));
+        assert!(timed_out.downcast_ref::<RunTimeoutMarker>().is_some());
+        let message = format!("{timed_out:#}");
+        assert!(
+            message.starts_with(
+                "run2_baseline reached hermit analyze's bound of 60 s for this run \
+                 (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)"
+            ),
+            "{message}"
+        );
+        let other = run.name_the_trial_bound(anyhow::anyhow!("no such file"));
+        assert_eq!(format!("{other:#}"), "no such file");
+    }
+
+    /// While trials are bounded, a trial's log file is capped at
+    /// max(64 MiB, 10 times the largest endpoint log); before an endpoint
+    /// wrote one, or with `--trial-timeout=off`, by HERMIT_LOG_MAX_BYTES alone.
+    #[test]
+    fn a_trials_log_is_capped_by_the_largest_endpoint_log() {
+        use std::time::Duration;
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        assert_eq!(options.trial_log_limit(), None);
+        options
+            .endpoints
+            .record(Duration::from_secs(1), Some(1 << 20));
+        assert_eq!(options.trial_log_limit(), Some(64 << 20));
+        options
+            .endpoints
+            .record(Duration::from_secs(1), Some(100 << 20));
+        assert_eq!(options.trial_log_limit(), Some(1000 << 20));
+        options
+            .endpoints
+            .record(Duration::from_secs(1), Some(2 << 20));
+        assert_eq!(options.trial_log_limit(), Some(1000 << 20));
+        options.trial_timeout = TrialTimeout::Off;
+        assert_eq!(options.trial_log_limit(), None);
+    }
+
+    /// A trial that did not finish did not reach the target: one that a
+    /// bound ended, or that Hermit refused at run time (a bare refusal, whose
+    /// reason Detcore logged). A refusal decided before the guest started
+    /// (with its reason attached) and any other failure (here: the log cap)
+    /// end the analysis with their error, still of their type.
+    #[test]
+    fn a_trial_that_did_not_finish_did_not_reach_the_target() {
+        let classify = |launched: anyhow::Result<()>, matched: bool| {
+            TrialEnd::classify(launched, || matched, None)
+        };
+        assert_eq!(classify(Ok(()), true).unwrap(), TrialEnd::Met);
+        assert_eq!(classify(Ok(()), false).unwrap(), TrialEnd::Missed);
+        let timed_out = anyhow::Error::new(RunTimeoutMarker)
+            .context("Guest exceeded the --timeout bound of 3 seconds");
+        let end = classify(Err(timed_out), true).unwrap();
+        assert_eq!(end, TrialEnd::Unfinished(Stop::Bound));
+        assert!(!end.reached_target() && !end.finished());
+        let refused = anyhow::Error::new(crate::container::PolicyRefusal);
+        assert_eq!(
+            classify(Err(refused), true).unwrap(),
+            TrialEnd::Unfinished(Stop::Refusal)
+        );
+        let admission = anyhow::Error::new(crate::container::PolicyRefusal)
+            .context("unsupported_preemption: --backend=kvm refuses --max-timeslice");
+        let admission = classify(Err(admission), true).unwrap_err();
+        assert!(
+            admission
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some()
+                && format!("{admission:#}").contains("unsupported_preemption"),
+            "{admission:#}"
+        );
+        let capped = classify(
+            Err(anyhow::Error::new(crate::container::LogCapExceeded)),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            capped
+                .downcast_ref::<crate::container::LogCapExceeded>()
+                .is_some(),
+            "{capped:#}"
+        );
+    }
+
+    /// An explicit `--trial-timeout` that the runs cannot keep (KVM, which
+    /// does not enforce `--timeout`, and the in-guest runtime, which refuses
+    /// one) is refused before any workspace or run; `auto` does without it.
+    #[test]
+    fn an_unenforceable_trial_timeout_is_refused_and_auto_does_without() {
+        let options = |argv: &[&str]| {
+            let args = crate::Args::try_parse_from(argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        let mut backends = vec!["kvm"];
+        if cfg!(feature = "liteinst") {
+            backends.push("liteinst");
+        }
+        for backend in backends {
+            let backend = format!("--backend={backend}");
+            let explicit = options(&[
+                "hermit",
+                &backend,
+                "analyze",
+                "--trial-timeout=5",
+                "--",
+                "/bin/true",
+            ]);
+            let error = explicit
+                .refuse_unenforceable_trial_timeout()
+                .expect_err("the runs cannot keep a --timeout");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{backend}: {error:#}"
+            );
+            assert!(error.to_string().contains("--trial-timeout=5"), "{error:#}");
+
+            let mut auto = options(&["hermit", &backend, "analyze", "--", "/bin/true"]);
+            auto.refuse_unenforceable_trial_timeout().unwrap();
+            auto.endpoints
+                .record(std::time::Duration::from_secs(10), None);
+            assert_eq!(
+                auto.trial_bound(&RunData::get_raw_runopts(&auto)),
+                None,
+                "{backend}"
+            );
+        }
+        options(&["hermit", "analyze", "--trial-timeout=5", "--", "/bin/true"])
+            .refuse_unenforceable_trial_timeout()
+            .unwrap();
+    }
+
+    /// A `--continuation-timeslice` shorter than the run's `--max-timeslice`,
+    /// or one for a run without PMU timeslices, is refused before any
+    /// workspace or trial, naming what to pass instead; one at least as long
+    /// is accepted.
+    #[test]
+    fn a_continuation_timeslice_that_would_change_the_prefix_is_refused() {
+        let refusal = |argv: &[&str]| {
+            let mut full = vec!["analyze", "--prefix-search"];
+            full.extend(argv);
+            full.push("/bin/true");
+            AnalyzeOpts::try_parse_from(full)
+                .unwrap()
+                .refuse_unsound_continuation_timeslice()
+        };
+        for (argv, reason) in [
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=100000",
+                ][..],
+                "shorter than the run's --max-timeslice=100000",
+            ),
+            (
+                &["--continuation-timeslice=20000000", "--"][..],
+                "shorter than the run's --max-timeslice=200000000",
+            ),
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=disabled",
+                ][..],
+                "disable PMU timeslices",
+            ),
+        ] {
+            let error = refusal(argv).expect_err(reason);
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(reason) && message.contains("Omit it (auto)"),
+                "{argv:?}: {message}"
+            );
+        }
+        refusal(&[
+            "--continuation-timeslice=200000000",
+            "--",
+            "--max-timeslice=1000",
+        ])
+        .unwrap();
+        refusal(&["--"]).unwrap();
+    }
+
+    /// The normalized copy of a run's preemption record is written beside it
+    /// for reading, and the run keeps its own record: the target endpoint
+    /// and --minimize's baseline replay the record that met the target.
+    /// Before, the run switched to the copy, whose renumbered priorities can
+    /// run another schedule, and a minimized record that met the target was
+    /// then "still not matching" it.
+    #[test]
+    fn a_normalized_record_is_written_for_reading_and_not_replayed() {
+        use detcore::preemptions::PreemptionRecord;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let recorded = workspace.path().join("round_014.preempts");
+        let history = vec![
+            (detcore::types::LogicalTime::from_nanos(1_000), 352),
+            (detcore::types::LogicalTime::from_nanos(2_000), 4923),
+        ];
+        let record = PreemptionRecord::from_vecs(&std::collections::BTreeMap::from([(
+            detcore::DetTid::from_raw(7),
+            history,
+        )]));
+        record.write_to_disk(&recorded).unwrap();
+        let mut run = RunData::from_minimize_output(
+            &options,
+            "minimized".to_owned(),
+            RunData::get_raw_runopts(&options),
+            record.clone(),
+            recorded.clone(),
+            workspace.path().join("round_014.log"),
+        );
+        let (normalized_path, normalized) = run.write_normalized_preempts();
+        assert_eq!(
+            normalized_path,
+            workspace.path().join("round_014.normalized")
+        );
+        assert!(normalized_path.exists());
+        assert_ne!(normalized, record, "normalizing renumbers the priorities");
+        assert_eq!(run.preempts_path_out(), recorded.as_path());
+        assert_eq!(run.preempts_out(), &record);
+    }
+
+    /// Analyze options with their workspace in `dir` and the journal on.
+    fn journaled_options(dir: &Path) -> AnalyzeOpts {
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", "--", "--chaos", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(dir.to_path_buf());
+        options.journal = Journal::open(dir).unwrap();
+        options
+    }
+
+    /// A run the journal holds, with the files it wrote unchanged, takes its
+    /// recorded outcome and wall time instead of running: `launch` here would
+    /// otherwise start a guest. A changed file makes it run again.
+    #[test]
+    fn a_journaled_run_takes_its_recorded_outcome_instead_of_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = journaled_options(dir.path());
+        let mut first = RunData::new_baseline(&options, "prefix_round_007".into()).unwrap();
+        let stdout = first.root_path().with_extension("stdout");
+        std::fs::write(&stdout, "FAILED\n").unwrap();
+        first.is_a_match = Some(true);
+        first.wall = Some(Duration::from_millis(2500));
+        let key = first.journal_key();
+        first
+            .journal_outcome(&options.journal, key.clone(), &Ok(()))
+            .unwrap();
+        let entry = options.journal.lookup(&key).unwrap();
+        assert_eq!(entry.end, RecordedEnd::Finished { matched: true });
+        assert_eq!(entry.wall_ms, Some(2500));
+        assert_eq!(entry.outputs.len(), 1, "{:?}", entry.outputs);
+        assert_eq!(entry.outputs[0].path, Path::new("prefix_round_007.stdout"));
+
+        // A later invocation's run of the same trial: answered.
+        let reopened = journaled_options(dir.path());
+        let mut again = RunData::new_baseline(&reopened, "prefix_round_007".into()).unwrap();
+        again.launch().unwrap();
+        assert!(again.is_a_match());
+        assert_eq!(
+            again.measurement(),
+            Some((Duration::from_millis(2500), None))
+        );
+        assert_eq!(reopened.journal.answered(), 1);
+
+        // Another trial (another name, so another key) is not.
+        let other = RunData::new_baseline(&reopened, "prefix_round_008".into()).unwrap();
+        assert_ne!(other.journal_key(), key);
+
+        // A file it wrote changed: it runs again.
+        std::fs::write(&stdout, "PASSED\n").unwrap();
+        let mut changed = RunData::new_baseline(&reopened, "prefix_round_007".into()).unwrap();
+        assert!(changed.answer_from_journal(&entry).unwrap().is_none());
+    }
+
+    /// A run its own bound stopped is journaled as such, and answered as the
+    /// same unfinished trial; one a refusal stopped likewise.
+    #[test]
+    fn a_journaled_timeout_or_refusal_is_answered_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = journaled_options(dir.path());
+        for (name, error, expected) in [
+            (
+                "bisect_round_001",
+                anyhow::Error::new(RunTimeoutMarker),
+                TrialEnd::Unfinished(Stop::Bound),
+            ),
+            (
+                "bisect_round_002",
+                anyhow::Error::new(crate::container::PolicyRefusal),
+                TrialEnd::Unfinished(Stop::Refusal),
+            ),
+        ] {
+            let mut first = RunData::new_baseline(&options, name.into()).unwrap();
+            let key = first.journal_key();
+            first
+                .journal_outcome(&options.journal, key, &Err(error))
+                .unwrap();
+            let mut again = RunData::new_baseline(&options, name.into()).unwrap();
+            assert_eq!(again.launch_trial().unwrap(), expected, "{name}");
+        }
+        // Any other error is not journaled: it ends the analysis, and a
+        // resume runs the trial again.
+        let mut failed = RunData::new_baseline(&options, "bisect_round_003".into()).unwrap();
+        let key = failed.journal_key();
+        failed
+            .journal_outcome(
+                &options.journal,
+                key.clone(),
+                &Err(anyhow::anyhow!("log cap")),
+            )
+            .unwrap();
+        assert_eq!(options.journal.lookup(&key), None);
+    }
+
+    /// A recording that analyze removed after reading it (to save disk) is
+    /// restored from the schedule the run replayed, when the two held the
+    /// same events, instead of running the trial again.
+    #[test]
+    fn a_removed_recording_is_restored_from_the_schedule_it_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = journaled_options(dir.path());
+        let events = vec![
+            SchedEvent::branches(detcore::types::DetTid::from_raw(3), 5),
+            SchedEvent::branches(detcore::types::DetTid::from_raw(4), 2),
+        ];
+        let make = || {
+            let mut run = RunData::new_baseline(&options, "bisect_round_004".into())
+                .unwrap()
+                .with_schedule_replay()
+                .with_schedule_recording();
+            let replayed = run.sched_path_in().to_path_buf();
+            options
+                .write_trial_schedule(events.clone(), &replayed)
+                .unwrap();
+            run
+        };
+        let mut first = make();
+        let recorded = first.sched_path_out().to_path_buf();
+        PreemptionRecord::from_sched_events(events.clone())
+            .write_to_disk(&recorded)
+            .unwrap();
+        first.is_a_match = Some(false);
+        let key = first.journal_key();
+        first
+            .journal_outcome(&options.journal, key.clone(), &Ok(()))
+            .unwrap();
+        assert!(
+            options
+                .journal
+                .lookup(&key)
+                .unwrap()
+                .recording_replays_input
+                .is_some()
+        );
+        std::fs::remove_file(&recorded).unwrap();
+        std::fs::remove_file(first.sched_path_in()).unwrap();
+
+        let mut again = make();
+        again.launch().unwrap();
+        assert!(!again.is_a_match());
+        assert_eq!(again.sched_out(), &events);
+    }
+
+    /// The budget shortens a run's `--timeout` to the time it has left,
+    /// unless the run's own bound is shorter, and no run starts once it is
+    /// spent.
+    #[test]
+    fn the_budget_bounds_each_run_and_starts_none_once_spent() {
+        use crate::analyze::budget::Budget;
+        use crate::analyze::budget::BudgetKind;
+        use crate::analyze::budget::TimeBudget;
+        use crate::analyze::budget::TrialBudget;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = journaled_options(dir.path());
+        options.budget = Budget::with_clock(
+            TimeBudget::Limit(Duration::from_secs(100)),
+            TrialBudget::Limit(NonZeroU64::new(2).unwrap()),
+            std::sync::Arc::new(|| Duration::from_secs(40)),
+        );
+        let mut run = RunData::new_baseline(&options, "prefix_round_001".into()).unwrap();
+        assert_eq!(run.runopts.run_timeout_seconds(), None);
+        assert!(run.bound_by_budget().unwrap());
+        assert_eq!(run.runopts.run_timeout_seconds(), NonZeroU64::new(60));
+
+        let mut own = RunData::new_baseline(&options, "prefix_round_002".into()).unwrap();
+        own.runopts.bound_run_timeout(NonZeroU64::new(30).unwrap());
+        assert!(!own.bound_by_budget().unwrap(), "its own 30 s is shorter");
+        assert_eq!(own.runopts.run_timeout_seconds(), NonZeroU64::new(30));
+
+        // The trial budget of two is spent: launch starts nothing.
+        let mut third = RunData::new_baseline(&options, "prefix_round_003".into()).unwrap();
+        let error = third.launch().unwrap_err();
+        let expired = error.downcast_ref::<BudgetExpired>().unwrap();
+        assert_eq!(expired.kind, BudgetKind::TrialBudget);
+        assert!(!third.has_launched());
+    }
+
+    /// The key names the contents of the schedule a run replays, not only
+    /// its name and command: the same trial replaying another schedule is
+    /// another run.
+    #[test]
+    fn the_key_names_what_the_run_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = journaled_options(dir.path());
+        let events = |count| {
+            vec![SchedEvent::branches(
+                detcore::types::DetTid::from_raw(3),
+                count,
+            )]
+        };
+        let mut run = RunData::new_baseline(&options, "bisect_round_005".into())
+            .unwrap()
+            .with_schedule_replay();
+        let path = run.sched_path_in().to_path_buf();
+        options.write_trial_schedule(events(5), &path).unwrap();
+        let first = run.journal_key();
+        options.write_trial_schedule(events(6), &path).unwrap();
+        assert_ne!(run.journal_key(), first);
+        options.write_trial_schedule(events(5), &path).unwrap();
+        assert_eq!(run.journal_key(), first);
+    }
+
+    /// A run that the budget's shortened `--timeout` ends is cut: the
+    /// analysis stops with the budget's error, journals nothing (a resume
+    /// runs it again) and gives the run its own bound back. The same end
+    /// under the run's own, shorter bound is the run's outcome, journaled as
+    /// a timeout.
+    #[test]
+    fn a_run_the_budgets_bound_ends_is_cut_and_not_journaled() {
+        use crate::analyze::budget::Budget;
+        use crate::analyze::budget::BudgetKind;
+        use crate::analyze::budget::TimeBudget;
+        use crate::analyze::budget::TrialBudget;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = journaled_options(dir.path());
+        options.budget = Budget::with_clock(
+            TimeBudget::Limit(Duration::from_secs(100)),
+            TrialBudget::Off,
+            std::sync::Arc::new(|| Duration::from_secs(40)),
+        );
+        let bounds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bounds.clone();
+        options.trial_runner = TrialRunner(Some(std::sync::Arc::new(move |run: &mut RunData| {
+            seen.lock().unwrap().push(run.runopts.run_timeout_seconds());
+            Err(anyhow::Error::new(RunTimeoutMarker))
+        })));
+
+        let mut own = RunData::new_baseline(&options, "prefix_round_001".into()).unwrap();
+        own.runopts.bound_run_timeout(NonZeroU64::new(30).unwrap());
+        assert_eq!(
+            own.launch_trial().unwrap(),
+            TrialEnd::Unfinished(Stop::Bound)
+        );
+        assert_eq!(options.journal.len(), 1, "its own bound ended it");
+
+        let mut cut = RunData::new_baseline(&options, "prefix_round_002".into()).unwrap();
+        let error = cut.launch().unwrap_err();
+        let expired = error
+            .downcast_ref::<BudgetExpired>()
+            .unwrap_or_else(|| panic!("{error:#}"));
+        assert_eq!(expired.kind, BudgetKind::TimeBudget);
+        assert_eq!(expired.cut.as_deref(), Some("prefix_round_002"));
+        assert_eq!(options.journal.len(), 1, "the cut run is not journaled");
+        assert_eq!(cut.runopts.run_timeout_seconds(), None);
+        assert_eq!(
+            *bounds.lock().unwrap(),
+            [NonZeroU64::new(30), NonZeroU64::new(60)]
+        );
+    }
+
+    /// A run's reproducer carries its own `--timeout`, never the shorter one
+    /// the budget gave it.
+    #[test]
+    fn the_reproducer_carries_the_runs_own_bound() {
+        use crate::analyze::budget::Budget;
+        use crate::analyze::budget::TimeBudget;
+        use crate::analyze::budget::TrialBudget;
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = journaled_options(dir.path());
+        options.budget = Budget::with_clock(
+            TimeBudget::Limit(Duration::from_secs(100)),
+            TrialBudget::Off,
+            std::sync::Arc::new(|| Duration::from_secs(40)),
+        );
+        for (name, own) in [
+            ("prefix_round_001", None),
+            ("prefix_round_002", NonZeroU64::new(200)),
+        ] {
+            let mut run = RunData::new_baseline(&options, name.into()).unwrap();
+            run.runopts.set_run_timeout(own);
+            assert!(run.bound_by_budget().unwrap());
+            assert_eq!(run.runopts.run_timeout_seconds(), NonZeroU64::new(60));
+            run.write_repro(own).unwrap();
+            let repro = std::fs::read_to_string(run.root_path().with_extension("repro")).unwrap();
+            assert!(!repro.contains("--timeout=60"), "{repro}");
+            assert_eq!(repro.contains("--timeout=200"), own.is_some(), "{repro}");
+            assert_eq!(run.runopts.run_timeout_seconds(), NonZeroU64::new(60));
         }
     }
 }
