@@ -32,21 +32,16 @@ impl Scheduler {
     /// thread, and every thread on a backend that does not retire a kill's
     /// victims at the kill turn) leave the scheduler at host-timed moments.
     /// Recorded where a run retires a kill's other threads at the delivery
-    /// (`retires_others_at_fatal_delivery`), or under `--pipe-wake-latency`
-    /// or `--virtual-timeout`.
+    /// (`retires_others_at_fatal_delivery`), under `--pipe-wake-latency` or
+    /// `--virtual-timeout`, or outside record/replay on a delivery path that
+    /// may file scheduler requests (`records_fatal_doom`).
+    /// The hand-off scan and the idle-poller deadlock check read the doom
+    /// (`fatal_signal_doomed`); the poll upgrade's count reads it until the
+    /// process's reap (`fatal_signals_unreaped`, forgotten in
+    /// `consume_child_wait`; `Scheduler::a_committed_doom_is_outstanding`).
     /// In-memory only; no recording carries it.
     pub(crate) fn record_committed_fatal_signal(&mut self, process: DetPid) {
         self.fatal_signal_doomed.insert(process);
-        self.fatal_signals_unreaped.insert(process);
-    }
-
-    /// Record, in every mode, that `process` received a signal whose default
-    /// action ends it, in the turn that delivered it, until its reap
-    /// (`consume_child_wait`). Only the poll upgrade's count reads it
-    /// (`Scheduler::a_committed_doom_is_outstanding`); the hand-off and the
-    /// deadlock check keep reading `fatal_signal_doomed`, recorded under
-    /// `--pipe-wake-latency` alone (`record_committed_fatal_signal`).
-    pub(crate) fn note_fatal_signal_delivery(&mut self, process: DetPid) {
         self.fatal_signals_unreaped.insert(process);
     }
 

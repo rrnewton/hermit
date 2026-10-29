@@ -7083,7 +7083,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 17;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 18;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -16653,12 +16653,15 @@ mod tests {
     /// sender makes in its turn: a process named by `kill`, and a SIGKILL with
     /// no named victim; another signal records nothing
     /// (https://github.com/rrnewton/hermit/issues/3904).
-    /// A fatal default-action delivery's `RecordFatalSignal` stops the poll
-    /// upgrade's count until the reap in every mode outside record/replay,
-    /// and dooms the process for the hand-off only under
-    /// `--pipe-wake-latency` (`Scheduler::note_fatal_signal_delivery`,
-    /// `Scheduler::record_committed_fatal_signal`; Claude review of
-    /// https://github.com/rrnewton/hermit/pull/4892).
+    /// A fatal default-action delivery committed without retiring the
+    /// process's other threads (`CommitFatalDelivery(false)`, which
+    /// `Detcore::inbound_delivered` sends outside record/replay,
+    /// `records_fatal_doom`) stops the poll upgrade's count until the reap
+    /// and dooms the process for the hand-off and the idle-poller check
+    /// (`Scheduler::record_committed_fatal_signal`; Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4892). A PID namespace's init,
+    /// which the scheduler does not doom (`Scheduler::commit_fatal_delivery`),
+    /// still stops the count: it fails closed.
     #[tokio::test]
     async fn a_fatal_delivery_stops_the_poll_upgrade_count_until_the_reap() {
         let plain = Config {
@@ -16667,8 +16670,20 @@ mod tests {
         };
         let mut pipe_wake = plain.clone();
         pipe_wake.pipe_wake_latency = Some(1_000);
-        for (config, hand_off) in [(plain, false), (pipe_wake, true)] {
+        for (config, label, init) in [
+            (plain.clone(), "plain", false),
+            (pipe_wake, "pipe-wake latency", false),
+            (plain, "a PID namespace's init", true),
+        ] {
             let (config, state, dettid, detpid) = cancellation_test_state_with_config(config);
+            if init {
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .thread_tree
+                    .mark_pid_namespace_init(detpid);
+            }
             assert_eq!(
                 state.sched.lock().unwrap().fatal_doom_recorded(detpid),
                 (false, false, false)
@@ -16680,17 +16695,18 @@ mod tests {
                         (
                             DetTime::new(&config),
                             MmId::initial(detpid),
-                            GlobalRequest::RecordFatalSignal,
+                            GlobalRequest::CommitFatalDelivery(false),
                         ),
                     )
                     .await
                     .1,
-                GlobalResponse::RecordFatalSignal(())
+                GlobalResponse::CommitFatalDelivery(false),
+                "{label}: nothing retired"
             );
             assert_eq!(
                 state.sched.lock().unwrap().fatal_doom_recorded(detpid),
-                (true, true, hand_off),
-                "pipe-wake latency {hand_off}"
+                (true, true, !init),
+                "{label}"
             );
         }
     }

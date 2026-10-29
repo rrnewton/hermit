@@ -554,12 +554,14 @@ struct PriorityCheckin<'a> {
     site: preemptions::callback_history::Site,
 }
 
-/// Whether a delivery whose default action ends its process records the doom
-/// with the scheduler (`GlobalRequest::RecordFatalSignal`), in the delivery's
-/// committed turn: under `--pipe-wake-latency` for the hand-off
-/// (`scheduler::pipe_wake`), and outside record/replay for the poll
-/// upgrade's count (`Scheduler::a_committed_doom_is_outstanding`), on a
-/// path that may file scheduler requests. A two-phase commit files none
+/// Whether a delivery whose default action ends its process is committed
+/// with the scheduler (`GlobalRequest::CommitFatalDelivery`, which records
+/// the doom) in the delivery's turn even where it retires no other thread
+/// (`syscalls::retires_others_at_fatal_delivery`): under
+/// `--pipe-wake-latency` for the hand-off (`scheduler::pipe_wake`), and
+/// outside record/replay for the poll upgrade's count
+/// (`Scheduler::a_committed_doom_is_outstanding`), on a path that may file
+/// scheduler requests. A two-phase commit files none
 /// (`two_phase_refusal`), which `--pipe-wake-latency` refuses anyway; a
 /// fatal delivery there goes on to `Tool::exit_for_predicted_death`, whose
 /// group Exit grant records the doom instead.

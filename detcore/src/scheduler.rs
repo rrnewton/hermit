@@ -1519,8 +1519,8 @@ pub struct Scheduler {
     /// deadlock check (`Scheduler::only_idle_guest_pollers_remain`).
     fatal_signal_doomed: BTreeSet<DetPid>,
     /// Processes a delivered signal with a fatal default action has doomed,
-    /// recorded in every mode and forgotten at the reap
-    /// (`note_fatal_signal_delivery`, `consume_child_wait`), for the poll
+    /// recorded at the delivery's commit and forgotten at the reap
+    /// (`record_committed_fatal_signal`, `consume_child_wait`), for the poll
     /// upgrade's count (`a_committed_doom_is_outstanding`).
     fatal_signals_unreaped: BTreeSet<DetPid>,
     /// Whether the `--pipe-wake-latency` hand-off has logged that it is inert.
@@ -5561,6 +5561,11 @@ impl Scheduler {
         let Some(process) = self.registered_process(sender) else {
             return false;
         };
+        // The poll upgrade's count stops at every such delivery, the two
+        // exceptions below included, until the process's reap: it fails
+        // closed where the scheduler cannot tell that the kernel ends the
+        // process at a committed point (`a_committed_doom_is_outstanding`).
+        self.fatal_signals_unreaped.insert(process);
         if self.thread_tree.is_pid_namespace_init(process)
             || self.exec_teardowns.contains_key(&process)
         {
@@ -17021,13 +17026,15 @@ impl Scheduler {
     /// (`Scheduler::commit_fatal_delivery`) for every default action that
     /// ends the process, wherever the backend may retire the process's other
     /// threads at that delivery (serialized threads, the guest's own kernel
-    /// signal state, no gdbserver: ptrace) or `--pipe-wake-latency` or
-    /// `--virtual-timeout` is on, except for a PID namespace's init and a
-    /// process with an exec in flight. Elsewhere this sees an unrecorded one
-    /// once its first victim has gone, and the dying thread's removal is
-    /// ordered, since the scheduler waits for a running thread to quiesce.
-    /// Siblings an exec tore down also left without a committed exit, so such
-    /// a process counts as going down too.
+    /// signal state, no gdbserver: ptrace), `--pipe-wake-latency` or
+    /// `--virtual-timeout` is on, or the run is outside record/replay on a
+    /// delivery path that may file scheduler requests (`records_fatal_doom`),
+    /// except for a PID namespace's init and a process with an exec in
+    /// flight. Elsewhere this sees an unrecorded one once its first victim
+    /// has gone, and the dying thread's removal is ordered, since the
+    /// scheduler waits for a running thread to quiesce. Siblings an exec tore
+    /// down also left without a committed exit, so such a process counts as
+    /// going down too.
     fn process_is_going_down(&self, tid: DetTid) -> bool {
         let Some(process) = self.thread_tree.thread_to_leader.get(&tid).copied() else {
             return true;
@@ -31690,7 +31697,7 @@ mod test {
                 s.record_committed_sigkill(DetTid::from_raw(writer.as_raw()), Some(writer));
             }),
             ("fatal signal", |s, writer| {
-                s.note_fatal_signal_delivery(writer)
+                s.record_committed_fatal_signal(writer)
             }),
         ];
         for (name, doom) in dooms {
