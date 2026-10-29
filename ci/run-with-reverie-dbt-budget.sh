@@ -3069,7 +3069,13 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 77ac9de280d5e6ac7505c55be5ff1a37e7996f95 (2026-10-29): from 7789af9e78f7967067e81c7369f7305555ba7d10.
+# CARRY TO 0afcb66a0d7ed157c3b5f324cb8f2e60cb20f5e2 (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
+# Interval: reverie train (1111, 1116, 1136, 1147, 1148, 1152, 1155,
+# 1160, 1161, 1162, 1178, 1179). The reverie-dbt tree is unchanged;
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, c1f267db, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
 # Interval: Counter2 lifecycle reports in the global owner (96a9ddb5),
 # generic command cases through actual DBT Tools (958575f9), the shared
 # ChromeTrace caller with inherited stdin (e1ef57aa) and ChunkyPrint caller
@@ -3077,7 +3083,13 @@ fi
 # (353ffffb). The reverie-dbt tree changed and the committed
 # inventory is 1043. The existing SDK budget carries, not runtime
 # equivalence.
-# CARRY TO 77ac9de280d5e6ac7505c55be5ff1a37e7996f95 (2026-10-29): from 7789af9e78f7967067e81c7369f7305555ba7d10.
+# CARRY TO 0afcb66a0d7ed157c3b5f324cb8f2e60cb20f5e2 (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
+# Interval: reverie train (1111, 1116, 1136, 1147, 1148, 1152, 1155,
+# 1160, 1161, 1162, 1178, 1179). The reverie-dbt tree is unchanged;
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, c1f267db, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
 # Interval: gdb signal/exit stops and interrupt stop (reverie 1104/1109).
 # reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs and third-party/ are
 # byte-identical by git object id between the pins (4e4afaa7, 3f2abba1,
@@ -3089,7 +3101,7 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=77ac9de280d5e6ac7505c55be5ff1a37e7996f95
+expected_pin=0afcb66a0d7ed157c3b5f324cb8f2e60cb20f5e2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
