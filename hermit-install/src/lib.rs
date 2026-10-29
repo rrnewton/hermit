@@ -8,7 +8,7 @@
 
 //! Build helper and finalizer for Hermit's release installation package.
 //!
-//! Default staging includes the core LiteInst resources. Full installations opt
-//! into `third-party-backends` to also stage DynamoRIO, SaBRe and e9patch. Both
-//! paths require the ordinary `stage-detcore-liteinst` finalizer after Cargo
-//! releases the target; selecting a package never bypasses its artifact proof.
+//! Staging includes the first-party LiteInst resources. DynamoRIO, SaBRe and
+//! e9patch are staged by their external repositories. The core package requires
+//! the ordinary `stage-detcore-liteinst` finalizer after Cargo releases the
+//! target; selecting a package never bypasses its artifact proof.
