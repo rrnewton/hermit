@@ -839,7 +839,6 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
 | `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
-
 | `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). Not with `--chaos-seeded-timeslice`, which draws the maximum instead. |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
