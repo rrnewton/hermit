@@ -3185,9 +3185,9 @@ mod legacy_backend_json {
     /// `eager_lone_preemptions` came after it too. DBT has no PMU timer, so
     /// the option has no effect there; it is never written and reads as
     /// false.
+    // `guest_ids` came after it too: DBT numbers its guest itself, so it is
+    // never written and reads as `GuestIds::Namespace`, its serde default.
     const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 35] = [
-        /// `guest_ids` came after it too: DBT numbers its guest itself, so it is
-        /// never written and reads as `GuestIds::Namespace`, its serde default.
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
