@@ -18637,13 +18637,15 @@ impl Scheduler {
     /// with timer preemption and the default heuristic, not replaying
     /// preemptions), and neither under a schedule replay nor under `hermit
     /// record`/`hermit replay` (`recordreplay_modes`), as for every deadline
-    /// hint. A schedule replay's live tail, once its trace has run out, is still
-    /// a schedule replay (`has_schedule_replay`): it runs without this count and
-    /// without the first-turn bound, as it runs without the starvation bound
-    /// (`bound_chaos_starvation`) and without any deadline hint (the guest side
-    /// reads `replay_schedule_from` for the whole run in
-    /// `cap_timeslice_at_deadline`). The tail is deterministic, and the
-    /// starvation these rules end can come back there.
+    /// hint. A schedule replay's live tail, once its trace has run out
+    /// (`schedule_replay_over`), is still a schedule replay to the scheduler
+    /// (`has_schedule_replay`): it runs without this count and without the
+    /// first-turn bound, as it runs without the starvation bound
+    /// (`bound_chaos_starvation`). Its threads, though, end slices there as in
+    /// a run without a schedule (`ThreadState::follows_replayed_schedule`), so
+    /// the tail does take deadline hints (`cap_timeslice_at_deadline`), only
+    /// not these two. The tail is deterministic, and the starvation these
+    /// rules end can come back there.
     /// The count is of committed turns, host-timed polling retries aside, as for
     /// `previous_turn_tid`: background calls and skipped turns do not commit, and
     /// host-timed admissions and signals change only which pass a turn falls in,
