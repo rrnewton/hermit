@@ -91,30 +91,6 @@ check_submodules() (
         path_names[$path]=$name
     done
 
-    # A submodule declared `update = none` is intentionally unpopulated:
-    # record which configured paths carry that declaration, by name.
-    local -A update_none=()
-    local update_file update_status=0
-    update_file=$(mktemp)
-    GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
-        config -z -f .gitmodules --get-regexp '^submodule\..*\.update$' >"$update_file" || update_status=$?
-    if ((update_status == 0)); then
-        local -a update_records=()
-        mapfile -d '' -t update_records <"$update_file"
-        local update_name
-        for record in "${update_records[@]}"; do
-            [[ $record == *$'\n'* ]] || fail 'malformed submodule update entry in .gitmodules'
-            key=${record%%$'\n'*}
-            update_name=${key#submodule.}
-            update_name=${update_name%.update}
-            [[ ${record#*$'\n'} == none ]] || continue
-            for path in "${configured_paths[@]}"; do
-                [[ ${path_names[$path]} == "$update_name" ]] && update_none[$path]=1
-            done
-        done
-    fi
-    rm -f -- "$update_file"
-
     ((${#configured[@]} == ${#gitlinks[@]})) || \
         fail ".gitmodules declares ${#configured[@]} path(s), but HEAD contains ${#gitlinks[@]} gitlink(s)"
     for path in "${!gitlinks[@]}"; do
@@ -122,8 +98,8 @@ check_submodules() (
             fail "committed gitlink is not declared in .gitmodules: $path"
     done
 
-    local observed=0 nested_root expected_root nested_head dirty display_path component part
-    local -a index_records=() path_parts=()
+    local observed=0 nested_root expected_root nested_head dirty display_path component part directory_entry
+    local -a index_records=() path_parts=() update_values=()
     for path in "${configured_paths[@]}"; do
         display_path=$prefix$path
         [[ -n ${gitlinks[$path]+present} ]] || \
@@ -153,22 +129,35 @@ check_submodules() (
             component=${component:+$component/}$part
             [[ ! -L $component ]] || fail "submodule path contains a symlink: $display_path"
         done
-        if [[ -n ${update_none[$path]+present} ]]; then
-            # Declared `update = none`: accept an absent path or an empty
-            # directory, exactly as declared and nothing looser. Anything
-            # present falls through to the populated checks below.
-            if [[ ! -e $path ]]; then
-                printf ' %s %s (update = none, unpopulated)\n' "$sha" "$display_path"
-                ((observed += 1))
-                continue
-            fi
-            if [[ -d $path && ! -L $path && -z $(ls -A -- "$path") ]]; then
-                printf ' %s %s (update = none, unpopulated)\n' "$sha" "$display_path"
-                ((observed += 1))
-                continue
+        [[ -d $path && ! -L $path ]] || fail "submodule directory is missing or not a directory: $display_path"
+        # Only nested declarations may be intentionally unpopulated, and the
+        # directory must exist with no content at all. Local configuration does
+        # not grant an exception; duplicate declarations and read errors refuse.
+        if [[ $recursive == 1 ]]; then
+            config_status=0
+            GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
+                config -z -f .gitmodules --get-all "submodule.${path_names[$path]}.update" >"$expected_file" || config_status=$?
+            if ((config_status == 0)); then
+                update_values=()
+                mapfile -d '' -t update_values <"$expected_file"
+                ((${#update_values[@]} == 1)) || \
+                    fail "ambiguous submodule update policy for $display_path; keep one declaration in .gitmodules"
+                if [[ ${update_values[0]} == none ]]; then
+                    # A checked fixed marker detects hidden and newline-only
+                    # names without confusing a failed listing with emptiness.
+                    if ! directory_entry=$(find "./$path" -mindepth 1 -maxdepth 1 -printf 'entry\n' -quit); then
+                        fail "could not inspect update=none directory $display_path; check directory permissions and retry"
+                    fi
+                    [[ -z $directory_entry ]] || \
+                        fail "nested update=none submodule must be completely empty: $display_path; move its contents aside before retrying"
+                    printf ' %s %s (update = none, unpopulated)\n' "$sha" "$display_path"
+                    ((observed += 1))
+                    continue
+                fi
+            elif ((config_status != 1)); then
+                fail "could not read submodule update policy for $display_path; check .gitmodules readability and syntax"
             fi
         fi
-        [[ -d $path && ! -L $path ]] || fail "submodule directory is missing or not a directory: $display_path"
         if ! nested_root=$(GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
             -C "$path" rev-parse --show-toplevel); then
             fail "submodule path is not a populated git repository: $display_path"
@@ -205,7 +194,7 @@ check_submodules() (
     done
 
     if [[ -z $prefix ]]; then
-        printf 'submodules OK -- %d configured path(s), verified against HEAD and populated worktrees without repair\n' \
+        printf 'submodules OK -- %d configured path(s), verified against HEAD without repair; ordinary worktrees populated, nested update=none directories empty\n' \
             "$observed"
     fi
 )
@@ -266,8 +255,8 @@ EOF
         printf '%s\n' "$checkout"
     }
     run_check() {
-        local checkout=$1
-        (cd "$checkout" && SUBMODULE_GIT="$git_bin" "$self" --check) >"$output" 2>&1
+        local checkout=$1 git_under_test=${2:-$git_bin}
+        (cd "$checkout" && SUBMODULE_GIT="$git_under_test" "$self" --check) >"$output" 2>&1
     }
     expect_refusal() {
         local label=$1 checkout=$2
@@ -289,7 +278,7 @@ EOF
     if "$git_bin" -C "$checkout" config --local --get-regexp '^submodule\..*\.' >/dev/null; then
         fail 'self-test verifier registered submodules while checking them'
     fi
-    grep -q 'verified against HEAD and populated worktrees without repair' "$output" || \
+    grep -q 'verified against HEAD without repair; ordinary worktrees populated, nested update=none directories empty' "$output" || \
         fail 'self-test clean success marker absent'
 
     checkout=$(make_checkout missing)
@@ -466,13 +455,12 @@ EOF
     expect_refusal 'unsafe committed descendant path' "$checkout"
     grep -q 'unsafe or malformed submodule path' "$output" || fail 'self-test missed unsafe descendant path'
 
-    # `update = none` (agent-utils ext/minibeads, hermit c05762a6): the
-    # declared-unpopulated submodule is accepted absent or as an empty
-    # directory, and refused with anything in it.
+    # A nested update=none declaration requires an existing, completely empty
+    # directory. The subsection name deliberately differs from the path.
     local leaf_sha
     leaf_sha=$("$git_bin" -C "$leaf_seed" rev-parse HEAD)
     cat >>"$agent_seed/.gitmodules" <<EOF
-[submodule "ext/minibeads"]
+[submodule "optional-leaf"]
     path = ext/minibeads
     url = $leaf_seed
     update = none
@@ -488,19 +476,152 @@ EOF
 
     checkout=$(make_nested_checkout update-none-empty)
     mkdir -p "$checkout/agent-utils/ext/minibeads"
+    config_before=$(nested_configs "$checkout")
     run_check "$checkout" || { cat "$output" >&2; fail 'self-test update = none empty directory failed'; }
+    config_after=$(nested_configs "$checkout")
+    [[ $config_before == "$config_after" ]] || fail 'self-test update=none success mutated Git configuration'
+    [[ ! -e $checkout/agent-utils/ext/minibeads/.git ]] || fail 'self-test populated update=none descendant'
     grep -q 'agent-utils/ext/minibeads (update = none, unpopulated)' "$output" || \
         fail 'self-test update = none marker absent'
-
-    checkout=$(make_nested_checkout update-none-absent)
-    run_check "$checkout" || { cat "$output" >&2; fail 'self-test update = none absent path failed'; }
 
     checkout=$(make_nested_checkout update-none-junk)
     mkdir -p "$checkout/agent-utils/ext/minibeads"
     printf '%s\n' junk >"$checkout/agent-utils/ext/minibeads/junk"
     expect_refusal 'update = none with content' "$checkout"
 
-    printf 'PASS: verify-submodules checks unregistered populated recursive repositories and refuses missing, foreign, wrong-HEAD, dirty, conflicted, symlinked, undeclared, malformed, and unreadable states without repair\n'
+    # Collect these new opponents so one unexpectedly accepted state cannot
+    # hide another. Every failure is counted and fails the suite below.
+    local strict_failures=0
+    expect_strict_refusal() {
+        local label=$1 checkout=$2 diagnostic=$3 git_under_test=${4:-$git_bin}
+        if run_check "$checkout" "$git_under_test"; then
+            cat "$output" >&2
+            printf 'FAIL: %s unexpectedly passed\n' "$label" >&2
+            ((strict_failures += 1))
+        elif ! grep -q "$diagnostic" "$output"; then
+            cat "$output" >&2
+            printf 'FAIL: %s was not refused at the expected guard\n' "$label" >&2
+            ((strict_failures += 1))
+        else
+            printf 'PASS: %s refused\n' "$label"
+        fi
+    }
+    commit_optional_contract() {
+        local checkout=$1
+        "$git_bin" -C "$checkout/agent-utils" add .gitmodules
+        "$git_bin" -C "$checkout/agent-utils" -c user.name=fixture -c user.email=fixture@example.invalid \
+            commit -qm 'fixture optional descendant policy'
+        "$git_bin" -C "$checkout" add agent-utils
+        "$git_bin" -C "$checkout" -c user.name=fixture -c user.email=fixture@example.invalid \
+            commit -qm 'fixture optional descendant pin'
+    }
+
+    local content_kind leaf
+    for content_kind in populated wrong-head dirty file hidden git-file git-directory newline; do
+        checkout=$(make_nested_checkout "update-none-$content_kind")
+        leaf=$checkout/agent-utils/ext/minibeads
+        case "$content_kind" in
+            populated|wrong-head|dirty)
+                "$git_bin" clone -q "$leaf_seed" "$leaf"
+                if [[ $content_kind != populated ]]; then
+                    printf '%s\n' changed >>"$leaf/payload"
+                    if [[ $content_kind == wrong-head ]]; then
+                        "$git_bin" -C "$leaf" -c user.name=fixture -c user.email=fixture@example.invalid \
+                            commit -qam changed
+                    fi
+                fi
+                ;;
+            file) printf '%s\n' content >"$leaf/file" ;;
+            hidden) printf '%s\n' content >"$leaf/.hidden" ;;
+            git-file) printf 'gitdir: %s\n' "$leaf_seed/.git" >"$leaf/.git" ;;
+            git-directory) mkdir "$leaf/.git" ;;
+            newline) touch "$leaf/"$'\n' ;;
+        esac
+        QUOTING_STYLE=literal expect_strict_refusal "update=none $content_kind content" "$checkout" \
+            'nested update=none submodule must be completely empty: agent-utils/ext/minibeads'
+    done
+
+    checkout=$(make_nested_checkout update-none-absent)
+    # Cloning can create an empty gitlink placeholder. Prove actual absence.
+    rm -rf -- "$checkout/agent-utils/ext/minibeads"
+    [[ ! -e $checkout/agent-utils/ext/minibeads && ! -L $checkout/agent-utils/ext/minibeads ]] || \
+        fail 'self-test absent update=none fixture still exists'
+    expect_strict_refusal 'missing update=none directory' "$checkout" \
+        'submodule directory is missing or not a directory: agent-utils/ext/minibeads'
+
+    local extra_policy
+    for extra_policy in none checkout; do
+        checkout=$(make_nested_checkout "update-none-duplicate-$extra_policy")
+        "$git_bin" -C "$checkout/agent-utils" config -f .gitmodules --add submodule.optional-leaf.update "$extra_policy"
+        commit_optional_contract "$checkout"
+        expect_strict_refusal "duplicate update policy $extra_policy" "$checkout" \
+            'ambiguous submodule update policy for agent-utils/ext/minibeads'
+    done
+
+    checkout=$(make_nested_checkout update-none-listing-failure)
+    mkdir "$root/failed-listing"
+    local listing_command
+    for listing_command in find ls; do
+        printf '#!/bin/sh\nexit 1\n' >"$root/failed-listing/$listing_command"
+        chmod +x "$root/failed-listing/$listing_command"
+    done
+    PATH="$root/failed-listing:$PATH" expect_strict_refusal 'failed directory listing' "$checkout" \
+        'could not inspect update=none directory agent-utils/ext/minibeads'
+
+    checkout=$(make_nested_checkout update-none-policy-failure)
+    "$git_bin" clone -q "$leaf_seed" "$checkout/agent-utils/ext/minibeads"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'for arg in "$@"; do\n'
+        printf '    [[ $arg != submodule.optional-leaf.update && $arg != '\''^submodule\\..*\\.update$'\'' ]] || exit 2\n'
+        printf 'done\n'
+        printf 'exec %q "$@"\n' "$git_bin"
+    } >"$root/failed-policy-git"
+    chmod +x "$root/failed-policy-git"
+    expect_strict_refusal 'failed update-policy query' "$checkout" \
+        'could not read submodule update policy for agent-utils/ext/minibeads' "$root/failed-policy-git"
+
+    checkout=$(make_nested_checkout update-none-top-level)
+    "$git_bin" -C "$checkout" config -f .gitmodules submodule.agent-utils.update none
+    "$git_bin" -C "$checkout" add .gitmodules
+    "$git_bin" -C "$checkout" -c user.name=fixture -c user.email=fixture@example.invalid \
+        commit -qm 'fixture top-level update policy'
+    run_check "$checkout" || { cat "$output" >&2; fail 'self-test populated top-level update=none checkout failed'; }
+    rm -rf -- "$checkout/agent-utils"
+    mkdir "$checkout/agent-utils"
+    expect_strict_refusal 'empty top-level update=none directory' "$checkout" \
+        'resolves through a different git repository: agent-utils'
+    rmdir "$checkout/agent-utils"
+    [[ ! -e $checkout/agent-utils && ! -L $checkout/agent-utils ]] || fail 'self-test top-level path still exists'
+    expect_strict_refusal 'absent top-level update=none directory' "$checkout" \
+        'submodule directory is missing or not a directory: agent-utils'
+
+    checkout=$(make_nested_checkout update-none-local-only)
+    "$git_bin" -C "$checkout/agent-utils/nested" config --local submodule.deps/deep.update none
+    rm -rf -- "$checkout/agent-utils/nested/deps/deep"
+    mkdir "$checkout/agent-utils/nested/deps/deep"
+    expect_strict_refusal 'local config does not exempt an empty descendant' "$checkout" \
+        'resolves through a different git repository: agent-utils/nested/deps/deep'
+
+    checkout=$(make_nested_checkout update-none-index-mismatch)
+    "$git_bin" -C "$checkout/agent-utils" update-index --cacheinfo "160000,$rr_sha,ext/minibeads"
+    expect_strict_refusal 'update=none mismatched index' "$checkout" \
+        'index entry does not match HEAD gitlink for agent-utils/ext/minibeads'
+    checkout=$(make_nested_checkout update-none-conflict)
+    "$git_bin" -C "$checkout/agent-utils" update-index --force-remove ext/minibeads
+    printf '160000 %s 1\text/minibeads\0' "$rr_sha" | \
+        "$git_bin" -C "$checkout/agent-utils" update-index -z --index-info
+    expect_strict_refusal 'update=none conflicted index' "$checkout" \
+        'index entry does not match HEAD gitlink for agent-utils/ext/minibeads'
+    checkout=$(make_nested_checkout update-none-symlink)
+    rmdir "$checkout/agent-utils/ext/minibeads"
+    mkdir "$root/empty-symlink-target"
+    ln -s "$root/empty-symlink-target" "$checkout/agent-utils/ext/minibeads"
+    expect_strict_refusal 'symlinked update=none directory' "$checkout" 'path contains a symlink'
+
+    ((strict_failures == 0)) || fail "$strict_failures update=none strictness opponent(s) failed"
+
+    printf 'PASS: verify-submodules checks ordinary populated repositories and empty nested update=none directories; refuses missing, foreign, wrong-HEAD, dirty, conflicted, symlinked, undeclared, malformed, unreadable, ambiguous-policy, and nonempty update=none states without repair\n'
 }
 
 case "${1:---check}" in
