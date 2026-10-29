@@ -54,6 +54,12 @@
 //               to it, so its poll is never classified.
 //   joined-listener the same, with the original kept open, so the received
 //               copy joins it: neither copy's poll is classified.
+//   forwarded-socket a client socket a forked child connected to this
+//               process's listener, passed over a socketpair (a guest-held
+//               channel) after the child closed its own copy, so the received
+//               copy joins nothing: its credentials name this process, but
+//               peer credentials do not show who else holds the open file, so
+//               its poll is never classified.
 //
 // Use a bogus 'RUN' directive so this test isn't disabled:
 // RUN: true
@@ -465,6 +471,28 @@ int main(int argc, char** argv) {
     short first = poll_listener(received, &target);
     short original = poll_listener(second, &target);
     printf("joined-listener: revents %#x %#x\n", first, original);
+  } else if (strcmp(mode, "forwarded-socket") == 0) {
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+      assert(close(pair[0]) == 0);
+      int client = connect_to_listener();
+      pass_descriptor(pair[1], client);
+      assert(close(client) == 0);
+      _exit(0);
+    }
+    assert(close(pair[1]) == 0);
+    int accepted = accept(listener, NULL, NULL);
+    assert(accepted >= 0);
+    reap(child);
+    int received = receive_descriptor(pair[0]);
+    struct peer writer = {accepted, 0};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, act_later, &writer) == 0);
+    printf("forwarded-socket: revents %#x\n", poll_one(received));
+    assert(pthread_join(thread, NULL) == 0);
   } else {
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;
