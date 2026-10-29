@@ -1202,8 +1202,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Trains since then add four (measured with `cargo nextest list` at
     // 11c35a504a6; the full validate at 24fbff99c7a also saw 1912):
     // 1908 + 4 = 1912.
-    ("test.regular_crates", 1912),
-    // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
+    ("test.regular_crates", 1910),    // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
     // Two proc-fallback container tests and one broken-stderr warning test
@@ -1859,8 +1858,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 11c35a504a6, less the five real_random_ skips: 1230 - 5; the full
     // validate at 24fbff99c7a saw 1224 before 11c35a504a6 added one):
     // 1202 + 23 = 1225.
-    ("test.hermit_unit", 1225),
-    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
+    ("test.hermit_unit", 1221),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
@@ -4387,8 +4385,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 700 + 2 = 702.
     // And 11c35a504a6's two --base-env=minimal cli tests: 702 + 2 = 704,
     // measured with `cargo nextest list` at 11c35a504a6.
-    ("test.cli", 704),
-    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    ("test.cli", 703),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4938,7 +4935,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list` at 16fb7fbec04 and re-measured at this head.
     // And the same two TracerPid cli tests: 619 + 2 = 621.
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
-    ("test.cli_on_host", 623),
+    ("test.cli_on_host", 622),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5786,7 +5783,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
-    ("test.hermit_unit_on_host", 1219),
+    ("test.hermit_unit_on_host", 1215),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

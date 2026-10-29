@@ -26,7 +26,6 @@ use detcore::preemptions::PreemptionRecord;
 use detcore::preemptions::strip_times_from_events_file;
 use detcore::types::SchedEvent;
 use detcore_model::config::ExpiredWaitCharge;
-use detcore_model::config::SleepRegistration;
 use hermit::process::Bind;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
@@ -860,54 +859,10 @@ impl AnalyzeOpts {
     /// writes must be: a record that omitted one would be accepted when
     /// replayed under another value
     /// (<https://github.com/rrnewton/hermit/issues/4380>).
-    /// The trials' `--sleep-registration`, from their run arguments, where
-    /// [`Self::adopt_sleep_registration`] puts it; `when-chosen` before then,
-    /// the rule of the `--chaos` runs analyze makes.
-    pub fn trial_sleep_registration(&self) -> SleepRegistration {
-        RunData::get_raw_runopts(self)
-            .det_opts
-            .det_config
-            .sleep_registration
-            .unwrap_or(SleepRegistration::WhenChosen)
-    }
-
-    /// Run every trial under one `--sleep-registration`: the run arguments'
-    /// own, or else the rule of the `target` recording (`--run1-preemptions`
-    /// for analyze, `--bad` for bisect), or else `when-chosen`, the rule of
-    /// the `--chaos` target run analyze makes. The value is added to the run
-    /// arguments, as [`Self::adopt_recorded_epoch`] adds the epoch, so trial
-    /// commands and reproducers carry it; recordings under another rule are
-    /// then refused ([`Self::refuse_recordings_under_another_pipe_wake_latency`]).
-    pub fn adopt_sleep_registration(&mut self, target: Option<&Path>) -> anyhow::Result<()> {
-        if RunData::get_raw_runopts(self)
-            .det_opts
-            .det_config
-            .sleep_registration
-            .is_some()
-        {
-            return Ok(());
-        }
-        let first_pass = match target {
-            Some(path) => {
-                detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(path)
-                    .map_err(anyhow::Error::msg)?
-            }
-            None => false,
-        };
-        self.run_arg.push(format!(
-            "--sleep-registration={}",
-            SleepRegistration::from_registered_at_first_pass(first_pass).as_str()
-        ));
-        Ok(())
-    }
-
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
         record
             .with_pipe_wake_latency(self.trial_pipe_wake_latency())
             .with_signal_state_copy(Some(self.trial_signal_state_copy()))
-            .with_queued_sleeps_registered_at_first_pass(
-                self.trial_sleep_registration() == SleepRegistration::FirstPass,
-            )
             .with_expired_wait_runs_charged_once(
                 self.trial_expired_wait_charge() == ExpiredWaitCharge::Once,
             )
@@ -1007,17 +962,6 @@ impl AnalyzeOpts {
                 &format!("{option} {}", path.display()),
                 recorded,
                 config.cap_preemption_charge,
-            ) {
-                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
-            }
-            let recorded =
-                detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(path)
-                    .map_err(anyhow::Error::msg)?;
-            if let Some(refusal) = detcore::preemptions::sleep_registration_mismatch(
-                &format!("{option} {}", path.display()),
-                recorded,
-                Some(self.trial_sleep_registration()),
-                true,
             ) {
                 return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
             }

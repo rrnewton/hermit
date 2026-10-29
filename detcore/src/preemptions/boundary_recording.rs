@@ -331,7 +331,6 @@ mod tests {
                 .with_epoch("2001-02-03T04:05:06Z".parse().unwrap())
                 .with_pipe_wake_latency(Some(0))
                 .with_signal_state_copy(false)
-                .with_queued_sleeps_registered_at_first_pass(true)
                 .with_expired_wait_runs_charged_once(true)
                 .into_string(),
         )
@@ -409,10 +408,6 @@ mod tests {
             assert_eq!(
                 super::super::read_recorded_signal_state_copy(&output).unwrap(),
                 Some(false)
-            );
-            assert_eq!(
-                super::super::read_recorded_queued_sleeps_registered_at_first_pass(&output),
-                Ok(true)
             );
             assert_eq!(
                 super::super::read_recorded_expired_wait_runs_charged_once(&output),
