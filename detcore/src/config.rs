@@ -104,6 +104,8 @@ mod tests {
         // Adds `GlobalResponse::WithLoneGrant`
         // (https://github.com/rrnewton/hermit/pull/4662).
         (9, "ebfd2b59a97e1d7a", "dafaa96d8b8cb3ad"),
+        // Adds `GlobalRequest::CommitFatalDelivery` and `GlobalResponse::CommitFatalDelivery`; removes `GlobalRequest::RecordFatalSignal` and `GlobalResponse::RecordFatalSignal` (#4676).
+        (10, "bb0fe6d9a43ee812", "dafaa96d8b8cb3ad"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
