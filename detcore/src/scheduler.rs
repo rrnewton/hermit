@@ -17965,10 +17965,13 @@ impl Scheduler {
     /// for ever behind a foreground thread that never blocks, a thread the
     /// schedule readmitted at the deferred priority included
     /// (https://github.com/rrnewton/hermit/issues/4472). The point is the
-    /// consumption of the last recorded event, or the replayer's release of
-    /// the rest of the schedule after a long run of events that match none of
-    /// it (`Replayer::release_schedule`). Either is a scheduled event of a
-    /// running thread, so it is the same in every run.
+    /// consumption of the last recorded event, at the schedule's fixed final
+    /// position, or the replayer's release of the rest of the schedule after a
+    /// long run of events that match none of it (`Replayer::release_schedule`).
+    /// A release can come at another event, or not at all, in another run: a
+    /// polling retry that matches a recorded one ends that run, and how many
+    /// retries the replay matches can be host-timed
+    /// (`Scheduler::is_polling_turn`).
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()
