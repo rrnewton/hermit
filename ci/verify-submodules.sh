@@ -40,9 +40,9 @@ check_submodules() (
 
     local -a configured_records=() tree_records=()
     mapfile -d '' -t tree_records <"$tree_file"
-    local -A configured=() gitlinks=()
+    local -A configured=() gitlinks=() path_names=()
     local -a configured_paths=()
-    local record key path metadata mode type sha extra
+    local record key path name metadata mode type sha extra
     for record in "${tree_records[@]}"; do
         [[ $record == *$'\t'* ]] || fail 'malformed git tree entry'
         metadata=${record%%$'\t'*}
@@ -86,7 +86,34 @@ check_submodules() (
         [[ -z ${configured[$path]+present} ]] || fail "duplicate configured submodule path: $path"
         configured[$path]=1
         configured_paths+=("$path")
+        name=${key#submodule.}
+        name=${name%.path}
+        path_names[$path]=$name
     done
+
+    # A submodule declared `update = none` is intentionally unpopulated:
+    # record which configured paths carry that declaration, by name.
+    local -A update_none=()
+    local update_file update_status=0
+    update_file=$(mktemp)
+    GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
+        config -z -f .gitmodules --get-regexp '^submodule\..*\.update$' >"$update_file" || update_status=$?
+    if ((update_status == 0)); then
+        local -a update_records=()
+        mapfile -d '' -t update_records <"$update_file"
+        local update_name
+        for record in "${update_records[@]}"; do
+            [[ $record == *$'\n'* ]] || fail 'malformed submodule update entry in .gitmodules'
+            key=${record%%$'\n'*}
+            update_name=${key#submodule.}
+            update_name=${update_name%.update}
+            [[ ${record#*$'\n'} == none ]] || continue
+            for path in "${configured_paths[@]}"; do
+                [[ ${path_names[$path]} == "$update_name" ]] && update_none[$path]=1
+            done
+        done
+    fi
+    rm -f -- "$update_file"
 
     ((${#configured[@]} == ${#gitlinks[@]})) || \
         fail ".gitmodules declares ${#configured[@]} path(s), but HEAD contains ${#gitlinks[@]} gitlink(s)"
@@ -126,6 +153,21 @@ check_submodules() (
             component=${component:+$component/}$part
             [[ ! -L $component ]] || fail "submodule path contains a symlink: $display_path"
         done
+        if [[ -n ${update_none[$path]+present} ]]; then
+            # Declared `update = none`: accept an absent path or an empty
+            # directory, exactly as declared and nothing looser. Anything
+            # present falls through to the populated checks below.
+            if [[ ! -e $path ]]; then
+                printf ' %s %s (update = none, unpopulated)\n' "$sha" "$display_path"
+                ((observed += 1))
+                continue
+            fi
+            if [[ -d $path && ! -L $path && -z $(ls -A -- "$path") ]]; then
+                printf ' %s %s (update = none, unpopulated)\n' "$sha" "$display_path"
+                ((observed += 1))
+                continue
+            fi
+        fi
         [[ -d $path && ! -L $path ]] || fail "submodule directory is missing or not a directory: $display_path"
         if ! nested_root=$(GIT_OPTIONAL_LOCKS=0 "${git_argv[@]}" -c core.fsmonitor=false \
             -C "$path" rev-parse --show-toplevel); then
@@ -423,6 +465,40 @@ EOF
     commit_nested_contract "$checkout"
     expect_refusal 'unsafe committed descendant path' "$checkout"
     grep -q 'unsafe or malformed submodule path' "$output" || fail 'self-test missed unsafe descendant path'
+
+    # `update = none` (agent-utils ext/minibeads, hermit c05762a6): the
+    # declared-unpopulated submodule is accepted absent or as an empty
+    # directory, and refused with anything in it.
+    local leaf_sha
+    leaf_sha=$("$git_bin" -C "$leaf_seed" rev-parse HEAD)
+    cat >>"$agent_seed/.gitmodules" <<EOF
+[submodule "ext/minibeads"]
+    path = ext/minibeads
+    url = $leaf_seed
+    update = none
+EOF
+    "$git_bin" -C "$agent_seed" add .gitmodules
+    "$git_bin" -C "$agent_seed" update-index --add --cacheinfo "160000,$leaf_sha,ext/minibeads"
+    "$git_bin" -C "$agent_seed" -c user.name=fixture -c user.email=fixture@example.invalid \
+        commit -qm 'declare ext/minibeads update = none'
+    agent_sha=$("$git_bin" -C "$agent_seed" rev-parse HEAD)
+    "$git_bin" -C "$super" update-index --cacheinfo "160000,$agent_sha,agent-utils"
+    "$git_bin" -C "$super" -c user.name=fixture -c user.email=fixture@example.invalid \
+        commit -qm 'pin agent-utils with update = none descendant'
+
+    checkout=$(make_nested_checkout update-none-empty)
+    mkdir -p "$checkout/agent-utils/ext/minibeads"
+    run_check "$checkout" || { cat "$output" >&2; fail 'self-test update = none empty directory failed'; }
+    grep -q 'agent-utils/ext/minibeads (update = none, unpopulated)' "$output" || \
+        fail 'self-test update = none marker absent'
+
+    checkout=$(make_nested_checkout update-none-absent)
+    run_check "$checkout" || { cat "$output" >&2; fail 'self-test update = none absent path failed'; }
+
+    checkout=$(make_nested_checkout update-none-junk)
+    mkdir -p "$checkout/agent-utils/ext/minibeads"
+    printf '%s\n' junk >"$checkout/agent-utils/ext/minibeads/junk"
+    expect_refusal 'update = none with content' "$checkout"
 
     printf 'PASS: verify-submodules checks unregistered populated recursive repositories and refuses missing, foreign, wrong-HEAD, dirty, conflicted, symlinked, undeclared, malformed, and unreadable states without repair\n'
 }
