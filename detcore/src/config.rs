@@ -112,7 +112,7 @@ mod tests {
         (11, "8bb87305b1bd45a3", "dafaa96d8b8cb3ad"),
         // Adds `GlobalRequest::CommitFatalDelivery`; removes `GlobalRequest::RecordFatalSignal`; adds `GlobalResponse::CommitFatalDelivery`; removes `GlobalResponse::RecordFatalSignal`
         // (https://github.com/rrnewton/hermit/pull/4676, renumbered to 12 at landing).
-        (12, "ab01c6abb5daa6d7", "dafaa96d8b8cb3ad"),        // Adds `GlobalRequest::SigkillDyingThreads`, `GlobalRequest::RecordSigkillRobustLists`, `GlobalRequest::TakeSigkillRobustList` and the matching responses
+        (12, "ab01c6abb5daa6d7", "dafaa96d8b8cb3ad"), // Adds `GlobalRequest::SigkillDyingThreads`, `GlobalRequest::RecordSigkillRobustLists`, `GlobalRequest::TakeSigkillRobustList` and the matching responses
         // (https://github.com/rrnewton/hermit/pull/4760, renumbered to 13 at landing).
         (13, "78e513d0fe279099", "dafaa96d8b8cb3ad"),
     ];
