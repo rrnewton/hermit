@@ -81,9 +81,10 @@ pub struct AnalyzeOpts {
     /// a batch at a time. This may accelerate the subsequent binary search.
     ///
     /// The baseline is then the minimized record with its latest intervention knocked out, and
-    /// knocked out again while the replay still meets the target; when no intervention is left,
-    /// or the knocked-out run does not finish, analyze searches within the target schedule
-    /// instead (as `--prefix-search` does). So `--minimize` finds its own baseline and does not
+    /// knocked out again while the replay still meets the target. When no intervention is left,
+    /// there is no baseline to bisect against and the analysis ends with that error, as it does
+    /// with the run's own error for a knocked-out run that does not finish; `--prefix-search`
+    /// needs no baseline. So `--minimize` finds its own baseline and does not
     /// take `--run2-seed`, `--run2-preemptions` or `--run2-schedule`. To search between a given
     /// pair of runs, omit `--minimize`.
     #[clap(
