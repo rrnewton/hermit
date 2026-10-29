@@ -725,7 +725,7 @@ fn session_serializer() -> &'static SessionSerializer {
 pub struct SessionGuard(());
 
 /// Hold the per-test session serializer for one in-process session; see
-/// [`SessionSerializer`]. Binaries whose tests drive sessions through their
+/// `SessionSerializer`. Binaries whose tests drive sessions through their
 /// own wrappers (tests/time) hold this across the session instead.
 pub fn serialized_session() -> SessionGuard {
     SessionGuard::acquire()
