@@ -118,8 +118,8 @@ impl std::fmt::Display for NoSingleSwap {
         write!(
             f,
             " The search has not established an exact one-swap pair of schedules with opposite \
-             outcomes. `hermit analyze --prefix-search` needs no baseline schedule and finds the \
-             scheduling decision within the failing one."
+             outcomes. `hermit analyze --prefix-search` needs no baseline schedule and searches \
+             for a scheduling decision within the failing one."
         )
     }
 }
@@ -1268,8 +1268,18 @@ mod tests {
         assert!(tester(&passing).unwrap().0);
         assert!(!tester(&failing).unwrap().0);
         assert!(tester(&[a.clone(), b.clone()]).unwrap().0);
-        let error =
-            search_for_critical_schedule(tester, passing, failing, &Config::default()).unwrap_err();
+        let mut calls = Vec::new();
+        let error = search_for_critical_schedule(
+            |schedule: &[SchedEvent]| {
+                calls.push(schedule.to_vec());
+                tester(schedule)
+            },
+            passing.clone(),
+            failing.clone(),
+            &Config::default(),
+        )
+        .unwrap_err();
+        assert_eq!(calls, [passing, failing]);
         let no_swap = error
             .downcast_ref::<NoSingleSwap>()
             .unwrap_or_else(|| panic!("not NoSingleSwap: {error:#}"));
