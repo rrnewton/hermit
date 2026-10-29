@@ -3070,7 +3070,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit", 2883),
+    // Train 12 adds fourteen detcore units (sleep registration and
+    // MSG_DONTWAIT): 2883 + 14 = 2897, measured with `cargo nextest list`
+    // at 16fb7fbec04 and re-measured at this head.
+    // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
+    ("test.detcore_unit", 2898),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4366,7 +4370,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 695),
+    // Train 12 adds five cli tests (run_timeout_names_...,
+    // msg_errqueue_..., a_signal_after_a_sleeps_deadline_...,
+    // kernel_run_sleeps_and_futex_waits_restart_...,
+    // a_recording_whose_stream_cannot_be_written_...): 695 + 5 = 700,
+    // measured with `cargo nextest list` at 16fb7fbec04 and re-measured
+    // at this head.
+    // And the two TracerPid cli tests (32e9ef22f60, 96e9f9db4be):
+    // 700 + 2 = 702.
+    ("test.cli", 702),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4913,7 +4925,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 614),
+    // The same five train-12 cli tests: 614 + 5 = 619, measured with
+    // `cargo nextest list` at 16fb7fbec04 and re-measured at this head.
+    // And the same two TracerPid cli tests: 619 + 2 = 621.
+    ("test.cli_on_host", 621),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5386,7 +5401,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit_on_host", 2883),
+    // The same fourteen train-12 detcore units: 2883 + 14 = 2897,
+    // measured with `cargo nextest list` at this head.
+    // And the same TracerPid unit: 2898.
+    ("test.detcore_unit_on_host", 2898),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
