@@ -10325,9 +10325,12 @@ fn signal_at_stops_qemu_at_the_same_point_in_two_runs() {
         .unwrap()
         .join("tests/qemu-boot/signal_at_snapshot.py");
     // The two runs go side by side, in directories of their own: the
-    // controller gives QEMU paths relative to its directory.
+    // controller gives QEMU paths relative to its directory. The directory
+    // reaches the guest, as its working directory and the controller's
+    // argument, and the snapshot depends on its length, so the two names
+    // have the same length (https://github.com/rrnewton/hermit/issues/4785).
     let snapshots = std::thread::scope(|scope| {
-        let runs = ["first", "second"].map(|run| {
+        let runs = ["1", "2"].map(|run| {
             let (qemu, controller) = (&qemu, &controller);
             scope.spawn(move || {
                 let dir = process_build_root(&format!("signal-at-qemu-{run}"));
