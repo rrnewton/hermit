@@ -54,3 +54,7 @@ RUN: %hermit --log info run -- %me joined-listener |& awk '/^joined-listener:/ {
 JOINLISTEN: joined-listener: revents 0x1 0x1
 JOINLISTEN-NEXT: classified polls: none
 JOINLISTEN-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me forwarded-socket |& awk '/^forwarded-socket:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=FORWARDED %s
+FORWARDED: forwarded-socket: revents 0x1
+FORWARDED-NEXT: classified polls: none
+FORWARDED-NEXT: marks revoked: no

@@ -1697,13 +1697,22 @@ mod event_tests {
         control
     }
 
+    /// What a send's message carries, and when (`send_rewritten_while_it_waits`).
+    #[derive(Clone, Copy)]
+    enum Rights {
+        /// No descriptor, throughout.
+        Never,
+        /// A guest-held pipe end, written by a sibling while the send waits.
+        Rewritten,
+        /// A guest-held pipe end, from the start.
+        FromTheStart,
+    }
+
     /// Runs one `sendmsg` (or, `batched`, one `sendmmsg` of one message)
     /// through the real retry loop, on a datagram socketpair end that is not
-    /// guest-held. The message carries no descriptor; with `rewrite`, a
-    /// sibling rewrites it to pass a guest-held pipe end while the send waits
-    /// between its two attempts. Returns each request's
-    /// `Resources::passes_descriptors_out`.
-    async fn send_rewritten_while_it_waits(batched: bool, rewrite: bool) -> Vec<bool> {
+    /// guest-held, its message carrying descriptors as `rights` says. Returns
+    /// each request's `Resources::passes_descriptors_out`.
+    async fn send_rewritten_while_it_waits(batched: bool, rights: Rights) -> Vec<bool> {
         let (parked_tx, parked_rx) = oneshot::channel();
         let (resume_tx, resume_rx) = oneshot::channel();
         let (tool, mut guest) = event_guest(FdType::Socket, Some((parked_tx, resume_rx)));
@@ -1730,7 +1739,10 @@ mod event_tests {
             .file_handles
             .insert(MARKED, marked);
         guest.memory.put_iovec(0, FIRST_DEST, 8);
-        put_message(&guest.memory, &[]);
+        match rights {
+            Rights::FromTheStart => put_message(&guest.memory, &rights_passing(MARKED)),
+            Rights::Never | Rights::Rewritten => put_message(&guest.memory, &[]),
+        }
         let memory = guest.memory.clone();
         let call: Syscall = if batched {
             reverie::syscalls::Sendmmsg::new()
@@ -1747,7 +1759,7 @@ mod event_tests {
         let event = tool.handle_syscall_event(&mut guest, call);
         let sibling = async {
             parked_rx.await.unwrap();
-            if rewrite {
+            if matches!(rights, Rights::Rewritten) {
                 put_message(&memory, &rights_passing(MARKED));
             }
             resume_tx.send(()).unwrap();
@@ -1767,17 +1779,24 @@ mod event_tests {
     /// by a sibling to pass a guest-held pipe end while it waits, it reports
     /// the pass-out in a request of its own before the attempt that passes it,
     /// so the scheduler revokes every guest-held mark first; left alone, it
-    /// files no extra request (Codex review of
-    /// https://github.com/rrnewton/hermit/pull/4862).
+    /// files no extra request. A send that passes a descriptor from the start
+    /// reports it with its first request, as before, and files no extra
+    /// request either: the thread has reported, so its later attempts check
+    /// no more (`ThreadState::passed_descriptors_out_reported`) (Codex review
+    /// of https://github.com/rrnewton/hermit/pull/4862).
     #[tokio::test(flavor = "current_thread")]
     async fn a_sendmsg_rewritten_to_pass_a_descriptor_while_it_waits_revokes_every_mark() {
         assert_eq!(
-            send_rewritten_while_it_waits(false, true).await,
+            send_rewritten_while_it_waits(false, Rights::Rewritten).await,
             [false, false, true]
         );
         assert_eq!(
-            send_rewritten_while_it_waits(false, false).await,
+            send_rewritten_while_it_waits(false, Rights::Never).await,
             [false, false]
+        );
+        assert_eq!(
+            send_rewritten_while_it_waits(false, Rights::FromTheStart).await,
+            [true, false]
         );
     }
 
@@ -1785,13 +1804,44 @@ mod event_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_sendmmsg_rewritten_to_pass_a_descriptor_while_it_waits_revokes_every_mark() {
         assert_eq!(
-            send_rewritten_while_it_waits(true, true).await,
+            send_rewritten_while_it_waits(true, Rights::Rewritten).await,
             [false, false, true]
         );
         assert_eq!(
-            send_rewritten_while_it_waits(true, false).await,
+            send_rewritten_while_it_waits(true, Rights::Never).await,
             [false, false]
         );
+        assert_eq!(
+            send_rewritten_while_it_waits(true, Rights::FromTheStart).await,
+            [true, false]
+        );
+    }
+
+    /// A send that may run outside the caller's turn counts as passing
+    /// descriptors out of the guest whatever its descriptor and messages are
+    /// when the handler looks (`Detcore::note_descriptors_passed_out`): other
+    /// threads run before the kernel imports them, and one may replace the
+    /// descriptor with an `AF_UNIX` socket that is not guest-held and rewrite
+    /// a message to pass a guest-held pipe. Here the descriptor is a
+    /// guest-held socket and the message carries no descriptor, which a send
+    /// in the turn does not report; the header is a `sendmsg`'s and a
+    /// `sendmmsg`'s first entry alike (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4862).
+    #[test]
+    fn a_send_outside_the_turn_counts_as_passing_descriptors_whatever_it_names_now() {
+        for outside_turn in [false, true] {
+            let (tool, mut guest) = event_guest(FdType::Socket, None);
+            guest
+                .thread
+                .with_detfd(FD, |detfd| detfd.set_guest_held())
+                .unwrap();
+            put_message(&guest.memory, &[]);
+            tool.note_descriptors_passed_out(&mut guest, FD, &[MESSAGE], outside_turn);
+            assert_eq!(
+                guest.thread.passed_descriptors_out_unreported, outside_turn,
+                "outside the turn: {outside_turn}"
+            );
+        }
     }
 
     fn readv(count: usize) -> Syscall {
