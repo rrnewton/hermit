@@ -3319,10 +3319,10 @@ mod legacy_backend_json {
     /// the option has no effect there; it is never written and reads as
     /// false.
     const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 37] = [
-    // `chaos_timeslice_range` came after it too: the scheduler draws the
-    // slices, not the runtime, so it is never written and reads as unset.
-    /// `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
-    /// reason; they read as `slice` and unset.
+        // `chaos_timeslice_range` came after it too: the scheduler draws the
+        // slices, not the runtime, so it is never written and reads as unset.
+        // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
+        // reason; they read as `slice` and unset.
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
