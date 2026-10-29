@@ -4426,10 +4426,8 @@ mod tests {
             )
             .unwrap();
         let mut again = RunData::new_baseline(&options, "bisect_round_005".into()).unwrap();
-        assert_eq!(
-            again.launch_trial().unwrap(),
-            TrialEnd::Unfinished(Stop::Refusal(Refusal::Deterministic))
-        );
+        let error = again.launch().unwrap_err();
+        assert_eq!(guest_refusal(&error), Some(Refusal::Deterministic));
         assert_eq!(
             again.refused(),
             Some(&RefusedRun {

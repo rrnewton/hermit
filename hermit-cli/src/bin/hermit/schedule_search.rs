@@ -106,10 +106,12 @@ pub struct InfeasibleSchedule {
     pub expected: i32,
     /// The thread that ran instead.
     pub running: i32,
-    /// Whether the run passed. It says nothing about the schedule; only an
-    /// endpoint, the order a run took, keeps it ([`search_for_critical_schedule_observed`]).
+    /// Whether the run passed, if it completed; `None` for a run stopped
+    /// after it left the schedule, which has no outcome at all. It says
+    /// nothing about the schedule; only an endpoint, the order a run took,
+    /// keeps it ([`search_for_critical_schedule_observed`]).
     #[serde(skip)]
-    pub passed: bool,
+    pub passed: Option<bool>,
 }
 
 impl std::fmt::Display for InfeasibleSchedule {
@@ -393,7 +395,14 @@ where
                              (check that the run replays: --selfcheck)",
                             "WARNING:".yellow().bold()
                         );
-                        infeasible.passed
+                        match infeasible.passed {
+                            Some(passed) => passed,
+                            None => bail!(
+                                "the {which} schedule endpoint's replay left its own recorded \
+                                 schedule and then stopped before it finished, so it has no \
+                                 outcome: {infeasible}"
+                            ),
+                        }
                     }
                 })
             };
@@ -2336,7 +2345,7 @@ mod tests {
             event: 580,
             expected: 5,
             running: 3,
-            passed: false,
+            passed: Some(false),
         })
     }
 
@@ -2515,7 +2524,7 @@ mod tests {
                     };
                     if sched == endpoint {
                         return Err(anyhow::Error::new(InfeasibleSchedule {
-                            passed,
+                            passed: Some(passed),
                             ..infeasible("bisect_round_001")
                                 .downcast::<InfeasibleSchedule>()
                                 .unwrap()

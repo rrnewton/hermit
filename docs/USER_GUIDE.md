@@ -929,7 +929,11 @@ completed baseline or certify a causal report. The error names the trial and
 its log file, or stderr when no file was requested. Inspect the named refusal
 and use a supported operation or configuration before retrying. An ordinary
 guest exit 122 remains a completed guest outcome, classified by the target
-criteria; its numeric status alone is not a refusal.
+criteria; its numeric status alone is not a refusal. A refusal the host's
+timing decides (a skid overshoot, `cause=skid-overshoot`) of a
+`--prefix-search` trial, a default-search trial or the baseline run runs that
+trial again once first, as analyze's own bound does; refused again, the
+analysis ends.
 
 By default analyze bisects between the failing schedule and a passing one from
 another run. Each round replays a splice of the two orders, matching each
@@ -937,27 +941,27 @@ event of one run with an event of the other. The matching keeps each thread's
 events in the order both runs executed them, and a syscall's entry with its
 return; where the two runs' per-thread traces disagree at all (one thread made
 two calls in opposite orders, or polled a different number of times between
-them), splices are not feasible, and analyze searches within the failing
-schedule instead (`--prefix-search`), saying why in the report. A splice can
-still ask for an order this execution cannot take across threads, such as a
-switch to a thread that is blocked at that point. A round whose replay runs another thread than its
-schedule names there has no outcome: the search tries other schedules between
-the same pair, and when none in a pass can be followed it ends with a partial
-report (`class=trial-inconclusive`, below) that lists them, says where each
-left its schedule and gives the `--prefix-search` command. When the two runs
-differ in events only one of them executed (for
-example timeslices that end at other points, or extra iterations of a polling
-loop), no single swap may separate the outcomes. `--prefix-search` searches
-within the failing schedule instead: each trial replays its first K events and
-then schedules without chaos, and a binary search finds the event at which the
-outcome flips. The continuation runs at the run's own `--max-timeslice`; a race
-found only at a short timeslice often shows without chaos at that timeslice
-too, and then the search continues at 200 ms instead
-(`--continuation-timeslice`). The report shows the stack of the thread the
-failing schedule runs at that event and of the thread that runs there
-otherwise. When both continuations run the same thread there, the decision is
-how long that thread runs: the report then shows its stack, and the stacks of
-the threads that run after it with and without the event:
+them), splices are not feasible, and analyze attempts a search within the
+failing schedule instead (`--prefix-search`), saying why in the report. A
+splice can still ask for an order this execution cannot take across threads,
+such as a switch to a thread that is blocked at that point. A round whose
+replay runs another thread than its schedule names there has no outcome: the
+search tries other schedules between the same pair. When none in a pass can be
+followed, analyze attempts a search within the failing schedule instead
+(`--prefix-search`), as it does when no single swap separates the outcomes,
+and the report says why. When the two runs differ in events only one of them
+executed (for example timeslices that end at other points, or extra iterations
+of a polling loop), no single swap may separate the outcomes.
+`--prefix-search` searches within the failing schedule instead: each trial
+replays its first K events and then schedules without chaos, and a binary
+search finds the event at which the outcome flips. The continuation runs at
+the run's own `--max-timeslice`; a race found only at a short timeslice often
+shows without chaos at that timeslice too, and then the search continues at
+200 ms instead (`--continuation-timeslice`). The report shows the stack of the
+thread the failing schedule runs at that event and of the thread that runs
+there otherwise. When both continuations run the same thread there, the
+decision is how long that thread runs: the report then shows its stack, and
+the stacks of the threads that run after it with and without the event:
 
 ```bash
 hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \

@@ -667,6 +667,11 @@ enum OwnBisectionEnd {
     /// with opposite outcomes (the error says why): a prefix search, which
     /// needs no baseline, searches for a decision within the failing schedule.
     SearchPrefixes(Error),
+    /// No schedule between the closest pair could be followed
+    /// ([`NoFeasibleSchedule`]): the bisection established no pair either, and
+    /// a prefix search attempts a decision within the failing schedule, its
+    /// report noting why.
+    NoFeasibleSplice(Error),
 }
 
 /// What the bisection of analyze's own endpoints, `bisected`, leads to. An
@@ -678,6 +683,9 @@ fn own_bisection_end(
     match bisected {
         Ok(critical) => Ok(OwnBisectionEnd::Critical(critical)),
         Err(error) if no_swap_separates(&error) => Ok(OwnBisectionEnd::SearchPrefixes(error)),
+        Err(error) if error.downcast_ref::<NoFeasibleSchedule>().is_some() => {
+            Ok(OwnBisectionEnd::NoFeasibleSplice(error))
+        }
         Err(error) => Err(point_endpoint_misses_at_replay(error)),
     }
 }
@@ -2751,7 +2759,9 @@ impl AnalyzeOpts {
                     event: departure.event,
                     expected: departure.expected.as_raw(),
                     running: departure.running.as_raw(),
-                    passed: launched.is_err() || !newrun.is_a_match(),
+                    // A round stopped after it left its schedule has no
+                    // outcome at all.
+                    passed: launched.is_ok().then(|| !newrun.is_a_match()),
                 }
                 .into());
             }
@@ -3524,7 +3534,6 @@ impl AnalyzeOpts {
                 trial_budget: budget.trial_limit(),
                 runs_from_journal,
                 cut_run: expired.cut.clone(),
-                infeasible: None,
                 interval: progress.interval.clone(),
                 bracket: progress.bracket.clone(),
                 stacks,
@@ -3714,8 +3723,9 @@ impl AnalyzeOpts {
 
     /// The default search between the target and baseline endpoint runs, and
     /// its report; the target's prefix search instead when the two runs'
-    /// per-thread traces diverge ([`DivergentTraces`]) or no single swap
-    /// separates them.
+    /// per-thread traces diverge ([`DivergentTraces`]), no single swap
+    /// separates them, or no schedule between them can be followed
+    /// ([`NoFeasibleSchedule`]).
     fn bisect_endpoints_and_report(
         &mut self,
         mut target_endpoint_run: RunData,
@@ -3750,7 +3760,7 @@ impl AnalyzeOpts {
                 &mut target_endpoint_run,
                 Some(format!(
                     "the default search did not bisect between the two runs: {why}. analyze \
-                     searched within the failing schedule instead (--prefix-search)."
+                     attempted a search within the failing schedule instead (--prefix-search)."
                 )),
             );
         }
@@ -3763,6 +3773,25 @@ impl AnalyzeOpts {
                     "No single swap separates the endpoints:".yellow().bold(),
                 );
                 return self.prefix_search_and_report(&mut target_endpoint_run, None);
+            }
+            // No schedule between the closest pair could be followed: the
+            // bisection established no pair either, and a prefix search,
+            // which needs no baseline, attempts a decision within the
+            // failing schedule.
+            OwnBisectionEnd::NoFeasibleSplice(error) => {
+                eprintln!(
+                    ":: {} {error:#}\n:: Searching within the failing schedule instead \
+                     (--prefix-search).",
+                    "No feasible splice:".yellow().bold(),
+                );
+                return self.prefix_search_and_report(
+                    &mut target_endpoint_run,
+                    Some(format!(
+                        "the default search did not bisect between the two runs: {error} \
+                         analyze attempted a search within the failing schedule instead \
+                         (--prefix-search)."
+                    )),
+                );
             }
         };
 
@@ -5590,6 +5619,16 @@ mod tests {
             trimmed_failing_passed: false,
         })));
         assert!(matches!(separable, Ok(OwnBisectionEnd::SearchPrefixes(_))));
+        let infeasible = own_bisection_end(Err(Error::new(NoFeasibleSchedule {
+            pass: 1,
+            edit_distance: 4,
+            swap_distance: 2,
+            tried: Vec::new(),
+        })));
+        assert!(matches!(
+            infeasible,
+            Ok(OwnBisectionEnd::NoFeasibleSplice(_))
+        ));
         for (precondition, class) in [
             (
                 AnalyzePrecondition::target_not_reproduced(
@@ -7321,6 +7360,10 @@ mod tests {
             if stopped(run, prefix) {
                 return Err(anyhow::Error::new(crate::container::RunTimeoutMarker));
             }
+            // A completed run records the schedule it ran, which main's
+            // checks of a completed continuation read: here, the one it
+            // replayed.
+            std::fs::copy(&replayed, run.sched_path_out()).unwrap();
             run.finish_for_test(prefix > deciding, std::time::Duration::from_secs(1));
             Ok(())
         })))
@@ -7410,12 +7453,12 @@ mod tests {
     }
 
     /// A `--search` round or a `--minimize` replay that Hermit refused is no
-    /// end either: a host-timed refusal runs it again and the rerun counts,
-    /// and a deterministic one (or a second refusal) stops the analysis as
-    /// inconclusive, naming the refusal, rather than counting it as a run
-    /// that missed the target.
+    /// end either: the refusal, host-timed or deterministic, ends the
+    /// analysis with Hermit's refusal at once, as main's completed-outcome
+    /// rule ends it at any run that did not complete, rather than counting
+    /// the run as one that missed the target.
     #[test]
-    fn a_refused_search_round_or_minimize_replay_is_never_an_end() {
+    fn a_refused_search_round_or_minimize_replay_ends_the_analysis() {
         use std::sync::Arc;
         use std::sync::Mutex;
         let parent = tempfile::tempdir().unwrap();
@@ -7441,54 +7484,36 @@ mod tests {
                 },
             ),
         ] {
-            // Refused once by a skid overshoot: the rerun's end counts.
-            let ran = Arc::new(Mutex::new(Vec::new()));
-            options.trial_runner = refusing_named_runner(
-                |name| (!name.ends_with("_retry")).then_some(Refusal::HostTimed),
-                true,
-                ran.clone(),
-            );
-            let found = launch(&options, &record).unwrap();
-            assert_eq!(
-                found,
-                if runname.starts_with("search") {
-                    format!("{runname}_retry")
-                } else {
-                    "true".to_owned()
-                }
-            );
-            assert_eq!(
-                ran.lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .collect::<Vec<_>>(),
-                [runname.to_owned(), format!("{runname}_retry")]
-            );
-            // Refused deterministically: inconclusive at once.
-            let ran = Arc::new(Mutex::new(Vec::new()));
-            options.trial_runner =
-                refusing_named_runner(|_| Some(Refusal::Deterministic), true, ran.clone());
-            let error = launch(&options, &record).unwrap_err();
-            let inconclusive = error.downcast_ref::<TrialInconclusive>().unwrap();
-            assert_eq!(inconclusive.runs, [runname.to_owned()]);
-            assert_eq!(
-                inconclusive.refused().map(|refused| refused.refusal),
-                Some(Refusal::Deterministic)
-            );
-            assert!(
-                inconclusive
-                    .to_string()
-                    .contains("openat2: RESOLVE_IN_ROOT")
-            );
+            for refuses in [
+                (|_| Some(Refusal::HostTimed)) as fn(&str) -> Option<Refusal>,
+                |_| Some(Refusal::Deterministic),
+            ] {
+                let ran = Arc::new(Mutex::new(Vec::new()));
+                options.trial_runner = refusing_named_runner(refuses, true, ran.clone());
+                let error = launch(&options, &record).unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .is_some(),
+                    "{runname}: {error:#}"
+                );
+                assert_eq!(
+                    ran.lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>(),
+                    [runname.to_owned()]
+                );
+            }
         }
     }
 
     /// A boundary recheck Hermit refused has no outcome to compare with the
-    /// search's: the decision stands, and the report says that recheck was
-    /// refused.
+    /// search's, so it ends the analysis with Hermit's refusal, as main's
+    /// rechecks that do not complete do.
     #[test]
-    fn a_refused_recheck_is_noted_in_the_report() {
+    fn a_refused_recheck_ends_the_analysis() {
         use std::sync::Arc;
         use std::sync::Mutex;
         let (len, deciding) = (200, 137);
@@ -7515,25 +7540,12 @@ mod tests {
             },
             ran.clone(),
         );
-        let decided = options.phase5_prefix_search(&target).unwrap();
-        assert_eq!(decided.decision, deciding);
+        let error = options
+            .phase5_prefix_search(&target)
+            .err()
+            .expect("a refused recheck has no outcome");
+        assert_stopped_trial(&error, "refusal");
         assert_eq!(*seen.lock().unwrap(), 2);
-        let note = decided.refused_rechecks.clone().unwrap();
-        assert!(
-            note.starts_with(&format!(
-                "the final recheck of the prefix of {} events (openat2: RESOLVE_IN_ROOT",
-                deciding + 1
-            )) && note.contains("was refused by Hermit"),
-            "{note}"
-        );
-        // The report says so: its stack-trace replays here are not refused.
-        options.trial_runner = backstop_runner(deciding, |_, _| false, ran.clone());
-        let report = options.phase6_record_prefix_outputs(decided).unwrap();
-        assert!(
-            report.header.contains(&format!("Note: {note}\n")),
-            "{}",
-            report.header
-        );
     }
 
     /// A trial Hermit refused in a way the host's timing decides (a skid
@@ -7576,46 +7588,31 @@ mod tests {
 
     /// A refusal is never an outcome. A trial Hermit refused again when it
     /// ran once more, or refused deterministically (at once, with no rerun:
-    /// it would be refused again), ends the search with a partial report
-    /// (exit 120, `trial-inconclusive`) that names the runs and the refusal,
-    /// with Detcore's reason; the advice says what a resume would do.
+    /// it would be refused again), ends the analysis with Hermit's refusal,
+    /// as main's completed-outcome rule ends it at any trial that did not
+    /// complete, and writes no partial report.
     #[test]
-    fn a_refusal_refused_again_or_deterministic_ends_the_search_with_a_partial_report() {
+    fn a_refusal_refused_again_or_deterministic_ends_the_analysis() {
         use std::sync::Arc;
         use std::sync::Mutex;
         let (len, deciding) = (200, 137);
         let target = two_thread_schedule(len);
         let parent = tempfile::tempdir().unwrap();
-        for (label, refusal, runs, says) in [
+        for (label, refusal, runs) in [
             (
                 "host-timed",
                 Refusal::HostTimed,
                 &["prefix_round_003", "prefix_round_003_retry"][..],
-                &[
-                    "prefix_round_003 was refused by Hermit (a host-timed refusal: observed 2",
-                    "; then prefix_round_003_retry was refused by Hermit (a host-timed refusal",
-                    "depends on the host's timing rather than the guest's",
-                    "Continue the analysis, which runs the refused trial again",
-                ][..],
             ),
             (
                 "deterministic",
                 Refusal::Deterministic,
                 &["prefix_round_003"][..],
-                &[
-                    "prefix_round_003 was refused by Hermit (openat2: RESOLVE_IN_ROOT cannot be \
-                     serviced on this backend)",
-                    "Hermit refuses that in every run of the trial, so the trial cannot be \
-                     evaluated",
-                    "A resumed analysis would run the same trial into the same refusal",
-                ][..],
             ),
         ] {
-            let report_file = parent.path().join(format!("{label}.json"));
-            let report = format!("--report-file={}", report_file.display());
             let (mut options, _workspace) = analysis_in(
                 &parent.path().join(label),
-                &["--target-stdout=FAILED", "--prefix-search", report.as_str()],
+                &["--target-stdout=FAILED", "--prefix-search"],
             );
             let ran = Arc::new(Mutex::new(Vec::new()));
             // The empty prefix misses, the whole schedule meets, and every
@@ -7628,12 +7625,9 @@ mod tests {
             let result = options
                 .phase5_prefix_search(&target)
                 .map(|_| ExitStatus::SUCCESS);
-            let status = options.end_on_budget(result).unwrap();
-            assert_eq!(
-                status,
-                ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT),
-                "{label}"
-            );
+            let error = options.end_on_budget(result).unwrap_err();
+            assert!(!options.partial_report_written, "{label}");
+            assert_stopped_trial(&error, "refusal");
             let ran: Vec<String> = ran
                 .lock()
                 .unwrap()
@@ -7645,23 +7639,6 @@ mod tests {
                 runs.iter().map(|run| run.to_string()).collect::<Vec<_>>(),
                 "{label}"
             );
-            let written: Report =
-                serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
-            let partial = written.partial.unwrap();
-            assert_eq!(partial.reason, PartialReason::TrialInconclusive, "{label}");
-            let inconclusive = partial.inconclusive.unwrap();
-            assert_eq!(
-                inconclusive.refused().map(|refused| refused.refusal),
-                Some(refusal),
-                "{label}"
-            );
-            for said in says {
-                assert!(
-                    written.header.contains(said),
-                    "{label}: {said}\n{}",
-                    written.header
-                );
-            }
         }
     }
 
@@ -8220,8 +8197,8 @@ mod tests {
     /// has no outcome: the search tries another schedule between the pair and
     /// settles on the same critical pair as a search in which every round is
     /// followed. When no schedule between the pair can be followed, the
-    /// analysis ends with a partial report (exit 120, `trial-inconclusive`)
-    /// that lists the rounds and gives the `--prefix-search` command.
+    /// search ends with the rounds it tried ([`NoFeasibleSchedule`]), which
+    /// the default search answers with a prefix search.
     #[test]
     fn a_bisection_round_that_left_its_schedule_never_decides() {
         use std::sync::Arc;
@@ -8296,46 +8273,35 @@ mod tests {
         assert!(followed_ran.lock().unwrap().len() >= 4 && ran.len() >= 4);
         drop(ran);
 
-        // No spliced round can be followed.
-        let (mut options, _w3, stopped, ran, report_file) = bisect("none", |name| {
+        // No spliced round can be followed: the search ends with the
+        // schedules it tried, which bisect_endpoints_and_report answers with
+        // a prefix search, as it does when no single swap separates the
+        // endpoints.
+        let (_options, _w3, stopped, ran, _) = bisect("none", |name| {
             name != "bisect_round_001" && name != "bisect_round_002"
         });
-        let status = options
-            .end_on_budget(stopped.map(|_| ExitStatus::SUCCESS))
-            .unwrap();
-        assert_eq!(
-            status,
-            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
-        );
-        let written: Report =
-            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
-        let partial = written.partial.unwrap();
-        assert_eq!(partial.reason, PartialReason::TrialInconclusive);
-        assert_eq!(partial.phase, Phase::Bisect);
-        let infeasible = partial.infeasible.unwrap();
+        let error = stopped.expect_err("no schedule could be followed");
+        let infeasible = error
+            .downcast_ref::<NoFeasibleSchedule>()
+            .unwrap_or_else(|| panic!("{error:#}"));
         assert_eq!(infeasible.pass, 0);
         assert_eq!(infeasible.tried.len() + 2, ran.lock().unwrap().len());
+        // Whether the round passed is not read: only an endpoint keeps it.
+        let first = &infeasible.tried[0];
         assert_eq!(
-            infeasible.tried[0],
+            InfeasibleSchedule {
+                passed: None,
+                ..first.clone()
+            },
             InfeasibleSchedule {
                 run: "bisect_round_003".to_owned(),
                 event: 2,
                 expected: 5,
                 running: 3,
-                passed: false,
+                passed: None,
             }
         );
-        assert!(
-            written
-                .header
-                .contains("because no schedule between the closest pair could be replayed")
-                && written
-                    .header
-                    .contains("A resumed analysis would replay the same schedules"),
-            "{}",
-            written.header
-        );
-        assert!(partial.resume_command.contains("--prefix-search"));
+        assert!(first.passed.is_some(), "a completed round has an outcome");
     }
 
     /// The default search's partial report names its pair of schedules, the
