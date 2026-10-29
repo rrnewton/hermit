@@ -601,12 +601,14 @@ a range alone does. The default is unchanged: plain `--chaos` keeps the fixed
   magnitude. At draws near 1 us the fixed charge for each committed scheduler
   turn (0.5 ms) makes up about 99% of guest-visible time
   ([#4813](https://github.com/rrnewton/hermit/issues/4813)), so a guest's own
-  watchdogs can fire on threads that are making progress. Hermit has no
-  option against this yet: `--cap-preemption-charge`, proposed in
-  [#4653](https://github.com/rrnewton/hermit/pull/4653) and not yet in
-  Hermit, caps the charge (in the crash hunt it cut a control's watchdog
-  aborts at a 1038 ns draw from 5 of 5 seeds to 1 of 5). Once it is
-  available, pass it beside fine draws.
+  watchdogs can fire on threads that are making progress. Pass
+  `--cap-preemption-charge` beside fine draws: it caps that charge (in the
+  crash hunt it cut a control's watchdog aborts at a 1038 ns draw from 5 of 5
+  seeds to 1 of 5). It is refused where no timeslice ends by expiry
+  (`--max-timeslice=disabled` without `--target-timeslice`), where no Detcore
+  scheduler orders the threads (`--namespace-only`, `--strace-only`,
+  `--no-sequentialize-threads`) and with the DBT backend, and it is never
+  applied in record mode.
 - A race that needs coarse slices is reached by fewer seeds than at the fixed
   default.
 - It is meant for seed sweeps: without a seed every run is seed 0, which draws
