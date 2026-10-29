@@ -159,8 +159,10 @@ impl Scheduler {
     /// record of its schedule, so the run goes on past it. A replay applies
     /// the options that shaped its recording as
     /// `detcore_model::schedule_replay_options` classifies them for that
-    /// point. The point is the consumption of the last recorded event, a
-    /// scheduled event of a running thread, so it is the same in every run.
+    /// point. The point is the consumption of the last recorded event (a
+    /// scheduled event of a running thread) or the replay's release of its
+    /// schedule (`Replayer::release_schedule`, which drops the records left);
+    /// each happens at the same observed event in every run.
     pub(super) fn past_the_schedule(&self) -> bool {
         self.has_schedule_replay() && !self.replay_has_records_left()
     }
