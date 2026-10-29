@@ -1848,7 +1848,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
     // Train 6 recount (measured on 21f770f6 base): 1187.
-    ("test.hermit_unit", 1198),
+    ("test.hermit_unit", 1201),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3066,7 +3066,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit", 2817),
+    ("test.detcore_unit", 2851),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4362,7 +4362,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 676),
+    ("test.cli", 688),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4909,7 +4909,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 595),
+    ("test.cli_on_host", 607),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5382,7 +5382,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit_on_host", 2817),
+    ("test.detcore_unit_on_host", 2851),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5753,7 +5753,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
-    ("test.hermit_unit_on_host", 1192),
+    ("test.hermit_unit_on_host", 1195),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
