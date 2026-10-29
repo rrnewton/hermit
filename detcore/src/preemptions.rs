@@ -4579,6 +4579,33 @@ mod tests {
         }
     }
 
+    /// A prefix keeps its source's events, instruction offsets included, so a
+    /// record that notes no background starts states its source's format,
+    /// whether the prefix replays some, all or more than all of the
+    /// schedule's events. (A shorter prefix of one that notes them drops them
+    /// and states the format below theirs,
+    /// `a_schedule_prefix_keeps_the_background_starts_only_for_the_whole_schedule`;
+    /// one whose offsets keep it at their format says it notes none,
+    /// `a_record_that_drops_its_background_starts_keeps_its_offsets_format_and_says_so`.)
+    #[test]
+    fn a_schedule_prefix_keeps_its_sources_record_format() {
+        let tid = DetTid::from_raw(3);
+        for format in [None, Some(SWITCH_IN_CHARGE_FORMAT)] {
+            let mut record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ]);
+            record.format_version = format;
+            for len in [0, 1, 2, 9] {
+                assert_eq!(
+                    record.schedule_prefix(len).format_version,
+                    format,
+                    "format {format:?}, prefix of {len} events"
+                );
+            }
+        }
+    }
+
     /// A replay of a schedule's first events keeps the callback checkpoints
     /// of the slices those events end, for the threads they run, and no later
     /// ones: the slice end at the prefix's own end belongs to the event after
