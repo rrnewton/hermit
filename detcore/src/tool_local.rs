@@ -4867,6 +4867,13 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) passed_descriptors_out_unreported: bool,
 
+    /// Set once a resource request of this thread carried
+    /// `Resources::passes_descriptors_out`, after which the scheduler trusts
+    /// no guest-held mark for the rest of the run, so this thread need not
+    /// report a pass-out again (`Detcore::passes_descriptors_out_now`).
+    #[serde(default)]
+    pub(crate) passed_descriptors_out_reported: bool,
+
     /// Set by the syscall handler when a `FUTEX_WAKE` woke a waiter and
     /// [`Config::yields_after_futex_wake`] holds, so that the
     /// syscall's post-hook takes a yield turn. A logically killed waker gets
@@ -5797,6 +5804,7 @@ impl<T> ThreadState<T> {
             uncharged_bootstrap_syscalls: 0,
             in_uncharged_bootstrap_syscall: false,
             passed_descriptors_out_unreported: false,
+            passed_descriptors_out_reported: false,
             yield_after_futex_wake: false,
             pipe_handoff_due: None,
             own_signal_turn_hold: None,

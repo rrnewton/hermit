@@ -3069,7 +3069,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And this change's three unit tests: 2814.
     // On main 32f85d391 (2877), this change's three units and fd's
     // a_received_descriptor_is_guest_held_only_through_its_senders_open_file: 2881, listed.
-    ("test.detcore_unit", 2887),
+    // a_received_descriptor_is_guest_held_only_through_its_senders_open_file: 2881.
+    // And io_buffers' two whole-loop send rewrite units: 2883, listed.
+    ("test.detcore_unit", 2889),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5389,7 +5391,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // replayer test and keeps the population at 2787.
     // And the same tests: 2814.
     // The same four units on main 32f85d391: 2881, listed.
-    ("test.detcore_unit_on_host", 2887),
+    // The same four units on main 32f85d391: 2881.
+    // And the same two send rewrite units: 2883, listed.
+    ("test.detcore_unit_on_host", 2889),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
