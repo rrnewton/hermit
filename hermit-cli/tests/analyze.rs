@@ -649,7 +649,8 @@ fn assert_spin_trial_stops_analysis(analyze_opts: &[&str], expected_run: &str) {
     let report = dir.path().join("report.json");
     let mut command = Command::new("timeout");
     command
-        .args(["--signal=KILL", "30s"])
+        // The stopped run runs again with 4 times its 3 s bound.
+        .args(["--signal=KILL", "60s"])
         .arg(hermit_test::hermit_binary())
         .args([
             "analyze",
@@ -682,9 +683,15 @@ fn assert_spin_trial_stops_analysis(analyze_opts: &[&str], expected_run: &str) {
     );
     assert!(
         combined.contains(&format!(
-            "{expected_run} reached hermit analyze's bound of 3 s per run"
+            "{expected_run} did not finish within hermit analyze's wall-clock bound of 3 s"
         )),
         "the intended later run must hit the bound: {combined}"
+    );
+    assert!(
+        combined.contains(&format!(
+            "{expected_run}_retry reached hermit analyze's bound of 12 s for this run"
+        )),
+        "its rerun with 4 times the bound must hit it too: {combined}"
     );
     assert!(
         combined.contains("no program outcome was established"),
