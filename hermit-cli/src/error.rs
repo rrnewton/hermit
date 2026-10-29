@@ -152,6 +152,20 @@ fn is_policy_refusal(err: &Error) -> bool {
             || cause.is::<detcore::TerminalReplayRefusal>()
             || cause.is::<detcore::PriorityHistoryRefusal>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
+            || is_chosen_root_id_taken(cause)
+    }
+    // The guest's first process could not have its chosen ID
+    // (`--no-namespace`, `Command::pid`): another task took it after Hermit
+    // checked, such as a run in another network namespace, which the window
+    // reservation does not cover. Linux's clone never fails with EEXIST but
+    // for a requested ID, so this is that refusal.
+    fn is_chosen_root_id_taken(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause
+            .downcast_ref::<reverie::process::Error>()
+            .is_some_and(|error| {
+                error.errno() == reverie::syscalls::Errno::EEXIST
+                    && error.context() == reverie::process::Context::Clone
+            })
     }
     if err.chain().any(refuses) {
         return true;

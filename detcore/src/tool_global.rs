@@ -33,7 +33,9 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
 use std::time::Duration;
@@ -1195,6 +1197,18 @@ pub struct GlobalState {
     // next port to use if input port is 0
     next_port: AtomicU16,
 
+    /// The ID the next guest task gets when Detcore chooses the IDs
+    /// (`GuestIds::Chosen`): one past the first process's at the start, one
+    /// more for every clone-family call that asks (`NextGuestId`). Zero when
+    /// the kernel numbers the guest.
+    next_guest_id: AtomicI32,
+
+    /// How many guest tasks were created with a host ID although Detcore
+    /// chooses the IDs (`GuestIds::Chosen` without `refuse_host_ids`): the
+    /// run's IDs are then not deterministic, which the summary says and the
+    /// preemption record states, so that a replay refuses it.
+    host_id_tasks: AtomicU64,
+
     // used ports
     used_ports: Mutex<HashSet<u16>>,
 
@@ -1832,6 +1846,12 @@ impl GlobalState {
             #[cfg(feature = "physical-mm-test-support")]
             initial_mm_probe: Mutex::new(None),
             next_port: AtomicU16::new(range[0]),
+            next_guest_id: AtomicI32::new(
+                cfg.guest_ids
+                    .base()
+                    .map_or(0, |base| base.saturating_add(1)),
+            ),
+            host_id_tasks: AtomicU64::new(0),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             syscall_observation_gaps: Mutex::new(BTreeSet::new()),
@@ -2487,6 +2507,9 @@ impl GlobalState {
         if let Some(replay) = &self.replay_host_inputs {
             summary.host_inputs_changed = replay.lock().unwrap().changes().to_vec();
         }
+        summary.guest_ids = (self.cfg.guest_ids != detcore_model::pid::GuestIds::Namespace)
+            .then_some(self.cfg.guest_ids);
+        summary.host_id_tasks = self.host_id_tasks.load(SeqCst);
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -2555,6 +2578,11 @@ impl GlobalTool for GlobalState {
         // A backend whose guest thread IDs are not host tasks never reads a
         // host task's `/proc` signal state for them (`read_kernel_signal_state`).
         crate::syscalls::refuse_host_signal_state_reads(&cfg.backend);
+        // How the guest is numbered, where no PID namespace of its own does
+        // it, so that a run's log says which IDs it can be compared by.
+        if cfg.guest_ids != detcore_model::pid::GuestIds::Namespace {
+            info!("[detcore] guest process IDs: {}", cfg.guest_ids);
+        }
         GlobalState::initialize(cfg, true)
     }
 
@@ -2906,6 +2934,16 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
+    /// The ID for the next guest task, when Detcore chooses the IDs: each
+    /// call takes the next one, whether or not the clone that asked succeeds,
+    /// so an ID is never given out twice. Asked in the caller's turn, so the
+    /// order of the takes is the guest's own order of clone-family calls.
+    /// `None` when the kernel numbers the guest.
+    fn take_guest_id(&self) -> Option<i32> {
+        self.cfg.guest_ids.base()?;
+        Some(self.next_guest_id.fetch_add(1, SeqCst))
+    }
+
     /// Evaluate a brk predicate in the controller's unchanged procfs view.
     /// The scheduler lock retains the caller's grant and physical identity
     /// until all temporary descriptors have closed. The backend fact excludes
@@ -4138,6 +4176,16 @@ impl GlobalState {
                         .map(|cookie| table.virtualize(cookie))
                         .collect(),
                 )
+            }
+            GlobalRequest::NextGuestId => R::NextGuestId(self.take_guest_id()),
+            GlobalRequest::GaveHostId => {
+                self.host_id_tasks.fetch_add(1, SeqCst);
+                // The run's IDs now depend on the host: a record of it says
+                // so, and a replay refuses it.
+                if let Some(writer) = &mut self.lock_rpc_scheduler(false).await.preemption_writer {
+                    writer.set_guest_ids(detcore_model::pid::GuestIds::Host);
+                }
+                R::GaveHostId(())
             }
             GlobalRequest::InPidNamespaceInit(thread) => {
                 let scheduler = self.lock_rpc_scheduler(false).await;
@@ -5639,7 +5687,9 @@ impl GlobalState {
                 // whenever its parent runs on after the clone, as recorded
                 // schedules usually have it, so this is a sign that the
                 // replay lost its guide only once it has left the record.
-                if sched.replay_registration_priority(child_dettid, initial_priority) {
+                if sched.replay_registration_priority(child_dettid, initial_priority)
+                    && !is_replay_root(&self.cfg, child_dettid)
+                {
                     if sched.replay_left_its_record() {
                         warn!(
                             "[detcore, dtid {}] registered before the replayed schedule switched to it, created by process {}; it takes its starting priority {}",
@@ -6747,7 +6797,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 7;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 8;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -7467,6 +7517,13 @@ pub enum GlobalRequest {
     /// of the `sched_setaffinity` that set it (`Scheduler::set_cpu_affinity`).
     /// Appended last.
     SetCpuAffinity(DetTid, crate::cpu_set::CpuSet),
+    /// Take the ID for the task a clone-family call is about to create, when
+    /// Detcore chooses the IDs (`GuestIds::Chosen`), in the caller's turn.
+    /// Appended last.
+    NextGuestId,
+    /// A guest task was created with a host ID although Detcore chooses the
+    /// IDs (`GlobalState::host_id_tasks`). Appended last.
+    GaveHostId,
 }
 
 /// Responses from the global object
@@ -7772,6 +7829,11 @@ pub enum GlobalResponse {
     /// The answer to `GlobalRequest::CpuAffinity` and
     /// `GlobalRequest::SetCpuAffinity`. Appended last.
     CpuAffinity(crate::cpu_set::TaskAffinity),
+    /// The answer to `GlobalRequest::NextGuestId`: the ID taken, or `None`
+    /// when the kernel numbers the guest. Appended last.
+    NextGuestId(Option<i32>),
+    /// The answer to `GlobalRequest::GaveHostId`. Appended last.
+    GaveHostId(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9039,6 +9101,36 @@ pub(crate) fn child_tid_clear_address(flags: CloneFlags, address: usize) -> usiz
     }
 }
 
+/// The priority a thread starts with under `--replay-schedule-from`, until
+/// the replayed schedule switches to it: the foreground for the guest's first
+/// thread, which the schedule's first event names, and the deferred priority
+/// for every other. The first thread is 3 in Hermit's PID namespace, and the
+/// chosen base under `--no-namespace` with chosen IDs (`GuestIds::Chosen`).
+/// Treating the base as any other thread left the first thread deferred
+/// beside its children, so that, until a context switch set the priorities,
+/// the run queue's order alone chose between it and an older child: a spliced
+/// schedule (`hermit analyze`'s two-seed bisection) with no switch between
+/// two clones ran the first child at the second clone's posthook, where the
+/// schedule had the parent.
+fn replay_starting_priority(config: &Config, dettid: DetTid) -> Priority {
+    if is_replay_root(config, dettid) {
+        REPLAY_FOREGROUND_PRIORITY
+    } else {
+        REPLAY_DEFERRED_PRIORITY
+    }
+}
+
+/// Whether `dettid` is the guest's first thread (`replay_starting_priority`):
+/// the chosen base under `GuestIds::Chosen`, whose later tasks take the IDs
+/// after it (a base of 2 makes 3 a child), and otherwise thread 3 or below,
+/// as Hermit's PID namespace numbers it.
+fn is_replay_root(config: &Config, dettid: DetTid) -> bool {
+    match config.guest_ids.base() {
+        Some(base) => dettid.as_raw() == base,
+        None => dettid <= DetTid::from_raw(3),
+    }
+}
+
 /// Global method RPC for the parent to add a child-thread to the round-robin pool.
 ///
 /// Nonblocking: future returning does not guarantee anything about the central scheduler,
@@ -9062,12 +9154,7 @@ where
         // side of the rpc, in recv_create_child_thread.
         None
     } else if guest.config().replay_schedule_from.is_some() {
-        // FIXME!  Find a cleaner way to make the root thread start off high-priority:
-        if child_dettid <= DetTid::from_raw(3) {
-            Some(REPLAY_FOREGROUND_PRIORITY)
-        } else {
-            Some(REPLAY_DEFERRED_PRIORITY)
-        }
+        Some(replay_starting_priority(guest.config(), child_dettid))
     } else if guest.config().chaos {
         let entropy = guest
             .thread_state_mut()
@@ -9149,11 +9236,7 @@ pub async fn create_vfork_child_thread<G, T>(
     let starting_priority = if guest.config().replay_preemptions_from.is_some() {
         None
     } else if guest.config().replay_schedule_from.is_some() {
-        Some(if child_dettid <= DetTid::from_raw(3) {
-            REPLAY_FOREGROUND_PRIORITY
-        } else {
-            REPLAY_DEFERRED_PRIORITY
-        })
+        Some(replay_starting_priority(guest.config(), child_dettid))
     } else if guest.config().chaos {
         Some(entropy_to_priority(vfork.child_priority_entropy.expect(
             "vfork child priority entropy missing in chaos mode",
@@ -9973,6 +10056,32 @@ where
         GlobalResponse::ThreadIsLive(live) => live,
         _ => unreachable!(),
     }
+}
+
+/// The ID the task that the caller's clone-family call is about to create
+/// gets, when Detcore chooses the IDs (`GuestIds::Chosen`); `None` when the
+/// kernel numbers the guest (`GlobalState::take_guest_id`).
+pub(crate) async fn next_guest_id<G, T>(guest: &mut G) -> Option<i32>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::NextGuestId).await;
+    match response.1 {
+        GlobalResponse::NextGuestId(id) => id,
+        _ => unreachable!(),
+    }
+}
+
+/// Tell the global state that a guest task was created with a host ID
+/// although Detcore chooses the IDs (`GlobalState::host_id_tasks`).
+pub(crate) async fn note_host_id_task<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::GaveHostId).await;
+    assert_eq!(response.1, GlobalResponse::GaveHostId(()));
 }
 
 /// Whether a `clone3` `set_tid` naming `dettid` is refused: a task of this
@@ -11422,6 +11531,43 @@ mod tests {
     /// (`GlobalResponse::Granted`).
     fn granted(response: super::GlobalResponse) -> super::GlobalResponse {
         super::GlobalResponse::Granted(Box::new(response))
+    }
+
+    /// Under `--replay-schedule-from` the guest's first thread starts in the
+    /// foreground and every other deferred, under either replayable
+    /// numbering: thread 3 in Hermit's PID namespace (`GuestIds::Namespace`),
+    /// the chosen base under `--no-namespace` (`GuestIds::Chosen`), whose
+    /// first thread a replay otherwise left deferred beside its children. A
+    /// low base's children are not taken for the first thread.
+    #[test]
+    fn the_first_guest_thread_starts_a_schedule_replay_in_the_foreground_under_either_numbering() {
+        use detcore_model::pid::GuestIds;
+        let namespace = super::Config::default();
+        assert_eq!(namespace.guest_ids, GuestIds::Namespace);
+        let chosen = |base| super::Config {
+            guest_ids: GuestIds::Chosen {
+                base,
+                refuse_host_ids: true,
+            },
+            ..Default::default()
+        };
+        let starts = |config: &super::Config, tid: i32| {
+            super::replay_starting_priority(config, super::DetTid::from_raw(tid))
+        };
+        let (foreground, deferred) = (
+            super::REPLAY_FOREGROUND_PRIORITY,
+            super::REPLAY_DEFERRED_PRIORITY,
+        );
+        assert_eq!(starts(&namespace, 3), foreground);
+        assert_eq!(starts(&namespace, 4), deferred);
+        assert_eq!(starts(&chosen(31744), 31744), foreground);
+        assert_eq!(starts(&chosen(31744), 31745), deferred);
+        assert_eq!(starts(&chosen(31744), 3), deferred);
+        assert_eq!(starts(&chosen(2), 2), foreground);
+        assert_eq!(starts(&chosen(2), 3), deferred);
+        assert_eq!(starts(&chosen(1), 1), foreground);
+        assert_eq!(starts(&chosen(1), 2), deferred);
+        assert_eq!(starts(&chosen(1), 3), deferred);
     }
 
     /// A process reads its current image's vector; a forked child its

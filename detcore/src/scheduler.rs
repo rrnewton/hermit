@@ -4379,7 +4379,8 @@ impl Scheduler {
                 .with_signal_state_copy(cfg.signal_state_copy)
                 .with_rng_seed(cfg.rng_seed())
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
-                .with_cap_preemption_charge(cfg.cap_preemption_charge);
+                .with_cap_preemption_charge(cfg.cap_preemption_charge)
+                .with_guest_ids(cfg.guest_ids);
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -16197,8 +16198,9 @@ impl Scheduler {
     /// recording (`release_replay_priorities_if_exhausted`) every thread has
     /// the default priority, so a new one does too: at the deferred priority
     /// it could wait for ever behind a parent that never blocks. Returns
-    /// whether a thread other than the root took its starting priority
-    /// unguided, a sign that the replay has left its recording.
+    /// whether the thread took its starting priority unguided, which, for any
+    /// thread but the guest's first (`tool_global::is_replay_root`), is a sign
+    /// that the replay has left its recording.
     pub(crate) fn replay_registration_priority(
         &mut self,
         dettid: DetTid,
@@ -16211,7 +16213,7 @@ impl Scheduler {
         match self.priorities.entry(dettid) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(starting);
-                dettid != crate::consts::ROOT_DETPID
+                true
             }
             std::collections::btree_map::Entry::Occupied(_) => false,
         }
@@ -17332,6 +17334,8 @@ impl Scheduler {
                 // GlobalState keeps the host-input records.
                 host_inputs: None,
                 host_inputs_changed: Vec::new(),
+                guest_ids: None,
+                host_id_tasks: 0,
             },
             info_reprio_descrip,
         ))

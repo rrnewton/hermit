@@ -4435,6 +4435,12 @@ pub struct ThreadState<T> {
     /// `handle_thread_start`; the parent clears its copy when injection returns.
     pub pending_vfork: Option<PendingVfork>,
 
+    /// The ID this thread's restarted clone-family call took when Detcore
+    /// chooses the IDs (`GuestIds::Chosen`): the call comes back after the
+    /// signal that interrupted it, and keeps its ID
+    /// (`Detcore::plan_clone_id`).
+    pub(crate) restarted_clone_id: Option<i32>,
+
     /// Shared file metadata among all threads in the same process.
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
     pub file_metadata: Arc<Mutex<FileMetadata>>,
@@ -5595,6 +5601,7 @@ impl<T> ThreadState<T> {
             thread_cpu_start_system_time: last_accounted_system_time,
             clone_flags: None,
             pending_vfork: None,
+            restarted_clone_id: None,
             // For the root thread, we initialize from the seed in the config:
             prng: crate::random::root_prng(cfg.rng_seed()),
             initialized_random_auxv: None,
