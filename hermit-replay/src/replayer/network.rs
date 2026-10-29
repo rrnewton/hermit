@@ -529,6 +529,8 @@ mod tests {
 
     use super::*;
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_poll_restores_outputs_before_returning_efault() {
         let mut output = libc::pollfd {
@@ -596,6 +598,8 @@ mod tests {
         assert_eq!(timeout, recorded_timeout);
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_poll_restores_outputs_before_returning_eintr() {
         let mut output = libc::pollfd {
@@ -624,6 +628,8 @@ mod tests {
         assert_eq!(output.revents, 0);
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_einval_performs_no_pollfd_write() {
         let event = PollEvent {
@@ -799,6 +805,8 @@ mod current_main_tests {
         assert_eq!(output_timeout, original_timeout);
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_poll_restores_fds_before_returning_a_recorded_error() {
         // THE ORDERING IS THE FIX. The old replayer returned the recorded error
@@ -834,6 +842,8 @@ mod current_main_tests {
         );
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_poll_early_error_with_pollfd_pointer_performs_no_fd_write() {
         let event = PollEvent {
