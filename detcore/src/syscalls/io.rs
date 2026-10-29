@@ -4002,15 +4002,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// A received descriptor that joins the open file its sender's table
     /// modeled (`crate::syscalls::scm_rights`) shares that open file's mark,
-    /// set or not, as a dup would. That needs no check here: a join takes
-    /// only what a guest's `sendmsg` or `sendmmsg` queued on the receiving
-    /// socket's known peer (`queue_sent_rights`), so the sender is a guest;
-    /// either the channel was guest-held, so the receiver is a guest too and
-    /// every holder of the open file is one, or the send revoked every mark
-    /// first (`note_descriptors_passed_out`, which both send paths run before
-    /// they send). A descriptor nothing queued names, such as one from a
-    /// process outside the guest, is a description of its own and starts
-    /// unmarked; this function marks it only on a guest-held channel. Marks
+    /// set or not, as a dup would. The mark it arrives with is sound: a join
+    /// takes only what a guest's `sendmsg` or `sendmmsg` queued on the
+    /// receiving socket's known peer (`queue_sent_rights`), so the sender is a
+    /// guest; either the channel was guest-held, so the receiver is a guest
+    /// too and every holder of the open file is one, or the send revoked every
+    /// mark first (`note_descriptors_passed_out`, which both send paths run
+    /// before they send). This function never sees a joined descriptor:
+    /// `record_received_descriptors` returns only the descriptors it recorded
+    /// as descriptions of their own (`Receipt::New`), so a join keeps its open
+    /// file's mark as it is. Each rule here holds for the open file all the
+    /// same: the object or its other end is already guest-held in this table,
+    /// or the socket is a connection whose peer is this process, never a
+    /// listener (`classify_guest_held_peer`). A descriptor nothing queued
+    /// names, such as one from a process outside the guest, is a description
+    /// of its own and starts unmarked; this function marks it only on a
+    /// guest-held channel. Marks
     /// only ever claim that no process outside the guest holds the object;
     /// once a descriptor may have left the guest, the scheduler stops trusting
     /// every mark (`Scheduler::polls_only_guest_state`).
@@ -4072,7 +4079,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   channel (`classify_received_descriptors`).
     ///
     /// A datagram socket's credentials are not its peer's, so it is never
-    /// marked here. A peer in another process, guest or not, and a socket with
+    /// marked here. Nor is a listening socket: `listen` sets a listener's
+    /// credentials to its caller's, so one this process listened on and then
+    /// received names this process, yet any process that can name its
+    /// address can connect and make it ready. Accept and connect never return
+    /// a listener, so only a receipt can offer one; `SO_ACCEPTCONN` must read
+    /// 0, and a socket whose value cannot be read is left unmarked. A peer in
+    /// another process, guest or not, and a socket with
     /// no peer credentials (any non-`AF_UNIX` socket, whose peer pid is 0) are
     /// left as they were. Best-effort and read-only: an injection that fails
     /// leaves the socket unmarked, and nothing the guest sees changes. Only
@@ -4090,6 +4103,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             return;
         };
         if kind != libc::SOCK_STREAM && kind != libc::SOCK_SEQPACKET {
+            return;
+        }
+        // A listener's credentials are its own (`unix_listen` sets them to
+        // the caller's), and an outside client's connect makes it ready.
+        if socket_option::<libc::c_int, _, _>(guest, fd, libc::SO_ACCEPTCONN).await != Some(0) {
             return;
         }
         let Some(credentials) =
