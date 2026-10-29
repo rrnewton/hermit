@@ -1703,7 +1703,18 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // 0x184 projects those private intervals from complete Smaps sections,
     // 0x185 random devices are classified by device number,
     // 0x186 projects coherent NUMA rows with authenticated private ownership,
-    // and 0x189 runs a MSG_DONTWAIT call on a socketpair end once),
+    // 0x187 a recording stores the schedule it ran under,
+    // 0x188 runs a MSG_DONTWAIT call on a socketpair end once,
+    // 0x189 replays a recorded poll's ERESTARTSYS as ERESTARTNOHAND,
+    // 0x18a gives each open of a random device a stream of its own,
+    // 0x18b keeps ignored signals from ending kernel-run epoll waits,
+    // 0x18c and kernel-run poll and select waits that name no mask,
+    // 0x18f a descriptor received over SCM_RIGHTS joins the open file its
+    // send modelled,
+    // 0x190 a fatal signal retires the process's other threads in its turn,
+    // 0x193 every /proc status file shows TracerPid 0,
+    // and 0x195 runs a kernel-run poll's restart as the guest's own
+    // restart_syscall),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
