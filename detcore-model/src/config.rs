@@ -2520,7 +2520,8 @@ fn config_wire_default() -> Config {
     config.sched_seed = None;
     // `BackendCapabilities` is defined in Reverie, outside
     // `CONFIG_DEFINITION_SOURCES`, so the source domain cannot see a change to
-    // it; only its encoding can. Every field is a bool, so any constant
+    // it; only its encoding can. Every field encodes in one byte (a bool, or
+    // the `u8` width of `hardware_watchpoints`), so any constant
     // carries every field's width (see
     // `config_fingerprint_sees_the_width_of_every_backend_capability`). KVM's
     // is kept, as it was when one field was optional and only KVM's set it.
@@ -3057,6 +3058,14 @@ impl LegacyBackendKeys {
         backend.reports_sigreturns = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
+        // Added after the legacy form froze (Reverie 1161 made it a `u8`
+        // width). The legacy form carries no width for it: by absence it
+        // says the bool false, and the minimal width that represents a
+        // legacy bool false is 0, so it reads back as 0. A backend with a
+        // nonzero width (ptrace reports 4 on x86_64) is preserved exactly
+        // only by the versioned envelope of `encode_backend_config_json`,
+        // never by these keys.
+        backend.hardware_watchpoints = 0;
         backend
     }
 }
@@ -3878,6 +3887,9 @@ mod tests {
         backend.promotes_open_files_before_native_lifecycle =
             backend.requires_thread_directed_process_signals;
         backend.loopback_pollers_yield_to_peers = backend.tool_shares_guest_descriptor_table;
+        // The legacy form carries no width for `hardware_watchpoints`: it
+        // reads back as 0, the minimal width (see `LegacyBackendKeys::capabilities`).
+        backend.hardware_watchpoints = 0;
         backend
     }
 
@@ -3968,7 +3980,13 @@ mod tests {
         let baseline = serde_json::to_value(BackendCapabilities::DBT).unwrap();
         for (name, value) in baseline.as_object().unwrap() {
             let mut edited = baseline.clone();
-            edited[name] = serde_json::Value::Bool(!value.as_bool().unwrap());
+            // Every capability is a bool except `hardware_watchpoints`, a
+            // `u8` width: flip it to another width (0 is DBT's, so 1).
+            edited[name] = if name == "hardware_watchpoints" {
+                serde_json::Value::from(1u8)
+            } else {
+                serde_json::Value::Bool(!value.as_bool().unwrap())
+            };
             let backend = serde_json::from_value(edited).unwrap();
             let sent = Config {
                 backend,
@@ -6572,18 +6590,25 @@ mod tests {
     fn config_fingerprint_sees_the_width_of_every_backend_capability() {
         // `BackendCapabilities` lives in Reverie, outside the fingerprinted
         // sources, so only its encoding can reveal a change to it. Every
-        // field is a bool, one byte in the encoding whatever its value, so the
-        // encoded default carries every field, and adding, removing or
-        // widening one changes the bytes. A field that is optional would have
+        // field encodes in one byte whatever its value (a bool, or the `u8`
+        // width of `hardware_watchpoints`), so the encoded default carries
+        // every field, and adding, removing or widening one changes the
+        // bytes. A field that is optional would have
         // to be present in the default, or a change to its width would encode
         // as the same bare `None`; this fails first.
         let config = config_wire_default();
         let fields = serde_json::to_value(config.backend).unwrap();
         let fields = fields.as_object().unwrap();
-        assert!(
-            fields.values().all(serde_json::Value::is_boolean),
-            "{fields:?}"
-        );
+        // The true widths from the capability table: every field is a bool
+        // except `hardware_watchpoints`, a `u8` count.
+        for (name, value) in fields {
+            if name == "hardware_watchpoints" {
+                let width = value.as_u64().expect("a u8 count encodes as a number");
+                assert!(width <= u64::from(u8::MAX), "{name}={width} exceeds a u8");
+            } else {
+                assert!(value.is_boolean(), "{name}={value} is not a bool");
+            }
+        }
         let encode = |config: &Config| {
             bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap()
         };
@@ -6599,6 +6624,14 @@ mod tests {
         });
         assert_eq!(encode(&flipped).len(), encode(&config).len());
         assert_ne!(encode(&flipped), encode(&config));
+        // The one numeric capability: another width within a `u8` changes
+        // the bytes at the same length; a wider type would change the length
+        // asserted above.
+        let widened = config.clone().with_backend(|backend| {
+            backend.hardware_watchpoints = backend.hardware_watchpoints.wrapping_add(1)
+        });
+        assert_eq!(encode(&widened).len(), encode(&config).len());
+        assert_ne!(encode(&widened), encode(&config));
     }
 
     #[test]
