@@ -1209,7 +1209,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // matching the full validate at c00dc58e0cd, which ran 1910 in this
     // selection (1909 passed; the one failure was the hosted-pin
     // assertion for the twin below, not a count refusal on this node).
-    ("test.regular_crates", 1910),
+    ("test.regular_crates", 1911),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1860,10 +1860,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1121, listed (1114 on main plus seven).
     // And the fourteen pinned_cpu::tests units, which choose the CPU a run is
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
-    // Incoming first-party source count 1226 + 9 split identities = 1235.
-    // The existing split source population delta is retained.
-    // Pending the unchanged strict compiled-inventory join; not a measured pass.
-    ("test.hermit_unit", 1235),
+    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
+    // Train 6 recount (measured on 21f770f6 base): 1187.
+    // Trains since then add 23 (measured with `cargo nextest list` at
+    // 11c35a504a6, less the five real_random_ skips: 1230 - 5; the full
+    // validate at 24fbff99c7a saw 1224 before 11c35a504a6 added one):
+    // 1202 + 23 = 1225.
+    // Six analyze outcome controls replace the timeout-as-baseline warning test: +5.
+    // And PR 4715's a_trial_writes_what_it_replays_only_into_the_workspace
+    // (a trial never writes into a --replay-schedule-from or
+    // --replay-preemptions-from file of the run arguments): 1226 + 1 = 1227.
+    // The split retains nine additional core identities: 1227 + 9 = 1236.
+    // Composed source count; the strict compiled-inventory join remains unrun.
+    ("test.hermit_unit", 1236),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3094,7 +3103,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2891 + 2 = 2893, re-measured with `cargo nextest list
     // -p hermit-detcore --lib --bins` at this integration head (the PR's
     // own 2899 was measured on its pre-revert base and does not apply here).
-    ("test.detcore_unit", 2893),
+    ("test.detcore_unit", 2898),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5430,7 +5439,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same P0 revert (7322689fae2) removes the same seven units here:
     // 2898 - 7 = 2891, matching the local twin's recount at c00dc58e0cd.
     // And the same two PR 4942 units: 2891 + 2 = 2893.
-    ("test.detcore_unit_on_host", 2893),
+    ("test.detcore_unit_on_host", 2898),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5801,10 +5810,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
-    // Incoming first-party source count 1220 + 9 split identities = 1229.
-    // The existing split source population delta is retained.
-    // Pending the unchanged strict compiled-inventory join; not a measured pass.
-    ("test.hermit_unit_on_host", 1229),
+    // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
+    // Train 6 recount (measured on 21f770f6 base): 1181.
+    // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
+    // The same six analyze outcome controls replace one obsolete warning test: +5.
+    // And the same PR 4715 trial-input workspace test: 1220 + 1 = 1221.
+    // The split retains nine additional core identities: 1221 + 9 = 1230.
+    // Composed source count; the strict compiled-inventory join remains unrun.
+    ("test.hermit_unit_on_host", 1230),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6023,7 +6036,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // so the hosted twin executes 1910 - 14 = 1896. Two of the four added
     // since 1894 are themselves hosted-excluded, so this twin gains only
     // two, not four: 1894 + 2 = 1896.
-    ("test.regular_crates_on_host", 1896),
+    ("test.regular_crates_on_host", 1897),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

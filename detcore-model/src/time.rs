@@ -974,17 +974,27 @@ impl GlobalTime {
             return;
         }
 
+        // Work the old leader did stays in aggregate time.
+        self.retire_thread(to);
         let survivor_time = self
             .time_vector
             .remove(&from)
             .unwrap_or_else(|| panic!("cannot reassign missing thread clock {from}"));
         let survivor_inherited = self.inherited_time.remove(&from).unwrap_or_default();
-        let retired_inherited = self.inherited_time.remove(&to).unwrap_or_default();
-        if let Some(retired_leader_time) = self.time_vector.remove(&to) {
-            self.extra_time = self.extra_time + (retired_leader_time - retired_inherited);
-        }
         self.time_vector.insert(to, survivor_time);
         self.inherited_time.insert(to, survivor_inherited);
+        self.sanity();
+    }
+
+    /// Drop the clock component of a thread that is gone, keeping its own
+    /// work in aggregate time. A later thread that Linux gives the same ID
+    /// then starts a component of its own, with its own inherited baseline,
+    /// instead of continuing the old thread's clock.
+    pub fn retire_thread(&mut self, dtid: DetTid) {
+        let inherited = self.inherited_time.remove(&dtid).unwrap_or_default();
+        if let Some(time) = self.time_vector.remove(&dtid) {
+            self.extra_time = self.extra_time + (time - inherited);
+        }
         self.sanity();
     }
 
@@ -1367,5 +1377,39 @@ mod global_time_tests {
         assert_eq!(time.threads_time(leader), worker_time);
         assert!(time.contains_thread(leader));
         assert!(!time.contains_thread(worker));
+    }
+
+    /// Linux gives an exited thread's ID to a later thread once IDs wrap at
+    /// `pid_max`. The later thread starts at its creator's time with a
+    /// component of its own: none of its inherited history is charged, and
+    /// the first holder's own work stays in aggregate time.
+    #[test]
+    fn a_reused_thread_id_starts_its_own_clock_and_keeps_the_old_work() {
+        let config = Config::default();
+        let mut time = GlobalTime::new(&config);
+        let start = time.as_nanos();
+        let parent = DetTid::from_raw(17);
+        let reused = DetTid::from_raw(18);
+        let mut parent_clock = DetTime::new(&config);
+        parent_clock.add_syscall_with_cost(100);
+        publish(&mut time, parent, &parent_clock);
+        let mut first_holder = parent_clock.clone_for_child();
+        first_holder.add_syscall_with_cost(50);
+        publish(&mut time, reused, &first_holder);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(150));
+
+        time.retire_thread(reused);
+        assert!(!time.contains_thread(reused));
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(150));
+
+        parent_clock.add_syscall_with_cost(1_000);
+        publish(&mut time, parent, &parent_clock);
+        let mut second_holder = parent_clock.clone_for_child();
+        publish(&mut time, reused, &second_holder);
+        assert_eq!(time.threads_time(reused), second_holder.as_nanos());
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_150));
+        second_holder.add_syscall_with_cost(7);
+        publish(&mut time, reused, &second_holder);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_157));
     }
 }
