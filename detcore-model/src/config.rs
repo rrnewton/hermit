@@ -6437,6 +6437,7 @@ mod tests {
         assert!(config.to_string().contains(" --runs-post-fork=random"));
     }
 
+#[test]
 fn the_expired_wait_charge_is_printed_when_set_and_never_enters_the_legacy_form() {
         assert_eq!(Config::default().expired_wait_charge, None);
         assert!(
@@ -6471,6 +6472,7 @@ fn the_expired_wait_charge_is_printed_when_set_and_never_enters_the_legacy_form(
         }
     }
 
+#[test]
 fn the_sleep_registration_is_printed_when_set_and_never_enters_the_legacy_form() {
         assert_eq!(Config::default().sleep_registration, None);
         assert!(
