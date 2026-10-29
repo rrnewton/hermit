@@ -6650,7 +6650,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         )
     }) || full_tags
         .iter()
-        .any(|tag| tag.contains("dbt") || tag.contains("sabre") || tag.contains("e9patch"))
+        .any(|tag| !hermit_manifest_plan::dag_source_ownership::is_core(tag))
     {
         return Err(
             "selective bracket: external cells or nodes reappeared in the core graph".into(),
