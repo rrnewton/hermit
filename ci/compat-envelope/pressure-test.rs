@@ -3190,7 +3190,7 @@ fn inherit_resume_selection(
         kvm_guest_cap: retained
             .kvm_guest_cap_explicit
             .then_some(retained.kvm_guest_cap),
-        cells_file: retained.cells_file.as_ref().map(|path| PathBuf::from(path)),
+        cells_file: retained.cells_file.as_ref().map(PathBuf::from),
         parity_select: retained.parity_select.clone(),
         resume_dir: requested.resume_dir.clone(),
         ..CellSelection::default()
@@ -18130,7 +18130,7 @@ fn resume_merge_self_test_at(scratch: &Path) -> Result<(), String> {
             .collect()
     };
     let new_tag = format!("cell.{}", cell_run_slug(&b, Some(2)));
-    require_runner_outcomes_for_resume(&meta, &evidence(&[new_tag.clone()]), &completed)
+    require_runner_outcomes_for_resume(&meta, &evidence(std::slice::from_ref(&new_tag)), &completed)
         .map_err(|e| format!("resume outcome check must accept durable+new outcomes: {e}"))?;
     if require_runner_outcomes_for_resume(&meta, &evidence(&[]), &completed).is_ok() {
         return Err("resume outcome check accepted a missing newly planned outcome".into());
@@ -18493,8 +18493,10 @@ fn resume_merge_self_test_at(scratch: &Path) -> Result<(), String> {
             inherited.cells_file
         ));
     }
-    let mut conflicting = CellSelection::default();
-    conflicting.manifest_guest_cap = Some(3);
+    let conflicting = CellSelection {
+        manifest_guest_cap: Some(3),
+        ..Default::default()
+    };
     let error = inherit_resume_selection(&retained_caps, &conflicting)
         .err()
         .ok_or("conflicting --manifest-guest-cap on resume must be refused")?;
@@ -18751,7 +18753,7 @@ fn resume_round2_self_test_at(scratch: &Path) -> Result<(), String> {
     let range_dir = scratch.join("range-dir");
     fs::create_dir_all(&range_dir)
         .map_err(|e| format!("cannot create {}: {e}", range_dir.display()))?;
-    fs::write(range_dir.join("run.json"), meta_json(&[a.clone()], &[], 1))
+    fs::write(range_dir.join("run.json"), meta_json(std::slice::from_ref(&a), &[], 1))
         .map_err(|e| format!("cannot write range fixture: {e}"))?;
     write_rep(
         &range_dir,
@@ -18767,7 +18769,7 @@ fn resume_round2_self_test_at(scratch: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot create {}: {e}", ref_dir.display()))?;
     fs::write(
         ref_dir.join("run.json"),
-        meta_json(&[a.clone()], &[b.clone()], 1),
+        meta_json(std::slice::from_ref(&a), std::slice::from_ref(&b), 1),
     )
     .map_err(|e| format!("cannot write reference fixture: {e}"))?;
     write_rep(
