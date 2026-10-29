@@ -29,7 +29,9 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
-#[cfg(target_arch = "x86_64")]use crate::event::InterruptedPoll;use crate::event::PollEvent;
+#[cfg(target_arch = "x86_64")]
+use crate::event::InterruptedPoll;
+use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::SelectEvent;
 use crate::event::fd_set_bytes;

@@ -3051,7 +3051,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             let result = self
                 .record_or_replay_shielded_wait(guest, Syscall::Poll(call))
                 .await;
-            kernel_poll_result(&call, result, deadline.is_some())
+            let result = kernel_poll_result(&call, result, deadline.is_some());
+            // The shielded wait replaced `run_kernel_poll` on this path, but
+            // a signal that ends the poll still leaves the guest's own
+            // `restart_syscall` to resume it, so keep the same record
+            // `run_kernel_poll_as` keeps.
+            if let Some(deadline) = deadline {
+                keep_restart_block(
+                    guest,
+                    &result,
+                    RestartCall::KernelPoll(call, deadline),
+                    None,
+                )
+                .await;
+            }
+            result
         }
     }
 

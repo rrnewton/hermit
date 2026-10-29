@@ -40,7 +40,9 @@ use reverie::syscalls::family::SockOptFamily;
 use super::Recorder;
 use crate::event::AcceptEvent;
 use crate::event::EpollWaitEvent;
-#[cfg(target_arch = "x86_64")]use crate::event::InterruptedPoll;use crate::event::PollEvent;
+#[cfg(target_arch = "x86_64")]
+use crate::event::InterruptedPoll;
+use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::RecvmsgEvent;
 use crate::event::SelectEvent;
