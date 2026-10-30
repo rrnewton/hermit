@@ -390,12 +390,11 @@ fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
     // build.liteinst_runtime_release_in_pinned_root was a second barrier until
     // 2026-09-30; the one validate-profile build now stages the LiteInst runtime
     // through hermit-install before build.e2e_artifact publishes.
-    for required in ["build.e2e_artifact_in_pinned_root"] {
-        if !build.deps.iter().any(|dependency| dependency == required) {
-            return Err(format!(
-                "full-plan bracket: privileged build can start before required build barrier {required}"
-            ));
-        }
+    let required = "build.e2e_artifact_in_pinned_root";
+    if !build.deps.iter().any(|dependency| dependency == required) {
+        return Err(format!(
+            "full-plan bracket: privileged build can start before required build barrier {required}"
+        ));
     }
     Ok(())
 }
