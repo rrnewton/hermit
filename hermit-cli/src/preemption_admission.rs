@@ -37,6 +37,12 @@ impl std::fmt::Display for UnsupportedPreemption {
                 f,
                 "; to request execution without that bound, pass --max-timeslice=disabled"
             )?;
+        } else if self.setting == "--chaos-timeslice-range" {
+            write!(
+                f,
+                "; use --backend=ptrace, or remove --chaos-timeslice-range and \
+                 --chaos-timeslice-draw=run to use the inherited cooperative scheduling settings"
+            )?;
         }
         Ok(())
     }
@@ -246,6 +252,11 @@ mod tests {
                 let error =
                     refuse_unsupported_preemption(&config, backend, true, false).unwrap_err();
                 assert_eq!(error.setting, setting);
+                if setting == "--chaos-timeslice-range" {
+                    let message = error.to_string();
+                    assert!(message.contains("--chaos-timeslice-draw=run"), "{message}");
+                    assert!(message.contains("--backend=ptrace"), "{message}");
+                }
             }
             refuse_unsupported_preemption(&config, Backend::Ptrace, true, false).unwrap();
         }

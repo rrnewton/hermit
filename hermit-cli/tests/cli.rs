@@ -19548,6 +19548,107 @@ fn a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it() {
     assert_ne!(other, drawn, "seeds 3 and 4 drew the same timeslice");
 }
 
+/// The discovery mode: `--chaos-timeslice-draw=run` without a range draws a
+/// chaos run's `--max-timeslice` from `RECOMMENDED_CHAOS_TIMESLICE_RANGE`,
+/// exactly as that range given explicitly does for the same seed: the summary
+/// reports the same value, inside the range, the guest prints the same, and
+/// the two preemption records are the same and state the value. Seeds 3 and 4
+/// draw 835700 and 372270 ns. A plain `--chaos` run keeps the default 200 ms
+/// and its record states no drawn value. Recorded draws retain the current
+/// replay adoption policy, covered by the adjacent run-draw regression.
+///
+/// PMU SUBJECT: without a usable PMU timer the draw is refused, so test.cli
+/// and test.cli_on_host skip it by exact name and
+/// privileged-test.pmu_cli_cases runs it.
+#[test]
+fn a_draw_without_a_range_draws_from_the_recommended_range() {
+    use detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE;
+    let _guard = hermit_run_guard();
+    let guest = chaos_spinner_and_new_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
+    let base = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--chaos",
+    ];
+    let run = |extra: &[&str], summary: &str| {
+        let mut args = base.to_vec();
+        let summary_arg = format!("--summary-json={summary}");
+        args.extend_from_slice(extra);
+        args.push(&summary_arg);
+        args.extend(["--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(summary).unwrap()).unwrap();
+        let timeslice = summary["preemption"]["max_timeslice_ns"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no timeslice in {summary}"));
+        (stdout(&output), timeslice)
+    };
+    let record = |path: &str| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap()
+    };
+    let range = RECOMMENDED_CHAOS_TIMESLICE_RANGE;
+    let explicit_range = format!("--chaos-timeslice-range={range}");
+    let mut drawn = Vec::new();
+    for seed in ["--seed=3", "--seed=4"] {
+        let bare_record = path(&format!("bare{seed}.json"));
+        let (bare_stdout, bare) = run(
+            &[
+                seed,
+                "--chaos-timeslice-draw=run",
+                &format!("--record-preemptions-to={bare_record}"),
+            ],
+            &path(&format!("bare{seed}.summary.json")),
+        );
+        assert!(
+            (range.min.get()..=range.max.get()).contains(&bare),
+            "{seed}: {bare} is outside {range}"
+        );
+        let explicit_record = path(&format!("explicit{seed}.json"));
+        let (explicit_stdout, explicit) = run(
+            &[
+                seed,
+                &explicit_range,
+                "--chaos-timeslice-draw=run",
+                &format!("--record-preemptions-to={explicit_record}"),
+            ],
+            &path(&format!("explicit{seed}.summary.json")),
+        );
+        assert_eq!(bare, explicit, "{seed}: another value was drawn");
+        assert_eq!(bare_stdout, explicit_stdout, "{seed}");
+        let bare_json = record(&bare_record);
+        assert_eq!(
+            bare_json["chaos_timeslice"], bare,
+            "{seed}: the record does not state the draw"
+        );
+        assert_eq!(
+            bare_json,
+            record(&explicit_record),
+            "{seed}: another schedule ran"
+        );
+        drawn.push(bare);
+    }
+    assert_ne!(drawn[0], drawn[1], "seeds 3 and 4 drew the same timeslice");
+    // A plain chaos run keeps the default, and its record states no draw.
+    let plain_record = path("plain.json");
+    let (_, plain) = run(
+        &[
+            "--seed=3",
+            &format!("--record-preemptions-to={plain_record}"),
+        ],
+        &path("plain.summary.json"),
+    );
+    assert_eq!(plain, 200_000_000);
+    assert!(record(&plain_record).get("chaos_timeslice").is_none());
+}
+
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn
 /// either: 90 ms before, 4 ms now.
 #[test]

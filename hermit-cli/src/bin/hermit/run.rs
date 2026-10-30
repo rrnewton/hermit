@@ -4919,6 +4919,78 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
     let drawn = detcore::preemptions::draw_chaos_timeslice(parsed_range, 7);
     assert_eq!(ro.det_opts.det_config.max_timeslice, Some(drawn));
     assert_eq!(ro.det_opts.det_config.chaos_timeslice, Some(drawn));
+    let mut bare = validate(&["hermit", "run", "--chaos", "--seed=7", run, "prog"]);
+    for _ in 0..2 {
+        assert_eq!(
+            bare.det_opts.det_config.chaos_timeslice_range,
+            Some(parsed_range)
+        );
+        assert_eq!(bare.det_opts.det_config.max_timeslice, Some(drawn));
+        assert_eq!(bare.det_opts.det_config.chaos_timeslice, Some(drawn));
+        bare.validate_args_with_perf_support(true).unwrap();
+    }
+    // Saving the resolved shorthand freezes its range as an explicit input.
+    let matches = <crate::Args as clap::CommandFactory>::command()
+        .try_get_matches_from([
+            "hermit",
+            "run",
+            "--chaos",
+            "--seed=7",
+            run,
+            "--save-config=unused.yaml",
+            "prog",
+        ])
+        .unwrap();
+    let mut args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::Subcommand::Run(saved) = &mut args.command else {
+        panic!("not a run command");
+    };
+    saved.validate_args_with_perf_support(true).unwrap();
+    let config = saved.saved_run_config().unwrap();
+    assert_eq!(
+        config.run["chaos-timeslice-range"],
+        parsed_range.to_string()
+    );
+    assert_eq!(config.run["chaos-timeslice-draw"], "run");
+    for explicit in ["--max-timeslice=disabled", "--chaos-seeded-timeslice"] {
+        let mut refused = run_opts_for(&["hermit", "run", "--chaos", explicit, run, "prog"]);
+        let error = format!(
+            "{:#}",
+            refused.validate_args_with_perf_support(true).unwrap_err()
+        );
+        assert!(
+            error.contains("give one of them, not both"),
+            "{explicit}: {error}"
+        );
+    }
+    let mut unavailable = run_opts_for(&["hermit", "run", "--chaos", run, "prog"]);
+    let error = format!(
+        "{:#}",
+        unavailable
+            .validate_args_with_perf_support(false)
+            .unwrap_err()
+    );
+    assert!(
+        error.contains("--chaos-timeslice-draw=run") && error.contains("usable PMU"),
+        "{error}"
+    );
+    for backend in ["--backend=dbt", "--backend=kvm"] {
+        let mut unavailable = run_opts_for(&["hermit", "run", backend, "--chaos", run, "prog"]);
+        let error = format!(
+            "{:#}",
+            unavailable
+                .validate_args_with_perf_support(true)
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("unsupported_preemption"),
+            "{backend}: {error}"
+        );
+        assert!(
+            error.contains("--chaos-timeslice-draw=run"),
+            "{backend}: {error}"
+        );
+    }
     ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(
         ro.det_opts.det_config.max_timeslice,
@@ -5012,6 +5084,7 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
             "prog",
         ],
         &["hermit", "run", "--max-timeslice=4321", &marked_arg, "prog"],
+        &["hermit", "run", "--chaos", run, &marked_arg, "prog"],
     ] {
         let ro = resolve(argv).unwrap();
         assert_eq!(ro.det_opts.det_config.max_timeslice, recorded, "{argv:?}");
@@ -5044,6 +5117,33 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
         std::num::NonZeroU64::new(200_000_000)
     );
     assert_eq!(plain.det_opts.det_config.chaos_timeslice, None);
+    // An unmarked legacy record keeps the existing requested draw policy.
+    // The shorthand must behave exactly like the explicit recommended range.
+    let explicit = validate(&[
+        "hermit",
+        "run",
+        "--chaos",
+        "--seed=7",
+        range,
+        run,
+        &unmarked_arg,
+        "prog",
+    ]);
+    let bare = validate(&[
+        "hermit",
+        "run",
+        "--chaos",
+        "--seed=7",
+        run,
+        &unmarked_arg,
+        "prog",
+    ]);
+    assert_eq!(explicit.det_opts.det_config.chaos_timeslice, Some(drawn));
+    assert_eq!(bare.det_opts.det_config.chaos_timeslice, Some(drawn));
+    assert_eq!(
+        bare.det_opts.det_config.max_timeslice,
+        explicit.det_opts.det_config.max_timeslice
+    );
 }
 
 /// The environment variable that turned the signal-state copy on while it
@@ -10832,12 +10932,19 @@ impl RunOpts {
                 TimerUnavailable::NoPmuProfile(reason) => reason.to_string(),
             };
             let request = match config.chaos_timeslice_range {
+                Some(range)
+                    if config.chaos_timeslice_draw
+                        == detcore_model::config::ChaosTimesliceDraw::Run =>
+                {
+                    format!("--chaos-timeslice-draw=run (--chaos-timeslice-range={range})")
+                }
                 Some(range) => format!("--chaos-timeslice-range={range}"),
                 None => "the replayed record's drawn --max-timeslice".to_owned(),
             };
             return Err(anyhow::Error::new(PolicyRefusal).context(format!(
-                "{request} needs PMU-backed preemption, but {reason}. Remove the range, or \
-                 replay on a host with a usable PMU."
+                "{request} needs PMU-backed preemption, but {reason}. Remove \
+                 --chaos-timeslice-range and --chaos-timeslice-draw=run, or run/replay on a \
+                 host with a usable PMU."
             )));
         }
 
@@ -13896,6 +14003,17 @@ impl RunOpts {
     /// record that states a drawn timeslice. Repeating this (analyze
     /// revalidates its trials' options) gives the same result.
     fn resolve_chaos_timeslice_range(&mut self) -> Result<(), Error> {
+        // The explicit run-draw shorthand is the same request as the
+        // recommended range written out. Keep the default Slice/no-range
+        // configuration untouched, and let the existing replay, conflict and
+        // PMU checks consume the resolved range.
+        let config = &mut self.det_opts.det_config;
+        if config.chaos_timeslice_draw == detcore_model::config::ChaosTimesliceDraw::Run
+            && config.chaos_timeslice_range.is_none()
+        {
+            config.chaos_timeslice_range =
+                Some(detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE);
+        }
         let config = &self.det_opts.det_config;
         let mut recorded = None;
         for (option, path) in [
@@ -14036,6 +14154,17 @@ impl RunOpts {
         if let Some(seed) = self.seed_from_resolved {
             config.run.remove(SEED_FROM_KEY);
             config.run.insert(SEED_KEY.to_owned(), seed.into());
+        }
+        // Freeze the range resolved for a bare run draw, so loading the saved
+        // config does not consult a possibly changed recommendation.
+        if self.det_opts.det_config.chaos_timeslice_draw
+            == detcore_model::config::ChaosTimesliceDraw::Run
+            && let Some(range) = self.det_opts.det_config.chaos_timeslice_range
+        {
+            config
+                .run
+                .entry("chaos-timeslice-range".to_owned())
+                .or_insert_with(|| range.to_string().into());
         }
         // A base Hermit chose for this run (from a free window) is saved as if
         // given, so the saved run takes the same IDs or is refused, instead of

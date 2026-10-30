@@ -1070,9 +1070,10 @@ impl AnalyzeOpts {
             Err(anyhow::Error::new(crate::container::PolicyRefusal).context(message))
         };
         let config = &parsed.det_opts.det_config;
-        if let Some(range) = config.chaos_timeslice_range
-            && config.chaos_timeslice_draw == detcore_model::config::ChaosTimesliceDraw::Run
-        {
+        if config.chaos_timeslice_draw == detcore_model::config::ChaosTimesliceDraw::Run {
+            let range = config
+                .chaos_timeslice_range
+                .unwrap_or(detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE);
             return refuse(format!(
                 "`hermit analyze` and `hermit bisect` cannot take --chaos-timeslice-range={range} \
                  --chaos-timeslice-draw=run in their run arguments: each trial would draw another \
@@ -1545,6 +1546,11 @@ mod tests {
             .unwrap();
 
         for (run_args, recordings, expected) in [
+            (
+                &["--chaos", "--chaos-timeslice-draw=run"][..],
+                &[][..],
+                "every trial must run under one",
+            ),
             (
                 &["--max-timeslice=5000"][..],
                 &recordings[..],

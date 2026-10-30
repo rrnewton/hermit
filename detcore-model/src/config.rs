@@ -671,7 +671,7 @@ pub struct Config {
     /// `--sched-heuristic`.
     ///
     /// Thread scheduling remains deterministic, determined by the random seed.
-    #[clap(long)]
+    #[clap(long, long_help = chaos_long_help())]
     pub chaos: bool,
 
     /// Draw the mean of each chaos slice from MIN..MAX virtual nanoseconds (both included),
@@ -701,9 +701,18 @@ pub struct Config {
     /// That reaches a race needing one scale throughout in more seeds, at a higher cost per run
     /// for the fine draws. The drawn value is printed in `--summary-json`
     /// (`preemption.max_timeslice_ns`) and stored in a `--record-preemptions-to` record, from
-    /// which a replay takes it.
+    /// which a replay takes it. Without an explicit range, `run` uses
+    /// [`RECOMMENDED_CHAOS_TIMESLICE_RANGE`]; `slice` still requires a range.
     #[serde(default)]
-    #[clap(long, value_enum, default_value_t, requires = "chaos_timeslice_range")]
+    #[clap(
+        long,
+        value_enum,
+        default_value_t,
+        requires = "chaos",
+        requires_if("slice", "chaos_timeslice_range"),
+        conflicts_with = "target_timeslice",
+        long_help = chaos_timeslice_draw_long_help()
+    )]
     pub chaos_timeslice_draw: ChaosTimesliceDraw,
 
     /// The `--max-timeslice` this run drew under `--chaos-timeslice-draw=run`, or took from the
@@ -2072,9 +2081,9 @@ impl fmt::Display for Config {
         }
         if let Some(range) = self.chaos_timeslice_range {
             write!(f, " --chaos-timeslice-range={range}")?;
-            if self.chaos_timeslice_draw == ChaosTimesliceDraw::Run {
-                write!(f, " --chaos-timeslice-draw=run")?;
-            }
+        }
+        if self.chaos_timeslice_draw == ChaosTimesliceDraw::Run {
+            write!(f, " --chaos-timeslice-draw=run")?;
         }
         if self.strict_schedule_boundaries {
             write!(f, " --strict-schedule-boundaries")?;
@@ -2511,6 +2520,62 @@ pub enum ChaosTimesliceDraw {
     Slice,
     /// The run draws its `--max-timeslice` from the range once.
     Run,
+}
+
+/// The range used by `--chaos-timeslice-draw=run` when no range is given.
+/// One microsecond to 200 milliseconds spans fine preemption windows and
+/// the ordinary maximum. Plain `--chaos` keeps its fixed maximum: fine draws
+/// can cost much more, so this discovery mode remains explicit.
+pub const RECOMMENDED_CHAOS_TIMESLICE_RANGE: TimesliceRange = TimesliceRange {
+    min: NonZeroU64::new(1_000).unwrap(),
+    max: NonZeroU64::new(200_000_000).unwrap(),
+};
+
+/// Long help for `--chaos`, including the explicit discovery mode.
+pub fn chaos_long_help() -> String {
+    let range = RECOMMENDED_CHAOS_TIMESLICE_RANGE;
+    format!(
+        "Schedule threads chaotically.\n\n\
+         The behavior of this flag is subject to change. Current behavior is to randomize thread \
+         priorities at every logical timeslice. Other randomization strategies are possible with \
+         `--sched-heuristic`.\n\n\
+         Thread scheduling remains deterministic, determined by the random seed.\n\n\
+         By default, every chaos slice's mean is the run's `--max-timeslice` (200000000 virtual \
+         nanoseconds unless given), so one seed sweep explores mostly one slice scale. For race \
+         discovery, sweep seeds with `--chaos-timeslice-draw=run`: each run draws its \
+         `--max-timeslice` once, log-uniformly from the recommended range {range} virtual \
+         nanoseconds (or from `--chaos-timeslice-range`), as a pure function of the scheduler \
+         seed. Fine draws explore short preemption windows, but can take orders of magnitude \
+         longer: size time limits for them. A replay adopts a recorded drawn maximum without \
+         drawing again. See `--chaos-timeslice-draw`."
+    )
+}
+
+/// Long help for the draw policy, sharing the recommended range with resolution.
+pub fn chaos_timeslice_draw_long_help() -> String {
+    let range = RECOMMENDED_CHAOS_TIMESLICE_RANGE;
+    format!(
+        "How a chaos run draws its timeslice. Requires `--chaos`.\n\n\
+         `run` (the discovery mode) draws the run's `--max-timeslice` once, log-uniformly from \
+         `--chaos-timeslice-range`, or from the recommended range {range} virtual nanoseconds \
+         (1 us to 200 ms) without an explicit range. The draw is a pure function of the scheduler \
+         seed; the run is then an ordinary chaos run under it, so a seed sweep spreads its seeds \
+         over the range, each seed at one scale. Without a seed, every run uses seed 0 and draws \
+         the same value. Fine draws can be much slower: size time limits for the fine end.\n\n\
+         Fine draws also incur frequent scheduler-turn charges in guest-visible time, which can \
+         trigger a guest's own watchdogs. See `--cap-preemption-charge` for the explicit option \
+         that caps expired-timeslice charges. The range parser requires MIN to be at least \
+         10 virtual nanoseconds and no larger than MAX.\n\n\
+         `--summary-json` reports the drawn value (`preemption.max_timeslice_ns`), and a \
+         `--record-preemptions-to` record stores it. A replay adopts a recorded drawn maximum \
+         without drawing again; it needs no timeslice option. A legacy record with no drawn \
+         value does not override the requested draw policy. `hermit analyze` and `hermit bisect` \
+         take a recorded value and refuse `run` in their run arguments, since all trials must \
+         share one maximum.\n\n\
+         `slice` (the default) draws each slice's mean from an explicitly supplied range; it is \
+         what a range alone does. Without a range or an explicit `run` draw, the ordinary fixed \
+         maximum remains unchanged."
+    )
 }
 
 /// The bounds of `--chaos-timeslice-range`, in virtual nanoseconds, both
@@ -4135,10 +4200,59 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(config.chaos_timeslice_draw, ChaosTimesliceDraw::Run);
-        assert!(
-            Config::try_parse_from(["config", "--chaos", "--chaos-timeslice-draw=run"]).is_err(),
-            "a draw without a range was accepted"
+        let bare =
+            Config::try_parse_from(["config", "--chaos", "--chaos-timeslice-draw=run"]).unwrap();
+        assert_eq!(bare.chaos_timeslice_draw, ChaosTimesliceDraw::Run);
+        assert_eq!(
+            bare.chaos_timeslice_range, None,
+            "the CLI resolves the range"
         );
+        assert_eq!(
+            Config::default().chaos_timeslice_draw,
+            ChaosTimesliceDraw::Slice
+        );
+        for args in [
+            vec!["config", "--chaos-timeslice-draw=run"],
+            vec!["config", "--chaos", "--chaos-timeslice-draw=slice"],
+            vec!["config", "--chaos", "--chaos-timeslice-draw=fixed"],
+            vec![
+                "config",
+                "--chaos",
+                "--chaos-timeslice-draw=run",
+                "--target-timeslice=1000",
+            ],
+        ] {
+            assert!(Config::try_parse_from(&args).is_err(), "{args:?}");
+        }
+        let rendered = bare.to_string();
+        assert!(
+            rendered.contains(" --chaos-timeslice-draw=run"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("--chaos-timeslice-range"), "{rendered}");
+        let reparsed =
+            Config::parse_from(std::iter::once("detcore").chain(rendered.split_whitespace()));
+        assert_eq!(reparsed.chaos_timeslice_draw, ChaosTimesliceDraw::Run);
+        assert_eq!(reparsed.chaos_timeslice_range, None);
+        assert_eq!(
+            RECOMMENDED_CHAOS_TIMESLICE_RANGE,
+            "1000..200000000".parse().unwrap()
+        );
+        let command = <Config as clap::CommandFactory>::command();
+        for id in ["chaos", "chaos_timeslice_draw"] {
+            let text = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap()
+                .get_long_help()
+                .unwrap()
+                .to_string();
+            assert!(
+                text.contains(&RECOMMENDED_CHAOS_TIMESLICE_RANGE.to_string()),
+                "{text}"
+            );
+            assert!(text.contains("time limits"), "{text}");
+        }
         // A drawn maximum renders as the range and the draw, which parse
         // back to the same request.
         let mut drawn = config.clone();
