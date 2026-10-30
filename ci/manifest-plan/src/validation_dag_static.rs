@@ -1900,7 +1900,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4896 adds two hermit-run units: 1279 + 2 = 1281, re-measured at this integration head.
     // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
-    ("test.hermit_unit", 1288),
+    // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
+    ("test.hermit_unit", 1289),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4468,7 +4469,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The PR 4853 transplant relocates three timeslice cases to the PMU node: 741 - 2 listed here
     // (the third is new and never listed here) = 739, re-measured at this integration head.
     // The 4843 overshoot fix adds one cli case: 739 + 1 = 740, re-measured at this integration head.
-    ("test.cli", 740),
+    // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
+    ("test.cli", 742),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5035,7 +5037,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three PR 4738 cases: 657 + 3 = 660.
     // The same PR 4853 transplant relocation: 660 - 2 = 658.
     // The same 4843 overshoot fix case: 658 + 1 = 659.
-    ("test.cli_on_host", 659),
+    // The same two PR 4912 cases: 659 + 2 = 661.
+    ("test.cli_on_host", 661),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5919,7 +5922,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4896 units: 1273 + 2 = 1275.
     // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
     // The same detlog correction unit: 1281 + 1 = 1282.
-    ("test.hermit_unit_on_host", 1282),
+    // The same PR 4912 unit: 1282 + 1 = 1283.
+    ("test.hermit_unit_on_host", 1283),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
