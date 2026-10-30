@@ -5296,19 +5296,12 @@ mod tests {
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes`, `replay_continue_fairly`,
-<<<<<<< HEAD
-        // `standard_stream_aliases`, `sleep_registration`, `strict_binder`
-        // and `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-seven fewer, so thirty-three keys fewer than fields.
+        // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
+        // `rewrite_exclusives_in_memory` and `strict_schedule_boundaries`
+        // none: fourteen more keys and forty-eight fewer, so thirty-four
+        // keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 33);
-=======
-        // `standard_stream_aliases`, `rewrite_exclusives_in_memory` and
-        // `strict_schedule_boundaries` none: fourteen more keys and forty-six
-        // fewer, so thirty-two keys fewer than fields.
-        assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 32);
->>>>>>> c41fb22e6d9 (Keep the in-memory rewrite's setting out of the legacy backend form)
+        assert_eq!(fields.len(), keys.len() + 34);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
