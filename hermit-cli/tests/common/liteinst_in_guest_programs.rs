@@ -5288,20 +5288,16 @@ fn liteinst_in_guest_close_range_releases_ports_like_ptrace() {
     );
 }
 
-/// Under `--verify` a recvmsg whose buffers cannot be observed after the call
-/// still returns the kernel's result to the guest: the buffer digest records
-/// an explicit, compared `unobserved` entry instead of hashing, and the verify
-/// report counts it. A plain receive is hashed as before. In the overwritten
-/// mode the guest's iovec array is its own receive buffer, so the payload
-/// overwrites the iovec with one byte at an unmapped address; before the
-/// entry, the failed read turned the guest's completed recvmsg into EFAULT
-/// under --verify.
+/// A complete actual-attempt snapshot makes a self-overwriting iovec's
+/// received bytes observable. Verify must compare their exact digest, retain
+/// the kernel's return, and never hash restored metadata over the payload.
+/// Genuine unreadability remains covered by unchanged observer unit tests.
 #[test]
 fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
     let _guard = hermit_run_guard();
     let guest = c_guest(&IOV_OVERWRITTEN_GUEST, "recvmsg_iov_overwritten_by_payload");
     let logs = tempfile::tempdir().expect("failed to create the verify-log directory");
-    for (mode, unobservable) in [("plain", false), ("overwritten", true)] {
+    for (mode, overwritten) in [("plain", false), ("overwritten", true)] {
         let log_dir = logs.path().join(mode);
         fs::create_dir(&log_dir).expect("failed to create a verify-log directory");
         let output = super::hermit_test::hermit_output(
@@ -5333,14 +5329,31 @@ fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
             .split_whitespace()
             .find_map(|field| field.strip_prefix("buffer="))
             .unwrap_or_else(|| panic!("{mode}: {stdout}"));
+        let destination = stdout
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("destination="))
+            .unwrap_or_else(|| panic!("{mode}: {stdout}"));
+        let sent = stdout
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("sent="))
+            .unwrap_or_else(|| panic!("{mode}: {stdout}"));
+        assert_eq!(
+            sent.len(),
+            32,
+            "independent sent payload is exactly 16 bytes"
+        );
+        assert!(sent.is_ascii(), "{mode}: {stdout}");
+        let payload: Vec<u8> = (0..16)
+            .map(|index| u8::from_str_radix(&sent[index * 2..index * 2 + 2], 16).unwrap())
+            .collect();
+        assert_eq!(destination == buffer, !overwritten, "{mode}: {stdout}");
         let expected_stdout = format!(
-            "buffer={buffer} received=16 overwritten={}\n",
-            u8::from(unobservable)
+            "buffer={buffer} received=16 overwritten={}\ndestination={destination} sent={sent}\n",
+            u8::from(overwritten)
         );
         assert_eq!(stdout, expected_stdout, "{mode}");
-        let hashed = format!("recvmsg in fd=4 {buffer}+16->");
-        let marker = "recvmsg in fd=4 unobserved ret=16 reason=buffer-unreadable at=";
-        let counted = "unobservable after the call (compared as 'unobserved' buffer-digest entries): run1=1, run2=1";
+        let expected_digest = detcore::Digest::new(&payload).to_string();
+        let hashed = format!("recvmsg in fd=4 {destination}+16->{expected_digest}");
         let golden: Vec<PathBuf> = fs::read_dir(&log_dir)
             .expect("failed to read the retained verify logs")
             .map(|entry| entry.expect("failed to read a retained log").path())
@@ -5356,22 +5369,34 @@ fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
             .lines()
             .filter(|line| line.contains("[iobuf]") && line.contains("recvmsg in"))
             .collect();
-        if unobservable {
-            assert!(
-                digests.len() == 1 && digests[0].contains(marker),
-                "{mode}: expected one {marker:?} entry: {digests:?}"
-            );
-            assert!(stderr.contains(counted), "{mode}: {stderr}");
-        } else {
-            assert!(
-                digests.len() == 1 && digests[0].contains(&hashed),
-                "{mode}: expected {hashed:?}: {digests:?}"
-            );
-            assert!(
-                !stderr.contains("unobservable after the call"),
-                "{mode}: {stderr}"
-            );
-        }
+        assert_eq!(digests.len(), 1, "{mode}: {digests:?}");
+        let (message, metadata) = digests[0]
+            .rsplit_once(" DETLOG_RECORD=")
+            .unwrap_or_else(|| panic!("{mode}: missing structured record: {digests:?}"));
+        let metadata: serde_json::Value = serde_json::from_str(metadata).unwrap_or_else(|error| {
+            panic!("{mode}: invalid structured record: {error}: {digests:?}")
+        });
+        assert_eq!(
+            metadata,
+            serde_json::json!({"schema": 1, "event": {"kind": "other"}}),
+            "{mode}: {digests:?}"
+        );
+        let (_, record) = message
+            .split_once("DETLOG [iobuf][dtid ")
+            .unwrap_or_else(|| panic!("{mode}: invalid iobuf record: {digests:?}"));
+        let (dtid, payload) = record
+            .split_once("] ")
+            .unwrap_or_else(|| panic!("{mode}: invalid thread prefix: {digests:?}"));
+        assert!(dtid.parse::<u64>().is_ok(), "{mode}: {digests:?}");
+        assert_eq!(
+            payload, hashed,
+            "{mode}: expected exact payload digest: {digests:?}"
+        );
+        assert!(
+            !stderr.contains("unobservable after the call"),
+            "{mode}: {stderr}"
+        );
+        assert!(!digests[0].contains("unobserved"), "{mode}: {digests:?}");
     }
 }
 
