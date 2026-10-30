@@ -19926,7 +19926,7 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
     }
 
@@ -19987,7 +19987,7 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
     }
 
@@ -20038,7 +20038,7 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
     }
 
@@ -20090,7 +20090,7 @@ mod tests {
         assert_eq!(first_turn.tid, child);
         assert_eq!(
             first_start.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
         first_holder.advance_to(first_holder.as_nanos() + LogicalTime::from_nanos(500));
         let deregistered = state
@@ -20167,7 +20167,7 @@ mod tests {
         assert_eq!(second_turn.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None)))
+            (None, granted(GlobalResponse::StartNewThread(None, None)))
         );
     }
 
