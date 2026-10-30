@@ -2696,11 +2696,6 @@ mod tests {
         }
     }
 
-    /// Capturing both stacks is not proof that the candidate completed. This
-    /// drives the stack-trace replay used by production reporting
-    /// ([`AnalyzeOpts::replay_for_stacks`]), whose completed outcome the
-    /// report then compares with the search's, rather than only the stack
-    /// launcher.
     #[test]
     fn a_timed_out_final_replay_cannot_validate_the_expected_outcome() {
         let dir = tempfile::tempdir().unwrap();
