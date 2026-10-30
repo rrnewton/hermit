@@ -6087,7 +6087,6 @@ mod tests {
         }
     }
 
-
     /// The in-guest reserved-signal set as an in-guest default-route run
     /// carries it: SIGSYS, SIGSEGV and SIGTRAP.
     fn in_guest_reserved_set() -> u64 {
