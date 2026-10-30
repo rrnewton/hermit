@@ -4520,6 +4520,13 @@ impl GlobalState {
                     .await
                     .commit_fatal_delivery(dtid, retire_others),
             ),
+            GlobalRequest::NoteFatalDelivery => {
+                let mut scheduler = self.lock_rpc_scheduler(false).await;
+                if let Some(process) = scheduler.registered_process(dtid) {
+                    scheduler.note_fatal_signal_delivery(process);
+                }
+                R::NoteFatalDelivery(())
+            }
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::SetFileMtime(ino, mtime) => {
                 R::SetFileMtime(self.recv_set_file_mtime(from, ino, mtime).await)
@@ -6068,8 +6075,10 @@ impl GlobalState {
                     reads_signalfd: false,
                     read_fd: None,
                     polls_guest_state_only: false,
+                    polls_a_named_fifo: false,
                     relies_on_guest_held_marks: false,
                     passes_descriptors_out: false,
+                    waits_on_guest_held_only: false,
                     waits_until_nothing_else_can_run: false,
                     previous_attempt_made_progress: false,
                     upgraded_from_attempt: 0,
@@ -7081,7 +7090,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 16;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 18;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -7322,6 +7331,11 @@ pub enum GlobalRequest {
     /// kernel carries that action out when it resumes the thread, so the
     /// process's other threads may be retired now.
     CommitFatalDelivery(bool),
+    /// The calling thread is delivering a signal whose default action ends
+    /// its process where the delivery is not committed (no
+    /// `CommitFatalDelivery`): stop the poll upgrade's count until the
+    /// process's reap, and doom nothing (`Scheduler::note_fatal_signal_delivery`).
+    NoteFatalDelivery,
 
     /// Bump mtime
     TouchFile(RawInode),
@@ -7914,6 +7928,7 @@ pub enum GlobalResponse {
     HandOffTurn(bool),
     /// Whether the process's other threads were retired.
     CommitFatalDelivery(bool),
+    NoteFatalDelivery(()),
     TouchFile(()),
     SetFileMtime(()),
     GlobalTimeLowerBound(LogicalTime),
@@ -9383,8 +9398,10 @@ where
     // A descriptor this thread may have passed out of the guest reaches the
     // scheduler with its next request, before it makes another decision
     // (`Resources::passes_descriptors_out`).
-    r.passes_descriptors_out |=
-        std::mem::take(&mut guest.thread_state_mut().passed_descriptors_out_unreported);
+    if std::mem::take(&mut guest.thread_state_mut().passed_descriptors_out_unreported) {
+        r.passes_descriptors_out = true;
+        guest.thread_state_mut().passed_descriptors_out_reported = true;
+    }
     // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;
@@ -10093,6 +10110,17 @@ where
             .1,
         GlobalResponse::CommitFatalDelivery(true)
     )
+}
+
+/// Report a delivery whose default action ends the calling thread's process
+/// where it is not committed (`GlobalRequest::NoteFatalDelivery`), so that the
+/// poll upgrade's count stops until the process's reap.
+pub async fn note_fatal_delivery<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    send_and_update_time(guest, GlobalRequest::NoteFatalDelivery).await;
 }
 
 /// [`determinize_inode`] for an entry of a directory snapshot taken at
@@ -16649,6 +16677,81 @@ mod tests {
     /// sender makes in its turn: a process named by `kill`, and a SIGKILL with
     /// no named victim; another signal records nothing
     /// (https://github.com/rrnewton/hermit/issues/3904).
+    /// A fatal default-action delivery stops the poll upgrade's count until
+    /// the reap (Claude review of https://github.com/rrnewton/hermit/pull/4892).
+    /// Committed (`CommitFatalDelivery(false)`), it also dooms the process for
+    /// the hand-off and the idle-poller check
+    /// (`Scheduler::record_committed_fatal_signal`), except a PID namespace's
+    /// init, which still stops the count: it fails closed. Noted for the count
+    /// alone (`NoteFatalDelivery`, as in a gdbserver session, whose client may
+    /// cancel the signal), it dooms nothing (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4892 at 67ace93b1).
+    #[tokio::test]
+    async fn a_fatal_delivery_stops_the_poll_upgrade_count_until_the_reap() {
+        let plain = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let mut pipe_wake = plain.clone();
+        pipe_wake.pipe_wake_latency = Some(1_000);
+        let commit = (
+            GlobalRequest::CommitFatalDelivery(false),
+            GlobalResponse::CommitFatalDelivery(false),
+        );
+        let note = (
+            GlobalRequest::NoteFatalDelivery,
+            GlobalResponse::NoteFatalDelivery(()),
+        );
+        for (config, label, init, (request, response), doomed) in [
+            (plain.clone(), "committed", false, commit.clone(), true),
+            (
+                pipe_wake,
+                "committed, pipe-wake latency",
+                false,
+                commit.clone(),
+                true,
+            ),
+            (
+                plain.clone(),
+                "committed, a PID namespace's init",
+                true,
+                commit,
+                false,
+            ),
+            (plain, "noted for the count alone", false, note, false),
+        ] {
+            let (config, state, dettid, detpid) = cancellation_test_state_with_config(config);
+            if init {
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .thread_tree
+                    .mark_pid_namespace_init(detpid);
+            }
+            assert_eq!(
+                state.sched.lock().unwrap().fatal_doom_recorded(detpid),
+                (false, false, false)
+            );
+            assert_eq!(
+                state
+                    .receive_rpc(
+                        reverie::Tid::from_raw(dettid.as_raw()),
+                        (DetTime::new(&config), MmId::initial(detpid), request,),
+                    )
+                    .await
+                    .1,
+                response,
+                "{label}: nothing retired"
+            );
+            assert_eq!(
+                state.sched.lock().unwrap().fatal_doom_recorded(detpid),
+                (true, true, doomed),
+                "{label}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn sigkill_notifications_record_the_doomed_process() {
         let (config, state, dettid, detpid) = cancellation_test_state();

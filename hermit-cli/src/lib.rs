@@ -4742,6 +4742,11 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
     // the parent kernel-blocked until the child registers.
     config.backend = backend_capabilities(backend);
+    // A fact about the backend's exit ordering that no capability states,
+    // decided here from the closed list of backends
+    // (`thread_exits_finish_before_the_next_turn`).
+    config.thread_exits_finish_before_the_next_turn =
+        thread_exits_finish_before_the_next_turn(backend);
     // Whether the run's process signals are tool-controlled is not decided
     // here: Detcore installs the backend's process signal control when the
     // backend offers it and threads are sequentialized, and reads the installed
@@ -4850,6 +4855,30 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
         Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,
         Backend::Sabre => reverie::BackendCapabilities::SABRE,
         Backend::Dbt => reverie::BackendCapabilities::DBT,
+    }
+}
+
+/// Whether a thread's native exit on `backend`, including the close of a
+/// descriptor table the thread holds alone (Linux's `exit_files`), finishes
+/// before Detcore can select another turn
+/// (`detcore::Config::thread_exits_finish_before_the_next_turn`), which
+/// polling retries need to count toward a poll upgrade. No backend capability
+/// states it, so it is decided here, per backend of this closed list, true only
+/// where it is proven, and a new backend must be decided before it compiles:
+/// - ptrace, and e9patch preprocessing, whose guest runs on ptrace: Reverie
+///   reports a thread's exit (`Tool::on_exit_thread`) with the final wait
+///   status the kernel gave it, after the whole native exit, and Detcore
+///   retires the thread only then;
+/// - DBT: it reports a thread's exit before the native exit runs, but
+///   Detcore registers the host thread's pidfd and commits no turn until the
+///   kernel shows the thread exited (`ExitedThreadBarrier`);
+/// - in-guest LiteInst and in-guest-trap retire a thread before its native
+///   `SYS_exit`, and SaBRe's runtime calls `Tool::on_exit_thread` before the
+///   raw `SYS_exit`; KVM is not proven.
+pub fn thread_exits_finish_before_the_next_turn(backend: Backend) -> bool {
+    match backend {
+        Backend::Ptrace | Backend::E9patch | Backend::Dbt => true,
+        Backend::Liteinst | Backend::InGuestTrap | Backend::Sabre | Backend::Kvm => false,
     }
 }
 
@@ -9249,6 +9278,35 @@ mod tests {
                 .backend
                 .needs_killed_thread_rpc_cancellation
         );
+    }
+
+    /// Preparation states the thread-exit ordering polling retries need to
+    /// count toward a poll upgrade for ptrace, e9patch preprocessing (which
+    /// runs on ptrace) and DBT, and for no other backend, whatever the
+    /// caller's configuration carried (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4892, round 4e).
+    #[test]
+    fn only_ptrace_e9patch_and_dbt_state_that_thread_exits_finish_first() {
+        for poisoned in [false, true] {
+            let config = super::DetConfig {
+                thread_exits_finish_before_the_next_turn: poisoned,
+                ..super::DetConfig::default()
+            };
+            for backend in Backend::ALL {
+                let expected = matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Dbt);
+                assert_eq!(
+                    prepare_backend_config(config.clone(), backend)
+                        .thread_exits_finish_before_the_next_turn,
+                    expected,
+                    "{backend:?}, caller's value {poisoned}"
+                );
+            }
+            assert!(
+                !prepare_in_guest_loader_route_config(config)
+                    .thread_exits_finish_before_the_next_turn
+            );
+        }
+        assert!(!super::DetConfig::default().thread_exits_finish_before_the_next_turn);
     }
 
     #[test]

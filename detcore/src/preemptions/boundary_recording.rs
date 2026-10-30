@@ -79,7 +79,9 @@ pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Resu
         return serde_json::from_slice(&bytes)
             .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e));
     }
-    let recording = Recording::decode(&bytes)
+    // Settings do not depend on the record's format, which the replay itself
+    // checks and refuses (`Recording::decode`), with the refusal's exit status.
+    let recording = Recording::decode_unchecked_format(&bytes)
         .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
     serde_json::from_value(
         super::record_serde::settings_value(recording.metadata()).map_err(|e| e.to_string())?,
@@ -89,9 +91,14 @@ pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Resu
 
 impl BoundaryRecording {
     /// Combine a validated preemption history with the sole global record
-    /// stream. The legacy history must not contain another global stream.
+    /// stream. The legacy history must not contain another global stream. The
+    /// history's format is checked by [`Recording::decode`], which refuses it
+    /// as a policy refusal (`RecordFormatRefusal`): a deserializer would lose
+    /// that error's type.
     pub fn new(preemptions: PreemptionRecord, schedule: Schedule) -> anyhow::Result<Self> {
-        preemptions.validate().map_err(anyhow::Error::msg)?;
+        preemptions
+            .validate_contents()
+            .map_err(anyhow::Error::msg)?;
         if !preemptions.global.is_empty() {
             bail!("slice-boundary recording has a second, legacy global event stream");
         }
@@ -169,7 +176,19 @@ impl Recording {
 
     /// Validate and parse either format without a malformed-new-to-legacy
     /// fallback.
+    /// A record whose format this Hermit refuses fails with a
+    /// `RecordFormatRefusal` in its chain, whichever format it is in.
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        let recording = Self::decode_unchecked_format(bytes)?;
+        recording
+            .metadata()
+            .validate_format()
+            .map_err(|refusal| anyhow::Error::new(super::RecordFormatRefusal(refusal)))?;
+        Ok(recording)
+    }
+
+    /// [`Self::decode`], except for the record's format.
+    fn decode_unchecked_format(bytes: &[u8]) -> anyhow::Result<Self> {
         // Inspect only to dispatch. Deserialize the ORIGINAL bytes again so
         // duplicate fields in the envelope are rejected. A malformed new
         // recording never falls back to legacy.
@@ -178,7 +197,7 @@ impl Recording {
             Ok(Self::Boundaries(envelope.slice_boundary_recording))
         } else {
             let legacy: PreemptionRecord = serde_json::from_slice(bytes)?;
-            legacy.validate().map_err(anyhow::Error::msg)?;
+            legacy.validate_contents().map_err(anyhow::Error::msg)?;
             Ok(Self::Legacy(legacy))
         }
     }
@@ -248,6 +267,22 @@ impl Recording {
     /// The host files the recorded run's guest opened, if the recording says.
     pub fn host_inputs(&self) -> Option<&detcore_model::host_input::HostInputSet> {
         self.metadata().host_inputs()
+    }
+
+    /// The recorded jumps of global time (`PreemptionRecord::time_skips`).
+    pub fn time_skips(&self) -> Option<&[super::TimeSkip]> {
+        self.metadata().time_skips()
+    }
+
+    /// Whether the recording lists every jump of global time its run made
+    /// (`PreemptionRecord::lists_its_time_skips`).
+    pub fn lists_its_time_skips(&self) -> bool {
+        self.metadata().lists_its_time_skips()
+    }
+
+    /// The recording's format (`PreemptionRecord::format_version`).
+    pub fn format_version(&self) -> Option<u32> {
+        self.metadata().format_version()
     }
 
     fn metadata(&self) -> &PreemptionRecord {
@@ -490,6 +525,31 @@ mod tests {
         assert!(super::super::read_recorded_epoch(&path).is_err());
         assert!(super::super::read_recorded_pipe_wake_latency(&path).is_err());
         assert!(super::super::read_recorded_signal_state_copy(&path).is_err());
+    }
+
+    /// A record of a format this Hermit refuses is refused as a policy
+    /// refusal (`RecordFormatRefusal`) in either envelope, while its settings
+    /// stay readable, so the replay itself refuses it with that exit status.
+    #[test]
+    fn a_refused_format_is_a_refusal_in_either_envelope() {
+        let refused = |value: &serde_json::Value| {
+            Recording::decode(&serde_json::to_vec(value).unwrap())
+                .unwrap_err()
+                .chain()
+                .any(|cause| cause.is::<super::super::RecordFormatRefusal>())
+        };
+        let mut boundary: serde_json::Value =
+            serde_json::from_slice(&sample(false).encode().unwrap()).unwrap();
+        boundary["slice_boundary_recording"]["preemptions"]["format_version"] =
+            serde_json::json!(99);
+        assert!(refused(&boundary));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("refused.json");
+        std::fs::write(&path, serde_json::to_vec(&boundary).unwrap()).unwrap();
+        assert!(super::super::read_recorded_epoch(&path).unwrap().is_some());
+        let mut plain = serde_json::to_value(PreemptionRecord::default()).unwrap();
+        plain["format_version"] = serde_json::json!(99);
+        assert!(refused(&plain));
     }
 
     #[test]

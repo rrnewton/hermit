@@ -623,6 +623,14 @@ pub struct Resources {
     /// whose outcome a host can change.
     #[serde(default)]
     pub(crate) polls_guest_state_only: bool,
+    /// Set beside `polls_guest_state_only` on a retry of a named FIFO that
+    /// joined internal polling (`DetFd::is_named_fifo`): a process outside
+    /// the container may hold its other end, so its attempts can succeed
+    /// without a guest action, and the poll never makes the run a deadlock
+    /// (`Scheduler::only_idle_guest_pollers_remain`). `false` for every other
+    /// request.
+    #[serde(default)]
+    pub(crate) polls_a_named_fifo: bool,
     /// Set with `polls_guest_state_only` when that rests on guest-held marks
     /// (`DetFd::is_guest_held`). Once a descriptor may have left the guest
     /// (`passes_descriptors_out`), the scheduler no longer counts such a poll
@@ -635,6 +643,18 @@ pub struct Resources {
     /// holds ready (`ThreadState::passed_descriptors_out_unreported`).
     #[serde(default)]
     pub(crate) passes_descriptors_out: bool,
+    /// Set on a polling request when every descriptor its attempt waits on is
+    /// guest-held (`DetFd::is_guest_held`) at the moment the request is filed:
+    /// only guests hold their other ends, so only a guest action can make the
+    /// attempt succeed. Unlike `polls_guest_state_only`, which follows how the
+    /// call is executed (internal polling), this is provenance, and it is
+    /// computed again before every attempt (`helpers::waits_on_guest_held_only`),
+    /// so a descriptor or `pollfd` entry the guest replaced between attempts
+    /// is judged as it is now. Only the retry loops that compute it set it;
+    /// every other request leaves it `false`. It feeds only the poll
+    /// upgrade's count (`Scheduler::retry_follows_guest_actions`).
+    #[serde(default)]
+    pub(crate) waits_on_guest_held_only: bool,
     /// Set by a blocking FIFO open waiting for a guest peer. When this polling
     /// turn commits and nothing else can run (`Scheduler::nothing_else_can_run`),
     /// the answer is `ResumeStatus::NothingElseCanRun`, and the open then waits
@@ -815,11 +835,17 @@ impl fmt::Debug for Resources {
         if self.polls_guest_state_only {
             debug.field("polls_guest_state_only", &true);
         }
+        if self.polls_a_named_fifo {
+            debug.field("polls_a_named_fifo", &true);
+        }
         if self.relies_on_guest_held_marks {
             debug.field("relies_on_guest_held_marks", &true);
         }
         if self.passes_descriptors_out {
             debug.field("passes_descriptors_out", &true);
+        }
+        if self.waits_on_guest_held_only {
+            debug.field("waits_on_guest_held_only", &true);
         }
         if self.waits_until_nothing_else_can_run {
             debug.field("waits_until_nothing_else_can_run", &true);
@@ -897,8 +923,10 @@ impl Resources {
             reads_signalfd: false,
             read_fd: None,
             polls_guest_state_only: false,
+            polls_a_named_fifo: false,
             relies_on_guest_held_marks: false,
             passes_descriptors_out: false,
+            waits_on_guest_held_only: false,
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
             upgraded_from_attempt: 0,
@@ -967,7 +995,11 @@ impl Resources {
         self.continues_sigreturn &= other.continues_sigreturn;
         self.private_sigchld_decides |= other.private_sigchld_decides;
         self.replay_served_from_log |= other.replay_served_from_log;
-        self.polls_guest_state_only |= other.polls_guest_state_only;
+        // A combined wait depends on guest state only if both parts do: these
+        // two fail closed, as every merge of a host-backed part must.
+        self.polls_guest_state_only &= other.polls_guest_state_only;
+        self.waits_on_guest_held_only &= other.waits_on_guest_held_only;
+        self.polls_a_named_fifo |= other.polls_a_named_fifo;
         self.relies_on_guest_held_marks |= other.relies_on_guest_held_marks;
         self.passes_descriptors_out |= other.passes_descriptors_out;
         self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;
@@ -1344,6 +1376,44 @@ mod tests {
             }
             assert_eq!(request.in_guest_sigalrm_sleep(), None, "case {case}");
         }
+    }
+
+    /// A combined wait is guest state only if both parts are: merging a part
+    /// a host can make ready withdraws `polls_guest_state_only` and
+    /// `waits_on_guest_held_only` whichever side it is on, so a merge can
+    /// never make the poll upgrade's count trust a host-backed wait
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4892).
+    #[test]
+    fn merging_a_host_backed_wait_withdraws_the_guest_state_flags() {
+        let tid = DetTid::from_raw(5);
+        let guest_state = || {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.polls_guest_state_only = true;
+            request.waits_on_guest_held_only = true;
+            request
+        };
+        let mut host = Resources::new(tid);
+        host.insert(ResourceID::InternalIOPolling, Permission::W);
+        for guest_first in [true, false] {
+            let merged = if guest_first {
+                let mut merged = guest_state();
+                merged.union(&host);
+                merged
+            } else {
+                let mut merged = host.clone();
+                merged.union(&guest_state());
+                merged
+            };
+            assert!(!merged.polls_guest_state_only, "guest first: {guest_first}");
+            assert!(
+                !merged.waits_on_guest_held_only,
+                "guest first: {guest_first}"
+            );
+        }
+        let mut both = guest_state();
+        both.union(&guest_state());
+        assert!(both.polls_guest_state_only && both.waits_on_guest_held_only);
     }
 
     #[test]

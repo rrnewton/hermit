@@ -106,8 +106,14 @@ impl RunData {
     pub fn preempts_out(&mut self) -> &PreemptionRecord {
         if self.in_mem_sched_out.is_none() {
             let path = self.sched_path_out();
-            let pr = PreemptionReader::new(path);
-            self.in_mem_sched_out = Some(pr.load_all());
+            let record = PreemptionReader::new(path).load_all();
+            // Trials spliced from this schedule make its jumps of global time.
+            self.analyze_opts
+                .time_skip_sources
+                .lock()
+                .unwrap()
+                .remember(&record);
+            self.in_mem_sched_out = Some(record);
         }
         self.in_mem_sched_out.as_ref().unwrap()
     }
@@ -1251,11 +1257,23 @@ impl AnalyzeOpts {
     }
 
     /// Write `record` for a trial to replay, stamped
-    /// ([`Self::stamp_trial_record`]).
+    /// ([`Self::stamp_trial_record`]). The record carries the jumps of global
+    /// time of the recorded schedule whose event prefix its events repeat
+    /// furthest (`crate::time_skip_carry`), so its replay jumps where that
+    /// recording did, and is in the oldest format among the recordings read,
+    /// whose rules its events follow. A record that would not validate is
+    /// refused before anything is written.
     pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
-        self.stamp_trial_record(record)
-            .write_to_disk(path)
-            .map_err(anyhow::Error::msg)
+        let (skips, format) = {
+            let sources = self.time_skip_sources.lock().unwrap();
+            (
+                sources.carried(record.schedevents()),
+                sources.trial_format(),
+            )
+        };
+        let record = self.stamp_trial_record(record.with_format(format).with_time_skips(skips));
+        record.validate().map_err(anyhow::Error::msg)?;
+        record.write_to_disk(path).map_err(anyhow::Error::msg)
     }
 
     /// Refuse, before any trial, recordings made under another

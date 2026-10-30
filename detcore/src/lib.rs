@@ -554,6 +554,50 @@ struct PriorityCheckin<'a> {
     site: preemptions::callback_history::Site,
 }
 
+/// How a delivery whose default action ends its process is reported to the
+/// scheduler, in the delivery's turn (`fatal_delivery_report`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FatalDeliveryReport {
+    /// Not reported.
+    Unreported,
+    /// Committed (`GlobalRequest::CommitFatalDelivery`), which dooms the
+    /// process (`Scheduler::commit_fatal_delivery`) and, where
+    /// `may_retire_others` and the kernel carries the default action out,
+    /// retires its other threads.
+    Committed { may_retire_others: bool },
+    /// Noted for the poll upgrade's count alone
+    /// (`GlobalRequest::NoteFatalDelivery`), which stops the count until the
+    /// process's reap and dooms nothing.
+    CountOnly,
+}
+
+/// How a delivery whose default action ends its process is reported to the
+/// scheduler. Main's commit (`Scheduler::commit_fatal_delivery`) where the
+/// process's other threads may be retired at the delivery
+/// (`syscalls::retires_others_at_fatal_delivery`), under
+/// `--pipe-wake-latency`, for the hand-off (`scheduler::pipe_wake`), or under
+/// `--virtual-timeout`, for the bound (`thread_is_doomed`). Else,
+/// outside record/replay and on a path that may file scheduler requests, a
+/// note that only stops the poll upgrade's count until the reap
+/// (`Scheduler::a_committed_doom_is_outstanding`): there a gdbserver client
+/// may still cancel the signal, so the process must not be doomed. A
+/// two-phase commit files none (`two_phase_refusal`); a fatal delivery there
+/// goes on to `Tool::exit_for_predicted_death`, whose group Exit grant
+/// records the doom instead.
+pub(crate) fn fatal_delivery_report(cfg: &Config, may_file_requests: bool) -> FatalDeliveryReport {
+    let may_retire_others = crate::syscalls::retires_others_at_fatal_delivery(cfg);
+    if may_retire_others
+        || cfg.pipe_wake_latency_in_effect().is_some()
+        || cfg.virtual_timeout.is_some()
+    {
+        FatalDeliveryReport::Committed { may_retire_others }
+    } else if may_file_requests && !cfg.recordreplay_modes {
+        FatalDeliveryReport::CountOnly
+    } else {
+        FatalDeliveryReport::Unreported
+    }
+}
+
 /// Why this configuration cannot keep the two-phase delivery protocol
 /// (`Tool::announce_signal_event`), if it cannot: a part of the commit would
 /// file a scheduler request, or would read what only exists after the
@@ -1884,7 +1928,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let turn = self
             .inbound_turn(guest, signal, stop, TurnScope::Delivery)
             .await;
-        self.inbound_delivered(guest, signal, turn, timer_entry)
+        self.inbound_delivered(guest, signal, turn, timer_entry, true)
             .await
     }
 
@@ -2224,6 +2268,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         signal: SigWrapper,
         turn: tool_local::InboundTurn,
         timer_entry: bool,
+        may_file_requests: bool,
     ) -> Result<Option<SigWrapper>, Errno> {
         let tool_local::InboundTurn {
             dettid,
@@ -2231,27 +2276,39 @@ impl<T: RecordOrReplay> Detcore<T> {
             boundary_token,
         } = turn;
         // A delivery that ends the process is committed in this turn
-        // (`Scheduler::commit_fatal_delivery`). Under `--pipe-wake-latency`
-        // or `--virtual-timeout` the doom feeds the hand-off scan
-        // (`scheduler::pipe_wake`) and the bound (`thread_is_doomed`). Where the
-        // kernel's signal state is the guest's own (ptrace), the process's
-        // other threads also leave the scheduler now, as Linux kills them at
-        // this delivery, instead of at their host-timed exit reports. That
-        // needs the kernel to carry out the default action when it resumes
-        // this thread, as its signal state says now: the signal is unblocked
-        // (`ptrace_signal` requeues a blocked one) and no gdbserver client
-        // can change or cancel it at the resume.
-        let may_retire_others = crate::syscalls::retires_others_at_fatal_delivery(&self.cfg);
-        let retired_the_others = (may_retire_others
-            || self.cfg.pipe_wake_latency_in_effect().is_some()
-            || self.cfg.virtual_timeout.is_some())
-            && match crate::syscalls::fatal_default_delivery(guest, signal.raw(), may_retire_others)
-            {
-                Some(retire_others) => {
-                    tool_global::commit_fatal_delivery(guest, retire_others).await
+        // (`Scheduler::commit_fatal_delivery`), which records its doom for
+        // the hand-off scan under `--pipe-wake-latency`
+        // (`scheduler::pipe_wake`) and for the bound under `--virtual-timeout`
+        // (`thread_is_doomed`). Where the kernel's signal state is the guest's
+        // own (ptrace), the process's other threads also leave the scheduler
+        // now, as Linux kills them at this delivery, instead of at their
+        // host-timed exit reports. That needs the kernel to carry out the
+        // default action when it resumes this thread, as its signal state says
+        // now: the signal is unblocked (`ptrace_signal` requeues a blocked
+        // one) and no gdbserver client can change or cancel it at the resume.
+        // Where it is not committed, outside record/replay, it is noted for
+        // the poll upgrade's count alone (`fatal_delivery_report`).
+        let retired_the_others = match fatal_delivery_report(&self.cfg, may_file_requests) {
+            FatalDeliveryReport::Unreported => false,
+            FatalDeliveryReport::Committed { may_retire_others } => {
+                match crate::syscalls::fatal_default_delivery(
+                    guest,
+                    signal.raw(),
+                    may_retire_others,
+                ) {
+                    Some(retire_others) => {
+                        tool_global::commit_fatal_delivery(guest, retire_others).await
+                    }
+                    None => false,
                 }
-                None => false,
-            };
+            }
+            FatalDeliveryReport::CountOnly => {
+                if crate::syscalls::fatal_default_delivery(guest, signal.raw(), false).is_some() {
+                    tool_global::note_fatal_delivery(guest).await;
+                }
+                false
+            }
+        };
         // A timer entry's siginfo, with its overrun counted now that the
         // delivery's turn is granted, where the handler's time begins.
         if timer_entry {
@@ -4528,7 +4585,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             mycount,
             boundary_token,
         };
-        self.inbound_delivered(guest, signal, turn, timer_entry)
+        self.inbound_delivered(guest, signal, turn, timer_entry, false)
             .await?;
         if guest.thread_state().scheduler_grants != grants {
             warn!(
@@ -5073,6 +5130,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     in_uncharged_bootstrap_syscall: false,
                     // The parent reports its own export with its next request.
                     passed_descriptors_out_unreported: false,
+                    passed_descriptors_out_reported: false,
+                    nonblocking_result_normalized: false,
                     yield_after_futex_wake: false,
                     pipe_handoff_due: None,
                     own_signal_turn_hold: None,

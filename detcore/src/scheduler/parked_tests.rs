@@ -4728,7 +4728,7 @@ fn child_wait_repark_after_legacy_signal_keeps_shared_alarm_eligible() {
         assert!(
             matches!(response.try_read(), Some(SchedResponse::Signaled(Some(signals))) if signals == vec![SigWrapper::from(Signal::SIGURG)])
         );
-        s.step6_reenquue(tid, Requeue::Back);
+        s.step6_reenquue(tid, Requeue::Back, UpgradeProgress::Counts);
         // The actual helper rechecks an ignored/blocked legacy signal and asks
         // for the same ChildWait again. Drive its normal request/park here.
         s.install_resource_origin(
@@ -5915,6 +5915,56 @@ fn the_controlled_loop_restores_a_due_poller_in_maintenance() {
     assert_eq!(s.controlled_turn_entries, 1);
     assert!(s.poll_deadline_of.is_empty());
     assert_eq!(s.run_queue.queued_priority(poller), Some(DEFAULT_PRIORITY));
+}
+
+/// KVM's controlled turn loop runs the timed poll upgrade in the maintenance
+/// stage that restores due pollers: the turn whose charge crosses the period
+/// restores a backed-off poller, which then runs its retry ahead of the
+/// spinner queued behind it, and the turn before does not. The scheduler's
+/// unit tests call `upgrade_pollers_on_time` directly; this one holds the
+/// call in the controlled loop (Claude and Codex reviews of
+/// https://github.com/rrnewton/hermit/pull/4652).
+#[test]
+fn the_controlled_loop_runs_the_timed_poll_upgrade_in_maintenance() {
+    use futures::FutureExt;
+
+    let (mut s, _backend) = fixture();
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let period = s.poll_upgrade_period;
+    let (spinner, _, _) = add(&mut s, 100, 100);
+    let (poller, _, _) = add(&mut s, 100, 101);
+    backed_off_poller_after(&mut s, poller, None, 6);
+    runnable(&mut s, spinner);
+    let scheduler = Arc::new(Mutex::new(s));
+    let turn = |scheduler: &Arc<Mutex<Scheduler>>, global: &Arc<Mutex<GlobalTime>>| {
+        do_a_turn_blocking(scheduler.clone(), global.clone(), &Err(SkipTurn))
+            .now_or_never()
+            .expect("nothing to wait for")
+            .expect("a runnable thread commits")
+    };
+    let first = turn(&scheduler, &global);
+    assert_eq!(first.tid, spinner, "the poller is backed off");
+    {
+        let s = scheduler.lock().unwrap();
+        assert_eq!(s.controlled_turn_entries, 1);
+        assert_eq!(
+            s.run_queue.queued_priority(poller),
+            Some(runqueue::LAST_PRIORITY)
+        );
+        assert!(
+            s.next_timed_poll_upgrade.is_some(),
+            "the first look starts the period"
+        );
+        assert!(s.next_turns[&spinner].req.try_read().is_none());
+        s.next_turns[&spinner].req.put(Ok(Resources::new(spinner)));
+    }
+    global.lock().unwrap().add_extra_time(period);
+    let second = turn(&scheduler, &global);
+    assert_eq!(second.tid, poller, "restored, it retries next");
+    assert_eq!((second.poll_attempt, second.upgraded_from_attempt), (0, 6));
+    let s = scheduler.lock().unwrap();
+    assert_eq!(s.controlled_turn_entries, 2);
+    assert_eq!(s.run_queue.poll_upgrade_count(), 1);
 }
 
 /// The controlled loop also restores a poller whose deadline is crossed while

@@ -2927,6 +2927,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut published = PublishedWaitMask::default();
         publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
         let result = loop {
+            // Provenance as it is now (`Resources::waits_on_guest_held_only`).
+            rsrc.waits_on_guest_held_only = poll_targets_guest_held(
+                guest,
+                probe.fds().map(|fds| fds.as_raw()),
+                probe.nfds() as usize,
+            );
             resource_request(guest, rsrc.clone()).await;
             // Virtual timerfds first (`crate::syscalls::timerfd`), in the
             // staged cells' scratch while they hold the stack.
@@ -3908,9 +3914,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, req).await;
         }
 
-        // What the address names, read before the call as Linux reads it,
-        // and whether the connection completes in this turn.
-        let unix_address = uservaddr.map_or(
+        // Whether the connection completes in this turn.
+        let in_turn = self.completes_in_turn(guest, call);
+        guest.thread_state_mut().nonblocking_result_normalized = false;
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        // A retried attempt's `EISCONN`, read as success, saw only that the
+        // open file was connected, by an earlier attempt or another thread's
+        // connect, not to which socket, nor that it read the address now
+        // there (Codex review of https://github.com/rrnewton/hermit/pull/4862).
+        let completed_by_another_attempt =
+            std::mem::take(&mut guest.thread_state_mut().nonblocking_result_normalized);
+        // What the address names, as the attempt that connected read it. A
+        // connect that completes in its turn made that attempt in this turn,
+        // after the last request it filed, so no other thread has rewritten
+        // the address since; an earlier read could name another socket than
+        // the one it reached, if another thread rewrote the address between
+        // attempts (Codex review of
+        // https://github.com/rrnewton/hermit/pull/4862). A connect outside its
+        // turn may have reached any name (`Detcore::note_unix_connect`).
+        let connected_to = uservaddr.map_or(
             crate::syscalls::scm_rights::UnixAddress::Unnamed,
             |address| {
                 crate::syscalls::scm_rights::unix_address(
@@ -3920,10 +3942,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
             },
         );
-        let in_turn = self.completes_in_turn(guest, call);
-        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         if let Ok(0) = &result {
-            self.note_unix_connect(guest, fd, &unix_address, in_turn);
+            // Pair it with nothing, and no name with anything.
+            let in_turn = in_turn && !completed_by_another_attempt;
+            self.note_unix_connect(guest, fd, &connected_to, in_turn);
         }
         if self.cfg.backend.loopback_pollers_yield_to_peers
             && connect_result_allows_peer_classification(&result)
@@ -3985,7 +4007,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     detfd.clear_guest_held();
                 }
             });
-            self.classify_guest_held_peer(guest, fd).await;
+            let connecting = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.open_file_handle())
+                .ok();
+            let listener = self.listener_named(guest, &connected_to);
+            let guest_created = crate::syscalls::scm_rights::both_ends_guest_made(
+                in_turn && !completed_by_another_attempt,
+                connecting.as_ref(),
+                listener.as_ref(),
+            );
+            self.classify_guest_held_peer(guest, fd, guest_created)
+                .await;
         }
 
         result
@@ -3997,13 +4030,29 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest-held, so the sender was a guest. Then a received descriptor is
     /// guest-held when this table already names its object, or the other end
     /// of the same pipe, through a guest-held description (the same host
-    /// device and inode), or when it is a socket whose peer is this process
-    /// (`classify_guest_held_peer`). A received descriptor is a description
-    /// of its own in Detcore's model (`record_received_descriptor`), so it
-    /// does not share the sender's mark. Marks only ever claim that no
-    /// process outside the guest holds the object; once a descriptor may have
-    /// left the guest, the scheduler stops trusting every mark
-    /// (`Scheduler::polls_only_guest_state`).
+    /// device and inode). A socket's peer credentials do not mark it here:
+    /// they name its peer, not every holder of its open file.
+    ///
+    /// A received descriptor that joins the open file its sender's table
+    /// modeled (`crate::syscalls::scm_rights`) shares that open file's mark,
+    /// set or not, as a dup would. The mark it arrives with is sound: a join
+    /// takes only what a guest's `sendmsg` or `sendmmsg` queued on the
+    /// receiving socket's known peer (`queue_sent_rights`), so the sender is a
+    /// guest; either the channel was guest-held, so the receiver is a guest
+    /// too and every holder of the open file is one, or the send revoked every
+    /// mark first (`note_descriptors_passed_out`, which both send paths run
+    /// before they send). This function never sees a joined descriptor:
+    /// `record_received_descriptors` returns only the descriptors it recorded
+    /// as descriptions of their own (`Receipt::New`), so a join keeps its open
+    /// file's mark as it is. The rule here holds for the open file all the
+    /// same: the object or its other end is already guest-held in this table.
+    /// A descriptor nothing queued names, such as one from a process outside
+    /// the guest, is a description of its own and starts unmarked; this
+    /// function marks it only on a guest-held channel, as a known object.
+    /// Marks
+    /// only ever claim that no process outside the guest holds the object;
+    /// once a descriptor may have left the guest, the scheduler stops trusting
+    /// every mark (`Scheduler::polls_only_guest_state`).
     async fn classify_received_descriptors<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4035,42 +4084,70 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .thread_state()
                     .names_guest_held_object(fd, stat.dev, stat.inode)
             });
+            // A received socket's peer credentials name its peer, not every
+            // holder of its open file: a host process may still hold the same
+            // open file, having handed it in over a channel that is not
+            // guest-held, from which a guest forwarded it here. So a socket
+            // that joined nothing is marked only as a known object, never
+            // from its credentials (Codex review of
+            // https://github.com/rrnewton/hermit/pull/4862).
             if known {
                 let _ = guest
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.set_guest_held());
-            } else if ty == FdType::Socket {
-                self.classify_guest_held_peer(guest, fd).await;
             }
         }
     }
 
-    /// Mark socket `fd` guest-held (`DetFd::is_guest_held`) when its peer, as
-    /// `SO_PEERCRED` names it, is the caller's own process, and the peer's
-    /// other end is therefore held by guests only:
+    /// Mark socket `fd`, a connection `connect` or `accept` just made,
+    /// guest-held (`DetFd::is_guest_held`) when guests alone hold both of its
+    /// ends and its peer is the caller's own process.
+    ///
+    /// `guest_created` is the provenance, which the caller checks: the
+    /// connecting socket and the listener are both sockets a guest made in
+    /// this run and never passed out of the guest (`DetFd::is_guest_created`),
+    /// the connecting socket being `fd` itself for a `connect` and, for an
+    /// `accept`, the socket whose connection it took
+    /// (`Detcore::note_unix_accept`). Only guests then hold the connecting
+    /// socket, and only guests can accept from the listener, so only guests
+    /// hold either end. Peer credentials alone prove neither: they name the
+    /// process that connected or listened, not every holder of the open file,
+    /// and a host process may have kept an alias of a socket it handed in
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4862). On
+    /// top of the provenance, `SO_PEERCRED` must name the caller's own
+    /// process:
     ///
     /// - An accepted socket (`accept`, `accept4`): Linux takes its credentials
-    ///   from the task that connected, when it connected, so the connecting
-    ///   end was then in this process.
+    ///   from the task that connected, when it connected.
     /// - A connected stream or seqpacket socket (`connect`): Linux copies the
-    ///   credentials of whoever called `listen`, so the listener was made in
-    ///   this process, and only a holder of that listener can accept. That is
-    ///   this process, or a process it shared the listener with: a guest,
-    ///   unless the listener left the guest, which revokes every mark
-    ///   (`note_descriptors_passed_out`).
-    /// - A stream or seqpacket socket a guest receives over a guest-held
-    ///   channel (`classify_received_descriptors`).
+    ///   credentials of whoever called `listen`.
+    ///
+    /// A received socket is never classified here
+    /// (`classify_received_descriptors`): its credentials name its peer, but
+    /// a host process may hold the received open file itself.
     ///
     /// A datagram socket's credentials are not its peer's, so it is never
-    /// marked here. A peer in another process, guest or not, and a socket with
+    /// marked here. Nor is a listening socket: `listen` sets a listener's
+    /// credentials to its caller's, so one this process listened on and then
+    /// received names this process, yet any process that can name its
+    /// address can connect and make it ready. Accept and connect never return
+    /// a listener, and receipts are not classified here, so the
+    /// `SO_ACCEPTCONN` test, which must read 0 and leaves a socket whose
+    /// value cannot be read unmarked, is a guard against a future caller. A peer in
+    /// another process, guest or not, and a socket with
     /// no peer credentials (any non-`AF_UNIX` socket, whose peer pid is 0) are
     /// left as they were. Best-effort and read-only: an injection that fails
     /// leaves the socket unmarked, and nothing the guest sees changes. Only
     /// plain runs read the mark (`polls_guest_state_only` feeds the scheduler's
     /// idle detection; record/replay polls run as external waits), so only
     /// they pay for it.
-    pub(crate) async fn classify_guest_held_peer<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) {
-        if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
+    pub(crate) async fn classify_guest_held_peer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        guest_created: bool,
+    ) {
+        if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes || !guest_created {
             return;
         }
         // A datagram socket's credentials are its creator's, or its
@@ -4080,6 +4157,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             return;
         };
         if kind != libc::SOCK_STREAM && kind != libc::SOCK_SEQPACKET {
+            return;
+        }
+        // A listener's credentials are its own (`unix_listen` sets them to
+        // the caller's), and an outside client's connect makes it ready.
+        if socket_option::<libc::c_int, _, _>(guest, fd, libc::SO_ACCEPTCONN).await != Some(0) {
             return;
         }
         let Some(credentials) =
@@ -4241,7 +4323,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// for `mark_exported_listeners`, this runs before the send and whatever
     /// it returns, and a message whose control data Detcore cannot read counts
     /// as passing descriptors.
-    fn note_descriptors_passed_out<G: Guest<Self>>(
+    ///
+    /// This reads the messages once, before the call. A send polled in the
+    /// caller's turns reads them again before every attempt
+    /// (`passes_descriptors_out_now`), and one passed through runs once in
+    /// this same turn. A send that runs outside the turn counts as passing
+    /// descriptors whatever it names, decided where it leaves the turn
+    /// (`passes_descriptors_out_outside_the_turn`). A descriptor passed out
+    /// is no longer a socket only guests hold (`DetFd::clear_guest_created`).
+    pub(crate) fn note_descriptors_passed_out<G: Guest<Self>>(
         &self,
         guest: &mut G,
         sockfd: RawFd,
@@ -4257,7 +4347,86 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (sent, unread) = sent_descriptors(guest, headers);
         if !sent.is_empty() || unread {
             guest.thread_state_mut().passed_descriptors_out_unreported = true;
+            clear_guest_created(guest, &sent);
         }
+    }
+
+    /// Notes, for a `sendmsg` or `sendmmsg` `call` about to run outside the
+    /// caller's turn in a plain sequentialized run, that it may pass
+    /// descriptors out of the guest
+    /// (`ThreadState::passed_descriptors_out_unreported`), whatever its
+    /// descriptor and messages name now. The kernel imports them at a
+    /// host-chosen moment, after other guest threads ran: one may have
+    /// replaced the descriptor with an `AF_UNIX` socket that is not
+    /// guest-held and rewritten a message to pass a guest-held one. Called
+    /// where the call leaves the turn (`record_or_replay_blocking_resource_then`),
+    /// so the request that leaves it carries the report, whatever the handler
+    /// decided earlier and however many requests came between (Codex review
+    /// of https://github.com/rrnewton/hermit/pull/4862).
+    pub(crate) fn passes_descriptors_out_outside_the_turn<G: Guest<Self>>(
+        guest: &mut G,
+        call: Syscall,
+    ) {
+        let config = guest.config();
+        if config.sequentialize_threads
+            && !config.recordreplay_modes
+            && matches!(call, Syscall::Sendmsg(_) | Syscall::Sendmmsg(_))
+        {
+            guest.thread_state_mut().passed_descriptors_out_unreported = true;
+        }
+    }
+
+    /// Whether `call`, a `sendmsg` or `sendmmsg` about to make an attempt in
+    /// the caller's turn, would pass descriptors out of the guest that this
+    /// thread has not reported yet (`note_descriptors_passed_out`), read from
+    /// its messages as they are now: a sibling may have rewritten them since
+    /// the handler read them, or while an earlier attempt waited. If so, the
+    /// pass-out is noted (`ThreadState::passed_descriptors_out_unreported`),
+    /// and the caller reports it in a request of its own before the attempt
+    /// runs. Only plain sequentialized runs read the marks, so only they
+    /// check; once this thread has reported a pass-out the scheduler trusts no
+    /// mark again, so it checks no more (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4862).
+    pub(crate) fn passes_descriptors_out_now<G: Guest<Self>>(guest: &mut G, call: Syscall) -> bool {
+        let config = guest.config();
+        if !config.sequentialize_threads || config.recordreplay_modes {
+            return false;
+        }
+        if guest.thread_state().passed_descriptors_out_reported {
+            return false;
+        }
+        let (sockfd, headers): (RawFd, Vec<usize>) = match call {
+            Syscall::Sendmsg(call) => (
+                call.fd(),
+                call.msg()
+                    .map(|header| header.as_raw())
+                    .into_iter()
+                    .collect(),
+            ),
+            Syscall::Sendmmsg(call) => (
+                call.sockfd(),
+                call.msgvec().map_or_else(Vec::new, |vector| {
+                    (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
+                        .map(|index| vector.as_raw() + index * std::mem::size_of::<Mmsghdr>())
+                        .collect()
+                }),
+            ),
+            _ => return false,
+        };
+        let reaches_a_guest = guest
+            .thread_state()
+            .with_detfd(sockfd, |detfd| detfd.is_guest_held())
+            .unwrap_or(false);
+        if reaches_a_guest {
+            return false;
+        }
+        let (sent, unread) = sent_descriptors(guest, &headers);
+        if sent.is_empty() && !unread {
+            return false;
+        }
+        guest.thread_state_mut().passed_descriptors_out_unreported = true;
+        clear_guest_created(guest, &sent);
+        true
     }
 
     /// Mark every accept-in-turn listener (`DetFd::is_accept_in_turn_eligible`)
@@ -4329,6 +4498,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 _ => {}
             }
         }
+    }
+}
+
+/// Withdraws `DetFd::set_guest_created` from each of `sent`, descriptors a
+/// send passes out of the guest.
+fn clear_guest_created<T, G>(guest: &G, sent: &[RawFd])
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    for &fd in sent {
+        let _ = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.clear_guest_created());
     }
 }
 

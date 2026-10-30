@@ -28,6 +28,7 @@ use serde::ser::SerializeMap;
 use super::HostObservedCount;
 use super::PreemptionRecord;
 use super::ThreadHistory;
+use super::TimeSkip;
 use super::callback_history;
 use crate::types::DetTid;
 use crate::types::SchedEvent;
@@ -67,6 +68,10 @@ struct RawRecord {
     host_inputs: Option<HostInputSet>,
     #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
+    time_skips: Option<Vec<TimeSkip>>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
@@ -273,6 +278,62 @@ mod tests {
     use crate::preemptions::boundary_recording::BoundaryRecording;
     use crate::preemptions::boundary_recording::Recording;
     use crate::preemptions::read_recorded_replay_departure;
+
+    /// `PreemptionRecord::time_skips` (#4863) reads back from a plain record
+    /// as written before the record's serde moved to `RawRecord`, and a
+    /// record written now keeps the jumps, plain or inside the incomplete
+    /// record's envelope. A field left out of `RawRecord` fails to compile,
+    /// but one kept there under `#[serde(skip)]` would be dropped without an
+    /// error.
+    #[test]
+    fn time_skips_round_trip_through_the_record_serde() {
+        let skip = TimeSkip {
+            event: 3,
+            target: crate::types::LogicalTime::from_nanos(1_000),
+            reason: crate::preemptions::TimeSkipReason::IdleGuestPollers,
+        };
+        let old = serde_json::json!({
+            "per_thread": {},
+            "global": [],
+            "format_version": 2,
+            "time_skips": [serde_json::to_value(skip).unwrap()],
+        })
+        .to_string();
+        let mut record: PreemptionRecord = serde_json::from_str(&old).unwrap();
+        assert_eq!(record.time_skips(), Some(&[skip][..]));
+        for marker in [None, Some(7)] {
+            record.replay_departed_at = marker;
+            let written = serde_json::to_string(&record).unwrap();
+            let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(back.time_skips(), Some(&[skip][..]), "{written}");
+            assert_eq!(back, record, "{written}");
+        }
+    }
+
+    /// `PreemptionRecord::format_version` (#4863) reads back from a plain
+    /// record as written before the record's serde moved to `RawRecord`, and
+    /// a record written now keeps it, plain or inside the incomplete record's
+    /// envelope; a record that has none still writes none.
+    #[test]
+    fn format_version_round_trips_through_the_record_serde() {
+        let old = r#"{"per_thread":{},"global":[],"format_version":2}"#;
+        let mut record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(record.format_version(), Some(2));
+        for marker in [None, Some(7)] {
+            record.replay_departed_at = marker;
+            let written = serde_json::to_string(&record).unwrap();
+            let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(back.format_version(), Some(2), "{written}");
+            assert_eq!(back, record, "{written}");
+        }
+        let unversioned: PreemptionRecord =
+            serde_json::from_str(r#"{"per_thread":{},"global":[]}"#).unwrap();
+        assert_eq!(unversioned.format_version(), None);
+        assert_eq!(
+            serde_json::to_string(&unversioned).unwrap(),
+            r#"{"per_thread":{},"global":[]}"#
+        );
+    }
 
     #[test]
     fn marked_envelopes_never_fall_back_to_legacy_fields() {

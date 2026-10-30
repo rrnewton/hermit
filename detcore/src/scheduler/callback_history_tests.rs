@@ -144,7 +144,7 @@ mod callback_history_scheduler_tests {
             .unwrap();
         s.step5_guest_unblock(d, &Resources::new(d), &response)
             .unwrap();
-        s.step6_reenquue(d, super::Requeue::Back);
+        s.step6_reenquue(d, super::Requeue::Back, super::runqueue::UpgradeProgress::Counts);
         if replaying {
             assert!(
                 s.consume_schedevent(&d_pre).keep_running,
@@ -166,7 +166,7 @@ mod callback_history_scheduler_tests {
         let granted = request.try_read().unwrap().unwrap();
         s.step4_resource_block(b, &granted, &response).unwrap();
         s.step5_guest_unblock(b, &granted, &response).unwrap();
-        s.step6_reenquue(b, super::Requeue::Back);
+        s.step6_reenquue(b, super::Requeue::Back, super::runqueue::UpgradeProgress::Counts);
         if replaying {
             assert!(!s.consume_schedevent(&b_post).keep_running);
             assert_eq!(s.priorities[&a], REPLAY_FOREGROUND_PRIORITY);
@@ -260,7 +260,7 @@ mod callback_history_scheduler_tests {
             assert!(granted.resources.is_empty());
             s.step4_resource_block(a, &granted, &response).unwrap();
             s.step5_guest_unblock(a, &granted, &response).unwrap();
-            s.step6_reenquue(a, super::Requeue::Back);
+            s.step6_reenquue(a, super::Requeue::Back, super::runqueue::UpgradeProgress::Counts);
             assert!(response.try_read().is_some());
             s.bump_global_time(&global, &Ok(granted));
             assert_eq!((s.committed_time - time).as_nanos(), 500_000);

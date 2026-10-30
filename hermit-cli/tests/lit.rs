@@ -380,8 +380,8 @@ fn fixtures(root: &Path) -> Vec<PathBuf> {
 fn every_lit_fixture_is_within_the_supported_subset() {
     let root = lit_root();
     let fixtures = fixtures(&root);
-    // 27 main.{rs,c,go} files, 47 .lit, 6 .test and 2 scheduler scripts.
-    assert_eq!(fixtures.len(), 82, "{fixtures:#?}");
+    // 28 main.{rs,c,go} files, 48 .lit, 6 .test and 2 scheduler scripts.
+    assert_eq!(fixtures.len(), 84, "{fixtures:#?}");
     let placeholder = Path::new("/placeholder");
     let substitutions = [
         ("hermit", placeholder),
@@ -400,8 +400,8 @@ fn every_lit_fixture_is_within_the_supported_subset() {
             checked += 1;
         }
     }
-    // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts 45.
-    assert_eq!(checked, 45);
+    // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts 58.
+    assert_eq!(checked, 58);
 }
 
 /// The `%me` of FIXTURE: its directory's `main.c`, compiled into DIRECTORY
@@ -543,6 +543,8 @@ lit_cases! {
     lit_hello_world_c_hermit_run_strict => "hello_world_c/hermit-run-strict.lit",
     lit_guest_held_polls_main => "guest_held_polls/main.c",
     lit_guest_held_polls_hermit_run => "guest_held_polls/hermit-run.lit",
+    lit_fifo_jump_replay_main => "fifo_jump_replay/main.c",
+    lit_fifo_jump_replay_hermit_run => "fifo_jump_replay/hermit-run.lit",
     lit_networking_main => "networking/main.c",
     lit_networking_hermit_run => "networking/hermit-run.lit",
     lit_rt_sigaction_main => "rt_sigaction/main.c",

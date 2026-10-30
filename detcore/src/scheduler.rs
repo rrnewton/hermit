@@ -47,6 +47,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fmt::Write;
 use std::iter::Peekable;
 use std::os::fd::AsRawFd;
@@ -90,6 +91,7 @@ pub use runqueue::Priority;
 use runqueue::REPLAY_DEFERRED_PRIORITY;
 use runqueue::REPLAY_FOREGROUND_PRIORITY;
 use runqueue::RunQueue;
+use runqueue::UpgradeProgress;
 pub use runqueue::entropy_to_priority;
 use serde::Deserialize;
 use serde::Serialize;
@@ -110,7 +112,10 @@ use crate::cpu_set::TaskAffinity;
 use crate::cpu_set::TaskCpus;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
+use crate::preemptions::PREEMPTION_RECORD_FORMAT;
 use crate::preemptions::PreemptionWriter;
+use crate::preemptions::TimeSkip;
+use crate::preemptions::TimeSkipReason;
 use crate::preemptions::boundary_recording::Recording;
 use crate::resources::ExternalOpId;
 use crate::resources::LOOPBACK_POLL_YIELD_FYI;
@@ -1269,10 +1274,49 @@ impl BackgroundReadSignals {
 /// (`Scheduler::upgrade_pollers_on_time`), whatever the maximum timeslice: a
 /// period near one turn charge would ready every filed retry at every pass
 /// and switch the pollers' backoff off. The period is also at least
-/// `POLLING_UPGRADE_INTERVAL` turn charges, so a round of readied retries,
-/// one turn per poller, cannot use it up before the queueing-operation
-/// interval would have upgraded anyway.
+/// `POLLING_UPGRADE_INTERVAL` turn charges. Each retry a timed upgrade readies
+/// costs one turn charge when it runs. The retry of a poll a host can decide
+/// does not count toward the queueing-operation interval
+/// (`Scheduler::upgrade_progress_of`), so the interval does not upgrade those
+/// pollers sooner: with fewer of them live than the period holds turn charges
+/// (400 at the defaults: 200 ms of 0.5 ms charges), one round of readied
+/// retries leaves part of the period to the other threads, and from about
+/// that many on one round uses the whole period, the next timed upgrade is
+/// due when it ends, and they retry about once a round, as if not backed off.
+/// The retry of a poll only guest actions decide counts, as before the
+/// fix-forward of <https://github.com/rrnewton/hermit/pull/4605>, when every
+/// retry did, so from 200 such pollers on the interval itself upgrades every
+/// 200 retries.
 const MIN_POLL_UPGRADE_PERIOD_NS: u64 = 200_000_000;
+
+/// A jump of global time that a commit requested (`Scheduler::pending_time_skip`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingTimeSkip {
+    /// Why nothing else could run.
+    reason: TimeSkipReason,
+    /// The earliest timeout among the polls the commit counted as idle, its
+    /// own included: the jump stops there if no timer is due earlier.
+    poll_deadline: Option<LogicalTime>,
+    /// The thread whose commit requested the jump. For an idle poller's
+    /// jump, the pass that makes it checks again that this thread still
+    /// waits in an idle guest-state poll and that nothing else can run
+    /// (`revalidated_idle_poll_jump`).
+    requester: DetTid,
+}
+
+/// Where the scheduler's jumps of global time come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimeSkipMode {
+    /// A run that replays no schedule decides its own jumps and records them.
+    Compute,
+    /// A replay of a record that lists its jumps makes exactly those, each
+    /// where the recording did, and computes none (`drive_recorded_time_skips`).
+    Driven(VecDeque<TimeSkip>),
+    /// A replay of a record without a list behaves as before such lists
+    /// existed: no idle-poller jump, and a FIFO open's fast-forward recomputes
+    /// its jump to the next timer, counting only untimed polls as idle.
+    Legacy,
+}
 
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
@@ -1503,9 +1547,17 @@ pub struct Scheduler {
     pipe_handoff_pending: BTreeMap<DetTid, Vec<DetTid>>,
     /// Processes a delivered signal with a fatal default action has doomed,
     /// recorded under `--pipe-wake-latency` or `--virtual-timeout` and read
-    /// through [`Scheduler::thread_is_doomed`] by the pipe hand-off scan and
-    /// the virtual bound (`a_thread_can_still_be_granted`).
+    /// through [`Scheduler::thread_is_doomed`] by the pipe hand-off scan, the
+    /// virtual bound (`a_thread_can_still_be_granted`) and the idle-poller
+    /// deadlock check (`Scheduler::only_idle_guest_pollers_remain`).
     fatal_signal_doomed: BTreeSet<DetPid>,
+    /// Processes a delivered signal with a fatal default action has doomed,
+    /// recorded at the delivery's commit, or where it is not committed, and
+    /// forgotten at the reap (`note_fatal_signal_delivery`,
+    /// `consume_child_wait`), for the poll upgrade's count
+    /// (`a_committed_doom_is_outstanding`). Unlike `fatal_signal_doomed` it
+    /// dooms no thread.
+    fatal_signals_unreaped: BTreeSet<DetPid>,
     /// Whether the `--pipe-wake-latency` hand-off has logged that it is inert.
     pipe_wake_inert_logged: bool,
 
@@ -1545,17 +1597,46 @@ pub struct Scheduler {
     /// thread's next request shows its attempt moved something (it is not a
     /// retry, or is one with `previous_attempt_made_progress`).
     last_progress: u64,
+    /// The sequence number taken at the latest thread retirement
+    /// (`logically_kill_thread`): a thread that leaves may close the last
+    /// descriptor of a pipe end, so for the idle-poller deadlock check
+    /// (`only_idle_guest_pollers_remain`) a poller's failed attempt before it
+    /// no longer shows the poller idle.
+    retired_at: u64,
     /// The sequence number of each guest-state-only poller's latest grant,
     /// until the thread commits a turn of another kind.
     guest_state_polled_at: BTreeMap<DetTid, u64>,
-    /// The sequence number of each thread's latest committed turn: a poller's
-    /// failed attempt came no earlier.
-    last_commit_at: BTreeMap<DetTid, u64>,
-    /// Set at the commit of a FIFO open's poll when nothing else can run but
-    /// a timer is due at a finite deadline: the next pass moves global time
-    /// to that deadline, as an empty run queue does, rather than letting the
-    /// poll crawl there one turn charge at a time (`unblock_guest`).
-    fast_forward_for_alone_poller: bool,
+    /// The sequence number of each thread's latest polling grant: its latest
+    /// attempt. Another grant is no attempt, and runs no guest code before a
+    /// poller's retry: a schedule replay's `TraceReplay` grant, which only
+    /// hands a thread held after a traced event its turn back, can fall
+    /// between a poller's failed attempt and its retry.
+    last_attempt_at: BTreeMap<DetTid, u64>,
+    /// Set at the commit of a FIFO open's poll, or of an idle guest-state
+    /// poller's retry, when nothing else can run but a deadline is due at a
+    /// finite time (`unblock_guest`): the next pass moves global time to that
+    /// deadline (`fast_forward_to_next_finite_deadline`), as an empty run queue
+    /// does, rather than letting the pollers crawl there one turn charge at a
+    /// time.
+    pending_time_skip: Option<PendingTimeSkip>,
+    /// Where jumps of global time come from (`TimeSkipMode`).
+    time_skip_mode: TimeSkipMode,
+    /// Whether a recorded jump of global time that the replay cannot make as
+    /// recorded stops the run, as `--die-on-desync` stops it for an event.
+    die_on_time_skip_desync: bool,
+    /// How many recorded jumps of global time the replay could not make as
+    /// recorded.
+    time_skip_desyncs: u64,
+    /// The target of the last recorded jump the replay made before any thread
+    /// had registered a deadline there (`check_unconfirmed_time_skip`).
+    unconfirmed_time_skip: Option<TimeSkip>,
+    /// Under a driven replay, the stream position and reason of the latest
+    /// commit that would have requested a jump in a free run: a FIFO open's
+    /// poll or an idle guest-state poller's retry when nothing else can run
+    /// before a finite deadline (`unblock_guest`). A recorded jump is made only
+    /// after such a commit at its position, as the recording made it after
+    /// one (`drive_recorded_time_skips`).
+    jump_request: Option<(u64, TimeSkipReason)>,
 
     /// Run-queue *removals* requested by a global-request handler
     /// (`reconnect_after_exec` -> `logically_kill_thread`), deferred to the same
@@ -1730,6 +1811,10 @@ pub struct Scheduler {
 
     /// How the backend runs the guest. See [`Config::backend`].
     backend: BackendCapabilities,
+    /// `Config::thread_exits_finish_before_the_next_turn`: whether a
+    /// polling retry may count toward a poll upgrade on this run's backend
+    /// (`retry_follows_guest_actions`).
+    thread_exits_finish_before_the_next_turn: bool,
     /// Whether a parent-death signal Detcore holds but cannot send ends the
     /// run when it would fire (`parent_death_firing_refusal`): an in-guest
     /// run's default route (`Config::in_guest_refuses_host_timed_producers`).
@@ -4403,7 +4488,8 @@ pub(crate) async fn finish_selected_turn(
     mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
     mg.note_granted_turn(&rsrcs, &global_time);
     let requeue = mg.requeue_after(&rsrcs);
-    mg.step6_reenquue(next_dtid, requeue);
+    let progress = mg.upgrade_progress_of(&rsrcs);
+    mg.step6_reenquue(next_dtid, requeue, progress);
     if let Some(call) = rsrcs.as_exit_syscall() {
         mg.step7_simulate_exit_posthook(next_dtid, call, &global_time);
     }
@@ -4417,7 +4503,7 @@ enum Requeue {
     /// At the back of its band.
     Back,
     /// At the back of its band, excluded from the next selection
-    /// ([`RunQueue::push_yielded`]).
+    /// ([`RunQueue::push_yielded_with`]).
     OneTurnYield,
     /// At the back of its band, in the yield epoch
     /// ([`RunQueue::push_yielded_into_epoch`]).
@@ -4785,12 +4871,24 @@ impl Scheduler {
         let mut boundary_replayer = None;
         let mut boundary_stacktrace_events = BTreeMap::new();
         let mut recorded_host_inputs = None;
+        let mut time_skip_mode = TimeSkipMode::Compute;
+        // The format of the record a replay follows: its run follows that
+        // format's rules, and so says so in its own record.
+        let mut replayed_format = None;
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
                 // File/JSON failures retain the ordinary loader's panic class.
                 // Only explicit format-policy mismatches below are refusals.
-                let recording = Recording::read(path).unwrap();
+                let recording = Recording::read(path).unwrap_or_else(|error| {
+                    if error
+                        .chain()
+                        .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>())
+                    {
+                        exit_on_scheduler_refusal(&format!("{error:#}"));
+                    }
+                    panic!("{error:?}")
+                });
                 recording
                     .require_faithful_replay()
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
@@ -4798,6 +4896,19 @@ impl Scheduler {
                     .require_strict_mode(cfg.strict_schedule_boundaries)
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
                 recorded_host_inputs = recording.host_inputs().cloned();
+                time_skip_mode = if recording.lists_its_time_skips() {
+                    TimeSkipMode::Driven(
+                        recording
+                            .time_skips()
+                            .unwrap_or_default()
+                            .iter()
+                            .copied()
+                            .collect(),
+                    )
+                } else {
+                    TimeSkipMode::Legacy
+                };
+                replayed_format = Some(recording.format_version());
                 match recording {
                     Recording::Legacy(record) => {
                         callback_checkpoints = record
@@ -4893,6 +5004,15 @@ impl Scheduler {
                 .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_chaos_timeslice(cfg.chaos_timeslice)
                 .with_guest_ids(cfg.guest_ids);
+            // A run that follows no record writes the newest format. A replay
+            // writes the format of the record it follows, whose rules it ran
+            // by. A replay of a format-1 record (`TimeSkipMode::Legacy`) takes
+            // format 2 once it makes a jump, a FIFO fast-forward it recomputes
+            // or a jump past the record's end (`PreemptionWriter::insert_time_skip`):
+            // the jumps must be listed to be replayed, though that record's own
+            // replay then decides a FIFO open by the newer rules.
+            let writer =
+                writer.with_format(replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT)));
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -5025,13 +5145,20 @@ impl Scheduler {
             unresolved_sigkill: false,
             pipe_handoff_pending: Default::default(),
             fatal_signal_doomed: Default::default(),
+            fatal_signals_unreaped: Default::default(),
             pipe_wake_inert_logged: false,
             pending_run_queue_admissions: Default::default(),
             progress_epoch: 0,
             last_progress: 0,
+            retired_at: 0,
             guest_state_polled_at: Default::default(),
-            last_commit_at: Default::default(),
-            fast_forward_for_alone_poller: false,
+            last_attempt_at: Default::default(),
+            pending_time_skip: None,
+            time_skip_mode,
+            die_on_time_skip_desync: cfg.die_on_desync,
+            time_skip_desyncs: 0,
+            unconfirmed_time_skip: None,
+            jump_request: None,
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.models_signal_targets(),
@@ -5063,6 +5190,7 @@ impl Scheduler {
             backend_failure_sender: Some(backend_failure_sender),
             backend_failure_wake: backend_failure_wake.shared(),
             backend: cfg.backend,
+            thread_exits_finish_before_the_next_turn: cfg.thread_exits_finish_before_the_next_turn,
             refuses_parent_death_firing: cfg.in_guest_refuses_host_timed_producers,
             signaled_background_since: None,
             signaled_background_refusal: None,
@@ -5527,6 +5655,11 @@ impl Scheduler {
         let Some(process) = self.registered_process(sender) else {
             return false;
         };
+        // The poll upgrade's count stops at every such delivery, the two
+        // exceptions below included, until the process's reap: it fails
+        // closed where the scheduler cannot tell that the kernel ends the
+        // process at a committed point (`a_committed_doom_is_outstanding`).
+        self.note_fatal_signal_delivery(process);
         if self.thread_tree.is_pid_namespace_init(process)
             || self.exec_teardowns.contains_key(&process)
         {
@@ -5888,6 +6021,17 @@ impl Scheduler {
                 rs.tid
             );
             self.guest_held_marks_revoked = true;
+        }
+        // A doom is judged when the request is filed, in the turn of the
+        // attempt whose outcome created it, as its provenance is
+        // (`Resources::waits_on_guest_held_only`): that attempt may have
+        // failed only because a doomed process's descriptors were still open,
+        // so a reap before the retry is selected must not let it count
+        // (Claude review of https://github.com/rrnewton/hermit/pull/4892,
+        // round 4b). Every copy of the request carries the cleared proof.
+        let mut rs = rs;
+        if rs.waits_on_guest_held_only && self.a_committed_doom_is_outstanding() {
+            rs.waits_on_guest_held_only = false;
         }
         let continuation =
             (rs.continues_sigreturn && Self::is_inbound_signal_turn(&rs)).then_some(rs.tid);
@@ -6264,6 +6408,10 @@ impl Scheduler {
         self.chaos_had_turn.remove(dtid);
         self.chaos_first_turn_waits.remove(dtid);
         self.retire_sigalrm_thread(*dtid, *detpid);
+        // A thread that leaves may close the last descriptor of a pipe end a
+        // poller waits on (`retired_at`).
+        self.progress_epoch += 1;
+        self.retired_at = self.progress_epoch;
         // The process's last thread: its shared queue goes with it.
         let last_of_process = self
             .process_signal_targets(*detpid)
@@ -9561,8 +9709,12 @@ impl Scheduler {
         if self.replay_waits_before_maintenance() {
             return Err(SkipTurn);
         }
-        if std::mem::take(&mut self.fast_forward_for_alone_poller) {
-            self.fast_forward_to_next_finite_deadline(global_time);
+        self.check_unconfirmed_time_skip();
+        self.end_time_skip_replay_once_exhausted(global_time);
+        if matches!(self.time_skip_mode, TimeSkipMode::Driven(_)) {
+            self.drive_recorded_time_skips(global_time);
+        } else if let Some(pending) = self.pending_time_skip.take() {
+            self.fast_forward_to_next_finite_deadline(global_time, pending);
         }
         // No thread runs until the replayed thread wakes: committed time
         // catches up in the next pass's step 1 (a replay with callback
@@ -9643,6 +9795,21 @@ impl Scheduler {
         if deadline.is_indefinite() {
             return false;
         }
+        // A record that lists its jumps of global time moves time itself,
+        // where the recording did (`drive_recorded_time_skips`). A recorded
+        // jump the replay has not made yet, to this deadline or an earlier
+        // one, is how the recording got there, and a FIFO open's jump waits
+        // for the replay's own poll to find nothing else can run; moving time
+        // here would pass it first. So the replay leaves time to that jump.
+        // A replay that has drifted and never reaches the jump's event now
+        // waits on it instead of on this fast-forward; it is off its
+        // recording then, and main's drift limits still apply
+        // (`replayer::REPLAY_KEPT_RETRY_LIMIT` and desync detection).
+        if let TimeSkipMode::Driven(expected) = &self.time_skip_mode
+            && expected.front().is_some_and(|skip| skip.target <= deadline)
+        {
+            return false;
+        }
         // Another timed event pops ahead of the replayed thread's wake: one
         // with an earlier deadline, or with the same deadline ordered first
         // (`TimedEvent`'s order: timer signals, then threads by id).
@@ -9667,27 +9834,282 @@ impl Scheduler {
         deadline > self.committed_time || another_pops_first
     }
 
-    /// Move global time to the earliest finite timed deadline, if it lies
-    /// ahead, so that `step2b_process_timed` fires it once committed time
-    /// catches up (the next pass, after step 1 updates committed time). Requested by a
-    /// FIFO open's poll when nothing else can run but such a timer
-    /// (`fast_forward_for_alone_poller`): as when the run queue is empty
-    /// (`step2d_decide_empty_queue`), no thread could otherwise act before it.
-    fn fast_forward_to_next_finite_deadline(&mut self, global_time: &Arc<Mutex<GlobalTime>>) {
-        let Some(deadline) = self.blocked.timed_waiters.next_deadline() else {
+    /// Move global time to the earliest finite deadline, if it lies ahead: a
+    /// timer's (`timed_waiters`), or the timeout of a poll that the commit
+    /// counted as idle (`PendingTimeSkip::poll_deadline`). `step2b_process_timed`
+    /// then fires the timer once committed time catches up (the next pass,
+    /// after step 1 updates committed time), and `step2b_restore_due_pollers`
+    /// lets the timed poll retry and time out. Requested at the commit of a
+    /// FIFO open's poll or of an idle guest-state poller's retry when nothing
+    /// else can run (`pending_time_skip`): as when the run queue is empty
+    /// (`step2d_decide_empty_queue`), no thread could otherwise act before
+    /// the deadline. An idle poller's jump is checked again here, where it is
+    /// made (`revalidated_idle_poll_jump`): between the commit and this pass
+    /// the requester's attempt ran, and a signal, say, may have ended its
+    /// wait. The target is the deadline itself, to the nanosecond, and the
+    /// jump is recorded where it is made, at the recorded stream's position
+    /// now (`TimeSkip::event`): a replay reaches that position at the same
+    /// point, after the requester's attempt.
+    fn fast_forward_to_next_finite_deadline(
+        &mut self,
+        global_time: &Arc<Mutex<GlobalTime>>,
+        pending: PendingTimeSkip,
+    ) {
+        let poll_deadline = match pending.reason {
+            TimeSkipReason::FifoOpenAlone => pending.poll_deadline,
+            TimeSkipReason::IdleGuestPollers => {
+                let Some(poll_deadline) = self.revalidated_idle_poll_jump(pending.requester) else {
+                    trace!(
+                        "[scheduler] dettid {} no longer waits alone in an idle poll; no jump",
+                        pending.requester
+                    );
+                    return;
+                };
+                poll_deadline
+            }
+        };
+        let timer = self
+            .blocked
+            .timed_waiters
+            .next_deadline()
+            .filter(|deadline| !deadline.is_indefinite());
+        let Some(target) = timer.into_iter().chain(poll_deadline).min() else {
             return;
         };
-        if deadline.is_indefinite() {
-            return;
-        }
         let mut gt = global_time.lock().unwrap();
         let now = gt.as_nanos();
-        if deadline > now {
-            info!(
-                "[scheduler] Nothing but a FIFO open's poll can run; skipping global time ahead to {}.",
-                deadline
-            );
-            gt.add_extra_time(deadline.duration_since(now));
+        if target <= now {
+            return;
+        }
+        info!(
+            "[scheduler] Nothing else can run ({:?}); skipping global time ahead to {}.",
+            pending.reason, target
+        );
+        gt.add_extra_time(target.duration_since(now));
+        drop(gt);
+        let event = self.recording_position();
+        if let Some(writer) = &mut self.preemption_writer {
+            writer.insert_time_skip(TimeSkip {
+                event,
+                target,
+                reason: pending.reason,
+            });
+        }
+    }
+
+    /// Whether idle poller `requester`, whose commit requested a jump, still
+    /// waits in an idle guest-state poll while nothing else can run, checked
+    /// where the jump is made (`fast_forward_to_next_finite_deadline`). Its
+    /// attempt has run since the commit: when it failed, the thread asks to
+    /// retry again, after no progress; when a signal or a peer ended its wait,
+    /// its request now is something else, and no jump is made. Returns the
+    /// earliest timeout of the idle polls, the requester's own included, as
+    /// `alone_until` does.
+    fn revalidated_idle_poll_jump(&self, requester: DetTid) -> Option<Option<LogicalTime>> {
+        let own = self
+            .next_turns
+            .get(&requester)
+            .and_then(|turn| turn.req.try_read())
+            .and_then(Result::ok)
+            .filter(|rs| self.waits_on_guest_state(rs))?;
+        let others = self.alone_until(requester, self.last_attempt_at.get(&requester).copied())?;
+        Some(others.into_iter().chain(own.poll_deadline).min())
+    }
+
+    /// End a schedule replay's control of the jumps of global time once the
+    /// replay has run out of records: the run goes on unguided and decides its
+    /// own jumps, as a run that replays nothing does
+    /// (`TimeSkipMode::Compute`). A recorded jump the replay never reached is
+    /// one it could not make as recorded, a desync. A replay of an older record
+    /// (`TimeSkipMode::Legacy`) makes no idle-poller jump while it replays,
+    /// and none of its jumps went unmade.
+    fn end_time_skip_replay_once_exhausted(&mut self, global_time: &Arc<Mutex<GlobalTime>>) {
+        if matches!(self.time_skip_mode, TimeSkipMode::Compute) || self.replay_has_records_left() {
+            return;
+        }
+        self.drive_recorded_time_skips(global_time);
+        let unmade = match std::mem::replace(&mut self.time_skip_mode, TimeSkipMode::Compute) {
+            TimeSkipMode::Driven(rest) => rest,
+            _ => VecDeque::new(),
+        };
+        // A FIFO-open jump at the very end of the stream still waits for the
+        // open's poll, and the run now decides it itself, as the recording
+        // did; a jump beyond the end was never reached.
+        let end = self.replay_position();
+        for skip in unmade.into_iter().filter(|skip| skip.event > end) {
+            self.time_skip_desync(&format!(
+                "the recording jumped as {skip:?}, but the replay ran out of records first"
+            ));
+        }
+    }
+
+    /// Under replay of a record that lists its jumps of global time, make
+    /// every recorded jump whose place in the stream (`TimeSkip::event`) the
+    /// replay has reached, as replay drives context switches. Each is checked
+    /// where it is made: its target must lie ahead of global time, and no
+    /// finite deadline this replay knows (`earliest_known_deadline`) may come
+    /// before it, or the jump would pass that deadline. The target itself may
+    /// not be known yet: replay releases each thread only when its next
+    /// recorded event is due, so a sleeper whose deadline the recording jumped
+    /// to may register it only after the jump; it then wakes at once, at the
+    /// same instant, and its deadline confirms the jump, while an earlier one
+    /// registered then is a deadline the jump passed
+    /// (`check_unconfirmed_time_skip`). A jump that fails a check is a desync;
+    /// one whose target global time has already passed is not made.
+    fn drive_recorded_time_skips(&mut self, global_time: &Arc<Mutex<GlobalTime>>) {
+        let position = self.replay_position();
+        loop {
+            let TimeSkipMode::Driven(expected) = &mut self.time_skip_mode else {
+                return;
+            };
+            let Some(&skip) = expected.front() else {
+                return;
+            };
+            // The recording made a FIFO open's jump at the first pass after
+            // the open's poll found nothing else could run, at this position.
+            // The open's own turns store no record, so they can lie between
+            // reaching the position and that poll, and the position alone
+            // would jump too early: such a jump waits for the replay's poll to
+            // find the same. An idle poller's jump needs no such wait: the
+            // replay holds every thread that was polling where the recording
+            // stood at its last event, so none of them retries before the jump.
+            let requested = skip.reason != TimeSkipReason::FifoOpenAlone
+                || self.jump_request == Some((skip.event, skip.reason));
+            if skip.event > position || (skip.event == position && !requested) {
+                return;
+            }
+            expected.pop_front();
+            self.jump_request = None;
+            if !requested {
+                self.time_skip_desync(&format!(
+                    "the recording jumped as {skip:?}, but the replay passed that point \
+                     before the FIFO open found nothing else could run"
+                ));
+            }
+            self.make_recorded_time_skip(global_time, skip);
+        }
+    }
+
+    /// Make and check one recorded jump of global time
+    /// (`drive_recorded_time_skips`).
+    fn make_recorded_time_skip(&mut self, global_time: &Arc<Mutex<GlobalTime>>, skip: TimeSkip) {
+        let known = self.earliest_known_deadline();
+        let mut gt = global_time.lock().unwrap();
+        let now = gt.as_nanos();
+        if skip.target <= now || skip.target.is_indefinite() {
+            drop(gt);
+            self.time_skip_desync(&format!(
+                "the recording jumped as {skip:?}, but global time is already {now}"
+            ));
+            return;
+        }
+        info!(
+            "[scheduler] Replaying a recorded jump ({:?}); skipping global time ahead to {}.",
+            skip.reason, skip.target
+        );
+        gt.add_extra_time(skip.target.duration_since(now));
+        drop(gt);
+        // This run records the jump where its own stream stands: a realized
+        // schedule that differs from the replayed one before the jump still
+        // indexes it against its own events.
+        let event = self.recording_position();
+        if let Some(writer) = &mut self.preemption_writer {
+            writer.insert_time_skip(TimeSkip { event, ..skip });
+        }
+        match known {
+            Some(known) if known < skip.target => self.time_skip_desync(&format!(
+                "the recording jumped as {skip:?}, past a finite deadline this replay knows, \
+                 {known}"
+            )),
+            Some(known) if known == skip.target => self.unconfirmed_time_skip = None,
+            _ => self.unconfirmed_time_skip = Some(skip),
+        }
+    }
+
+    /// Check the last recorded jump made before its target was a deadline this
+    /// replay knew (`make_recorded_time_skip`), once a thread registers its
+    /// deadline: in the recording the target was the earliest finite deadline,
+    /// so a deadline registered since that lies before the target is one the
+    /// jump passed, a desync; one at the target confirms the jump. Runs every
+    /// pass until the jump is confirmed or refuted, also after the replay has
+    /// run out of records; one still unconfirmed when the run ends is
+    /// reported in the run summary.
+    fn check_unconfirmed_time_skip(&mut self) {
+        let Some(skip) = self.unconfirmed_time_skip else {
+            return;
+        };
+        match self.earliest_known_deadline() {
+            Some(known) if known < skip.target => {
+                self.unconfirmed_time_skip = None;
+                self.time_skip_desync(&format!(
+                    "the recording jumped as {skip:?}, but a thread then registered an earlier \
+                     deadline, {known}, which the jump passed"
+                ));
+            }
+            Some(known) if known == skip.target => self.unconfirmed_time_skip = None,
+            _ => {}
+        }
+    }
+
+    /// The earliest finite deadline the scheduler knows: a timer's
+    /// (`timed_waiters`), or one a thread's pending request carries, a sleep's
+    /// (`ResourceID::SleepUntil`) or a poll's timeout (`Resources::poll_deadline`).
+    fn earliest_known_deadline(&self) -> Option<LogicalTime> {
+        let timer = self
+            .blocked
+            .timed_waiters
+            .next_deadline()
+            .filter(|deadline| !deadline.is_indefinite());
+        let requests = self.next_turns.values().filter_map(|turn| {
+            turn.req
+                .try_read_with(|req| {
+                    let rs = req.as_ref().ok()?;
+                    let sleep = rs
+                        .resources
+                        .keys()
+                        .filter_map(|resource| match resource {
+                            ResourceID::SleepUntil(deadline) if !deadline.is_indefinite() => {
+                                Some(*deadline)
+                            }
+                            _ => None,
+                        })
+                        .min();
+                    let poll = rs.poll_deadline.filter(|_| Self::is_polling_turn(rs));
+                    sleep.into_iter().chain(poll).min()
+                })
+                .flatten()
+        });
+        timer.into_iter().chain(requests).min()
+    }
+
+    /// Where a schedule replay stands in the recorded stream: the stored
+    /// records it has consumed (`TimeSkip::event`).
+    fn replay_position(&self) -> u64 {
+        if let Some(replayer) = &self.boundary_replayer {
+            replayer.stored_index() as u64
+        } else if let Some(replayer) = &self.replayer {
+            replayer.events_popped
+        } else {
+            0
+        }
+    }
+
+    /// Where the next stored record falls in the stream this run records:
+    /// where a jump made now falls (`TimeSkip::event`).
+    fn recording_position(&self) -> u64 {
+        self.preemption_writer
+            .as_ref()
+            .map_or(0, PreemptionWriter::stream_position)
+    }
+
+    /// A recorded jump of global time the replay cannot make as recorded:
+    /// reported, and fatal under `--die-on-desync`, as an event desync is.
+    fn time_skip_desync(&mut self, complaint: &str) {
+        self.time_skip_desyncs += 1;
+        warn!("[scheduler] schedule replay desynchronized: {complaint}");
+        if self.die_on_time_skip_desync {
+            eprintln!("Replay mode desynchronized from trace, bailing out: {complaint}");
+            immediate_fatal_exit();
         }
     }
 
@@ -10132,14 +10554,22 @@ impl Scheduler {
     /// not in time. A thread that runs whole timeslices without taking a turn,
     /// a spin loop, adds about two queueing operations per slice, so a socket
     /// or pipe reader whose data had arrived waited about 100 of the
-    /// spinner's slices, 10 to 20 s of virtual time, for its next retry. Now, at the end of the
-    /// slice in which the period runs out, such a poller is runnable at its
-    /// normal priority. Without chaos it retries next. Under chaos it competes
-    /// by priority, and once passed over at two change points the starvation
-    /// bound puts the changing thread behind it (`bound_chaos_starvation`).
+    /// spinner's slices, 10 to 20 s of virtual time, for its next retry. Now,
+    /// at the end of the slice in which the period runs out, such a poller is
+    /// runnable at its normal priority. Without chaos it retries next. Under
+    /// chaos it competes by priority, and once passed over at two change
+    /// points the starvation bound puts the changing thread behind it
+    /// (`bound_chaos_starvation`).
     /// A program whose queueing operations already upgrade within the period
-    /// sees no extra upgrade. When one runs, each queued poller costs at most
-    /// a skipped and a committed turn.
+    /// sees no extra upgrade. When one runs, each queued live poller costs at
+    /// most a skipped turn, which is not charged, and one committed turn
+    /// charge: from about 400 live pollers at the defaults, one round fills
+    /// the period (`MIN_POLL_UPGRADE_PERIOD_NS`). A timed upgrade also sets
+    /// PR 4605's mark on a backed-off poller in the last band
+    /// (`QueueValue::upgraded_in_place`), as an interval upgrade does, so under
+    /// chaos the change-point bound counts it from then on
+    /// (`bound_chaos_starvation`): virtual time, not only queueing operations,
+    /// decides when.
     ///
     /// Nothing is upgraded here under a schedule replayer, whose trace sets
     /// the run queue (as for `ready_channel`); under `hermit record` and
@@ -10148,16 +10578,27 @@ impl Scheduler {
     /// picks threads regardless of priority, where a poller cannot starve.
     ///
     /// Determinism: the inputs are committed time, the run queue, its upgrade
-    /// count and the filed requests at the first scheduler pass that sees a
-    /// new committed time, after all threads have quiesced, so every run
-    /// upgrades at the same pass. Later passes at the same committed time,
-    /// whose number can depend on host timing (a skipped pass, the KVM loop's
-    /// refreshes), do not look again: an operation-count upgrade one of them
-    /// runs is seen at the next committed time, in every run alike. A thread a
-    /// committed decision doomed (`thread_is_doomed`) may still be queued or
-    /// not, at host-timed moments: its retry is not readied and it is not
-    /// counted in the INFO line, and once a SIGKILL's victim could not be
-    /// named no retry is readied at all, as for `ready_channel`.
+    /// count (`RunQueue::poll_upgrade_count`) and the filed requests at the
+    /// first scheduler pass that sees a new committed time, after all threads
+    /// have quiesced. The upgrade count moves only at counted queueing
+    /// operations (`RunQueue::upgrade_progress`) and at this function's own
+    /// upgrades, which it records after its own call: a requeue whose number
+    /// depends on host timing (the retry of a poll a host can decide, a
+    /// loopback poll's yield) moves neither, so the period restarts at the
+    /// same pass in every run that agrees on the counted operations. Before the fix-forward of
+    /// <https://github.com/rrnewton/hermit/pull/4605> every push counted, and
+    /// the period inherited the host-timed phase of those requeues (Codex
+    /// review of <https://github.com/rrnewton/hermit/pull/4652>). Committed
+    /// time itself still carries every polling turn's charge, so where retries
+    /// are host-timed, so is the time this compares. Later passes at the
+    /// same committed time, whose number can depend on host timing (a skipped
+    /// pass, the KVM loop's refreshes), do not look again: an operation-count
+    /// upgrade one of them runs is seen at the next committed time, in every
+    /// run alike. A thread a committed decision doomed (`thread_is_doomed`)
+    /// may still be queued or not, at host-timed moments: its retry is not
+    /// readied and it is not counted in the INFO line, and once a SIGKILL's
+    /// victim could not be named no retry is readied at all, as for
+    /// `ready_channel`.
     fn upgrade_pollers_on_time(&mut self) {
         if self.has_schedule_replay()
             || self.recordreplay_modes
@@ -11549,6 +11990,7 @@ impl Scheduler {
         self.sigkilled_processes.remove(&child);
         self.pi_doomed_processes.remove(&child);
         self.fatal_signal_doomed.remove(&child);
+        self.fatal_signals_unreaped.remove(&child);
         self.thread_tree.process_parent.remove(&child);
         self.thread_tree.process_wait.remove(&child);
         self.thread_tree.child_subreapers.remove(&child);
@@ -14730,6 +15172,13 @@ impl Scheduler {
         {
             classes.push("thread(s) held at a happens-before gate whose BEFORE anchor cannot fire");
         }
+        // Queued threads at a deadlock are pollers no attempt can satisfy
+        // (`only_idle_guest_pollers_remain`).
+        if !self.run_queue.is_empty() {
+            classes.push(
+                "thread(s) retrying a pipe or socket-pair call no remaining thread can satisfy",
+            );
+        }
         if classes.is_empty() {
             // Defensive: every caller fires with at least one class present.
             "thread(s) blocked with no possible wake".to_owned()
@@ -14790,7 +15239,18 @@ impl Scheduler {
             "  turn {}, committed time {}",
             self.turn, self.committed_time
         );
-        let _ = writeln!(out, "  run queue: {} runnable", self.run_queue.len());
+        if self.run_queue.is_empty() {
+            let _ = writeln!(out, "  run queue: 0 runnable");
+        } else {
+            let mut pollers: Vec<DetTid> = self.run_queue.tids().copied().collect();
+            pollers.sort();
+            let _ = writeln!(
+                out,
+                "  run queue: {} polling with no possible progress: {}",
+                pollers.len(),
+                render_tid_list(&pollers)
+            );
+        }
 
         let _ = writeln!(out, "  threads ({}), by dettid:", self.next_turns.len());
         // `next_turns` is a BTreeMap, so this walk is already ordered.
@@ -15360,6 +15820,14 @@ impl Scheduler {
         } else {
             // A queued thread ends any empty state.
             self.empty_queue_kick_turn = None;
+            // Only pollers that cannot succeed are queued, and every other
+            // thread waits for a wake that no thread can give. Without a
+            // timer or outside input that could end one of those waits, that
+            // is the deadlock an empty queue reports above; left alone, the
+            // pollers would retry forever, each retry moving virtual time on.
+            if self.stuck_with_only_idle_pollers(external_waits_empty) {
+                return Err(self.report_terminal_deadlock_unless_zap_pending());
+            }
         }
         Ok(())
     }
@@ -15600,9 +16068,11 @@ impl Scheduler {
                 "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} polling resource {:?}",
                 self.turn, dettid, rs
             );
-            // Requeue the thread as a poller
+            // Requeue the thread as a poller. A retry's requeue does not count
+            // toward the next poll upgrade (`upgrade_progress_of`).
             let popped = self.run_queue.commit_tentative_pop();
             assert_eq!(dettid, popped);
+            let progress = self.upgrade_progress_of(rs);
             let priority = self.get_priority(dettid);
             // The replayed schedule's next event is this retry: a poll backoff
             // would hand the turn to another thread and leave the schedule. A
@@ -15632,10 +16102,10 @@ impl Scheduler {
                     && replayer.keep_retry_turn(dettid)
             });
             if keeps_turn {
-                self.run_queue.push_back(dettid, priority);
+                self.run_queue.push_back_with(dettid, priority, progress);
             } else {
                 self.run_queue
-                    .push_poller(dettid, priority, rs.poll_attempt);
+                    .push_poller_with(dettid, priority, rs.poll_attempt, progress);
             }
             // Before the count reset below hides that this is a retry.
             self.note_sigalrm_polling_wait(dettid, rs);
@@ -16443,18 +16913,38 @@ impl Scheduler {
     /// priority is the last band, which the upgrade reaches but cannot move:
     /// before it counted, two threads sleeping in turns at better priorities
     /// kept such a poller from its next retry forever, so it never saw a pipe
-    /// write it was polling for. In the last band the lead is by round-robin
-    /// turn alone, and a thread woken from a timed wait is pushed to the front
-    /// of its band (`wake_timed_event`). At the change point itself, though,
-    /// the changing thread is requeued behind the passed-over one, and every
-    /// other thread that keeps running ahead of it is demoted the same way at
-    /// its own next change point, so the passed-over thread runs eventually.
+    /// write it was polling for. Poll upgrades follow their own count of the
+    /// queueing operations that do not depend on host timing
+    /// (`RunQueue::upgrade_progress`), so whether one has reached a poller at
+    /// a change point is the same in every run of a seed.
     ///
-    /// Deterministic: it reads only the priority map and run-queue membership
-    /// at this change point, in thread-ID order, and counts change only at
-    /// change points and committed turns; run-queue membership is the same
-    /// input turn selection reads. The priority it returns is the one recorded
-    /// for `dettid`, so a preemption replay restores it as a fixed priority.
+    /// What the bound guarantees is counted in change points, not turns. In
+    /// a band the lead is by round-robin turn alone, and a thread woken from
+    /// a timed wait is pushed to the front of its band (`wake_timed_event`),
+    /// as are a clone child's start and a signal's wake
+    /// (`runqueue_push_front`). At the change point that takes the bound,
+    /// the changing thread is requeued behind the passed-over thread, and so
+    /// is each other thread that keeps running ahead of it, at its own next
+    /// change point. So the passed-over thread is selected at the first
+    /// selection at which no thread at a better priority is runnable and none
+    /// was put at the front of its band since. Threads that sleep in turns,
+    /// in its band or at a better priority, keep it waiting for as long as
+    /// one of them wakes before that selection, and the bound does not see
+    /// them: no change point passes it over. Putting a woken thread behind a
+    /// thread at the bound instead was tried in the first revisions of
+    /// https://github.com/rrnewton/hermit/pull/4892 and taken out: it hid
+    /// the sleep-ordered races chaos searches for, a closed-source timer race
+    /// found at 10 of 11 seeds being found at none. A thread at a better
+    /// priority that runs in short bursts between sleeps keeps that priority
+    /// until it reaches a change point, which it may seldom do; while it
+    /// sleeps, the passed-over thread can run.
+    ///
+    /// Deterministic: it reads only the priority map, run-queue membership
+    /// and the poll upgrade's marks at this change point, in thread-ID order,
+    /// and counts change only at change points and committed turns;
+    /// run-queue membership is the same input turn selection reads. The
+    /// priority it returns is the one recorded for `dettid`, so a preemption
+    /// replay restores it as a fixed priority.
     fn bound_chaos_starvation(&mut self, dettid: DetTid, drawn: Priority) -> Priority {
         if !self.chaos_bounds_starvation || self.has_schedule_replay() {
             return drawn;
@@ -16483,15 +16973,9 @@ impl Scheduler {
         }
         if priority != drawn {
             // A poller the bound counts only because a poll upgrade reached it
-            // in the last band (`RunQueue::can_be_passed_over`) is named, so
-            // that a log shows when the bound, and nothing else, retried it.
-            let last_band_poller = starving_threads
-                .iter()
-                .find(|(tid, prio)| {
-                    Some(*prio) == starving && !self.run_queue.contains_non_polling_tid(*tid)
-                })
-                .map(|(tid, _)| *tid);
-            if let Some(poller) = last_band_poller {
+            // in the last band is named, so that a log shows when the bound
+            // retried it and nothing else would have.
+            if let Some(poller) = self.poller_the_bound_retries(&starving_threads, starving) {
                 info!(
                     "[scheduler] chaos change point of dettid {}: priority {} drawn, {} taken, behind poller dettid {}, passed over at {} change points after a poll upgrade reached it in the last band",
                     dettid, drawn, priority, poller, CHAOS_PASSOVER_BOUND
@@ -16504,6 +16988,33 @@ impl Scheduler {
             }
         }
         priority
+    }
+
+    /// The poller the bound's INFO line names among `starving_threads`, the
+    /// threads at the passover bound that the change point's draw beat: one
+    /// at the priority the bound moved behind (`starving`) that the bound
+    /// counts only because a poll upgrade reached it in the last band
+    /// (`RunQueue::can_be_passed_over`). None when a non-polling thread
+    /// starves at that priority too: it would have given the same priority on
+    /// its own, so the poller was not the reason (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4605, finding 2).
+    fn poller_the_bound_retries(
+        &self,
+        starving_threads: &[(DetTid, Priority)],
+        starving: Option<Priority>,
+    ) -> Option<DetTid> {
+        let mut at_starving = starving_threads
+            .iter()
+            .filter(|(_, prio)| Some(*prio) == starving)
+            .map(|(tid, _)| *tid);
+        if at_starving
+            .clone()
+            .any(|tid| self.run_queue.contains_non_polling_tid(tid))
+        {
+            None
+        } else {
+            at_starving.next()
+        }
     }
 
     /// Helper for priority changepoint logic
@@ -16695,6 +17206,51 @@ impl Scheduler {
         Self::retry_number(rs) > 1 && !rs.previous_attempt_made_progress
     }
 
+    /// The idle-poller bookkeeping of `dtid`'s committed turn (`unblock_guest`):
+    /// its sequence number; a polling grant's attempt (`last_attempt_at`); and
+    /// progress, which any grant but a guest-state-only poll and a replayed
+    /// switch-in (`switch_in`) is, and a guest-state-only poller's previous
+    /// grant is unless this request retries after an attempt that moved
+    /// nothing. Returns `dtid`'s latest attempt before this commit.
+    fn note_committed_turn(
+        &mut self,
+        dtid: DetTid,
+        polling: bool,
+        guest_state_poll: bool,
+        fruitless: bool,
+        switch_in: bool,
+    ) -> Option<u64> {
+        self.progress_epoch += 1;
+        let previous_attempt = if polling {
+            self.last_attempt_at.insert(dtid, self.progress_epoch)
+        } else {
+            self.last_attempt_at.get(&dtid).copied()
+        };
+        let previous_grant = self.guest_state_polled_at.remove(&dtid);
+        if guest_state_poll {
+            if let Some(previous) = previous_grant
+                && !fruitless
+            {
+                self.last_progress = self.last_progress.max(previous);
+            }
+            self.guest_state_polled_at.insert(dtid, self.progress_epoch);
+        } else if !switch_in {
+            // A replayed switch-in (`TraceReplay`) only resumes its thread,
+            // which changes guest state, if at all, by a later request that
+            // commits on its own; a replay hands idle pollers such turns
+            // where the recording only skipped them, so counting one would
+            // keep an opener that the recording found alone from ever being so.
+            self.last_progress = self.progress_epoch;
+        }
+        previous_attempt
+    }
+
+    /// Whether nothing else can run ([`Self::alone_until`] answers `Some`).
+    #[cfg(test)]
+    fn nothing_else_can_run(&self, dtid: DetTid) -> bool {
+        self.alone_until(dtid, Some(u64::MAX)).is_some()
+    }
+
     /// Whether no guest thread other than `dtid` can make progress unless a
     /// host acts or a timer fires, judged from scheduler state alone at
     /// `dtid`'s commit (<https://github.com/rrnewton/hermit/issues/2203>).
@@ -16704,7 +17260,7 @@ impl Scheduler {
     ///   (`Resources::polls_guest_state_only`), whatever its backoff, whose
     ///   request retries after an attempt that moved nothing
     ///   (`waits_after_a_failed_attempt`), made no earlier than the latest
-    ///   progress: its latest commit (`last_commit_at`) is at or after every
+    ///   progress: its latest attempt (`last_attempt_at`) is at or after every
     ///   turn known to be progress (`last_progress`) and every other poller's
     ///   grant whose thread's request does not repeat that call without
     ///   progress (`retries_its_call_without_progress`);
@@ -16716,73 +17272,277 @@ impl Scheduler {
     /// A thread in neither state is runnable work, is running, or awaits
     /// admission to the run queue, so something else can run; so can a thread
     /// queued after `sched_yield` or polling what a host can change. The answer
-    /// leans to "something else can run", which only keeps a FIFO open
-    /// polling. When it is "nothing", the caller still waits for any timer due
-    /// at a finite deadline first (`unblock_guest`).
-    fn nothing_else_can_run(&self, dtid: DetTid) -> bool {
-        // A grant counts as progress unless the thread's current request
-        // repeats that grant's call after an attempt that moved nothing.
-        let progress = self
-            .guest_state_polled_at
+    /// leans to "something else can run", which only keeps a FIFO open polling
+    /// and lets pollers reach the next deadline one turn charge at a time.
+    /// When it is "nothing", the caller first moves global time to the
+    /// earliest finite deadline (`unblock_guest`).
+    ///
+    /// `dtid` itself must be idle too: its latest attempt before this commit
+    /// (`own_previous_attempt`, from `last_attempt_at`) is at or after that
+    /// progress. A commit lets `dtid` run its next attempt, and an attempt that
+    /// can see newer progress may succeed and run on into guest code, which
+    /// must never see global time jump.
+    ///
+    /// `None` when something else can run; otherwise the earliest timeout
+    /// among the idle pollers counted (`Resources::poll_deadline`), if any has
+    /// one: a timed poll ends at its deadline on its own, so a jump of global
+    /// time must stop there.
+    fn alone_until(
+        &self,
+        dtid: DetTid,
+        own_previous_attempt: Option<u64>,
+    ) -> Option<Option<LogicalTime>> {
+        self.alone_until_with(dtid, own_previous_attempt, true)
+    }
+
+    /// [`Self::alone_until`], where `timed_polls_idle` false counts a poll with
+    /// a timeout as able to run, as before jumps could stop at a poll's own
+    /// timeout (`TimeSkipMode::Legacy`).
+    fn alone_until_with(
+        &self,
+        dtid: DetTid,
+        own_previous_attempt: Option<u64>,
+        timed_polls_idle: bool,
+    ) -> Option<Option<LogicalTime>> {
+        let progress = self.latest_progress(Some(dtid));
+        if !own_previous_attempt.is_some_and(|attempt| attempt >= progress) {
+            return None;
+        }
+        let mut earliest_poll_deadline: Option<LogicalTime> = None;
+        for &tid in self.next_turns.keys().filter(|&&tid| tid != dtid) {
+            if self.is_idle_guest_poller(tid, progress) {
+                let deadline = self.requested_poll_deadline(tid);
+                if deadline.is_some() && !timed_polls_idle {
+                    return None;
+                }
+                earliest_poll_deadline = earliest_poll_deadline.into_iter().chain(deadline).min();
+                continue;
+            }
+            if !(self.is_parked(tid) || self.held_by_replay(tid)) {
+                return None;
+            }
+        }
+        Some(earliest_poll_deadline)
+    }
+
+    /// The latest committed turn an idle poller's failed attempt must not
+    /// precede (`is_idle_guest_poller`): the latest turn known to be progress
+    /// (`last_progress`), or the latest grant of a guest-state-only poller
+    /// other than `except`. A grant counts as progress unless the thread's
+    /// current request repeats that grant's call after an attempt that moved
+    /// nothing (`retries_its_call_without_progress`).
+    fn latest_progress(&self, except: Option<DetTid>) -> u64 {
+        self.guest_state_polled_at
             .iter()
-            .filter(|&(&tid, _)| tid != dtid)
+            .filter(|&(&tid, _)| Some(tid) != except)
             .filter(|&(&tid, _)| {
-                !self
-                    .next_turns
-                    .get(&tid)
-                    .and_then(|turn| turn.req.try_read())
-                    .is_some_and(
-                        |req| matches!(req, Ok(rs) if Self::retries_its_call_without_progress(&rs)),
-                    )
+                !self.request_satisfies(tid, Self::retries_its_call_without_progress)
             })
             .map(|(_, &grant)| grant)
-            .fold(self.last_progress, u64::max);
+            .fold(self.last_progress, u64::max)
+    }
+
+    /// Whether `tid` has posted a request and it passes `test`.
+    fn request_satisfies(&self, tid: DetTid, test: impl FnOnce(&Resources) -> bool) -> bool {
         self.next_turns
-            .keys()
-            .filter(|&&tid| tid != dtid)
-            .all(|&tid| {
-                let idle_poller = self.run_queue.contains_tid(tid)
-                    && self
-                        .last_commit_at
-                        .get(&tid)
-                        .is_some_and(|&commit| commit >= progress)
-                    && self
-                        .next_turns
-                        .get(&tid)
-                        .and_then(|turn| turn.req.try_read())
-                        .is_some_and(|req| {
-                            // A poll with a timeout ends at its own deadline,
-                            // which `fast_forward_to_next_finite_deadline` does
-                            // not consider, so it is not idle: jumping over it,
-                            // or opening in the kernel while it waits, would end
-                            // it late.
-                            matches!(req, Ok(rs) if Self::is_polling_turn(&rs)
-                            && self.polls_only_guest_state(&rs)
-                            && rs.poll_deadline.is_none()
-                            && Self::waits_after_a_failed_attempt(&rs))
-                        });
-                let parked_futex = self.next_turns.get(&tid).is_some_and(is_futex_request)
-                    && self
-                        .blocked
-                        .futex_waiters
-                        .values()
-                        .any(|waiters| waiters.iter().any(|waiter| waiter.dettid == tid));
-                let parked = parked_futex
-                    || self.blocked.child_waiters.contains_key(&tid)
-                    || self
-                        .blocked
-                        .physical_child_waiters
-                        .values()
-                        .any(|waiters| waiters.contains(&tid))
-                    || self.blocked.rt_sigsuspend_blockers.contains_key(&tid)
-                    || self.blocked.external_io_blockers.contains_key(&tid)
-                    || self.blocked.timed_waiters.thread_deadline(tid).is_some()
-                    || self
-                        .happens_before
-                        .as_ref()
-                        .is_some_and(|hb| hb.parked.contains(&tid));
-                idle_poller || parked
+            .get(&tid)
+            .and_then(|turn| turn.req.try_read_with(|req| req.as_ref().is_ok_and(test)))
+            .unwrap_or(false)
+    }
+
+    /// Whether `tid` is queued as a poller whose attempts depend only on guest
+    /// actions (`polls_only_guest_state`), whatever its backoff, and whose
+    /// request retries after an attempt that moved nothing
+    /// (`waits_after_a_failed_attempt`), made no earlier than `progress`
+    /// (`latest_progress`): its latest attempt (`last_attempt_at`) is at or
+    /// after it. A poll with a timeout counts too: it ends at its own deadline
+    /// (`requested_poll_deadline`), where `alone_until` stops a jump of global
+    /// time; the idle-poller deadlock check leaves it out
+    /// (`only_idle_guest_pollers_remain`).
+    fn is_idle_guest_poller(&self, tid: DetTid, progress: u64) -> bool {
+        self.run_queue.contains_tid(tid)
+            && self.attempted_since(tid, progress)
+            && self.request_satisfies(tid, |rs| self.waits_on_guest_state(rs))
+    }
+
+    /// The timeout of `tid`'s posted request (`Resources::poll_deadline`), if
+    /// it has one.
+    fn requested_poll_deadline(&self, tid: DetTid) -> Option<LogicalTime> {
+        self.next_turns
+            .get(&tid)
+            .and_then(|turn| {
+                turn.req
+                    .try_read_with(|req| req.as_ref().ok().and_then(|rs| rs.poll_deadline))
             })
+            .flatten()
+    }
+
+    /// Whether a driven replay holds `tid` until its next recorded event
+    /// (`TraceReplay`): it cannot act before that event, which no other
+    /// thread's action can bring nearer while every other thread is idle: it
+    /// was an idle poller or parked where the recording stood (`alone_until`).
+    /// An older record's replay decides as before (`TimeSkipMode::Legacy`).
+    fn held_by_replay(&self, tid: DetTid) -> bool {
+        matches!(self.time_skip_mode, TimeSkipMode::Driven(_))
+            && self.request_satisfies(tid, Self::is_internal_turn)
+    }
+
+    /// A retry, after an attempt that moved nothing, of a poll whose attempts
+    /// depend only on guest actions (`is_idle_guest_poller`).
+    fn waits_on_guest_state(&self, rs: &Resources) -> bool {
+        Self::is_polling_turn(rs)
+            && self.polls_only_guest_state(rs)
+            && Self::waits_after_a_failed_attempt(rs)
+    }
+
+    /// Whether `tid`'s latest attempt (`last_attempt_at`) is at or after `progress`.
+    fn attempted_since(&self, tid: DetTid, progress: u64) -> bool {
+        self.last_attempt_at
+            .get(&tid)
+            .is_some_and(|&commit| commit >= progress)
+    }
+
+    /// Whether `tid` is parked as a futex waiter, a child waiter, an
+    /// `rt_sigsuspend` waiter, at a happens-before gate, in a timed wait, or
+    /// in a call that waits on a host (external IO): only another thread, a
+    /// host or a timer can wake it.
+    fn is_parked(&self, tid: DetTid) -> bool {
+        self.parked_futex_waiter(tid).is_some()
+            || self.blocked.child_waiters.contains_key(&tid)
+            || self
+                .blocked
+                .physical_child_waiters
+                .values()
+                .any(|waiters| waiters.contains(&tid))
+            || self.blocked.rt_sigsuspend_blockers.contains_key(&tid)
+            || self.blocked.external_io_blockers.contains_key(&tid)
+            || self.blocked.timed_waiters.thread_deadline(tid).is_some()
+            || self
+                .happens_before
+                .as_ref()
+                .is_some_and(|hb| hb.parked.contains(&tid))
+    }
+
+    /// Whether no thread can make progress although threads are queued: each
+    /// queued thread is an idle guest-state poller (`is_idle_guest_poller`,
+    /// with progress counted from every thread's grants and retirements)
+    /// whose poll has no deadline of its own (`Resources::poll_deadline`), is
+    /// not of a named FIFO, which a process outside the container may also
+    /// hold (`Resources::polls_a_named_fifo`), and is not a FIFO open, which
+    /// waits in the kernel instead
+    /// (`Resources::waits_until_nothing_else_can_run`); every other thread is
+    /// parked (`is_parked`); and no thread's process is doomed
+    /// (`thread_is_doomed`), as its exit would close its descriptors at a
+    /// host-timed moment. Each poller's latest attempt then failed after
+    /// everything any thread did, and its next attempt finds the same guest
+    /// state unless a parked thread is woken first. Whether something can
+    /// still wake one is the caller's question (`stuck_with_only_idle_pollers`).
+    fn only_idle_guest_pollers_remain(&self) -> bool {
+        // The queued requests first: a runnable thread at the head of the
+        // queue, the usual case, ends the check at once.
+        let pollers_wait = !self.run_queue.is_empty()
+            && self.run_queue.tids().all(|&tid| {
+                self.request_satisfies(tid, |rs| {
+                    self.waits_on_guest_state(rs)
+                        && rs.poll_deadline.is_none()
+                        && !rs.polls_a_named_fifo
+                        && !rs.waits_until_nothing_else_can_run
+                })
+            });
+        if !pollers_wait {
+            return false;
+        }
+        let progress = self.latest_progress(None).max(self.retired_at);
+        self.run_queue
+            .tids()
+            .all(|&tid| self.attempted_since(tid, progress))
+            && self.next_turns.keys().all(|&tid| {
+                (self.run_queue.contains_tid(tid) || self.is_parked(tid))
+                    && !self.thread_is_doomed(tid)
+                    && !self.process_is_going_down(tid)
+            })
+    }
+
+    /// Whether `tid`'s process is going down although no committed turn
+    /// recorded its doom: another of its threads already left the scheduler
+    /// without a committed exit, so it died of a signal or with its process
+    /// (`committed_exits`, read the same way by `child_is_stuck`). A fatal
+    /// signal is recorded as a doom at its delivery
+    /// (`Scheduler::commit_fatal_delivery`) for every default action that
+    /// ends the process, wherever the backend may retire the process's other
+    /// threads at that delivery (serialized threads, the guest's own kernel
+    /// signal state, no gdbserver: ptrace), `--pipe-wake-latency` or
+    /// `--virtual-timeout` is on, except for a PID namespace's init and a
+    /// process with an exec in flight; a delivery noted for the poll
+    /// upgrade's count alone dooms nothing (`crate::fatal_delivery_report`).
+    /// Elsewhere this sees an unrecorded one once its first victim has gone,
+    /// and the dying thread's removal is ordered, since the scheduler waits
+    /// for a running thread to quiesce. Siblings an exec tore down also left
+    /// without a committed exit, so such a process counts as going down too.
+    fn process_is_going_down(&self, tid: DetTid) -> bool {
+        let Some(process) = self.thread_tree.thread_to_leader.get(&tid).copied() else {
+            return true;
+        };
+        self.thread_tree
+            .my_thread_group(&DetTid::from_raw(process.as_raw()))
+            .iter()
+            .any(|thread| self.left_without_a_committed_exit(*thread))
+    }
+
+    /// Whether `thread` left the scheduler other than by its own committed
+    /// exit (`process_is_going_down`).
+    fn left_without_a_committed_exit(&self, thread: DetTid) -> bool {
+        !self.next_turns.contains_key(&thread) && !self.committed_exits.contains(&thread)
+    }
+
+    /// Whether the run can never progress although threads are queued: only
+    /// idle guest-state pollers are queued (`only_idle_guest_pollers_remain`),
+    /// and neither a timer with a deadline, a pending physical process exit,
+    /// a SIGKILL whose victim the scheduler could not name, a doomed process
+    /// a backend may have retired before the kernel ended it
+    /// (`may_retire_before_the_kernel`), nor an outstanding host call or
+    /// child that can still exit (`external_waits_settled`) can wake a
+    /// parked thread. The cheap checks come first; the scan of every thread
+    /// the run has had comes after the run-queue check, which a runnable
+    /// thread ends at once.
+    fn stuck_with_only_idle_pollers(&self, external_waits_empty: bool) -> bool {
+        !self.next_deadline_is_reachable()
+            && self.pending_physical_process_exits.is_empty()
+            && !self.unresolved_sigkill
+            && self.only_idle_guest_pollers_remain()
+            && !(self.may_retire_before_the_kernel() && self.doomed_process_pending())
+            && self.external_waits_settled(external_waits_empty)
+    }
+
+    /// Whether this backend can retire a thread before the kernel has ended
+    /// it, so that its descriptors may still be open: a backend whose
+    /// scheduler identities do not name host tasks reports a thread's exit
+    /// before the native exit runs (`physical_thread_pidfds`), and one with
+    /// thread-directed process signals retires a SIGKILL's victims at the
+    /// sender's turn (`note_process_sigkill`). On ptrace a thread is retired
+    /// only once the kernel has finished its exit.
+    fn may_retire_before_the_kernel(&self) -> bool {
+        !self.physical_thread_pidfds.is_empty()
+            || self.backend.requires_thread_directed_process_signals
+    }
+
+    /// Whether some process may be doomed and not yet reaped: a granted
+    /// exit, a committed SIGKILL, an exec teardown in flight,
+    /// a delivered fatal signal (`thread_is_doomed`), or any thread that left
+    /// without a committed exit (`left_without_a_committed_exit`). The last
+    /// two are never forgotten, so on a backend that may retire threads early
+    /// (`may_retire_before_the_kernel`) one signal death ends the idle-poller
+    /// verdict for the run.
+    fn doomed_process_pending(&self) -> bool {
+        !self.thread_tree.granted_exits.is_empty()
+            || !self.sigkilled_processes.is_empty()
+            || !self.exec_teardowns.is_empty()
+            || !self.fatal_signal_doomed.is_empty()
+            || self
+                .thread_tree
+                .thread_to_leader
+                .keys()
+                .any(|thread| self.left_without_a_committed_exit(*thread))
     }
 
     /// Whether no guest thread other than `dtid` can run before `dtid` next
@@ -16876,6 +17636,169 @@ impl Scheduler {
     /// loopback connection. Its count is kernel-readiness timing, not guest-visible progress.
     fn is_loopback_poll_yield_turn(&self, rsrcs: &Resources) -> bool {
         rsrcs.fyi == LOOPBACK_POLL_YIELD_FYI
+    }
+
+    /// Whether requeueing the thread that made `rs` counts toward the next
+    /// poll upgrade ([`UpgradeProgress`]). A call's first attempt and every
+    /// other turn count: the guest made them. A loopback poll's yield does
+    /// not, and nor does a polling retry, skipped (`poll_attempt > 0`, the
+    /// backed-off requeue in `step4_resource_block`) or run
+    /// (`upgraded_from_attempt > 0`, its requeue in `step6_reenquue`), unless
+    /// it provably waits on guest actions alone
+    /// (`retry_follows_guest_actions`). How many retries a thread makes on a
+    /// descriptor a host can change depends on when the host makes it ready,
+    /// which two runs of one seed need not share. Counted, those retries moved
+    /// every later poll upgrade, and with it the poll upgrade's mark on a
+    /// last-band poller that the chaos change-point bound reads (Codex review
+    /// of <https://github.com/rrnewton/hermit/pull/4605>).
+    ///
+    /// A retry that waits on guest actions alone counts, as every retry did
+    /// before: under sequentialized execution only another guest thread's
+    /// turn can make its descriptor ready, and the scheduler orders those
+    /// turns, so every run of a seed makes as many such retries. That keeps
+    /// the upgrade cadence of programs whose threads poll each other, which
+    /// chaos's race search depends on: leaving those retries out as well hid a
+    /// closed-source IPC shutdown race, found at 3 of 8 seeds before and at
+    /// none after (<https://github.com/rrnewton/hermit/pull/4892>, revision 4).
+    ///
+    /// Under record/replay every requeue counts, as before: a recording must
+    /// replay with the schedule it was made with, without a RECORD_VERSION
+    /// bump (as for `note_poll_deadline`). There, a polled attempt on a
+    /// container-internal descriptor goes through the recorder
+    /// (`retry_nonblocking_syscall`'s subtool), so a replay makes the retries
+    /// its recording made, and a call on another descriptor runs blocking in
+    /// the background, its readmission turn in the rejoin log.
+    fn upgrade_progress_of(&self, rs: &Resources) -> UpgradeProgress {
+        if self.recordreplay_modes {
+            return UpgradeProgress::Counts;
+        }
+        let host_timed = self.is_loopback_poll_yield_turn(rs)
+            || (Self::is_polling_turn(rs)
+                && Self::retry_number(rs) > 0
+                && !self.retry_follows_guest_actions(rs));
+        if host_timed {
+            UpgradeProgress::HostTimed
+        } else {
+            UpgradeProgress::Counts
+        }
+    }
+
+    /// Whether polling request `rs` can become ready only through a guest
+    /// action, as far as the scheduler can prove it, so that its retries
+    /// count toward the next poll upgrade (`upgrade_progress_of`). It fails
+    /// closed, and every condition must hold:
+    ///
+    /// - provenance: every descriptor the attempt waits on was guest-held
+    ///   when the request was filed (`Resources::waits_on_guest_held_only`,
+    ///   computed again before every attempt by `helpers::waits_on_guest_held_only`
+    ///   from #4862's marks). How the call is executed
+    ///   (`polls_guest_state_only`, set for every internal pipe, and for a
+    ///   socketpair end only while it is guest-held, `single_fd_poll_readiness`)
+    ///   is not proof: an inherited pipe write end can have a host reader and
+    ///   carries no mark. A request no loop computed provenance for, of
+    ///   whatever kind, does not count;
+    /// - the guest-state classification still stands (`polls_only_guest_state`),
+    ///   and no thread may have passed descriptors out of the guest since
+    ///   (`guest_held_marks_revoked`): a passed descriptor may be one a poller
+    ///   waits on, and a mark set before the pass no longer proves anything;
+    /// - no finite deadline (`poll_deadline`): such a poll also ends when
+    ///   virtual time reaches its deadline, and virtual time advances with
+    ///   every polling turn, host-timed ones included, so how many of its
+    ///   retries come before the timeout can follow host timing. #4692's
+    ///   idle-poller deadlock check leaves such a poll out too
+    ///   (`only_idle_guest_pollers_remain`);
+    /// - not a named FIFO (`polls_a_named_fifo`), whose path any process may
+    ///   open, and not a FIFO open waiting for a peer
+    ///   (`waits_until_nothing_else_can_run`), for the same reason;
+    /// - no doomed process awaiting its reap (`a_committed_doom_is_outstanding`),
+    ///   neither when the request was filed (`request_put` then clears its
+    ///   provenance) nor at its requeue;
+    /// - not a run whose backend delivers signals in two phases
+    ///   (`in_guest_signal_delivery`). There a predicted fatal delivery
+    ///   holds the turn and files its group's Exit, whose grant records the
+    ///   doom (`Tool::exit_for_predicted_death`, which refuses, ending the
+    ///   run, outside that gate), so no window is known; the gate fails
+    ///   closed regardless, as no gate case measured such a backend;
+    /// - only on a backend whose host stated that a thread's native exit,
+    ///   which closes a descriptor table the thread holds alone
+    ///   (`exit_files`), finishes before the scheduler can select another turn
+    ///   (`Config::thread_exits_finish_before_the_next_turn`, false unless the
+    ///   host proved it for that backend): a thread that is not its process's
+    ///   last dooms no process, so that close would be a host-timed wake no
+    ///   committed decision covers (Codex reviews of
+    ///   https://github.com/rrnewton/hermit/pull/4892, rounds 4c to 4e). On
+    ///   ptrace Reverie reports a thread's exit with the final wait status the
+    ///   kernel gave it, after the whole native exit, and Detcore retires the
+    ///   thread only then (`may_retire_before_the_kernel`); on DBT step 2
+    ///   commits no turn while an exited thread's barrier is pending
+    ///   (`ExitedThreadBarrier`).
+    ///
+    /// A `poll` or `ppoll` that mixes guest-held and other descriptors is not
+    /// guest-held (`helpers::poll_targets_guest_held` asks every entry), nor
+    /// is any `select`, `epoll_wait` or signal wait.
+    fn retry_follows_guest_actions(&self, rs: &Resources) -> bool {
+        !self.in_guest_signal_delivery
+            && self.thread_exits_finish_before_the_next_turn
+            && rs.waits_on_guest_held_only
+            && self.polls_only_guest_state(rs)
+            && !self.guest_held_marks_revoked
+            && !self.a_committed_doom_is_outstanding()
+            && rs.poll_deadline.is_none()
+            && !rs.polls_a_named_fifo
+            && !rs.waits_until_nothing_else_can_run
+    }
+
+    /// Whether a committed turn has doomed a process that has not been
+    /// reaped since: a granted exit, a committed SIGKILL (or one whose victim
+    /// the scheduler could not name), an exec teardown in flight, or a
+    /// delivered fatal signal. A doomed process's descriptors close in the
+    /// kernel at a host-chosen moment after that decision (Linux's
+    /// `exit_files` in `do_exit`), and the last writer's close wakes a pipe's
+    /// readers (`pipe_release`), so a guest-state poll on a pipe whose other
+    /// end it holds can become ready at a host-timed moment (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4892, blocking). While one is
+    /// outstanding no polling retry counts toward a poll upgrade
+    /// (`retry_follows_guest_actions`).
+    ///
+    /// Every input is a decision some committed turn made, and each is
+    /// forgotten only at a committed point: the reap (`consume_child_wait`)
+    /// or the exec's completion. Never the registration a backend removes at
+    /// a host-timed moment, which #4692's deadlock check also reads
+    /// (`doomed_process_pending`). It is read when a request is filed
+    /// (`request_put`) and when a retry is requeued (`retry_follows_guest_actions`).
+    ///
+    /// A child reaped automatically (`autoreaped_exits`) or never waited
+    /// for is never forgotten, so the count stays off for the rest of the
+    /// run: Linux decides the automatic reap in `exit_notify`, after
+    /// `exit_files`, but the scheduler records it when it retires the
+    /// process's last thread (`logically_kill_thread`), which may come before
+    /// the kernel's teardown, and no later point is committed. A thread with
+    /// a descriptor table of its own (`CLONE_THREAD` without `CLONE_FILES`,
+    /// or `unshare(CLONE_FILES)`) also closes it at its exit, at a host-chosen
+    /// moment; the scheduler does not know which tables are private, so that
+    /// close is not covered.
+    fn a_committed_doom_is_outstanding(&self) -> bool {
+        !self.thread_tree.granted_exits.is_empty()
+            || !self.sigkilled_processes.is_empty()
+            // The PI-futex record of committed SIGKILLs: today a subset of
+            // `sigkilled_processes`, read so that the count stays off while
+            // either record holds a process until its reap.
+            || !self.pi_doomed_processes.is_empty()
+            || self.unresolved_sigkill
+            || !self.exec_teardowns.is_empty()
+            || !self.fatal_signals_unreaped.is_empty()
+    }
+
+    /// Whether a committed doom is outstanding, and whether a fatal delivery
+    /// recorded one for `process` for the count alone and for the hand-off
+    /// (test observation of `a_committed_doom_is_outstanding`).
+    #[cfg(test)]
+    pub(crate) fn fatal_doom_recorded(&self, process: DetPid) -> (bool, bool, bool) {
+        (
+            self.a_committed_doom_is_outstanding(),
+            self.fatal_signals_unreaped.contains(&process),
+            self.fatal_signal_doomed.contains(&process),
+        )
     }
 
     /// A turn that commits only `InboundSignal` resources: a thread's signal
@@ -17288,22 +18211,34 @@ impl Scheduler {
         let fatal_alarm = self.in_guest_fatal_alarm_pending(dtid);
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         let now = self.committed_time;
-        let (polling_grant, guest_state_only, fruitless, wants_alone, sleep_due, chaos_sleep_due) =
-            match self
-                .next_turns
-                .get(&dtid)
-                .and_then(|turn| turn.req.try_read())
-            {
-                Some(Ok(rs)) => (
-                    Self::is_polling_turn(&rs),
-                    self.polls_only_guest_state(&rs),
-                    Self::retries_its_call_without_progress(&rs),
-                    rs.waits_until_nothing_else_can_run,
-                    Self::is_due_sleep(&rs, self.committed_time),
-                    ends_a_due_sleep(&rs, now),
-                ),
-                _ => (false, false, false, false, false, false),
-            };
+        let (
+            polling_grant,
+            guest_state_only,
+            fruitless,
+            wants_alone,
+            sleep_due,
+            chaos_sleep_due,
+            idle_poll,
+            own_poll_deadline,
+            switch_in,
+        ) = match self
+            .next_turns
+            .get(&dtid)
+            .and_then(|turn| turn.req.try_read())
+        {
+            Some(Ok(rs)) => (
+                Self::is_polling_turn(&rs),
+                self.polls_only_guest_state(&rs),
+                Self::retries_its_call_without_progress(&rs),
+                rs.waits_until_nothing_else_can_run,
+                Self::is_due_sleep(&rs, self.committed_time),
+                ends_a_due_sleep(&rs, now),
+                self.waits_on_guest_state(&rs),
+                rs.poll_deadline,
+                Self::is_internal_turn(&rs),
+            ),
+            _ => (false, false, false, false, false, false, false, None, false),
+        };
         let guest_state_poll = polling_grant && guest_state_only;
         // Whether this grant ends a timed wait at its deadline
         // (`expired_wait_grant`, read by `bump_global_time`).
@@ -17325,32 +18260,64 @@ impl Scheduler {
                     .and_then(Result::ok)
             })
             .flatten();
-        self.progress_epoch += 1;
-        self.last_commit_at.insert(dtid, self.progress_epoch);
-        let previous_grant = self.guest_state_polled_at.remove(&dtid);
-        if guest_state_poll {
-            // This thread's previous grant moved something unless this request
-            // retries after an attempt that did not.
-            if let Some(previous) = previous_grant
-                && !fruitless
-            {
-                self.last_progress = self.last_progress.max(previous);
-            }
-            self.guest_state_polled_at.insert(dtid, self.progress_epoch);
+        // The committing thread's latest attempt before this commit: whether
+        // that attempt could see the latest progress.
+        let previous_attempt =
+            self.note_committed_turn(dtid, polling_grant, guest_state_poll, fruitless, switch_in);
+        // A FIFO open's poll asks whether nothing else can run, and so does an
+        // idle guest-state poller's retry: either way, when only a deadline can
+        // still let a thread act, global time moves to it at the next pass. A
+        // replay of a record that lists its jumps answers the same, but makes
+        // only the recorded jumps (`TimeSkipMode::Driven`); a replay of an older
+        // record lets only a FIFO open ask, as before (`TimeSkipMode::Legacy`).
+        let legacy = self.time_skip_mode == TimeSkipMode::Legacy;
+        let reason = if wants_alone {
+            Some(TimeSkipReason::FifoOpenAlone)
+        } else if idle_poll && !legacy {
+            Some(TimeSkipReason::IdleGuestPollers)
         } else {
-            self.last_progress = self.progress_epoch;
-        }
-        let mut alone = wants_alone && self.nothing_else_can_run(dtid);
-        if alone
-            && self
+            None
+        };
+        let mut alone = false;
+        let others = reason.and_then(|_| {
+            if legacy {
+                self.alone_until_with(dtid, Some(u64::MAX), false)
+            } else {
+                self.alone_until(dtid, previous_attempt)
+            }
+        });
+        if let (Some(reason), Some(others_poll_deadline)) = (reason, others) {
+            let poll_deadline = if legacy {
+                None
+            } else {
+                others_poll_deadline
+                    .into_iter()
+                    .chain(own_poll_deadline)
+                    .min()
+            };
+            let timer_due = self
                 .blocked
                 .timed_waiters
                 .next_deadline()
-                .is_some_and(|deadline| !deadline.is_indefinite())
-        {
-            // Only a timer can still let another thread run: move to it now.
-            alone = false;
-            self.fast_forward_for_alone_poller = true;
+                .is_some_and(|deadline| !deadline.is_indefinite());
+            if timer_due || poll_deadline.is_some() {
+                if matches!(self.time_skip_mode, TimeSkipMode::Driven(_)) {
+                    // Where the recording requested its jump, at this commit,
+                    // the replay notes the request and makes the recorded jump
+                    // (`drive_recorded_time_skips`).
+                    self.jump_request = Some((self.replay_position(), reason));
+                } else {
+                    self.pending_time_skip = Some(PendingTimeSkip {
+                        reason,
+                        poll_deadline,
+                        requester: dtid,
+                    });
+                }
+            } else {
+                // Only a FIFO open answers that nothing else can run; an idle
+                // poller just retries, as before.
+                alone = wants_alone;
+            }
         }
         if let Err(error) = self.clear_nextturn(dtid) {
             self.fail_parked(dtid, error);
@@ -17770,8 +18737,9 @@ impl Scheduler {
         }
     }
 
-    /// Step: reenqueue the thread that just had a turn.
-    fn step6_reenquue(&mut self, next_dtid: DetTid, requeue: Requeue) {
+    /// Step: reenqueue the thread that just had a turn, counting toward the
+    /// next poll upgrade as `progress` says (`upgrade_progress_of`).
+    fn step6_reenquue(&mut self, next_dtid: DetTid, requeue: Requeue, progress: UpgradeProgress) {
         // We delay popping till here, so while holding the lock we "atomically" move the
         // thread from the front to the back of the queue.
         let dt2 = if requeue == Requeue::YieldEpoch {
@@ -17782,14 +18750,16 @@ impl Scheduler {
         assert_eq!(next_dtid, dt2);
         // A yield's queue placement is transient: the thread keeps its persistent priority
         // and its band.
+        let priority = self.get_priority(next_dtid);
         let pos = match requeue {
-            Requeue::Back => self.runqueue_push_back(next_dtid),
-            Requeue::OneTurnYield => {
-                let priority = self.get_priority(next_dtid);
-                self.run_queue.push_yielded(next_dtid, priority)
-            }
+            Requeue::Back => self.run_queue.push_back_with(next_dtid, priority, progress),
+            Requeue::OneTurnYield => self
+                .run_queue
+                .push_yielded_with(next_dtid, priority, progress),
+            // Only a guest's own `sched_yield` joins the epoch, never a
+            // loopback poll's yield (`requeue_after`): it always counts.
             Requeue::YieldEpoch => {
-                let priority = self.get_priority(next_dtid);
+                debug_assert_eq!(progress, UpgradeProgress::Counts);
                 self.run_queue.push_yielded_into_epoch(next_dtid, priority)
             }
         };
@@ -18948,6 +19918,25 @@ impl Scheduler {
                 .get_or_insert_with(String::new)
                 .push_str(&format!("{message}\n"));
         }
+        let unmade_time_skips = match &self.time_skip_mode {
+            TimeSkipMode::Driven(rest) => rest.len(),
+            _ => 0,
+        };
+        if self.time_skip_desyncs > 0
+            || unmade_time_skips > 0
+            || self.unconfirmed_time_skip.is_some()
+        {
+            let message = format!(
+                "DESYNC recorded jumps of global time: {} desynced, {} not reached, {} unconfirmed",
+                self.time_skip_desyncs,
+                unmade_time_skips,
+                usize::from(self.unconfirmed_time_skip.is_some()),
+            );
+            tracing::warn!("{}", message);
+            desync_descrip
+                .get_or_insert_with(String::new)
+                .push_str(&format!("{message}\n"));
+        }
 
         let (reprio_descrip, info_reprio_descrip) = if let Some(pw) = self.preemption_writer.take()
         {
@@ -19613,7 +20602,7 @@ mod test {
 
     /// A queued polling thread whose request carries `polls_guest_state_only`
     /// as given and retries after an attempt that moved nothing, with its
-    /// latest grant recorded as the latest committed turn.
+    /// latest grant recorded as its latest attempt.
     fn queued_poller(sched: &mut Scheduler, tid: DetTid, guest_state_only: bool) {
         register_known_thread(sched, tid);
         let mut resources = Resources::new(tid);
@@ -19622,7 +20611,7 @@ mod test {
         resources.polls_guest_state_only = guest_state_only;
         sched.next_turns[&tid].req.put(Ok(resources));
         sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
-        sched.last_commit_at.insert(tid, sched.progress_epoch);
+        sched.last_attempt_at.insert(tid, sched.progress_epoch);
         if guest_state_only {
             sched
                 .guest_state_polled_at
@@ -19901,27 +20890,45 @@ mod test {
         assert!(sched.nothing_else_can_run(opener));
     }
 
-    /// A guest-state poll with a timeout wakes at its deadline, which the
-    /// alone-poller fast-forward does not consider, so it may still run.
-    #[test]
-    fn a_guest_poller_with_a_timeout_may_still_run() {
-        let mut sched = Scheduler::new(&Config::default());
-        let opener = DetTid::from_raw(3);
-        register_known_thread(&mut sched, opener);
-        let poller = DetTid::from_raw(5);
-        register_known_thread(&mut sched, poller);
-        let mut resources = Resources::new(poller);
+    /// A guest-state poller with a timeout, queued and idle like
+    /// [`queued_poller`].
+    fn timed_queued_poller(sched: &mut Scheduler, tid: DetTid, deadline: LogicalTime) {
+        register_known_thread(sched, tid);
+        let mut resources = Resources::new(tid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.poll_attempt = 1;
         resources.polls_guest_state_only = true;
-        resources.poll_deadline = Some(LogicalTime::from_nanos(1_000_000));
-        sched.next_turns[&poller].req.put(Ok(resources));
-        sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 1);
-        sched.last_commit_at.insert(poller, sched.progress_epoch);
+        resources.poll_deadline = Some(deadline);
+        sched.next_turns[&tid].req.put(Ok(resources));
+        sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
+        sched.last_attempt_at.insert(tid, sched.progress_epoch);
         sched
             .guest_state_polled_at
-            .insert(poller, sched.progress_epoch);
-        assert!(!sched.nothing_else_can_run(opener));
+            .insert(tid, sched.progress_epoch);
+    }
+
+    /// A timed guest-state poll is idle like any other, and its deadline bounds
+    /// a jump of global time: the earliest such timeout is reported.
+    #[test]
+    fn a_timed_guest_poller_is_idle_and_its_deadline_bounds_the_jump() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        timed_queued_poller(
+            &mut sched,
+            DetTid::from_raw(5),
+            LogicalTime::from_nanos(9_000_000),
+        );
+        timed_queued_poller(
+            &mut sched,
+            DetTid::from_raw(7),
+            LogicalTime::from_nanos(4_000_000),
+        );
+        queued_poller(&mut sched, DetTid::from_raw(9), true);
+        assert_eq!(
+            sched.alone_until(opener, Some(u64::MAX)),
+            Some(Some(LogicalTime::from_nanos(4_000_000)))
+        );
     }
 
     #[test]
@@ -19935,6 +20942,49 @@ mod test {
         sched.progress_epoch += 1;
         sched.last_progress = sched.progress_epoch;
         assert!(!sched.nothing_else_can_run(opener));
+    }
+
+    /// A schedule replay's `TraceReplay` grant hands a thread held after a
+    /// traced event its turn back, and is no attempt. A pipe reader held that
+    /// way after its failed attempt, while the writer wrote and left, is not
+    /// idle: its retry may succeed. Before, the grant counted as the reader's
+    /// latest attempt, and a schedule replay of a reader whose writers had
+    /// exited reported a false guest deadlock. A further failed attempt makes
+    /// the reader idle again.
+    #[test]
+    fn a_trace_replay_grant_after_a_failed_attempt_is_no_attempt() {
+        let mut sched = Scheduler::new(&Config::default());
+        let reader = DetTid::from_raw(3);
+        queued_poller(&mut sched, reader, true);
+        sched.thread_tree.add_child(reader, reader, true);
+        assert!(sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(DetTid::from_raw(7), false, false, false, false);
+        sched.note_committed_turn(reader, false, false, false, false);
+        assert!(!sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(reader, true, true, true, false);
+        assert!(sched.only_idle_guest_pollers_remain());
+    }
+
+    /// A replayed switch-in (`TraceReplay`) is neither progress nor an
+    /// attempt. Another thread's switch-in leaves an idle reader idle. The
+    /// false-deadlock witness above still holds with switch-ins left out of
+    /// progress: a writer's ordinary grant after the reader's failed attempt
+    /// is progress, which the reader's own switch-in does not hide, so the
+    /// reader is idle again only after a further failed attempt.
+    #[test]
+    fn a_switch_in_is_neither_progress_nor_an_attempt() {
+        let mut sched = Scheduler::new(&Config::default());
+        let reader = DetTid::from_raw(3);
+        queued_poller(&mut sched, reader, true);
+        sched.thread_tree.add_child(reader, reader, true);
+        assert!(sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(DetTid::from_raw(9), false, false, false, true);
+        assert!(sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(DetTid::from_raw(7), false, false, false, false);
+        sched.note_committed_turn(reader, false, false, false, true);
+        assert!(!sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(reader, true, true, true, false);
+        assert!(sched.only_idle_guest_pollers_remain());
     }
 
     /// A partial pipe write's retry follows an attempt that moved bytes: the
@@ -19954,7 +21004,7 @@ mod test {
         resources.previous_attempt_made_progress = true;
         sched.next_turns[&writer].req.put(Ok(resources));
         sched.run_queue.push_poller(writer, DEFAULT_PRIORITY, 2);
-        sched.last_commit_at.insert(writer, sched.progress_epoch);
+        sched.last_attempt_at.insert(writer, sched.progress_epoch);
         sched
             .guest_state_polled_at
             .insert(writer, sched.progress_epoch);
@@ -20068,6 +21118,219 @@ mod test {
         assert!(!sched.nothing_else_can_run(opener));
     }
 
+    /// A reader polling a pipe (dtid 3), whose latest attempt failed after
+    /// every other turn, beside the pipe's writer (dtid 5), parked in a futex
+    /// wait no thread will wake: the shape of a guest whose writer blocked on
+    /// a lock nobody holds before writing. Each thread is its own process.
+    fn reader_beside_a_blocked_writer_with(config: &Config) -> (Scheduler, Arc<Mutex<GlobalTime>>) {
+        let mut sched = Scheduler::new(config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(config)));
+        let reader = DetTid::from_raw(3);
+        queued_poller(&mut sched, reader, true);
+        let writer = DetTid::from_raw(5);
+        register_known_thread(&mut sched, writer);
+        let mut wait = Resources::new(writer);
+        wait.insert(ResourceID::FutexWait, Permission::R);
+        sched.next_turns[&writer].req.put(Ok(wait));
+        sched
+            .blocked
+            .futex_waiters
+            .entry(FutexID::private(MmId::initial(writer), 0x404100))
+            .or_default()
+            .push(futex_waiter(5, u32::MAX));
+        sched.thread_tree.add_child(reader, reader, true);
+        sched.thread_tree.add_child(reader, writer, true);
+        (sched, global_time)
+    }
+
+    fn reader_beside_a_blocked_writer() -> (Scheduler, Arc<Mutex<GlobalTime>>) {
+        reader_beside_a_blocked_writer_with(&Config::default())
+    }
+
+    /// Whether step2d let the run go on: no deadlock report.
+    fn polls_on(sched: &mut Scheduler, global_time: &Arc<Mutex<GlobalTime>>) -> bool {
+        sched.step2d_handle_empty_queue(global_time).is_ok()
+            && sched.take_terminal_deadlock().is_none()
+    }
+
+    /// No attempt of the reader's can succeed until the writer runs, and
+    /// nothing can wake the writer: the run reports the deadlock rather than
+    /// let the reader poll forever, each retry moving virtual time on.
+    #[test]
+    fn a_reader_beside_a_writer_nothing_can_wake_is_a_deadlock() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        assert!(sched.step2d_handle_empty_queue(&global_time).is_err());
+        let report = sched
+            .take_terminal_deadlock()
+            .expect("the scheduler should report the deadlock");
+        assert!(
+            report.starts_with(
+                "Deadlock detected: thread(s) waiting on futex, and thread(s) retrying a pipe \
+                 or socket-pair call no remaining thread can satisfy, but no runnable threads \
+                 left.\n"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("  run queue: 1 polling with no possible progress: dtid 3\n"),
+            "{report}"
+        );
+    }
+
+    /// A turn committed since the reader's latest attempt may have made the
+    /// pipe ready: the reader tries again.
+    #[test]
+    fn a_reader_that_has_not_retried_since_progress_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        sched.progress_epoch += 1;
+        sched.last_progress = sched.progress_epoch;
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// The writer leaves after the reader's latest attempt (its exit closes
+    /// its descriptors): the reader tries again first.
+    #[test]
+    fn a_reader_retries_after_the_writer_leaves() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let writer = DetTid::from_raw(5);
+        sched.logically_kill_thread(&writer, &DetPid::from_raw(5), MmId::initial(writer));
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// Another thread of the writer's process already left without a
+    /// committed exit, so it died of a signal or with its process: the
+    /// writer's thread leaves too, at a host-timed moment, closing the
+    /// process's descriptors. A sibling that left by its own exit is gone
+    /// harmlessly.
+    #[test]
+    fn a_reader_beside_a_writer_whose_sibling_died_polls_on() {
+        for sibling_exited in [false, true] {
+            let (mut sched, global_time) = reader_beside_a_blocked_writer();
+            let writer = DetTid::from_raw(5);
+            let sibling = DetTid::from_raw(6);
+            sched.thread_tree.add_child(writer, sibling, false);
+            if sibling_exited {
+                sched.committed_exits.insert(sibling);
+            }
+            assert_eq!(
+                polls_on(&mut sched, &global_time),
+                !sibling_exited,
+                "sibling exited {sibling_exited}"
+            );
+        }
+    }
+
+    /// The writer's process is doomed (a committed SIGKILL here; a granted
+    /// exit, an exec teardown or a fatal signal alike) while its thread is
+    /// still registered: the thread leaves, closing its descriptors, at a
+    /// host-timed moment.
+    #[test]
+    fn a_reader_beside_a_doomed_writer_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        sched.record_committed_sigkill(DetTid::from_raw(5), Some(DetPid::from_raw(5)));
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// A backend that retires a SIGKILL's victims at the kill retires them
+    /// before the kernel has closed their descriptors: a doomed process that
+    /// has not been reaped holds the verdict back there, and only there.
+    #[test]
+    fn a_doomed_process_holds_the_verdict_only_where_threads_retire_early() {
+        let early = Config::default().with_backend(|backend| {
+            backend.requires_thread_directed_process_signals = true;
+        });
+        for (config, retires_early) in [(Config::default(), false), (early, true)] {
+            let (mut sched, global_time) = reader_beside_a_blocked_writer_with(&config);
+            sched.record_committed_sigkill(DetTid::from_raw(9), Some(DetPid::from_raw(9)));
+            assert_eq!(
+                polls_on(&mut sched, &global_time),
+                retires_early,
+                "retires early {retires_early}"
+            );
+        }
+    }
+
+    /// A timer can still let a thread run: the reader polls on until it fires.
+    /// The sleeper is a process of its own, so that only its deadline, not an
+    /// unknown process counted as doomed, keeps the verdict back.
+    #[test]
+    fn a_reader_beside_a_finite_timer_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .thread_tree
+            .add_child(DetTid::from_raw(3), sleeper, true);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(u64::MAX / 2), sleeper);
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// A call waiting on a host may still complete and wake a thread.
+    #[test]
+    fn a_reader_beside_external_io_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let other = DetTid::from_raw(7);
+        register_known_thread(&mut sched, other);
+        sched
+            .blocked
+            .external_io_blockers
+            .insert(other, ExternalOpId::new(other, 1));
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// Runnable work beside the reader can still wake the writer.
+    #[test]
+    fn a_reader_beside_runnable_work_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let runnable = DetTid::from_raw(7);
+        register_known_thread(&mut sched, runnable);
+        sched.run_queue.push_back(runnable, DEFAULT_PRIORITY);
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// A poll whose outcome a host can change, a retry on a named FIFO, which
+    /// a process outside the container may also hold, and a FIFO open, which
+    /// waits in the kernel once nothing else can run, are no deadlock.
+    #[test]
+    fn polls_a_host_may_satisfy_poll_on() {
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        for kind in ["host-reachable", "named fifo", "fifo open"] {
+            let mut sched = Scheduler::new(&config);
+            let poller = DetTid::from_raw(3);
+            match kind {
+                "host-reachable" => queued_poller(&mut sched, poller, false),
+                "named fifo" => {
+                    queued_poller(&mut sched, poller, true);
+                    let mut retry = Resources::new(poller);
+                    retry.insert(ResourceID::InternalIOPolling, Permission::W);
+                    retry.poll_attempt = 1;
+                    retry.polls_guest_state_only = true;
+                    retry.polls_a_named_fifo = true;
+                    register_known_thread(&mut sched, poller);
+                    sched.next_turns[&poller].req.put(Ok(retry));
+                }
+                _ => {
+                    fifo_open_poll(&mut sched, poller);
+                    sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 1);
+                    sched.last_attempt_at.insert(poller, sched.progress_epoch);
+                }
+            }
+            let writer = DetTid::from_raw(5);
+            register_known_thread(&mut sched, writer);
+            sched
+                .blocked
+                .timed_waiters
+                .insert(LogicalTime::INDEFINITE, writer);
+            sched.thread_tree.add_child(poller, poller, true);
+            sched.thread_tree.add_child(poller, writer, true);
+            assert!(polls_on(&mut sched, &global_time), "{kind}");
+        }
+    }
+
     /// A FIFO open's polling request (`waits_until_nothing_else_can_run`).
     fn fifo_open_poll(sched: &mut Scheduler, tid: DetTid) {
         register_known_thread(sched, tid);
@@ -20077,6 +21340,8 @@ mod test {
         resources.polls_guest_state_only = true;
         resources.waits_until_nothing_else_can_run = true;
         sched.next_turns[&tid].req.put(Ok(resources));
+        // Its previous poll, after which nothing moved.
+        sched.last_attempt_at.insert(tid, sched.progress_epoch);
     }
 
     /// A sleeping thread cannot run before its deadline, so it does not keep a
@@ -20097,7 +21362,14 @@ mod test {
         assert!(sched.nothing_else_can_run(opener));
         let answer = turn_answer(&mut sched, opener);
         assert!(matches!(answer, Some(SchedResponse::Go(_))), "{answer:?}");
-        assert!(sched.fast_forward_for_alone_poller);
+        assert_eq!(
+            sched.pending_time_skip,
+            Some(PendingTimeSkip {
+                reason: TimeSkipReason::FifoOpenAlone,
+                poll_deadline: None,
+                requester: opener,
+            })
+        );
     }
 
     /// Beside a wait no time ends (`pause`), the open falls back at once
@@ -20118,7 +21390,617 @@ mod test {
             matches!(answer, Some(SchedResponse::GoAlone(_))),
             "{answer:?}"
         );
-        assert!(!sched.fast_forward_for_alone_poller);
+        assert_eq!(sched.pending_time_skip, None);
+    }
+
+    /// An idle guest-state poller's retry (`queued_poller`) whose request is
+    /// about to commit.
+    fn committing_idle_poller(sched: &mut Scheduler, tid: DetTid, deadline: Option<LogicalTime>) {
+        register_known_thread(sched, tid);
+        let mut resources = Resources::new(tid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.poll_attempt = 2;
+        resources.polls_guest_state_only = true;
+        resources.poll_deadline = deadline;
+        sched.next_turns[&tid].req.put(Ok(resources));
+        // Its previous, failed attempt, after which nothing moved.
+        sched.last_attempt_at.insert(tid, sched.progress_epoch);
+        sched
+            .guest_state_polled_at
+            .insert(tid, sched.progress_epoch);
+    }
+
+    /// A poller whose previous attempt came before another thread's progress
+    /// may succeed now and run on, so its commit requests no jump: the jump
+    /// would land while it runs.
+    #[test]
+    fn a_poller_whose_last_attempt_predates_progress_requests_no_jump() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        // Another thread's turn committed after the poller's last attempt.
+        sched.progress_epoch += 1;
+        sched.last_progress = sched.progress_epoch;
+        let sleeper = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None);
+    }
+
+    /// A call's first attempt runs in the turn an ordinary grant gave its
+    /// thread, and only a polling grant records an attempt
+    /// (`last_attempt_at`). So the commit of the call's first retry, beside a
+    /// sleeper, requests no jump: nothing shows that the first attempt came
+    /// after the latest progress, here the ordinary grant itself. The commit
+    /// of the second retry, after the first retry's attempt failed with
+    /// nothing else able to run, requests it.
+    #[test]
+    fn a_first_retry_after_an_ordinary_grant_jumps_at_its_second_retry() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        register_known_thread(&mut sched, poller);
+        let sleeper = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        // An ordinary turn, in which the thread calls a read whose first
+        // attempt fails.
+        sched.next_turns[&poller]
+            .req
+            .put(Ok(Resources::new(poller)));
+        let _ = turn_answer(&mut sched, poller);
+        let retry = |sched: &mut Scheduler, attempt| {
+            let mut resources = Resources::new(poller);
+            resources.insert(ResourceID::InternalIOPolling, Permission::W);
+            resources.poll_attempt = attempt;
+            resources.polls_guest_state_only = true;
+            sched.next_turns[&poller].req.put(Ok(resources));
+        };
+        retry(&mut sched, 1);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None);
+        retry(&mut sched, 2);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(
+            sched.pending_time_skip,
+            Some(PendingTimeSkip {
+                reason: TimeSkipReason::IdleGuestPollers,
+                poll_deadline: None,
+                requester: poller,
+            })
+        );
+    }
+
+    /// A replayed switch-in (`TraceReplay`) of an idle poller is no progress:
+    /// a FIFO open beside that poller, with no timer, still goes alone, as in
+    /// the recording that only skipped the poller (Claude review, round 2: the
+    /// replay otherwise spun on the open).
+    #[test]
+    fn a_replayed_switch_in_is_no_progress() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        fifo_open_poll(&mut sched, opener);
+        let poller = DetTid::from_raw(5);
+        register_known_thread(&mut sched, poller);
+        // Its failed attempt, after which nothing moved; the replay held it
+        // after that attempt.
+        sched.last_attempt_at.insert(poller, sched.progress_epoch);
+        let mut switch_in = Resources::new(poller);
+        switch_in.insert(ResourceID::TraceReplay, Permission::RW);
+        sched.next_turns[&poller].req.put(Ok(switch_in));
+        let _ = turn_answer(&mut sched, poller);
+        // The poller then retries its poll, as fruitlessly as before.
+        let mut retry = Resources::new(poller);
+        retry.insert(ResourceID::InternalIOPolling, Permission::W);
+        retry.poll_attempt = 2;
+        retry.polls_guest_state_only = true;
+        sched.next_turns[&poller].req.put(Ok(retry));
+        sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 2);
+        let answer = turn_answer(&mut sched, opener);
+        assert!(
+            matches!(answer, Some(SchedResponse::GoAlone(_))),
+            "{answer:?}"
+        );
+    }
+
+    /// The commit of an idle guest-state poller's retry beside a sleeper and
+    /// another idle poller moves time to the sleeper's deadline at the next
+    /// pass; the poller itself is answered as before.
+    #[test]
+    fn an_idle_poller_beside_a_sleeper_moves_time_to_its_deadline() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let answer = turn_answer(&mut sched, poller);
+        assert!(matches!(answer, Some(SchedResponse::Go(_))), "{answer:?}");
+        assert_eq!(
+            sched.pending_time_skip,
+            Some(PendingTimeSkip {
+                reason: TimeSkipReason::IdleGuestPollers,
+                poll_deadline: None,
+                requester: poller,
+            })
+        );
+    }
+
+    /// Beside a thread that can still run, an idle poller's commit requests
+    /// nothing.
+    #[test]
+    fn an_idle_poller_beside_a_runnable_thread_requests_no_jump() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        let sleeper = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        // Registered, but running: not queued and not parked.
+        register_known_thread(&mut sched, DetTid::from_raw(7));
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None);
+    }
+
+    /// Beside a wait no time ends, an idle poller just retries: no jump, and
+    /// no "nothing else can run" answer, which only a FIFO open takes.
+    #[test]
+    fn an_idle_poller_beside_an_indefinite_wait_just_retries() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        let paused = DetTid::from_raw(5);
+        register_known_thread(&mut sched, paused);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, paused);
+        let answer = turn_answer(&mut sched, poller);
+        assert!(matches!(answer, Some(SchedResponse::Go(_))), "{answer:?}");
+        assert_eq!(sched.pending_time_skip, None);
+    }
+
+    /// A poll's own timeout bounds the jump: with no timer at all, the
+    /// committing poller's deadline is the target, and a timer due later than
+    /// another idle poller's timeout does not move time past that timeout.
+    #[test]
+    fn a_poll_timeout_earlier_than_the_timer_is_the_jump_target() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let poller = DetTid::from_raw(3);
+        let own = start + LogicalTime::from_nanos(7_000_000);
+        committing_idle_poller(&mut sched, poller, Some(own));
+        let other = start + LogicalTime::from_nanos(3_000_000);
+        timed_queued_poller(&mut sched, DetTid::from_raw(5), other);
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(start + LogicalTime::from_nanos(5_000_000), sleeper);
+        let _ = turn_answer(&mut sched, poller);
+        let pending = sched.pending_time_skip.take().expect("a jump is requested");
+        assert_eq!(pending.poll_deadline, Some(other));
+        // Its attempt fails and it asks to retry again.
+        repost_idle_retry(&mut sched, poller, Some(own));
+        sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), other);
+    }
+
+    /// The poller's next request after an attempt that failed: another retry.
+    fn repost_idle_retry(sched: &mut Scheduler, tid: DetTid, deadline: Option<LogicalTime>) {
+        let mut resources = Resources::new(tid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.poll_attempt = 3;
+        resources.polls_guest_state_only = true;
+        resources.poll_deadline = deadline;
+        sched.next_turns[&tid].req.put(Ok(resources));
+    }
+
+    /// An idle poller's jump is checked again where it is made, after the
+    /// poller's attempt: when the poller asks to retry again and nothing else
+    /// can run, time moves; when a signal ended its wait, so that its request
+    /// is now the signal's, or another thread became runnable, no jump is
+    /// made (Codex review, finding 3).
+    #[test]
+    fn a_requested_jump_is_checked_again_where_it_is_made() {
+        let config = Config::default();
+        let setup = || {
+            let mut sched = Scheduler::new(&config);
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+            let start = global_time.lock().unwrap().as_nanos();
+            let poller = DetTid::from_raw(3);
+            committing_idle_poller(&mut sched, poller, None);
+            let sleeper = DetTid::from_raw(7);
+            register_known_thread(&mut sched, sleeper);
+            let deadline = start + LogicalTime::from_nanos(2_000_000);
+            sched.blocked.timed_waiters.insert(deadline, sleeper);
+            let _ = turn_answer(&mut sched, poller);
+            let pending = sched.pending_time_skip.take().expect("a jump is requested");
+            (sched, global_time, start, deadline, poller, pending)
+        };
+
+        let (mut sched, global_time, _, deadline, poller, pending) = setup();
+        repost_idle_retry(&mut sched, poller, None);
+        sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        let (mut sched, global_time, start, _, poller, pending) = setup();
+        let mut signal = Resources::new(poller);
+        signal.insert(
+            ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+            Permission::W,
+        );
+        sched.next_turns[&poller].req.put(Ok(signal));
+        sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+
+        let (mut sched, global_time, start, _, poller, pending) = setup();
+        repost_idle_retry(&mut sched, poller, None);
+        let runnable = DetTid::from_raw(9);
+        register_known_thread(&mut sched, runnable);
+        sched.runqueue_push_back(runnable);
+        sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+    }
+
+    /// A replay of a record that lists its jumps makes each where the
+    /// recording did, once its stream position reaches the jump's, and checks
+    /// it there: a jump past a deadline the replay knows is a desync but is
+    /// still made; one global time has passed is a desync and is not made.
+    /// Its own commits request no jump.
+    #[test]
+    fn a_replay_drives_the_recorded_jumps_and_checks_them() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let at = |ns: u64| start + LogicalTime::from_nanos(ns);
+        let skip = |event, target| TimeSkip {
+            event,
+            target,
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.time_skip_mode = TimeSkipMode::Driven(
+            [
+                skip(4, at(1_000_000)),
+                skip(9, at(2_000_000)),
+                skip(9, at(3_000_000)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched.blocked.timed_waiters.insert(at(1_000_000), sleeper);
+
+        // An idle poller beside the sleeper requests nothing: jumps are driven.
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None);
+
+        // Before its stream position the recorded jump waits.
+        sched.replayer.as_mut().unwrap().events_popped = 3;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+
+        // At it, the jump is made, and its target is the sleeper's deadline.
+        sched.replayer.as_mut().unwrap().events_popped = 4;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(1_000_000));
+        assert_eq!(sched.time_skip_desyncs, 0);
+
+        // Past both later jumps at once. The first goes to a deadline this
+        // replay does not know yet, which a thread may register after it: no
+        // desync. The second passes a deadline the replay knows, at 2.5 ms: a
+        // desync, still made.
+        sched.blocked.timed_waiters.remove(sleeper);
+        sched.blocked.timed_waiters.insert(at(2_500_000), sleeper);
+        sched.replayer.as_mut().unwrap().events_popped = 12;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(3_000_000));
+        assert_eq!(sched.time_skip_desyncs, 1);
+
+        // The second jump's target was not known when it was made. A thread
+        // registering an earlier deadline afterwards shows the jump passed it.
+        sched.unconfirmed_time_skip = Some(skip(9, at(4_000_000)));
+        sched.blocked.timed_waiters.remove(sleeper);
+        sched.blocked.timed_waiters.insert(at(3_500_000), sleeper);
+        sched.check_unconfirmed_time_skip();
+        assert_eq!(sched.time_skip_desyncs, 2);
+        assert_eq!(sched.unconfirmed_time_skip, None);
+        // One registering the target itself confirms it.
+        sched.unconfirmed_time_skip = Some(skip(9, at(3_500_000)));
+        sched.check_unconfirmed_time_skip();
+        assert_eq!(sched.time_skip_desyncs, 2);
+        assert_eq!(sched.unconfirmed_time_skip, None);
+
+        // A recorded jump whose target global time has passed is not made.
+        sched.time_skip_mode =
+            TimeSkipMode::Driven([skip(12, at(2_500_000))].into_iter().collect());
+        sched.blocked.timed_waiters.remove(sleeper);
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(3_000_000));
+        assert_eq!(sched.time_skip_desyncs, 3);
+    }
+
+    /// A recorded FIFO-open jump waits, at its stream position, for the
+    /// replay's open to poll and find nothing else can run, as the recording's
+    /// did before it jumped: the open's turns store no record, so the position
+    /// is reached before them. Moving past the position without that poll is
+    /// a desync, and the jump is made late.
+    #[test]
+    fn a_recorded_fifo_jump_waits_for_the_opens_poll() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let at = |ns: u64| start + LogicalTime::from_nanos(ns);
+        let fifo = |event, target| TimeSkip {
+            event,
+            target,
+            reason: TimeSkipReason::FifoOpenAlone,
+        };
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.time_skip_mode = TimeSkipMode::Driven(
+            [fifo(4, at(1_000_000)), fifo(6, at(2_000_000))]
+                .into_iter()
+                .collect(),
+        );
+        let sleeper = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sleeper);
+        sched.blocked.timed_waiters.insert(at(1_000_000), sleeper);
+        sched.replayer.as_mut().unwrap().events_popped = 4;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+
+        // The open polls; nothing else can run before the sleeper's deadline.
+        let opener = DetTid::from_raw(3);
+        fifo_open_poll(&mut sched, opener);
+        let _ = turn_answer(&mut sched, opener);
+        assert_eq!(sched.jump_request, Some((4, TimeSkipReason::FifoOpenAlone)));
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(1_000_000));
+        assert_eq!(sched.time_skip_desyncs, 0);
+
+        // Past the next jump's position with no such poll: late, a desync.
+        sched.blocked.timed_waiters.remove(sleeper);
+        sched.replayer.as_mut().unwrap().events_popped = 7;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(2_000_000));
+        assert_eq!(sched.time_skip_desyncs, 1);
+    }
+
+    /// Once a replay runs out of records, the run decides its own jumps: a
+    /// recorded jump at the end of the stream is still made, one beyond it is
+    /// a desync, and a replay of an older record ends the same way, without
+    /// one.
+    #[test]
+    fn a_replay_that_runs_out_of_records_decides_its_own_jumps() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let at = |ns: u64| start + LogicalTime::from_nanos(ns);
+        let skip = |event, target| TimeSkip {
+            event,
+            target,
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.replayer.as_mut().unwrap().events_popped = 4;
+        sched.time_skip_mode = TimeSkipMode::Driven(
+            [skip(4, at(1_000_000)), skip(20, at(2_000_000))]
+                .into_iter()
+                .collect(),
+        );
+        sched.end_time_skip_replay_once_exhausted(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(1_000_000));
+        assert_eq!(sched.time_skip_desyncs, 1);
+        assert_eq!(sched.time_skip_mode, TimeSkipMode::Compute);
+
+        let mut sched = Scheduler::new(&config);
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.time_skip_mode = TimeSkipMode::Legacy;
+        sched.end_time_skip_replay_once_exhausted(&global_time);
+        assert_eq!(sched.time_skip_desyncs, 0);
+        assert_eq!(sched.time_skip_mode, TimeSkipMode::Compute);
+    }
+
+    /// A run that replays nothing records in the current format, which lists
+    /// every jump, also when it made none; a replay of such a record is driven
+    /// by its (possibly empty) list, and a replay of a format-1 record keeps the
+    /// older rules (`TimeSkipMode::Legacy`) and records format 1.
+    #[test]
+    fn a_record_states_its_format_and_its_replay_follows_it() {
+        let recording = Config {
+            record_preemptions: true,
+            ..Config::default()
+        };
+        let written = Scheduler::new(&recording)
+            .preemption_writer
+            .take()
+            .unwrap()
+            .into_string();
+        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert!(record.lists_its_time_skips());
+
+        let dir = tempfile::tempdir().unwrap();
+        let replay = |record: crate::preemptions::PreemptionRecord| {
+            let path = dir.path().join("record.json");
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            Scheduler::new(&Config {
+                replay_schedule_from: Some(path),
+                record_preemptions: true,
+                ..Config::default()
+            })
+        };
+        let empty = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new());
+        let mut current = replay(empty.clone().with_current_format());
+        assert_eq!(
+            current.time_skip_mode,
+            TimeSkipMode::Driven(VecDeque::new())
+        );
+        assert!(
+            current
+                .preemption_writer
+                .take()
+                .unwrap()
+                .into_string()
+                .contains("\"format_version\"")
+        );
+        let mut older = replay(empty);
+        assert_eq!(older.time_skip_mode, TimeSkipMode::Legacy);
+        assert!(
+            !older
+                .preemption_writer
+                .take()
+                .unwrap()
+                .into_string()
+                .contains("format_version")
+        );
+    }
+
+    /// A record whose jump moves to the indefinite deadline is refused, and a
+    /// replay never makes such a jump.
+    #[test]
+    fn a_jump_to_the_indefinite_deadline_is_refused() {
+        let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .with_time_skips(vec![TimeSkip {
+                event: 0,
+                target: LogicalTime::INDEFINITE,
+                reason: TimeSkipReason::IdleGuestPollers,
+            }]);
+        assert!(record.validate_format().is_err());
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        sched.make_recorded_time_skip(
+            &global_time,
+            TimeSkip {
+                event: 0,
+                target: LogicalTime::INDEFINITE,
+                reason: TimeSkipReason::IdleGuestPollers,
+            },
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+        assert_eq!(sched.time_skip_desyncs, 1);
+    }
+
+    /// A replay of a record without a jump list behaves as before such lists
+    /// existed: an idle poller requests no jump, and a FIFO open counts a
+    /// timed poll as able to run and moves only to a timer.
+    #[test]
+    fn a_replay_of_an_older_record_keeps_the_old_fast_forward() {
+        let mut sched = Scheduler::new(&Config::default());
+        sched.time_skip_mode = TimeSkipMode::Legacy;
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None, "no idle-poller jump");
+
+        let mut sched = Scheduler::new(&Config::default());
+        sched.time_skip_mode = TimeSkipMode::Legacy;
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let opener = DetTid::from_raw(9);
+        fifo_open_poll(&mut sched, opener);
+        let _ = turn_answer(&mut sched, opener);
+        assert_eq!(
+            sched.pending_time_skip,
+            Some(PendingTimeSkip {
+                reason: TimeSkipReason::FifoOpenAlone,
+                poll_deadline: None,
+                requester: opener,
+            })
+        );
+
+        let mut sched = Scheduler::new(&Config::default());
+        sched.time_skip_mode = TimeSkipMode::Legacy;
+        timed_queued_poller(
+            &mut sched,
+            DetTid::from_raw(5),
+            LogicalTime::from_nanos(9_000_000),
+        );
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let opener = DetTid::from_raw(9);
+        fifo_open_poll(&mut sched, opener);
+        let _ = turn_answer(&mut sched, opener);
+        assert_eq!(sched.pending_time_skip, None, "a timed poll can still run");
+    }
+
+    /// The recorder writes every jump into the record, so a replay can check
+    /// it, at the recorded stream's position where the jump is made.
+    #[test]
+    fn a_recorded_run_writes_its_time_skips() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let mut writer = PreemptionWriter::new(None);
+        for _ in 0..6 {
+            writer.insert_schedevent(SchedEvent::syscall(
+                DetTid::from_raw(3),
+                Sysno::poll,
+                SyscallPhase::Polling,
+            ));
+        }
+        sched.preemption_writer = Some(writer);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let target = start + LogicalTime::from_nanos(1_500_000);
+        sched.fast_forward_to_next_finite_deadline(
+            &global_time,
+            PendingTimeSkip {
+                reason: TimeSkipReason::FifoOpenAlone,
+                poll_deadline: Some(target),
+                requester: DetTid::from_raw(3),
+            },
+        );
+        let written = sched.preemption_writer.take().unwrap().into_string();
+        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            record.time_skips(),
+            Some(
+                &[TimeSkip {
+                    event: 6,
+                    target,
+                    reason: TimeSkipReason::FifoOpenAlone,
+                }][..]
+            )
+        );
     }
 
     fn register_known_thread(sched: &mut Scheduler, tid: DetTid) {
@@ -24446,6 +26328,274 @@ mod test {
         assert_eq!(filed.poll_attempt, 3, "not readied");
     }
 
+    /// A skipped polling retry, requeued through step 4 any number of times.
+    /// Each requeue takes a round-robin turn and nothing else
+    /// (`upgrade_progress_of`).
+    fn skip_polling_retries(sched: &mut Scheduler, retrier: DetTid, count: u64) {
+        for attempt in 0..count {
+            let mut request = Resources::new(retrier);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.poll_attempt = 2 + (attempt % 3) as u32;
+            sched.next_turns.get_mut(&retrier).unwrap().req = Ivar::full(Ok(request.clone()));
+            let response = sched.next_turns[&retrier].resp.clone();
+            assert_eq!(sched.run_queue.tentative_pop_tid(retrier), Some(retrier));
+            assert!(
+                sched
+                    .step4_resource_block(retrier, &request, &response)
+                    .is_err()
+            );
+        }
+    }
+
+    /// What a run looks like at one of the scheduler's looks at a committed
+    /// time: the time, the upgrade count, the counted queueing operations,
+    /// the next timed upgrade and the thread that would be selected.
+    type PollUpgradeLook = (
+        LogicalTime,
+        u64,
+        u64,
+        Option<(LogicalTime, u64)>,
+        Option<DetTid>,
+    );
+
+    fn look_for_a_timed_poll_upgrade(
+        sched: &mut Scheduler,
+        at: LogicalTime,
+        looks: &mut Vec<PollUpgradeLook>,
+    ) {
+        sched.committed_time = at;
+        sched.upgrade_pollers_on_time();
+        let next = sched.run_queue.tentative_pop_next();
+        sched.run_queue.undo_tentative_pop();
+        looks.push((
+            at,
+            sched.run_queue.poll_upgrade_count(),
+            sched.run_queue.upgrade_progress(),
+            sched.next_timed_poll_upgrade,
+            next,
+        ));
+    }
+
+    /// The two poll-upgrade triggers stay apart, and host timing moves
+    /// neither (Codex review of https://github.com/rrnewton/hermit/pull/4652,
+    /// blocking). A skipped polling retry's requeue, made through step 4 any
+    /// number of times between two of the scheduler's looks, counts toward
+    /// neither the queueing-operation interval (`upgrade_progress`) nor the
+    /// upgrade count (`poll_upgrade_count`) the timed trigger restarts its
+    /// period from. So for 0 to 600 such requeues around each boundary the
+    /// run takes the same steps: a timed upgrade exactly at start + period;
+    /// an operation upgrade at the 200th counted operation, just before the
+    /// next timed deadline, which restarts the period once, at the next look;
+    /// and the next timed upgrade a whole period after that look. Each
+    /// upgrade advances the count once, the timed trigger records the count
+    /// after its own upgrade, and a timed upgrade leaves the counted
+    /// operations alone.
+    #[test]
+    fn host_timed_requeues_move_neither_poll_upgrade_trigger() {
+        let interval = runqueue::POLLING_UPGRADE_INTERVAL;
+        let poller = DetTid::from_raw(13);
+        let worker = DetTid::from_raw(15);
+        let retrier = DetTid::from_raw(17);
+        let normal = 500;
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        let ns = Duration::from_nanos;
+        let run = |retries: u64| {
+            let mut sched = Scheduler::new(&Config::default());
+            let period = sched.poll_upgrade_period;
+            for tid in [poller, worker, retrier] {
+                register_known_thread(&mut sched, tid);
+            }
+            sched.priorities.insert(poller, normal);
+            sched.priorities.insert(retrier, 9000);
+            sched.run_queue.push_poller(poller, normal, 6);
+            sched.runqueue_push_back(worker);
+            sched.run_queue.push_poller(retrier, 9000, 1);
+            let mut looks = Vec::new();
+            let look = look_for_a_timed_poll_upgrade;
+
+            look(&mut sched, start, &mut looks);
+            skip_polling_retries(&mut sched, retrier, retries);
+            look(&mut sched, start + period / 2, &mut looks);
+            skip_polling_retries(&mut sched, retrier, retries);
+            look(&mut sched, start + (period - ns(1)), &mut looks);
+            let counted = sched.run_queue.upgrade_progress();
+            look(&mut sched, start + period, &mut looks);
+            assert_eq!(
+                sched.run_queue.poll_upgrade_count(),
+                1,
+                "{retries}: the timed upgrade at start + period, counted once"
+            );
+            assert_eq!(
+                sched.run_queue.upgrade_progress(),
+                counted,
+                "{retries}: a timed upgrade is not a queueing operation"
+            );
+            assert_eq!(
+                sched.next_timed_poll_upgrade,
+                Some((start + period * 2, 1)),
+                "{retries}: recorded after its own upgrade"
+            );
+
+            // The poller retries and backs off again, and the worker's turns
+            // bring the counted operations to one short of the interval.
+            assert!(sched.run_queue.remove_tid(poller));
+            sched.run_queue.push_poller(poller, normal, 7);
+            while !(sched.run_queue.upgrade_progress() + 1).is_multiple_of(interval) {
+                assert!(sched.run_queue.remove_tid(worker));
+                sched.runqueue_push_back(worker);
+            }
+            skip_polling_retries(&mut sched, retrier, retries);
+            assert_eq!(sched.run_queue.poll_upgrade_count(), 1, "{retries}");
+            // The 200th counted operation, just before the timed deadline.
+            assert!(sched.run_queue.remove_tid(worker));
+            sched.runqueue_push_back(worker);
+            assert_eq!(
+                sched.run_queue.poll_upgrade_count(),
+                2,
+                "{retries}: the interval upgrade, counted once"
+            );
+            skip_polling_retries(&mut sched, retrier, retries);
+            let seen = start + (period * 2 - ns(1));
+            look(&mut sched, seen, &mut looks);
+            assert_eq!(
+                sched.next_timed_poll_upgrade,
+                Some((seen + period, 2)),
+                "{retries}: the interval upgrade restarted the period once"
+            );
+
+            // Backed off again: the old deadline passes with no upgrade, and
+            // the restarted one brings it.
+            assert!(sched.run_queue.remove_tid(poller));
+            sched.run_queue.push_poller(poller, normal, 8);
+            skip_polling_retries(&mut sched, retrier, retries);
+            look(&mut sched, start + period * 2, &mut looks);
+            look(&mut sched, seen + (period - ns(1)), &mut looks);
+            look(&mut sched, seen + period, &mut looks);
+            assert_eq!(sched.run_queue.poll_upgrade_count(), 3, "{retries}");
+            looks
+        };
+        let base = run(0);
+        let selections: Vec<Option<DetTid>> = base.iter().map(|look| look.4).collect();
+        assert_eq!(
+            selections,
+            [
+                Some(worker),
+                Some(worker),
+                Some(worker),
+                Some(poller),
+                Some(poller),
+                Some(worker),
+                Some(worker),
+                Some(poller),
+            ],
+            "backed off until each upgrade, then ahead of the worker"
+        );
+        for retries in [1, 2, 7, 199, 200, 201, 600] {
+            assert_eq!(run(retries), base, "{retries} host-timed requeues per gap");
+        }
+    }
+
+    /// The retries a timed poll upgrade readies (`ready_filed_retries`) do not
+    /// count toward the queueing-operation interval when they run, through
+    /// steps 4 to 6: like any retry, each is host-timed
+    /// (`upgrade_progress_of`). Counting them would let the number of live
+    /// pollers at a timed upgrade move the next interval upgrade, and with it
+    /// the timed trigger's period.
+    #[test]
+    fn the_retries_a_timed_poll_upgrade_readies_do_not_count_toward_the_interval() {
+        let mut sched = Scheduler::new(&Config::default());
+        let actor = DetTid::from_raw(1);
+        sched.thread_tree.add_child(actor, actor, true);
+        register_known_thread(&mut sched, actor);
+        let pollers: Vec<DetTid> = (0..5).map(|i| DetTid::from_raw(21 + 2 * i)).collect();
+        for &tid in &pollers {
+            sched.thread_tree.add_child(actor, tid, true);
+            register_known_thread(&mut sched, tid);
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.poll_attempt = 3;
+            sched.next_turns[&tid].req.put(Ok(request));
+            sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, 3);
+        }
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        sched.committed_time = start;
+        sched.upgrade_pollers_on_time();
+        sched.committed_time = start + sched.poll_upgrade_period;
+        sched.upgrade_pollers_on_time();
+        let counted = sched.run_queue.upgrade_progress();
+        for &tid in &pollers {
+            let request = sched.next_turns[&tid]
+                .req
+                .try_read()
+                .unwrap()
+                .expect("a filed request");
+            assert_eq!(
+                (request.poll_attempt, request.upgraded_from_attempt),
+                (0, 3),
+                "readied"
+            );
+            assert_eq!(sched.run_queue.tentative_pop_tid(tid), Some(tid));
+            let response = sched.next_turns[&tid].resp.clone();
+            assert!(sched.step4_resource_block(tid, &request, &response).is_ok());
+            assert!(sched.step5_guest_unblock(tid, &request, &response).is_ok());
+            let requeue = sched.requeue_after(&request);
+            let progress = sched.upgrade_progress_of(&request);
+            sched.step6_reenquue(tid, requeue, progress);
+        }
+        assert_eq!(
+            sched.run_queue.upgrade_progress(),
+            counted,
+            "five readied retries ran and none counted"
+        );
+    }
+
+    /// Step 2 runs the timed poll upgrade (`step2_process_blocked`): a
+    /// backed-off poller is restored at the pass that crosses the period and
+    /// not before. The upgrade also gives a backed-off poller in the last band
+    /// PR 4605's mark, so the chaos change-point bound counts it
+    /// (`can_be_passed_over`). The unit tests above call
+    /// `upgrade_pollers_on_time` directly; this one holds the call in step 2
+    /// (Claude and Codex reviews of
+    /// https://github.com/rrnewton/hermit/pull/4652).
+    #[test]
+    fn step2_runs_the_timed_poll_upgrade() {
+        let mut sched = Scheduler::new(&Config::default());
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let period = sched.poll_upgrade_period;
+        let poller = DetTid::from_raw(13);
+        let last_band = DetTid::from_raw(15);
+        for tid in [poller, last_band] {
+            register_known_thread(&mut sched, tid);
+        }
+        sched.priorities.insert(poller, 500);
+        sched.priorities.insert(last_band, runqueue::LAST_PRIORITY);
+        sched.run_queue.push_poller(poller, 500, 6);
+        sched
+            .run_queue
+            .push_poller(last_band, runqueue::LAST_PRIORITY, 5);
+        let backed_off = Some(runqueue::LAST_PRIORITY);
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        for (at, restored) in [
+            (start, false),
+            (start + (period - Duration::from_nanos(1)), false),
+            (start + period, true),
+        ] {
+            sched.committed_time = at;
+            let _ = sched.step2_process_blocked(&global_time);
+            assert_eq!(
+                sched.run_queue.queued_priority(poller),
+                if restored { Some(500) } else { backed_off },
+                "at {at}"
+            );
+            assert_eq!(
+                sched.run_queue.can_be_passed_over(last_band),
+                restored,
+                "the last-band poller's mark, at {at}"
+            );
+        }
+        assert_eq!(sched.run_queue.poll_upgrade_count(), 1);
+    }
+
     /// `--cap-preemption-charge`: a committed turn whose request ends an
     /// expired timeslice is charged the virtual time its thread ran in that
     /// slice, from its previous granted turn to this request, at most the
@@ -27471,6 +29621,41 @@ mod test {
         assert_eq!(global_time.lock().unwrap().as_nanos(), before);
     }
 
+    /// A schedule replay of a record that lists its jumps of global time
+    /// leaves time to a recorded jump it has not made yet, to the replayed
+    /// sleeper's deadline or an earlier one, instead of moving time to the
+    /// deadline itself: the jump is made where the recording made it, and a
+    /// FIFO open's jump only after the replay's own poll found nothing else
+    /// could run (`drive_recorded_time_skips`). A recorded jump to a later
+    /// target leaves the replayed wake's fast-forward as before.
+    #[test]
+    fn a_replay_leaves_time_to_a_recorded_jump_it_has_not_made() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(5);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        let before = global_time.lock().unwrap().as_nanos();
+        let wake = SchedEvent::syscall(sleeper, Sysno::clock_nanosleep, SyscallPhase::Posthook);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![wake]));
+        let jump = |target| TimeSkip {
+            event: 1,
+            target,
+            reason: TimeSkipReason::FifoOpenAlone,
+        };
+        for target in [deadline, deadline - LogicalTime::from_nanos(10)] {
+            scheduler.time_skip_mode = TimeSkipMode::Driven(VecDeque::from([jump(target)]));
+            assert!(
+                !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+                "a recorded jump to {target} is still to be made"
+            );
+            assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+        }
+        scheduler.time_skip_mode = TimeSkipMode::Driven(VecDeque::from([jump(
+            deadline + LogicalTime::from_nanos(10),
+        )]));
+        assert!(scheduler.replay_fast_forward_to_recorded_wake(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
     /// A scheduler pass under a schedule replay whose next recorded event
     /// resumes a thread asleep in virtual time holds for that thread's wake:
     /// it moves global time to the sleeper's deadline and ends without a
@@ -29751,7 +31936,7 @@ mod test {
                 assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
                 let requeue = scheduler.requeue_after(&request);
                 assert_eq!(requeue, Requeue::YieldEpoch);
-                scheduler.step6_reenquue(yielder, requeue);
+                scheduler.step6_reenquue(yielder, requeue, UpgradeProgress::Counts);
             }
         }
         (scheduler, tids)
@@ -29830,7 +32015,7 @@ mod test {
         assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
         let requeue = scheduler.requeue_after(&request);
         assert_eq!(requeue, Requeue::Back);
-        scheduler.step6_reenquue(worker, requeue);
+        scheduler.step6_reenquue(worker, requeue, UpgradeProgress::Counts);
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tids[0]));
     }
 
@@ -29861,7 +32046,7 @@ mod test {
             assert!(matches!(response.try_read(), Some(SchedResponse::Go(_))));
             let requeue = scheduler.requeue_after(&request);
             assert_eq!(requeue, Requeue::YieldEpoch);
-            scheduler.step6_reenquue(last, requeue);
+            scheduler.step6_reenquue(last, requeue, UpgradeProgress::Counts);
         }
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(tids[0]));
     }
@@ -30019,7 +32204,7 @@ mod test {
                 let requeue = scheduler.requeue_after(&request);
                 for _ in 0..yields_each {
                     assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
-                    scheduler.step6_reenquue(yielder, requeue);
+                    scheduler.step6_reenquue(yielder, requeue, UpgradeProgress::Counts);
                 }
             }
             let expected = if chaos { awaited } else { first };
@@ -30046,7 +32231,7 @@ mod test {
                 scheduler.run_queue.tentative_pop_tid(yielder),
                 Some(yielder)
             );
-            scheduler.step6_reenquue(yielder, requeue);
+            scheduler.step6_reenquue(yielder, requeue, UpgradeProgress::Counts);
         }
     }
 
@@ -30371,7 +32556,7 @@ mod test {
                 .is_ok()
         );
         let requeue = scheduler.requeue_after(&request);
-        scheduler.step6_reenquue(tid, requeue);
+        scheduler.step6_reenquue(tid, requeue, UpgradeProgress::Counts);
     }
 
     /// Under chaos, a thread that never blocks redraws its priority at each
@@ -30472,6 +32657,687 @@ mod test {
         spinner_changepoint(&mut scheduler, spinner, 4756, 4);
         assert_eq!(scheduler.priorities[&spinner], runqueue::LAST_PRIORITY);
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(waiter));
+    }
+
+    /// A configuration as the host prepares it for the ptrace backend, on
+    /// which polling retries may count toward a poll upgrade
+    /// (`Config::thread_exits_finish_before_the_next_turn`).
+    fn ptrace_config() -> Config {
+        Config {
+            backend: BackendCapabilities::PTRACE,
+            thread_exits_finish_before_the_next_turn: true,
+            ..Config::default()
+        }
+    }
+
+    /// Which polling retries count toward the next poll upgrade, at each
+    /// boundary of the classification (`retry_follows_guest_actions`). A
+    /// retry counts only when its request carries provenance that every
+    /// descriptor it waits on is guest-held (`waits_on_guest_held_only`, set
+    /// by the retry loops in `syscalls::helpers` before each attempt) beside
+    /// the guest-state classification, and no finite deadline. It does not
+    /// count, as host-timed, for:
+    ///
+    /// - (a) a named FIFO that joined internal polling (`polls_a_named_fifo`,
+    ///   set through `is_named_fifo`, PR 4692): any process may open its path;
+    /// - (b) a FIFO open waiting for a guest peer
+    ///   (`waits_until_nothing_else_can_run`, set by the FIFO open in
+    ///   `syscalls::files`), for the same reason;
+    /// - (c) any guest-state poll once a request reports that descriptors may
+    ///   have left the guest (`passes_descriptors_out`, which `request_put`
+    ///   turns into `guest_held_marks_revoked`);
+    /// - (d) a poll the syscall layer did not classify as guest state, as it
+    ///   does not for a set mixing guest-held and host-backed descriptors;
+    /// - (e) a retry of any other or unknown kind (fail closed);
+    /// - (f) the routing bit without provenance: an internal pipe that is not
+    ///   guest-held, such as an inherited pipe write end (a socketpair end
+    ///   without the mark, such as a bound datagram one, already falls under
+    ///   (d), `single_fd_poll_readiness`) (Codex review of
+    ///   https://github.com/rrnewton/hermit/pull/4892, blocking 1);
+    /// - (g) a guest-held poll with a finite deadline, whose timeout virtual
+    ///   time decides (blocking 2).
+    ///
+    /// A first attempt counts whatever its kind, and so does every retry under
+    /// record/replay. Through step 4, a counted retry's skipped requeue
+    /// advances the progress and a host-timed one's does not, and however
+    /// many finite-deadline retries are interleaved with host-timed ones, the
+    /// progress is the same.
+    #[test]
+    fn only_a_retry_that_waits_on_guest_actions_alone_counts_toward_a_poll_upgrade() {
+        let poller = DetTid::from_raw(100);
+        let retry = |configure: &dyn Fn(&mut Resources)| {
+            let mut rs = Resources::new(poller);
+            rs.insert(ResourceID::InternalIOPolling, Permission::W);
+            rs.poll_attempt = 2;
+            configure(&mut rs);
+            rs
+        };
+        let held = |rs: &mut Resources| {
+            rs.polls_guest_state_only = true;
+            rs.waits_on_guest_held_only = true;
+        };
+        let internal = retry(&held);
+        let guest_held = retry(&|rs| {
+            held(rs);
+            rs.relies_on_guest_held_marks = true;
+        });
+        let named_fifo = retry(&|rs| {
+            held(rs);
+            rs.polls_a_named_fifo = true;
+        });
+        let fifo_open = retry(&|rs| {
+            held(rs);
+            rs.waits_until_nothing_else_can_run = true;
+        });
+        let unclassified_poll = retry(&|rs| rs.fyi("poll"));
+        let unknown = retry(&|rs| rs.fyi("an unknown call"));
+        let routing_only = retry(&|rs| rs.polls_guest_state_only = true);
+        let provenance_only = retry(&|rs| rs.waits_on_guest_held_only = true);
+        let finite = retry(&|rs| {
+            held(rs);
+            rs.relies_on_guest_held_marks = true;
+            rs.poll_deadline = Some(LogicalTime::from_nanos(5_000_000));
+        });
+        let counted = |sched: &Scheduler, rs: &Resources| {
+            let skipped = sched.upgrade_progress_of(rs);
+            let run = sched.upgrade_progress_of(&rs.clone().upgraded_to_runnable());
+            assert_eq!(skipped, run, "{rs:?}: the skipped and the run retry agree");
+            skipped == UpgradeProgress::Counts
+        };
+        let config = ptrace_config();
+        let mut sched = Scheduler::new(&config);
+        assert!(counted(&sched, &internal), "guest-held pipe or socketpair");
+        assert!(counted(&sched, &guest_held), "guest-held poll");
+        assert!(!counted(&sched, &named_fifo), "(a) named FIFO");
+        assert!(!counted(&sched, &fifo_open), "(b) FIFO open");
+        assert!(
+            !counted(&sched, &unclassified_poll),
+            "(d) mixed or host-backed"
+        );
+        assert!(!counted(&sched, &unknown), "(e) unknown kind");
+        assert!(!counted(&sched, &routing_only), "(f) routing bit, no mark");
+        assert!(
+            !counted(&sched, &provenance_only),
+            "unclassified, marks alone"
+        );
+        assert!(!counted(&sched, &finite), "(g) finite deadline");
+        // (h) A backend that delivers signals in two phases: nothing counts.
+        let mut two_phase = Scheduler::new(&config);
+        two_phase.in_guest_signal_delivery = true;
+        assert!(!counted(&two_phase, &internal), "(h) two-phase delivery");
+        assert!(!counted(&two_phase, &guest_held), "(h) two-phase delivery");
+        // (i) Only a configuration whose host stated that a thread's native
+        // exit, and with it a private descriptor table's close, finishes
+        // before the next turn counts
+        // (`Config::thread_exits_finish_before_the_next_turn`). The statement
+        // decides, not the capability set: a custom or later backend that
+        // reports ptrace's or DBT's exact capabilities, and leaves the
+        // statement at its default, counts nothing, and so does a
+        // configuration nobody prepared.
+        for (name, backend, stated) in [
+            ("ptrace", BackendCapabilities::PTRACE, true),
+            ("DBT", BackendCapabilities::DBT, true),
+            (
+                "ptrace's capabilities, unstated",
+                BackendCapabilities::PTRACE,
+                false,
+            ),
+            (
+                "DBT's capabilities, unstated",
+                BackendCapabilities::DBT,
+                false,
+            ),
+            (
+                "in-guest LiteInst",
+                BackendCapabilities::LITEINST_IN_GUEST,
+                false,
+            ),
+            ("SaBRe", BackendCapabilities::SABRE, false),
+            ("KVM", BackendCapabilities::KVM, false),
+        ] {
+            let sched = Scheduler::new(&Config {
+                backend,
+                thread_exits_finish_before_the_next_turn: stated,
+                ..config.clone()
+            });
+            assert_eq!(counted(&sched, &internal), stated, "(i) {name}");
+            assert_eq!(counted(&sched, &guest_held), stated, "(i) {name}");
+        }
+        let unprepared = Scheduler::new(&Config::default());
+        assert!(!counted(&unprepared, &internal), "(i) unprepared");
+        assert!(!counted(&unprepared, &guest_held), "(i) unprepared");
+        for rs in [&named_fifo, &fifo_open, &unknown, &routing_only, &finite] {
+            let mut first = rs.clone();
+            first.poll_attempt = 0;
+            assert_eq!(
+                sched.upgrade_progress_of(&first),
+                UpgradeProgress::Counts,
+                "{rs:?}: a first attempt"
+            );
+        }
+
+        // Through step 4: a counted retry's skipped requeue counts, a
+        // host-timed one's does not.
+        register_known_thread(&mut sched, poller);
+        // The progress the skipped requeue of `rs` adds through step 4.
+        let skip = |sched: &mut Scheduler, rs: &Resources| {
+            sched.runqueue_push_back(poller);
+            let before = sched.run_queue.upgrade_progress();
+            sched.next_turns.get_mut(&poller).unwrap().req = Ivar::full(Ok(rs.clone()));
+            let response = sched.next_turns[&poller].resp.clone();
+            assert_eq!(sched.run_queue.tentative_pop_next(), Some(poller));
+            assert!(sched.step4_resource_block(poller, rs, &response).is_err());
+            assert!(sched.run_queue.remove_tid(poller));
+            sched.run_queue.upgrade_progress() - before
+        };
+        for (rs, advance) in [
+            (&internal, 1),
+            (&named_fifo, 0),
+            (&unknown, 0),
+            (&routing_only, 0),
+            (&finite, 0),
+        ] {
+            assert_eq!(skip(&mut sched, rs), advance, "{rs:?} through step 4");
+        }
+        // (g) A finite-deadline poll's retries interleaved with host-timed
+        // ones, in whatever number virtual time allows before its timeout,
+        // leave the progress where it was.
+        let host = retry(&|_| {});
+        for (finite_retries, host_retries) in [(0, 0), (1, 3), (4, 1), (7, 7)] {
+            let mut added = 0;
+            for _ in 0..host_retries {
+                added += skip(&mut sched, &host);
+            }
+            for _ in 0..finite_retries {
+                added += skip(&mut sched, &finite);
+            }
+            assert_eq!(
+                added, 0,
+                "{finite_retries} finite and {host_retries} host-timed retries"
+            );
+        }
+
+        // (c) Once descriptors may have left the guest, no guest-state poll
+        // counts, guest-held or not.
+        let mut export = Resources::new(DetTid::from_raw(7));
+        export.passes_descriptors_out = true;
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        sched.request_put(&Ivar::new(), export, &global_time);
+        assert!(sched.guest_held_marks_revoked);
+        assert!(!counted(&sched, &guest_held), "(c) guest-held, revoked");
+        assert!(!counted(&sched, &internal), "(c) internal, revoked");
+
+        // Record/replay counts every requeue, as before.
+        let mut sched = Scheduler::new(&config);
+        sched.recordreplay_modes = true;
+        for rs in [
+            &named_fifo,
+            &fifo_open,
+            &unclassified_poll,
+            &unknown,
+            &routing_only,
+            &finite,
+        ] {
+            assert!(counted(&sched, rs), "{rs:?} under record/replay");
+        }
+    }
+
+    /// A delivery noted for the poll upgrade's count alone
+    /// (`note_fatal_signal_delivery`, where the delivery is not committed, as
+    /// in a gdbserver session whose client may cancel the signal) stops the
+    /// count until the reap but dooms no thread: the hand-off, the timed and
+    /// filed-retry upgrades and the idle-poller verdict still see its process
+    /// alive. A committed delivery (`record_committed_fatal_signal`) dooms it
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4892 at
+    /// 67ace93b1).
+    #[test]
+    fn a_fatal_delivery_noted_for_the_count_alone_dooms_no_thread() {
+        let mut sched = Scheduler::new(&ptrace_config());
+        let parent = DetPid::from_raw(100);
+        let writer = DetPid::from_raw(200);
+        sched.thread_tree.add_child(parent, parent, true);
+        sched.thread_tree.add_child(parent, writer, true);
+        let thread = DetTid::from_raw(writer.as_raw());
+        sched.note_fatal_signal_delivery(writer);
+        assert!(sched.a_committed_doom_is_outstanding(), "the count stops");
+        assert!(!sched.thread_is_doomed(thread), "noted: not doomed");
+        sched.record_committed_fatal_signal(writer);
+        assert!(sched.thread_is_doomed(thread), "committed: doomed");
+    }
+
+    /// No polling retry counts while a committed decision has doomed a
+    /// process that has not been reaped (`a_committed_doom_is_outstanding`):
+    /// its descriptors close in the kernel at a host-chosen moment, and a
+    /// parent polling a pipe whose writer is that dying child sees the close
+    /// then (Claude review of https://github.com/rrnewton/hermit/pull/4892,
+    /// blocking). A granted exit, a committed SIGKILL and a delivered fatal
+    /// signal each stop the count, and only the reap restarts it; an exec
+    /// teardown stops it until the exec completes; a SIGKILL whose victim
+    /// the scheduler could not name stops it for good.
+    #[test]
+    fn a_retry_does_not_count_while_a_doomed_process_awaits_its_reap() {
+        let reader = DetTid::from_raw(100);
+        let mut retry = Resources::new(reader);
+        retry.insert(ResourceID::InternalIOPolling, Permission::W);
+        retry.poll_attempt = 2;
+        retry.polls_guest_state_only = true;
+        retry.waits_on_guest_held_only = true;
+        let counted =
+            |sched: &Scheduler| sched.upgrade_progress_of(&retry) == UpgradeProgress::Counts;
+        let parent = DetPid::from_raw(100);
+        let writer = DetPid::from_raw(200);
+        type Doom = fn(&mut Scheduler, DetPid);
+        let dooms: [(&str, Doom); 3] = [
+            ("granted exit", |s, writer| {
+                s.thread_tree.granted_exits.insert(writer);
+            }),
+            ("committed SIGKILL", |s, writer| {
+                s.record_committed_sigkill(DetTid::from_raw(writer.as_raw()), Some(writer));
+            }),
+            ("fatal signal", |s, writer| {
+                s.note_fatal_signal_delivery(writer)
+            }),
+        ];
+        for (name, doom) in dooms {
+            let mut sched = Scheduler::new(&ptrace_config());
+            sched.thread_tree.add_child(parent, parent, true);
+            sched.thread_tree.add_child(parent, writer, true);
+            assert!(counted(&sched), "{name}: before");
+            doom(&mut sched, writer);
+            assert!(!counted(&sched), "{name}: doomed, not reaped");
+            sched.logically_exited_processes.insert(writer);
+            assert!(sched.consume_child_wait(parent, writer), "{name}");
+            assert!(counted(&sched), "{name}: reaped");
+        }
+        // The PI-futex record of a committed SIGKILL (`pi_doomed_processes`)
+        // stops the count on its own as well, until the reap.
+        let mut sched = Scheduler::new(&ptrace_config());
+        sched.thread_tree.add_child(parent, parent, true);
+        sched.thread_tree.add_child(parent, writer, true);
+        sched.pi_doomed_processes.insert(writer);
+        assert!(!counted(&sched), "PI-futex doom: doomed, not reaped");
+        sched.logically_exited_processes.insert(writer);
+        assert!(sched.consume_child_wait(parent, writer), "PI-futex doom");
+        assert!(counted(&sched), "PI-futex doom: reaped");
+        let mut sched = Scheduler::new(&ptrace_config());
+        let caller = DetTid::from_raw(writer.as_raw());
+        let mm = MmId::initial(writer);
+        sched.exec_teardowns.insert(
+            writer,
+            ExecTeardown {
+                caller,
+                mm,
+                siblings: Default::default(),
+                observed: Default::default(),
+            },
+        );
+        assert!(!counted(&sched), "exec teardown in flight");
+        assert!(
+            sched
+                .finish_exec_teardown(caller, writer, mm, false)
+                .is_empty()
+        );
+        assert!(counted(&sched), "exec complete");
+        let mut sched = Scheduler::new(&ptrace_config());
+        sched.record_unresolved_sigkill(None);
+        assert!(!counted(&sched), "an unnamed SIGKILL victim");
+    }
+
+    /// The doom is judged when a retry is filed, as its provenance is: an
+    /// attempt made while a doomed writer's descriptors were still open may
+    /// have failed only because the kernel had not closed them yet, so its
+    /// retry does not count even when it is selected after the reap, at its
+    /// step-4 skip or as the run retry. A retry filed after the reap counts
+    /// (Claude review of https://github.com/rrnewton/hermit/pull/4892, round
+    /// 4b, blocking).
+    #[test]
+    fn a_retry_filed_while_a_process_was_doomed_does_not_count_after_the_reap() {
+        let config = ptrace_config();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let reader = DetTid::from_raw(100);
+        let parent = DetPid::from_raw(100);
+        let writer = DetPid::from_raw(200);
+        let mut sched = Scheduler::new(&config);
+        sched.thread_tree.add_child(parent, parent, true);
+        sched.thread_tree.add_child(parent, writer, true);
+        register_known_thread(&mut sched, reader);
+        let mut retry = Resources::new(reader);
+        retry.insert(ResourceID::InternalIOPolling, Permission::W);
+        retry.poll_attempt = 2;
+        retry.polls_guest_state_only = true;
+        retry.waits_on_guest_held_only = true;
+        let file = |sched: &mut Scheduler| {
+            let filed = Ivar::new();
+            sched.request_put(&filed, retry.clone(), &global_time);
+            match filed.try_read() {
+                Some(Ok(rs)) => rs,
+                other => panic!("filed {other:?}"),
+            }
+        };
+        // The progress the filed retry's step-4 skip adds, and whether its
+        // run retry would count.
+        let requeue = |sched: &mut Scheduler, rs: &Resources| {
+            sched.runqueue_push_back(reader);
+            let before = sched.run_queue.upgrade_progress();
+            sched.next_turns.get_mut(&reader).unwrap().req = Ivar::full(Ok(rs.clone()));
+            let response = sched.next_turns[&reader].resp.clone();
+            assert_eq!(sched.run_queue.tentative_pop_next(), Some(reader));
+            assert!(sched.step4_resource_block(reader, rs, &response).is_err());
+            assert!(sched.run_queue.remove_tid(reader));
+            let run = sched.upgrade_progress_of(&rs.clone().upgraded_to_runnable());
+            (
+                sched.run_queue.upgrade_progress() - before,
+                run == UpgradeProgress::Counts,
+            )
+        };
+        sched.thread_tree.granted_exits.insert(writer);
+        let during = file(&mut sched);
+        assert!(!during.waits_on_guest_held_only, "filed while doomed");
+        sched.logically_exited_processes.insert(writer);
+        assert!(sched.consume_child_wait(parent, writer));
+        assert_eq!(requeue(&mut sched, &during), (0, false), "after the reap");
+        let after = file(&mut sched);
+        assert!(after.waits_on_guest_held_only, "filed after the reap");
+        assert_eq!(
+            requeue(&mut sched, &after),
+            (1, true),
+            "filed after the reap"
+        );
+    }
+
+    /// A requeue whose number depends on host timing does not count toward
+    /// the next poll upgrade, through the scheduler's own paths: a polling
+    /// retry skipped and backed off in step 4, the same retry run and
+    /// requeued in step 6, and a loopback poll's yield. A call's first
+    /// attempt, an ordinary turn and a guest's own `sched_yield` count, and
+    /// under record/replay every requeue counts, as before (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4605).
+    #[test]
+    fn a_host_timed_requeue_does_not_count_toward_a_poll_upgrade() {
+        let poller = DetTid::from_raw(100);
+        let mut first = Resources::new(poller);
+        first.insert(ResourceID::InternalIOPolling, Permission::W);
+        let mut skipped = first.clone();
+        skipped.poll_attempt = 3;
+        let run = skipped.upgraded_to_runnable();
+        let mut sched_yield = Resources::new(poller);
+        sched_yield.insert(ResourceID::SchedYield, Permission::W);
+        let mut loopback = sched_yield.clone();
+        loopback.fyi(LOOPBACK_POLL_YIELD_FYI);
+        let ordinary = Resources::new(poller);
+        let cases = [
+            ("first attempt", &first, UpgradeProgress::Counts),
+            ("skipped retry", &skipped, UpgradeProgress::HostTimed),
+            ("run retry", &run, UpgradeProgress::HostTimed),
+            (
+                "loopback poll's yield",
+                &loopback,
+                UpgradeProgress::HostTimed,
+            ),
+            ("sched_yield", &sched_yield, UpgradeProgress::Counts),
+            ("ordinary turn", &ordinary, UpgradeProgress::Counts),
+        ];
+        for chaos in [false, true] {
+            let mut scheduler = Scheduler::new(&Config {
+                chaos,
+                ..Config::default()
+            });
+            for (name, rs, expected) in &cases {
+                assert_eq!(
+                    scheduler.upgrade_progress_of(rs),
+                    *expected,
+                    "{name}, chaos={chaos}"
+                );
+            }
+            scheduler.recordreplay_modes = true;
+            for (name, rs, _) in &cases {
+                assert_eq!(
+                    scheduler.upgrade_progress_of(rs),
+                    UpgradeProgress::Counts,
+                    "{name} under record/replay, chaos={chaos}"
+                );
+            }
+        }
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        register_known_thread(&mut scheduler, poller);
+        scheduler.runqueue_push_back(poller);
+        let counted = scheduler.run_queue.upgrade_progress();
+        let next = scheduler.next_turns.get(&poller).unwrap();
+        next.req.put(Ok(skipped.clone()));
+        let response = next.resp.clone();
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
+        assert!(
+            scheduler
+                .step4_resource_block(poller, &skipped, &response)
+                .is_err()
+        );
+        assert_eq!(
+            scheduler.run_queue.queued_priority(poller),
+            Some(8 * DEFAULT_PRIORITY),
+            "skipped and backed off"
+        );
+        assert_eq!(
+            scheduler.run_queue.upgrade_progress(),
+            counted,
+            "the skipped retry's requeue"
+        );
+        let runnable = scheduler.next_turns[&poller]
+            .req
+            .try_read()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scheduler.upgrade_progress_of(&runnable),
+            UpgradeProgress::HostTimed
+        );
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(poller), Some(poller));
+        scheduler.step6_reenquue(
+            poller,
+            scheduler.requeue_after(&runnable),
+            scheduler.upgrade_progress_of(&runnable),
+        );
+        assert_eq!(
+            scheduler.run_queue.upgrade_progress(),
+            counted,
+            "the run retry's requeue"
+        );
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(poller), Some(poller));
+        scheduler.step6_reenquue(
+            poller,
+            scheduler.requeue_after(&loopback),
+            scheduler.upgrade_progress_of(&loopback),
+        );
+        assert_eq!(
+            scheduler.run_queue.upgrade_progress(),
+            counted,
+            "the loopback poll's yield"
+        );
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(poller), Some(poller));
+        scheduler.step6_reenquue(
+            poller,
+            scheduler.requeue_after(&ordinary),
+            scheduler.upgrade_progress_of(&ordinary),
+        );
+        assert_eq!(
+            scheduler.run_queue.upgrade_progress(),
+            counted + 1,
+            "an ordinary turn's requeue"
+        );
+    }
+
+    /// Two runs of one chaos seed that differ only in how many host-timed
+    /// retry requeues they make just before a poll upgrade take the same
+    /// change points. With 197 counted queueing operations made, the retries
+    /// add none, so the two change points that bring the count to 199 find
+    /// the last-band poller not yet upgraded in every run and keep their
+    /// draws; the 200th operation upgrades it in every run, and the bound
+    /// then takes the last band behind it at its second pass, as without
+    /// retries. Counting the retries upgraded it before, or between, those
+    /// change points in some runs only (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4605).
+    #[test]
+    fn host_timed_retries_before_a_poll_upgrade_leave_chaos_change_points_alone() {
+        let interval = runqueue::POLLING_UPGRADE_INTERVAL;
+        let mut decisions = Vec::new();
+        for retries in [0, 1, 2, 5, 3 * interval] {
+            let (mut scheduler, spinner, waiter) = chaos_spinner_and_waiter(
+                Config {
+                    chaos: true,
+                    ..Config::default()
+                },
+                500,
+                runqueue::LAST_PRIORITY,
+            );
+            assert!(scheduler.run_queue.remove_tid(waiter));
+            scheduler
+                .run_queue
+                .push_poller(waiter, runqueue::LAST_PRIORITY, 5);
+            // A thread that polls in every run; only its retry count differs.
+            let retrier = DetTid::from_raw(102);
+            register_known_thread(&mut scheduler, retrier);
+            scheduler
+                .run_queue
+                .push_poller(retrier, DEFAULT_PRIORITY, 1);
+            while scheduler.run_queue.upgrade_progress() < interval - 3 {
+                assert!(scheduler.run_queue.remove_tid(spinner));
+                scheduler.runqueue_push_back(spinner);
+            }
+            for attempt in 0..retries {
+                assert!(scheduler.run_queue.remove_tid(retrier));
+                scheduler.run_queue.push_poller_with(
+                    retrier,
+                    DEFAULT_PRIORITY,
+                    2 + (attempt % 2) as u32,
+                    UpgradeProgress::HostTimed,
+                );
+            }
+            let mut taken = Vec::new();
+            for (at, drawn) in [(1, 136), (2, 7043)] {
+                spinner_changepoint(&mut scheduler, spinner, drawn, at);
+                taken.push(scheduler.priorities[&spinner]);
+            }
+            assert_eq!(
+                scheduler.run_queue.upgrade_progress(),
+                interval - 1,
+                "{retries} retries"
+            );
+            assert!(
+                scheduler.chaos_passed_over.is_empty(),
+                "{retries} retries: no upgrade yet, so no pass is counted"
+            );
+            assert!(scheduler.run_queue.remove_tid(spinner));
+            scheduler.runqueue_push_back(spinner);
+            assert!(
+                scheduler.run_queue.can_be_passed_over(waiter),
+                "{retries} retries: the 200th operation upgrades"
+            );
+            for (at, drawn) in [(3, 136), (4, 4756)] {
+                spinner_changepoint(&mut scheduler, spinner, drawn, at);
+                taken.push(scheduler.priorities[&spinner]);
+            }
+            decisions.push(taken);
+        }
+        assert_eq!(decisions[0], [136, 7043, 136, runqueue::LAST_PRIORITY]);
+        assert!(
+            decisions.iter().all(|taken| *taken == decisions[0]),
+            "{decisions:?}"
+        );
+    }
+
+    /// A thread woken from a timed wait goes to the front of its band under
+    /// chaos too, also ahead of a thread chaos change points have passed over
+    /// once and the bound will let through at the next one. Keeping it behind
+    /// such a thread (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4605, finding 1) hid the
+    /// sleep-ordered races chaos searches for: a closed-source timer race
+    /// found at 10 of 11 seeds was found at none
+    /// (https://github.com/rrnewton/hermit/pull/4892, revision 4). The bound
+    /// still lets the passed-over poller through at the next change point.
+    #[test]
+    fn a_timed_wake_goes_to_the_front_of_its_band_beside_a_thread_at_the_chaos_passover_bound() {
+        let next = |scheduler: &mut Scheduler| {
+            let next = scheduler.run_queue.tentative_pop_next();
+            scheduler.run_queue.undo_tentative_pop();
+            next
+        };
+        let (mut scheduler, spinner, poller) = chaos_spinner_and_waiter(
+            Config {
+                chaos: true,
+                ..Config::default()
+            },
+            500,
+            runqueue::LAST_PRIORITY,
+        );
+        assert!(scheduler.run_queue.remove_tid(poller));
+        scheduler
+            .run_queue
+            .push_poller(poller, runqueue::LAST_PRIORITY, 5);
+        scheduler.run_queue.poll_upgrade_now();
+        let sleepers = [DetTid::from_raw(102), DetTid::from_raw(103)];
+        for sleeper in sleepers {
+            register_known_thread(&mut scheduler, sleeper);
+            scheduler
+                .priorities
+                .insert(sleeper, runqueue::LAST_PRIORITY);
+        }
+        spinner_changepoint(&mut scheduler, spinner, 136, 1);
+        assert_eq!(scheduler.chaos_passed_over.get(&poller), Some(&1));
+        assert!(scheduler.run_queue.remove_tid(spinner));
+        for round in 0..4 {
+            let sleeper = sleepers[round % 2];
+            scheduler.wake_timed_event(LogicalTime::from_nanos(2 + round as u64), sleeper);
+            assert_eq!(
+                next(&mut scheduler),
+                Some(sleeper),
+                "round {round}: ahead of the passed-over poller"
+            );
+            assert!(scheduler.run_queue.remove_tid(sleeper));
+        }
+        scheduler.runqueue_push_back(spinner);
+        spinner_changepoint(&mut scheduler, spinner, 136, 6);
+        assert_eq!(
+            scheduler.priorities[&spinner],
+            runqueue::LAST_PRIORITY,
+            "the bound puts the spinner behind the poller"
+        );
+        assert_eq!(next(&mut scheduler), Some(poller));
+    }
+
+    /// The bound's INFO line names a poller only when it alone explains the
+    /// priority taken: not when a non-polling thread starves at the same
+    /// priority too (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4605, finding 2).
+    #[test]
+    fn the_bound_names_a_poller_only_when_no_other_thread_starves_beside_it() {
+        let (mut scheduler, worker, poller) = chaos_spinner_and_waiter(
+            Config {
+                chaos: true,
+                ..Config::default()
+            },
+            runqueue::LAST_PRIORITY,
+            runqueue::LAST_PRIORITY,
+        );
+        assert!(scheduler.run_queue.remove_tid(poller));
+        scheduler
+            .run_queue
+            .push_poller(poller, runqueue::LAST_PRIORITY, 5);
+        scheduler.run_queue.poll_upgrade_now();
+        let last = Some(runqueue::LAST_PRIORITY);
+        let both = [
+            (worker, runqueue::LAST_PRIORITY),
+            (poller, runqueue::LAST_PRIORITY),
+        ];
+        assert_eq!(
+            scheduler.poller_the_bound_retries(&both[1..], last),
+            Some(poller)
+        );
+        assert_eq!(scheduler.poller_the_bound_retries(&both, last), None);
+        assert_eq!(scheduler.poller_the_bound_retries(&both[..1], last), None);
+        assert_eq!(
+            scheduler.poller_the_bound_retries(&both[1..], Some(9000)),
+            None
+        );
     }
 
     /// The bound counts only a thread the new priority still beats, and only
@@ -30625,7 +33491,7 @@ mod test {
                     .put(Ok(continuation));
             }
             assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
-            scheduler.step6_reenquue(yielder, Requeue::YieldEpoch);
+            scheduler.step6_reenquue(yielder, Requeue::YieldEpoch, UpgradeProgress::Counts);
             assert!(scheduler.step2c_process_io_blockers().is_ok());
             assert_eq!(
                 scheduler.blocked.external_io_blockers.get(&background),
@@ -30684,7 +33550,7 @@ mod test {
         );
         assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
-        scheduler.step6_reenquue(yielder, Requeue::YieldEpoch);
+        scheduler.step6_reenquue(yielder, Requeue::YieldEpoch, UpgradeProgress::Counts);
         scheduler.step2e_process_signal_deferred();
         assert!(
             scheduler.blocked.sigchld_deferred.contains(&signaled),
@@ -36937,6 +39803,15 @@ mod test {
         );
         hb.parked.insert(held);
         scheduler.happens_before = Some(hb);
+        // Two queued pollers no attempt can satisfy, which add a headline
+        // class and are named on the run-queue line.
+        let mut pollers = vec![15, 17];
+        if reverse {
+            pollers.reverse();
+        }
+        for dettid in pollers {
+            queued_poller(&mut scheduler, DetTid::from_raw(dettid), true);
+        }
         scheduler
     }
 
@@ -37005,7 +39880,10 @@ mod test {
             "Deadlock detected: thread(s) waiting on futex, and thread(s) waiting \
              indefinitely (pause, or a timer beyond the end of logical time), and \
              thread(s) held at a happens-before gate whose BEFORE anchor cannot fire, \
-             but no runnable threads left.",
+             and thread(s) retrying a pipe or socket-pair call no remaining thread can \
+             satisfy, but no runnable threads left.",
+            "run queue: 2 polling with no possible progress: dtid 15, dtid 17",
+            "dtid 15: InternalIOPolling: W (poll_attempt 1)",
             "dtid 13: HappensBeforeCheckpoint(50): R",
             "dtid 3",
             "dtid 9",

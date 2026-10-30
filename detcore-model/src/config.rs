@@ -1545,6 +1545,25 @@ pub struct Config {
     #[clap(skip)]
     pub in_guest_signal_delivery: bool,
 
+    /// The backend running this configuration is one on which a thread's
+    /// native exit, including the close of a descriptor table the thread
+    /// holds alone (Linux's `exit_files`), finishes before Detcore can select
+    /// another turn. Only then may a polling retry count toward a poll
+    /// upgrade (`Scheduler::retry_follows_guest_actions`): a thread that is
+    /// not its process's last dooms no process, so its private table's close
+    /// would otherwise be a host-timed wake no committed decision covers.
+    ///
+    /// The host sets it, not a flag, when it prepares a run, from its closed
+    /// list of backends, true only for those whose exit ordering is proven
+    /// (`hermit::thread_exits_finish_before_the_next_turn`): ptrace, e9patch
+    /// preprocessing (which runs on ptrace) and DBT. False, the default,
+    /// counts no polling retry, so a configuration nobody prepared, or one a
+    /// custom backend embedding Detcore builds, fails closed whatever its
+    /// `backend` capabilities say. It has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub thread_exits_finish_before_the_next_turn: bool,
+
     /// Whether `--replay-preemptions-from` names a record that carries
     /// callback checkpoints, so priority-history replay ends each annotated
     /// row at its recorded callback endpoint instead of at the first stop that
@@ -3510,6 +3529,9 @@ mod legacy_backend_json {
     /// `in_guest_refuses_host_timed_producers` is false for DBT (it is set
     /// only for in-guest runs), so it is never written and reads as false.
     /// So is `in_guest_signal_delivery`, for the same reason.
+    /// `thread_exits_finish_before_the_next_turn` came after it froze. It is
+    /// never written and reads as false, so DBT's standalone fallback, the
+    /// form's only reader, counts no polling retry toward a poll upgrade.
     /// `launch_image` came after the legacy form froze: it is never written
     /// and reads as unset. DBT's runtime takes it from the coordinator's
     /// configuration instead, which declares DynamoRIO's library as the
@@ -3557,7 +3579,7 @@ mod legacy_backend_json {
     /// `access_trace_max_bytes` came after it too; the scheduler writes the
     /// trace, and `hermit run` refuses it on DBT, so they are never written
     /// and read as unset, 0, unset and unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 44] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 45] = [
         // `chaos_timeslice_range` came after it too: the scheduler draws the
         // slices, not the runtime, so it is never written and reads as unset.
         // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
@@ -3598,6 +3620,7 @@ mod legacy_backend_json {
         "work_span_report",
         "signal_at",
         "in_guest_signal_delivery",
+        "thread_exits_finish_before_the_next_turn",
         "annotated_priority_replay",
         "virtual_cpus",
         "notice_host_network_abstract_binds",
@@ -3748,6 +3771,7 @@ mod legacy_backend_json {
                     | "in_guest_site_patching_off"
                     | "in_guest_refuses_host_timed_producers"
                     | "in_guest_signal_delivery"
+                    | "thread_exits_finish_before_the_next_turn"
                     | "annotated_priority_replay"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
@@ -4095,6 +4119,7 @@ mod legacy_backend_json {
                 | "work_span_report"
                 | "signal_at"
                 | "in_guest_signal_delivery"
+                | "thread_exits_finish_before_the_next_turn"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
@@ -5000,6 +5025,7 @@ mod tests {
                 | "work_span_report"
                 | "signal_at"
                 | "in_guest_signal_delivery"
+                | "thread_exits_finish_before_the_next_turn"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
@@ -5042,6 +5068,7 @@ mod tests {
         // `mountinfo_mount_namespace`, `directory_placeholder`,
         // `container_procfs`, `signal_delivery_check_fatal`,
         // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
+        // `thread_exits_finish_before_the_next_turn`,
         // `annotated_priority_replay`, `virtual_cpus`, `replay_edited_preemptions`,
         // `notice_host_network_abstract_binds`, `eager_lone_preemptions`,
         // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
@@ -5049,9 +5076,9 @@ mod tests {
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes` and
         // `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-three fewer, so twenty-nine keys fewer than fields.
+        // forty-four fewer, so thirty keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 29);
+        assert_eq!(fields.len(), keys.len() + 30);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6372,6 +6399,53 @@ mod tests {
             .expect("the field is serialized");
         let decoded: Config = serde_json::from_value(encoded).unwrap();
         assert!(!decoded.replay_edited_preemptions);
+    }
+
+    /// `thread_exits_finish_before_the_next_turn` reaches every Tool image
+    /// and coordinator-built configuration through Reverie's bincode
+    /// handshake unchanged, and reads back as false from a JSON configuration
+    /// without the key (its serde default) and from the legacy form, which
+    /// never carries it: whatever does not state it counts no polling retry.
+    #[test]
+    fn thread_exit_ordering_round_trips_and_defaults_to_false() {
+        assert!(!Config::default().thread_exits_finish_before_the_next_turn);
+        for on in [false, true] {
+            let config = Config {
+                thread_exits_finish_before_the_next_turn: on,
+                backend: BackendCapabilities::DBT,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.thread_exits_finish_before_the_next_turn, on);
+            let json: Config =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(json.thread_exits_finish_before_the_next_turn, on);
+            let legacy = to_legacy_backend_json(&config).unwrap();
+            assert!(
+                !legacy.contains("thread_exits_finish_before_the_next_turn"),
+                "{legacy}"
+            );
+            assert!(
+                !from_legacy_backend_json(&legacy)
+                    .unwrap()
+                    .thread_exits_finish_before_the_next_turn
+            );
+        }
+        let mut encoded = serde_json::to_value(Config {
+            thread_exits_finish_before_the_next_turn: true,
+            ..Config::default()
+        })
+        .unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("thread_exits_finish_before_the_next_turn")
+            .expect("the field is serialized");
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.thread_exits_finish_before_the_next_turn);
     }
 
     /// The gate reaches every Tool image through Reverie's bincode handshake
