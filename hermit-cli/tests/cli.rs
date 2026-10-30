@@ -56331,12 +56331,18 @@ fn chosen_json_requires_provenance_before_the_cli_starts_the_guest() {
         let mut value = serde_json::json!({
             "per_thread": {}, "global": [],
             "guest_ids": detcore_model::pid::GuestIds::Chosen { base: 5000, refuse_host_ids: true },
-            "format_version": 3,
-            "time_skips": []
+            "format_version": 3
         });
         if let Some(metadata) = metadata {
             value["reserved_input"] = metadata;
         }
+        // Reach the provenance gate with a valid format-3 fixture: an empty
+        // time-skip history has its canonical omitted representation.
+        assert!(value.get("time_skips").is_none());
+        let fixture: detcore::preemptions::PreemptionRecord =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(fixture.format_version(), Some(3));
+        fixture.validate_format().unwrap();
         fs::write(&schedule, serde_json::to_vec(&value).unwrap()).unwrap();
         for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
             let args = [
