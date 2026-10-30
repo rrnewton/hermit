@@ -135,6 +135,12 @@ pub struct PreemptionRecord {
     /// is nonzero. Zero, and absent, for a run that counted none, for other
     /// architectures, and for records written before the field existed.
     store_exclusive_failures: HostObservedCount,
+    /// The `--sched-seed` of the run that produced this record (`--seed`
+    /// sets it too): the seed of the scheduler's own random choices, which a
+    /// replay makes too wherever the record does not decide them. `None` for
+    /// records written before the field existed, and for records synthesized
+    /// in memory.
+    sched_seed: Option<u64>,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -187,6 +193,7 @@ impl PreemptionRecord {
             expired_wait_runs_charged_once: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
+            sched_seed: None,
         }
     }
 
@@ -251,6 +258,7 @@ impl PreemptionRecord {
             host_inputs,
             store_exclusive_failures: _,
             replay_departed_at,
+            sched_seed,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -303,6 +311,7 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             // A prefix of an inexact record is inexact too.
             replay_departed_at: *replay_departed_at,
+            sched_seed: *sched_seed,
         }
     }
 
@@ -431,6 +440,26 @@ impl PreemptionRecord {
         self
     }
 
+    /// The same record, stating the guest random seed (`--rng-seed`) of the
+    /// trials it came from (`None` for unknown). Every record analyze,
+    /// minimize or bisect writes from trials carries it, so that replaying it
+    /// gives the guest the trials' random values
+    /// (https://github.com/rrnewton/hermit/issues/4868).
+    pub fn with_rng_seed(mut self, rng_seed: Option<u64>) -> Self {
+        self.rng_seed = rng_seed;
+        self
+    }
+
+    /// The same record, stating the scheduler seed (`--sched-seed`) of the
+    /// run it came from (`None` for unknown), as [`Self::with_rng_seed`]
+    /// states the guest random seed: a schedule analyze writes for a trial
+    /// carries the target run's, so that replaying it makes the choices the
+    /// schedule leaves open as the target did.
+    pub fn with_sched_seed(mut self, sched_seed: Option<u64>) -> Self {
+        self.sched_seed = sched_seed;
+        self
+    }
+
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
     pub fn extract_all(&self) -> BTreeMap<DetTid, ThreadHistory> {
         self.per_thread.clone()
@@ -508,6 +537,7 @@ impl PreemptionRecord {
             host_inputs: self.host_inputs.clone(),
             // A count of this run's host, not part of the preemptions.
             store_exclusive_failures: HostObservedCount::default(),
+            sched_seed: self.sched_seed,
         }
     }
 
@@ -576,6 +606,7 @@ impl PreemptionRecord {
             expired_wait_runs_charged_once: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
+            sched_seed: None,
         }
     }
 
@@ -1724,6 +1755,26 @@ mod tests {
         }
     }
 
+    /// The scheduler seed of the recorded run is a setting of the whole run,
+    /// as the guest random seed is: a prefix of the schedule keeps it,
+    /// whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_scheduler_seed() {
+        let tid = DetTid::from_raw(3);
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ]);
+        record.sched_seed = Some(7654321);
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).sched_seed,
+                Some(7654321),
+                "prefix of {len} events"
+            );
+        }
+    }
+
     /// A replay of a schedule's first events keeps the callback checkpoints
     /// of the slices those events end, for the threads they run, and no later
     /// ones: the slice end at the prefix's own end belongs to the event after
@@ -2105,6 +2156,13 @@ impl PreemptionWriter {
         self.inner.guest_ids = (ids != detcore_model::pid::GuestIds::Namespace).then_some(ids);
     }
 
+    /// Store the seed of the scheduler's own random choices, so a replay can
+    /// make them as the recording did.
+    pub fn with_sched_seed(mut self, sched_seed: u64) -> Self {
+        self.inner.sched_seed = Some(sched_seed);
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -2424,6 +2482,18 @@ pub fn read_recorded_rng_seed(path: &Path) -> Result<Option<u64>, String> {
         rng_seed: Option<u64>,
     }
     Ok(boundary_recording::read_settings::<RngSeedOnly>(path)?.rng_seed)
+}
+
+/// Read only the `--sched-seed` stored in a preemption record file, as
+/// [`read_recorded_rng_seed`] reads the guest random seed. `Ok(None)` means the
+/// record predates the field.
+pub fn read_recorded_sched_seed(path: &Path) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct SchedSeedOnly {
+        #[serde(default)]
+        sched_seed: Option<u64>,
+    }
+    Ok(boundary_recording::read_settings::<SchedSeedOnly>(path)?.sched_seed)
 }
 
 /// Read only the `--pipe-wake-latency` stored in a preemption record file, as

@@ -1423,6 +1423,20 @@ pub struct RunOpts {
     #[clap(skip)]
     chaos_timeslice_adopted: bool,
 
+    /// Clap provenance: whether `--seed` (or `HERMIT_PRNG`) was given rather
+    /// than defaulted, so a schedule replay can refuse one that contradicts
+    /// the recording instead of overriding it. Fails closed, as
+    /// `max_timeslice_explicit` does: a caller that never captured the source
+    /// (`capture_max_timeslice_source`) has its seed treated as given.
+    #[clap(skip = true)]
+    seed_explicit: bool,
+
+    /// Runtime-only: the record [`Self::adopt_replayed_rng_seed`] last took
+    /// seeds from and what it changed, so that preparing the same record again
+    /// changes nothing.
+    #[clap(skip)]
+    replay_seeds_prepared: Option<PreparedReplaySeeds>,
+
     /// Runtime-only: the seed `--seed-from` chose, which `--save-config`
     /// writes in its place.
     #[clap(skip)]
@@ -4769,6 +4783,50 @@ fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
     );
 }
 
+/// What [`RunOpts::adopt_replayed_rng_seed`] did for one replayed record.
+#[derive(Debug, Clone)]
+struct PreparedReplaySeeds {
+    /// The replayed record.
+    record: PathBuf,
+    /// The guest random seed and the scheduler seed before any was adopted.
+    before: (Option<u64>, Option<u64>),
+    /// The seeds adopted from the record.
+    adopted: detcore_model::summary::AdoptedSeeds,
+}
+
+/// The seed a schedule replay adopts for `option` from the recorded seed
+/// `recorded` of the record at `path`: `Some` when the run omitted it.
+/// `explicit` is the run's own `option`, `global` its explicit `--seed`. One
+/// that differs from the record is refused, naming both and `consequence`,
+/// or kept when there is no `consequence`: a different scheduler seed
+/// changes nothing the record decides.
+fn adopted_seed(
+    option: &str,
+    consequence: Option<&str>,
+    explicit: Option<u64>,
+    global: Option<u64>,
+    recorded: Option<u64>,
+    path: &std::path::Path,
+) -> Result<Option<u64>, Error> {
+    let Some(recorded) = recorded else {
+        return Ok(None);
+    };
+    let (given, spelled) = match (explicit, global) {
+        (Some(seed), _) => (seed, format!("{option}={seed}")),
+        (None, Some(seed)) => (seed, format!("--seed={seed}")),
+        (None, None) => return Ok(Some(recorded)),
+    };
+    let Some(consequence) = consequence.filter(|_| given != recorded) else {
+        return Ok(None);
+    };
+    Err(Error::new(PolicyRefusal).context(format!(
+        "the explicit {spelled} differs from the seed {recorded} that {} was recorded under: \
+         {consequence}, so the recorded schedule cannot reproduce it. Omit it to replay with the \
+         recorded seed, or pass {option}={recorded}.",
+        path.display(),
+    )))
+}
+
 #[test]
 fn marked_replay_records_are_refused_before_the_container() {
     use detcore::preemptions::PreemptionRecord;
@@ -4877,19 +4935,39 @@ fn replay_takes_the_recorded_rng_seed_and_refuses_another() {
     fs::write(&record, r#"{"per_thread":{},"global":[],"rng_seed":6}"#).unwrap();
     let replay_arg = format!("--replay-schedule-from={}", record.display());
 
-    let mut omitted =
-        RunOpts::parse_from(["fakehermit", "--seed=1", replay_arg.as_str(), "fakeprog"]);
+    // No --seed: the recorded guest seed is adopted. The record stores no
+    // scheduler seed, so that one stays the default.
+    let mut omitted = run_opts_for(&["hermit", "run", replay_arg.as_str(), "fakeprog"]);
     omitted.adopt_replayed_rng_seed().unwrap();
     let config = &omitted.det_opts.det_config;
-    assert_eq!(
-        config.rng_seed(),
-        6,
-        "the recorded seed replaces the one --seed implies"
+    assert_eq!(config.rng_seed(), 6, "the recorded seed is adopted");
+    assert_eq!(config.sched_seed(), 0, "no recorded schedule seed to adopt");
+
+    // A RunOpts whose seed's source was never captured treats it as given.
+    let mut uncaptured =
+        RunOpts::parse_from(["fakehermit", "--seed=1", replay_arg.as_str(), "fakeprog"]);
+    let refusal = uncaptured.adopt_replayed_rng_seed().unwrap_err();
+    assert!(
+        format!("{refusal:#}").contains("--seed=1 differs from the seed 6"),
+        "{refusal:#}"
     );
-    assert_eq!(
-        config.sched_seed(),
-        1,
-        "the schedule seed stays the caller's"
+
+    // --seed-from is refused with any replay.
+    let mut drawn = run_opts_for(&[
+        "hermit",
+        "run",
+        "--seed-from=SystemRandom",
+        replay_arg.as_str(),
+        "fakeprog",
+    ]);
+    let refusal = drawn.adopt_replayed_rng_seed().unwrap_err();
+    assert!(
+        refusal.downcast_ref::<PolicyRefusal>().is_some(),
+        "{refusal:#}"
+    );
+    assert!(
+        format!("{refusal:#}").contains("Omit --seed-from"),
+        "{refusal:#}"
     );
 
     let mut explicit = RunOpts::parse_from([
@@ -5244,6 +5322,120 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
     assert_eq!(
         bare.det_opts.det_config.max_timeslice,
         explicit.det_opts.det_config.max_timeslice
+    );
+}
+
+/// A replay takes the scheduler seed from the record as it takes the guest
+/// random seed, and says so in its summary. An explicit `--seed` that
+/// contradicts the recorded guest seed is refused, naming `--seed`; another
+/// explicit `--sched-seed` is kept; a `--seed` that agrees adopts nothing.
+#[test]
+fn replay_takes_the_recorded_seeds_and_refuses_a_contradicting_seed() {
+    let directory = tempfile::tempdir().unwrap();
+    let record = directory.path().join("schedule.preempts");
+    fs::write(
+        &record,
+        r#"{"per_thread":{},"global":[],"rng_seed":6,"sched_seed":7}"#,
+    )
+    .unwrap();
+    let replay_arg = format!("--replay-preemptions-from={}", record.display());
+
+    let mut omitted = run_opts_for(&["hermit", "run", replay_arg.as_str(), "fakeprog"]);
+    omitted.adopt_replayed_rng_seed().unwrap();
+    let config = &omitted.det_opts.det_config;
+    assert_eq!((config.rng_seed(), config.sched_seed()), (6, 7));
+    assert_eq!(
+        config.replay_adopted_seeds,
+        Some(detcore_model::summary::AdoptedSeeds {
+            rng: Some(6),
+            sched: Some(7)
+        })
+    );
+
+    let mut contradicting =
+        run_opts_for(&["hermit", "run", "--seed=1", replay_arg.as_str(), "fakeprog"]);
+    let refusal = contradicting
+        .adopt_replayed_rng_seed()
+        .expect_err("--seed contradicts the recorded seeds");
+    assert!(
+        refusal.downcast_ref::<PolicyRefusal>().is_some(),
+        "{refusal:#}"
+    );
+    assert!(
+        format!("{refusal:#}").contains("--seed=1 differs from the seed 6"),
+        "{refusal:#}"
+    );
+
+    // --sched-seed alone agrees; the guest random seed is still adopted.
+    let mut partial = run_opts_for(&[
+        "hermit",
+        "run",
+        "--sched-seed=7",
+        replay_arg.as_str(),
+        "fakeprog",
+    ]);
+    partial.adopt_replayed_rng_seed().unwrap();
+    assert_eq!(
+        partial.det_opts.det_config.replay_adopted_seeds,
+        Some(detcore_model::summary::AdoptedSeeds {
+            rng: Some(6),
+            sched: None
+        })
+    );
+    // Another explicit --sched-seed is kept: the record decides the schedule.
+    let mut other_sched = run_opts_for(&[
+        "hermit",
+        "run",
+        "--sched-seed=8",
+        replay_arg.as_str(),
+        "fakeprog",
+    ]);
+    other_sched.adopt_replayed_rng_seed().unwrap();
+    let config = &other_sched.det_opts.det_config;
+    assert_eq!((config.rng_seed(), config.sched_seed()), (6, 8));
+
+    // A --seed that agrees with both adopts nothing.
+    fs::write(
+        &record,
+        r#"{"per_thread":{},"global":[],"rng_seed":6,"sched_seed":6}"#,
+    )
+    .unwrap();
+    let mut agreeing =
+        run_opts_for(&["hermit", "run", "--seed=6", replay_arg.as_str(), "fakeprog"]);
+    agreeing.adopt_replayed_rng_seed().unwrap();
+    assert_eq!(agreeing.det_opts.det_config.replay_adopted_seeds, None);
+}
+
+/// `RunOpts::run`, which in-process callers such as `hermit analyze` launch
+/// through, takes a replayed record's seeds as `main` does: a guest random
+/// seed given explicitly that contradicts the record is refused with `hermit
+/// run`'s refusal before anything is launched.
+#[test]
+fn run_takes_a_replayed_records_seeds_as_main_does() {
+    let directory = tempfile::tempdir().unwrap();
+    let record = directory.path().join("schedule.preempts");
+    fs::write(
+        &record,
+        r#"{"per_thread":{},"global":[],"rng_seed":6,"sched_seed":7}"#,
+    )
+    .unwrap();
+    let replay_arg = format!("--replay-preemptions-from={}", record.display());
+    let args =
+        crate::Args::try_parse_from(["hermit", "run", "--rng-seed=1", &replay_arg, "fakeprog"])
+            .unwrap();
+    let crate::Subcommand::Run(options) = args.command else {
+        unreachable!()
+    };
+    let refusal = options
+        .run(&args.global, true)
+        .expect_err("--rng-seed=1 contradicts the recorded guest random seed");
+    assert!(
+        refusal.downcast_ref::<PolicyRefusal>().is_some(),
+        "{refusal:#}"
+    );
+    assert!(
+        format!("{refusal:#}").contains("--rng-seed=1 differs from the seed 6"),
+        "{refusal:#}"
     );
 }
 
@@ -8968,49 +9160,104 @@ impl RunOpts {
         Ok(())
     }
 
-    /// Replay a preemption or schedule record with the guest random seed it was
-    /// recorded under.
+    /// Replay a preemption or schedule record with the seeds it was recorded
+    /// under: the guest's random seed and the scheduler's.
     ///
-    /// `--seed` also seeds what the guest reads as randomness (getrandom,
-    /// `/dev/urandom`), so a replay at another `--seed`, or at the default one,
-    /// handed the guest other values than the recording did and desynced from
-    /// the schedule it replays. An omitted `--rng-seed` now takes the recorded
-    /// one, and a different explicit one is refused before anything is
-    /// launched. A record written before the seed was stored is replayed as
-    /// before.
-    fn adopt_replayed_rng_seed(&mut self) -> Result<(), Error> {
+    /// `--seed` seeds both what the guest reads as randomness (getrandom,
+    /// `/dev/urandom`) and the scheduler's own random choices, which a replay
+    /// still makes wherever the record does not decide them, so a replay under
+    /// other seeds could leave the schedule it replays. For each seed the
+    /// record stores, a run that omits it (`--rng-seed`, `--sched-seed`, and
+    /// `--seed` for both) takes the recorded one, and the run's summary says
+    /// so (`Config::replay_adopted_seeds`). A guest random seed given
+    /// explicitly, by its own option or by `--seed`, that differs is refused
+    /// before anything is launched, naming both. A different explicit
+    /// scheduler seed is kept: the record decides the schedule wherever it
+    /// records a decision. A record written before a seed was stored is
+    /// replayed as before for that seed.
+    ///
+    /// Every launch of a recorded run goes through this: `main` before it
+    /// reads stdin, and [`Self::run`] for every caller, among them `hermit
+    /// analyze`'s trials, which also call it before their validation and
+    /// reproducer (`RunData::launch`). It is idempotent: preparing the same
+    /// record again changes nothing, and preparing another record first takes
+    /// back what the earlier one adopted, where the options still hold it.
+    pub(crate) fn adopt_replayed_rng_seed(&mut self) -> Result<(), Error> {
         if self.namespace_only {
             return Ok(());
         }
         let config = &self.det_opts.det_config;
-        let Some(path) = config
+        let path = config
             .replay_preemptions_from
             .clone()
-            .or_else(|| config.replay_schedule_from.clone())
-        else {
-            return Ok(());
-        };
-        let Some(recorded) =
-            detcore::preemptions::read_recorded_rng_seed(&path).map_err(Error::msg)?
-        else {
-            return Ok(());
-        };
-        match self.det_opts.det_config.rng_seed {
-            None => {
-                self.det_opts.det_config.rng_seed = Some(recorded);
-                Ok(())
+            .or_else(|| config.replay_schedule_from.clone());
+        if let Some(prepared) = self.replay_seeds_prepared.take() {
+            if path.as_ref() == Some(&prepared.record) {
+                self.replay_seeds_prepared = Some(prepared);
+                return Ok(());
             }
-            Some(explicit) if explicit != recorded => {
-                Err(Error::new(PolicyRefusal).context(format!(
-                    "the explicit --rng-seed={explicit} differs from the seed {recorded} that {} \
-                     was recorded under. The guest would read other random values than the \
-                     recorded run did, so the recorded schedule cannot reproduce it. Omit \
-                     --rng-seed to replay with the recorded seed, or pass --rng-seed={recorded}.",
-                    path.display(),
-                )))
+            let config = &mut self.det_opts.det_config;
+            if prepared.adopted.rng.is_some() && config.rng_seed == prepared.adopted.rng {
+                config.rng_seed = prepared.before.0;
             }
-            Some(_) => Ok(()),
+            if prepared.adopted.sched.is_some() && config.sched_seed == prepared.adopted.sched {
+                config.sched_seed = prepared.before.1;
+            }
+            config.replay_adopted_seeds = None;
         }
+        let Some(path) = path else {
+            return Ok(());
+        };
+        let config = &self.det_opts.det_config;
+        // --seed-from draws a fresh seed, and a replay takes its seeds from
+        // the record: the two contradict each other whatever is drawn.
+        if self.seed_from.is_some() {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "--seed-from draws a new seed, but {} is replayed with the seeds it was recorded \
+                 under. Omit --seed-from.",
+                path.display(),
+            )));
+        }
+        let recorded_rng =
+            detcore::preemptions::read_recorded_rng_seed(&path).map_err(Error::msg)?;
+        let recorded_sched =
+            detcore::preemptions::read_recorded_sched_seed(&path).map_err(Error::msg)?;
+        let global = self.seed_explicit.then_some(config.seed);
+        let rng = adopted_seed(
+            "--rng-seed",
+            Some("the guest would read other random values than the recorded run did"),
+            config.rng_seed,
+            global,
+            recorded_rng,
+            &path,
+        )?;
+        // An explicit scheduler seed that differs is kept rather than
+        // refused: the record decides the schedule wherever it records a
+        // decision, and a replay under another scheduler seed follows it.
+        let sched = adopted_seed(
+            "--sched-seed",
+            None,
+            config.sched_seed,
+            global,
+            recorded_sched,
+            &path,
+        )?;
+        let config = &mut self.det_opts.det_config;
+        let before = (config.rng_seed, config.sched_seed);
+        if let Some(seed) = rng {
+            config.rng_seed = Some(seed);
+        }
+        if let Some(seed) = sched {
+            config.sched_seed = Some(seed);
+        }
+        let adopted = detcore_model::summary::AdoptedSeeds { rng, sched };
+        config.replay_adopted_seeds = adopted.any().then_some(adopted);
+        self.replay_seeds_prepared = Some(PreparedReplaySeeds {
+            record: path,
+            before,
+            adopted,
+        });
+        Ok(())
     }
 
     /// Refuse to replay a preemption or schedule record made under another
@@ -12294,6 +12541,9 @@ impl RunOpts {
         // Analyze and other in-process callers bypass the outer CLI entry.
         self.refuse_an_invalid_replayed_record()?;
         let mut options = self.clone();
+        // A recorded run is launched with its record's seeds, whoever calls;
+        // for `main`, which took them already, this changes nothing.
+        options.adopt_replayed_rng_seed()?;
         options.det_opts.det_config.annotated_priority_replay =
             options.annotated_priority_replay_admission()?;
         let network_trace = options.open_network_trace()?;
@@ -14036,6 +14286,9 @@ impl RunOpts {
     pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
         self.max_timeslice_explicit =
             matches.value_source("max_timeslice") != Some(clap::parser::ValueSource::DefaultValue);
+        self.seed_explicit = matches
+            .value_source("seed")
+            .is_some_and(|source| source != clap::parser::ValueSource::DefaultValue);
     }
 
     /// The maximum timeslice `--chaos-seeded-timeslice` drew from the

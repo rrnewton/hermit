@@ -440,6 +440,10 @@ fn publish_ordering_schedule_command(seed: u64, schedule: &Path) -> Command {
         ])
         .arg(EPOCH)
         .arg(format!("--seed={seed}"))
+        // One guest random seed for every schedule: bisect replays both under
+        // one and refuses records made under two
+        // (https://github.com/rrnewton/hermit/issues/4868).
+        .arg("--rng-seed=0")
         .arg(format!("--record-preemptions-to={}", schedule.display()))
         .arg(&stress_binaries().concurrency)
         .args(["publish-ordering", "2"]);

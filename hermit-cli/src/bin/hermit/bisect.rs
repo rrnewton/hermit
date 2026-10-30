@@ -143,6 +143,7 @@ impl BisectOpts {
             // the run arguments' --timeout alone.
             trial_timeout: crate::analyze::TrialTimeout::Off,
             endpoints: Default::default(),
+            trial_sched_seed: Default::default(),
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
@@ -165,6 +166,12 @@ impl BisectOpts {
         analyzer.adopt_recorded_epoch(&[("--good", &self.good), ("--bad", &self.bad)])?;
         // Every replay charges expired timed waits as the failing schedule did.
         analyzer.adopt_expired_wait_charge(Some(&self.bad))?;
+        // And with the guest random seed they were recorded under: each
+        // trial's schedule is written anew without one too
+        // (https://github.com/rrnewton/hermit/issues/4868).
+        analyzer.adopt_trial_rng_seed(&[("--good", &self.good), ("--bad", &self.bad)])?;
+        // And with the failing schedule's scheduler seed.
+        analyzer.adopt_trial_sched_seed(Some(&self.bad))?;
         // Every replay registers queued sleeps as the failing schedule did.
         analyzer.adopt_recorded_timeslice(&[("--good", &self.good), ("--bad", &self.bad)])?;
         analyzer.refuse_recordings_under_another_pipe_wake_latency(&[
@@ -730,6 +737,94 @@ mod tests {
             error
                 .to_string()
                 .contains(&format!("pass --epoch={RECORDED_RFC3339}")),
+            "{error:#}"
+        );
+    }
+
+    /// Bisect replays with the guest random seed its schedules were recorded
+    /// under, as `hermit run` does when it replays one
+    /// (https://github.com/rrnewton/hermit/issues/4868). Before, every replay
+    /// gave the guest the run arguments' random seed, 0 unless given, so a
+    /// failing schedule recorded under another seed replayed to the passing
+    /// outcome. Schedules under two seeds, and a different explicit
+    /// `--rng-seed`, are refused before any replay.
+    #[test]
+    fn bisect_replays_with_the_guest_random_seed_its_schedules_were_recorded_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let trials = |good: Option<u64>, bad: Option<u64>, run_args: &[&str]| {
+            let (good_path, bad_path) = schedules_with_epochs(dir, None, None);
+            for (path, seed) in [(&good_path, good), (&bad_path, bad)] {
+                let mut record: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+                if let Some(seed) = seed {
+                    record["rng_seed"] = serde_json::Value::from(seed);
+                }
+                fs::write(path, record.to_string()).unwrap();
+            }
+            let good = format!("--good={}", good_path.display());
+            let bad = format!("--bad={}", bad_path.display());
+            let mut argv = vec!["hermit", "bisect", good.as_str(), bad.as_str(), "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Bisect(options) = args.command else {
+                panic!("{argv:?} is not bisect")
+            };
+            let (mut analyzer, _, _) = options.prepare(&args.global)?;
+            analyzer.tmp_dir = Some(dir.to_path_buf());
+            Ok::<_, Error>(analyzer)
+        };
+
+        // Schedules without a seed change nothing.
+        let unseeded = trials(None, None, &[]).unwrap();
+        assert_eq!(unseeded.run_arg, ["--expired-wait-charge=each"]);
+
+        // The recorded seed, from either schedule or both, also over the run
+        // arguments' --seed, which seeds the scheduler.
+        for (good, bad, run_args) in [
+            (Some(7), Some(7), &[][..]),
+            (Some(7), None, &[][..]),
+            (None, Some(7), &[][..]),
+            (Some(7), Some(7), &["--seed=3"][..]),
+        ] {
+            let seeded = trials(good, bad, run_args).unwrap();
+            assert_eq!(
+                seeded.trial_rng_seeds_for_test(),
+                (7, 7),
+                "{good:?} / {bad:?} / {run_args:?}"
+            );
+        }
+
+        // An equal explicit --rng-seed adds no second one; a different one is
+        // refused, naming the remedy.
+        let explicit = trials(Some(7), Some(7), &["--rng-seed=7"]).unwrap();
+        assert_eq!(explicit.run_arg, ["--expired-wait-charge=each"]);
+        let error = trials(Some(7), Some(7), &["--rng-seed=3"]).unwrap_err();
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert!(error.to_string().contains("pass --rng-seed=7"), "{error:#}");
+
+        // A record the run arguments replay takes part as well.
+        fs::create_dir_all(dir.join("replayed")).unwrap();
+        let (replayed, _) = schedules_with_epochs(&dir.join("replayed"), None, None);
+        let mut record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&replayed).unwrap()).unwrap();
+        record["rng_seed"] = serde_json::Value::from(7);
+        fs::write(&replayed, record.to_string()).unwrap();
+        let replayed = format!("--replay-preemptions-from={}", replayed.display());
+        let from_run_arguments = trials(None, None, &[&replayed]).unwrap();
+        assert_eq!(from_run_arguments.trial_rng_seeds_for_test(), (7, 7));
+
+        // Schedules under two seeds are refused, naming both.
+        let error = trials(Some(1), Some(7), &[]).unwrap_err();
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains("was recorded under the guest random seed 1 and --bad")
+                && error
+                    .to_string()
+                    .contains("Record both runs with the same --rng-seed"),
             "{error:#}"
         );
     }

@@ -1901,7 +1901,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
-    ("test.hermit_unit", 1289),
+    // And bisect::tests::bisect_replays_with_the_guest_random_seed_its_schedules_were_recorded_under
+    // and analyze::phases::tests::analyze_replays_records_with_the_guest_random_seed_they_were_recorded_under
+    // and analyze::phases::tests::analyze_trials_of_a_seeded_target_take_its_guest_random_seed
+    // (https://github.com/rrnewton/hermit/issues/4868): 1292.
+    // And run::replay_takes_the_recorded_seeds_and_refuses_a_contradicting_seed
+    // (the scheduler seed too, and an explicit --seed checked): 1293, listed.
+    // And analyze::phases::tests::analyze_trials_replay_a_record_under_its_recorded_seeds
+    // and run::run_takes_a_replayed_records_seeds_as_main_does (every launch
+    // takes a replayed record's seeds): 1295.
+    // And analyze::phases::tests::analyze_trials_take_the_targets_scheduler_seed_and_endpoints_their_own: 1296.
+    ("test.hermit_unit", 1296),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3148,7 +3158,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4897 adds two detcore units: 2979 + 2 = 2981, re-measured at this integration head.
     // The 4843 overshoot fix adds eighteen detcore units: 2981 + 18 = 2999, re-measured at this integration head.
     // The socketpair readiness increment adds one detcore unit: 2999 + 1 = 3000, re-measured at this integration head.
-    ("test.detcore_unit", 3000),
+    // And scheduler::test::a_recorded_schedule_stores_the_scheduler_seed: 3001,
+    // listed.
+    // And a_schedule_prefix_keeps_the_scheduler_seed, for main's prefix
+    // records: 3002.
+    // And record_serde::tests::the_scheduler_seed_round_trips_through_the_record_serde: 3003.
+    ("test.detcore_unit", 3003),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5537,7 +5552,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4897 units: 2979 + 2 = 2981.
     // The same eighteen 4843 overshoot fix units: 2981 + 18 = 2999.
     // The same socketpair readiness unit: 2999 + 1 = 3000.
-    ("test.detcore_unit_on_host", 3000),
+    // And the same recorded scheduler-seed unit: 3001, listed.
+    // And the same prefix scheduler-seed unit: 3002.
+    // And the same record-serde round trip: 3003.
+    ("test.detcore_unit_on_host", 3003),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5930,7 +5948,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
-    ("test.hermit_unit_on_host", 1283),
+    // And the same three trial-guest-random-seed units: 1286.
+    // And the same recorded-seeds replay test: 1287, listed.
+    // And the same two replayed-seed tests: 1289.
+    // And the same trial scheduler-seed test: 1290.
+    ("test.hermit_unit_on_host", 1290),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -11182,7 +11204,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"super"########,
         job: r########"weekly_portable_chaos_cases"########,
         desc: r########"Weekly portable chaos cases"########,
-        description: r########"Runs the non-ignored tests of hermit-cli/tests/stress_suite.rs on one thread: chaos_finds_and_reproduces_order_violation and schedule_bisect_localizes_publish_ordering_race (the --skip of slow_cas_search_and_replay has no effect, as that test is ignored). Both use `hermit run --base-env=minimal --chaos --sched-heuristic=random --max-timeslice=disabled --no-virtualize-cpuid --seed=N` on the default ptrace backend with a 10-second timeout per run, so no PMU is needed. The first requires tests/chaos/order_violation.c to print "Hello world!" without chaos, one of seeds 0-15 to expose the race, and the first such seed to reproduce "ERROR! global_str is null at use." twice. It names no seed, because the seed depends on the guest binary: 9 when built on the validation host, 8 in the pinned validate root. The second records preemptions, under one fixed epoch, for a passing and a failing publish-ordering seed among seeds 0-39 (all of 0-9 expose the race in the pinned root), then requires `hermit bisect` to localize the divergence to two adjacent events with stack traces. The binary also runs in test.hermit_integration. A failure is blocking for the super validation."########,
+        description: r########"Runs the non-ignored tests of hermit-cli/tests/stress_suite.rs on one thread: chaos_finds_and_reproduces_order_violation and schedule_bisect_localizes_publish_ordering_race (the --skip of slow_cas_search_and_replay has no effect, as that test is ignored). Both use `hermit run --base-env=minimal --chaos --sched-heuristic=random --max-timeslice=disabled --no-virtualize-cpuid --seed=N` on the default ptrace backend with a 10-second timeout per run, so no PMU is needed. The first requires tests/chaos/order_violation.c to print "Hello world!" without chaos, one of seeds 0-15 to expose the race, and the first such seed to reproduce "ERROR! global_str is null at use." twice. It names no seed, because the seed depends on the guest binary: 9 when built on the validation host, 8 in the pinned validate root. The second records preemptions, under one fixed epoch and with --rng-seed=0 (bisect refuses records made under two guest random seeds), for a passing and a failing publish-ordering seed among seeds 0-39 (all of 0-9 exposed the race in the pinned root when measured without --rng-seed; the guest reads no randomness), then requires `hermit bisect` to localize the divergence to two adjacent events with stack traces. The binary also runs in test.hermit_integration. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test stress_suite -j 1 -- --skip slow_cas_search_and_replay"########,
         cmdtype: CmdType::Unknown,

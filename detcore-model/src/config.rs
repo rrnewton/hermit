@@ -958,6 +958,14 @@ pub struct Config {
     #[clap(skip)]
     pub guest_ids: crate::pid::GuestIds,
 
+    /// **Internal:** The seeds `hermit run` took from the recording a schedule
+    /// replay replays (`--replay-preemptions-from`, `--replay-schedule-from`),
+    /// because the run omitted them; the run's summary says so. The seeds
+    /// themselves are already in `rng_seed` and `sched_seed`.
+    #[serde(default)]
+    #[clap(skip)]
+    pub replay_adopted_seeds: Option<crate::summary::AdoptedSeeds>,
+
     /// **Internal:** Path to the replay data folder.
     #[clap(skip)]
     pub replay_data: Option<PathBuf>,
@@ -3557,7 +3565,9 @@ mod legacy_backend_json {
     /// `access_trace_max_bytes` came after it too; the scheduler writes the
     /// trace, and `hermit run` refuses it on DBT, so they are never written
     /// and read as unset, 0, unset and unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 44] = [
+    /// `replay_adopted_seeds` came after it too: only the run's summary reads
+    /// it, so it is never written and reads as unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 45] = [
         // `chaos_timeslice_range` came after it too: the scheduler draws the
         // slices, not the runtime, so it is never written and reads as unset.
         // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
@@ -3612,6 +3622,7 @@ mod legacy_backend_json {
         "access_trace_from",
         "access_trace_max_records",
         "access_trace_max_bytes",
+        "replay_adopted_seeds",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3786,7 +3797,8 @@ mod legacy_backend_json {
                     | "chaos_timeslice"
                     | "access_trace"
                     | "access_trace_max_records"
-                    | "access_trace_max_bytes",
+                    | "access_trace_max_bytes"
+                    | "replay_adopted_seeds",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -4104,7 +4116,8 @@ mod legacy_backend_json {
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"
                 | "guest_ids"
-                | "detlog_anon" => Ok(()),
+                | "detlog_anon"
+                | "replay_adopted_seeds" => Ok(()),
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5009,7 +5022,8 @@ mod tests {
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"
                 | "guest_ids"
-                | "detlog_anon" => {}
+                | "detlog_anon"
+                | "replay_adopted_seeds" => {}
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5047,11 +5061,11 @@ mod tests {
         // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
-        // `access_trace_max_bytes` and
+        // `access_trace_max_bytes`, `replay_adopted_seeds` and
         // `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-three fewer, so twenty-nine keys fewer than fields.
+        // forty-four fewer, so thirty keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 29);
+        assert_eq!(fields.len(), keys.len() + 30);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

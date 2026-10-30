@@ -145,7 +145,9 @@ pub struct AnalyzeOpts {
     pub run1_schedule: Option<PathBuf>,
 
     /// Optionally use a second chaos seed to identify the baseline run that
-    /// does NOT meet the target criteria.
+    /// does NOT meet the target criteria. It seeds the baseline's schedule
+    /// only: the baseline gives the guest the target run's random seed, as
+    /// every trial does.
     #[clap(
         long,
         conflicts_with = "run2_preemptions",
@@ -286,6 +288,13 @@ pub struct AnalyzeOpts {
     /// measured before it.
     #[clap(skip)]
     pub endpoints: EndpointMeasurements,
+
+    /// The scheduler seed of the target run, which every trial whose
+    /// schedule analyze writes replays under
+    /// ([`AnalyzeOpts::adopt_trial_sched_seed`],
+    /// [`AnalyzeOpts::stamp_trial_record`]); `None` before it is known.
+    #[clap(skip)]
+    pub trial_sched_seed: Option<u64>,
 }
 
 /// `--trial-timeout`.
