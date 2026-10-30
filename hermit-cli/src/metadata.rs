@@ -893,7 +893,13 @@ impl RecordVersion {
 // holds restart_syscall at that point instead of poll, so an older replayer
 // would refuse it as a desync, and this one would refuse an older recording
 // the same way; the exact-match gate names the cause instead.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x195);
+// 0x195 -> 0x196 (ledger-assigned 0x196 for this change): a run without a
+// PID namespace of its own (--no-namespace) can number its guest's process
+// and thread IDs from a chosen base, and the preemption record carries that
+// numbering so a replay under another one is refused. A recording made
+// before the numbering existed names no guest IDs, so an older replayer
+// would key its threads differently and diverge; it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x196);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -918,7 +924,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x195);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x195;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x196;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
