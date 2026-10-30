@@ -765,12 +765,12 @@ impl CommandBindings {
     fn select<'a>(&'a self, core: &'a Path, backend: &str) -> Result<(&'a Path, bool), String> {
         self.recheck()?;
         if hermit_manifest_plan::execution_owners::core_backends().contains(backend) {
-            if let Some(binding) = self.entries.get(backend) {
-                if binding.identity.executable != core {
-                    return Err(format!(
-                        "core selector {backend} changed its retained executable"
-                    ));
-                }
+            if let Some(binding) = self.entries.get(backend)
+                && binding.identity.executable != core
+            {
+                return Err(format!(
+                    "core selector {backend} changed its retained executable"
+                ));
             }
             return Ok((core, false));
         }

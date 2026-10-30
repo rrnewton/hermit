@@ -819,8 +819,6 @@ const STRICT_COMPAT_ONLY_RETIRED: &str = "--strict-compat-only was retired on 20
 enum Focused {
     PortableStrictCompat,
     RrCompat,
-    SabreCompat,
-    E9patchCompat,
     QemuL2,
     PrivilegedOnly,
     HostedPortable,
@@ -851,8 +849,6 @@ impl Focused {
         match self {
             Focused::PortableStrictCompat => "portable-strict-compat-only".into(),
             Focused::RrCompat => "rr-compat-only".into(),
-            Focused::SabreCompat => "sabre-compat-only".into(),
-            Focused::E9patchCompat => "e9patch-compat-only".into(),
             Focused::QemuL2 => "qemu-l2-only".into(),
             Focused::PrivilegedOnly => "privileged-only".into(),
             Focused::HostedPortable => "hosted-portable".into(),
@@ -872,8 +868,6 @@ impl Focused {
         match self {
             Focused::PortableStrictCompat => "portable-strict-compat-only",
             Focused::RrCompat => "rr-compat-only",
-            Focused::SabreCompat => "sabre-compat-only",
-            Focused::E9patchCompat => "e9patch-compat-only",
             Focused::QemuL2 => "qemu-l2-only",
             Focused::PrivilegedOnly => "privileged-only",
             Focused::HostedPortable => "hosted-portable-only",
@@ -13489,12 +13483,6 @@ fn keep_ancestor_baseline(
 /// committed `ci/dag/validate.json`. The maintenance generator is separate and
 /// never reaches this function.
 fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
-    if matches!(
-        args.focused.as_ref(),
-        Some(Focused::SabreCompat | Focused::E9patchCompat)
-    ) {
-        return Err("this physical run type is owned by hermit-3rdparty-patching/ci/retained-ci-catalog.json; use its measured static frontend and prepared-project graph".into());
-    }
     let (committed, source_path, source_bytes) = load_committed_validation_dag(root)?;
 
     if let Some(Focused::Only { lane, nodes }) = &args.focused {
@@ -13759,8 +13747,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         (Some(Focused::HostedPrivileged), _) => Some("hosted-privileged"),
         (Some(Focused::PortableStrictCompat), _) => Some("portable-strict-compat-only"),
         (Some(Focused::RrCompat), _) => Some("rr-compat-only"),
-        (Some(Focused::SabreCompat), _) => Some("sabre-compat-only"),
-        (Some(Focused::E9patchCompat), _) => Some("e9patch-compat-only"),
         (Some(Focused::QemuL2), _) => Some("qemu-l2-only"),
         (Some(Focused::Envelope { .. }), _) => Some("envelope-only"),
         (None, Level::Quick) => Some("quick"),

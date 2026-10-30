@@ -56,8 +56,6 @@ pub use hermit_manifest_plan::host_capability::cpuid_faulting_absent;
 pub use hermit_manifest_plan::host_capability::kvm_absent;
 pub use hermit_manifest_plan::host_capability::probe_host_capability;
 
-use crate::validate_corpus;
-use crate::validate_corpus::CorpusPaths;
 
 /// The canonical test epoch the strict compatibility probes pass, from its one
 /// source: `hermit run --strict` refuses an epoch drawn from the host clock.
@@ -76,18 +74,6 @@ pub const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
 /// the committed DAG; this value is never a runtime profile rewrite.
 const SYNTHETIC_DEFAULT_CPU_TIMEOUT_S: i64 = 7200;
 
-/// Wall budget for one compatibility probe. Mirrors `STRICT_COMPAT_TIMEOUT=60`
-/// (validate.sh:1091).
-const COMPAT_TIMEOUT_S: i64 = 60;
-/// Extended budget for the two large internal executables under e9patch
-/// (validate.sh:2991).
-const COMPAT_E9PATCH_LARGE_TIMEOUT_S: i64 = 180;
-/// CPU budget for a compatibility probe: these are short guest runs under Hermit,
-/// so a spin is the failure mode a CPU cap catches.
-const COMPAT_CPU_TIMEOUT_S: i64 = 120;
-/// Memory ceiling for a compatibility probe.
-const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
-
 /// Which compatibility corpus a focused mode runs, and how it is labelled.
 ///
 /// One mode remains: the e9patch-compat-only profile's per-program probes from
@@ -99,13 +85,6 @@ pub enum CompatMode {
 }
 
 impl CompatMode {
-    /// The `ci/compat/corpus-<mode>.json` file this mode reads.
-    pub fn corpus_name(self) -> &'static str {
-        match self {
-            CompatMode::E9patch => "e9patch",
-        }
-    }
-
     /// Plain-language name printed per row and in the summary.
     pub fn display_name(self) -> &'static str {
         match self {
@@ -147,13 +126,7 @@ impl CompatMode {
         }
     }
 
-    /// Per-row wall budget, reproducing the budget override the bash applies.
-    pub fn timeout_for(self, label: &str) -> i64 {
-        if self == CompatMode::E9patch && matches!(label, "mysql" | "php") {
-            return COMPAT_E9PATCH_LARGE_TIMEOUT_S;
-        }
-        COMPAT_TIMEOUT_S
-    }
+
 }
 
 /// Build a fully-declared node. This is the ONLY node constructor the plan
@@ -233,23 +206,6 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
         .map(|a| shell_quote(a.as_ref()))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// A fixture passed as a positional argument to `bash -c` is expanded by the
-/// outer shell, before Hermit clears the guest environment. Keep it double-quoted
-/// so the generated DAG's later `$VALIDATE_RUN_STATE` substitution is expanded
-/// once without word splitting. Literal shell metacharacters in constructed paths
-/// must still survive unchanged; the placeholder is inserted after this quoting.
-fn shell_quote_fixture_operand(path: &str) -> String {
-    let mut quoted = String::from("\"");
-    for ch in path.chars() {
-        if matches!(ch, '\\' | '"' | '$' | '`') {
-            quoted.push('\\');
-        }
-        quoted.push(ch);
-    }
-    quoted.push('"');
-    quoted
 }
 
 /// The always-on preflight gates and the manifest-audit binary producer, as DAG nodes.
@@ -569,24 +525,6 @@ pub fn partition_host_inapplicable(
         ));
     }
     Ok((keep, withheld))
-}
-
-/// Build the compatibility-corpus nodes for one mode.
-///
-/// One DAG node PER PROBE. That is a deliberate change from the bash, which ran
-/// all ~191 probes serially inside a single gate:
-///   * each probe now gets its own wall + CPU + memory box, so one runaway row
-///     cannot consume the whole gate's budget;
-///   * each probe's verdict is a TYPED `StepOutcome`, so the summary table is
-///     built from structured results instead of a scraped TSV; and
-///   * the corpus becomes parallel, which is where a large part of the wall-clock
-///     win in this profile is expected to come from.
-
-/// DAG tags are `group.job`, so a job containing `.` would produce an ambiguous
-/// tag. Corpus labels are shell-command names (`c++filt`, `wc-lines`), none of
-/// which contain a dot today, but the mapping is applied rather than assumed.
-pub fn sanitize_job(label: &str) -> String {
-    label.replace('.', "_")
 }
 
 /// Load the complete committed DAG and select one label with its dependency
