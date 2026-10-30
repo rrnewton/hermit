@@ -946,6 +946,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Publish the posthook checkpoint for a syscall that ends with
+    /// `res` instead of its result, and complete it with that result.
+    /// Boxed at its post-dispatch call sites so those rare error paths
+    /// do not grow every syscall's future
+    /// (`hot_path_futures_stay_small`).
+    async fn complete_after_posthook<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        count: u64,
+        res: Result<i64, Error>,
+        interrupted: Option<Errno>,
+    ) -> Result<i64, Error> {
+        self.publish_posthook_checkpoint(guest, count, &res, interrupted)
+            .await;
+        self.complete_syscall(guest, res).await
+    }
+
     /// A5 step 3c.1c, D40: resolve a `WaitSignalEnd::BehindCaught` end, in
     /// the thread's own turn (`wait_end_checkpoint`), by reading the caught
     /// actions Linux's delivery loop sets up, one query `rt_sigaction` each,
@@ -1273,6 +1290,39 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// unsupported-syscall policy.
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3361): Review the
     // emulated `restart_syscall` resumption and the record it consumes.
+    /// The `detlog_io_buffers` observation of a finished call, read with
+    /// the kernel's view of the call's memory put back (`entry_view`) and
+    /// another thread's rewrite restored after it. `Some` with the error
+    /// that ends the call when either the observation or the restore
+    /// fails. Boxed at the call site: it holds the entry view across the
+    /// observation, which would otherwise grow every syscall's future
+    /// (`hot_path_futures_stay_small`).
+    #[allow(clippy::too_many_arguments)]
+    async fn detlog_io_buffers_in_entry_view<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        ret: i64,
+        dettid: DetTid,
+        rng_readv_output: Option<&[io_buffers::BufferExtent]>,
+        count: u64,
+        interrupted: Option<Errno>,
+    ) -> Option<Result<i64, Error>> {
+        let entry = entry_view(guest, call);
+        let view = entry
+            .as_deref()
+            .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
+        let observed = io_buffers::detlog_io_buffers(guest, call, ret, dettid, rng_readv_output);
+        let restored = restore_entry_view(guest, view);
+        match restored.and(observed) {
+            Err(error) => Some(
+                self.complete_after_posthook(guest, count, Err(error), interrupted)
+                    .await,
+            ),
+            Ok(()) => None,
+        }
+    }
+
     async fn handle_restart_syscall<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -6015,7 +6065,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
-                Syscall::Writev(w) => self.handle_writev(guest, w).await,
+                // The vectored handlers keep the call's entry import
+                // across their retries, so they are boxed like the open
+                // family (`hot_path_futures_stay_small`).
+                Syscall::Writev(w) => Box::pin(self.handle_writev(guest, w)).await,
                 Syscall::Openat(o) => Box::pin(self.handle_openat(guest, o)).await,
                 #[cfg(target_arch = "x86_64")]
                 Syscall::Open(o) => Box::pin(self.handle_openat(guest, o.into())).await,
@@ -6059,8 +6112,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.handle_preadv2_with_output(guest, s, &mut rng_readv_output)
                         .await
                 }
-                Syscall::Pwritev(s) => self.handle_pwritev(guest, s).await,
-                Syscall::Pwritev2(s) => self.handle_pwritev2(guest, s).await,
+                Syscall::Pwritev(s) => Box::pin(self.handle_pwritev(guest, s)).await,
+                Syscall::Pwritev2(s) => Box::pin(self.handle_pwritev2(guest, s)).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)
                 Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
@@ -6406,10 +6459,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-901)
-                Syscall::Recvmsg(s) => self.handle_recvmsg(guest, s).await,
+                Syscall::Recvmsg(s) => Box::pin(self.handle_recvmsg(guest, s)).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
-                Syscall::Sendmsg(s) => self.handle_sendmsg(guest, s).await,
-                Syscall::Sendmmsg(s) => self.handle_sendmmsg(guest, s).await,
+                Syscall::Sendmsg(s) => Box::pin(self.handle_sendmsg(guest, s)).await,
+                Syscall::Sendmmsg(s) => Box::pin(self.handle_sendmmsg(guest, s)).await,
 
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#788): recvmmsg is the multi-message form of
@@ -6422,7 +6475,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Recvmmsg(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
                     self.handle_sock_diag_recvmmsg(guest, s).await
                 }
-                Syscall::Recvmmsg(s) => self.handle_recvmmsg(guest, s).await,
+                Syscall::Recvmmsg(s) => Box::pin(self.handle_recvmmsg(guest, s)).await,
                 Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
                 Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6700,7 +6753,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             self.note_fd_readied(guest, fd, wants).await;
         }
         if crate::fifo_peer::any_orphaned_page() {
-            Self::unmap_orphaned_staging_pages(guest).await;
+            // Boxed: a rare cleanup, kept out of every syscall's future
+            // (`hot_path_futures_stay_small`).
+            Box::pin(Self::unmap_orphaned_staging_pages(guest)).await;
         }
 
         // With asynchronous exit completion, a descriptor that would make this
@@ -6714,10 +6769,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             && let Err(error) =
                 Box::pin(self.refuse_exit_dependencies_in_view(guest, &call, ret)).await
         {
-            let res = Err(error);
-            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
-                .await;
-            return self.complete_syscall(guest, res).await;
+            return Box::pin(self.complete_after_posthook(
+                guest,
+                new_count,
+                Err(error),
+                interrupted,
+            ))
+            .await;
         }
         // A new executable file mapping's exclusive pairs (store-exclusive
         // retry loops). Boxed, so this rare path does not grow every
@@ -6779,10 +6837,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         if let Err(error) = self.detlog_memory_maps(guest) {
-            let res = Err(error);
-            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
-                .await;
-            return self.complete_syscall(guest, res).await;
+            return Box::pin(self.complete_after_posthook(
+                guest,
+                new_count,
+                Err(error),
+                interrupted,
+            ))
+            .await;
         }
         // Same control point again, for the bytes this syscall moved through a guest buffer.
         // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
@@ -6796,23 +6857,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
         {
-            let entry = entry_view(guest, &call);
-            let view = entry
-                .as_deref()
-                .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
-            let observed = io_buffers::detlog_io_buffers(
+            // Boxed: the entry view it holds would otherwise grow every
+            // syscall's future (`hot_path_futures_stay_small`).
+            if let Some(done) = Box::pin(self.detlog_io_buffers_in_entry_view(
                 guest,
                 &call,
                 *ret,
                 dettid,
                 rng_readv_output.as_deref(),
-            );
-            let restored = restore_entry_view(guest, view);
-            if let Err(error) = restored.and(observed) {
-                let res = Err(error);
-                self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
-                    .await;
-                return self.complete_syscall(guest, res).await;
+                new_count,
+                interrupted,
+            ))
+            .await
+            {
+                return done;
             }
         }
 
