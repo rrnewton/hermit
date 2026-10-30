@@ -525,6 +525,66 @@ preemptions or events, manual interrupt points, a happens-before program or
 `--gdbserver` (a debugger stopping the thread between skipped ends would see
 Hermit's slice bookkeeping behind its program counter).
 
+Chaos reorders threads but never changes how long a timed wait lasts against
+other threads' work: a sleeping thread wakes when the virtual clock, which
+advances with that work, reaches its deadline. A race ordered by that ratio
+(a test that sleeps while a worker computes, a periodic timer against a
+teardown) therefore keeps one order under every seed.
+`--chaos-timed-wait-spread=R` ends each sleep, and each futex wait with a
+timeout (in the default precise futex mode), after its remaining duration
+times a seeded factor drawn log-uniformly from `[1/R, R]` of the clock's
+progress. When the factor is below one, the clock
+first jumps to the wait's deadline, as if the other threads had been
+descheduled, so the waiter still observes its full duration; above one, the
+wait oversleeps. Poll, epoll and select timeouts and signal timers are not
+spread. A recording stores the spread and seed, and a replay under others is
+refused. With the option, sleeps are registered at the first scheduler pass
+unless `--sleep-registration` says otherwise, so a recording replays with
+`--replay-schedule-from` and the recorded spread and seed, or with
+`--replay-preemptions-from` and `--chaos` as well. A schedule replay refuses a
+recording of sleeps registered when chosen, and spreads no wait it files after
+its schedule has run out (see the table below). `hermit analyze` cannot bisect or
+minimize such a run: its trials replay schedules found under different
+scheduler seeds, and the spread's factors are keyed on the seed.
+
+A schedule replay applies the run options that change thread order, slice
+ends, timed waits or virtual time as the table below records, in the part of
+the run its schedule covers and past the end of that schedule. The table
+describes what Hermit does today; the rule it measures against is that the
+replayed part reproduces the recording, and that past the schedule no new
+chaos decision is made while a semantic option still applies. Rows marked
+"known gap" do not follow that rule yet. Past the schedule a replay stops
+drawing new `--chaos-timed-wait-spread` wake times, the one row Hermit's
+scheduler reads from this table; a replay given `--chaos`, `--fuzz-futexes`,
+`--chaos-target-races`, a random `--sched-heuristic` or `--runs-post-fork=random`
+keeps making those decisions, and some semantic options, such as
+`--pipe-wake-latency`, do not apply past the schedule. The schedule ends at the consumption of its last
+record. A legacy replay then goes on unguided. A slice-boundary replay refuses
+the next event it observes, so for it only what the thread does between
+consuming that record and that event, such as filing the timed wait of the
+syscall whose prehook was the last record, comes past the schedule.
+
+<!-- BEGIN schedule replay options: rendered from detcore-model's schedule_replay_options::TABLE -->
+| Option | Kind | Replayed part | Past the schedule | Status | Read by code | Why | Code |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `--chaos` | chaos decision | from the schedule | only under `--chaos` | known gap | no | Random slice ends and priorities. The replayed part follows the schedule's recorded switches; a replay given `--chaos` also keeps drawing slice ends and priorities, during the schedule and after it (gap). A slice-boundary replay refuses `--chaos`. | tool_local.rs ThreadState::next_timeslice (slice end draw); lib.rs Detcore::end_timeslice_with_checkpoint (random priority change point); scheduler.rs validate_strict_boundary_config |
+| `--chaos-timed-wait-spread` | chaos decision | yes | no | follows the rule | yes | A seeded draw of each timed wait's wake time. The replay draws again from the recorded spread and seed, and refuses others; past the schedule a wait is queued at its deadline. | scheduler.rs Scheduler::file_timed_wait; preemptions.rs timed_wait_spread_mismatch |
+| `--chaos-per-thread-slowdown`, `--chaos-slowdown-max-factor`, `--chaos-epoch-length-ns` | chaos decision | only under `--chaos` | only under `--chaos` | known gap | no | A seeded factor that scales each thread's virtual time per RCB, drawn only when the replay has `--chaos`; the recorded factors are read only by `--replay-preemptions-from`. A replay without `--chaos` does not reproduce a recording made with it, and one with `--chaos` keeps drawing past the schedule (gaps). | tool_local.rs ThreadState::next_timeslice |
+| `--chaos-target-races` | chaos decision | yes | yes | known gap | no | Draws a process-directed signal's target thread and a woken thread's queue position from the fuzz seed whenever given, during the schedule and after it (gap). Its child priorities are not drawn in a schedule replay, whose children take the replay priorities. | scheduler.rs Scheduler::chaos_signal_target, Scheduler::force_unblock_thread_at; tool_global.rs create_child_thread (after its schedule replay branch) |
+| `--fuzz-futexes` | chaos decision | yes | yes | known gap | no | Draws which futex waiters a wake takes, from the fuzz seed, during the schedule and after it (gap). | scheduler.rs Scheduler::take_futex_wakees, Scheduler::choose_fuzzed_futex_wakees |
+| `--sched-heuristic`, `--sched-sticky-random-param` | chaos decision | yes | yes | known gap | no | `random` and `stickyrandom` draw the next thread from the scheduler seed at every turn, during the schedule and after it (gap); `connectbind` and `none` draw nothing. | runqueue.rs RunQueue::tentative_pop_next |
+| `--runs-post-fork` | chaos decision | yes | yes | known gap | no | `random` draws whether a new thread runs before its parent at every clone, during the schedule and after it (gap); `parent` and `child` draw nothing. | tool_global.rs recv_create_child_thread; scheduler.rs Scheduler::child_runs_first_post_fork |
+| `--target-timeslice`, `--target-timeslice-syscalls-only` | semantic | from the schedule | only under `--chaos` | known gap | no | A replay ignores `--target-timeslice-syscalls-only`, and one without `--chaos` ignores `--target-timeslice` too, during the schedule and after it: its slice end stays the replay's (gap past the schedule). A replay given `--chaos` uses the target as the mean of its random slice ends. | tool_local.rs ThreadState::next_timeslice and ThreadState::instruction_trap_ends_timeslice |
+| `--max-timeslice`, `--preemption-timeout` | semantic | yes | yes | known gap | no | The fallback PMU stop of every slice in both parts: a replay programs the PMU at the slice's selected end when that end is finite, which takes precedence and may lie beyond the configured maximum (a replay given `--chaos` draws such ends), and at the configured maximum when the selected end is the maximum time; it stops a thread that makes no syscalls. Past the schedule a replay without `--chaos` keeps its software slice end at the maximum time, so only this PMU stop on the thread's own execution ends a slice, not the plain run's end on logical time, which counts expired waits (gap). Under `--no-rcb-time` it also sets the software slice end. | tool_local.rs ThreadState::next_timeslice |
+| `--no-rcb-time` | semantic | yes | yes | follows the rule | no | Virtual time without branch counts: slice ends at the maximum timeslice of logical time, in both parts. | tool_local.rs ThreadState::next_timeslice; lib.rs Detcore::handle_timer_event |
+| `--clock-multiplier` | semantic | yes | yes | follows the rule | no | Scales virtual time per RCB and per scheduler turn, in both parts. | detcore-model time.rs DetTime::new; config.rs Config::scheduler_turn_charge; tool_local.rs ThreadState::next_timeslice |
+| `--scheduler-turn-cost` | semantic | yes | yes | follows the rule | no | The virtual time each committed scheduler turn adds, in both parts. | config.rs Config::scheduler_turn_charge; detcore-model time.rs GlobalTime::add_scheduler_time |
+| `--epoch` | semantic | yes | yes | follows the rule | no | Where virtual time starts. The recording stores it, and its slice ends are absolute virtual times. | detcore-model time.rs GlobalTime::new; scheduler.rs Scheduler::new (stamps the record) |
+| `--sleep-registration` | semantic | yes | yes | follows the rule | no | When a queued sleep becomes a timed waiter. A replay that leaves it unset takes the recording's value, and another value is refused. | config.rs Config::queued_sleeps_registered_at_first_pass; scheduler.rs Scheduler::new |
+| `--pipe-wake-latency` | semantic | from the schedule | no | known gap | no | When a pipe write readies its reader. A schedule replay makes the hand-off inert in both parts: while records remain the schedule reproduces the recorded switch to the reader, and past the schedule nothing hands off (gap). The recording stores the value, and another value is refused. | scheduler/pipe_wake.rs Scheduler::ready_channel; config.rs Config::pipe_wake_latency_in_effect |
+| `--futex-wake-yields` | semantic | yes | yes | follows the rule | no | A thread whose futex wake woke a waiter yields its turn. The record holds no queue order, so the replay yields again, in both parts. | config.rs Config::yields_after_futex_wake; lib.rs Detcore::post_handler_hook_observed |
+<!-- END schedule replay options -->
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
 `--replay-preemptions-from=FILE`. A record edited after it was recorded (for
@@ -905,6 +965,7 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
 | `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
+| `--chaos-timed-wait-spread=R` | Ends each sleep and futex timeout after its duration times a seeded factor in `[1/R, R]`, never before its deadline on the guest's clock. |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes

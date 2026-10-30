@@ -155,6 +155,21 @@ impl Scheduler {
         self.replayer.is_some() || self.boundary_replayer.is_some()
     }
 
+    /// Whether a schedule replay, in either format, has consumed every
+    /// record of its schedule, so the run goes on past it. A replay applies
+    /// the options that shaped its recording as
+    /// `detcore_model::schedule_replay_options` classifies them for that
+    /// point. The point is the consumption of the last recorded event (a
+    /// scheduled event of a running thread), the schedule's fixed final
+    /// position, or the replay's release of its schedule
+    /// (`Replayer::release_schedule`, which drops the records left). A
+    /// release can come at another event, or not at all, in another run: how
+    /// many polling retries the replay matches can be host-timed
+    /// (`Scheduler::is_polling_turn`).
+    pub(super) fn past_the_schedule(&self) -> bool {
+        self.has_schedule_replay() && !self.replay_has_records_left()
+    }
+
     pub(super) fn replay_has_records_left(&self) -> bool {
         assert!(self.replayer.is_none() || self.boundary_replayer.is_none());
         match &self.boundary_replayer {
@@ -505,6 +520,57 @@ mod tests {
                 .next_boundary_index(),
             Some(1)
         );
+    }
+
+    /// The spread stops exactly at the consumption of a slice-boundary
+    /// schedule's last record, whether that record is an event or a
+    /// timeslice end: a wait filed while it is ahead is spread, one filed
+    /// after it is queued at its deadline.
+    #[test]
+    fn consuming_the_last_boundary_record_stops_the_spread() {
+        let sleeper = DetTid::from_raw(5);
+        let other = DetTid::from_raw(7);
+        let seed = (0..256)
+            .find(|seed| {
+                super::super::timed_wait_spread::timed_wait_factor(*seed, sleeper, 0, 10.0) < 0.5
+            })
+            .expect("a seed that spreads the wait");
+        let event = Record::Event(SchedEvent::syscall(
+            DetTid::from_raw(3),
+            Sysno::getpid,
+            crate::types::SyscallPhase::Prehook,
+        ));
+        for (case, records) in [
+            ("an event last", vec![marker(3, 1), event.clone()]),
+            ("a timeslice end last", vec![event.clone(), marker(3, 1)]),
+        ] {
+            let config = Config {
+                chaos_timed_wait_spread: Some(10.0),
+                sched_seed: Some(seed),
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            scheduler.boundary_replayer = Some(BoundaryReplayer::new(
+                Schedule::new(records.clone()).unwrap(),
+            ));
+            scheduler.consume_boundary_record(&records[0]).unwrap();
+            assert!(!scheduler.past_the_schedule(), "{case}");
+            let deadline = scheduler.committed_time + LogicalTime::from_nanos(1_000_000);
+            scheduler.file_timed_wait(sleeper, deadline);
+            assert_ne!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                Some(deadline),
+                "{case}: a wait filed while a record is left is spread"
+            );
+            scheduler.consume_boundary_record(&records[1]).unwrap();
+            assert!(scheduler.past_the_schedule(), "{case}");
+            scheduler.file_timed_wait(other, deadline);
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(other),
+                Some(deadline),
+                "{case}"
+            );
+        }
     }
 
     #[test]

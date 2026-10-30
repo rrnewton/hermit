@@ -336,6 +336,7 @@ pub mod pedigree;
 pub mod pid;
 pub mod procfs;
 pub mod schedule;
+pub mod schedule_replay_options;
 pub mod summary;
 pub mod syscall_histogram;
 pub mod time;
