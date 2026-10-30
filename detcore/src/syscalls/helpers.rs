@@ -489,8 +489,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
-            // Routing through internal polling does not prove closed guest
-            // membership: even a pipe may have been passed to a host.
+            // Binary record/replay keeps the internal-FD authority captured at
+            // entry, as its existing FIFO-open policy requires. Plain runs
+            // instead need revocable proof of closed guest membership.
+            rsrc.polls_guest_state_only = self.cfg.recordreplay_modes && internal_fd;
             refresh_guest_poll_state(guest, wrapped, &mut rsrc);
             // A pipe read: a recorded private `SIGCHLD` ends it as on Linux.
             rsrc.private_sigchld_decides = reads_a_pipe(guest, wrapped);
@@ -583,6 +585,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
         );
         let mut resources = pipe_writev_resources(guest.thread_state().dettid, call);
+        resources.polls_guest_state_only = self.cfg.recordreplay_modes;
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
             .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
@@ -935,6 +938,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A pipe write: a recorded private `SIGCHLD` ends it as on Linux
         // (`Resources::private_sigchld_decides`).
         resources.private_sigchld_decides = true;
+        resources.polls_guest_state_only = self.cfg.recordreplay_modes;
         refresh_guest_poll_state(guest, call.into(), &mut resources);
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
@@ -1537,15 +1541,20 @@ pub(crate) fn poll_targets_guest_held<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// Refresh only descriptor-based idle-poll authority, independently of the
 /// syscall's record/replay routing. In plain runs, pipes and socketpairs also
 /// rely on the guest-held mark: SCM export revokes that authority for queued
-/// requests. Record/replay retains its pre-existing internal-FD classification
-/// for FIFO-open decisions, without enabling the new idle-poller jumps.
+/// requests. Record/replay retains the internal-FD classification captured by
+/// its handler at entry, including across descriptor replacement during a
+/// retry, for its existing FIFO-open decisions. It does not enable the new
+/// idle-poller jumps.
 /// Non-FD primitives retain the proof supplied by their own handlers.
 pub(crate) fn refresh_guest_poll_state<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     call: Syscall,
     resources: &mut Resources,
 ) {
-    let recordreplay = guest.config().recordreplay_modes;
+    if guest.config().recordreplay_modes {
+        resources.relies_on_guest_held_marks = false;
+        return;
+    }
     let held = match call {
         #[cfg(target_arch = "x86_64")]
         Syscall::Poll(call) => poll_targets_guest_held(
@@ -1558,16 +1567,10 @@ pub(crate) fn refresh_guest_poll_state<G: Guest<Detcore<T>>, T: RecordOrReplay>(
             call.fds().map(|fds| fds.as_raw()),
             call.nfds() as usize,
         ),
-        _ if get_fd(call).is_some() => {
-            if recordreplay {
-                syscall_targets_internal_fd(guest, call)
-            } else {
-                syscall_targets_guest_held_fd(guest, call)
-            }
-        }
+        _ if get_fd(call).is_some() => syscall_targets_guest_held_fd(guest, call),
         _ => return,
     };
-    resources.relies_on_guest_held_marks = held && !recordreplay;
+    resources.relies_on_guest_held_marks = held;
     resources.polls_guest_state_only = held;
 }
 

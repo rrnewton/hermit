@@ -1477,114 +1477,124 @@ fn add_pipe(guest: &mut TurnGuest, fd: i32, id: crate::types::OpenFileId) {
 /// an export must revoke their idle authority without changing that routing.
 #[tokio::test]
 async fn internal_pipe_poll_authority_depends_on_revocable_guest_held_provenance() {
-    for socketpair in [false, true] {
-        for held in [false, true] {
-            for operation in ["read", "write", "writev"] {
-                let _seam = script(proc_state(0, 0, 0));
-                let mut guest = turn_guest(true, Some(0));
-                let id = crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 700);
-                let fd = crate::fd::DetFd::new(
-                    8,
-                    nix::fcntl::OFlag::O_RDWR,
+    for (recordreplay, replaying) in [(false, false), (true, false), (true, true)] {
+        for socketpair in [false, true] {
+            for held in [false, true] {
+                for operation in ["read", "write", "writev"] {
+                    let _seam = script(proc_state(0, 0, 0));
+                    let mut guest = turn_guest(true, Some(0));
+                    guest.config.recordreplay_modes = recordreplay;
+                    guest.config.replaying = replaying;
+                    let id = crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 700);
+                    let fd = crate::fd::DetFd::new(
+                        8,
+                        nix::fcntl::OFlag::O_RDWR,
+                        if socketpair {
+                            crate::fd::FdType::Socket
+                        } else {
+                            crate::fd::FdType::Pipe
+                        },
+                        id,
+                    );
+                    fd.set_physically_nonblocking();
                     if socketpair {
-                        crate::fd::FdType::Socket
-                    } else {
-                        crate::fd::FdType::Pipe
-                    },
-                    id,
-                );
-                fd.set_physically_nonblocking();
-                if socketpair {
-                    fd.set_socketpair_endpoint();
-                }
-                if held {
-                    fd.set_guest_held();
-                }
-                guest
-                    .thread
-                    .file_metadata
-                    .lock()
-                    .unwrap()
-                    .file_handles
-                    .insert(8, fd);
-                let tool = tool(&guest);
-                let buffer = Box::leak(Box::new([0u8; 8])).as_mut_ptr() as usize;
-                guest.write_results = VecDeque::from([Err(Errno::EAGAIN), Ok(1)]);
-                guest.read_results = VecDeque::from([Err(Errno::EAGAIN), Ok(1)]);
-                let result = match operation {
-                    "read" => {
-                        tool.execute_nonblockable_fd_syscall(
-                            &mut guest,
-                            reverie::syscalls::Read::new()
+                        fd.set_socketpair_endpoint();
+                    }
+                    if held {
+                        fd.set_guest_held();
+                    }
+                    guest
+                        .thread
+                        .file_metadata
+                        .lock()
+                        .unwrap()
+                        .file_handles
+                        .insert(8, fd);
+                    let tool = tool(&guest);
+                    let buffer = Box::leak(Box::new([0u8; 8])).as_mut_ptr() as usize;
+                    guest.write_results = VecDeque::from([Err(Errno::EAGAIN), Ok(1)]);
+                    guest.read_results = VecDeque::from([Err(Errno::EAGAIN), Ok(1)]);
+                    let result = match operation {
+                        "read" => {
+                            tool.execute_nonblockable_fd_syscall(
+                                &mut guest,
+                                reverie::syscalls::Read::new()
+                                    .with_fd(8)
+                                    .with_buf(AddrMut::from_raw(buffer))
+                                    .with_len(1),
+                            )
+                            .await
+                        }
+                        "write" => {
+                            let call = reverie::syscalls::Write::new()
                                 .with_fd(8)
-                                .with_buf(AddrMut::from_raw(buffer))
-                                .with_len(1),
-                        )
-                        .await
-                    }
-                    "write" => {
-                        let call = reverie::syscalls::Write::new()
-                            .with_fd(8)
-                            .with_buf(Addr::from_raw(buffer))
-                            .with_len(1);
-                        if socketpair {
-                            tool.execute_nonblockable_fd_syscall(&mut guest, call).await
-                        } else {
-                            tool.execute_blocking_pipe_write(&mut guest, call, id).await
+                                .with_buf(Addr::from_raw(buffer))
+                                .with_len(1);
+                            if socketpair {
+                                tool.execute_nonblockable_fd_syscall(&mut guest, call).await
+                            } else {
+                                tool.execute_blocking_pipe_write(&mut guest, call, id).await
+                            }
                         }
-                    }
-                    "writev" => {
-                        let iovec = Box::leak(Box::new([buffer, 1usize])).as_mut_ptr() as usize;
-                        let call = reverie::syscalls::Writev::new()
-                            .with_fd(8)
-                            .with_iov(Addr::from_raw(iovec))
-                            .with_len(1);
-                        if socketpair {
-                            tool.execute_nonblockable_fd_syscall(&mut guest, call).await
-                        } else {
-                            tool.execute_blocking_pipe_writev(&mut guest, call, id)
-                                .await
+                        "writev" => {
+                            let iovec = Box::leak(Box::new([buffer, 1usize])).as_mut_ptr() as usize;
+                            let call = reverie::syscalls::Writev::new()
+                                .with_fd(8)
+                                .with_iov(Addr::from_raw(iovec))
+                                .with_len(1);
+                            if socketpair {
+                                tool.execute_nonblockable_fd_syscall(&mut guest, call).await
+                            } else {
+                                tool.execute_blocking_pipe_writev(&mut guest, call, id)
+                                    .await
+                            }
                         }
-                    }
-                    _ => unreachable!(),
-                };
-                assert_eq!(
-                    result.unwrap(),
-                    1,
-                    "held={held}, socketpair={socketpair}, {operation}"
-                );
-                let requests: Vec<_> = guest
-                    .requests()
-                    .into_iter()
-                    .filter(|r| r.resources.contains_key(&ResourceID::InternalIOPolling))
-                    .collect();
-                assert!(!requests.is_empty());
-                for request in &requests {
-                    assert_eq!(request.polls_guest_state_only, held);
+                        _ => unreachable!(),
+                    };
                     assert_eq!(
-                        request.relies_on_guest_held_marks, held,
-                        "an exported internal FD must lose the same authority as any guest-held FD"
+                        result.unwrap(),
+                        1,
+                        "held={held}, socketpair={socketpair}, {operation}"
+                    );
+                    let requests: Vec<_> = guest
+                        .requests()
+                        .into_iter()
+                        .filter(|r| r.resources.contains_key(&ResourceID::InternalIOPolling))
+                        .collect();
+                    assert!(!requests.is_empty());
+                    for request in &requests {
+                        assert_eq!(request.polls_guest_state_only, recordreplay || held);
+                        assert_eq!(
+                            request.relies_on_guest_held_marks,
+                            held && !recordreplay,
+                            "an exported internal FD must lose the same authority as any guest-held FD"
+                        );
+                    }
+                    let request = requests.last().unwrap().clone();
+                    assert!(
+                        request.poll_attempt > 0,
+                        "a real failed attempt preceded this request"
+                    );
+                    let config = guest.config.clone();
+                    let mut scheduler = crate::scheduler::Scheduler::new(&config);
+                    let time =
+                        std::sync::Arc::new(Mutex::new(crate::types::GlobalTime::new(&config)));
+                    let admitted = crate::ivar::Ivar::new();
+                    scheduler.request_put(&admitted, request, &time);
+                    let request = admitted.try_read().unwrap().unwrap();
+                    assert_eq!(
+                        scheduler.idle_guest_poll_for_test(&request),
+                        recordreplay || held
+                    );
+                    let mut export = Resources::new(PEER);
+                    export.passes_descriptors_out = true;
+                    scheduler.request_put(&crate::ivar::Ivar::new(), export, &time);
+                    assert_eq!(
+                        scheduler.idle_guest_poll_for_test(&request),
+                        recordreplay,
+                        "record={recordreplay}, replay={replaying}: export revokes new authority; binary record/replay retains its prior {operation} classification"
                     );
                 }
-                let request = requests.last().unwrap().clone();
-                assert!(
-                    request.poll_attempt > 0,
-                    "a real failed attempt preceded this request"
-                );
-                let config = Config::default();
-                let mut scheduler = crate::scheduler::Scheduler::new(&config);
-                let time = std::sync::Arc::new(Mutex::new(crate::types::GlobalTime::new(&config)));
-                let admitted = crate::ivar::Ivar::new();
-                scheduler.request_put(&admitted, request, &time);
-                let request = admitted.try_read().unwrap().unwrap();
-                assert_eq!(scheduler.idle_guest_poll_for_test(&request), held);
-                let mut export = Resources::new(PEER);
-                export.passes_descriptors_out = true;
-                scheduler.request_put(&crate::ivar::Ivar::new(), export, &time);
-                assert!(
-                    !scheduler.idle_guest_poll_for_test(&request),
-                    "scheduler admission revokes the actual {operation} request after export"
-                );
             }
         }
     }
@@ -1593,7 +1603,8 @@ async fn internal_pipe_poll_authority_depends_on_revocable_guest_held_provenance
 /// Binary record/replay keeps the prior internal-FD classification used by
 /// FIFO opens, but never reads the new guest-held marks. This exercises the
 /// shared production refresh and direct poll-array classifier with a real
-/// descriptor table and guest-memory array, including clearing stale flags.
+/// descriptor table and guest-memory array. A retry clears new mark reliance
+/// without replacing entry authority with the current descriptor's provenance.
 #[test]
 fn record_replay_poll_classification_keeps_only_its_prior_internal_fd_authority() {
     for (recordreplay, replaying) in [(false, false), (true, false), (true, true)] {
@@ -1659,14 +1670,15 @@ fn record_replay_poll_classification_keeps_only_its_prior_internal_fd_authority(
                 ];
                 for (call, array) in calls {
                     let mut resources = Resources::new(THREAD);
-                    resources.polls_guest_state_only = true;
+                    let prior_internal = !array && matches!(kind, "pipe" | "socketpair");
+                    resources.polls_guest_state_only =
+                        if recordreplay { prior_internal } else { true };
                     resources.relies_on_guest_held_marks = true;
                     crate::syscalls::helpers::refresh_guest_poll_state(
                         &mut guest,
                         call,
                         &mut resources,
                     );
-                    let prior_internal = !array && matches!(kind, "pipe" | "socketpair");
                     assert_eq!(
                         resources.polls_guest_state_only,
                         if recordreplay { prior_internal } else { held },
@@ -1679,6 +1691,43 @@ fn record_replay_poll_classification_keeps_only_its_prior_internal_fd_authority(
                         "{}, {kind}, record={recordreplay}: mark authority",
                         call.name()
                     );
+                    let replacement = crate::fd::DetFd::new(
+                        8,
+                        nix::fcntl::OFlag::O_RDWR,
+                        crate::fd::FdType::Eventfd,
+                        crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 901),
+                    );
+                    if !held {
+                        replacement.set_guest_held();
+                    }
+                    let original = guest
+                        .thread
+                        .file_metadata
+                        .lock()
+                        .unwrap()
+                        .file_handles
+                        .insert(8, replacement)
+                        .unwrap();
+                    resources.relies_on_guest_held_marks = true;
+                    crate::syscalls::helpers::refresh_guest_poll_state(
+                        &mut guest,
+                        call,
+                        &mut resources,
+                    );
+                    assert_eq!(
+                        resources.polls_guest_state_only,
+                        if recordreplay { prior_internal } else { !held },
+                        "{}, {kind}, record={recordreplay}: binary record/replay retains entry authority after slot replacement",
+                        call.name()
+                    );
+                    assert_eq!(resources.relies_on_guest_held_marks, !recordreplay && !held);
+                    guest
+                        .thread
+                        .file_metadata
+                        .lock()
+                        .unwrap()
+                        .file_handles
+                        .insert(8, original);
                 }
                 let mut primitive = Resources::new(THREAD);
                 primitive.polls_guest_state_only = true;
