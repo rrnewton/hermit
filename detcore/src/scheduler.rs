@@ -2309,6 +2309,9 @@ pub struct Scheduler {
     /// The access trace (`--record-access-trace-to`), written as events are
     /// recorded ([`Self::record_access`]). It never feeds a decision.
     pub access_trace: Option<crate::access_trace::AccessTraceWriter>,
+    /// Plain raw-schedule replay uses temporary dispatch bands, not logical
+    /// recording priorities. The writer owns the latter through retirement.
+    record_logical_replay_priorities: bool,
 
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
@@ -4933,6 +4936,7 @@ impl Scheduler {
         Self {
             preemption_writer,
             access_trace,
+            record_logical_replay_priorities: Self::records_logical_replay_priorities(cfg),
             callback_history_active: crate::preemptions::callback_history::recording_enabled(cfg)
                 || cfg.annotated_priority_replay
                 || callback_checkpoints
@@ -7086,7 +7090,14 @@ impl Scheduler {
             self.timeslices.insert(new_leader, timeslice);
         }
         if let Some(writer) = &mut self.preemption_writer {
-            writer.set_current(new_leader, survivor_priority);
+            // The caller survives exec; raw replay's foreground/deferred band
+            // is only dispatch control, not the caller's logical history.
+            let recorded_priority = if self.record_logical_replay_priorities {
+                writer.current_priority(caller)
+            } else {
+                survivor_priority
+            };
+            writer.set_current(new_leader, recorded_priority);
         }
         // Post-exec reconnection can arrive asynchronously on backends whose
         // exec-child self-bootstraps outside a scheduler turn (DBT), so route
@@ -17852,6 +17863,37 @@ impl Scheduler {
         self.run_queue.push_back(dettid, priority)
     }
 
+    fn records_logical_replay_priorities(cfg: &Config) -> bool {
+        cfg.replay_schedule_from.is_some()
+            && cfg.replay_preemptions_from.is_none()
+            && !cfg.chaos
+            && cfg.sched_heuristic == crate::config::SchedHeuristic::None
+    }
+
+    /// Record the actual birth policy separately from raw replay's dispatch
+    /// priority. `vfork_child` comes from CreateVforkChildThread's authenticated
+    /// registration path, not a speculative priority-map key or replay row.
+    /// Other policies retain their existing writer behavior.
+    pub(crate) fn register_preemption_thread(
+        &mut self,
+        dettid: DetTid,
+        starting_priority: Priority,
+        vfork_child: bool,
+    ) {
+        let logical_priority = if self.record_logical_replay_priorities {
+            if vfork_child {
+                DEFAULT_PRIORITY - 1
+            } else {
+                DEFAULT_PRIORITY
+            }
+        } else {
+            starting_priority
+        };
+        if let Some(writer) = &mut self.preemption_writer {
+            writer.register_thread(dettid, logical_priority);
+        }
+    }
+
     /// Under `--replay-schedule-from`, give a thread registering now its
     /// priority. A context switch to it that came before its registration
     /// has already set one. Otherwise it takes its `starting` priority:
@@ -21757,6 +21799,358 @@ mod test {
             Some(DEFAULT_PRIORITY)
         );
         assert_eq!(sched.priorities.get(&foreground), Some(&DEFAULT_PRIORITY));
+    }
+
+    fn plain_replay_with_writer(events: Vec<SchedEvent>) -> Scheduler {
+        let mut sched = Scheduler::new(&Config::default());
+        sched.record_logical_replay_priorities = true;
+        sched.replayer = Some(Replayer::new(events));
+        sched.preemption_writer = Some(PreemptionWriter::new(None));
+        sched
+    }
+
+    #[test]
+    fn committed_exit_posthook_handoff_preserves_scheduler_target_and_state() {
+        use detcore_model::schedule::Op;
+        use detcore_model::schedule::boundary::Record;
+        use detcore_model::schedule::boundary::Schedule;
+
+        for boundary in [false, true] {
+            for group in [false, true] {
+                for through_step7 in [false, true] {
+                    let parent = DetTid::from_raw(3);
+                    let exiting = DetTid::from_raw(5);
+                    // exit_group's next owner is outside the exiting group;
+                    // raw exit instead leaves a live peer in the same group.
+                    let process = if group { exiting } else { parent };
+                    let config = Config::default();
+                    let mut clock = GlobalTime::new(&config);
+                    clock.update_global_time(exiting, clock.as_nanos(), LogicalTime::ZERO);
+                    let duration = clock.threads_duration(exiting);
+                    let global_time = Mutex::new(clock);
+                    let syscall = if group {
+                        Sysno::exit_group
+                    } else {
+                        Sysno::exit
+                    };
+                    let terminal = SchedEvent::syscall(exiting, syscall, SyscallPhase::Posthook)
+                        .with_time(duration);
+                    let next = SchedEvent {
+                        dettid: parent,
+                        op: Op::Branch,
+                        count: 123,
+                        start_rip: None,
+                        end_rip: detcore_model::schedule::InstructionPointer::new(12345),
+                        end_time: Some(LogicalTime::from_nanos(123)),
+                    };
+                    let mut sched = plain_replay_with_writer(vec![terminal.clone(), next.clone()]);
+                    if boundary {
+                        sched.replayer = None;
+                        sched.boundary_replayer = Some(boundary_replayer::BoundaryReplayer::new(
+                            Schedule::new(vec![
+                                Record::Event(terminal.clone()),
+                                Record::Event(next.clone()),
+                            ])
+                            .unwrap(),
+                        ));
+                    } else {
+                        sched.replayer.as_mut().unwrap().die_on_desync = true;
+                    }
+                    sched.thread_tree.add_child(parent, parent, true);
+                    sched.thread_tree.add_child(parent, exiting, group);
+                    for (tid, priority) in [
+                        (parent, REPLAY_DEFERRED_PRIORITY),
+                        (exiting, REPLAY_FOREGROUND_PRIORITY),
+                    ] {
+                        register_known_thread(&mut sched, tid);
+                        sched.priorities.insert(tid, priority);
+                        sched.register_preemption_thread(tid, priority, false);
+                        sched.runqueue_push_back(tid);
+                    }
+                    let exit = ResourceID::Exit {
+                        group,
+                        process,
+                        mm: MmId::initial(process),
+                    };
+                    assert!(!sched.committed_exits.contains(&exiting));
+                    assert!(
+                        sched
+                            .block_for_one_resource(
+                                exiting,
+                                &exit,
+                                &Permission::RW,
+                                None,
+                                None,
+                                &Ivar::new()
+                            )
+                            .is_ok()
+                    );
+                    assert!(sched.committed_exits.contains(&exiting));
+                    let mut request = Resources::new(exiting);
+                    request.insert(exit, Permission::RW);
+                    let placeholder = request.as_exit_syscall().unwrap();
+                    assert_eq!(placeholder.number(), syscall);
+                    let before = (sched.turn, sched.committed_time);
+
+                    if through_step7 {
+                        // The real committed Exit request produces this exact
+                        // synthetic posthook; the warning/check stays intact.
+                        sched.step7_simulate_exit_posthook(exiting, placeholder, &global_time);
+                        assert_eq!(sched.recorded_event_count, 1);
+                    } else {
+                        let observed = SchedEvent::syscall(
+                            exiting,
+                            placeholder.number(),
+                            SyscallPhase::Posthook,
+                        )
+                        .with_time(duration);
+                        let consumed = sched.consume_schedevent(&observed);
+                        assert!(consumed.keep_running, "the exit grant supplies the handoff");
+                        assert_eq!(consumed.event_ix, 0);
+                        assert_eq!(
+                            consumed.timeslice_remaining,
+                            (!boundary).then(|| LogicalTime::from_rcbs(123))
+                        );
+                        assert_eq!(sched.recorded_event_count, 0);
+                    }
+                    assert_eq!((sched.turn, sched.committed_time), before);
+                    assert_eq!(sched.priorities[&exiting], REPLAY_DEFERRED_PRIORITY);
+                    assert_eq!(sched.priorities[&parent], REPLAY_FOREGROUND_PRIORITY);
+                    assert_eq!(
+                        sched.run_queue.queued_priority(exiting),
+                        Some(REPLAY_DEFERRED_PRIORITY)
+                    );
+                    assert_eq!(
+                        sched.run_queue.queued_priority(parent),
+                        Some(REPLAY_FOREGROUND_PRIORITY)
+                    );
+                    assert_eq!(sched.run_queue.tids().count(), 2);
+                    assert!(!sched.replay_priorities_released);
+                    if boundary {
+                        let cursor = sched.boundary_replayer.as_ref().unwrap();
+                        assert_eq!(cursor.stored_index(), 1);
+                        assert_eq!(cursor.record(1), Some(&Record::Event(next)));
+                        assert!(!sched.timeslices.contains_key(&parent));
+                    } else {
+                        let cursor = sched.replayer.as_ref().unwrap();
+                        assert_eq!((cursor.traced_event_count, cursor.events_popped), (1, 1));
+                        assert_eq!(cursor.cursor.peek(), Some(&next));
+                        assert_eq!(
+                            cursor.desync_counts,
+                            BTreeMap::from([(exiting, replayer::DesyncStats::default())])
+                        );
+                        assert_eq!(
+                            sched.timeslices.get(&parent),
+                            Some(&Some(LogicalTime::from_rcbs(123)))
+                        );
+                    }
+                    let writer = sched.preemption_writer.as_ref().unwrap();
+                    assert_eq!(writer.current_priority(parent), DEFAULT_PRIORITY);
+                    assert_eq!(writer.current_priority(exiting), DEFAULT_PRIORITY);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logical_replay_priority_policy_excludes_other_priority_authorities() {
+        let raw = Config {
+            replay_schedule_from: Some("not-opened-by-this-predicate".into()),
+            ..Config::default()
+        };
+        assert!(Scheduler::records_logical_replay_priorities(&raw));
+        assert!(!Scheduler::records_logical_replay_priorities(
+            &Config::default()
+        ));
+        for cfg in [
+            Config {
+                chaos: true,
+                ..raw.clone()
+            },
+            Config {
+                sched_heuristic: crate::config::SchedHeuristic::ConnectBind,
+                ..raw.clone()
+            },
+            Config {
+                sched_heuristic: crate::config::SchedHeuristic::Random,
+                ..raw.clone()
+            },
+            Config {
+                replay_preemptions_from: Some("not-opened-either".into()),
+                ..raw
+            },
+        ] {
+            assert!(!Scheduler::records_logical_replay_priorities(&cfg));
+            let mut sched = Scheduler::new(&Config::default());
+            sched.record_logical_replay_priorities =
+                Scheduler::records_logical_replay_priorities(&cfg);
+            sched.preemption_writer = Some(PreemptionWriter::new(None));
+            let tid = DetTid::from_raw(3);
+            sched.register_preemption_thread(tid, REPLAY_DEFERRED_PRIORITY, false);
+            assert_eq!(
+                sched
+                    .preemption_writer
+                    .as_ref()
+                    .unwrap()
+                    .current_priority(tid),
+                REPLAY_DEFERRED_PRIORITY
+            );
+        }
+    }
+
+    #[test]
+    fn logical_replay_priorities_survive_retirement_eof_and_later_births() {
+        let root = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let vfork = DetTid::from_raw(7);
+        let first = SchedEvent::syscall(root, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let last = SchedEvent::syscall(root, Sysno::getppid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(20_000));
+        let mut sched = plain_replay_with_writer(vec![first.clone(), last.clone()]);
+        sched.thread_tree.add_child(root, root, true);
+        sched.thread_tree.add_child(root, child, false);
+        sched.thread_tree.add_child(root, vfork, true);
+        for (tid, control, is_vfork) in [
+            (root, REPLAY_FOREGROUND_PRIORITY, false),
+            (child, REPLAY_DEFERRED_PRIORITY, false),
+            (vfork, REPLAY_DEFERRED_PRIORITY, true),
+        ] {
+            register_known_thread(&mut sched, tid);
+            sched.priorities.insert(tid, control);
+            sched.register_preemption_thread(tid, control, is_vfork);
+        }
+        sched.readmit_ready_thread(vfork);
+        sched.logically_kill_thread(&child, &root, MmId::initial(root));
+        assert!(!sched.next_turns.contains_key(&child));
+        assert!(!sched.priorities.contains_key(&child));
+        let before = (sched.turn, sched.committed_time);
+        let _ = sched.consume_schedevent(&first);
+        assert!(!sched.replay_priorities_released);
+        assert_eq!(sched.priorities[&root], REPLAY_FOREGROUND_PRIORITY);
+        assert_eq!(sched.priorities[&vfork], REPLAY_DEFERRED_PRIORITY);
+        assert_eq!(
+            sched
+                .preemption_writer
+                .as_ref()
+                .unwrap()
+                .current_priority(root),
+            DEFAULT_PRIORITY
+        );
+        assert_eq!(
+            sched
+                .preemption_writer
+                .as_ref()
+                .unwrap()
+                .current_priority(vfork),
+            DEFAULT_PRIORITY - 1
+        );
+        let _ = sched.consume_schedevent(&last);
+        assert!(sched.replay_priorities_released);
+        assert_eq!(sched.priorities[&root], DEFAULT_PRIORITY);
+        assert_eq!(
+            sched.run_queue.queued_priority(vfork),
+            Some(DEFAULT_PRIORITY)
+        );
+        assert_eq!((sched.turn, sched.committed_time), before);
+        for (tid, is_vfork) in [(DetTid::from_raw(9), false), (DetTid::from_raw(11), true)] {
+            register_known_thread(&mut sched, tid);
+            assert!(!sched.replay_registration_priority(tid, REPLAY_DEFERRED_PRIORITY));
+            sched.register_preemption_thread(tid, REPLAY_DEFERRED_PRIORITY, is_vfork);
+            assert_eq!(sched.priorities[&tid], DEFAULT_PRIORITY);
+        }
+        let queue = sched.run_queue.tids().copied().collect::<Vec<_>>();
+        sched.release_replay_priorities_if_exhausted();
+        assert_eq!(sched.run_queue.tids().copied().collect::<Vec<_>>(), queue);
+        assert!(!sched.priorities.contains_key(&child));
+        let exported: serde_json::Value =
+            serde_json::from_str(&sched.preemption_writer.take().unwrap().into_string()).unwrap();
+        for (tid, priority) in [
+            ("3", 1000),
+            ("5", 1000),
+            ("7", 999),
+            ("9", 1000),
+            ("11", 999),
+        ] {
+            assert_eq!(exported["per_thread"][tid]["final_prio"], priority);
+            assert_eq!(
+                exported["per_thread"][tid]["prio_changes"],
+                serde_json::json!([])
+            );
+        }
+    }
+
+    #[test]
+    fn logical_replay_resync_does_not_invent_a_lookahead_history() {
+        let tid = DetTid::from_raw(3);
+        let future = DetTid::from_raw(5);
+        let first = SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let skipped = SchedEvent::syscall(future, Sysno::getppid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(20_000));
+        let last = SchedEvent::syscall(tid, Sysno::gettid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(30_000));
+        let mut sched = plain_replay_with_writer(vec![first.clone(), skipped, last.clone()]);
+        register_known_thread(&mut sched, tid);
+        sched.priorities.insert(tid, REPLAY_FOREGROUND_PRIORITY);
+        sched.register_preemption_thread(tid, REPLAY_FOREGROUND_PRIORITY, false);
+        let _ = sched.consume_schedevent(&first);
+        assert_eq!(sched.priorities[&future], REPLAY_FOREGROUND_PRIORITY);
+        assert!(!sched.next_turns.contains_key(&future));
+        let _ = sched.consume_schedevent(&last);
+        let replayer = sched.replayer.as_ref().unwrap();
+        assert_eq!(replayer.traced_event_count, 2);
+        assert_eq!(replayer.desync_counts[&tid].hard, 1);
+        assert_eq!(replayer.desync_counts[&tid].fast_forwards, 1);
+        assert_eq!(replayer.desync_counts[&tid].resync_deletions, 1);
+        let exported: serde_json::Value =
+            serde_json::from_str(&sched.preemption_writer.take().unwrap().into_string()).unwrap();
+        assert_eq!(exported["per_thread"].as_object().unwrap().len(), 1);
+        assert_eq!(exported["per_thread"]["3"]["final_prio"], DEFAULT_PRIORITY);
+        assert!(exported["per_thread"].get("5").is_none());
+    }
+
+    #[test]
+    fn logical_replay_exec_inherits_caller_not_dispatch_priority() {
+        for control in [REPLAY_FOREGROUND_PRIORITY, REPLAY_DEFERRED_PRIORITY] {
+            let leader = DetTid::from_raw(17);
+            let caller = DetTid::from_raw(18);
+            let mut sched = plain_replay_with_writer(vec![]);
+            let (detpid, mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+            sched.requeue_with_new_priority(caller, control);
+            sched.register_preemption_thread(leader, REPLAY_FOREGROUND_PRIORITY, false);
+            sched.register_preemption_thread(caller, REPLAY_DEFERRED_PRIORITY, true);
+            let before = (sched.turn, sched.committed_time);
+            reconnect_nonleader_exec(&mut sched, leader, caller, detpid, mm);
+            assert_eq!(sched.priorities[&leader], control);
+            assert!(!sched.next_turns.contains_key(&caller));
+            assert_eq!((sched.turn, sched.committed_time), before);
+            let writer = sched.preemption_writer.as_ref().unwrap();
+            assert_eq!(writer.current_priority(leader), DEFAULT_PRIORITY - 1);
+            assert_eq!(writer.current_priority(caller), DEFAULT_PRIORITY - 1);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot read current priority before registering thread")]
+    fn logical_replay_exec_still_requires_the_callers_writer_row() {
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let mut sched = plain_replay_with_writer(vec![]);
+        let (detpid, mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        sched.register_preemption_thread(leader, REPLAY_FOREGROUND_PRIORITY, false);
+        reconnect_nonleader_exec(&mut sched, leader, caller, detpid, mm);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot set current priority before registering thread")]
+    fn logical_replay_exec_still_requires_the_replacement_writer_row() {
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let mut sched = plain_replay_with_writer(vec![]);
+        let (detpid, mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        sched.register_preemption_thread(caller, REPLAY_DEFERRED_PRIORITY, true);
+        reconnect_nonleader_exec(&mut sched, leader, caller, detpid, mm);
     }
 
     /// A thread registering after the replayed schedule ran out takes the

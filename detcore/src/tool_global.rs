@@ -5930,9 +5930,11 @@ impl GlobalState {
                 }
             }
 
-            if let Some(pr) = &mut sched.preemption_writer {
-                pr.register_thread(child_dettid, initial_priority);
-            }
+            sched.register_preemption_thread(
+                child_dettid,
+                initial_priority,
+                parent_is_kernel_blocked,
+            );
 
             // Describe *how* the admission side is chosen, but do not resolve it
             // (and in particular do not draw the post-fork PRNG) here: this
@@ -13417,6 +13419,90 @@ mod tests {
             replay.provenance().unwrap().unwrap().assignment_order,
             provenance.assignment_order
         );
+    }
+
+    #[tokio::test]
+    async fn plain_replay_registration_records_actual_root_clone_and_vfork_policy() {
+        use crate::preemptions::PreemptionRecord;
+        use crate::preemptions::boundary_recording::Recording;
+        use crate::scheduler::runqueue::REPLAY_DEFERRED_PRIORITY;
+        use crate::scheduler::runqueue::REPLAY_FOREGROUND_PRIORITY;
+        use crate::types::SyscallPhase;
+        let root = DetTid::from_raw(3);
+        let clone = DetTid::from_raw(5);
+        let vfork = DetTid::from_raw(7);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schedule.json");
+        Recording::Legacy(PreemptionRecord::from_sched_events(vec![
+            SchedEvent::syscall(root, Sysno::getpid, SyscallPhase::Prehook),
+        ]))
+        .write(&path)
+        .unwrap();
+        let config = Config {
+            sequentialize_threads: false,
+            replay_schedule_from: Some(path),
+            record_preemptions: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let mm = MmId::initial(root);
+        let before = {
+            let sched = state.sched.lock().unwrap();
+            (sched.turn, sched.committed_time)
+        };
+        for (child, flags, is_vfork, sender, priority) in [
+            (root, None, false, root, REPLAY_FOREGROUND_PRIORITY),
+            (
+                clone,
+                Some(CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM | CloneFlags::CLONE_SIGHAND),
+                false,
+                root,
+                REPLAY_DEFERRED_PRIORITY,
+            ),
+            (
+                vfork,
+                Some(CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM),
+                true,
+                vfork,
+                REPLAY_DEFERRED_PRIORITY,
+            ),
+        ] {
+            assert_eq!(
+                state
+                    .recv_create_child_thread(
+                        Tid::from_raw(sender.as_raw()),
+                        mm,
+                        super::ChildRegistration {
+                            parent_dettid: root,
+                            parent_detpid: root,
+                            child_dettid: child,
+                            child_tid_addr: 0,
+                            flags,
+                            exit_signal: libc::SIGCHLD,
+                            physical_ids: None,
+                            maybe_priority: Some(priority),
+                            parent_is_kernel_blocked: is_vfork,
+                        }
+                    )
+                    .await,
+                SchedulerRpcResult::Continue(())
+            );
+            let sched = state.sched.lock().unwrap();
+            assert_eq!(sched.priorities[&child], priority);
+            assert_eq!(
+                sched
+                    .preemption_writer
+                    .as_ref()
+                    .unwrap()
+                    .current_priority(child),
+                if is_vfork {
+                    DEFAULT_PRIORITY - 1
+                } else {
+                    DEFAULT_PRIORITY
+                }
+            );
+            assert_eq!((sched.turn, sched.committed_time), before);
+        }
     }
 
     #[tokio::test]

@@ -141,6 +141,19 @@ pub enum ReplayAction {
     ContextSwitch(bool, DetTid, Option<LogicalTime>),
 }
 
+/// Exit has no returning guest continuation to background. Its synthetic
+/// posthook is emitted only after the scheduler commits the Exit request;
+/// the existing exit grant, rather than an extra TraceReplay yield, hands off.
+pub(super) fn is_terminal_posthook(event: &SchedEvent) -> bool {
+    matches!(
+        event.op,
+        Op::Syscall(
+            reverie::syscalls::Sysno::exit | reverie::syscalls::Sysno::exit_group,
+            SyscallPhase::Posthook
+        )
+    )
+}
+
 fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
     if !is_desync(observed, expected) {
         "SYNCED".to_string()
@@ -672,7 +685,13 @@ impl Replayer {
                 // semantics to that on replay.  If we have threads A&B, and events "A_prehook,
                 // B_*, A_posthook", then does the effect of A's syscall happen before or after
                 // B's logic?
-                ReplayAction::ContextSwitch(!is_prehook, next_tid, timeslice)
+                // A committed exit also hands off naturally: there is no
+                // returning continuation on which to request a background.
+                ReplayAction::ContextSwitch(
+                    !(is_prehook || is_terminal_posthook(observed)),
+                    next_tid,
+                    timeslice,
+                )
             } else {
                 // We're still running the next event.
                 ReplayAction::Continue(timeslice)
@@ -1186,6 +1205,69 @@ mod tests {
             replayer.observe_event(&schedule[0]),
             ReplayAction::ContextSwitch(true, tid(3), None)
         );
+    }
+
+    #[test]
+    fn terminal_posthook_handoff_preserves_target_duration_and_cursor() {
+        for syscall in [Sysno::exit, Sysno::exit_group] {
+            let mut b = builder::SchedTestBuilder::new();
+            let exited = b.syscall_post(syscall, SOME_RIP, tid(5));
+            let next = SchedEvent {
+                end_rip: detcore_model::schedule::InstructionPointer::new(SOME_RIP),
+                ..b.branch(123, tid(3))
+            };
+            let mut r = Replayer::new(vec![exited.clone(), next.clone()]);
+            r.die_on_desync = true;
+            assert_eq!(
+                r.observe_event(&exited),
+                ReplayAction::ContextSwitch(false, tid(3), Some(LogicalTime::from_rcbs(123)))
+            );
+            assert_eq!(r.cursor.peek(), Some(&next));
+            assert_eq!((r.traced_event_count, r.events_popped), (1, 1));
+            assert_eq!(
+                r.desync_counts,
+                BTreeMap::from([(tid(5), DesyncStats::default())])
+            );
+            assert_eq!(r.observe_event(&next), ReplayAction::Continue(None));
+            assert!(!r.has_events_left());
+        }
+    }
+
+    #[test]
+    fn returning_posthook_handoff_stays_immediate() {
+        for syscall in [Sysno::getpid, Sysno::mprotect] {
+            let mut b = builder::SchedTestBuilder::new();
+            let returned = b.syscall_post(syscall, SOME_RIP, tid(5));
+            let next = b.other(SOME_RIP, tid(3));
+            let mut r = Replayer::new(vec![returned.clone(), next.clone()]);
+            assert_eq!(
+                r.observe_event(&returned),
+                ReplayAction::ContextSwitch(true, tid(3), None)
+            );
+            assert_eq!(r.cursor.peek(), Some(&next));
+            assert_eq!(
+                r.desync_counts,
+                BTreeMap::from([(tid(5), DesyncStats::default())])
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_posthook_mismatch_remains_fatal_without_consumption() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.syscall_post(Sysno::exit, SOME_RIP, tid(5));
+        let observed = SchedEvent {
+            op: Op::Syscall(Sysno::exit_group, SyscallPhase::Posthook),
+            ..recorded
+        };
+        let mut r = Replayer::new(vec![recorded.clone(), b.other(SOME_RIP, tid(3))]);
+        r.die_on_desync = true;
+        assert_eq!(
+            r.observe_event(&observed),
+            ReplayAction::Stop(StopReason::FatalDesync)
+        );
+        assert_eq!(r.cursor.peek(), Some(&recorded));
+        assert_eq!(r.events_popped, 0);
     }
 
     #[test]

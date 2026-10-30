@@ -849,6 +849,9 @@ impl PreemptionRecord {
 pub struct ThreadHistory {
     /// The priority of the last timeslice, after the last preemption.
     /// (This is also the initial priority if there are no preemptions.)
+    /// Plain nochaos/default-heuristic raw replay retains this logical policy
+    /// value; its temporary foreground/deferred dispatch bands are not changes
+    /// to the recorded policy.
     pub final_prio: Priority,
 
     /// The preemption points and priority just BEFORE the preemption occurred.  It's
@@ -2285,6 +2288,21 @@ impl PreemptionWriter {
             boundary,
         ));
         Ok(index)
+    }
+
+    /// Current recorded priority of a genuinely registered thread. During plain
+    /// raw-schedule replay this is logical state, not a dispatch-control band.
+    pub(crate) fn current_priority(&self, tid: DetTid) -> Priority {
+        self.inner
+            .per_thread
+            .get(&tid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "PreemptionRecord: Cannot read current priority before registering thread {}",
+                    tid
+                )
+            })
+            .final_prio
     }
 
     /// Set the priority of the current thread after a change.
