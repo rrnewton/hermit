@@ -1209,7 +1209,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // matching the full validate at c00dc58e0cd, which ran 1910 in this
     // selection (1909 passed; the one failure was the hosted-pin
     // assertion for the twin below, not a count refusal on this node).
-    ("test.regular_crates", 1911),
+    // Re-measured at 3bdd41fda38 (PR 4736 tip): `cargo nextest list
+    // --profile ci --workspace --exclude hermit-detcore --exclude
+    // hermit-detcore-tests --exclude hermit-run --exclude
+    // hermetic_infra_hermit_flaky-tests` lists 1913, matching the full
+    // validate at that tip (1913 executed, all passed).
+    ("test.regular_crates", 1913),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1870,7 +1875,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And PR 4715's a_trial_writes_what_it_replays_only_into_the_workspace
     // (a trial never writes into a --replay-schedule-from or
     // --replay-preemptions-from file of the run arguments): 1226 + 1 = 1227.
-    ("test.hermit_unit", 1227),
+    // Re-measured at 3bdd41fda38: the selection lists 1245 with
+    // `cargo nextest list --profile ci`, less the node's five
+    // `--skip ptrace_completion::tests::real_random_` /
+    // `kvm_execution_tests::` cases: 1240, matching the full validate
+    // at that tip (1240 executed, all passed).
+    ("test.hermit_unit", 1240),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3102,7 +3112,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // -p hermit-detcore --lib --bins` at this integration head (the PR's
     // own 2899 was measured on its pre-revert base and does not apply here).
     // Five Binder parsing units and one ioctl admission unit: 2898 + 6 = 2904.
-    ("test.detcore_unit", 2904),
+    // Re-measured at 3bdd41fda38: `cargo nextest list --profile ci
+    // -p hermit-detcore --lib --bins` lists 2914, matching the full
+    // validate at that tip (2914 executed, all passed).
+    ("test.detcore_unit", 2914),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3492,7 +3505,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And random_determinism's
     // a_schedule_replay_hands_the_guest_the_recorded_random_values (a replay
     // adopts the recorded --rng-seed and refuses another): 347, listed.
-    ("test.hermit_integration_3", 347),
+    // Re-measured at 3bdd41fda38 by the full validate at that tip:
+    // 349 executed, all passed (the two added cases are in this shard;
+    // the shard pins 61 + 290 + 349 again sum to the on-host 700).
+    ("test.hermit_integration_3", 349),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -5442,7 +5458,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2898 - 7 = 2891, matching the local twin's recount at c00dc58e0cd.
     // And the same two PR 4942 units: 2891 + 2 = 2893.
     // The same six Binder receipt units: 2898 + 6 = 2904.
-    ("test.detcore_unit_on_host", 2904),
+    // The same recount at 3bdd41fda38: 2914 (no exclusions on this twin).
+    ("test.detcore_unit_on_host", 2914),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5558,7 +5575,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two-run syscall-histogram test: 693, listed.
     // And the same random_determinism schedule-replay test: 694, listed.
     // Train 6 recount (measured on 21f770f6 base): 695.
-    ("test.hermit_integration_on_host", 698),
+    // Re-measured at 3bdd41fda38: the on-host selection lists 700 with
+    // `cargo nextest list --profile ci` (the local shards' 61 + 290 + 349).
+    ("test.hermit_integration_on_host", 700),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -5816,7 +5835,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
     // The same six analyze outcome controls replace one obsolete warning test: +5.
     // And the same PR 4715 trial-input workspace test: 1220 + 1 = 1221.
-    ("test.hermit_unit_on_host", 1221),
+    // Re-measured at 3bdd41fda38: 1245 listed, less the five `--skip`
+    // cases and this twin's six named forced-gate exclusions: 1234.
+    ("test.hermit_unit_on_host", 1234),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6035,7 +6056,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // so the hosted twin executes 1910 - 14 = 1896. Two of the four added
     // since 1894 are themselves hosted-excluded, so this twin gains only
     // two, not four: 1894 + 2 = 1896.
-    ("test.regular_crates_on_host", 1897),
+    // Recount at 3bdd41fda38: the local selection lists 1913 and all
+    // fourteen hosted exclusions are present exactly once, so the
+    // hosted twin executes 1913 - 14 = 1899.
+    ("test.regular_crates_on_host", 1899),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

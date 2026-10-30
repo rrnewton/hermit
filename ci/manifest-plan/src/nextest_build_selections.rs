@@ -951,7 +951,11 @@ mod tests {
             // owner-death tests: the population measures 698 at this
             // integration head (the PR's +2 on its stale base of 694,
             // re-measured here rather than carried over).
-            assert_eq!(population, 698);
+            // Recount at 3bdd41fda38: the selection lists 700
+            // (`cargo nextest list --profile ci` on the on-host
+            // selection), matching the full validate at that tip, whose
+            // third shard executed 349 (347 + 2), all passed: 700.
+            assert_eq!(population, 700);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
