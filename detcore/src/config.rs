@@ -144,6 +144,8 @@ mod tests {
         (17, "14429e331cedfbc2", "846052997d97693f"),
         // Adds `GlobalResponse::WithReplayInstructionOffset` (#4845).
         (18, "ccfae94fb610649c", "846052997d97693f"),
+        // Retypes `GlobalResponse::StartNewThread` (#4789).
+        (19, "a27f21996e6332c8", "846052997d97693f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
