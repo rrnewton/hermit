@@ -1933,7 +1933,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And analyze::phases::tests::analyze_trials_replay_a_record_under_its_recorded_seeds
     // and run::run_takes_a_replayed_records_seeds_as_main_does (every launch
     // takes a replayed record's seeds): 1325.
-    ("test.hermit_unit", 1325),
+    // And analyze::phases::tests::analyze_trials_take_the_targets_scheduler_seed_and_endpoints_their_own: 1326.
+    ("test.hermit_unit", 1326),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6043,7 +6044,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three trial-guest-random-seed units: 1316.
     // And the same recorded-seeds replay test: 1317, listed.
     // And the same two replayed-seed tests: 1319.
-    ("test.hermit_unit_on_host", 1319),
+    // And the same trial scheduler-seed test: 1320.
+    ("test.hermit_unit_on_host", 1320),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
