@@ -122,6 +122,12 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4862, renumbered to 15 at
         // integration; digests measured at this head).
         (15, "edaba1a0186b437c", "846052997d97693f"),
+        // Retypes `GlobalRequest::TraceSchedEvent`, including its nested
+        // AccessPayload signal observation (Handler/Ignored/Default/Unknown).
+        // The definition digest below covers the outer enums, not nested types.
+        // (https://github.com/rrnewton/hermit/pull/4738, renumbered to 16 at
+        // integration; digests measured at this head).
+        (16, "182b80da8855a429", "846052997d97693f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

@@ -1961,6 +1961,27 @@ impl GlobalState {
         }
     }
 
+    /// Close the access trace (`--record-access-trace-to`): the calls that
+    /// never returned, then the end line that marks it complete. The trace
+    /// is an observation, so a failure to finish it is reported and leaves
+    /// the run's outcome alone; the missing end line tells a reader.
+    fn finish_access_trace(&mut self) {
+        let (writer, events) = {
+            let mut sched = self.sched.lock().unwrap();
+            (sched.access_trace.take(), sched.recorded_event_count)
+        };
+        // Output I/O runs without the scheduler mutex.
+        if let Some(writer) = writer
+            && let Err(error) = writer.finish(events)
+        {
+            let path = self.cfg.access_trace.as_ref().map(|p| p.display());
+            warn!(
+                "hermit: the access trace {} is incomplete: {error}",
+                path.map_or_else(String::new, |p| p.to_string())
+            );
+        }
+    }
+
     /// Write the network trace of a record run, or check that a replay used
     /// the whole recording. Returns the refusal a replay ends with.
     fn finish_network_trace(&mut self) -> Option<String> {
@@ -2294,6 +2315,7 @@ impl GlobalState {
             debug!("Global state cleanup, continuing...");
         }
         let network_refusal = self.finish_network_trace();
+        self.finish_access_trace();
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
@@ -4532,9 +4554,9 @@ impl GlobalState {
                 let ns = self.global_time.lock().unwrap().as_nanos();
                 R::GlobalTimeLowerBound(ns)
             }
-            GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap) => {
+            GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap, access) => {
                 match self
-                    .recv_trace_schedevent(ev, detpid, request_mm, command_bootstrap)
+                    .recv_trace_schedevent(ev, detpid, request_mm, command_bootstrap, access)
                     .await
                 {
                     SchedulerRpcResult::Continue(response) => R::TraceSchedEvent(response),
@@ -6712,6 +6734,7 @@ impl GlobalState {
         detpid: DetPid,
         request_mm: MmId,
         command_bootstrap: bool,
+        access: Option<Box<crate::access_trace::AccessPayload>>,
     ) -> SchedulerRpcResult<TraceSchedEventResponse> {
         let ev = {
             let mut sched = self.lock_rpc_scheduler(false).await;
@@ -6762,7 +6785,9 @@ impl GlobalState {
                 }
                 let consumed = sched.consume_schedevent(&ev);
                 let print_stack2 = if self.cfg.record_preemptions {
-                    sched.record_event(&ev)
+                    let stack = sched.record_event(&ev);
+                    sched.record_access(&ev, access);
+                    stack
                 } else {
                     None
                 };
@@ -6830,7 +6855,9 @@ impl GlobalState {
                     return SchedulerRpcResult::ThreadExited;
                 }
                 if self.cfg.record_preemptions {
-                    sched.record_event(&ev)
+                    let stack = sched.record_event(&ev);
+                    sched.record_access(&ev, access);
+                    stack
                 } else {
                     None
                 }
@@ -7078,7 +7105,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 15;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 16;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -7329,9 +7356,16 @@ pub enum GlobalRequest {
     /// Retrieve global time.
     GlobalTimeLowerBound,
 
-    /// Record scheduling event in a total order.
+    /// Record scheduling event in a total order. The last field is what the
+    /// event adds to the access trace (`--record-access-trace-to`); `None`
+    /// without one.
     // Logging provenance only; never serialized into a schedule artifact.
-    TraceSchedEvent(SchedEvent, DetPid, bool),
+    TraceSchedEvent(
+        SchedEvent,
+        DetPid,
+        bool,
+        Option<Box<crate::access_trace::AccessPayload>>,
+    ),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -10252,6 +10286,21 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    trace_schedevent_with_access(guest, ev, tag_end_rip, None).await
+}
+
+/// [`trace_schedevent`], carrying what the event adds to the access trace
+/// (`crate::access_trace`). The payload rides on the same request: no
+/// request is added, and an RPC's clock charge does not depend on its size.
+pub async fn trace_schedevent_with_access<G, T>(
+    guest: &mut G,
+    ev: SchedEvent,
+    tag_end_rip: bool,
+    access: Option<crate::access_trace::AccessPayload>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     assert!(guest.config().sequentialize_threads);
 
     // trace_schedevent is called AFTER the event is complete, and the rip is resting just after it.
@@ -10298,7 +10347,7 @@ where
     }
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap),
+        GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap, access.map(Box::new)),
     )
     .await;
 
@@ -20081,7 +20130,7 @@ mod tests {
         install_test_registration(&state, dettid, request_seen.clone());
         install_test_registration(&state, next_tid, Ivar::new());
 
-        let replay = state.recv_trace_schedevent(event, detpid, MmId::initial(detpid), false);
+        let replay = state.recv_trace_schedevent(event, detpid, MmId::initial(detpid), false, None);
         let kill_after_replay_yield = async {
             while request_seen.try_read().is_none() {
                 tokio::task::yield_now().await;
