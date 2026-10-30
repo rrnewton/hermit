@@ -32,8 +32,9 @@ that died first, or one older than the field), a malformed one, or one that reco
 payload as invalid refuses the whole ingest before anything is written to IMPORT_DIR.
 An execution's rows, result.json and run_id.
 marker (see --local-artifacts) must name one run id, and no two executions may share one.
-Tpx owns retries (cells run the harness with --no-retry). A cell's Nth execution in Tpx
-order is attempt N, and its row (at most one, for its own cell) carries that number. An
+The Hermit test-harness owns retries in both modes (owner policy, 2026-10-30; Tpx retries
+are off). A cell's Nth harness attempt in execution order is attempt N, and its row carries
+that number; one execution may write several rows, one per attempt. An
 execution that wrote no row still takes its number, so the next row shows the gap and
 import mode refuses the history. "Passed only on rerun" therefore stays visible, as
 attempt 1 failing before attempt 2 passes, even when attempt 1 died before writing a row.
@@ -660,7 +661,7 @@ def main():
             sys.exit(f"ingest: {where} has a result.json for {result.get('cell')}")
         if len(rows) > 1 or any(cell_of(row) != cell for row in rows):
             sys.exit(f"ingest: {where} has {len(rows)} rows, for cells {sorted({cell_of(row) for row in rows})}; "
-                     f"a cell runs the harness once (--no-retry), which writes one row, for that cell")
+                     f"a cell runs the harness, which writes one row per attempt, for that cell")
         ids = [row.get("run_id") for row in rows] + ([result.get("run_id")] if result is not None else [])
         ids += [marker] if marker is not None else []
         if len(set(ids)) > 1 or None in ids:
@@ -767,8 +768,13 @@ def main():
             if withheld_on_re(cell, rows, summary, route):
                 withheld += 1
                 continue
-            attempt += 1
+            if not rows:
+                attempt += 1
+            # The harness owns retries (owner policy, 2026-10-30): one
+            # execution may write several rows, one per innermost attempt,
+            # and each takes its own attempt number in order.
             for row in rows:
+                attempt += 1
                 buckets[(lane, category)].append(dict(row, attempt=attempt))
                 attempts[attempt] += 1
             if not rows and not claims_host_inapplicable(cell, summary):

@@ -51,7 +51,6 @@ use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::ptrace_cell_capability;
 use hermit_manifest_plan::runner::refused_on_an_inexact_branch_counter;
 use hermit_manifest_plan::runner::requires_capability;
-use hermit_manifest_plan::runner::retries_product_failures;
 use hermit_manifest_plan::runner::row_records_cell_relaxations;
 use hermit_manifest_plan::runner::run_cell;
 use hermit_manifest_plan::runner::skid_overshoot_only_reports;
@@ -2915,11 +2914,17 @@ enum Retries {
     Off,
 }
 
-/// Why a finished attempt is retried.
+/// Why a finished attempt is retried. Classification labels the retry for
+/// diagnosis; it does not gate it (owner policy, 2026-10-30): every failing
+/// test earns the bounded retry at the innermost cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetryCause {
     /// A measured product failure ([`cell_result_is_retryable`]).
     ProductFailure,
+    /// Any other failing attempt (timeout, OOM, no-result, product ERROR,
+    /// a replay failure): retried under the universal policy, labelled by
+    /// its failure class in the retry record.
+    Failure,
     /// A verify cell whose only failure is Hermit's typed precise-timer
     /// overshoot ([`skid_overshoot_only_reports`]), carrying the number of
     /// `HERMIT_SKID_OVERSHOOT` reports. It is counted and reported as a
@@ -2948,12 +2953,16 @@ fn attempt_retry_cause(
     if retries != Retries::Framework {
         return None;
     }
+    // A passing or host-inapplicable attempt is not a failing test.
+    if result.outcome != "FAIL" && result.outcome != "ERROR" {
+        return None;
+    }
     // The host-input and skid rules check the stdout assertions the row
     // records, and the skid rule also admits the guest disposition and applies
     // the comparator it records, so the row must record exactly what this
     // cell's manifest declares; an imported row recorded under another
-    // declaration or recipe does not choose its own. An executed row either
-    // rule can admit always records its cell's declarations.
+    // declaration or recipe does not choose its own label. An executed row
+    // either rule can admit always records its cell's declarations.
     // The level relaxations are the producing host's
     // ([`row_records_cell_relaxations`]).
     let records_this_cell = || {
@@ -2961,19 +2970,22 @@ fn attempt_retry_cause(
             && result.declared_stdout.as_ref() == Some(&cell_declared_stdout(cell))
             && row_records_cell_relaxations(cell, result)
     };
-    if host_input_change_only(result) && records_this_cell() {
-        return Some(RetryCause::HostInputChanged);
-    }
-    if !retries_product_failures(cell) {
-        return None;
+    if records_this_cell() {
+        if host_input_change_only(result) {
+            return Some(RetryCause::HostInputChanged);
+        }
+        if let Some(reports) = skid_overshoot_only_reports(result) {
+            return Some(RetryCause::SkidOvershoot { reports });
+        }
     }
     if cell_result_is_retryable(result.outcome.as_str(), result.failure_class) {
         return Some(RetryCause::ProductFailure);
     }
-    if !records_this_cell() {
-        return None;
-    }
-    skid_overshoot_only_reports(result).map(|reports| RetryCause::SkidOvershoot { reports })
+    // Universal retry (owner policy, 2026-10-30): every other failing test
+    // — timeout, OOM, no-result, product ERROR, replay, no_retry_reason
+    // cells included — earns the same bounded innermost retry. Its class
+    // remains on the row for diagnosis.
+    Some(RetryCause::Failure)
 }
 
 /// Whether this finished attempt of `cell` is retried; see
@@ -3569,7 +3581,12 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let retried = retried_attempts(args.retries, &cells, &attempt_results);
     let product_retried = retried
         .iter()
-        .filter(|retried| retried.cause == RetryCause::ProductFailure)
+        .filter(|retried| {
+            matches!(
+                retried.cause,
+                RetryCause::ProductFailure | RetryCause::Failure
+            )
+        })
         .collect::<Vec<_>>();
     let host_input_retried = retried
         .iter()
@@ -4918,13 +4935,13 @@ rundir.mkdir()
             ("skid-then-match-relaxed-producer", true, 2, 1, 0),
             ("skid-twice", false, 2, 1, 0),
             ("skid-no-retry", false, 1, 0, 0),
-            ("unmarked-skid", false, 1, 0, 0),
+            ("unmarked-skid", false, 2, 0, 1),
             ("diverged-marked", false, 2, 0, 1),
             ("diverged-then-skid", false, 2, 0, 1),
             ("unmarked-diverged-then-match", true, 2, 0, 1),
-            ("rejected-guest-skid", false, 1, 0, 0),
-            ("crashed-operand-skid", false, 1, 0, 0),
-            ("skid-wrong-stdout", false, 1, 0, 0),
+            ("rejected-guest-skid", false, 2, 0, 1),
+            ("crashed-operand-skid", false, 2, 0, 1),
+            ("skid-wrong-stdout", false, 2, 0, 1),
         ] {
             let fixture = std::env::temp_dir().join(format!(
                 "hermit-harness-skid-retry-{}-{:?}-{scenario}",
@@ -5315,7 +5332,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                             &real_cell("c-programs/getrusage-self-accounting"),
                             &redeclared
                         ),
-                        None
+                        Some(super::RetryCause::Failure)
                     );
                     // Likewise a row recorded under a stdout declaration the
                     // real cell does not make: its compared runs meet its own
@@ -5337,7 +5354,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                             &real_cell("c-programs/getrusage-self-accounting"),
                             &restated
                         ),
-                        None
+                        Some(super::RetryCause::Failure)
                     );
                     // A row whose report is not the bytes its recorded digest
                     // names (an imported or edited row) earns no retry: the
@@ -5352,7 +5369,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                                 &real_cell("c-programs/getrusage-self-accounting"),
                                 &undigested
                             ),
-                            None,
+                            Some(super::RetryCause::Failure),
                             "a {label} report digest: {undigested:#?}"
                         );
                     }
@@ -5363,7 +5380,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                             &real_cell("compat/cat"),
                             first
                         ),
-                        None
+                        Some(super::RetryCause::SkidOvershoot { reports: 2 })
                     );
                 }
                 "unmarked-skid" => {
@@ -5388,7 +5405,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                             &real_cell("c-programs/getrusage-self-accounting"),
                             first
                         ),
-                        None,
+                        Some(super::RetryCause::Failure),
                         "{scenario}"
                     );
                 }
@@ -5462,7 +5479,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         }),
                         "{rows:#?}"
                     );
-                    assert_eq!(summary["errors"], json!(1), "{scenario}");
+                    assert_eq!(summary["errors"], json!(0), "{scenario}");
                     assert_eq!(super::skid_overshoot_only_reports(first), None);
                     // The same attempt with the plain skid reason, as an older
                     // producer would have labelled it, is still refused: the
@@ -5485,7 +5502,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         Some(2),
                         "the relabelled row differs from a qualifying one only in its declaration"
                     );
-                    assert!(!stdout.contains("retrying this cell only"), "{stdout}");
+                    assert!(stdout.contains("retrying this cell only"), "{stdout}");
                 }
                 "unmarked-diverged-then-match" => {
                     // A divergence with no overshoot marker, then a match: the
@@ -5555,8 +5572,9 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                     /// The skid row earns its retry, and the producer's PASS
                     /// after it is the verdict.
                     Retried,
-                    /// The skid row earns no retry: it ends the history.
-                    Ended,
+                    /// Universal retry: the row earns a generic retry, so the
+                    /// producer's PASS is kept, but it is not SKID-counted.
+                    RetriedGeneric,
                     /// The producer recorded only the skid attempt.
                     Unretried,
                 }
@@ -5698,9 +5716,9 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         ("import-fallback-recomputed-pass", Expect::Retried),
                         ("import-misdigested-path-pass", Expect::Retried),
                         ("import-unselected-pass", Expect::Retried),
-                        ("import-pathless-skid", Expect::Ended),
-                        ("import-fallback-recomputed-skid", Expect::Ended),
-                        ("import-misdigested-path-skid", Expect::Ended),
+                        ("import-pathless-skid", Expect::RetriedGeneric),
+                        ("import-fallback-recomputed-skid", Expect::RetriedGeneric),
+                        ("import-misdigested-path-skid", Expect::RetriedGeneric),
                         ("import-lone-skid", Expect::Unretried),
                     ]
                 } else {
@@ -5711,12 +5729,12 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         ("import-reportless-pass", Expect::Retried),
                         ("import-diverged-pass", Expect::Retried),
                         ("import-relaxed-pass", Expect::Retried),
-                        ("import-misdigested-skid", Expect::Ended),
-                        ("import-undigested-skid", Expect::Ended),
-                        ("import-redeclared-skid", Expect::Ended),
-                        ("import-vacuous-skid", Expect::Ended),
-                        ("import-relaxed-skid", Expect::Ended),
-                        ("import-plain-error-skid", Expect::Ended),
+                        ("import-misdigested-skid", Expect::RetriedGeneric),
+                        ("import-undigested-skid", Expect::RetriedGeneric),
+                        ("import-redeclared-skid", Expect::RetriedGeneric),
+                        ("import-vacuous-skid", Expect::RetriedGeneric),
+                        ("import-relaxed-skid", Expect::RetriedGeneric),
+                        ("import-plain-error-skid", Expect::RetriedGeneric),
                         ("import-lone-skid", Expect::Unretried),
                     ]
                 };
@@ -5849,7 +5867,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                     }
                     let (result, published, summary, context) = import(variant, &imported);
                     let stdout = String::from_utf8_lossy(&result.stdout);
-                    let dropped = usize::from(matches!(expect, Expect::Ended));
+                    let dropped = 0;
                     assert!(
                         String::from_utf8_lossy(&result.stderr).contains(&format!(
                             "0 have no result; {dropped} producer retr(ies) this run would not have made were dropped"
@@ -5936,7 +5954,18 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                                 assert_eq!(lone_summary["passed"], json!(1), "{lone_context}");
                             }
                         }
-                        Expect::Ended | Expect::Unretried => {
+                        Expect::RetriedGeneric => {
+                            assert_eq!(
+                                published.iter().map(rebound).collect::<Vec<_>>(),
+                                imported.iter().map(rebound).collect::<Vec<_>>(),
+                                "{context}"
+                            );
+                            assert_eq!(result.status.code(), Some(0), "{context}");
+                            assert_eq!(summary["passed"], json!(1), "{context}");
+                            assert_eq!(summary["skid_retries"], json!(0), "{context}");
+                            assert!(stdout.contains("PRODUCT-RETRY count 1"), "{context}");
+                        }
+                        Expect::Unretried => {
                             // The skid row itself, as its producer wrote it,
                             // and nothing after it; its ERROR fails the run.
                             assert_eq!(
@@ -6366,7 +6395,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                 String::from_utf8_lossy(&result.stderr)
             );
             let confirmed = scenario == "counter-confirmed";
-            let succeeds = scenario == "complete" || confirmed;
+            let succeeds = scenario == "complete" || confirmed || scenario == "untrusted-retry";
             assert_eq!(
                 result.status.code(),
                 Some(if succeeds { 0 } else { 1 }),
@@ -6442,7 +6471,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             assert_eq!(errors, Vec::from_iter(expected_error), "{context}");
             assert_eq!(
                 summary["errors"],
-                u64::from(expected_error.is_some()),
+                u64::from(expected_error.is_some() && scenario != "untrusted-retry"),
                 "{context}"
             );
             // Each history no producer writes is refused for its own reason.
@@ -6499,14 +6528,16 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             );
             assert_eq!(
                 summary["imported"]["dropped_retries"],
-                u64::from(matches!(scenario, "untrusted-retry" | "no-retry")),
+                u64::from(scenario == "no-retry"),
                 "{context}"
             );
             match scenario {
                 // The producer's retry after an infrastructure ERROR is not
                 // one this run would have made: the ERROR is the verdict.
                 // Under --no-retry, no retry is: the first FAIL is.
-                "untrusted-retry" => assert_eq!(custom, vec![(1, "ERROR")], "{context}"),
+                "untrusted-retry" => {
+                    assert_eq!(custom, vec![(1, "ERROR"), (2, "PASS")], "{context}")
+                }
                 "no-retry" => {
                     assert_eq!(custom, vec![(1, "FAIL")], "{context}");
                     assert_eq!(summary["failed"], 1, "{context}");
@@ -6569,7 +6600,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             let junit = fs::read_to_string(path.join("out/junit.xml")).unwrap();
             let header = format!(
                 "tests=\"3\" failures=\"{failed}\" errors=\"{}\" skipped=\"{host_inapplicable}\"",
-                u64::from(expected_error.is_some())
+                u64::from(expected_error.is_some() && scenario != "untrusted-retry")
             );
             assert!(junit.contains(&header), "{junit}\n{context}");
             let counts: serde_json::Value =
@@ -10259,11 +10290,18 @@ sys.exit(1 if failed else 0)
         for (id, expected) in [
             (
                 "infra",
-                vec![(
-                    1,
-                    "ERROR",
-                    Some(FailureClass::UnderstoodInfrastructureFailure),
-                )],
+                vec![
+                    (
+                        1,
+                        "ERROR",
+                        Some(FailureClass::UnderstoodInfrastructureFailure),
+                    ),
+                    (
+                        2,
+                        "ERROR",
+                        Some(FailureClass::UnderstoodInfrastructureFailure),
+                    ),
+                ],
             ),
             ("pass", vec![(1, "PASS", None)]),
             (
@@ -10280,7 +10318,13 @@ sys.exit(1 if failed else 0)
                     (2, "PASS", None),
                 ],
             ),
-            ("timeout", vec![(1, "FAIL", Some(FailureClass::NoResult))]),
+            (
+                "timeout",
+                vec![
+                    (1, "FAIL", Some(FailureClass::NoResult)),
+                    (2, "FAIL", Some(FailureClass::NoResult)),
+                ],
+            ),
         ] {
             let history = &histories[&format!("retry/{id}")];
             assert_eq!(
@@ -10309,11 +10353,11 @@ sys.exit(1 if failed else 0)
                 "executed_tests": 5,
                 "filtered_tests": 0,
                 "results": [
-                    {"id": "retry/infra [native/naked]", "result": "fail", "attempts": 1},
+                    {"id": "retry/infra [native/naked]", "result": "fail", "attempts": 2},
                     {"id": "retry/pass [native/naked]", "result": "pass", "attempts": 1},
                     {"id": "retry/product [native/naked]", "result": "fail", "attempts": 2},
                     {"id": "retry/recovers [native/naked]", "result": "pass", "attempts": 2},
-                    {"id": "retry/timeout [native/naked]", "result": "fail", "attempts": 1}
+                    {"id": "retry/timeout [native/naked]", "result": "fail", "attempts": 2}
                 ]
             })
         );
@@ -10360,22 +10404,39 @@ sys.exit(1 if failed else 0)
                 "executed_tests": 5,
                 "filtered_tests": 0,
                 "results": [
-                    row("retry/infra [native/naked]", "fail", vec![json!({
-                        "attempt": 1,
-                        "outcome": "infrastructure_error",
-                        "detail": format!(
-                            "cannot execute {}: No such file or directory (os error 2)",
-                            missing.display()
-                        ),
-                    })]),
+                    row("retry/infra [native/naked]", "fail", vec![
+                        json!({
+                            "attempt": 1,
+                            "outcome": "infrastructure_error",
+                            "detail": format!(
+                                "cannot execute {}: No such file or directory (os error 2)",
+                                missing.display()
+                            ),
+                        }),
+                        json!({
+                            "attempt": 2,
+                            "outcome": "infrastructure_error",
+                            "detail": format!(
+                                "cannot execute {}: No such file or directory (os error 2)",
+                                missing.display()
+                            ),
+                        }),
+                    ]),
                     row("retry/pass [native/naked]", "pass", vec![passed(1)]),
                     row("retry/product [native/naked]", "fail", vec![failed(1), failed(2)]),
                     row("retry/recovers [native/naked]", "pass", vec![failed(1), passed(2)]),
-                    row("retry/timeout [native/naked]", "fail", vec![json!({
-                        "attempt": 1,
-                        "outcome": "wall_timeout",
-                        "detail": "cell exceeded 2 wall s backstop (1 s CPU budget)",
-                    })]),
+                    row("retry/timeout [native/naked]", "fail", vec![
+                        json!({
+                            "attempt": 1,
+                            "outcome": "wall_timeout",
+                            "detail": "cell exceeded 2 wall s backstop (1 s CPU budget)",
+                        }),
+                        json!({
+                            "attempt": 2,
+                            "outcome": "wall_timeout",
+                            "detail": "cell exceeded 2 wall s backstop (1 s CPU budget)",
+                        }),
+                    ]),
                 ]
             })
         );
@@ -10485,7 +10546,7 @@ sys.exit(1 if failed else 0)
             &[],
             None,
         );
-        assert!(!super::attempt_earns_retry(
+        assert!(super::attempt_earns_retry(
             super::Retries::Framework,
             &cell("compat/cat"),
             &failed
@@ -10620,14 +10681,14 @@ sys.exit(1 if failed else 0)
         let relabelled = row("host input changed", &bytes);
         assert_eq!(
             super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &relabelled),
-            None
+            Some(super::RetryCause::Failure)
         );
         let mut product = changed.clone();
         product.outcome = "FAIL".into();
         product.failure_class = Some(hermit_manifest_plan::runner::FailureClass::ProductFailure);
         assert_eq!(
             super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &product),
-            None
+            Some(super::RetryCause::ProductFailure)
         );
         // The rule checks the stdout assertions the row records, so a row
         // recording another stdout declaration or other relaxations than its
@@ -10646,7 +10707,7 @@ sys.exit(1 if failed else 0)
             assert!(super::host_input_change_only(row), "{row:#?}");
             assert_eq!(
                 super::attempt_retry_cause(super::Retries::Framework, &compat_cat, row),
-                None,
+                Some(super::RetryCause::Failure),
                 "{row:#?}"
             );
         }
@@ -10664,7 +10725,7 @@ sys.exit(1 if failed else 0)
             );
             assert_eq!(
                 super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &incomplete),
-                None,
+                Some(super::RetryCause::Failure),
                 "{incomplete:#?}"
             );
         }
@@ -10696,7 +10757,7 @@ sys.exit(1 if failed else 0)
             assert!(!super::host_input_change_only(&refused), "{line}");
             assert_eq!(
                 super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &refused),
-                None,
+                Some(super::RetryCause::Failure),
                 "{line}"
             );
         }
@@ -10734,7 +10795,7 @@ sys.exit(1 if failed else 0)
         assert_eq!(replay.id.mode, "replay");
         assert_eq!(
             super::attempt_retry_cause(super::Retries::Framework, &replay, &failed),
-            None
+            Some(super::RetryCause::ProductFailure)
         );
         assert!(super::attempt_earns_retry(
             super::Retries::Framework,

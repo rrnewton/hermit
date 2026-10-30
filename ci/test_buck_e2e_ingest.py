@@ -555,7 +555,7 @@ class IngestTest(unittest.TestCase):
             with self.subTest(name):
                 self.refused(
                     {"RUN": [execution(X, 100, "PASS", "rx1", rows=rows), Y_PASSES]},
-                    "a cell runs the harness once (--no-retry), which writes one row, for that cell",
+                    "a cell runs the harness, which writes one row per attempt, for that cell",
                 )
 
     def test_a_result_json_for_another_cell_is_refused(self):

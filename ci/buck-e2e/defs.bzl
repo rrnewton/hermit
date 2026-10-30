@@ -2,9 +2,9 @@
 
 One test per cell of ci/expected-e2e-plan.json. Each runs `test-harness run` for exactly
 that cell (cell.sh) and reports one Tpx HPHP-JSON result with the cell's evidence (the
-harness rows, verify report and both DETLOGs) as Tpx artifacts. Tpx owns retries: cells
-pass --no-retry to the harness, so `buck2 test ... -- --retry 1` retries a failed cell
-and the ingester keeps "passed only on rerun" red.
+harness rows, verify report and both DETLOGs) as Tpx artifacts. The Hermit test-harness owns retries in both modes (owner policy, 2026-10-30):
+cells run the harness without --no-retry, Tpx retries are off (do not pass
+`buck2 test ... -- --retry`), and the ingester keeps "passed only on rerun" visible.
 
 Routing (per cell, first match wins; see _route):
   local: kvm backend, privileged lane, a host-capability requirement (every kvm cell names
