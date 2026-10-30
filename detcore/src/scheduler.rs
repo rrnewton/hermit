@@ -17543,39 +17543,16 @@ impl Scheduler {
     ///
     /// Only where change points are bounded (`chaos_bounds_starvation`: chaos
     /// with timer preemption and the default heuristic, not replaying
-    /// preemptions), and not under `hermit record`/`hermit replay`
-    /// (`recordreplay_modes`), as for every deadline hint. Not under a schedule
-    /// replay either, in both of its phases (`has_schedule_replay`):
-    /// - While it follows recorded schedule events, the recorded slice ends
-    ///   apply and no live deadline hint does (`cap_timeslice_at_deadline`).
-    /// - Once the schedule is over, its last event consumed or the rest
-    ///   released (`schedule_replay_over`), each thread ends slices as in a
-    ///   run without a schedule (`ThreadState::follows_replayed_schedule`),
-    ///   so ordinary deadline hints apply. The scheduler still counts the run
-    ///   as a schedule replay, though, so this count, the first-turn bound and
-    ///   the starvation bound (`bound_chaos_starvation`) stay off.
-    ///
-    /// In each phase these rules are functions of scheduler state. Where the
-    /// tail begins need not be. A tail that begins at the consumption of the
-    /// last recorded event begins at the same event in every run. A release,
-    /// though, also depends on how many recorded polling retries the replay
-    /// matched, since a matched retry ends the run of unmatched events
-    /// (`Replayer::release_schedule`). That count can be host-timed even
-    /// inside Hermit's stable-filesystem and no-network boundary: a guest call
-    /// on the background path finishes at a host-timed moment, and an actor
-    /// outside the container can make a descriptor ready
-    /// (`Scheduler::is_polling_turn`). So a released tail can begin at another
-    /// event, or not at all. The starvation these rules end can come back in
-    /// the tail.
-    ///
-    /// The count is of committed turns, host-timed polling retries aside, as for
-    /// `previous_turn_tid`: background calls and skipped turns do not commit, and
-    /// host-timed admissions and signals change only which pass a turn falls in,
-    /// not how many turns a thread has taken. Both runs of --verify therefore end
-    /// the same slices. A preemption recording records the slice end it causes
-    /// like any other change point, and a preemption or schedule replay, while
-    /// it follows its recorded slice ends, applies no hint
-    /// (`cap_timeslice_at_deadline`), so it needs none there.
+    /// preemptions), and neither under a schedule replay nor under `hermit
+    /// record`/`hermit replay` (`recordreplay_modes`), as for every deadline
+    /// hint. The count is of committed turns, host-timed polling retries
+    /// aside, as for `previous_turn_tid`: background calls and skipped turns
+    /// do not commit, and host-timed admissions and signals change only which
+    /// pass a turn falls in, not how many turns a thread has taken. Both runs
+    /// of --verify therefore end the same slices. A preemption recording
+    /// records the slice end it causes like any other change point, and a
+    /// preemption or schedule replay follows its recorded slice ends and
+    /// applies no hint (`cap_timeslice_at_deadline`), so a replay needs none.
     /// Such a slice ends at a syscall check-in, and a preemption replay ends
     /// a slice recorded there at the same branch count, which can fall just
     /// before the syscall rather than after it; until
@@ -17965,13 +17942,10 @@ impl Scheduler {
     /// for ever behind a foreground thread that never blocks, a thread the
     /// schedule readmitted at the deferred priority included
     /// (https://github.com/rrnewton/hermit/issues/4472). The point is the
-    /// consumption of the last recorded event, at the schedule's fixed final
-    /// position, or the replayer's release of the rest of the schedule after a
-    /// long run of events that match none of it (`Replayer::release_schedule`).
-    /// A release can come at another event, or not at all, in another run: a
-    /// polling retry that matches a recorded one ends that run, and how many
-    /// retries the replay matches can be host-timed
-    /// (`Scheduler::is_polling_turn`).
+    /// consumption of the last recorded event, or the replayer's release of
+    /// the rest of the schedule after a long run of events that match none of
+    /// it (`Replayer::release_schedule`). Either is a scheduled event of a
+    /// running thread, so it is the same in every run.
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()

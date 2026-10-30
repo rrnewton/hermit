@@ -568,12 +568,9 @@ impl Replayer {
     ///
     /// The count is a liveness backstop, and a heuristic: a detour longer than
     /// the threshold that would have rejoined the schedule loses the rest of
-    /// it too. It is a function of the observed events in turn order. An
-    /// unmatched polling retry neither counts nor ends the run, since how many
-    /// a blocked call makes can be host-timed. A retry that matches a recorded
-    /// one ends the run, as every matched event does, and how many retries the
-    /// replay matches can be host-timed too (`Scheduler::is_polling_turn`). So
-    /// the release can come at another event, or not at all, in another run.
+    /// it too. It is a function of the observed events in turn order alone,
+    /// polling retries left out, so the release happens at the same event in
+    /// every run.
     fn release_schedule(&mut self, current_ix: u64) -> ReplayAction {
         let dropped = self.cursor.by_ref().count();
         self.release = Some(Release {
