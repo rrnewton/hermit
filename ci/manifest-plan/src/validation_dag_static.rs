@@ -4435,7 +4435,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 703 + 1 = 704.
     // PR 4836 adds one cli case: 704 + 1 = 705 (the PR's own +1 delta, re-based at this head).
     // PR 4841 adds a_blocked_vectored_call_moves_bytes_through_the_memory_it_began_with: 705 + 1 = 706.
-    ("test.cli", 706),
+    // PR 4844 adds preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do: 706 + 1 = 707.
+    ("test.cli", 707),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4989,7 +4990,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same binder descriptor test, not excluded: 623.
     // The same PR 4836 cli case: 623 + 1 = 624.
     // The same PR 4841 cli case: 624 + 1 = 625.
-    ("test.cli_on_host", 625),
+    // The same PR 4844 cli case: 625 + 1 = 626.
+    ("test.cli_on_host", 626),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
