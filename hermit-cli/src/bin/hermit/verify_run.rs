@@ -462,6 +462,7 @@ pub(crate) fn compare(
                 dbt: None,
                 backend,
                 passthru_opt: record1.passthru_opt,
+                harness_host_input_change: None,
             },
             CompletedVerificationRun {
                 output: &out1,

@@ -294,6 +294,91 @@ fn finished_open(human: &str) -> Option<(u64, u64)> {
 /// (`first_divergent_positions`, the comparator's positions of that record),
 /// so the two runs had done the same things up to that open. Without every
 /// position nothing is attributed.
+/// Volatile host files whose replacement between the two runs of a
+/// verification pair can diverge them before Detcore observes any open:
+/// the dynamic-linker cache (read by every loader, including DBT's, before
+/// Detcore interception) and the group database (frozen for the guest, but
+/// read by host-side launchers). The harness snapshots these itself.
+pub const VOLATILE_HOST_INPUT_PATHS: [&str; 2] = ["/etc/ld.so.cache", "/etc/group"];
+
+/// Host identity of `path` now, or `None` when it cannot be stat'ed.
+pub fn host_file_identity(path: &Path) -> Option<HostFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path).ok()?;
+    Some(HostFileIdentity {
+        dev: md.dev(),
+        ino: md.ino(),
+        size: md.size() as i64,
+        mtime_sec: md.mtime(),
+        mtime_nsec: md.mtime_nsec(),
+    })
+}
+
+/// Identities of a set of host files at one moment, in the given order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VolatileHostInputs {
+    pub entries: Vec<(String, Option<HostFileIdentity>)>,
+}
+
+impl VolatileHostInputs {
+    pub fn capture(paths: &[&Path]) -> Self {
+        Self {
+            entries: paths
+                .iter()
+                .map(|p| (p.to_string_lossy().into_owned(), host_file_identity(p)))
+                .collect(),
+        }
+    }
+    pub fn capture_volatile() -> Self {
+        Self::capture(&VOLATILE_HOST_INPUT_PATHS.map(Path::new))
+    }
+    fn changed(&self, other: &Self) -> Option<(String, HostFileIdentity, HostFileIdentity)> {
+        self.entries
+            .iter()
+            .zip(&other.entries)
+            .find_map(|((p, a), (_, b))| match (a, b) {
+                (Some(a), Some(b)) if a != b => Some((p.clone(), *a, *b)),
+                _ => None,
+            })
+    }
+}
+
+/// First volatile change across a verify pair: `before`->`mid` is run 1,
+/// `mid`->`after` is run 2. Same typed evidence as the Detcore path.
+pub fn harness_host_input_change(
+    before: &VolatileHostInputs,
+    mid: &VolatileHostInputs,
+    after: &VolatileHostInputs,
+) -> Option<InfrastructureError> {
+    if let Some((path, b, a)) = before.changed(mid) {
+        return Some(InfrastructureError::HostInputChanged {
+            run: VerificationRun::Run1,
+            path,
+            before: b,
+            after: a,
+        });
+    }
+    mid.changed(after)
+        .map(|(path, b, a)| InfrastructureError::HostInputChanged {
+            run: VerificationRun::Run2,
+            path,
+            before: b,
+            after: a,
+        })
+}
+
+/// Effective evidence for a pair: Detcore's placed change wins; otherwise
+/// the harness volatile change, only on divergence. Stateless — the
+/// one-retry budget is the caller's (manifest runner), so a second
+/// divergence with this evidence stays a failure, never a loop.
+pub fn effective_host_input_change(
+    detcore: Option<InfrastructureError>,
+    harness: Option<InfrastructureError>,
+    diverged: bool,
+) -> Option<InfrastructureError> {
+    detcore.or_else(|| harness.filter(|_| diverged))
+}
+
 pub fn explains_divergence(
     complete_comparison: bool,
     open_positions: [Option<usize>; 2],
@@ -658,6 +743,82 @@ mod tests {
         assert_eq!(parsed.records.len(), 1);
         assert_eq!(parsed.mutated, vec!["/data/F".to_string()]);
         assert!(!parse_host_inputs(&format!("{record}\n{mutation}\n{{\"records\":1}}\n")).complete);
+    }
+
+    #[test]
+    fn harness_swap_during_run1_and_run2_is_named_with_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("ld.so.cache");
+        let group = dir.path().join("group");
+        std::fs::write(&cache, "v1").unwrap();
+        std::fs::write(&group, "g").unwrap();
+        let paths: Vec<&Path> = vec![&cache, &group];
+        let cap = || VolatileHostInputs::capture(&paths);
+        let before = cap();
+        // Swap cache mid-pair (run 1), as ldconfig does: new file over old.
+        let tmp = dir.path().join("new");
+        std::fs::write(&tmp, "v2-longer").unwrap();
+        std::fs::rename(&tmp, &cache).unwrap();
+        let mid = cap();
+        let change = harness_host_input_change(&before, &mid, &mid).unwrap();
+        match &change {
+            InfrastructureError::HostInputChanged {
+                run,
+                path,
+                before: b,
+                after: a,
+            } => {
+                assert_eq!(*run, VerificationRun::Run1);
+                assert!(path.ends_with("ld.so.cache"), "{path}");
+                assert_ne!(b.ino, a.ino);
+                assert_ne!(b, a);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            change
+                .to_string()
+                .contains("host input changed during run 1")
+        );
+        // No change -> None; change only in run 2 -> Run2.
+        assert_eq!(harness_host_input_change(&mid, &mid, &mid), None);
+        std::fs::write(&tmp, "v3").unwrap();
+        std::fs::rename(&tmp, &cache).unwrap();
+        let after = cap();
+        match harness_host_input_change(&mid, &mid, &after).unwrap() {
+            InfrastructureError::HostInputChanged { run, .. } => {
+                assert_eq!(run, VerificationRun::Run2)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn dbt_style_pair_harness_evidence_only_on_divergence() {
+        // DBT-style: no Detcore records (loader pre-read), harness swap.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("ld.so.cache");
+        std::fs::write(&cache, "a").unwrap();
+        let paths: Vec<&Path> = vec![&cache];
+        let before = VolatileHostInputs::capture(&paths);
+        let tmp = dir.path().join("n");
+        std::fs::write(&tmp, "bb").unwrap();
+        std::fs::rename(&tmp, &cache).unwrap();
+        let after = VolatileHostInputs::capture(&paths);
+        let harness = harness_host_input_change(&before, &after, &after);
+        assert!(matches!(
+            harness,
+            Some(InfrastructureError::HostInputChanged { .. })
+        ));
+        // Diverged pair -> evidence (runner consumes this for one retry).
+        assert!(effective_host_input_change(None, harness.clone(), true).is_some());
+        // Matched pair -> no evidence; second diverged pair still just
+        // evidence (no loop state here; runner's budget makes it FAIL).
+        assert_eq!(
+            effective_host_input_change(None, harness.clone(), false),
+            None
+        );
+        assert!(effective_host_input_change(None, harness, true).is_some());
     }
 
     /// A change of size or time that keeps the host inode is not the

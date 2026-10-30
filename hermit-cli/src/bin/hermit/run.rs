@@ -58,8 +58,10 @@ use hermit::happens_before::refuse_unenforceable_anchors;
 use hermit::happens_before::resolve_program;
 use hermit::host_input_change::HostInputs;
 use hermit::host_input_change::PatternDifference;
+use hermit::host_input_change::VolatileHostInputs;
 use hermit::host_input_change::explains_divergence;
 use hermit::host_input_change::find_pattern_difference;
+use hermit::host_input_change::harness_host_input_change;
 use hermit::host_input_change::open_position;
 use hermit::host_input_change::read_host_inputs;
 use reverie::process::Bind;
@@ -13046,6 +13048,7 @@ impl RunOpts {
         run1_options.fatal_core_run_label = Some("run1");
         run2_options.fatal_core_run_label = Some("run2");
 
+        let volatile_before = VolatileHostInputs::capture_volatile();
         // Captured BEFORE run 1 so the same values can be put back before run 2.
         // See the restore call below for the measurement this exists for.
         let fd_flags_before_run1 = standard_fd_status_flags();
@@ -13192,6 +13195,7 @@ impl RunOpts {
             .map(take_verify_summary_before_next_run)
             .transpose()?
             .flatten();
+        let volatile_mid = VolatileHostInputs::capture_volatile();
         let host_inputs1 = host_inputs_path.as_deref().map(read_host_inputs);
         if let Some(file) = &host_inputs_file {
             file.set_len(0)
@@ -13369,6 +13373,7 @@ impl RunOpts {
             .map(|(first, second)| super::backends::DbtVerificationComparison::new(first, second));
 
         let summary2 = summary2_path.and_then(read_verify_summary);
+        let volatile_after = VolatileHostInputs::capture_volatile();
         let outcome = conclude_verification(
             VerificationConclusion {
                 verify_json: self.verify_json.as_deref(),
@@ -13377,6 +13382,11 @@ impl RunOpts {
                 dbt: dbt_comparison,
                 backend: self.selected_backend(),
                 passthru_opt: self.det_opts.det_config.passthru_opt,
+                harness_host_input_change: harness_host_input_change(
+                    &volatile_before,
+                    &volatile_mid,
+                    &volatile_after,
+                ),
             },
             CompletedVerificationRun {
                 output: &out1,
@@ -15463,6 +15473,10 @@ pub(super) struct VerificationConclusion<'a> {
     pub(super) backend: Backend,
     /// Whether both runs used `--passthru-opt`.
     pub(super) passthru_opt: bool,
+    /// Harness-observed volatile change (`/etc/ld.so.cache`, `/etc/group`)
+    /// across the pair, for backends whose loader reads them before
+    /// Detcore records opens (DBT). Same typed evidence as Detcore's.
+    pub(super) harness_host_input_change: Option<hermit::canonical_verdict::InfrastructureError>,
 }
 
 /// Compare two completed verification runs, publish the report to the
@@ -15483,6 +15497,7 @@ pub(super) fn conclude_verification(
         dbt,
         backend,
         passthru_opt,
+        harness_host_input_change,
     } = conclusion;
     let out1 = run1.output;
     let out2 = run2.output;
@@ -15595,6 +15610,14 @@ pub(super) fn conclude_verification(
             }
             unobserved.is_none()
         });
+    // Backend-independent fallback: harness stat'ed the volatile files
+    // around each run, so a change there is host-side even when the
+    // backend's loader read it before Detcore could record an open.
+    let host_input_change = hermit::host_input_change::effective_host_input_change(
+        host_input_change,
+        harness_host_input_change,
+        outcome.verdict == Verdict::Diverged,
+    );
 
     // Emit the machine-readable verdict (if requested) before collapsing the
     // outcome to the historical exit-code convention. The verdict is recorded
