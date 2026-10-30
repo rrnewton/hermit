@@ -1804,6 +1804,7 @@ mod tests {
             turn: 4,
             wakes: 0,
             calls: vec![(tid, 1)],
+            popped: None,
         });
         for len in [2, 9] {
             assert_eq!(
@@ -1964,6 +1965,7 @@ mod tests {
             turn: 4,
             wakes: 0,
             calls: vec![(tid, 1)],
+            popped: None,
         });
         record.validate().unwrap();
         let mut stripped = record.clone();
