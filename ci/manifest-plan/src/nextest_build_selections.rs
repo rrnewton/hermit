@@ -955,7 +955,9 @@ mod tests {
             // (`cargo nextest list --profile ci` on the on-host
             // selection), matching the full validate at that tip, whose
             // third shard executed 349 (347 + 2), all passed: 700.
-            assert_eq!(population, 700);
+            // Recount at 360e99b2e24: shard 2 grew to 292 (61 + 292 +
+            // 349), so the on-host population is 702.
+            assert_eq!(population, 702);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
