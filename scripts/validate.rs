@@ -25781,6 +25781,11 @@ fn write_ledger_with_snapshot(
         ),
     };
     add_raw_census(&mut record, census);
+    // Fail closed: no census, no green claim — an explicit red signal.
+    if !matches!(&retries, Some(Ok(_))) {
+        record["landing_signal"] = serde_json::json!("red");
+        record["flaky_tests"] = serde_json::json!(Vec::<String>::new());
+    }
     if let Some(Ok(framework)) = &retries {
         let rollup = hermit_manifest_plan::ledger::RetryRollupV1::from_framework_retries(framework);
         // Nextest/test-runner retries live on the outcomes' test results,
@@ -25811,7 +25816,7 @@ fn write_ledger_with_snapshot(
         record["flaky_tests"] = serde_json::json!(top_flaky);
         eprintln!(
             "validate: landing signal: {signal} ({} retries; flaky: {})",
-            rollup.total_retries,
+            rollup.total_retries + extra_retries,
             if top_flaky.is_empty() {
                 "none".to_string()
             } else {
