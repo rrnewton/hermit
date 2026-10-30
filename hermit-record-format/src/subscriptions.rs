@@ -11,109 +11,118 @@
 use reverie::Subscription;
 use reverie::syscalls::Sysno;
 
+/// The calls of [`record_and_replay`] that every architecture's table has.
+const SHARED_SYSCALLS: &[Sysno] = &[
+    Sysno::execve,
+    Sysno::execveat,
+    //Sysno::brk,
+    Sysno::mprotect,
+    //Sysno::arch_prctl,
+    Sysno::read,
+    Sysno::pread64,
+    Sysno::readv,
+    Sysno::preadv,
+    Sysno::preadv2,
+    Sysno::recvfrom,
+    Sysno::recvmsg,
+    Sysno::write,
+    Sysno::pwrite64,
+    Sysno::writev,
+    Sysno::pwritev,
+    Sysno::pwritev2,
+    Sysno::sendfile,
+    Sysno::faccessat,
+    Sysno::faccessat2,
+    Sysno::lseek,
+    Sysno::fstat,
+    Sysno::statfs,
+    Sysno::fstatfs,
+    Sysno::statx,
+    Sysno::getdents64,
+    Sysno::mmap,
+    //Sysno::munmap,
+    Sysno::openat,
+    Sysno::close,
+    Sysno::openat2,
+    Sysno::mkdirat,
+    Sysno::mknodat,
+    Sysno::fchownat,
+    Sysno::linkat,
+    Sysno::renameat,
+    Sysno::renameat2,
+    Sysno::symlinkat,
+    Sysno::fchmodat,
+    Sysno::utimensat,
+    Sysno::chdir,
+    Sysno::fchdir,
+    Sysno::getcwd,
+    Sysno::close_range,
+    Sysno::fadvise64,
+    Sysno::flock,
+    Sysno::ftruncate,
+    // Descriptor syncs, metadata changes and xattr calls: replay
+    // returns the recorded results, because a replayed descriptor may
+    // be a placeholder, and reapplies changes inside the replay root.
+    Sysno::fsync,
+    Sysno::fdatasync,
+    Sysno::syncfs,
+    Sysno::fchmod,
+    Sysno::fchown,
+    Sysno::fsetxattr,
+    Sysno::fremovexattr,
+    Sysno::setxattr,
+    Sysno::lsetxattr,
+    Sysno::removexattr,
+    Sysno::lremovexattr,
+    Sysno::getxattr,
+    Sysno::lgetxattr,
+    Sysno::fgetxattr,
+    Sysno::listxattr,
+    Sysno::llistxattr,
+    Sysno::flistxattr,
+    Sysno::dup,
+    Sysno::dup3,
+    Sysno::ioctl,
+    Sysno::socket,
+    Sysno::pidfd_getfd,
+    Sysno::clock_gettime,
+    Sysno::clock_getres,
+    Sysno::gettimeofday,
+    Sysno::settimeofday,
+    Sysno::setsockopt,
+    Sysno::fcntl,
+    Sysno::epoll_ctl,
+    Sysno::connect,
+    Sysno::bind,
+    Sysno::listen,
+    Sysno::shutdown,
+    Sysno::accept,
+    Sysno::accept4,
+    Sysno::sendto,
+    Sysno::sendmsg,
+    Sysno::ppoll,
+    Sysno::pselect6,
+    Sysno::epoll_pwait,
+    Sysno::epoll_pwait2,
+    Sysno::getsockopt,
+    Sysno::getpeername,
+    Sysno::getsockname,
+    Sysno::getrandom,
+    Sysno::unlinkat,
+    // aarch64 has no readlink, so its C library reads every link with
+    // readlinkat: it belongs here, not with the x86_64-only calls below.
+    Sysno::readlinkat,
+];
+
 /// The syscalls (and `rdtsc`/`cpuid`) the recorder captures and the replayer
 /// answers. One list, so a replay always subscribes to exactly the events its
 /// recording holds.
 pub fn record_and_replay() -> Subscription {
     let mut subscription = Subscription::none();
-    subscription.rdtsc().cpuid().syscalls([
-        Sysno::execve,
-        Sysno::execveat,
-        //Sysno::brk,
-        Sysno::mprotect,
-        //Sysno::arch_prctl,
-        Sysno::read,
-        Sysno::pread64,
-        Sysno::readv,
-        Sysno::preadv,
-        Sysno::preadv2,
-        Sysno::recvfrom,
-        Sysno::recvmsg,
-        Sysno::write,
-        Sysno::pwrite64,
-        Sysno::writev,
-        Sysno::pwritev,
-        Sysno::pwritev2,
-        Sysno::sendfile,
-        Sysno::faccessat,
-        Sysno::faccessat2,
-        Sysno::lseek,
-        Sysno::fstat,
-        Sysno::statfs,
-        Sysno::fstatfs,
-        Sysno::statx,
-        Sysno::getdents64,
-        Sysno::mmap,
-        //Sysno::munmap,
-        Sysno::openat,
-        Sysno::close,
-        Sysno::openat2,
-        Sysno::mkdirat,
-        Sysno::mknodat,
-        Sysno::fchownat,
-        Sysno::linkat,
-        Sysno::renameat,
-        Sysno::renameat2,
-        Sysno::symlinkat,
-        Sysno::fchmodat,
-        Sysno::utimensat,
-        Sysno::chdir,
-        Sysno::fchdir,
-        Sysno::getcwd,
-        Sysno::close_range,
-        Sysno::fadvise64,
-        Sysno::flock,
-        Sysno::ftruncate,
-        // Descriptor syncs, metadata changes and xattr calls: replay
-        // returns the recorded results, because a replayed descriptor may
-        // be a placeholder, and reapplies changes inside the replay root.
-        Sysno::fsync,
-        Sysno::fdatasync,
-        Sysno::syncfs,
-        Sysno::fchmod,
-        Sysno::fchown,
-        Sysno::fsetxattr,
-        Sysno::fremovexattr,
-        Sysno::setxattr,
-        Sysno::lsetxattr,
-        Sysno::removexattr,
-        Sysno::lremovexattr,
-        Sysno::getxattr,
-        Sysno::lgetxattr,
-        Sysno::fgetxattr,
-        Sysno::listxattr,
-        Sysno::llistxattr,
-        Sysno::flistxattr,
-        Sysno::dup,
-        Sysno::dup3,
-        Sysno::ioctl,
-        Sysno::socket,
-        Sysno::pidfd_getfd,
-        Sysno::clock_gettime,
-        Sysno::clock_getres,
-        Sysno::gettimeofday,
-        Sysno::settimeofday,
-        Sysno::setsockopt,
-        Sysno::fcntl,
-        Sysno::epoll_ctl,
-        Sysno::connect,
-        Sysno::bind,
-        Sysno::listen,
-        Sysno::shutdown,
-        Sysno::accept,
-        Sysno::accept4,
-        Sysno::sendto,
-        Sysno::sendmsg,
-        Sysno::ppoll,
-        Sysno::pselect6,
-        Sysno::epoll_pwait,
-        Sysno::epoll_pwait2,
-        Sysno::getsockopt,
-        Sysno::getpeername,
-        Sysno::getsockname,
-        Sysno::getrandom,
-        Sysno::unlinkat,
-    ]);
+    subscription
+        .rdtsc()
+        .cpuid()
+        .syscalls(SHARED_SYSCALLS.iter().copied());
     // Legacy calls only the x86_64 table has.
     #[cfg(target_arch = "x86_64")]
     subscription.syscalls([
@@ -137,7 +146,6 @@ pub fn record_and_replay() -> Subscription {
         Sysno::select,
         Sysno::epoll_wait,
         Sysno::readlink,
-        Sysno::readlinkat,
         Sysno::mkdir,
         Sysno::unlink,
     ]);
@@ -146,4 +154,22 @@ pub fn record_and_replay() -> Subscription {
     subscription.syscall(Sysno::fstatat);
 
     subscription
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// readlinkat is recorded and replayed on every architecture: it is in
+    /// the shared list, not only in an architecture's own block. aarch64 has
+    /// no readlink, so a recording there reads every link through readlinkat.
+    #[test]
+    fn readlinkat_is_recorded_and_replayed_on_every_architecture() {
+        assert!(SHARED_SYSCALLS.contains(&Sysno::readlinkat));
+        assert!(
+            record_and_replay()
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::readlinkat)
+        );
+    }
 }
