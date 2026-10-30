@@ -1884,7 +1884,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (analyzer_reproducer_starts_in_the_trials_directory,
     // a_reproducers_directory_is_quoted_for_the_shell): 1240 + 2 = 1242,
     // re-measured at this integration head.
-    ("test.hermit_unit", 1242),
+    // PR 4836 adds run::detlog_anon_is_ptrace_only: 1242 + 1 = 1243, re-measured at this integration head.
+    ("test.hermit_unit", 1243),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3119,7 +3120,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-measured at 3bdd41fda38: `cargo nextest list --profile ci
     // -p hermit-detcore --lib --bins` lists 2914, matching the full
     // validate at that tip (2914 executed, all passed).
-    ("test.detcore_unit", 2914),
+    // PR 4836 adds three detcore units: 2914 + 3 = 2917, re-measured at this integration head.
+    ("test.detcore_unit", 2917),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4430,7 +4432,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with `cargo nextest list` at 11c35a504a6.
     // Binder receipt adds one CLI identity (capability-skipped without binderfs):
     // 703 + 1 = 704.
-    ("test.cli", 704),
+    // PR 4836 adds one cli case: 704 + 1 = 705 (the PR's own +1 delta, re-based at this head).
+    ("test.cli", 705),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4982,7 +4985,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two TracerPid cli tests: 619 + 2 = 621.
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
     // And the same binder descriptor test, not excluded: 623.
-    ("test.cli_on_host", 623),
+    // The same PR 4836 cli case: 623 + 1 = 624.
+    ("test.cli_on_host", 624),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5463,7 +5467,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two PR 4942 units: 2891 + 2 = 2893.
     // The same six Binder receipt units: 2898 + 6 = 2904.
     // The same recount at 3bdd41fda38: 2914 (no exclusions on this twin).
-    ("test.detcore_unit_on_host", 2914),
+    // The same three PR 4836 units: 2914 + 3 = 2917.
+    ("test.detcore_unit_on_host", 2917),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5842,7 +5847,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-measured at 3bdd41fda38: 1245 listed, less the five `--skip`
     // cases and this twin's six named forced-gate exclusions: 1234.
     // The same two PR 4826 rundata units: 1234 + 2 = 1236.
-    ("test.hermit_unit_on_host", 1236),
+    // The same PR 4836 unit: 1236 + 1 = 1237.
+    ("test.hermit_unit_on_host", 1237),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
