@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3045,
-      "applicable": 2237,
-      "selectable": 1757,
-      "population": 2995,
-      "population_candidate_selected": 1757,
-      "population_candidate_not_selected": 472,
-      "population_candidate_disabled": 766
+      "cells": 3055,
+      "applicable": 2244,
+      "selectable": 1763,
+      "population": 3005,
+      "population_candidate_selected": 1763,
+      "population_candidate_not_selected": 473,
+      "population_candidate_disabled": 769
     },
     "by_backend": {
       "dbt": {
-        "cells": 609,
-        "applicable": 560,
-        "selectable": 558,
-        "population": 599,
-        "population_candidate_selected": 558,
+        "cells": 611,
+        "applicable": 561,
+        "selectable": 559,
+        "population": 601,
+        "population_candidate_selected": 559,
         "population_candidate_not_selected": 1,
-        "population_candidate_disabled": 40
+        "population_candidate_disabled": 41
       },
       "in-guest-trap": {
-        "cells": 609,
-        "applicable": 313,
-        "selectable": 313,
-        "population": 599,
-        "population_candidate_selected": 313,
+        "cells": 611,
+        "applicable": 314,
+        "selectable": 314,
+        "population": 601,
+        "population_candidate_selected": 314,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 287
+      },
+      "kvm": {
+        "cells": 611,
+        "applicable": 577,
+        "selectable": 575,
+        "population": 601,
+        "population_candidate_selected": 575,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 26
+      },
+      "liteinst": {
+        "cells": 611,
+        "applicable": 315,
+        "selectable": 315,
+        "population": 601,
+        "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 286
       },
-      "kvm": {
-        "cells": 609,
-        "applicable": 574,
-        "selectable": 572,
-        "population": 599,
-        "population_candidate_selected": 572,
-        "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 27
-      },
-      "liteinst": {
-        "cells": 609,
-        "applicable": 314,
-        "selectable": 314,
-        "population": 599,
-        "population_candidate_selected": 314,
-        "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 285
-      },
       "sabre": {
-        "cells": 609,
-        "applicable": 476,
+        "cells": 611,
+        "applicable": 477,
         "selectable": 0,
-        "population": 599,
+        "population": 601,
         "population_candidate_selected": 0,
-        "population_candidate_not_selected": 471,
-        "population_candidate_disabled": 128
+        "population_candidate_not_selected": 472,
+        "population_candidate_disabled": 129
       }
     }
   },
@@ -460,11 +460,21 @@
     {"test_id":"c-programs/inotify-blocking-faults","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: LinuxEmu refuses a blocking inotify instance (inotify_init1 without IN_NONBLOCK answers ENOSYS), and this guest reads one (https://github.com/rrnewton/hermit/issues/4768)"},
     {"test_id":"c-programs/inotify-blocking-faults","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-blocking-faults","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/inotify-failed-protection-key","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-failed-protection-key","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-failed-protection-key","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-failed-protection-key","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-failed-protection-key","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/inotify-faults","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-faults","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/inotify-faults","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: LinuxEmu renumbers rename cookies itself and puts back the old bytes of a cookie a fault cut short, even an IN_IGNORED event's zero cookie, which the guest checks; the Reverie slice that deletes LinuxEmu's copy (row 9 of section 3 of the LinuxEmu scope document) enables it (https://github.com/rrnewton/hermit/issues/4793)"},
+    {"test_id":"c-programs/inotify-faults","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-faults","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-faults","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/inotify-guard-page-faults","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: The tool reads guest memory with process_vm_readv, which refuses a write-only page the guest can write (https://github.com/rrnewton/hermit/issues/4530). In this guest's last case Linux copies on through such a page, so the events before it do not account for the bytes the read took, and Hermit leaves every byte of that read as Linux wrote it, host cookies included, which the guest prints"},
+    {"test_id":"c-programs/inotify-guard-page-faults","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The tool reads guest memory with process_vm_readv, which refuses a write-only page the guest can write (https://github.com/rrnewton/hermit/issues/4530). In this guest's last case Linux copies on through such a page, so the events before it do not account for the bytes the read took, and Hermit leaves every byte of that read as Linux wrote it, host cookies included, which the guest prints"},
+    {"test_id":"c-programs/inotify-guard-page-faults","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-guard-page-faults","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The tool reads guest memory with process_vm_readv, which refuses a write-only page the guest can write (https://github.com/rrnewton/hermit/issues/4530). In this guest's last case Linux copies on through such a page, so the events before it do not account for the bytes the read took, and Hermit leaves every byte of that read as Linux wrote it, host cookies included, which the guest prints"},
+    {"test_id":"c-programs/inotify-guard-page-faults","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: The tool reads guest memory with process_vm_readv, which refuses a write-only page the guest can write (https://github.com/rrnewton/hermit/issues/4530). In this guest's last case Linux copies on through such a page, so the events before it do not account for the bytes the read took, and Hermit leaves every byte of that read as Linux wrote it, host cookies included, which the guest prints"},
     {"test_id":"c-programs/inotify-protection-key-fault","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-protection-key-fault","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)"},
     {"test_id":"c-programs/inotify-protection-key-fault","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: LinuxEmu has no protection keys (pkey_alloc answers ENOSYS)"},

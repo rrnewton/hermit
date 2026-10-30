@@ -11,9 +11,13 @@
 // guest cannot write, then fails with EFAULT (or, for a readv whose later
 // iovec faults, returns the earlier iovecs' count). The events it copied are
 // left in the buffer, with the cookie every other instance sees for their
-// rename; that agreement is all the guest prints about rename cookies (Linux
-// draws them from one host-wide counter, so their values differ from run to
-// run; under Hermit, `--verify-strict` also compares them). Each case puts
+// rename. The guest checks that agreement and also prints the cookies
+// themselves. Linux draws them from one host-wide counter, so natively they
+// are large and differ from run to run; under Hermit they are the run's
+// virtual cookies, numbered from 1 in the order the run first reads them, so
+// the reference instance's two renames are 1 and 2, the many renames below
+// are 3 onwards, and a host cookie left in place shows as a large number that
+// differs between the two runs of a verify pair. Each case puts
 // the end of the buffer at a different place: after one event and part of
 // the next event's header, inside its cookie, inside its length, in a readv's
 // second iovec, and after more than 64 KiB of events. The buffers end at
@@ -75,6 +79,11 @@ static uint32_t cookie_at(const char *p) {
 
 static uint32_t mask_at(const char *p) {
   return ((const struct inotify_event *)p)->mask;
+}
+
+// Print the cookie of the event at `p`: under Hermit, a small virtual cookie.
+static void show_cookie(const char *what, const char *p) {
+  printf("%s: %u\n", what, (unsigned)cookie_at(p));
 }
 
 // `pages` pages, the last one protected with `last`, and the address
@@ -151,11 +160,14 @@ int main(void) {
          ok && c1 && c1 == cookie_at(whole + EVENT) && c2 && c2 == cookie_at(whole + 3 * EVENT) &&
              c1 != c2,
          &all);
+  show_cookie("the first rename's cookie", whole);
+  show_cookie("the second rename's cookie", whole + 2 * EVENT);
 
   // 40 writable bytes: one event, then the next event's wd and mask.
   char *at = edge(2, PROT_READ, 40);
   report("a read that faults after one event fails with EFAULT", faults(b, at, 2 * EVENT), &all);
   report("the event it copied has the rename's cookie", cookie_at(at) == c1, &all);
+  show_cookie("its cookie", at);
 
   // 44 writable bytes: the next event's cookie whole, then its length cut.
   at = edge(2, PROT_READ, 44);
@@ -163,12 +175,18 @@ int main(void) {
          faults(c, at, 2 * EVENT), &all);
   report("both cookies it copied whole are the rename's",
          cookie_at(at) == c1 && cookie_at(at + EVENT) == c1, &all);
+  show_cookie("the first cookie", at);
+  show_cookie("the second cookie", at + EVENT);
 
   // 42 writable bytes before a read-only page: the next event's cookie cut.
   at = edge(2, PROT_READ, 42);
   report("a read that faults at a read-only page fails with EFAULT", faults(d, at, 2 * EVENT),
          &all);
   report("the event before the cut cookie has the rename's cookie", cookie_at(at) == c1, &all);
+  show_cookie("its cookie", at);
+  // Linux wrote two bytes of the next event's cookie; under Hermit, zeros,
+  // since no virtual cookie can be found for part of one.
+  printf("the cut cookie's bytes: %02x %02x\n", (unsigned char)at[40], (unsigned char)at[41]);
 
   // A readv whose first iovec faults fails with EFAULT, as a read does.
   at = edge(2, PROT_READ, 40);
@@ -177,6 +195,7 @@ int main(void) {
   report("a readv whose first iovec faults fails with EFAULT",
          readv(v, iov, 2) == -1 && errno == EFAULT, &all);
   report("the event its first iovec holds has the rename's cookie", cookie_at(at) == c1, &all);
+  show_cookie("its cookie", at);
 
   // A readv whose second iovec faults after one event returns the first
   // iovec's event, and the event in the second iovec has the rename's
@@ -187,6 +206,8 @@ int main(void) {
   report("a readv whose second iovec faults returns the first iovec",
          readv(e, later, 2) == EVENT && cookie_at(first) == c1, &all);
   report("the event the faulting iovec holds has the rename's cookie", cookie_at(at) == c1, &all);
+  show_cookie("the first iovec's cookie", first);
+  show_cookie("the faulting iovec's cookie", at);
 
   // O holds exactly the two IN_MOVED_FROM events. A readv into {buf, 64} and
   // {buf + 8, 16} fills the first iovec and finds nothing more for the
@@ -199,6 +220,8 @@ int main(void) {
          &all);
   report("both have their renames' cookies",
          cookie_at(both) == c1 && cookie_at(both + EVENT) == c2, &all);
+  show_cookie("the first event's cookie", both);
+  show_cookie("the second event's cookie", both + EVENT);
 
   // X holds both renames' four events, and the buffer the events A read.
   refused_before_copy(x, whole, sizeof whole, "nonblocking", &all);
@@ -230,15 +253,22 @@ int main(void) {
   report("its first and last whole events have the renames' cookies",
          ok && cookie_at(at) == cookie_at(reference) && cookie_at(at + last) == cookie_at(reference + last),
          &all);
+  show_cookie("its first event's cookie", at);
+  show_cookie("its last whole event's cookie", at + last);
 
   // 42 writable bytes, then a write-only page, then an inaccessible one: the
   // copy runs on through the write-only page and faults after 4,138 bytes.
   // The second event's cookie, split by the first page boundary, was copied
   // whole, as its rename's first event's was. The check compares the pair's
-  // two cookies with each other only, which holds whether Hermit renumbered
-  // them (ptrace reads the write-only page) or left them as Linux wrote them
-  // (the in-process backends cannot read it, so they cannot tell where the
-  // copy ended); what it rules out is a whole cookie taken for a cut one.
+  // two cookies with each other only, and prints neither, which holds whether
+  // Hermit renumbered them (ptrace and KVM read the write-only page, so the
+  // copy ends at the inaccessible one) or left them as Linux wrote them (the
+  // in-process backends cannot read it, and the events before it do not
+  // account for the bytes the read took, so they cannot tell where the copy
+  // ended); what it rules out is a whole cookie taken for a cut one, and a
+  // rename whose two events carry different cookies. This case stays last: a
+  // backend that leaves host cookies leaves them in this instance only, where
+  // nothing reads them again.
   at = edge(3, PROT_NONE, page + 42);
   if (mprotect(at + 42, page, PROT_WRITE) != 0) return 4;
   report("a read that faults after a write-only page fails with EFAULT",

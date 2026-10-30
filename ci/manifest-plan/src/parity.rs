@@ -6284,7 +6284,12 @@ mod tests {
         // c-programs/signalfd-threads (a signalfd in a multi-threaded process,
         // https://github.com/rrnewton/hermit/issues/4797) adds one row per
         // candidate backend: 3045.
-        assert_eq!(parsed.cells.len(), 3045);
+        // c-programs/inotify-failed-protection-key and
+        // c-programs/inotify-guard-page-faults (the events a read copies before
+        // it faults after a failed protection-key allocation, and at a guard
+        // page, https://github.com/rrnewton/hermit/issues/4793) add one row
+        // per candidate backend each: 3055.
+        assert_eq!(parsed.cells.len(), 3055);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
