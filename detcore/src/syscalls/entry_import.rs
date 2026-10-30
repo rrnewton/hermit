@@ -67,6 +67,10 @@ pub(crate) struct EntryImport {
     /// (`____sys_recvmsg`): `msg_namelen` when the call named an address,
     /// `msg_flags` and `msg_controllen`. As `(start, end)` guest addresses.
     written_on_completion: Vec<(usize, usize)>,
+    /// Complete geometry read immediately before the successful generic read
+    /// attempt. An explicit error cannot reuse an earlier snapshot. Retry and
+    /// exit-dependency readers continue to use the unchanged `regions`.
+    observation: Option<Result<Vec<(usize, usize)>, Errno>>,
 }
 
 /// What another thread wrote over an [`EntryImport`]'s regions, held between
@@ -182,7 +186,89 @@ impl EntryImport {
             call: *call,
             regions,
             written_on_completion,
+            observation: None,
         })
+    }
+
+    /// Read only the metadata of one actual attempt, after reinstatement and
+    /// immediately before delegation. These calls preserve their pointer
+    /// arguments in `into_nonblocking` and have one terminal data-bearing
+    /// attempt. Aggregated pipe writev deliberately uses a different contract.
+    pub(crate) fn capture_observation<M: MemoryAccess>(
+        memory: &M,
+        call: &Syscall,
+    ) -> Option<Result<Vec<(usize, usize)>, Errno>> {
+        let geometry = || -> Result<Vec<(usize, usize)>, Errno> {
+            let (address, count) = match call {
+                Syscall::Readv(call) => (
+                    call.iov().map_or(0, |address| address.as_raw()),
+                    crate::io_buffers::linux_iovec_count(call.len() as u64),
+                ),
+                Syscall::Recvmsg(call) => {
+                    let message: Msghdr = memory.read_value(call.msg().ok_or(Errno::EFAULT)?)?;
+                    (message.msg_iov as usize, message.msg_iovlen)
+                }
+                _ => unreachable!("only supported observation calls enter capture"),
+            };
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            if count > MAX_IOVECS {
+                return Err(Errno::EINVAL);
+            }
+            let address = Addr::<libc::iovec>::from_raw(address).ok_or(Errno::EFAULT)?;
+            let mut iovecs = vec![
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                };
+                count
+            ];
+            memory.read_values(address, &mut iovecs)?;
+            Ok(iovecs
+                .into_iter()
+                .map(|iov| (iov.iov_base as usize, iov.iov_len))
+                .collect())
+        };
+        matches!(call, Syscall::Readv(_) | Syscall::Recvmsg(_)).then(geometry)
+    }
+
+    /// Attach the successful terminal attempt's observer result without
+    /// changing the metadata used by retry or exit-dependency observers.
+    pub(crate) fn with_observation(
+        entry: Option<Box<Self>>,
+        call: Syscall,
+        observation: Option<Result<Vec<(usize, usize)>, Errno>>,
+    ) -> Option<Box<Self>> {
+        let Some(observation) = observation else {
+            return entry;
+        };
+        let mut entry = entry.unwrap_or_else(|| {
+            Box::new(Self {
+                call,
+                regions: Vec::new(),
+                written_on_completion: Vec::new(),
+                observation: None,
+            })
+        });
+        assert_eq!(
+            entry.call, call,
+            "observation belongs to the same guest call"
+        );
+        entry.observation = Some(observation);
+        Some(entry)
+    }
+
+    pub(crate) fn has_observation(&self) -> bool {
+        self.observation.is_some()
+    }
+
+    /// Complete geometry of the actual successful read attempt, or no
+    /// certificate. Unknown must use the ordinary post-call observer, never
+    /// an older candidate. Outbound and aggregate write observations do not
+    /// use this read-side certificate.
+    pub(crate) fn observation_geometry(&self) -> Option<&[(usize, usize)]> {
+        self.observation.as_ref()?.as_ref().ok().map(Vec::as_slice)
     }
 
     /// The call this memory belongs to.

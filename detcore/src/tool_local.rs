@@ -4584,11 +4584,13 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) receive_geometry: Option<Option<crate::syscalls::scm_rights::ReceiveGeometry>>,
 
-    /// The memory the vectored call this thread just ran copied when it
-    /// began (`EntryImport`), when another thread has rewritten it since: the
-    /// observers that read the call's arguments after it returns
-    /// (`--detlog-io-buffers`) read them as the kernel's copy held them. Set
-    /// as the call's internal polling ends and taken as the call returns.
+    /// Retained metadata for the vectored call's observers. Original entry
+    /// regions preserve the existing outbound and exit-dependency overlays.
+    /// When buffer logging is observed, generic readv/recvmsg also retain a
+    /// separate complete-geometry result from the successful actual attempt;
+    /// their buffer observer hashes returned guest bytes without an overlay.
+    /// Set as internal polling ends and taken as the call returns. A failed
+    /// final capture cannot certify an earlier attempt's geometry.
     #[serde(skip)]
     pub(crate) entry_import: Option<Box<crate::syscalls::entry_import::EntryImport>>,
 

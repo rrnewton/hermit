@@ -1340,13 +1340,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// unsupported-syscall policy.
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3361): Review the
     // emulated `restart_syscall` resumption and the record it consumes.
-    /// The `detlog_io_buffers` observation of a finished call, read with
-    /// the kernel's view of the call's memory put back (`entry_view`) and
-    /// another thread's rewrite restored after it. `Some` with the error
-    /// that ends the call when either the observation or the restore
-    /// fails. Boxed at the call site: it holds the entry view across the
-    /// observation, which would otherwise grow every syscall's future
-    /// (`hot_path_futures_stay_small`).
+    /// Observe completed incoming vectored calls using saved actual-attempt
+    /// metadata for locations and real returned bytes for payload. The old
+    /// outbound observation contract is unchanged: a send can have read the
+    /// temporarily reinstated metadata itself as payload. Boxed at the call
+    /// site to keep every syscall's future small.
     #[allow(clippy::too_many_arguments)]
     async fn detlog_io_buffers_in_entry_view<G: Guest<Self>>(
         &self,
@@ -1358,13 +1356,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         count: u64,
         interrupted: Option<Errno>,
     ) -> Option<Result<i64, Error>> {
+        if !guest.config().detlog_io_buffers || !io_buffers::observed() {
+            return None;
+        }
         let entry = entry_view(guest, call);
-        let view = entry
-            .as_deref()
-            .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
-        let observed = io_buffers::detlog_io_buffers(guest, call, ret, dettid, rng_readv_output);
-        let restored = restore_entry_view(guest, view);
-        match restored.and(observed) {
+        let observed = if matches!(call, Syscall::Readv(_) | Syscall::Recvmsg(_)) {
+            let geometry = entry
+                .as_deref()
+                .and_then(|entry| entry.observation_geometry());
+            io_buffers::detlog_io_buffers_with_entry_geometry(
+                guest,
+                call,
+                ret,
+                dettid,
+                rng_readv_output,
+                geometry,
+            )
+        } else {
+            // A write may have sent the restored metadata as payload. Its
+            // existing observer contract is outside this read-side repair.
+            let view = entry
+                .as_deref()
+                .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
+            let observed =
+                io_buffers::detlog_io_buffers(guest, call, ret, dettid, rng_readv_output);
+            restore_entry_view(guest, view).and(observed)
+        };
+        match observed {
             Err(error) => Some(
                 self.complete_after_posthook(guest, count, Err(error), interrupted)
                     .await,
@@ -7047,10 +7065,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // arguments, so it does not matter whether the buffer lives on the stack, in the brk
         // heap, in BSS or in an anonymous mmap -- the last two of which neither mapping hash
         // can see. Only successful calls moved anything.
-        // A vectored call moved its bytes through its memory as it began
-        // (`EntryImport`), so the observer reads the call's arguments with
-        // the kernel's view put back for the read, and another thread's
-        // rewrite restored after it. No guest thread runs in between.
+        // Incoming readv/recvmsg observation uses complete geometry captured
+        // for the successful attempt, when available, but hashes the actual
+        // returned guest bytes without reinstating metadata over the payload.
+        // Outbound observation retains its entry-metadata overlay: the call
+        // may have sent those reinstated bytes. Exit-dependency readers keep
+        // their separate existing overlay contract.
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
         {

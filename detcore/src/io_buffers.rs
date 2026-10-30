@@ -861,6 +861,13 @@ fn chunk_digests(buf: &[u8]) -> (usize, Vec<String>) {
     (chunk, chunks)
 }
 
+/// Match the module target of the I/O-buffer records, including the in-guest
+/// forwarder's target policy. Callers in helpers or the top-level syscall
+/// dispatcher must not expand the macro under their own module targets.
+pub(crate) fn observed() -> bool {
+    crate::detlog_observed!()
+}
+
 /// ⚠️ THE GUARD IS FIRST AND THAT IS THE POINT. Everything below it touches
 /// guest memory: for `recvmsg` the extents cannot even be computed without
 /// reading a `msghdr` and an `iovec` array out of the guest. That is
@@ -880,7 +887,24 @@ where
     G: Guest<T>,
     T: Tool,
 {
-    if !crate::detlog_observed!() {
+    detlog_io_buffers_with_entry_geometry(guest, call, ret, dettid, rng_output, None)
+}
+
+/// Locations come from complete captured metadata; payload always comes from
+/// actual post-call guest memory. RNG's committed geometry takes precedence.
+pub(crate) fn detlog_io_buffers_with_entry_geometry<G, T>(
+    guest: &mut G,
+    call: &Syscall,
+    ret: i64,
+    dettid: DetTid,
+    rng_output: Option<&[BufferExtent]>,
+    entry_geometry: Option<&[(usize, usize)]>,
+) -> Result<(), Error>
+where
+    G: Guest<T>,
+    T: Tool,
+{
+    if !observed() {
         return Ok(());
     }
     let dir = direction(call).as_str();
@@ -904,14 +928,12 @@ where
         Some(fd) => fd.to_string(),
         None => "-".to_string(),
     };
-    // A recvmsg's buffers are found by re-reading its msghdr after the call,
-    // and Linux lets the receive's own output overwrite that header. When the
-    // re-read, a buffer read, or the re-read iovec's coverage of the returned
-    // length fails, the call's bytes cannot be (fully) observed. That is
-    // recorded as an explicit, compared `unobserved` entry after whatever was
-    // hashed, as before, from the re-read; and the guest still gets the
-    // kernel's result: the instrumentation must never change the guest's
-    // execution. Other calls keep failing on an observation error.
+    // Prefer complete actual-attempt geometry to re-reading a recvmsg header
+    // that the output may overwrite. With no certificate, keep the existing
+    // post-call observation. Failed geometry/payload reads and incomplete
+    // coverage remain explicit compared `unobserved` entries. A readable
+    // aliased payload can be hashed without writing metadata over it. The
+    // guest keeps the kernel's result; other calls retain their error policy.
     let unobserved = |reason: String| {
         crate::detlog!(
             "[iobuf][dtid {}] {} {} fd={} unobserved ret={} reason={}",
@@ -929,7 +951,21 @@ where
     };
     let moved_extents = {
         let memory = guest.memory();
-        match observed_extents(&memory, call, ret, rng_output) {
+        let extents = if rng_output.is_none() {
+            entry_geometry.map(|geometry| {
+                let iovecs: Vec<libc::iovec> = geometry
+                    .iter()
+                    .map(|&(base, len)| libc::iovec {
+                        iov_base: base as *mut libc::c_void,
+                        iov_len: len,
+                    })
+                    .collect();
+                Ok(iovec_extents_from_slice(&iovecs, ret))
+            })
+        } else {
+            None
+        };
+        match extents.unwrap_or_else(|| observed_extents(&memory, call, ret, rng_output)) {
             Ok(extents) => extents,
             Err(_) if receive.is_some() => {
                 unobserved("header-or-iovec-unreadable".to_string());
@@ -1707,6 +1743,44 @@ mod event_tests {
         fn exit(&self, _span: &Id) {}
     }
 
+    /// A target-scoped INFO subscriber. "*" enables every INFO target;
+    /// any other value enables only that exact module.
+    struct TargetBufferLog {
+        messages: BufferLog,
+        target: &'static str,
+    }
+
+    impl Subscriber for TargetBufferLog {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == Level::INFO
+                && (self.target == "*" || metadata.target() == self.target)
+        }
+
+        fn new_span(&self, span: &Attributes<'_>) -> Id {
+            self.messages.new_span(span)
+        }
+
+        fn record(&self, span: &Id, values: &Record<'_>) {
+            self.messages.record(span, values);
+        }
+
+        fn record_follows_from(&self, span: &Id, follows: &Id) {
+            self.messages.record_follows_from(span, follows);
+        }
+
+        fn event(&self, event: &Event<'_>) {
+            self.messages.event(event);
+        }
+
+        fn enter(&self, span: &Id) {
+            self.messages.enter(span);
+        }
+
+        fn exit(&self, span: &Id) {
+            self.messages.exit(span);
+        }
+    }
+
     fn readv(count: usize) -> Syscall {
         reverie::syscalls::Readv::new()
             .with_fd(FD)
@@ -2163,6 +2237,87 @@ mod event_tests {
         let messages = logs.0.lock().unwrap();
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert_extent(&messages[0], FIRST_DEST, PIPE_BYTES);
+    }
+
+    /// The real retry and posthook must use the emitter's target, not the
+    /// helper/dispatcher targets. Disabled observers must add no guest reads,
+    /// including when another module's INFO records are enabled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn readv_observer_uses_its_emitter_target_and_disabled_config_adds_no_reads() {
+        let mut disabled_reads = None;
+        for (enabled, target, emits) in [
+            (false, "nothing", false),
+            (false, "detcore::io_buffers", false),
+            (false, "detcore::syscalls::helpers", false),
+            (false, "*", false),
+            (true, "nothing", false),
+            (true, "detcore::syscalls::helpers", false),
+            (true, "detcore::io_buffers", true),
+        ] {
+            let case = format!("detlog_io_buffers={enabled}, target={target}");
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(TargetBufferLog {
+                messages: logs.clone(),
+                target,
+            });
+            let (parked_tx, parked_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = oneshot::channel();
+            let (mut tool, mut guest) = event_guest(FdType::Pipe, Some((parked_tx, resume_rx)));
+            guest.config.detlog_io_buffers = enabled;
+            tool.cfg = guest.config.clone();
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, FIRST_DEST, 8);
+
+            let event = tool.handle_syscall_event(&mut guest, readv(1));
+            let mutate_during_retry = async {
+                parked_rx.await.unwrap();
+                memory.put_iovec(0, RETRY_DEST, 8);
+                resume_tx.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(event, mutate_during_retry)
+            })
+            .await
+            .expect("readv did not cross its retry resource wait");
+            assert_eq!(result.unwrap(), 4, "{case}");
+            assert_eq!(
+                guest.injected_iovecs,
+                [(FIRST_DEST, 8), (FIRST_DEST, 8)],
+                "{case}"
+            );
+            assert_eq!(*guest.polls.lock().unwrap(), [0, 1], "{case}");
+            assert_eq!(*guest.releases.lock().unwrap(), 1, "{case}");
+            assert_eq!(guest.thread.stats.syscall_count, 1, "{case}");
+            assert_eq!(memory.iovec(0), (RETRY_DEST, 8), "{case}");
+            assert_eq!(
+                memory.bytes(FIRST_DEST, 4).as_slice(),
+                PIPE_BYTES.as_slice(),
+                "{case}"
+            );
+            assert_eq!(memory.bytes(FIRST_DEST + 4, 4), [CANARY; 4], "{case}");
+            assert_eq!(memory.bytes(RETRY_DEST, 8), [CANARY; 8], "{case}");
+            let messages = logs.0.lock().unwrap();
+            if emits {
+                assert_eq!(messages.len(), 1, "{case}: {messages:?}");
+                assert_extent(&messages[0], FIRST_DEST, PIPE_BYTES);
+            } else {
+                assert!(messages.is_empty(), "{case}: {messages:?}");
+                let reads = memory.1.lock().unwrap();
+                let footprint = (
+                    reads.imported_entries,
+                    reads.observer_reads.clone(),
+                    reads.exact_reads.clone(),
+                );
+                if let Some(expected) = &disabled_reads {
+                    assert_eq!(
+                        &footprint, expected,
+                        "{case}: disabled observation added reads"
+                    );
+                } else {
+                    disabled_reads = Some(footprint);
+                }
+            }
+        }
     }
 
     /// An ordinary readv whose observation fails after the call returns that
@@ -2926,6 +3081,92 @@ mod event_tests {
             messages[0].contains(&format!("fstat in fd={FD} ")),
             "{}",
             messages[0]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn certified_recvmsg_geometry_hashes_payload_overwriting_its_own_iovec() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (tool, mut guest) = event_guest(FdType::Socket, None);
+        let memory = guest.memory.clone();
+        memory.put_iovec(0, IOV, std::mem::size_of::<libc::iovec>());
+        let call = recvmsg_with_iov(&memory, IOV, 1, 0);
+        let captured =
+            crate::syscalls::entry_import::EntryImport::capture_observation(&memory, &call)
+                .expect("recvmsg is supported")
+                .expect("all metadata is readable");
+        assert_eq!(captured, vec![(IOV, std::mem::size_of::<libc::iovec>())]);
+        guest.thread.entry_import = crate::syscalls::entry_import::EntryImport::with_observation(
+            crate::syscalls::entry_import::EntryImport::capture(&memory, &call).map(Box::new),
+            call,
+            Some(Ok(captured)),
+        );
+        // The received bytes encode an unmapped pointer, while their actual
+        // destination is the readable iovec object itself.
+        memory.put_iovec(0, UNMAPPED, 1);
+        let payload = memory.bytes(IOV, std::mem::size_of::<libc::iovec>());
+        let before = memory.0.lock().unwrap().clone();
+        let failure = tool
+            .detlog_io_buffers_in_entry_view(
+                &mut guest,
+                &call,
+                payload.len() as i64,
+                DetTid::from_raw(1),
+                None,
+                0,
+                None,
+            )
+            .await;
+        assert!(
+            failure.is_none(),
+            "successful observation must keep the syscall result"
+        );
+        assert_eq!(
+            *memory.0.lock().unwrap(),
+            before,
+            "observer must not write guest memory"
+        );
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_named_extent(&messages[0], "recvmsg", IOV, &payload);
+        let mut original = Vec::new();
+        original.extend_from_slice(&IOV.to_ne_bytes());
+        original.extend_from_slice(&std::mem::size_of::<libc::iovec>().to_ne_bytes());
+        assert!(
+            !messages[0].contains(&Digest::new(&original).to_string()),
+            "metadata is not payload"
+        );
+    }
+
+    #[test]
+    fn actual_attempt_capture_is_complete_and_does_not_reuse_an_older_iovec() {
+        let memory = EventMemory::new();
+        let call = recvmsg_with_iov(&memory, IOV, 1, 0);
+        memory.put_iovec(0, FIRST_DEST, 4);
+        let first = crate::syscalls::entry_import::EntryImport::capture_observation(&memory, &call)
+            .unwrap()
+            .unwrap();
+        memory.put_iovec(0, FIRST_DEST + 64, 2);
+        let last = crate::syscalls::entry_import::EntryImport::capture_observation(&memory, &call)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, vec![(FIRST_DEST, 4)]);
+        assert_eq!(last, vec![(FIRST_DEST + 64, 2)]);
+        let unreadable = recvmsg_with_iov(&memory, UNMAPPED, 1, 0);
+        assert_eq!(
+            crate::syscalls::entry_import::EntryImport::capture_observation(&memory, &unreadable),
+            Some(Err(Errno::EFAULT)),
+        );
+        let entry = crate::syscalls::entry_import::EntryImport::with_observation(
+            crate::syscalls::entry_import::EntryImport::capture(&memory, &call).map(Box::new),
+            call,
+            Some(Err(Errno::EFAULT)),
+        )
+        .unwrap();
+        assert!(
+            entry.observation_geometry().is_none(),
+            "failed final capture must not reuse old metadata"
         );
     }
 

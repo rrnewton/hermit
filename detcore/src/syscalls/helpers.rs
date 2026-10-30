@@ -2935,6 +2935,7 @@ where
     // that rewrites it while the call waits changes nothing the call moves.
     // Boxed, so the call's future stays small (`hot_path_futures_stay_small`).
     let entry_import = EntryImport::capture(&guest.memory(), &call0.into()).map(Box::new);
+    let mut completed_observation = None;
     // The stack-allocated memory here needs to live across the loop, which means
     // surviving multiple syscall injections:
     let (mut call, mut maybe_stackguard) = call0.into_nonblocking(guest).await;
@@ -3091,6 +3092,14 @@ where
             )
             .await;
         }
+        // Read actual metadata after reinstatement and all earlier awaits.
+        // Observation adds no reads or allocation when buffer logging is off.
+        let attempt_observation =
+            if guest.config().detlog_io_buffers && crate::io_buffers::observed() {
+                EntryImport::capture_observation(&guest.memory(), &call.into())
+            } else {
+                None
+            };
         // Route through the record/replay subtool for internal pipes so each poll (an
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
         // reproduces deterministically; otherwise execute the syscall directly.
@@ -3181,6 +3190,9 @@ where
             let res = call
                 .normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0)
                 .map_err(|e| e.into());
+            if res.is_ok() {
+                completed_observation = attempt_observation;
+            }
             tracing::trace!(
                 "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",
                 rsrc.poll_attempt,
@@ -3190,6 +3202,8 @@ where
             break res;
         }
     };
+    let entry_import =
+        EntryImport::with_observation(entry_import, call0.into(), completed_observation);
     keep_entry_view(guest, entry_import);
 
     // The single exit: the guest's mask goes back before the result is
@@ -3345,7 +3359,8 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let view = entry_import.filter(|entry| entry.differs(&guest.memory()));
+    let view =
+        entry_import.filter(|entry| entry.has_observation() || entry.differs(&guest.memory()));
     guest.thread_state_mut().entry_import = view;
 }
 
