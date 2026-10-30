@@ -3114,6 +3114,82 @@ mod tests {
         assert!(error.to_string().contains(expected), "{error:#}");
     }
 
+    /// A record made under guest random seed `rng` and scheduler seed `sched`.
+    fn record_with_seeds(dir: &Path, name: &str, rng: u64, sched: u64) -> PathBuf {
+        let path = record_with_rng_seed(dir, name, Some(rng));
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["sched_seed"] = serde_json::Value::from(sched);
+        std::fs::write(&path, value.to_string()).unwrap();
+        path
+    }
+
+    /// The guest random seed, the scheduler seed and the adopted seeds a trial
+    /// runs under once `RunData::launch` has prepared it.
+    fn prepared_seeds(
+        trial: &mut RunData,
+    ) -> (u64, u64, Option<detcore_model::summary::AdoptedSeeds>) {
+        trial.prepare_trial_options().unwrap();
+        let config = &trial.runopts.det_opts.det_config;
+        (
+            config.rng_seed(),
+            config.sched_seed(),
+            config.replay_adopted_seeds,
+        )
+    }
+
+    /// A trial that replays a record runs under that record's seeds, as
+    /// `hermit run` does: the target named by `--run1-preemptions`, and a trial
+    /// that replays a schedule record. The guest random seed is the one
+    /// analyze gives every trial (`adopt_trial_rng_seed`), so only the
+    /// scheduler seed is adopted, and the trial's reproducer names both.
+    /// Preparing again, as `RunOpts::run` does, changes nothing; preparing for
+    /// another record takes that record's scheduler seed.
+    #[test]
+    fn analyze_trials_replay_a_record_under_its_recorded_seeds() {
+        use detcore_model::summary::AdoptedSeeds;
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let record = record_with_seeds(dir, "recorded", 6, 7);
+        let options = prepared_with(
+            dir,
+            &[format!("--run1-preemptions={}", record.display())],
+            &[],
+        )
+        .unwrap();
+        let target = RunData::new_run1_target(&options, "target".to_owned()).unwrap();
+        let schedule = RunData::new_baseline(&options, "schedule".to_owned())
+            .unwrap()
+            .with_schedule_replay_from(record.clone());
+        let adopted = |sched| {
+            Some(AdoptedSeeds {
+                rng: None,
+                sched: Some(sched),
+            })
+        };
+        for (name, mut trial) in [("target", target), ("schedule", schedule)] {
+            assert_eq!(prepared_seeds(&mut trial), (6, 7, adopted(7)), "{name}");
+            let repro = trial.repro_command();
+            assert!(
+                repro.contains(" --rng-seed=6") && repro.contains(" --sched-seed=7"),
+                "{repro}"
+            );
+            assert_eq!(
+                prepared_seeds(&mut trial),
+                (6, 7, adopted(7)),
+                "{name}, again"
+            );
+        }
+
+        let other = record_with_seeds(dir, "other", 6, 9);
+        let mut trial = RunData::new_baseline(&options, "retargeted".to_owned())
+            .unwrap()
+            .with_schedule_replay_from(record);
+        prepared_seeds(&mut trial);
+        let mut trial = trial.with_schedule_replay_from(other);
+        assert_eq!(prepared_seeds(&mut trial), (6, 9, adopted(9)));
+    }
+
     /// The trial that replays `--run1-preemptions` starts from the epoch the
     /// record was made under, as `hermit run` replaying it does
     /// (https://github.com/rrnewton/hermit/issues/3870). Before, it started
