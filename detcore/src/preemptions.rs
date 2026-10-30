@@ -1634,6 +1634,36 @@ mod tests {
         }
     }
 
+    /// How the recorded run numbered its guest is a setting a replay of the
+    /// record must share (`guest_ids_mismatch`), so a prefix record keeps it,
+    /// for any length, as `clone_preemptions_only` does.
+    #[test]
+    fn a_schedule_prefix_keeps_the_guest_numbering() {
+        use detcore_model::pid::GuestIds;
+        let tid = DetTid::from_raw(3);
+        for ids in [
+            None,
+            Some(GuestIds::Host),
+            Some(GuestIds::Chosen {
+                base: 4000,
+                refuse_host_ids: true,
+            }),
+        ] {
+            let mut record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ]);
+            record.guest_ids = ids;
+            for len in [0, 1, 2, 9] {
+                assert_eq!(
+                    record.schedule_prefix(len).guest_ids(),
+                    ids,
+                    "prefix of {len} events"
+                );
+            }
+        }
+    }
+
     /// A replay of a schedule's first events keeps the callback checkpoints
     /// of the slices those events end, for the threads they run, and no later
     /// ones: the slice end at the prefix's own end belongs to the event after
