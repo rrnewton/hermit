@@ -157,6 +157,10 @@ mod tests {
         // of tuples (#4779), and the digest now covers the StoreExclusive
         // request's payload types.
         (20, "db709ad93785cfa4", "f013e36743d8d9e6"),
+        // `SchedEvent::strex_fails`, which the event's bincode always writes
+        // (#4780), and the digest now covers the event `TraceSchedEvent`
+        // carries: its fields, its `Serialize` and its count's representation.
+        (21, "c2640dec38993a57", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -202,11 +206,54 @@ mod tests {
         code
     }
 
+    /// The items of detcore-model's schedule.rs that decide how
+    /// `GlobalRequest::TraceSchedEvent` carries its event: the event's
+    /// fields, its hand-written `Serialize`, which decides which of them the
+    /// RPC's bincode writes, and its host-observed count's representation.
+    const SCHED_EVENT_WIRE: [&str; 3] = [
+        "pub struct SchedEvent {",
+        "impl Serialize for SchedEvent {",
+        "pub struct HostObserved(pub u32);",
+    ];
+
+    /// The lines of code of the item `source` declares, unindented, on the
+    /// line `header`: the attributes just above it (its derives and serde
+    /// attributes decide its encoding), the header, and its body through
+    /// the closing brace without comments or blank lines, or the header
+    /// alone for an item that ends on it.
+    fn wire_item(source: &str, header: &str) -> Vec<String> {
+        let lines: Vec<&str> = source.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == header)
+            .unwrap_or_else(|| panic!("{header} is declared"));
+        let attributes = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| line.starts_with("#["))
+            .count();
+        let mut code: Vec<String> = lines[at - attributes..=at]
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect();
+        if !header.ends_with(';') {
+            code.extend(
+                lines[at + 1..]
+                    .iter()
+                    .take_while(|line| **line != "}")
+                    .map(|line| line.trim())
+                    .filter(|line| !line.is_empty() && !line.starts_with("//"))
+                    .map(str::to_owned),
+            );
+        }
+        code
+    }
+
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
-    /// `source`, and of the StoreExclusive payload's types in `payload`:
-    /// their variants, fields, payload types, order and attributes, not
-    /// their documentation.
-    fn definition_digest(source: &str, payload: &str) -> String {
+    /// `source`, of the StoreExclusive payload's types in `payload`, and of
+    /// the scheduled event's wire items in `schedule`: their variants,
+    /// fields, payload types, order and attributes, not their documentation.
+    fn definition_digest(source: &str, payload: &str, schedule: &str) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
         let payload = STORE_EXCLUSIVE_PAYLOAD
@@ -214,10 +261,16 @@ mod tests {
             .map(|header| nested_definition(payload, header).join("\n"))
             .collect::<Vec<_>>()
             .join("\n");
+        let schedule = SCHED_EVENT_WIRE
+            .iter()
+            .map(|header| wire_item(schedule, header).join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
             (3, payload.as_bytes()),
+            (4, schedule.as_bytes()),
         ])
     }
 
@@ -235,7 +288,8 @@ mod tests {
     fn the_global_rpc_revision_matches_its_definitions() {
         let source = include_str!("tool_global.rs");
         let payload = include_str!("store_exclusive.rs");
-        let digest = definition_digest(source, payload);
+        let schedule = include_str!("../../detcore-model/src/schedule.rs");
+        let digest = definition_digest(source, payload, schedule);
         let resources = include_str!("resources.rs");
         let resources_digest = resources_definition_digest(resources);
         let revision = crate::tool_global::GLOBAL_RPC_REVISION;
@@ -265,13 +319,13 @@ mod tests {
             "pub enum GlobalRequest {\n    /// Documentation only.\n\n",
             1,
         );
-        assert_eq!(definition_digest(&documented, payload), digest);
+        assert_eq!(definition_digest(&documented, payload, schedule), digest);
         let added = source.replacen(
             "pub enum GlobalRequest {\n",
             "pub enum GlobalRequest {\n    Added(u32),\n",
             1,
         );
-        assert_ne!(definition_digest(&added, payload), digest);
+        assert_ne!(definition_digest(&added, payload, schedule), digest);
         // Retype GlobalRequest's VirtualInotifyCookies wherever it sits: later
         // revisions append variants after it.
         let retyped = source.replacen(
@@ -280,7 +334,7 @@ mod tests {
             1,
         );
         assert_ne!(retyped, source);
-        assert_ne!(definition_digest(&retyped, payload), digest);
+        assert_ne!(definition_digest(&retyped, payload, schedule), digest);
         // A field added to a payload type changes it too, as this change's
         // own move from tuples to `ScannedMapping` and `Found` did; its
         // documentation does not.
@@ -290,14 +344,46 @@ mod tests {
             1,
         );
         assert_ne!(grown, payload);
-        assert_ne!(definition_digest(source, &grown), digest);
+        assert_ne!(definition_digest(source, &grown, schedule), digest);
         let documented = payload.replacen(
             "    pub struct Found {\n",
             "    pub struct Found {\n        /// Documentation only.\n",
             1,
         );
         assert_ne!(documented, payload);
-        assert_eq!(definition_digest(source, &documented), digest);
+        assert_eq!(definition_digest(source, &documented, schedule), digest);
+        // The event `TraceSchedEvent` carries is detcore-model's: a field
+        // added to it, a change to which fields its `Serialize` writes, or
+        // its count's representation changes the digest; a doc line does
+        // not.
+        let grown = schedule.replacen(
+            "    pub strex_fails: HostObserved,\n",
+            "    pub strex_fails: HostObserved,\n    pub added: u32,\n",
+            1,
+        );
+        assert_ne!(grown, schedule);
+        assert_ne!(definition_digest(source, payload, &grown), digest);
+        let carried = schedule.replacen(
+            "let carry = !strex_fails.is_zero() || !serializer.is_human_readable();",
+            "let carry = !strex_fails.is_zero();",
+            1,
+        );
+        assert_ne!(carried, schedule);
+        assert_ne!(definition_digest(source, payload, &carried), digest);
+        let opaque = schedule.replacen(
+            "#[serde(transparent)]\npub struct HostObserved(pub u32);",
+            "pub struct HostObserved(pub u32);",
+            1,
+        );
+        assert_ne!(opaque, schedule);
+        assert_ne!(definition_digest(source, payload, &opaque), digest);
+        let documented = schedule.replacen(
+            "pub struct SchedEvent {\n",
+            "pub struct SchedEvent {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, schedule);
+        assert_eq!(definition_digest(source, payload, &documented), digest);
 
         let documented = resources.replacen(
             "pub struct Resources {\n",

@@ -475,6 +475,7 @@ impl PreemptionRecord {
     pub fn with_schedule(&self, events: Vec<SchedEvent>) -> Option<PreemptionRecord> {
         let mut record = self.clone();
         record.global = events;
+        record.forget_segment_store_exclusives();
         record.validate().is_ok().then_some(record)
     }
 
@@ -558,6 +559,18 @@ impl PreemptionRecord {
         record.global = events;
         record.validate()?;
         Ok(record)
+    }
+
+    /// Drop each segment's failed store-exclusives and the flag that says
+    /// every segment was counted, for a schedule whose events are no longer
+    /// the ones this run observed: split, edited or replaced. A count copied
+    /// into a derived event, or carried by one from another run, would claim
+    /// an observation nobody made.
+    fn forget_segment_store_exclusives(&mut self) {
+        self.segment_store_exclusives = HostObservedFlag::default();
+        for event in &mut self.global {
+            event.strex_fails = detcore_model::schedule::HostObserved::default();
+        }
     }
 
     /// The `--max-timeslice` the run that produced this record drew under
@@ -769,11 +782,13 @@ impl PreemptionRecord {
             }
         }
         self.global = result;
+        self.forget_segment_store_exclusives();
     }
 
     /// Iterate over the schedevents.
     pub fn schedevents_iter_mut(&mut self) -> std::slice::IterMut<'_, SchedEvent> {
         self.callback_checkpoints.clear();
+        self.forget_segment_store_exclusives();
         self.global.iter_mut()
     }
 
@@ -1768,6 +1783,72 @@ mod tests {
         let back: PreemptionRecord = serde_json::from_str(&legacy).unwrap();
         assert!(!back.segment_store_exclusives());
         assert_eq!(back.global[0].strex_fails.0, 0);
+    }
+
+    /// A record whose segments failed store-exclusives, counted for every
+    /// segment.
+    fn counted_record() -> PreemptionRecord {
+        let tid = DetTid::from_raw(3);
+        let mut failing = SchedEvent::branches(tid, 4);
+        failing.strex_fails = detcore_model::schedule::HostObserved(2);
+        let mut record =
+            PreemptionRecord::from_sched_events(vec![failing, SchedEvent::branches(tid, 6)]);
+        record.segment_store_exclusives = HostObservedFlag(true);
+        record
+    }
+
+    fn holds_no_store_exclusive_counts(record: &PreemptionRecord) -> bool {
+        !record.segment_store_exclusives()
+            && record
+                .global
+                .iter()
+                .all(|event| event.strex_fails.is_zero())
+    }
+
+    /// A split segment's halves cannot say which failed its store-exclusives,
+    /// and a count copied into both would claim two observations where there
+    /// was one, so a split record keeps neither the counts nor the flag.
+    #[test]
+    fn a_split_schedule_keeps_no_store_exclusive_counts() {
+        let mut record = counted_record();
+        record.split_map(|event, _| {
+            let half = event.count / 2;
+            [
+                SchedEvent {
+                    count: half,
+                    ..event.clone()
+                },
+                SchedEvent {
+                    count: event.count - half,
+                    ..event
+                },
+            ]
+        });
+        assert_eq!(record.global.len(), 4);
+        assert!(holds_no_store_exclusive_counts(&record));
+    }
+
+    /// Events handed out for editing are no longer the ones the run
+    /// observed, so the record drops their counts and the flag first.
+    #[test]
+    fn an_edited_schedule_keeps_no_store_exclusive_counts() {
+        let mut record = counted_record();
+        for event in record.schedevents_iter_mut() {
+            event.count += 1;
+        }
+        assert!(holds_no_store_exclusive_counts(&record));
+    }
+
+    /// A schedule put in place of the record's own is not the one its run
+    /// counted, so the new record keeps neither its counts nor the flag; the
+    /// original keeps its own.
+    #[test]
+    fn a_replaced_schedule_keeps_no_store_exclusive_counts() {
+        let record = counted_record();
+        let replaced = record.with_schedule(record.global.clone()).unwrap();
+        assert!(holds_no_store_exclusive_counts(&replaced));
+        assert!(record.segment_store_exclusives());
+        assert_eq!(record.global[0].strex_fails.0, 2);
     }
 
     /// The run's failed store-exclusives ride in a record so that a replay

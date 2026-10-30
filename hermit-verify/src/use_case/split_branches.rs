@@ -116,4 +116,29 @@ mod tests {
 
         assert_eq!(counts, vec![(Op::Branch, 1, 9980), (Op::Branch, 2, 10000)]);
     }
+
+    /// Splitting a branch segment cannot tell which half failed its
+    /// store-exclusives, so the split record keeps neither the count nor the
+    /// flag that every segment was counted.
+    #[test]
+    fn splitting_branches_keeps_no_store_exclusive_count() {
+        let tid = DetPid::from_raw(3);
+        let mut failing = SchedEvent::branches(tid, 4);
+        failing.strex_fails = detcore_model::schedule::HostObserved(2);
+        let mut writer = detcore::preemptions::PreemptionWriter::new(None);
+        writer.insert_schedevent(failing);
+        writer.insert_schedevent(SchedEvent::branches(tid, 6));
+        writer.record_segment_store_exclusives(true);
+        let mut record: detcore::preemptions::PreemptionRecord =
+            serde_json::from_str(&writer.into_string()).unwrap();
+        assert!(record.segment_store_exclusives());
+        record.split_map(split_branches);
+        let counts: Vec<_> = record
+            .schedevents()
+            .iter()
+            .map(|event| (event.count, event.strex_fails.0))
+            .collect();
+        assert_eq!(counts, vec![(2, 0), (2, 0), (6, 0)]);
+        assert!(!record.segment_store_exclusives());
+    }
 }
