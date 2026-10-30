@@ -326,6 +326,15 @@ exit 125.
 
 ## A virtual timeout bounds virtual time, not the host's
 
+`--virtual-timeout` is refused with `--gdbserver` or `--dap-listen`, before
+starting the guest or debugger. A debugger can suppress a fatal signal after
+Detcore has marked the process doomed; the surviving guest would then be
+excluded from the virtual bound. Until that final-delivery state is reconciled,
+Hermit fails closed with `HERMIT_VIRTUAL_TIMEOUT_WITH_DEBUGGER`. Remove either
+the debugger option or the virtual bound, or use `--timeout` for a wall-clock
+bound. Debugger runs without a virtual bound and virtual bounds without a
+debugger retain their existing admission.
+
 `hermit run --virtual-timeout=N` bounds the run in **virtual** nanoseconds:
 Detcore's global virtual time since the run began, the same quantity
 `--summary` reports as elapsed (`virttime_elapsed` in `--summary-json`). The

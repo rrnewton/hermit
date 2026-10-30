@@ -238,7 +238,10 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         FailureKind::SkidOvershoot {
             count: error.count(),
         }
-    } else if is_policy_refusal(error)
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>())
+        || is_policy_refusal(error)
         || error
             .downcast_ref::<crate::LiteinstInGuestRefusal>()
             .is_some()

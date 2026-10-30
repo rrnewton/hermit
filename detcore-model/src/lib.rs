@@ -338,6 +338,7 @@ pub mod schedule;
 pub mod summary;
 pub mod syscall_histogram;
 pub mod time;
+pub mod virtual_timeout;
 
 /// Exact native runtime/dispatch-sequence envelope, separate from admission.
 pub mod liteinst_native_exec_runtime;

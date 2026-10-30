@@ -4619,6 +4619,11 @@ fn validate_strict_boundary_config(cfg: &Config) -> Result<(), &'static str> {
 impl Scheduler {
     /// Create a new scheduler based on the configuration.
     pub fn new(cfg: &Config) -> Self {
+        if let Err(refusal) =
+            detcore_model::virtual_timeout::refuse_debugger(cfg.virtual_timeout, cfg.gdbserver)
+        {
+            exit_on_scheduler_refusal(&refusal);
+        }
         if let Err(reason) = validate_strict_boundary_config(cfg) {
             exit_on_scheduler_refusal(&anyhow::anyhow!(reason));
         }
@@ -36484,6 +36489,49 @@ mod test {
             panic!("a removed unwind must not run")
         })));
         assert_eq!(unwind_terminal_outcome(&sched, deadlock), None);
+    }
+
+    #[test]
+    fn a_virtual_timeout_with_a_debugger_is_refused_before_scheduler_construction() {
+        const CHILD: &str = "HERMIT_VIRTUAL_TIMEOUT_DEBUGGER_SCHEDULER_TEST";
+        const NAME: &str = "scheduler::test::a_virtual_timeout_with_a_debugger_is_refused_before_scheduler_construction";
+        if std::env::var_os(CHILD).is_some() {
+            Scheduler::new(&Config {
+                virtual_timeout: std::num::NonZeroU64::new(5_000_000_000),
+                gdbserver: true,
+                ..Config::default()
+            });
+            panic!("the raw scheduler admitted a debugger with a virtual bound");
+        }
+        // Each option alone retains its constructor admission.
+        Scheduler::new(&Config {
+            gdbserver: true,
+            ..Config::default()
+        });
+        Scheduler::new(&Config {
+            virtual_timeout: std::num::NonZeroU64::new(5_000_000_000),
+            ..Config::default()
+        });
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{output:?}"
+        );
+        assert!(
+            stderr.contains("HERMIT_VIRTUAL_TIMEOUT_WITH_DEBUGGER"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("--gdbserver or --dap-listen"), "{stderr}");
+        assert!(
+            stderr.contains("use --timeout for a wall-clock bound"),
+            "{stderr}"
+        );
     }
 
     /// `--virtual-timeout` stops the run at the first commit of the global

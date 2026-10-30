@@ -5161,6 +5161,7 @@ async fn dispatch_backend(
 ) -> Result<ExitStatus, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
@@ -5523,6 +5524,7 @@ async fn dispatch_output_backend(
 ) -> Result<Output, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
@@ -8698,6 +8700,58 @@ mod tests {
         // This tree's manifest declares `dbt`, so build.rs must have judged it
         // a source build, whatever the package is called.
         const { assert!(!cfg!(hermit_registry_build)) };
+    }
+
+    #[tokio::test]
+    async fn virtual_timeout_with_debugger_is_refused_at_both_raw_library_dispatches() {
+        for (gdbserver, bounded) in [(false, false), (true, false), (false, true), (true, true)] {
+            let config = DetConfig {
+                gdbserver,
+                virtual_timeout: bounded.then(|| std::num::NonZeroU64::new(5_000_000_000).unwrap()),
+                ..DetConfig::default()
+            };
+            // No retained operation owner: admitted cases stop at that later
+            // boundary, without starting a guest or waiting for a debugger.
+            // The unsupported combination must be refused before it is reached.
+            let status = dispatch_backend(
+                Command::new("/nonexistent/guest"),
+                config.clone(),
+                false,
+                &None,
+                Backend::Ptrace,
+                None,
+            )
+            .await
+            .unwrap_err();
+            let output = dispatch_output_backend(
+                Command::new("/nonexistent/guest"),
+                config,
+                false,
+                &None,
+                Backend::Ptrace,
+                None,
+            )
+            .await
+            .unwrap_err();
+            for error in [status, output] {
+                if gdbserver && bounded {
+                    assert!(
+                        error.is::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>(),
+                        "{error}"
+                    );
+                    let classified =
+                        crate::error::SerializableError::from(error.context("raw library launch"));
+                    assert_eq!(classified.kind(), crate::error::FailureKind::PolicyRefusal);
+                } else {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("ordinary ptrace requires its retained operation owner"),
+                        "{error}"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(not(feature = "sabre"))]

@@ -5973,6 +5973,93 @@ fn scheduler_turn_cost_parses_round_trips_and_is_refused_for_dbt() {
     );
 }
 
+#[test]
+fn virtual_timeout_with_debugger_is_refused_before_dispatch_and_validation() {
+    for debugger in ["--gdbserver", "--dap-listen=127.0.0.1:0"] {
+        for bounded in [false, true] {
+            let mut argv = vec!["fakehermit", debugger];
+            if bounded {
+                argv.push("--virtual-timeout=5000000000");
+            }
+            argv.push("/nonexistent/guest");
+            let options = RunOpts::parse_from(argv);
+            let mut dispatch = options.clone();
+            let result = dispatch.dispatch_before_validation(None, None);
+            if bounded {
+                let error = result.unwrap_err();
+                assert!(
+                    error.is::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>(),
+                    "{error}"
+                );
+                for timer_available in [false, true] {
+                    let error = options
+                        .clone()
+                        .validate_args_with_perf_support(timer_available)
+                        .unwrap_err();
+                    assert!(
+                        error.is::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>(),
+                        "{error}"
+                    );
+                }
+                let error = options.clone().validate_args().unwrap_err();
+                assert!(
+                    error.is::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>(),
+                    "{error}"
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    if options.dap_listen.is_some() {
+                        RunDispatch::DapSupervisor
+                    } else {
+                        RunDispatch::Run
+                    }
+                );
+                options
+                    .clone()
+                    .validate_args_with_perf_support(true)
+                    .unwrap();
+            }
+        }
+    }
+    let mut bounded = RunOpts::parse_from([
+        "fakehermit",
+        "--virtual-timeout=5000000000",
+        "/nonexistent/guest",
+    ]);
+    assert_eq!(
+        bounded.dispatch_before_validation(None, None).unwrap(),
+        RunDispatch::Run
+    );
+    bounded.validate_args_with_perf_support(true).unwrap();
+}
+
+#[test]
+fn virtual_timeout_with_debugger_is_refused_before_raw_container_launch() {
+    // Occupied port makes an accidentally reached bind fail promptly. The
+    // required policy refusal must precede that bind, not merely guest work.
+    let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = format!("--gdbserver-port={}", held.local_addr().unwrap().port());
+    let options = RunOpts::parse_from([
+        "fakehermit",
+        "--gdbserver",
+        port.as_str(),
+        "--virtual-timeout=5000000000",
+        "/nonexistent/guest",
+    ]);
+    let result = options.launch_in_container(
+        (),
+        "debugger admission test",
+        None,
+        |_, _, _| -> Result<(), Error> { panic!("refused combination reached container work") },
+    );
+    let error = result.unwrap_err();
+    assert!(
+        error.is::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>(),
+        "{error}"
+    );
+}
+
 /// `--virtual-timeout` takes virtual nanoseconds (not zero, not a unit), is
 /// rendered into the reproduce command and round-trips; its help says what it
 /// bounds and how it differs from `--timeout`. A launch without Detcore's
@@ -6019,6 +6106,7 @@ fn virtual_timeout_parses_round_trips_and_is_refused_without_the_scheduler() {
         "Unlike `--timeout`, a wall-clock bound",
         "(`class=run-timeout`)",
         "fires at the same point of the same schedule on every host and in every run",
+        "Also refused before guest or debugger startup with `--gdbserver` or `--dap-listen`",
     ] {
         assert!(
             help.contains(expected),
@@ -8699,6 +8787,7 @@ impl RunOpts {
     ) -> Result<RunDispatch, Error> {
         self.set_backend(backend);
         self.lower_strace_only();
+        self.refuse_virtual_timeout_with_debugger()?;
         self.prepare_mapped_verification_inputs()?;
         self.refuse_unready_exec_stop()?;
         // Before stdin is read or any backend is probed, so a backend that
@@ -8913,6 +9002,17 @@ impl RunOpts {
             Err(refusal) => Err(Error::new(PolicyRefusal)
                 .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))),
         }
+    }
+
+    /// Refuse before a pending DAP listener is lowered to the GDB configuration,
+    /// and before direct callers can bind a debugger port or launch a container.
+    fn refuse_virtual_timeout_with_debugger(&self) -> Result<(), Error> {
+        let config = &self.det_opts.det_config;
+        detcore_model::virtual_timeout::refuse_debugger(
+            config.virtual_timeout,
+            config.gdbserver || self.dap_listen.is_some(),
+        )?;
+        Ok(())
     }
 
     /// Refuses `--gdbserver`, and `--dap-listen`, which implies it, where the
@@ -9887,6 +9987,7 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
+        self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
         self.refuse_gdbserver_without_a_gdbserver()?;
         refuse_signal_state_check_env(std::env::var_os(SIGNAL_STATE_CHECK_ENV).as_deref())
@@ -9941,6 +10042,7 @@ impl RunOpts {
         // Callers other than `main` (analyze, oci, tests) reach validation
         // without `dispatch_before_validation`; lowering again is a no-op.
         self.lower_strace_only();
+        self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
         // Before the timer settings are checked, which read the timeslice.
         self.resolve_chaos_timeslice_range()?;
@@ -11785,6 +11887,7 @@ impl RunOpts {
             + 'static,
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
+        self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
         let gdbserver_port = self.bind_gdbserver_port()?;
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {

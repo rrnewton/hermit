@@ -1122,7 +1122,10 @@ pub struct Config {
     /// with the bound is refused there. Needs sequentialized threads and virtual time: refused
     /// with `--no-sequentialize-threads`, `--namespace-only`, `--strace-only` or
     /// `--no-virtualize-time`, and on the dbt, liteinst, in-guest-trap and sabre backends, where
-    /// it has not been qualified.
+    /// it has not been qualified. Also refused before guest or debugger startup with
+    /// `--gdbserver` or `--dap-listen`: a debugger can suppress a fatal signal after Detcore
+    /// marks its process doomed, leaving a survivor outside the bound. Remove the debugger
+    /// option or the virtual bound, or use `--timeout` for a wall-clock bound instead.
     #[serde(default)]
     #[clap(long, value_name = "virtual-nanoseconds")]
     pub virtual_timeout: Option<NonZeroU64>,

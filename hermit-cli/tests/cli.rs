@@ -42882,6 +42882,48 @@ const VIRTUAL_TIMEOUT_SLEEP_BOUND: &str = "3500000000";
 /// [`VIRTUAL_TIMEOUT_SLEEP_BOUND`] stops it.
 const VIRTUAL_TIMEOUT_SLEEP_STDOUT: &str = "tick 0\ntick 1\ntick 2\ntick 3\n";
 
+/// Admission precedes both GDB binding and DAP supervisor startup. An
+/// occupied port would report a different error if either boundary were crossed.
+#[test]
+fn virtual_timeout_with_debugger_refuses_before_guest_or_listener_startup() {
+    let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = held.local_addr().unwrap().port();
+    let gdb_port = format!("--gdbserver-port={port}");
+    let dap = format!("--dap-listen=127.0.0.1:{port}");
+    for debugger in ["--gdbserver", dap.as_str()] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--virtual-timeout=5000000000",
+                debugger,
+                gdb_port.as_str(),
+                "--",
+                "/bin/echo",
+                "guest-started",
+            ]),
+            directory.path(),
+            Duration::from_secs(45),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout")).unwrap();
+        assert_eq!(status.and_then(|status| status.code()), Some(122), "{log}");
+        assert!(stdout.is_empty(), "guest ran: {stdout:?}; {log}");
+        assert!(
+            log.contains("HERMIT_VIRTUAL_TIMEOUT_WITH_DEBUGGER"),
+            "{log}"
+        );
+        assert!(log.contains("--gdbserver or --dap-listen"), "{log}");
+        assert!(
+            log.contains("use --timeout for a wall-clock bound"),
+            "{log}"
+        );
+        assert!(!log.contains("Failed to bind"), "{log}");
+        assert!(!log.contains("class=run-timeout"), "{log}");
+    }
+}
+
 /// A guest that never ends stops at `--virtual-timeout`: exit 124 and
 /// `HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=N` after the
 /// scheduler's report and the summary, never `--timeout`'s
