@@ -123,13 +123,28 @@ pub fn landing_signal(
     if rollup.total_retries == 0 && extra_retries == 0 {
         return ("green-clean", Vec::new());
     }
-    let mut flaky: Vec<&RetryRecordV1> = rollup.tests.iter().filter(|t| t.flaky_pass).collect();
+    let mut flaky: Vec<&RetryRecordV1> = rollup
+        .tests
+        .iter()
+        .filter(|t| t.flaky_pass && t.retries > 0)
+        .collect();
     flaky.sort_by(|a, b| b.retries.cmp(&a.retries).then_with(|| a.test.cmp(&b.test)));
     let mut top: Vec<String> = flaky
         .iter()
         .map(|t| format!("{} ({} retries)", t.test, t.retries))
         .collect();
     top.extend(extra_flaky_tests);
+    // Global top by retries, parsed back out of the "(N retries)" suffix.
+    top.sort_by(|a, b| {
+        let n = |s: &str| {
+            s.rsplit('(')
+                .next()
+                .and_then(|r| r.split(' ').next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        n(b).cmp(&n(a)).then_with(|| a.cmp(b))
+    });
     top.truncate(10);
     ("green-flaky", top)
 }
