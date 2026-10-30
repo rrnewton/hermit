@@ -32,6 +32,7 @@ use crate::analyze::checkpoint::PrefixBracket;
 use crate::analyze::checkpoint::Progress;
 use crate::analyze::checkpoint::ProgressHandle;
 use crate::analyze::races::RacingAccesses;
+use crate::analyze::rundata::HermitRun;
 use crate::analyze::rundata::TrialRunner;
 use crate::analyze::verdict::Verdict;
 use crate::analyze::verdict::VerdictReason;
@@ -465,6 +466,12 @@ pub struct AnalyzeOpts {
     /// set it to drive the searches without a guest.
     #[clap(skip)]
     pub trial_runner: TrialRunner,
+
+    /// What `RunData::run_now` takes in place of `hermit run`'s result;
+    /// unset, it runs `hermit run`. Tests set it to take a run through
+    /// `run_now` and the journal without a guest.
+    #[clap(skip)]
+    pub hermit_run: HermitRun,
 }
 
 /// `--continuation-timeslice`.
