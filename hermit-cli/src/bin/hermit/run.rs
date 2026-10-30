@@ -1911,6 +1911,11 @@ pub struct RunOpts {
     /// (https://github.com/rrnewton/hermit/issues/4693).
     #[clap(skip)]
     ld_so_cache_snapshot: Option<super::container::LdSoCacheSnapshot>,
+    /// The mounts of the namespace this process was launched in, read just
+    /// before it creates a run's container (`capture_launch_namespace_mounts`)
+    /// for `detcore::Config::launch_namespace_mounts`.
+    #[clap(skip)]
+    launch_namespace_mounts: detcore_model::host_input::LaunchNamespaceMounts,
     /// Exact original package for both verification runs: inherited from the
     /// shared-input holder, or opened once by inline verification.
     #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
@@ -12319,6 +12324,7 @@ impl RunOpts {
         detcore::preemptions::validate_config_replay_inputs(&self.det_opts.det_config)?;
         <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
         let mut options = self.clone();
+        options.capture_launch_namespace_mounts();
         options.det_opts.det_config.annotated_priority_replay =
             options.annotated_priority_replay_admission()?;
         let network_trace = options.open_network_trace()?;
@@ -13952,6 +13958,7 @@ impl RunOpts {
             );
         }
         let mut options = self.clone();
+        options.capture_launch_namespace_mounts();
         options.det_opts.det_config.annotated_priority_replay =
             options.annotated_priority_replay_admission()?;
         let network_trace = options.open_network_trace()?;
@@ -14739,8 +14746,24 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Read the mounts of the namespace this process runs in, for
+    /// `detcore::Config::launch_namespace_mounts`, unless they were read
+    /// already. Called on the options a run launches with, before its
+    /// container is created, so the mounts are those of the namespace the
+    /// guest's inherited descriptors come from, not the container's copies.
+    fn capture_launch_namespace_mounts(&mut self) {
+        if self.launch_namespace_mounts.0.is_empty()
+            && let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo")
+        {
+            self.launch_namespace_mounts = detcore_model::host_input::LaunchNamespaceMounts(
+                detcore_model::host_input::mount_types(&mountinfo),
+            );
+        }
+    }
+
     fn effective_det_config(&self) -> DetConfig {
         let mut config = self.det_opts.det_config.clone();
+        config.launch_namespace_mounts = self.launch_namespace_mounts.clone();
         if !self.allow_unsupported_syscalls
             && std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1")
         {
