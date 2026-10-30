@@ -2170,15 +2170,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // cleared for a tracing backend; a chosen-ID plan issues it through
         // `inject_clone_planned`, whose staged copy clears the flag itself.
         let (maybe_res, untraced_refusal) = match clone_plan {
-            super::chosen_ids::ClonePlan::Kernel
-            | super::chosen_ids::ClonePlan::GuestChosen => {
+            super::chosen_ids::ClonePlan::Kernel | super::chosen_ids::ClonePlan::GuestChosen => {
                 match inject_traced_clone(guest, clone_family, flags).await {
                     CloneInjection::Ran(result) => (result, None),
                     // No call ran. ENOMEM is what the guest gets with
                     // --allow-unsupported-syscalls: a clone Linux could not complete.
-                    CloneInjection::Refused(reason) => {
-                        (Err(Errno::ENOMEM), Some(reason))
-                    }
+                    CloneInjection::Refused(reason) => (Err(Errno::ENOMEM), Some(reason)),
                 }
             }
             _ => (
