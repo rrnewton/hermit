@@ -87,6 +87,10 @@ int main(void) {
   page[0] = 1;
   must(munmap(page, 8192) == 0, "munmap");
 
+  // The trace checks a clock output explicitly; timer setup need not call it.
+  struct timespec now = {0};
+  must(syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &now) == 0, "clock_gettime");
+
   timer_t timer;
   struct sigevent event = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR1};
   must(timer_create(CLOCK_MONOTONIC, &event, &timer) == 0, "timer_create");
