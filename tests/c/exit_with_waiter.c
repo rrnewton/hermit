@@ -13,12 +13,21 @@
 //
 // "busy FILE" starts no thread: main rewrites FILE and fsyncs it in a loop, in
 // calls a recording logs, until something outside the guest kills it.
+//
+// "both FILE" starts the waiter as "poll" does, then writes "ready" to FILE and
+// blocks in the same poll itself, so that every thread waits in a call that
+// never returns, until something outside the guest kills it.
+//
+// "segv" and "abort" start the waiter as "poll" does, then main crashes: a
+// store to address 0 (SIGSEGV) or abort(3) (SIGABRT). Linux ends the waiter
+// inside its poll with the same signal, and the process dies of it.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/select.h>
@@ -96,6 +105,15 @@ int main(int argc, char **argv) {
     }
     return 0;
   }
+  const char *ready = NULL;
+  const char *crash = NULL;
+  if (strcmp(mode, "both") == 0 && argc > 2) {
+    ready = argv[2];
+    mode = "poll";
+  } else if (strcmp(mode, "segv") == 0 || strcmp(mode, "abort") == 0) {
+    crash = mode;
+    mode = "poll";
+  }
   // "recv" waits on a socket pair, the others on a pipe.
   int made = strcmp(mode, "recv") == 0
                  ? socketpair(AF_UNIX, SOCK_STREAM, 0, fds)
@@ -123,6 +141,27 @@ int main(int argc, char **argv) {
       read(waiting[0], &c, 1) != 1) {
     perror("waiter");
     return 2;
+  }
+  if (ready != NULL) {
+    int fd = open(ready, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || write(fd, "ready", 5) != 5 || close(fd) != 0) {
+      perror("ready");
+      return 2;
+    }
+    struct pollfd pfd = {fds[0], POLLIN, 0};
+    poll(&pfd, 1, -1);
+    printf("both: main's poll returned\n");
+    return 1;
+  }
+  if (crash != NULL) {
+    printf("%s: crashing with a thread still waiting\n", crash);
+    fflush(stdout);
+    if (strcmp(crash, "abort") == 0) {
+      abort();
+    }
+    *(volatile int *)0 = 1;
+    printf("%s: the store to address 0 returned\n", crash);
+    return 1;
   }
   struct timespec delay = {0, 50 * 1000 * 1000};
   syscall(SYS_nanosleep, &delay, NULL);

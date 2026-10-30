@@ -4363,6 +4363,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
         if delivered.is_some() {
             crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal as i32).await;
+            // The record/replay tool is told of the delivery Detcore decided,
+            // while its siginfo can still be read (`Guest::signal_info`); its
+            // answer cannot suppress it. The recorder marks a thread that
+            // dies of it as one it saw end.
+            self.record_or_replay
+                .handle_signal_event(&mut guest.into_guest(), signal)
+                .await?;
         }
         Ok(delivered.map(|_| signal))
     }
@@ -4381,6 +4388,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await?;
         if delivered.is_some() {
             crate::syscalls::signal_shadow::check_and_record_delivery(guest, signal).await;
+            // As in `handle_signal_event`.
+            self.record_or_replay
+                .handle_raw_signal_event(&mut guest.into_guest(), signal)
+                .await?;
         }
         Ok(delivered.map(|signal| signal.raw()))
     }

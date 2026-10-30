@@ -899,7 +899,15 @@ impl RecordVersion {
 // numbering so a replay under another one is refused. A recording made
 // before the numbering existed names no guest IDs, so an older replayer
 // would key its threads differently and diverge; it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x196);
+// 0x196 -> 0x197 (the next value above main's 0x196; the lander may renumber it
+// per its ledger at landing): each thread stream that ends in an orderly exit
+// gets a terminal record beside it (`stream-<digest>.end`), counting both its
+// files and naming the call the thread exited in, and replay leaves a thread
+// whose recording ends inside a call blocked only on that record. An older
+// recording has none, so this replayer would refuse what its recorder made
+// parkable, and an older replayer would park a thread on a stream merely cut
+// short; it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x197);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -924,7 +932,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x196);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x196;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x197;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

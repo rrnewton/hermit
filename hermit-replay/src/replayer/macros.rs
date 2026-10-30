@@ -25,7 +25,7 @@ macro_rules! next_event {
         let recorded = match $guest.thread_state_mut().next_event_or_end() {
             Ok(Some(recorded)) => recorded,
             Ok(None) => {
-                match $crate::replayer::park_unreturned_call($guest, concat!(stringify!($event), " event")).await {}
+                match $crate::replayer::park_unreturned_call($guest, concat!(stringify!($event), " event"), true).await {}
             }
             Err(error) => panic!(
                 "Replay event stream ended unexpectedly on thread {} while expecting {} after syscall event {}: {}",

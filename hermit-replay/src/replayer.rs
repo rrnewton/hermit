@@ -478,22 +478,31 @@ impl Default for ReplayerThreadState {
 /// Parks a thread whose recording ends inside its current call. A recorder
 /// writes a call's syscall record when the call starts and all its events
 /// when it returns, so a thread whose streams both end there, before any of
-/// the call's events, never returned from the call: it was still blocked in
-/// it, or had not yet reached the recorder, when the process exited or
-/// another thread's `execve` ended it.
+/// the call's events, may not have returned from the call: it was still
+/// blocked in it, or had not yet reached the recorder, when the process
+/// exited or another thread's `execve` ended it. `recorded` says whether the
+/// call has a syscall record.
+///
+/// Streams cut short at a record boundary end the same way, so the recording
+/// must also say so positively: the thread's terminal record, which the
+/// recorder writes only after an orderly exit with both stream files written
+/// in full, must count exactly what replay read and name this call as the one
+/// the thread was in (`EventReader::check_unreturned_call`). A thread a signal
+/// ended, from inside the guest or from outside it, has no terminal record.
 ///
 /// Replay leaves the thread blocked in the kernel the same way, in an
 /// injected `pause`, until the replayed exit ends the thread and the backend
-/// drops this handler with it. Detcore's scheduler must accept first
+/// drops this handler with it. Detcore's scheduler must accept too
 /// (`replay_call_never_returns`): only a background call can be parked, since
 /// a thread holding its turn would stop the replay, and a call the rejoin log
 /// readmits returned in the recording. A thread the scheduler has already
-/// removed is waited out instead: an exit is ending it. Any other ending of the recording, and
-/// a signal that reaches the parked thread (none ended the call in the
-/// recording), stops the replay as a divergence.
+/// removed is waited out instead: an exit is ending it. Any other ending of
+/// the recording, and a signal that reaches the parked thread (none ended the
+/// call in the recording), stops the replay as a divergence.
 pub(crate) async fn park_unreturned_call<G: Guest<Replayer>>(
     guest: &mut G,
     expecting: &str,
+    recorded: bool,
 ) -> reverie::Never {
     let thread = guest.tid();
     let state = guest.thread_state_mut();
@@ -511,6 +520,18 @@ pub(crate) async fn park_unreturned_call<G: Guest<Replayer>>(
             "Replay could not read the recording of thread {thread} after syscall event \
              {count}: {error}"
         ),
+    }
+    // Streams that end here look the same whether the thread died in this
+    // call or the recording was cut short at a record boundary, so the
+    // thread is parked only on the recorder's positive evidence: the
+    // terminal record of an orderly exit that counts what replay read and
+    // names this call (`EventReader::check_unreturned_call`).
+    if let Err(reason) = state.check_unreturned_call(recorded) {
+        panic!(
+            "Replay event stream ended unexpectedly on thread {thread}: no {expecting} after \
+             syscall event {count}, and the recording does not show that the call never \
+             returned: {reason}"
+        );
     }
     let verdict = detcore::replay_call_never_returns_reply(
         guest
@@ -624,7 +645,7 @@ impl Tool for Replayer {
         let state = guest.thread_state_mut();
         state.call_events_start = state.events_read;
         if !self.expect_syscall(guest, syscall) {
-            match park_unreturned_call(guest, "syscall record").await {}
+            match park_unreturned_call(guest, "syscall record", false).await {}
         }
 
         // As the recorder does: the kernel's restart of a poll a signal ended

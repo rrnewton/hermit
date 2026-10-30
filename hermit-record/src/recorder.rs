@@ -12,6 +12,7 @@ mod network;
 mod random;
 mod time;
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs as stdfs;
 use std::io;
@@ -73,6 +74,7 @@ use crate::event_stream::ChildEventStreamIds;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventStreamId;
 use crate::event_stream::EventWriter;
+use crate::event_stream::ThreadEnding;
 
 const MAX_EXEC_DEPENDENCY_DEPTH: usize = 5;
 
@@ -94,6 +96,10 @@ pub struct RecorderThreadState {
     /// shares with the thread that created it (`OutputDescriptions`).
     #[serde(skip)]
     output_descriptions: std::sync::Arc<OutputDescriptions>,
+    /// Whether the recorder's last sight of this thread was the delivery
+    /// stop of a signal whose default action ends it (`FatalDeliveries`).
+    #[serde(skip)]
+    fatal_pending: bool,
 }
 
 /// Duplicates of the stdout and stderr open file descriptions the root guest
@@ -207,13 +213,15 @@ impl RecorderThreadState {
     }
 
     /// Writes out and closes the thread's streams as the thread exits
-    /// (`EventWriter::finish`), or says why its recording is incomplete. The
-    /// recorder then marks the recording as one replay refuses
+    /// (`EventWriter::finish`), with their terminal record when the recorder
+    /// saw how the thread ended (`ending`), or says why its recording is
+    /// incomplete.
+    /// The recorder then marks the recording as one replay refuses
     /// (`detcore::detlog::record_replay_refusal`, kept in its metadata), rather
     /// than let replay fail later on the cut stream, far from the cause.
-    fn finish(self) -> Result<(), String> {
+    fn finish(self, ending: Option<ThreadEnding>) -> Result<(), String> {
         let stream_id = self.stream_id;
-        self.events.finish().map_err(|error| {
+        self.events.finish(ending).map_err(|error| {
             format!(
                 "the recording of thread stream {stream_id} could not be written in full: {error}"
             )
@@ -458,6 +466,10 @@ pub struct Recorder {
     /// takes them (`RecorderThreadState::outputs`).
     stdout: Option<OutputIdentity>,
     stderr: Option<OutputIdentity>,
+    /// The fatal signals whose delivery stop was the last the recorder saw
+    /// of a thread of this process (`FatalDeliveries`).
+    #[serde(skip)]
+    fatal_deliveries: Mutex<FatalDeliveries>,
 }
 
 impl Default for Recorder {
@@ -466,6 +478,146 @@ impl Default for Recorder {
             data: PathBuf::new(),
             stdout: None,
             stderr: None,
+            fatal_deliveries: Default::default(),
+        }
+    }
+}
+
+/// A signal delivered at a delivery stop whose default action, which the
+/// kernel runs next, ends the thread's group: the signal, its `si_code` when
+/// the stop's siginfo could be read, and the stream of the thread it was
+/// delivered to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FatalDelivery {
+    signal: i32,
+    code: Option<i32>,
+    stream: EventStreamId,
+}
+
+/// For each thread of a process, the fatal delivery that was the last thing
+/// the recorder saw of it, if it was one. A later event of the thread (a
+/// syscall, an rdtsc, an exec, another delivery) clears it, so a delivery
+/// counts only when nothing followed it but the thread's exit: a delivery
+/// stop, then the exit, with no handler run and no return to user code
+/// between. A handled or ignored delivery never counts.
+///
+/// A death no such stop preceded has no evidence here, and its streams get no
+/// terminal record. SIGKILL takes no stop (kernel/signal.c:2919 at v6.16),
+/// nor does a signal whose action is SA_IMMUTABLE, as the forced SIGSYS of a
+/// seccomp kill is (force_sig_seccomp, kernel/signal.c:1811-1823; HANDLER_EXIT
+/// sets it, :1308-1309), and a seccomp kill of one thread of several exits it
+/// with no signal at all (do_exit(SIGSYS), kernel/seccomp.c:1352).
+#[derive(Debug, Default)]
+struct FatalDeliveries(HashMap<i32, FatalDelivery>);
+
+impl FatalDeliveries {
+    /// Thread `tid` reached a delivery stop that delivers `delivery`'s signal,
+    /// whose default action ends the thread when `delivery` is `Some`.
+    fn delivered(&mut self, tid: i32, delivery: Option<FatalDelivery>) {
+        match delivery {
+            Some(delivery) => self.0.insert(tid, delivery),
+            None => self.0.remove(&tid),
+        };
+    }
+
+    /// The recorder saw another event of thread `tid`.
+    fn event(&mut self, tid: i32) {
+        self.0.remove(&tid);
+    }
+
+    /// How thread `tid`, which ended with `status`, ended, as its terminal
+    /// record tells replay, or `None` when the recorder did not see it end. An
+    /// exit status is an orderly exit: `exit`, `exit_group`, or another
+    /// thread's `execve`, which ends the others with code 0 (do_group_exit,
+    /// kernel/exit.c at v6.16). A signal is how the thread ended only when it
+    /// is the fatal delivery that was the last thing the recorder saw of this
+    /// thread, or, for a thread that signal's group exit ended, of exactly
+    /// one other thread of the process: the record names that thread.
+    fn ending(&self, tid: i32, status: ExitStatus) -> Option<ThreadEnding> {
+        let signal = match status {
+            ExitStatus::Exited(code) => return Some(ThreadEnding::Exited(code)),
+            ExitStatus::Signaled(signal, _) => signal as i32,
+            ExitStatus::SignaledRaw(signal, _) => signal,
+        };
+        let delivery = match self.0.get(&tid) {
+            Some(own) => (own.signal == signal).then_some(own)?,
+            None => {
+                let mut others = self.0.values().filter(|other| other.signal == signal);
+                let delivery = others.next()?;
+                others.next().is_none().then_some(delivery)?
+            }
+        };
+        Some(ThreadEnding::Signaled {
+            signal,
+            code: delivery.code,
+            delivered_to: delivery.stream.clone(),
+        })
+    }
+}
+
+/// Whether the kernel's next step for `signal`, delivered to a thread whose
+/// `/proc/<tid>/status` is `status`, is its default action ending the group:
+/// neither caught (`SigCgt`) nor ignored (`SigIgn`), with a default action
+/// that terminates or dumps core rather than ignoring, stopping or continuing
+/// (signal(7)). `None` when the status names neither mask.
+fn ends_by_default(signal: i32, status: &str) -> Option<bool> {
+    let mask = |field: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
+            .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+    };
+    let bit = 1u64.checked_shl(u32::try_from(signal - 1).ok()?)?;
+    if (mask("SigCgt")? | mask("SigIgn")?) & bit != 0 {
+        return Some(false);
+    }
+    Some(!matches!(
+        signal,
+        libc::SIGCHLD
+            | libc::SIGCONT
+            | libc::SIGSTOP
+            | libc::SIGTSTP
+            | libc::SIGTTIN
+            | libc::SIGTTOU
+            | libc::SIGURG
+            | libc::SIGWINCH
+    ))
+}
+
+impl Recorder {
+    /// Thread `guest` reached the delivery stop of `signal`, which Detcore
+    /// delivers: remembered as the thread's fatal delivery when the kernel's
+    /// next step is its default action ending the group (`ends_by_default`).
+    fn note_delivery<G: Guest<Self>>(&self, guest: &mut G, signal: i32) {
+        let tid = guest.tid().as_raw();
+        let fatal = std::fs::read_to_string(format!("/proc/{tid}/status"))
+            .ok()
+            .and_then(|status| ends_by_default(signal, &status))
+            == Some(true);
+        let delivery = fatal.then(|| FatalDelivery {
+            signal,
+            // `si_code` follows `si_signo` and `si_errno` in Linux's
+            // `siginfo_t`.
+            code: guest.signal_info().map(|info| {
+                i32::from_ne_bytes(info[8..12].try_into().expect("siginfo holds si_code"))
+            }),
+            stream: guest.thread_state().stream_id.clone(),
+        });
+        guest.thread_state_mut().fatal_pending = delivery.is_some();
+        self.fatal_deliveries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .delivered(tid, delivery);
+    }
+
+    /// The recorder sees another event of thread `guest`, which therefore
+    /// did not die of a delivery it saw before.
+    fn note_event<G: Guest<Self>>(&self, guest: &mut G) {
+        if std::mem::take(&mut guest.thread_state_mut().fatal_pending) {
+            self.fatal_deliveries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .event(guest.tid().as_raw());
         }
     }
 }
@@ -480,6 +632,7 @@ impl Tool for Recorder {
             data: cfg.replay_data.as_ref().unwrap().clone(),
             stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
+            fatal_deliveries: Default::default(),
         }
     }
 
@@ -526,6 +679,7 @@ impl Tool for Recorder {
                     state.output_descriptions.clone()
                 }
             },
+            fatal_pending: false,
         }
     }
 
@@ -538,16 +692,78 @@ impl Tool for Recorder {
         tid: Tid,
         _global_state: &G,
         thread_state: Self::ThreadState,
-        _exit_status: ExitStatus,
+        exit_status: ExitStatus,
     ) -> Result<(), Error> {
-        if let Err(reason) = thread_state.finish() {
+        let ending = self
+            .fatal_deliveries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ending(tid.as_raw(), exit_status);
+        if let Err(reason) = thread_state.finish(ending) {
             tracing::error!("[tid {tid}] {reason}");
             detcore::detlog::record_replay_refusal(&reason);
         }
         Ok(())
     }
 
+    /// Detcore reports each signal delivery it lets through, at its delivery
+    /// stop, after it has decided it; the answer cannot suppress it.
+    async fn handle_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: reverie::Signal,
+    ) -> Result<Option<reverie::Signal>, Errno> {
+        self.note_delivery(guest, signal as i32);
+        Ok(Some(signal))
+    }
+
+    /// As `handle_signal_event`, for a realtime signal.
+    async fn handle_raw_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+    ) -> Result<Option<i32>, Errno> {
+        self.note_delivery(guest, signal);
+        Ok(Some(signal))
+    }
+
     async fn handle_syscall_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Error> {
+        self.note_event(guest);
+        let result = self.record_syscall(guest, syscall).await;
+        // The handler returned, so the call is no longer in flight: a thread
+        // that exits after this was not inside it (`StreamEnd::call_in_flight`).
+        guest.thread_state_mut().events.call_returned();
+        result
+    }
+
+    // TODO-HUMAN-REVIEW(#2370)
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        // A successful exec's handler never returns: committing its event
+        // here ends the call.
+        self.note_event(guest);
+        guest.thread_state_mut().events.call_returned();
+        self.commit_exec(guest).await
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    async fn handle_rdtsc_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        request: Rdtsc,
+    ) -> Result<RdtscResult, Errno> {
+        self.note_event(guest);
+        self.record_rdtsc(guest, request).await
+    }
+}
+
+impl Recorder {
+    /// Records one syscall (`Tool::handle_syscall_event`): its record, then
+    /// its handler, which writes its events when the call returns.
+    async fn record_syscall<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Syscall,
@@ -794,8 +1010,9 @@ impl Tool for Recorder {
         }?)
     }
 
+    /// Commits a successful exec's event (`Tool::handle_post_exec`).
     // TODO-HUMAN-REVIEW(#2370)
-    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+    async fn commit_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
         let result = match guest.thread_state_mut().pending_exec.take() {
             Some(PreparedExec::Ready(event)) => {
                 self.record_event(guest, Ok(SyscallEvent::Exec(event)));
@@ -820,8 +1037,9 @@ impl Tool for Recorder {
         result
     }
 
+    /// Records an rdtsc (`Tool::handle_rdtsc_event`).
     #[cfg(target_arch = "x86_64")]
-    async fn handle_rdtsc_event<G: Guest<Self>>(
+    async fn record_rdtsc<G: Guest<Self>>(
         &self,
         guest: &mut G,
         request: Rdtsc,
@@ -1636,6 +1854,129 @@ mod finish_tests {
         }
     }
 
+    /// The status masks of a thread that catches `caught` and ignores
+    /// `ignored`, as `/proc/<tid>/status` lists them.
+    fn status(caught: &[i32], ignored: &[i32]) -> String {
+        let mask = |signals: &[i32]| {
+            signals
+                .iter()
+                .fold(0u64, |mask, signal| mask | 1 << (signal - 1))
+        };
+        format!(
+            "Name:\tguest\nSigBlk:\t0000000000000000\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n",
+            mask(ignored),
+            mask(caught)
+        )
+    }
+
+    /// A signal's delivery ends the thread's group next only when it is
+    /// neither caught nor ignored and its default action terminates.
+    #[test]
+    fn only_an_uncaught_terminating_signal_ends_the_group_by_default() {
+        assert_eq!(
+            ends_by_default(libc::SIGSEGV, &status(&[], &[])),
+            Some(true)
+        );
+        assert_eq!(
+            ends_by_default(libc::SIGRTMIN() + 1, &status(&[], &[])),
+            Some(true)
+        );
+        assert_eq!(
+            ends_by_default(libc::SIGSYS, &status(&[libc::SIGSYS], &[])),
+            Some(false)
+        );
+        assert_eq!(
+            ends_by_default(libc::SIGTERM, &status(&[], &[libc::SIGTERM])),
+            Some(false)
+        );
+        assert_eq!(
+            ends_by_default(libc::SIGCHLD, &status(&[], &[])),
+            Some(false)
+        );
+        assert_eq!(
+            ends_by_default(libc::SIGTSTP, &status(&[], &[])),
+            Some(false)
+        );
+        assert_eq!(ends_by_default(libc::SIGSEGV, "Name:\tguest\n"), None);
+    }
+
+    /// An exit status is an orderly exit. A signal is how a thread ended
+    /// only when its fatal delivery was the last thing the recorder saw of
+    /// the thread, or, for a thread its group exit ended, of exactly one other
+    /// thread; the record names the thread it was delivered to.
+    #[test]
+    fn a_thread_whose_last_sight_was_a_fatal_delivery_has_an_ending() {
+        let (faulted, waiter) = (7, 8);
+        let stream = EventStreamId::root();
+        let delivery = |signal| FatalDelivery {
+            signal,
+            code: Some(1),
+            stream: stream.clone(),
+        };
+        let mut deliveries = FatalDeliveries::default();
+        assert_eq!(
+            deliveries.ending(waiter, ExitStatus::Exited(3)),
+            Some(ThreadEnding::Exited(3))
+        );
+        let segv = ExitStatus::Signaled(reverie::Signal::SIGSEGV, true);
+        assert_eq!(deliveries.ending(waiter, segv), None);
+        deliveries.delivered(faulted, Some(delivery(libc::SIGSEGV)));
+        let ending = Some(ThreadEnding::Signaled {
+            signal: libc::SIGSEGV,
+            code: Some(1),
+            delivered_to: stream.clone(),
+        });
+        assert_eq!(deliveries.ending(waiter, segv), ending);
+        assert_eq!(deliveries.ending(faulted, segv), ending);
+        // SIGKILL takes no delivery stop: a death by it is not this one.
+        let kill = ExitStatus::Signaled(reverie::Signal::SIGKILL, false);
+        assert_eq!(deliveries.ending(faulted, kill), None);
+        assert_eq!(deliveries.ending(waiter, kill), None);
+    }
+
+    /// A SIGSYS the guest handled, then a death by SIGSYS that took no
+    /// delivery stop (a seccomp kill's forced, SA_IMMUTABLE SIGSYS): the
+    /// handled delivery was never a fatal one, so neither the killed thread
+    /// nor its waiters get an ending, and replay refuses rather than parks.
+    #[test]
+    fn a_handled_sigsys_then_a_death_with_no_stop_has_no_ending() {
+        let (killed, waiter) = (7, 8);
+        let handled = ends_by_default(libc::SIGSYS, &status(&[libc::SIGSYS], &[])) == Some(true);
+        let mut deliveries = FatalDeliveries::default();
+        deliveries.delivered(
+            killed,
+            handled.then(|| FatalDelivery {
+                signal: libc::SIGSYS,
+                code: None,
+                stream: EventStreamId::root(),
+            }),
+        );
+        let sys = ExitStatus::Signaled(reverie::Signal::SIGSYS, true);
+        assert_eq!(deliveries.ending(killed, sys), None);
+        assert_eq!(deliveries.ending(waiter, sys), None);
+    }
+
+    /// A fatal delivery the thread outlived, its handler having run and the
+    /// thread gone on to a later event, is forgotten: a later death of that
+    /// thread, or of its group, by the same signal, has no ending.
+    #[test]
+    fn a_delivery_a_later_event_followed_is_no_evidence_of_a_death() {
+        let (thread, waiter) = (7, 8);
+        let mut deliveries = FatalDeliveries::default();
+        deliveries.delivered(
+            thread,
+            Some(FatalDelivery {
+                signal: libc::SIGTERM,
+                code: Some(0),
+                stream: EventStreamId::root(),
+            }),
+        );
+        deliveries.event(thread);
+        let term = ExitStatus::Signaled(reverie::Signal::SIGTERM, false);
+        assert_eq!(deliveries.ending(thread, term), None);
+        assert_eq!(deliveries.ending(waiter, term), None);
+    }
+
     /// A thread whose streams cannot be written out in full when it exits
     /// leaves its recording marked as one replay must refuse, with the reason.
     /// Its writer is on `/dev/full`, whose every write fails with ENOSPC, as a
@@ -1648,8 +1989,11 @@ mod finish_tests {
                 .open("/dev/full")
                 .unwrap()
         };
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data.path().join("thread")).unwrap();
         let mut state = RecorderThreadState {
-            events: EventWriter::for_test(full(), full()),
+            events: EventWriter::for_test(full(), full())
+                .with_terminal_record(data.path(), &EventStreamId::root().child(3)),
             stream_id: EventStreamId::root().child(3),
             child_stream_ids: ChildEventStreamIds::default(),
             pending_exec: None,
@@ -1657,6 +2001,7 @@ mod finish_tests {
             outputs: ContainerOutputs::default(),
             output_descriptions: Default::default(),
             interrupted_poll: None,
+            fatal_pending: false,
         };
         state
             .push_event(Event {
@@ -1680,6 +2025,13 @@ mod finish_tests {
                 "thread stream {stream} could not be written in full"
             )) && refusal.contains("No space left on device"),
             "{refusal}"
+        );
+        // Nor does the thread get a terminal record, though it exited in
+        // order, so replay parks none of its calls.
+        let end = stream.file_path(data.path(), ".end");
+        assert!(
+            !end.exists(),
+            "a terminal record was written after a failed write"
         );
     }
 }

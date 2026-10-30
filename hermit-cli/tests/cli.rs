@@ -39572,7 +39572,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x196, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x197, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
@@ -56147,21 +56147,34 @@ fn a_recording_cut_between_calls_is_refused_rather_than_parked() {
     );
 }
 
-/// A recording whose only thread was killed from outside the guest, inside a
-/// call it ran in its own turn, is refused at once rather than parked: a
-/// parked turn holder would stop the replay for good. `exit_with_waiter busy`
-/// rewrites a file in a loop of logged calls; the test kills the guest with
-/// SIGKILL from outside while `record start` records it, which still commits
-/// the recording, and `replay --autopilot` must then fail with the event
-/// stream error.
-#[test]
-fn a_recording_killed_from_outside_is_refused_rather_than_parked() {
-    let _lock = hermit_run_guard();
+/// Runs `replay --autopilot` of recording `id` in `data_dir`, with a timeout
+/// of `seconds`, and returns its stderr, which must say it refused: neither
+/// a replay that waited out the timeout nor one that succeeded passes.
+fn refused_replay(data_dir: &Path, id: &str, seconds: u32) -> String {
+    let data_dir_arg = format!("--data-dir={}", data_dir.display());
+    let args = ["replay", "--autopilot", &data_dir_arg, id];
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", &format!("{seconds}s")])
+        .arg(env!("CARGO_BIN_EXE_hermit"));
+    append_hermit_args(&mut command, &args);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_ne!(output.status.code(), Some(124), "{args:?} hung:\n{stderr}");
+    assert!(!output.status.success(), "{args:?} replayed:\n{stderr}");
+    stderr
+}
+
+/// Records `exit_with_waiter MODE FILE` with `record start`, waits until the
+/// guest has written FILE, kills the guest with SIGKILL from outside, and
+/// returns the data directory and the recording's id: `record start` still
+/// commits the recording.
+fn record_exit_with_waiter_killed_from_outside(mode: &str) -> (tempfile::TempDir, String) {
     let guest = compiled_c_guest(&EXIT_WITH_WAITER_GUEST, "exit_with_waiter");
     let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create the recording data dir");
     let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
-    let busy_file = data_dir.path().join("busy.bin");
+    let ready_file = data_dir.path().join("ready.bin");
     let args = [
         "record",
         "start",
@@ -56170,8 +56183,8 @@ fn a_recording_killed_from_outside_is_refused_rather_than_parked() {
         &data_dir_arg,
         "--",
         guest.to_str().unwrap(),
-        "busy",
-        busy_file.to_str().unwrap(),
+        mode,
+        ready_file.to_str().unwrap(),
     ];
     let mut record = hermit_command(&args)
         .stdout(Stdio::null())
@@ -56193,9 +56206,9 @@ fn a_recording_killed_from_outside_is_refused_rather_than_parked() {
         if std::time::Instant::now() >= deadline {
             let _ = record.kill();
             let _ = record.wait();
-            panic!("the guest never started rewriting its file");
+            panic!("the guest never wrote {}", ready_file.display());
         }
-        if std::fs::metadata(&busy_file).is_ok_and(|meta| meta.len() > 0) {
+        if std::fs::metadata(&ready_file).is_ok_and(|meta| meta.len() > 0) {
             std::thread::sleep(std::time::Duration::from_millis(300));
             let found = std::fs::read_dir("/proc").unwrap().find_map(|entry| {
                 let pid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
@@ -56223,26 +56236,225 @@ fn a_recording_killed_from_outside_is_refused_rather_than_parked() {
     let id = std::fs::read_dir(data_dir.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .find(|name| !["last", "last-run", "tmp", "busy.bin"].contains(&name.as_str()))
+        .find(|name| !["last", "last-run", "tmp", "ready.bin"].contains(&name.as_str()))
         .expect("record start committed no recording");
+    (data_dir, id)
+}
 
-    let args = ["replay", "--autopilot", &data_dir_arg, &id];
-    let mut command = Command::new("timeout");
-    command
-        .args(["--kill-after", "10s", "120s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"));
-    append_hermit_args(&mut command, &args);
-    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_ne!(output.status.code(), Some(124), "{args:?} hung:\n{stderr}");
-    assert!(
-        !output.status.success(),
-        "{args:?} replayed a killed recording"
-    );
-    // Refused by the scheduler: the thread held its turn.
+/// A recording whose only thread was killed from outside the guest, inside a
+/// call it ran in its own turn, is refused at once rather than parked: a
+/// parked turn holder would stop the replay for good. `exit_with_waiter busy`
+/// rewrites a file in a loop of logged calls; the test kills the guest with
+/// SIGKILL from outside while `record start` records it, which still commits
+/// the recording. The signal ended the thread, so its stream has no terminal
+/// record, and `replay --autopilot` must fail with the event stream error
+/// naming that.
+#[test]
+fn a_recording_killed_from_outside_is_refused_rather_than_parked() {
+    let _lock = hermit_run_guard();
+    let (data_dir, id) = record_exit_with_waiter_killed_from_outside("busy");
+    let stderr = refused_replay(data_dir.path(), &id, 120);
     assert!(
         stderr.contains("Replay event stream ended unexpectedly")
-            && stderr.contains("holds its turn"),
-        "{args:?}:\n{stderr}"
+            && stderr.contains("has no terminal record"),
+        "{stderr}"
+    );
+}
+
+/// A recording cut short while every live thread waited in a call that never
+/// returned is refused, not parked: parking them all would leave the replay
+/// waiting for an exit the recording does not hold. `exit_with_waiter both`
+/// has main and its waiter thread block in polls on an empty pipe; the test
+/// kills the guest from outside once both wait. Neither thread exited in
+/// order, so neither stream has a terminal record, and `replay --autopilot`
+/// must refuse at once rather than wait out its timeout.
+#[test]
+fn a_recording_killed_while_every_thread_waits_is_refused_rather_than_parked() {
+    let _lock = hermit_run_guard();
+    let (data_dir, id) = record_exit_with_waiter_killed_from_outside("both");
+    let stderr = refused_replay(data_dir.path(), &id, 30);
+    assert!(
+        stderr.contains("Replay event stream ended unexpectedly")
+            && stderr.contains("has no terminal record"),
+        "{stderr}"
+    );
+}
+
+/// A recording of a crash while a worker waits in poll replays to the same
+/// death. `exit_with_waiter segv` and `abort` start the poll waiter, then main
+/// stores to address 0 (SIGSEGV) or calls abort(3) (SIGABRT): Linux ends the
+/// waiter inside its poll with that signal. The recorder saw the signal
+/// delivered to main, so both streams get terminal records naming it, the
+/// waiter's with its poll in flight and main's as the thread it was delivered
+/// to. Replay parks the waiter on its record, replays main into the same
+/// crash, and ends, as `record start` did, with the guest's signal and line.
+#[test]
+fn a_recording_of_a_crash_while_a_thread_waits_replays_to_the_same_death() {
+    use std::os::unix::process::ExitStatusExt;
+
+    use hermit_record_format::event_stream::EventReader;
+    use hermit_record_format::event_stream::EventStreamId;
+    use hermit_record_format::event_stream::ThreadEnding;
+
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&EXIT_WITH_WAITER_GUEST, "exit_with_waiter");
+    for (mode, signal) in [("segv", libc::SIGSEGV), ("abort", libc::SIGABRT)] {
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the recording data dir");
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let printed = format!("{mode}: crashing with a thread still waiting\n");
+        let args = [
+            "record",
+            "start",
+            "--record-timeout",
+            "120",
+            &data_dir_arg,
+            "--",
+            guest.to_str().unwrap(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.signal(),
+            Some(signal),
+            "{args:?} ended with {}:\n{log}",
+            output.status
+        );
+        assert_eq!(stdout(&output), printed, "{args:?}:\n{log}");
+        let id = std::fs::read_dir(data_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .find(|name| !["last", "last-run", "tmp"].contains(&name.as_str()))
+            .expect("record start wrote no recording");
+        let recording = data_dir.path().join(&id);
+        // The waiter is the root thread's first child.
+        let mut reader = EventReader::open(&recording, &EventStreamId::root().child(0)).unwrap();
+        while reader.next_debug_event_or_end().unwrap().is_some() {}
+        while reader.next_event_or_end().unwrap().is_some() {}
+        let end = reader
+            .check_unreturned_call(true)
+            .expect("the waiter's terminal record does not name its poll");
+        assert!(
+            matches!(
+                end.ending,
+                ThreadEnding::Signaled { signal: named, ref delivered_to, .. }
+                    if named == signal && *delivered_to == EventStreamId::root()
+            ),
+            "{mode}: {end:?}"
+        );
+
+        let args = ["replay", "--autopilot", &data_dir_arg, &id];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.signal(),
+            Some(signal),
+            "{args:?} ended with {}:\n{log}",
+            output.status
+        );
+        assert_eq!(stdout(&output), printed, "{args:?}:\n{log}");
+    }
+}
+
+/// The recording of a thread that exited inside a call is parked only on its
+/// terminal record. `exit_with_waiter poll`'s waiter thread is parked in
+/// replay as in `a_recording_that_ends_inside_a_blocked_call_replays`; here
+/// its recording is refused without the terminal records, which a thread a
+/// signal ended or a recording whose last write failed lacks, and then with
+/// the waiter's syscall stream cut at its last record boundary, which the
+/// terminal record still counts: both look like a thread that died inside a
+/// call, and neither shows it.
+#[test]
+fn a_parked_recording_without_its_terminal_evidence_is_refused() {
+    use hermit_record_format::event_stream::EventReader;
+    use hermit_record_format::event_stream::EventStreamId;
+    use hermit_record_format::event_stream::EventWriter;
+
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&EXIT_WITH_WAITER_GUEST, "exit_with_waiter");
+    let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the recording data dir");
+    let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+    let args = [
+        "record",
+        "start",
+        "--record-timeout",
+        "120",
+        &data_dir_arg,
+        "--",
+        guest.to_str().unwrap(),
+        "poll",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let id = std::fs::read_dir(data_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| !["last", "last-run", "tmp"].contains(&name.as_str()))
+        .expect("record start wrote no recording");
+    let recording = data_dir.path().join(&id);
+    // The waiter is the root thread's first child.
+    let waiter = EventStreamId::root().child(0);
+    assert!(
+        waiter.file_path(&recording, ".end").exists(),
+        "the waiter exited in order but has no terminal record"
+    );
+
+    // Without the terminal records.
+    let ends: Vec<PathBuf> = std::fs::read_dir(recording.join("thread"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "end"))
+        .collect();
+    for end in &ends {
+        std::fs::rename(end, end.with_extension("end-saved")).unwrap();
+    }
+    let stderr = refused_replay(data_dir.path(), &id, 120);
+    assert!(
+        stderr.contains("Replay event stream ended unexpectedly")
+            && stderr.contains("has no terminal record"),
+        "{stderr}"
+    );
+    for end in &ends {
+        std::fs::rename(end.with_extension("end-saved"), end).unwrap();
+    }
+
+    // The waiter's syscall stream cut at its last record boundary: the
+    // header's length from a fresh writer, then each record's.
+    let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    drop(EventWriter::create(scratch.path(), &waiter).unwrap());
+    let mut boundary = std::fs::metadata(waiter.file_path(scratch.path(), ".debug"))
+        .unwrap()
+        .len();
+    let mut boundaries = vec![boundary];
+    let mut reader = EventReader::open(&recording, &waiter).unwrap();
+    while let Some(record) = reader.next_debug_event_or_end().unwrap() {
+        boundary += bincode::serde::encode_to_vec(&record, bincode::config::legacy())
+            .unwrap()
+            .len() as u64;
+        boundaries.push(boundary);
+    }
+    while reader.next_event_or_end().unwrap().is_some() {}
+    // The intact recording names the waiter's poll, its last record, as the
+    // call it exited in.
+    let end = reader
+        .check_unreturned_call(true)
+        .expect("the waiter's terminal record does not name its poll");
+    assert_eq!(end.call_in_flight, Some(end.syscalls));
+    let syscalls = waiter.file_path(&recording, ".debug");
+    assert_eq!(std::fs::metadata(&syscalls).unwrap().len(), boundary);
+    assert!(boundaries.len() > 1, "the waiter has no syscall record");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&syscalls)
+        .unwrap()
+        .set_len(boundaries[boundaries.len() - 2])
+        .unwrap();
+    let stderr = refused_replay(data_dir.path(), &id, 120);
+    assert!(
+        stderr.contains("Replay event stream ended unexpectedly")
+            && stderr.contains("was cut short"),
+        "{stderr}"
     );
 }

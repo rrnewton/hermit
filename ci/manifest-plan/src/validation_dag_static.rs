@@ -1220,7 +1220,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // And event_stream::tests::a_stream_cut_at_an_event_boundary_ends_cleanly: 1930.
-    ("test.regular_crates", 1930),
+    // And the two terminal-record units, a_terminal_record_names_the_call_a_thread_exited_in
+    // and a_stream_that_cannot_be_written_in_full_gets_no_terminal_record: 1932.
+    // And four recorder::finish_tests units of how a thread ended (ends_by_default, an ending
+    // from a last fatal delivery, a handled SIGSYS then a stop-less death, a later event): 1936.
+    ("test.regular_crates", 1936),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4480,7 +4484,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_recording_that_ends_inside_a_blocked_call_replays: 743.
     // And a_recording_cut_between_calls_is_refused_rather_than_parked: 744.
     // And a_recording_killed_from_outside_is_refused_rather_than_parked: 745.
-    ("test.cli", 745),
+    // And a_recording_killed_while_every_thread_waits_is_refused_rather_than_parked
+    // and a_parked_recording_without_its_terminal_evidence_is_refused: 747.
+    // And a_recording_of_a_crash_while_a_thread_waits_replays_to_the_same_death: 748.
+    ("test.cli", 748),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5051,7 +5058,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_recording_that_ends_inside_a_blocked_call_replays: 662.
     // And a_recording_cut_between_calls_is_refused_rather_than_parked: 663.
     // And a_recording_killed_from_outside_is_refused_rather_than_parked: 664.
-    ("test.cli_on_host", 664),
+    // And the same two terminal-record cli cases: 666.
+    // And the same crash-recording cli case: 667.
+    ("test.cli_on_host", 667),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6168,7 +6177,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // And event_stream::tests::a_stream_cut_at_an_event_boundary_ends_cleanly: 1916.
-    ("test.regular_crates_on_host", 1916),
+    // And the same two terminal-record units: 1918.
+    // And the same four recorder ending units: 1922.
+    ("test.regular_crates_on_host", 1922),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
