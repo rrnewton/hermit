@@ -55942,6 +55942,7 @@ fn run_refuses_incomplete_replay_before_guest_execution() {
 
     for flag in ["--replay-preemptions-from", "--replay-schedule-from"] {
         let refused = run(&[format!("{flag}={}", marked.display())]);
+        // EXIT-CLASS: hermit (the incomplete-record refusal's own exit status)
         assert_eq!(refused.status.code(), Some(122), "{}", stderr(&refused));
         assert!(
             refused.stdout.is_empty(),
@@ -55963,6 +55964,7 @@ fn run_refuses_incomplete_replay_before_guest_execution() {
             ];
             flags.extend(verification);
             let refused = run(&flags);
+            // EXIT-CLASS: hermit (the exploration-only refusal's own exit status)
             assert_eq!(refused.status.code(), Some(122), "{}", stderr(&refused));
             assert!(
                 refused.stdout.is_empty(),
