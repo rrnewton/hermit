@@ -1220,7 +1220,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // And detcore-model host_input::tests::stdio_kinds_name_each_changed_descriptor: 1930.
-    ("test.regular_crates", 1930),
+    // And host_input::tests::terminal_devices_follow_the_kernels_driver_list: 1931.
+    ("test.regular_crates", 1931),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4477,7 +4478,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
     // And a_schedule_replay_names_a_stdio_kind_changed_since_the_recording: 743.
     // And a_verify_run_records_the_stdio_kinds_its_guest_was_given: 744.
-    ("test.cli", 744),
+    // And a_library_run_records_the_stdio_kinds_of_its_commands_descriptors: 745.
+    ("test.cli", 745),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5047,7 +5049,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4912 cases: 659 + 2 = 661.
     // And the same stdio-kind replay test: 662.
     // And the same captured-run stdio-kind test: 663.
-    ("test.cli_on_host", 663),
+    // And the same library-run stdio-kind test: 664.
+    ("test.cli_on_host", 664),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6163,7 +6166,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // And the same detcore-model stdio unit: 1916.
-    ("test.regular_crates_on_host", 1916),
+    // And the same terminal-device unit: 1917.
+    ("test.regular_crates_on_host", 1917),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
