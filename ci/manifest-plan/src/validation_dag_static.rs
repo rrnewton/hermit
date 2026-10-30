@@ -1892,7 +1892,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4679 adds eight hermit-run units: 1264 + 8 = 1272, re-measured at this integration head.
     // PR 4865 adds one hermit-run unit: 1272 + 1 = 1273, re-measured at this integration head.
     // PR 4607 adds two hermit-run units: 1273 + 2 = 1275, re-measured at this integration head.
-    ("test.hermit_unit", 1275),
+    // The loader-cache provenance fix adds two hermit-run units: 1275 + 2 = 1277, re-measured at this integration head.
+    ("test.hermit_unit", 1277),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3134,7 +3135,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4679 adds three detcore units: 2950 + 3 = 2953, re-measured at this integration head.
     // PR 4861 adds two detcore units: 2953 + 2 = 2955, re-measured at this integration head.
     // PR 4862 adds three detcore units: 2955 + 3 = 2958, re-measured at this integration head.
-    ("test.detcore_unit", 2958),
+    // The loader-cache provenance fix adds one detcore unit: 2958 + 1 = 2959, re-measured at this integration head.
+    ("test.detcore_unit", 2959),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5499,7 +5501,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three PR 4679 units: 2950 + 3 = 2953.
     // The same two PR 4861 units: 2953 + 2 = 2955.
     // The same three PR 4862 units: 2955 + 3 = 2958.
-    ("test.detcore_unit_on_host", 2958),
+    // The same loader-cache provenance unit: 2958 + 1 = 2959.
+    ("test.detcore_unit_on_host", 2959),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5884,7 +5887,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same eight PR 4679 units: 1258 + 8 = 1266.
     // The same one PR 4865 unit: 1266 + 1 = 1267.
     // The same two PR 4607 units: 1267 + 2 = 1269.
-    ("test.hermit_unit_on_host", 1269),
+    // The same two loader-cache provenance units: 1269 + 2 = 1271.
+    ("test.hermit_unit_on_host", 1271),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
