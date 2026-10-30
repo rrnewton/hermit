@@ -50,15 +50,20 @@
 //! left alone. A read that took bytes copied the events it dequeued up to
 //! the first byte the guest cannot write, which depends only on the guest's
 //! page protections ([`copied_before_fault`], which reads and writes back no
-//! byte past those the read took). The events there are walked by their
-//! lengths, never by what a cookie holds ([`faulted_events`]), and they must
-//! account for the bytes the read took ([`FaultedEvents::account_for`]). The
-//! cookies Linux wrote whole are renumbered, and a rename cookie the fault cut
-//! short, of which Linux wrote only some bytes, is written as zeros (any other
-//! event's cookie is 0, so its bytes are left). Beyond the count a `readv`
-//! returned, the bytes it took are the events it copied into the next iovec
-//! before a fault there, renumbered the same way; none means that iovec was
-//! left untouched, even where it overlaps the filled ones.
+//! byte past those the read took). A page Hermit cannot read is taken for
+//! that end too, though it may be one the guest can write (a write-only
+//! page, which the in-process backends cannot read,
+//! <https://github.com/rrnewton/hermit/issues/4530>). Either way the events
+//! there are walked by their lengths, never by what a cookie holds
+//! ([`faulted_events`]), and they must account for the bytes the read took
+//! ([`FaultedEvents::account_for`]), which they do exactly when Linux's copy
+//! ended there. The cookies Linux wrote whole are renumbered, and a rename
+//! cookie the fault cut short, of which Linux wrote only some bytes, is
+//! written as zeros (any other event's cookie is 0, so its bytes are left).
+//! Beyond the count a `readv` returned, the bytes it took are the events it
+//! copied into the next iovec before a fault there, renumbered the same way;
+//! none means that iovec was left untouched, even where it overlaps the
+//! filled ones.
 //!
 //! This rests on x86-64's `copy_to_user`, which stores every byte before the
 //! one that faults; `raw_copy_to_user` may store fewer
@@ -77,17 +82,20 @@
 //!   renumbering reads back.
 //! - A read that faults where Hermit cannot tell where the copy ended
 //!   (warned):
-//!   - the address space has ever allocated or applied a protection key
-//!     (`pkey_alloc`, `pkey_mprotect`): Hermit's copies do not check
-//!     protection keys, so a page they can write may be one the guest
-//!     cannot, and nothing is probed;
-//!   - Hermit cannot read a page within the bytes the read took: the
-//!     in-process backends cannot read an inaccessible or write-only page
-//!     (<https://github.com/rrnewton/hermit/issues/4530>), and a write-only
-//!     page is one the guest can write;
-//!   - a write-back ends short of a page, Hermit finds no page the guest
-//!     cannot write within those bytes, or the events found do not account
-//!     for them.
+//!   - the address space has allocated a protection key (a `pkey_alloc`
+//!     that returned one) or may have applied one (a `pkey_mprotect` with a
+//!     key other than -1, which is plain `mprotect`, that the backend ran,
+//!     failed or not, since a call that fails part way can have changed some
+//!     pages; a backend without protection keys answers ENOSYS and runs
+//!     nothing): Hermit's copies do not check protection keys, so a page
+//!     they can write may be one the guest cannot, and nothing is probed;
+//!   - the events before the first page Hermit cannot read do not account
+//!     for the bytes the read took, because Linux copied past that page: a
+//!     write-only page, which the guest can write but the in-process
+//!     backends cannot read (<https://github.com/rrnewton/hermit/issues/4530>);
+//!   - a write-back ends short of a page, Hermit finds no page it cannot
+//!     read or the guest cannot write within those bytes, or the events
+//!     found do not account for them.
 //! - A `readv` or `preadv2` whose count ends at the start of a later iovec,
 //!   where the queue's count is not known (warned). Linux may have copied
 //!   events into that iovec before a fault there
@@ -310,17 +318,13 @@ enum Unsettled {
     /// Hermit's copies do not check, so a page they can write may be one the
     /// guest cannot (`MemoryMetadata::protection_keys`).
     ProtectionKeys,
-    /// Hermit cannot read a page within the bytes the read took: a
-    /// write-only page on the in-process backends
-    /// (<https://github.com/rrnewton/hermit/issues/4530>) is one the guest can
-    /// write, so it may not be where Linux stopped.
-    Unreadable,
     /// A write-back ended short of a page or failed other than with EFAULT.
     WriteBack,
-    /// The buffer runs past the end of the address space.
+    /// The buffer starts at address 0 or runs past the end of the address
+    /// space.
     OutOfRange,
-    /// Every page within the bytes the read took is one the guest can write,
-    /// as far as Hermit's copies see.
+    /// Every page within the bytes the read took is one Hermit can read and
+    /// the guest can write, as far as Hermit's copies see.
     NoUnwritablePage,
 }
 
@@ -330,9 +334,10 @@ impl std::fmt::Display for Unsettled {
             Unsettled::ProtectionKeys => {
                 "the address space has used protection keys, which Hermit's copies do not check"
             }
-            Unsettled::Unreadable => "Hermit cannot read a page within the bytes the read took",
             Unsettled::WriteBack => "Hermit's write-back of a page Linux wrote did not complete",
-            Unsettled::OutOfRange => "the buffer runs past the end of the address space",
+            Unsettled::OutOfRange => {
+                "the buffer starts at address 0 or runs past the end of the address space"
+            }
             Unsettled::NoUnwritablePage => {
                 "every page within the bytes the read took is one Hermit can write, so it \
                  cannot see what stopped Linux"
@@ -356,11 +361,14 @@ impl std::fmt::Display for Unsettled {
 /// bytes read, through a copy that respects the guest's page protection
 /// (`write_with_user_access`): the first page that copy refuses is where Linux
 /// stopped, and every page before it is one Linux wrote, so writing its bytes
-/// back changes nothing. A page Hermit cannot read settles nothing
-/// ([`Unsettled::Unreadable`]): ptrace reads any mapped page, but the
-/// in-process backends cannot read a write-only page, which the guest can
-/// write. The caller has ruled out protection keys, which the copy does not
-/// check ([`Unsettled::ProtectionKeys`]).
+/// back changes nothing. A page Hermit cannot read ends the bytes returned
+/// too, though the guest may be able to write it (a write-only page, which
+/// the in-process backends cannot read,
+/// <https://github.com/rrnewton/hermit/issues/4530>), and then Linux copied
+/// past it. The caller decides whether Linux's copy ended there: the events
+/// in the bytes returned account for the bytes the read took exactly when it
+/// did ([`FaultedEvents::account_for`]). The caller has ruled out protection
+/// keys, which the copy does not check ([`Unsettled::ProtectionKeys`]).
 fn copied_before_fault<M: MemoryAccess>(
     memory: &mut M,
     address: usize,
@@ -374,7 +382,7 @@ fn copied_before_fault<M: MemoryAccess>(
         let start = AddrMut::<u8>::from_raw(at).ok_or(Unsettled::OutOfRange)?;
         let mut bytes = vec![0u8; length];
         if crate::io_buffers::read_written(memory, start, &mut bytes).is_err() {
-            return Err(Unsettled::Unreadable);
+            return Ok(written);
         }
         match memory.write_with_user_access(start, &bytes) {
             Ok(copied) if copied == length => written.extend_from_slice(&bytes),
@@ -411,6 +419,19 @@ impl FaultedEvents {
     /// Linux wrote that event's length, the rest is exactly its size; where
     /// it did not, the rest is a size an event can have ([`MAX_EVENT`]) and
     /// more than the bytes of it written.
+    ///
+    /// Given that the `written` bytes are Linux's (every page they lie on
+    /// took its bytes back, so the guest can write it and Linux's copy passed
+    /// through it), this decides exactly whether Linux's copy ended where
+    /// they end, at the start of the first page Hermit cannot read or the
+    /// guest cannot write. Linux's copy faulted inside the last event it
+    /// dequeued, at the start of a page, and an event is at most
+    /// [`MAX_EVENT`] bytes, less than a page. Where these events account for
+    /// `taken`, the last event dequeued is the one cut where `written` ends,
+    /// so the fault lies less than [`MAX_EVENT`] bytes past that end, and the
+    /// only page start there is the end itself. Where Linux copied past it,
+    /// as through a write-only page Hermit cannot read, it dequeued events
+    /// past the next page start, and these events do not account for them.
     fn account_for(&self, written: usize, taken: usize) -> bool {
         let Some(rest) = taken.checked_sub(self.complete) else {
             return false;
@@ -1450,8 +1471,10 @@ mod tests {
 
     /// Linux's copy ends at the first page the guest cannot write, which the
     /// write-back refuses. Every page before it keeps exactly its bytes,
-    /// however large the buffer. An inaccessible page is found so only
-    /// where Hermit can read it, as ptrace's word reads can.
+    /// however large the buffer. An inaccessible page is found so where
+    /// Hermit can read it, as ptrace's word reads can; where it cannot, it
+    /// ends the bytes found as an unreadable page
+    /// (`an_unreadable_page_linux_stopped_at_ends_the_copy`).
     #[test]
     fn the_copy_ends_at_the_first_page_the_guest_cannot_write() {
         use Access::*;
@@ -1507,16 +1530,17 @@ mod tests {
         assert_eq!(memory.written, [(BASE + 100, 200)]);
     }
 
-    /// A page Hermit cannot read settles nothing. On an in-process backend a
-    /// write-only page cannot be read, though Linux writes it: 42 writable
-    /// bytes, a write-only page and an inaccessible one hold the 130 events
-    /// of 65 renames, and Linux copied 4,138 bytes of them and took all
-    /// 4,160. Taking the write-only page for the end would make the second
-    /// event's whole cookie a cut one. Through ptrace's word reads the
-    /// write-only page is read, and the copy ends at the inaccessible one, as
-    /// it did.
+    /// A page Hermit cannot read ends the bytes found, and the events there
+    /// must confirm it. On an in-process backend a write-only page cannot be
+    /// read, though Linux writes it: 42 writable bytes, a write-only page and
+    /// an inaccessible one hold the 130 events of 65 renames, and Linux
+    /// copied 4,138 bytes of them and took all 4,160. The 42 bytes before the
+    /// write-only page do not account for them, so the read is left as Linux
+    /// wrote it, and the rename the page boundary splits keeps one cookie in
+    /// both its events. Through ptrace's word reads the write-only page is
+    /// read, and the copy ends at the inaccessible one, as it did.
     #[test]
-    fn an_unreadable_page_leaves_the_end_unknown() {
+    fn a_page_linux_copied_past_does_not_end_the_copy() {
         use Access::*;
         let start = BASE + PAGE - 42;
         let mut records = Vec::new();
@@ -1535,14 +1559,16 @@ mod tests {
         let taken = records.len();
         assert_eq!(taken, 4160);
 
-        assert_eq!(
-            copied_before_fault(&mut in_process, start, taken),
-            Err(Unsettled::Unreadable)
-        );
+        let written = copied_before_fault(&mut in_process, start, taken).unwrap();
+        assert_eq!(written.len(), 42);
         assert_eq!(
             in_process.written,
             [(start, 42)],
             "only the bytes Linux wrote before the unreadable page are written back"
+        );
+        assert!(
+            !faulted_events(&written).account_for(written.len(), taken),
+            "Linux copied past the write-only page"
         );
 
         let written = copied_before_fault(&mut ptrace, start, taken).unwrap();
@@ -1554,14 +1580,39 @@ mod tests {
             events.whole.contains(&40),
             "the cookie the page boundary splits"
         );
+    }
 
-        // An inaccessible first page settles nothing on an in-process
-        // backend either.
+    /// A page Hermit cannot read where Linux's copy did stop: an
+    /// inaccessible page, which neither the in-process backends nor KVM can
+    /// read, after 40 writable bytes (issue 4793's reproducer) or 42 (the
+    /// second event's cookie cut), and an unmapped page, which ptrace's word
+    /// reads cannot reach either. The events before it account for the
+    /// bytes the read took, so the copy ends there, exactly as at a
+    /// read-only page. An inaccessible first page leaves nothing found.
+    #[test]
+    fn an_unreadable_page_linux_stopped_at_ends_the_copy() {
+        use Access::*;
+        let records = renames(191_669_668, 191_669_669);
+        for writable in [40, 42] {
+            let mut memory = Pages::new(&[ReadWrite, None]);
+            memory.bytes[PAGE - writable..PAGE].copy_from_slice(&records[..writable]);
+            let written = copied_before_fault(&mut memory, BASE + PAGE - writable, 64).unwrap();
+            assert_eq!(written, records[..writable]);
+            let events = faulted_events(&written);
+            assert_eq!(events.whole, [8]);
+            assert_eq!(events.cut, (writable == 42).then_some(40..42));
+            assert!(events.account_for(written.len(), 64));
+        }
+
+        let mut ptrace = Pages {
+            peeks: true,
+            ..Pages::new(&[ReadWrite])
+        };
+        let written = copied_before_fault(&mut ptrace, BASE + PAGE - 40, 64).unwrap();
+        assert_eq!(written.len(), 40);
+
         let mut memory = Pages::new(&[None]);
-        assert_eq!(
-            copied_before_fault(&mut memory, BASE, 64),
-            Err(Unsettled::Unreadable)
-        );
+        assert_eq!(copied_before_fault(&mut memory, BASE, 64), Ok(Vec::new()));
     }
 
     const BASE: usize = 0x10000;

@@ -3771,6 +3771,49 @@ fn failure_proves_outputs_unwritten(result: &Result<i64, Error>) -> bool {
     matches!(result, Err(Error::Errno(errno)) if *errno != Errno::EFAULT)
 }
 
+/// Whether `pkey_mprotect(start, len, prot, key)`, which returned `result`,
+/// may have applied a protection key to some pages
+/// (`MemoryMetadata::protection_keys`). It cannot have when:
+/// - `key` is -1: that is plain `mprotect` (`mprotect` is
+///   `do_mprotect_pkey(start, len, prot, -1)`, mm/mprotect.c), which applies
+///   no key;
+/// - it returned ENOSYS: it never ran (a backend without protection keys,
+///   KVM's LinuxEmu, answers every pkey_mprotect so);
+/// - `len` is 0: Linux returns 0 or EINVAL having changed nothing;
+/// - it failed, and its arguments are ones `do_mprotect_pkey` refuses before
+///   it takes the mmap lock, so before it changes any mapping: both
+///   `PROT_GROWSDOWN` and `PROT_GROWSUP`, a start that is not page-aligned
+///   (untagging an address changes only its high bits), or a `prot` bit other
+///   than `PROT_READ`, `PROT_WRITE`, `PROT_EXEC`, `PROT_SEM` and those two
+///   (x86-64 has the generic `arch_validate_prot`).
+///
+/// Any other call may have, failures included: one that fails part way
+/// (ENOMEM, EACCES, or EINVAL from a check of a later VMA) can have applied
+/// the key to the VMAs before, and Linux does not say which; nor can an
+/// EINVAL for a key never allocated, which Linux returns before it changes
+/// anything, be told from those by its result.
+fn pkey_mprotect_may_apply_a_key(
+    start: usize,
+    len: usize,
+    prot: usize,
+    key: usize,
+    result: &Result<i64, Error>,
+) -> bool {
+    /// `PROT_SEM` (include/uapi/asm-generic/mman-common.h).
+    const PROT_SEM: usize = 0x8;
+    /// x86-64's page size.
+    const PAGE: usize = 4096;
+    let grows = (libc::PROT_GROWSDOWN | libc::PROT_GROWSUP) as usize;
+    let known = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as usize | PROT_SEM | grows;
+    let refused_before_any_change =
+        (prot & grows) == grows || !start.is_multiple_of(PAGE) || (prot & !known) != 0;
+    let never_applied = key as i32 == -1
+        || len == 0
+        || matches!(result, Err(Error::Errno(Errno::ENOSYS)))
+        || (result.is_err() && refused_before_any_change);
+    !never_applied
+}
+
 /// The happens-before request a syscall entry makes once its result is
 /// decided, for the posthook anchors it reached at its prehook (`anchors`), or
 /// `None` (<https://github.com/rrnewton/hermit/issues/3929>):
@@ -7049,12 +7092,35 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             // An address space that allocates or applies a protection key may
             // hold pages its guest cannot write although Hermit's copies can
-            // (`MemoryMetadata::protection_keys`).
-            SyscallClassification::PassThrough
-                if matches!(call.number(), Sysno::pkey_alloc | Sysno::pkey_mprotect) =>
-            {
-                guest.thread_state().note_protection_keys();
-                self.passthrough(guest, call).await
+            // (`MemoryMetadata::protection_keys`). A key exists only once
+            // pkey_alloc returns one: a failed allocation (EINVAL, ENOSPC, or
+            // a backend without protection keys answering ENOSYS) allocates
+            // nothing, so it is not recorded.
+            SyscallClassification::PassThrough if call.number() == Sysno::pkey_alloc => {
+                let result = self.passthrough(guest, call).await;
+                if matches!(result, Ok(key) if key >= 0) {
+                    guest.thread_state().note_protection_keys();
+                }
+                result
+            }
+            // pkey_mprotect is recorded after it returns, unless it cannot
+            // have applied a key: key -1 (plain mprotect), ENOSYS (the backend
+            // ran nothing), no length, or a failure Linux returns before it
+            // changes any mapping. Every other outcome is recorded, failures
+            // included ([`pkey_mprotect_may_apply_a_key`]); a record is never
+            // cleared. Recording after the call is the same as before it for
+            // the reads that consult the record: they renumber only with
+            // sequentialized threads, so no other guest thread reads between
+            // the call and the record.
+            SyscallClassification::PassThrough if call.number() == Sysno::pkey_mprotect => {
+                let args = call.into_parts().1;
+                let result = self.passthrough(guest, call).await;
+                if pkey_mprotect_may_apply_a_key(
+                    args.arg0, args.arg1, args.arg2, args.arg3, &result,
+                ) {
+                    guest.thread_state().note_protection_keys();
+                }
+                result
             }
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
             // The kernel's restart of a wait Detcore emulates, or ran in the
@@ -7724,6 +7790,52 @@ mod subscription_tests {
                 "passthru_opt let {syscall} bypass Detcore's protection-key record"
             );
         }
+    }
+
+    /// A pkey_mprotect is recorded unless it cannot have applied a key: key
+    /// -1, which is plain mprotect, however the argument register holds it;
+    /// ENOSYS, which a backend without protection keys answers without
+    /// running the call; no length; and a failure whose arguments Linux
+    /// refuses before it changes any mapping (the ineffective controls).
+    /// Success, and every failure that can follow a partial change, are
+    /// recorded (the partially effective controls), as is a success reported
+    /// for arguments Linux refuses.
+    #[test]
+    fn only_a_pkey_mprotect_that_may_apply_a_key_is_recorded() {
+        let may_apply = pkey_mprotect_may_apply_a_key;
+        let start = 0x7000_0000_usize;
+        let rw = (libc::PROT_READ | libc::PROT_WRITE) as usize;
+        let enosys = Err(Error::Errno(Errno::ENOSYS));
+        let einval = Err(Error::Errno(Errno::EINVAL));
+        for minus_one in [u32::MAX as usize, usize::MAX] {
+            assert!(!may_apply(start, 4096, rw, minus_one, &Ok(0)));
+            assert!(!may_apply(start, 4096, rw, minus_one, &enosys));
+        }
+        assert!(!may_apply(start, 4096, rw, 5, &enosys));
+        assert!(!may_apply(start, 0, rw, 5, &Ok(0)), "no length");
+        assert!(
+            !may_apply(start + 1, 4096, rw, 5, &einval),
+            "an unaligned start"
+        );
+        let both_growths = (libc::PROT_GROWSDOWN | libc::PROT_GROWSUP) as usize;
+        assert!(!may_apply(start, 4096, rw | both_growths, 5, &einval));
+        assert!(
+            !may_apply(start, 4096, rw | 0x10, 5, &einval),
+            "an unknown prot bit"
+        );
+
+        assert!(may_apply(start, 4096, rw, 5, &Ok(0)));
+        assert!(
+            may_apply(start, 4096, rw | 0x8, 5, &Ok(0)),
+            "PROT_SEM is valid"
+        );
+        for errno in [Errno::EINVAL, Errno::ENOMEM, Errno::EACCES] {
+            assert!(may_apply(start, 2 * 4096, rw, 5, &Err(Error::Errno(errno))));
+        }
+        assert!(
+            may_apply(start + 1, 4096, rw, 5, &Ok(0)),
+            "a success is believed"
+        );
     }
 
     /// Io-buffer hashing can only hash a syscall Detcore is subscribed to.

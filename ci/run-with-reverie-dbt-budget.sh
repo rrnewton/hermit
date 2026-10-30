@@ -3101,7 +3101,15 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=7946bb3094fa2c554be08e13c20235f13a03e1d3
+# CARRY TO 5163c23cb1614e7fef75cf49eb0bad13a6f1e9ef (2026-10-30): from 7946bb3094fa2c554be08e13c20235f13a03e1d3.
+# Interval: this slice only: LinuxEmu's FIONREAD forwarding on inotify and its
+# faulting-iovec copy-back (5163c23c), on Reverie main 7946bb30. The
+# reverie-dbt tree is unchanged and the committed inventory stays 1043.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=5163c23cb1614e7fef75cf49eb0bad13a6f1e9ef
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

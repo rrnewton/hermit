@@ -1058,9 +1058,21 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/inotify_failed_protection_key.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace, SaBRe, DBT, KVM, LiteInst and in-guest-trap; ci=true)",
+      "why": "tests/c/inotify_failed_protection_key.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a protection-key allocation that fails (an unknown flag; a backend without protection keys refuses every call) allocates nothing, so a later inotify read that faults before a read-only page must still leave the event it copied with its rename's cookie, and the cookie values, which the guest prints, must repeat in every run: under Hermit, the run's small virtual cookies (https://github.com/rrnewton/hermit/issues/4793)"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/inotify_faults.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace, SaBRe, DBT, LiteInst and in-guest-trap; ci=true)",
-      "why": "tests/c/inotify_faults.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: the events a read or readv copies before it fails with EFAULT, with the buffer ending inside the next event's header, cookie or length, at a read-only page, or after more than 64 KiB of events, must carry the cookie another instance sees for their rename, as must the event a readv copies into a second iovec that faults and the events a readv returns before an overlapping second iovec that receives nothing, an IN_IGNORED event's cut zero cookie must stay zeros, a rename split by the page boundary before a write-only page must keep one cookie in both events, a read Linux refuses before reading the queue (a count past the address space, a second iovec outside it, an unreadable iovec array) must leave the buffer and the queue as they were, and the cookie values must repeat in every run (https://github.com/rrnewton/hermit/issues/4793)"
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace, SaBRe, DBT, KVM, LiteInst and in-guest-trap; ci=true)",
+      "why": "tests/c/inotify_faults.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: the events a read or readv copies before it fails with EFAULT, with the buffer ending inside the next event's header, cookie or length, at a read-only page, or after more than 64 KiB of events, must carry the cookie another instance sees for their rename, as must the event a readv copies into a second iovec that faults and the events a readv returns before an overlapping second iovec that receives nothing, an IN_IGNORED event's cut zero cookie must stay zeros, the event before a write-only page through which the copy runs must carry its rename's cookie, a read Linux refuses before reading the queue (a count past the address space, a second iovec outside it, an unreadable iovec array) must leave the buffer and the queue as they were, and the cookie values, which the guest prints, must repeat in every run: under Hermit, the run's small virtual cookies (https://github.com/rrnewton/hermit/issues/4793)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/inotify_guard_page_faults.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/inotify_guard_page_faults.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: the events a read or readv copies before it faults at a PROT_NONE guard page (40, 44 and 42 bytes into the events, and in a readv's second iovec), at an unmapped page, or after running through a write-only page, must carry the cookie another instance sees for their rename, the bytes of a rename cookie the fault cut must be zeros under Hermit, and the cookie values, which the guest prints, must repeat in every run: under Hermit, the run's small virtual cookies (https://github.com/rrnewton/hermit/issues/4793)"
     },
     {
       "disposition": "manifest-test",

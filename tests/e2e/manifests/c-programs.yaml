@@ -14040,6 +14040,80 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-failed-protection-key
+    description: Strict verification for tests/c/inotify_failed_protection_key.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_failed_protection_key.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        # KVM qualified 2026-10-30: 21 of 21 canonical strict verify pairs (bitwise parity,
+        # 158 INFO records each side); stdout identical to ptrace's.
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+          - kvm
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as for c-programs/inotify-watch (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/inotify-faults
     description: Strict verification for tests/c/inotify_faults.c
     lane: portable
@@ -14059,20 +14133,94 @@ test:
     modes:
       verify:
         ci: true
+        # KVM qualified 2026-10-30: 21 of 21 canonical strict verify pairs at the tree that
+        # enabled this cell (bitwise parity, 2477 INFO records each side); stdout and every
+        # syscall record identical to ptrace's. Required on KVM: its first faulting case is
+        # issue 4793's reproducer with the read-only tail (read(fd, page_end - 40, 64) after
+        # two renames), so a KVM fault path that leaves host cookies fails here, as Reverie
+        # 1a76af3a pinned without FIONREAD forwarding did (https://github.com/rrnewton/hermit/issues/4793).
         backends_enabled:
           - ptrace
           - sabre
           - dbt
+          - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          kvm: LinuxEmu renumbers rename cookies itself and puts back the old bytes of a cookie a fault cut short, even an IN_IGNORED event's zero cookie, which the guest checks; the Reverie slice that deletes LinuxEmu's copy (row 9 of section 3 of the LinuxEmu scope document) enables it (https://github.com/rrnewton/hermit/issues/4793)
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
           in-guest-trap:
             - --max-timeslice=disabled
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as for c-programs/inotify-watch (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-guard-page-faults
+    description: Strict verification for tests/c/inotify_guard_page_faults.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_guard_page_faults.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        # KVM qualified 2026-10-30: 21 of 21 canonical strict verify pairs (bitwise parity,
+        # 362 INFO records each side); stdout identical to ptrace's.
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          sabre: The tool reads guest memory with process_vm_readv, which refuses a write-only page the guest can write (https://github.com/rrnewton/hermit/issues/4530). In this guest's last case Linux copies on through such a page, so the events before it do not account for the bytes the read took, and Hermit leaves every byte of that read as Linux wrote it, host cookies included, which the guest prints
+          dbt: The tool reads guest memory with process_vm_readv, which refuses a write-only page the guest can write (https://github.com/rrnewton/hermit/issues/4530). In this guest's last case Linux copies on through such a page, so the events before it do not account for the bytes the read took, and Hermit leaves every byte of that read as Linux wrote it, host cookies included, which the guest prints
+          liteinst: The tool reads guest memory with process_vm_readv, which refuses a write-only page the guest can write (https://github.com/rrnewton/hermit/issues/4530). In this guest's last case Linux copies on through such a page, so the events before it do not account for the bytes the read took, and Hermit leaves every byte of that read as Linux wrote it, host cookies included, which the guest prints
+          in-guest-trap: The tool reads guest memory with process_vm_readv, which refuses a write-only page the guest can write (https://github.com/rrnewton/hermit/issues/4530). In this guest's last case Linux copies on through such a page, so the events before it do not account for the bytes the read took, and Hermit leaves every byte of that read as Linux wrote it, host cookies included, which the guest prints
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
