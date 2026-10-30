@@ -3140,7 +3140,7 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 93516abd82a52d903ab4422e3709316df1e7349a (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
+# CARRY TO 9c98f50f1d052cb75ae26d672c8275221a4aed34 (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
 # Interval: reverie train (1111, 1116, 1136, 1147, 1148, 1152, 1155,
 # 1160, 1161, 1162, 1178, 1179). The reverie-dbt tree is unchanged;
 # reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
@@ -3161,8 +3161,8 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 93516abd82a52d903ab4422e3709316df1e7349a ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 93516abd82a52d903ab4422e3709316df1e7349a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9c98f50f1d052cb75ae26d672c8275221a4aed34 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9c98f50f1d052cb75ae26d672c8275221a4aed34 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
