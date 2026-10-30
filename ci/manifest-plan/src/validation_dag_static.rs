@@ -1218,7 +1218,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest-plan cases: 1913 + 5 = 1918, re-measured at this integration head.
     // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
-    ("test.regular_crates", 1928),
+    // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
+    ("test.regular_crates", 1929),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1898,7 +1899,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738 adds two hermit-run units: 1277 + 2 = 1279, re-measured at this integration head.
     // PR 4896 adds two hermit-run units: 1279 + 2 = 1281, re-measured at this integration head.
     // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
-    ("test.hermit_unit", 1287),
+    // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
+    ("test.hermit_unit", 1288),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5910,7 +5912,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4738 units: 1271 + 2 = 1273.
     // The same two PR 4896 units: 1273 + 2 = 1275.
     // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
-    ("test.hermit_unit_on_host", 1281),
+    // The same detlog correction unit: 1281 + 1 = 1282.
+    ("test.hermit_unit_on_host", 1282),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6136,7 +6139,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // fourteen hosted exclusions present exactly once: 1918 - 14 = 1904.
     // PR 4738: the same nine added cases: 1927 - 14 = 1913.
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
-    ("test.regular_crates_on_host", 1914),
+    // Its detlog correction: the same one added case: 1929 - 14 = 1915.
+    ("test.regular_crates_on_host", 1915),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
