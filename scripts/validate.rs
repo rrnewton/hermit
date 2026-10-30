@@ -12923,7 +12923,34 @@ const EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS: [(&str, &[&str]); 2] = [
     ),
 ];
 
+// Retain the complete historical tables and validate every owner before
+// deriving the current core projection. Unknown ownership is a refusal.
+fn expected_shared_integration_consumers(
+    consumers: &[&str],
+    core_only: bool,
+) -> Result<Vec<String>, String> {
+    let declared: BTreeSet<String> = consumers.iter().map(|tag| (*tag).to_string()).collect();
+    let known = hermit_manifest_plan::dag_source_ownership::source_partition_tags(
+        &[], consumers, false,
+    );
+    if declared.len() != consumers.len() || known != declared {
+        return Err(format!(
+            "shared integration-test consumers have unknown or duplicate source owners: declared={consumers:?}, known={known:?}"
+        ));
+    }
+    Ok(consumers.iter()
+        .filter(|tag| !core_only || hermit_manifest_plan::dag_source_ownership::is_core(tag))
+        .map(|tag| (*tag).to_string()).collect())
+}
+
 fn assert_committed_shared_integration_test_consumers(steps: &[Step]) -> Result<(), String> {
+    assert_shared_integration_test_consumers_for_owners(steps, true)
+}
+
+fn assert_shared_integration_test_consumers_for_owners(
+    steps: &[Step],
+    core_only: bool,
+) -> Result<(), String> {
     let mut by_binary: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for step in steps {
         for binary in step.integration_test_binaries.iter().flatten() {
@@ -12935,19 +12962,16 @@ fn assert_committed_shared_integration_test_consumers(steps: &[Step]) -> Result<
         consumers.iter().any(|tag| tag.starts_with("privileged-"))
             && consumers.iter().any(|tag| !tag.starts_with("privileged-"))
     });
+    let expected = EXPECTED_SHARED_INTEGRATION_TESTS.iter()
+        .map(|(binary, consumers)| {
+            expected_shared_integration_consumers(consumers, core_only)
+                .map(|consumers| (*binary, consumers))
+        }).collect::<Result<Vec<_>, String>>()?;
     if by_binary.len() != EXPECTED_SHARED_INTEGRATION_TESTS.len()
-        || EXPECTED_SHARED_INTEGRATION_TESTS
-            .iter()
-            .any(|(binary, consumers)| {
-                let expected = consumers
-                    .iter()
-                    .map(|tag| (*tag).to_string())
-                    .collect::<Vec<_>>();
-                by_binary.get(binary) != Some(&expected)
-            })
+        || expected.iter().any(|(binary, consumers)| by_binary.get(binary) != Some(consumers))
     {
         return Err(format!(
-            "committed shared integration-test consumers changed: expected={EXPECTED_SHARED_INTEGRATION_TESTS:?}, actual={by_binary:?}"
+            "committed shared integration-test consumers changed: expected={expected:?}, actual={by_binary:?}"
         ));
     }
     Ok(())
@@ -12957,7 +12981,19 @@ fn assert_committed_shared_integration_test_serialization(
     steps: &[Step],
     caps: &BTreeMap<String, i64>,
 ) -> Result<(), String> {
-    assert_committed_shared_integration_test_consumers(steps)?;
+    assert_shared_integration_test_serialization_for_owners(steps, caps, true)
+}
+
+fn assert_shared_integration_test_serialization_for_owners(
+    steps: &[Step],
+    caps: &BTreeMap<String, i64>,
+    core_only: bool,
+) -> Result<(), String> {
+    if core_only {
+        assert_committed_shared_integration_test_consumers(steps)?;
+    } else {
+        assert_shared_integration_test_consumers_for_owners(steps, false)?;
+    }
     let resource_count = caps
         .keys()
         .chain(steps.iter().flat_map(|step| step.hint.resources.keys()))
@@ -12971,10 +13007,9 @@ fn assert_committed_shared_integration_test_serialization(
     }
     for (binary, consumers) in EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS {
         let resource = format!("integration_test_binaries.{binary}");
-        let mut expected: Vec<(String, i64)> = consumers
-            .iter()
-            .map(|tag| ((*tag).to_string(), 1))
-            .collect();
+        let mut expected: Vec<(String, i64)> =
+            expected_shared_integration_consumers(consumers, core_only)?
+                .into_iter().map(|tag| (tag, 1)).collect();
         expected.sort();
         let mut actual: Vec<(String, i64)> = steps
             .iter()
@@ -32976,7 +33011,7 @@ printf finalized >target/finalized
         let step = cfg
             .steps
             .iter()
-            .find(|step| step.tag() == "test.isolated_dbt_workdir")
+            .find(|step| step.tag() == "test.cli")
             .unwrap();
         assert_eq!(step.jobs_flag.as_deref(), Some(""));
         assert_eq!(step.jobs_env.as_deref(), Some("NEXTEST_TEST_THREADS"));
@@ -32989,7 +33024,7 @@ printf finalized >target/finalized
                 "-p",
                 "hermit-run",
                 "--features",
-                "third-party-backends",
+                "liteinst",
                 "--test",
                 "cli"
             ]
@@ -33983,8 +34018,56 @@ mod shared_consumer_tests {
     #[test]
     fn actual_shared_cli_population_requires_the_workdir_consumer_and_every_resource() {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
-        let full = dagrun::select_steps_by_labels(&cfg, &["full".into()]).unwrap();
+        let mut full = dagrun::select_steps_by_labels(&cfg, &["full".into()]).unwrap();
         assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
+            .unwrap();
+        assert_eq!(
+            expected_shared_integration_consumers(EXPECTED_SHARED_INTEGRATION_TESTS[0].1, true)
+                .unwrap(),
+            ["privileged-cpuid.cpu_profile_v3", "privileged-test.cli_kvm",
+             "privileged-test.pmu_cli_cases", "test.cli"].map(str::to_string)
+        );
+        assert_eq!(
+            expected_shared_integration_consumers(EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS[0].1, true)
+                .unwrap(),
+            ["privileged-cpuid.cpu_profile_v3", "test.cli"].map(str::to_string)
+        );
+        assert_eq!(
+            expected_shared_integration_consumers(EXPECTED_SHARED_INTEGRATION_TESTS[1].1, true)
+                .unwrap(),
+            ["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"].map(str::to_string)
+        );
+        assert!(expected_shared_integration_consumers(&["test.unknown_shared_consumer"], true).is_err());
+        assert!(expected_shared_integration_consumers(&["test.cli", "test.cli"], true).is_err());
+        assert_eq!(
+            hermit_manifest_plan::dag_source_ownership::source_partition_tags(
+                &[], &["test.isolated_dbt_workdir"], false,
+            ),
+            ["test.isolated_dbt_workdir".to_string()].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert!(!hermit_manifest_plan::dag_source_ownership::is_core("test.isolated_dbt_workdir"));
+        for tag in EXPECTED_SHARED_INTEGRATION_TESTS.iter().flat_map(|(_, tags)| *tags)
+            .filter(|tag| hermit_manifest_plan::dag_source_ownership::is_core(tag))
+        {
+            let mut missing = full.steps.clone();
+            missing.retain(|step| step.tag() != *tag);
+            assert!(assert_committed_shared_integration_test_consumers(&missing).is_err());
+        }
+        // Plant external metadata explicitly; this row is never executed and
+        // does not register a backend or stand in for a physical DBT workload.
+        let mut external = full.steps.iter().find(|step| step.tag() == "test.cli")
+            .unwrap().clone();
+        external.group = "test".into();
+        external.job = "isolated_dbt_workdir".into();
+        external.cmd = "false # metadata fixture; never executed".into();
+        external.integration_test_binaries = Some(vec!["cli".into()]);
+        external.hint.resources.clear();
+        external.hint.resources.insert("integration_test_binaries.cli".into(), 1);
+        full.steps.push(external);
+        assert!(assert_committed_shared_integration_test_serialization(
+            &full.steps, &full.resource_caps,
+        ).is_err());
+        assert_shared_integration_test_serialization_for_owners(&full.steps, &full.resource_caps, false)
             .unwrap();
         let isolated = full
             .steps
@@ -34009,7 +34092,7 @@ mod shared_consumer_tests {
             let mut missing = full.steps.clone();
             missing.retain(|step| step.tag() != tag);
             assert!(
-                assert_committed_shared_integration_test_consumers(&missing).is_err(),
+                assert_shared_integration_test_consumers_for_owners(&missing, false).is_err(),
                 "missing consumer {tag} accepted"
             );
         }
@@ -34017,7 +34100,7 @@ mod shared_consumer_tests {
         let mut unexpected = isolated.clone();
         unexpected.job = "unexpected_cli_consumer".into();
         extra.push(unexpected);
-        assert!(assert_committed_shared_integration_test_consumers(&extra).is_err());
+        assert!(assert_shared_integration_test_consumers_for_owners(&extra, false).is_err());
 
         // Keep exact cap/demand equality over the consumers, including the
         // newly enumerated workdir consumer. The verifying build node holds
@@ -34049,9 +34132,10 @@ mod shared_consumer_tests {
                         .resources
                         .insert(resource.into(), 1);
                     assert!(
-                        assert_committed_shared_integration_test_serialization(
+                        assert_shared_integration_test_serialization_for_owners(
                             &regained,
-                            &full.resource_caps
+                            &full.resource_caps,
+                            false,
                         )
                         .is_err(),
                         "{tag} holding {resource} again was accepted"
@@ -34067,9 +34151,10 @@ mod shared_consumer_tests {
                 .resources
                 .insert(resource.into(), 1);
             assert!(
-                assert_committed_shared_integration_test_serialization(
+                assert_shared_integration_test_serialization_for_owners(
                     &builder_holds,
-                    &full.resource_caps
+                    &full.resource_caps,
+                    false,
                 )
                 .is_err(),
                 "the verifying build node holding {resource} was accepted"
@@ -34084,9 +34169,10 @@ mod shared_consumer_tests {
                     .resources
                     .remove(resource);
                 assert!(
-                    assert_committed_shared_integration_test_serialization(
+                    assert_shared_integration_test_serialization_for_owners(
                         &missing,
-                        &full.resource_caps
+                        &full.resource_caps,
+                        false,
                     )
                     .is_err(),
                     "missing resource {resource} on {tag} accepted"
@@ -34095,11 +34181,11 @@ mod shared_consumer_tests {
             let mut caps = full.resource_caps.clone();
             caps.remove(resource);
             assert!(
-                assert_committed_shared_integration_test_serialization(&full.steps, &caps).is_err()
+                assert_shared_integration_test_serialization_for_owners(&full.steps, &caps, false).is_err()
             );
             caps.insert(resource.into(), 2);
             assert!(
-                assert_committed_shared_integration_test_serialization(&full.steps, &caps).is_err()
+                assert_shared_integration_test_serialization_for_owners(&full.steps, &caps, false).is_err()
             );
         }
     }
