@@ -1004,19 +1004,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         );
         let maximum_before = pid_max();
-        let mut attribution = self
-            .cfg
-            .sequentialize_threads
-            .then(|| {
-                AddedIdEvidence::capture(
-                    &guest.memory(),
-                    guest.tid().as_raw(),
-                    &call,
-                    &chosen,
-                    maximum_before,
-                )
-            })
-            .flatten();
+        // A filter can distinguish the staged struct pointer or injection
+        // instruction pointer even when every original field is preserved.
+        // Only a launch with no inherited filter, and no additional guest
+        // filter beyond Reverie's known Allow/Trace filter, can certify this
+        // errno. Counting arbitrary inherited filters is not equivalence.
+        let mut attribution = (self.cfg.sequentialize_threads
+            && self.cfg.inherited_seccomp == detcore_model::config::InheritedSeccomp::Disabled
+            && self.clone3_could_fare_otherwise(guest).is_none())
+        .then(|| {
+            AddedIdEvidence::capture(
+                &guest.memory(),
+                guest.tid().as_raw(),
+                &call,
+                &chosen,
+                maximum_before,
+            )
+        })
+        .flatten();
         if let Some(evidence) = &attribution
             && crate::tool_global::thread_id_refused(guest, DetTid::from_raw(evidence.id)).await
         {

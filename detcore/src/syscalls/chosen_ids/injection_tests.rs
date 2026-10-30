@@ -136,6 +136,7 @@ impl CloneGuest {
 
     fn enable_fresh_attempt(&mut self) {
         self.config.sequentialize_threads = true;
+        self.config.inherited_seccomp = detcore_model::config::InheritedSeccomp::Disabled;
         self.proof_context = true;
         self.thread = ThreadState::new(
             DetPid::from_raw(std::process::id() as i32),
@@ -446,6 +447,36 @@ async fn an_added_id_without_attribution_evidence_still_refuses_strict_runs() {
     assert_eq!(guest.attempts, [false]);
     assert!(guest.registry_queries.lock().unwrap().is_empty());
     assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+
+    // An inherited filter may return EINVAL only for the staged pointer or
+    // private injection IP. A filter count does not prove that errno also
+    // belongs to the original call, even with otherwise complete evidence.
+    use detcore_model::config::InheritedSeccomp;
+    for inherited in [
+        InheritedSeccomp::Unknown,
+        InheritedSeccomp::Strict,
+        InheritedSeccomp::Filter(None),
+        InheritedSeccomp::Filter(Some(0)),
+        InheritedSeccomp::Filter(Some(1)),
+    ] {
+        let mut guest = CloneGuest::new(true, Ok(6000));
+        guest.enable_fresh_attempt();
+        guest.config.inherited_seccomp = inherited;
+        let tool = Detcore::new(guest.tid(), &guest.config);
+        let call = guest.original_call();
+        let plan = guest.fresh_plan(5001);
+        let refused =
+            std::panic::AssertUnwindSafe(tool.inject_clone_planned(&mut guest, call, plan, false))
+                .catch_unwind()
+                .await
+                .expect_err("an inherited filter can distinguish the rewritten call");
+        let reason = refused.downcast_ref::<PolicyRefused>().unwrap();
+        assert!(reason.0.contains("needs every guest process ID chosen"));
+        assert!(reason.0.contains("EINVAL"));
+        assert_eq!(guest.attempts, [false]);
+        assert!(guest.registry_queries.lock().unwrap().is_empty());
+        assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+    }
 
     // A definitely invalid added ID refuses before staging or injection.
     for id in [
