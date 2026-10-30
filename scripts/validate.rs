@@ -9781,7 +9781,10 @@ fn record_scorecard_writeback(summary: &mut RunSummary, writeback: Option<Scorec
 
 /// The descriptor stays owned by DurableLog until tee has terminated. The
 /// kernel fd reference names the opened object even if its display path moves.
-fn spawn_durable_tee(file: &std::fs::File) -> std::io::Result<std::process::Child> {
+fn spawn_durable_tee(
+    file: &std::fs::File,
+    stdout: std::process::Stdio,
+) -> std::io::Result<std::process::Child> {
     use std::os::fd::AsRawFd;
     Command::new("tee")
         .arg("-a")
@@ -9791,6 +9794,7 @@ fn spawn_durable_tee(file: &std::fs::File) -> std::io::Result<std::process::Chil
             file.as_raw_fd()
         ))
         .stdin(std::process::Stdio::piped())
+        .stdout(stdout)
         .spawn()
 }
 
@@ -9832,7 +9836,7 @@ fn setup_durable_log(
             return Err(4);
         }
     };
-    let mut tee = match spawn_durable_tee(&file) {
+    let mut tee = match spawn_durable_tee(&file, std::process::Stdio::inherit()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
