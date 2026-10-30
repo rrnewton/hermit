@@ -127,8 +127,10 @@ pub fn load(root: &Path, mode: &str, paths: &CorpusPaths) -> Result<Vec<CorpusRo
                 Some(level.to_string())
             }
         };
-        if let Some(level) = parsed.proc.as_deref()
-            && !matches!(level, "minimal" | "standard")
+        if let Some(level) = parsed
+            .proc
+            .as_deref()
+            .filter(|level| !matches!(*level, "minimal" | "standard"))
         {
             return Err(format!(
                 "{} row {i} ({}): proc {level:?} is not one of minimal|standard",
