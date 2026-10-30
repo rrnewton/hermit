@@ -137,6 +137,7 @@ static ANON_MAPPING_WRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PREEMPTION_CHARGE_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STDERR_FSYNC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3394,6 +3395,31 @@ fn untraced_clone_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "untraced-clone guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn stderr_fsync_guest() -> &'static Path {
+    STDERR_FSYNC_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("stderr-fsync");
+        fs::create_dir_all(&build_root).expect("failed to create stderr-fsync guest directory");
+        let guest = build_root.join("stderr_fsync");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/stderr_fsync.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile stderr-fsync guest");
+        assert!(
+            output.status.success(),
+            "stderr-fsync guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -20782,6 +20808,291 @@ fn a_schedule_replay_leaves_out_a_fifo_its_guest_writes() {
     assert_eq!(
         replayed["host_inputs"]["digest"], recorded["host_inputs"]["digest"],
         "{replayed}"
+    );
+}
+
+/// A schedule replay names each standard descriptor whose kind differs from
+/// its recording's, on stderr and in its summary, and the recorded schedule
+/// and both summaries carry the kinds. The guest prints what `fsync` on its
+/// stderr returns: 0 for the recording, whose stderr is a file, and `EINVAL`
+/// for a replay whose stderr is a pipe, so such a replay can run differently
+/// where the guest checks, as an abort path that flushes stderr does. A
+/// replay with stderr a file again names nothing. Only a warning: the replay
+/// still runs.
+#[test]
+fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
+    let program = stderr_fsync_guest()
+        .to_str()
+        .expect("stderr-fsync guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let record_arg = format!("--record-preemptions-to={}", schedule.display());
+    let replay_arg = format!("--replay-schedule-from={}", schedule.display());
+    // A run with stderr a file when `stderr_file` is given, else a pipe; its
+    // stdout, the stderr it wrote, and its summary.
+    let run = |schedule_arg: &str, name: &str, stderr_file: bool| {
+        let summary = directory.path().join(format!("{name}.summary.json"));
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let args = [
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            schedule_arg,
+            summary_arg.as_str(),
+            "--",
+            program,
+        ];
+        let stderr_path = directory.path().join(format!("{name}.stderr"));
+        let mut command = hermit_command(&args);
+        command.stdin(Stdio::null());
+        if stderr_file {
+            command.stderr(fs::File::create(&stderr_path).unwrap());
+        }
+        let output = hermit_test::hermit_output(name, &mut command);
+        assert_success(&output, &args);
+        let written = if stderr_file {
+            fs::read_to_string(&stderr_path).unwrap()
+        } else {
+            stderr(&output)
+        };
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        (stdout(&output), written, summary)
+    };
+    let named = |stderr: &str| -> Vec<String> {
+        stderr
+            .lines()
+            .filter(|line| {
+                line.starts_with("HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING")
+                    && line.contains("(fd ")
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let (recorded, recorded_stderr, recorded_summary) = run(&record_arg, "record", true);
+    assert_eq!(recorded, "fsync(stderr) = 0\n");
+    assert!(named(&recorded_stderr).is_empty(), "{recorded_stderr}");
+    assert_eq!(recorded_summary["host_inputs"]["stdio"]["stderr"], "file");
+    let record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    assert_eq!(record["host_inputs"]["stdio"]["stderr"], "file");
+
+    let (piped, piped_stderr, piped_summary) = run(&replay_arg, "replay-pipe", false);
+    assert_eq!(piped, "fsync(stderr) = Invalid argument\n");
+    assert_eq!(
+        named(&piped_stderr),
+        vec![
+            "HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING stderr (fd 2) was a regular file in the \
+             recording and is a pipe now; the run may diverge where the guest checks it (fstat, \
+             isatty, fsync, lseek)"
+                .to_owned()
+        ],
+        "{piped_stderr}"
+    );
+    assert_eq!(piped_summary["host_inputs"]["stdio"]["stderr"], "pipe");
+    assert_eq!(
+        piped_summary["stdio_changed"],
+        serde_json::json!([{"fd": 2, "recorded": "file", "now": "pipe"}])
+    );
+
+    let (again, again_stderr, again_summary) = run(&replay_arg, "replay-file", true);
+    assert_eq!(again, recorded);
+    assert!(named(&again_stderr).is_empty(), "{again_stderr}");
+    assert!(
+        again_summary.get("stdio_changed").is_none(),
+        "{again_summary}"
+    );
+}
+
+/// A plain `hermit run`, which runs its guest in a container, records the
+/// kinds of the standard descriptors the guest inherits from outside it:
+/// here its stdin is `/dev/null` and its stdout and stderr are files. Those
+/// descriptors name mounts of the namespace Hermit was launched in, which the
+/// container's own mount table does not list, so without that namespace's
+/// table (`Config::launch_namespace_mounts`) all three read as unknown. Each
+/// file is `file` on a local, in-kernel filesystem, as the test's target
+/// directory normally is, and `unknown` on any other (an overlay), whose
+/// type Hermit does not read.
+#[test]
+fn a_containerized_run_records_the_stdio_kinds_it_inherits() {
+    use std::os::fd::AsRawFd;
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary = directory.path().join("summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let args = [
+        "run",
+        "--base-env=minimal",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        summary_arg.as_str(),
+        "--",
+        "/bin/true",
+    ];
+    let stdout_file = fs::File::create(directory.path().join("hermit.stdout")).unwrap();
+    let stderr_path = directory.path().join("hermit.stderr");
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
+    // What Hermit can read of these files: their mount's type, by this
+    // process's own mount table, where they were opened.
+    let file_kind = {
+        let fdinfo =
+            fs::read_to_string(format!("/proc/self/fdinfo/{}", stdout_file.as_raw_fd())).unwrap();
+        let mount: u64 = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mounts = detcore_model::host_input::mount_types(
+            &fs::read_to_string("/proc/self/mountinfo").unwrap(),
+        );
+        let (_, fstype) = mounts.iter().find(|(id, _)| *id == mount).unwrap();
+        if detcore_model::host_input::LOCAL_KERNEL_FILESYSTEMS.contains(&fstype.as_str()) {
+            "file"
+        } else {
+            "unknown"
+        }
+    };
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null());
+    command.stdout(stdout_file);
+    command.stderr(stderr_file);
+    let output = hermit_test::hermit_output("containerized-stdio-kinds", &mut command);
+    let written = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        output.status.success(),
+        "hermit {args:?} failed with {}\nstderr:\n{written}",
+        output.status
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+    assert_eq!(
+        summary["host_inputs"]["stdio"],
+        serde_json::json!({"stdin": "char_device", "stdout": file_kind, "stderr": file_kind}),
+        "{written}"
+    );
+}
+
+/// A library caller's `Command` decides the guest's standard descriptors,
+/// and the run records the kinds the guest has at its first exec, not the
+/// caller's own. Here the guest's stdout is one end of a socket pair, which
+/// this test process's stdout never is: the summary says `socket`, and the
+/// guest's output arrives on the other end. Its stdin is a regular file on
+/// procfs, a local in-kernel filesystem, so its type comes from the file
+/// itself: `file`, where this process's stdin is `/dev/null`. Recording the
+/// calling process's descriptors would name its own instead.
+#[test]
+fn a_library_run_records_the_stdio_kinds_of_its_commands_descriptors() {
+    use std::io::Read;
+
+    // A Detcore session in this process, as
+    // library_runs_return_on_a_256_kib_thread runs one: in a fresh process
+    // of this binary, away from the threaded harness's sibling sessions.
+    const CHILD: &str = "HERMIT_LIBRARY_STDIO_KINDS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_library_run_records_the_stdio_kinds_of_its_commands_descriptors",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary = directory.path().join("summary.json");
+    let (guest_end, mut caller_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    let summary_path = Some(summary.clone());
+    // Built on the launching thread: the command is not `Send`.
+    let status = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let config = hermit::DetConfig {
+                sequentialize_threads: true,
+                record_host_inputs: true,
+                ..Default::default()
+            };
+            let mut command = reverie::process::Command::new("/bin/echo");
+            command.arg("through the socket");
+            command.stdin(fs::File::open("/proc/version").unwrap());
+            command.stdout(guest_end);
+            hermit::run(command, config, false, &summary_path)
+                .map(|status| status.code())
+                .map_err(|error| format!("{error:#}"))
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(status, Ok(Some(0)));
+    let mut written = String::new();
+    caller_end.read_to_string(&mut written).unwrap();
+    assert_eq!(written, "through the socket\n");
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+    let stdio = &summary["host_inputs"]["stdio"];
+    assert_eq!(stdio["stdin"], "file", "{summary}");
+    assert_eq!(stdio["stdout"], "socket", "{summary}");
+}
+
+/// A run whose output Hermit captures records the kinds of the standard
+/// descriptors its guest was given, not Hermit's own. `--verify` gives each
+/// run's guest a snapshot of Hermit's stdin (here `/dev/null`) and piped
+/// stdout and stderr, so with Hermit's own stdout and stderr regular files
+/// the summary still says pipes, and the guest itself finds its stderr a pipe
+/// (`fsync` fails with `EINVAL`). Recording Hermit's descriptors instead
+/// would claim files the guest never had.
+#[test]
+fn a_verify_run_records_the_stdio_kinds_its_guest_was_given() {
+    let program = stderr_fsync_guest()
+        .to_str()
+        .expect("stderr-fsync guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary = directory.path().join("summary.json");
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let args = [
+        "run",
+        "--verify",
+        "--base-env=minimal",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        summary_arg.as_str(),
+        "--",
+        program,
+    ];
+    let stdout_path = directory.path().join("hermit.stdout");
+    let stderr_path = directory.path().join("hermit.stderr");
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null());
+    command.stdout(fs::File::create(&stdout_path).unwrap());
+    command.stderr(fs::File::create(&stderr_path).unwrap());
+    let output = hermit_test::hermit_output("verify-stdio-kinds", &mut command);
+    let written = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        output.status.success(),
+        "hermit {args:?} failed with {}\nstderr:\n{written}",
+        output.status
+    );
+    assert_eq!(
+        fs::read_to_string(&stdout_path).unwrap(),
+        "fsync(stderr) = Invalid argument\n",
+        "{written}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+    assert_eq!(
+        summary["host_inputs"]["stdio"],
+        serde_json::json!({"stdin": "char_device", "stdout": "pipe", "stderr": "pipe"}),
+        "{written}"
     );
 }
 

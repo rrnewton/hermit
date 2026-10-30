@@ -1266,6 +1266,18 @@ pub struct GlobalState {
     // Whether `settle_host_inputs` has run.
     host_inputs_settled: AtomicBool,
 
+    // The kinds of file behind the guest's standard descriptors that the
+    // replayed recording names, when `Config::record_host_inputs` is set; and
+    // the kinds the root's own descriptors have at its first image, with
+    // those that differ from the recording's
+    // (`detcore_model::host_input::StdioKinds`, `GlobalState::read_guest_stdio`).
+    // Information only, as `recorded_host_inputs` is.
+    recorded_stdio: Option<detcore_model::host_input::StdioKinds>,
+    stdio: Mutex<(
+        Option<detcore_model::host_input::StdioKinds>,
+        Vec<detcore_model::host_input::StdioChange>,
+    )>,
+
     // The canonical models of open file descriptions that several guest
     // processes share (see `crate::shared_open_files`). Locked after `sched`,
     // never before it.
@@ -1844,7 +1856,7 @@ impl GlobalState {
 
         // A replayed recording that names the host files its run opened:
         // this run's opens are compared against them.
-        let replay_host_inputs = cfg
+        let recorded_host_inputs = cfg
             .record_host_inputs
             .then(|| {
                 preemptions_to_replay
@@ -1853,7 +1865,12 @@ impl GlobalState {
                     .cloned()
                     .or_else(|| sched.lock().unwrap().recorded_host_inputs.clone())
             })
-            .flatten()
+            .flatten();
+        // The guest's standard descriptor kinds the recording names, which
+        // the root's own are compared with at its first image
+        // (`GlobalState::read_guest_stdio`).
+        let recorded_stdio = recorded_host_inputs.as_ref().and_then(|set| set.stdio);
+        let replay_host_inputs = recorded_host_inputs
             .map(|recorded| Mutex::new(crate::host_inputs::ReplayHostInputs::new(recorded)));
         let range = Self::read_port_range();
         let network = Self::network_engine(cfg).map(Mutex::new);
@@ -1906,6 +1923,8 @@ impl GlobalState {
             replay_host_inputs,
             host_input_sources: Mutex::new(Vec::new()),
             host_inputs_settled: AtomicBool::new(false),
+            recorded_stdio,
+            stdio: Mutex::new((None, Vec::new())),
             shared_open_files: process_exit_cleanup.shared_open_files,
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
@@ -2444,13 +2463,102 @@ impl GlobalState {
         if mutated.contains("/") {
             return None;
         }
-        Some(crate::host_inputs::input_set(
+        let mut set = crate::host_inputs::input_set(
             &self
                 .host_inputs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
             &mutated,
-        ))
+        );
+        set.stdio = self.stdio.lock().unwrap_or_else(PoisonError::into_inner).0;
+        Some(set)
+    }
+
+    /// Take the kinds of file behind the guest's standard descriptors from
+    /// the root's own descriptors 0-2 at its first image, keep them for the
+    /// run's host-input set, and return those that differ from the
+    /// recording's. `pid` is the root's host process, and `image` the device
+    /// and inode the root's exec ran, as the root read them from its own
+    /// `exe` link. Called without the scheduler lock, as the root waits at
+    /// its first exec.
+    ///
+    /// Nothing here opens, copies or closes a descriptor, and nothing reaches
+    /// a filesystem that could wait on a server or see a request the native
+    /// program never made. `/proc/<pid>` is the root only if its maps map
+    /// the file its `exe` link names with that inode, all procfs text
+    /// (`detcore_model::host_input::maps_name_image`). A descriptor whose
+    /// `/proc/<pid>/fd/<n>` link is no path (a pipe, a socket, an anonymous
+    /// inode) is classified by that kernel-made name; any other by its own
+    /// type, read with a cached `statx` through that link only on a local,
+    /// in-kernel filesystem (`StdioKind::of_guest_descriptor`,
+    /// `detcore_model::host_input::LOCAL_KERNEL_FILESYSTEMS`), its mount
+    /// looked up in the guest's namespace, this process's and the one Hermit
+    /// was launched in (`Config::launch_namespace_mounts`). A descriptor it
+    /// does not read is `StdioKind::Unknown`, which is never compared.
+    /// Nothing is kept where there is no such process or image (KVM, whose
+    /// guest threads are no host tasks; DBT, which records no host inputs;
+    /// SaBRe, whose root never execs; a root that changed its root
+    /// directory).
+    fn read_guest_stdio(
+        &self,
+        pid: i32,
+        image: Option<(u64, u64)>,
+    ) -> Vec<detcore_model::host_input::StdioChange> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+
+        use detcore_model::host_input::StdioKind;
+        use detcore_model::host_input::StdioKinds;
+        let task = PathBuf::from(format!("/proc/{pid}"));
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        let is_root = image.is_some_and(|(_, ino)| {
+            let exe = std::fs::read_link(task.join("exe"));
+            let maps = read(&task.join("maps"));
+            matches!((exe, maps), (Ok(exe), Some(maps))
+                if detcore_model::host_input::maps_name_image(&maps, exe.as_os_str().as_bytes(), ino))
+        });
+        if !is_root {
+            return Vec::new();
+        }
+        // The guest's mounts, this process's, and those of the namespace
+        // Hermit was launched in, where descriptors the guest inherits from
+        // outside its container live.
+        let mut mounts: Vec<(u64, String)> =
+            [task.join("mountinfo"), "/proc/self/mountinfo".into()]
+                .iter()
+                .filter_map(|path| read(path))
+                .flat_map(|text| detcore_model::host_input::mount_types(&text))
+                .collect();
+        mounts.extend(self.cfg.launch_namespace_mounts.0.iter().cloned());
+        let drivers = read(Path::new("/proc/tty/drivers"));
+        let kind = |fd: i32| {
+            let entry = task.join("fd").join(fd.to_string());
+            let link = match std::fs::read_link(&entry) {
+                Ok(link) => link,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return StdioKind::Closed;
+                }
+                Err(_) => return StdioKind::Unknown,
+            };
+            StdioKind::of_guest_descriptor(
+                link.as_os_str().as_bytes(),
+                read(&task.join("fdinfo").join(fd.to_string())).as_deref(),
+                &mounts,
+                drivers.as_deref(),
+                || cached_file_type(&entry),
+            )
+        };
+        let now = StdioKinds {
+            stdin: kind(0),
+            stdout: kind(1),
+            stderr: kind(2),
+        };
+        let changes = self
+            .recorded_stdio
+            .map(|recorded| StdioKinds::changes(&recorded, &now))
+            .unwrap_or_default();
+        *self.stdio.lock().unwrap_or_else(PoisonError::into_inner) = (Some(now), changes.clone());
+        changes
     }
 
     /// Read what the run's host-input records need from the files
@@ -2600,6 +2708,12 @@ impl GlobalState {
         summary.guest_ids = (self.cfg.guest_ids != detcore_model::pid::GuestIds::Namespace)
             .then_some(self.cfg.guest_ids);
         summary.host_id_tasks = self.host_id_tasks.load(SeqCst);
+        summary.stdio_changed = self
+            .stdio
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .1
+            .clone();
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -4170,6 +4284,31 @@ impl GlobalState {
                         // root's descriptor remains live until local validation.
                         overrides.initial_input =
                             input.take().map(|input| input.lease.identity().clone());
+                    }
+                }
+                // The guest's standard descriptors, as the root's first image
+                // finds them: whatever its launch installed, which this
+                // process need not share. Read before the root's first
+                // instruction (it waits for this reply), but after the
+                // scheduler is released: a stat can reach a filesystem whose
+                // server would need a turn (`GlobalState::read_guest_stdio`).
+                let stdio_root = (first_image
+                    && self.cfg.record_host_inputs
+                    && self.root_dettid.get() == Some(&dtid))
+                .then(|| {
+                    // The root's host process: the one its backend
+                    // registered, or its own ID where guest threads are host
+                    // tasks under the IDs the scheduler knows them by.
+                    sched.physical_process_id(dtid).or_else(|| {
+                        crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+                            .then_some(detpid.as_raw())
+                    })
+                })
+                .flatten();
+                drop(sched);
+                if let Some(pid) = stdio_root {
+                    for change in &self.read_guest_stdio(pid, kernel_image) {
+                        report_host_input_change(change);
                     }
                 }
                 R::MarkPastFirstExecve(Box::new(overrides))
@@ -8490,11 +8629,53 @@ pub(crate) async fn record_host_input<G, T>(
     );
 }
 
-/// Print `change` on Hermit's own stderr, never the guest's output or the
-/// log `--verify` compares, without panicking where the guest made the shared
-/// stderr nonblocking (`crate::util::RetryingStderr`). The caller holds no
-/// lock.
-fn report_host_input_change(change: &detcore_model::host_input::HostInputChange) {
+/// The `st_mode` and device number of the file `path` names (following a
+/// link), from the inode's cached attributes: `statx` with
+/// `AT_STATX_DONT_SYNC`, asking only for its type and mode (and inode), which
+/// never change. Used only on local, in-kernel filesystems
+/// (`detcore_model::host_input::LOCAL_KERNEL_FILESYSTEMS`), which answer from
+/// the host; the flag keeps a filesystem that would revalidate from doing
+/// so.
+fn cached_file_type(path: &std::path::Path) -> Option<(libc::mode_t, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buffer = std::mem::MaybeUninit::<libc::statx>::uninit();
+    // SAFETY: `path` is NUL-terminated and `buffer` has room for a whole
+    // `struct statx`.
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_STATX_DONT_SYNC,
+            libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_INO,
+            buffer.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: statx succeeded, so it wrote the struct.
+    let buffer = unsafe { buffer.assume_init() };
+    if buffer.stx_mask & libc::STATX_TYPE == 0 {
+        return None;
+    }
+    // glibc's `gnu_dev_makedev`.
+    let (major, minor) = (
+        u64::from(buffer.stx_rdev_major),
+        u64::from(buffer.stx_rdev_minor),
+    );
+    let rdev = ((major & 0xfff) << 8)
+        | ((major & !0xfff) << 32)
+        | (minor & 0xff)
+        | ((minor & !0xff) << 12);
+    Some((libc::mode_t::from(buffer.stx_mode), rdev))
+}
+
+/// Print `change`, a host input that changed since its recording, on Hermit's
+/// own stderr, never the guest's output or the log `--verify` compares,
+/// without panicking where the guest made the shared stderr nonblocking
+/// (`crate::util::RetryingStderr`). The caller holds no lock.
+fn report_host_input_change(change: &dyn std::fmt::Display) {
     let line = format!(
         "{} {change}\n",
         detcore_model::host_input::HOST_INPUT_CHANGED_SINCE_RECORDING_MARKER
