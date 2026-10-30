@@ -6043,6 +6043,51 @@ mod tests {
         assert_eq!(reparsed.access_trace_max_bytes, Some(4096));
     }
 
+    /// Anonymous-memory logging is newer than the frozen DBT configuration.
+    /// Omit every mode from its object and positional forms while preserving
+    /// the exact mode in the current serde and bincode encodings.
+    #[test]
+    fn anonymous_mapping_logs_never_enter_the_legacy_form() {
+        let off = Config {
+            detlog_stack: true,
+            detlog_regs: true,
+            detlog_io_buffers: false,
+            detlog_regs_cadence: 7,
+            ..Config::default()
+        };
+        let legacy = to_legacy_backend_json(&off).unwrap();
+        assert!(!legacy.contains("detlog_anon"), "{legacy}");
+        for mode in [None, Some(DetlogAnon::Mappings), Some(DetlogAnon::Pages)] {
+            let config = Config {
+                detlog_anon: mode,
+                ..off.clone()
+            };
+            let object = to_legacy_backend_json(&config).unwrap();
+            assert_eq!(object, legacy);
+            let values: Vec<serde_json::Value> = ordered_entries(&object)
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect();
+            let array = serde_json::to_string(&values).unwrap();
+            for encoded in [object, array] {
+                let decoded = from_legacy_backend_json(&encoded).unwrap();
+                assert_eq!(decoded.detlog_anon, None);
+                assert_eq!(to_legacy_backend_json(&decoded).unwrap(), legacy);
+            }
+
+            let current = serde_json::to_value(&config).unwrap();
+            assert_eq!(current["detlog_anon"], serde_json::to_value(mode).unwrap());
+            let decoded: Config = serde_json::from_value(current).unwrap();
+            assert_eq!(decoded.detlog_anon, mode);
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.detlog_anon, mode);
+        }
+    }
+
+
     /// The in-guest reserved-signal set as an in-guest default-route run
     /// carries it: SIGSYS, SIGSEGV and SIGTRAP.
     fn in_guest_reserved_set() -> u64 {

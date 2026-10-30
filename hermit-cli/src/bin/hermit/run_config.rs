@@ -1415,6 +1415,39 @@ mod tests {
         );
     }
 
+    /// The optional value's implicit mappings mode and both explicit modes
+    /// must retain their actual typed values through the production save/load
+    /// path, not merely parse successfully.
+    #[test]
+    fn anonymous_mapping_log_modes_survive_save_and_load() {
+        use detcore_model::config::DetlogAnon;
+
+        for (spelling, expected, saved_value) in [
+            ("--detlog-anon", DetlogAnon::Mappings, "mappings"),
+            ("--detlog-anon=mappings", DetlogAnon::Mappings, "mappings"),
+            ("--detlog-anon=pages", DetlogAnon::Pages, "pages"),
+        ] {
+            let argv = sample_argv(Section::Run, &[spelling]);
+            let (args, _) = parse_at(&argv, SAVING_CLOCK);
+            let crate::Subcommand::Run(run) = args.command else {
+                panic!("not a run command");
+            };
+            assert_eq!(run.det_opts.det_config.detlog_anon, Some(expected));
+            let (before, after, saved) = save_and_load(&argv);
+            assert_eq!(before, after, "{spelling}");
+            assert_eq!(saved.run["detlog-anon"], Value::from(saved_value));
+
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("run.yaml");
+            write(&path, &saved).unwrap();
+            let (reloaded, _) = parse_at(&load(&path, &[]), LOADING_CLOCK);
+            let crate::Subcommand::Run(run) = reloaded.command else {
+                panic!("not a run command");
+            };
+            assert_eq!(run.det_opts.det_config.detlog_anon, Some(expected));
+        }
+    }
+
     /// The guarantee itself: for every option, saving an invocation that
     /// gives it and loading the file reproduces every parsed field.
     #[test]
