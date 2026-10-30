@@ -6407,16 +6407,28 @@ fn chaos_timed_wait_spread_parses_round_trips_and_is_refused_where_inert() {
     assert_eq!(default.det_opts.det_config.chaos_timed_wait_spread, None);
     assert!(!format!("{default}").contains("timed-wait-spread"));
 
+    // Validation reads a replayed record for the timeslice its run drew, so
+    // each replay needs a readable record; these state none.
+    let dir = tempfile::tempdir().unwrap();
+    let preemptions = dir.path().join("preemptions.json");
+    let schedule = dir.path().join("schedule.json");
+    for record in [&preemptions, &schedule] {
+        detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .write_to_disk(record)
+            .unwrap();
+    }
+    let preemptions = format!("--replay-preemptions-from={}", preemptions.display());
+    let schedule = format!("--replay-schedule-from={}", schedule.display());
     let mut replay = RunOpts::parse_from([
         "fakehermit",
-        "--replay-preemptions-from=preemptions.json",
+        preemptions.as_str(),
         "--chaos-timed-wait-spread=10",
         "fakeprog",
     ]);
     replay.validate_args_with_perf_support(true).unwrap();
     let mut schedule_replay = RunOpts::parse_from([
         "fakehermit",
-        "--replay-schedule-from=schedule.json",
+        schedule.as_str(),
         "--chaos-timed-wait-spread=10",
         "fakeprog",
     ]);
