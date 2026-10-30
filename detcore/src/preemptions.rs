@@ -2129,13 +2129,13 @@ mod tests {
             serde_json::to_value(&exact).unwrap(),
             serde_json::to_value(&record).unwrap()
         );
-        let mut other = record.clone();
-        other.global.push(SchedEvent::branches(late, 1));
+        let mut other_record = record.clone();
+        other_record.global.push(SchedEvent::branches(late, 1));
         let mut mixed = record.global.clone();
         mixed.push(SchedEvent::branches(main, 1));
         assert!(
             record
-                .interpolate_events(&other, mixed)
+                .interpolate_events(&other_record, mixed)
                 .unwrap_err()
                 .contains("callback checkpoints")
         );
