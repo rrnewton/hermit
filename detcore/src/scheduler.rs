@@ -20965,6 +20965,28 @@ mod test {
         assert!(sched.only_idle_guest_pollers_remain());
     }
 
+    /// A replayed switch-in (`TraceReplay`) is neither progress nor an
+    /// attempt. Another thread's switch-in leaves an idle reader idle. The
+    /// false-deadlock witness above still holds with switch-ins left out of
+    /// progress: a writer's ordinary grant after the reader's failed attempt
+    /// is progress, which the reader's own switch-in does not hide, so the
+    /// reader is idle again only after a further failed attempt.
+    #[test]
+    fn a_switch_in_is_neither_progress_nor_an_attempt() {
+        let mut sched = Scheduler::new(&Config::default());
+        let reader = DetTid::from_raw(3);
+        queued_poller(&mut sched, reader, true);
+        sched.thread_tree.add_child(reader, reader, true);
+        assert!(sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(DetTid::from_raw(9), false, false, false, true);
+        assert!(sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(DetTid::from_raw(7), false, false, false, false);
+        sched.note_committed_turn(reader, false, false, false, true);
+        assert!(!sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(reader, true, true, true, false);
+        assert!(sched.only_idle_guest_pollers_remain());
+    }
+
     /// A partial pipe write's retry follows an attempt that moved bytes: the
     /// writer may move more (Claude review of
     /// https://github.com/rrnewton/hermit/pull/4329, F1).
@@ -21407,6 +21429,52 @@ mod test {
             .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
         let _ = turn_answer(&mut sched, poller);
         assert_eq!(sched.pending_time_skip, None);
+    }
+
+    /// A call's first attempt runs in the turn an ordinary grant gave its
+    /// thread, and only a polling grant records an attempt
+    /// (`last_attempt_at`). So the commit of the call's first retry, beside a
+    /// sleeper, requests no jump: nothing shows that the first attempt came
+    /// after the latest progress, here the ordinary grant itself. The commit
+    /// of the second retry, after the first retry's attempt failed with
+    /// nothing else able to run, requests it.
+    #[test]
+    fn a_first_retry_after_an_ordinary_grant_jumps_at_its_second_retry() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        register_known_thread(&mut sched, poller);
+        let sleeper = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        // An ordinary turn, in which the thread calls a read whose first
+        // attempt fails.
+        sched.next_turns[&poller]
+            .req
+            .put(Ok(Resources::new(poller)));
+        let _ = turn_answer(&mut sched, poller);
+        let retry = |sched: &mut Scheduler, attempt| {
+            let mut resources = Resources::new(poller);
+            resources.insert(ResourceID::InternalIOPolling, Permission::W);
+            resources.poll_attempt = attempt;
+            resources.polls_guest_state_only = true;
+            sched.next_turns[&poller].req.put(Ok(resources));
+        };
+        retry(&mut sched, 1);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None);
+        retry(&mut sched, 2);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(
+            sched.pending_time_skip,
+            Some(PendingTimeSkip {
+                reason: TimeSkipReason::IdleGuestPollers,
+                poll_deadline: None,
+                requester: poller,
+            })
+        );
     }
 
     /// A replayed switch-in (`TraceReplay`) of an idle poller is no progress:

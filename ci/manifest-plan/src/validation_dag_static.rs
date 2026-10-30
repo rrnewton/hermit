@@ -1911,7 +1911,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same unit on main dc85ec16a (1289): 1290, listed.
     // And this change's Hermit unit tests: 1175.
     // The same six on main 32f85d391 (1202): 1208.
-    // The same six on main dc85ec16a (1289): 1295, listed.
+    // The same six on main dc85ec16a (1289): 1295.
+    // The same six on #4892's head 83050eb31 (1290): 1296, listed.
     ("test.hermit_unit", 1296),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
@@ -3242,8 +3243,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // On main 32f85d391 with #4862 (2889), the same seventeen units: 2906.
     // On main dc85ec16a with #4862 (3043), the same seventeen units: 3060.
     // And record_serde's time_skips_round_trip_through_the_record_serde and
-    // format_version_round_trips_through_the_record_serde: 3062, listed.
-    ("test.detcore_unit", 3093),
+    // format_version_round_trips_through_the_record_serde: 3062.
+    // The same nineteen units on #4892's head 83050eb31 (3074): 3093.
+    // And scheduler's a_switch_in_is_neither_progress_nor_an_attempt and
+    // a_first_retry_after_an_ordinary_grant_jumps_at_its_second_retry, from
+    // the port onto #4892: 3095, listed.
+    ("test.detcore_unit", 3095),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5704,8 +5709,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same units on main 16a66895f: 2888.
     // The same units on main 32f85d391 (2889): 2906.
     // The same units on main dc85ec16a (3043): 3060.
-    // And the same two record serde round trips: 3062, listed.
-    ("test.detcore_unit_on_host", 3093),
+    // And the same two record serde round trips: 3062.
+    // The same units on #4892's head 83050eb31 (3074): 3093.
+    // And the same two units from the port onto #4892: 3095, listed.
+    ("test.detcore_unit_on_host", 3095),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5826,7 +5833,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at 360e99b2e24: shard 2 grew to 292 (see its pin), so the
     // whole-node twin executes 61 + 292 + 349 = 702.
     // And scheduler_deadlock's poll-deadlock report: 703, listed.
-    // And the same two lit cases: 704, listed, on main dc85ec16a (702).
+    // And the same two lit cases: 704 on main dc85ec16a (702).
+    // The same two on #4892's head 83050eb31 (703): 705, listed.
     ("test.hermit_integration_on_host", 705),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
@@ -6105,7 +6113,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same unit on main dc85ec16a (1283): 1284, listed.
     // And the same tests: 1169.
     // The same six on main 32f85d391 (1196): 1202.
-    // The same six on main dc85ec16a (1283): 1289, listed.
+    // The same six on main dc85ec16a (1283): 1289.
+    // The same six on #4892's head 83050eb31 (1284): 1290, listed.
     ("test.hermit_unit_on_host", 1290),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
