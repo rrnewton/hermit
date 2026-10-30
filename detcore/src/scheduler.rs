@@ -17827,8 +17827,10 @@ impl Scheduler {
                 self.last_progress = self.last_progress.max(previous);
             }
             self.guest_state_polled_at.insert(dtid, self.progress_epoch);
-        } else if !switch_in {
-            // A replayed switch-in (`TraceReplay`) only resumes its thread,
+        } else if !switch_in || self.recordreplay_modes {
+            // Binary record/replay preserves its earlier progress accounting,
+            // including raw callers replaying a legacy schedule. Otherwise a
+            // replayed switch-in (`TraceReplay`) only resumes its thread,
             // which changes guest state, if at all, by a later request that
             // commits on its own; a replay hands idle pollers such turns
             // where the recording only skipped them, so counting one would
@@ -20907,6 +20909,34 @@ mod test {
                     requester: poller,
                 }),
                 "record={recordreplay}, replay={replaying}"
+            );
+
+            // A raw caller may still combine binary R/R with a legacy
+            // schedule. Its TraceReplay grant keeps base progress accounting:
+            // an older internal poll must probe again before a FIFO may jump.
+            let mut switched = Scheduler::new(&config);
+            register_known_thread(&mut switched, poller);
+            queued_poller(&mut switched, DetTid::from_raw(5), true);
+            let previous_progress = switched.last_progress;
+            let mut request = Resources::new(poller);
+            request.insert(ResourceID::TraceReplay, Permission::RW);
+            switched.next_turns[&poller].req.put(Ok(request));
+            let _ = turn_answer(&mut switched, poller);
+            assert_eq!(
+                switched.last_progress,
+                if recordreplay {
+                    switched.progress_epoch
+                } else {
+                    previous_progress
+                },
+                "record={recordreplay}, replay={replaying}: switch-in progress"
+            );
+            assert_eq!(
+                switched
+                    .alone_until_with(poller, Some(u64::MAX), false)
+                    .is_some(),
+                !recordreplay,
+                "record={recordreplay}, replay={replaying}: the older internal poll is stale"
             );
         }
     }
