@@ -1219,7 +1219,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
-    ("test.regular_crates", 1929),
+    // And detcore-model's summary::tests::desync_notes_round_trip_through_summary_json
+    // (https://github.com/rrnewton/hermit/issues/4876): 1930.
+    // And detcore-model's summary::tests::desync_notes_round_trip_through_summary_json
+    // (https://github.com/rrnewton/hermit/issues/4876, #4878): 1931.
+    ("test.regular_crates", 1931),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3151,7 +3155,53 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
-    ("test.detcore_unit", 3034),
+    // And a_binder_call_blocks_when_it_waits_for_another_process: 3035.
+    // And the eleven scheduler units for readmissions in a `hermit run`
+    // preemption record and their replay:
+    // a_preemption_record_carries_the_readmissions_a_replay_follows,
+    // a_record_whose_readmissions_go_backwards_is_refused,
+    // recording_preemptions_logs_hermit_runs_readmissions_without_changing_them,
+    // a_preemption_replay_readmits_at_the_recorded_point,
+    // a_preemption_replay_that_leaves_its_record_goes_on_as_a_fresh_run,
+    // a_preemption_replay_waits_where_its_recording_spun_and_goes_on_where_it_went_on,
+    // a_preemption_replay_off_its_record_leaves_it_where_nothing_else_moves,
+    // a_preemption_replay_readmits_a_vfork_child_at_its_recorded_turn,
+    // a_preemption_replay_off_its_record_at_step2a_rejoins_the_vfork_parent,
+    // a_preemption_replay_off_its_record_does_not_freeze_on_a_gated_vfork_child
+    // and
+    // a_preemption_replay_past_its_last_readmission_parks_a_finished_call_only_up_to_the_valve:
+    // 3046.
+    // And a_schedule_prefix_keeps_the_readmissions_only_for_the_whole_schedule,
+    // for main's prefix records: 3047.
+    // And rejoins_round_trip_through_the_record_serde, for main's record
+    // serde: 3048.
+    // And seven units for readmissions a schedule replay matches by the
+    // timed events popped in their turn: 3055.
+    // And the scheduler units
+    // a_prehook_switch_hands_a_backgrounded_call_its_turn_before_deferred_threads
+    // and only_a_prehook_switch_leaves_its_thread_a_call_to_carry_out: 3057,
+    // listed.
+    // And the background-start units
+    // preemptions::tests::background_starts_follow_their_events_and_version_the_record,
+    // replayer::tests::a_recorded_background_start_is_the_next_decision_after_its_events,
+    // replayer::tests::recorded_background_starts_keep_their_order_through_the_last_event,
+    // replayer::tests::a_fast_forward_retires_the_starts_it_skips,
+    // only_a_legacy_recording_notes_its_background_starts
+    // and a_recorded_background_start_begins_its_call_where_the_recording_did:
+    // 3063, listed.
+    // And scheduler::replayer::tests::untaken_background_starts_name_their_place_in_the_record
+    // and scheduler::test::the_summary_names_each_untaken_background_start
+    // (https://github.com/rrnewton/hermit/issues/4876): 3065.
+    // And a_schedule_prefix_keeps_the_background_starts_only_for_the_whole_schedule,
+    // for main's prefix records: 3066.
+    // And format_version_round_trips_through_the_record_serde and
+    // background_starts_round_trip_through_the_record_serde, for main's
+    // record serde: 3068.
+    // And scheduler::callback_history_scheduler_tests::summarized_desyncs_name_their_recorded_event,
+    // preemptions::tests::callback_checkpoints_are_placed_at_the_event_ending_their_slice
+    // and scheduler::callback_history_scheduler_tests::desync_notes_collect_every_producers_note
+    // (https://github.com/rrnewton/hermit/issues/4876, #4878): 3071.
+    ("test.detcore_unit", 3071),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4484,7 +4534,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
-    ("test.cli", 744),
+    // And a_blocking_binder_read_does_not_hold_the_guests_turn, which skips
+    // the same way: 745.
+    // And a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did
+    // (readmissions in a `hermit run` preemption record, replayed under a race
+    // probe): 746.
+    ("test.cli", 746),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5056,7 +5111,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
-    ("test.cli_on_host", 663),
+    // And the same blocking binder read test: 664.
+    // And the same preemption-replay readmission test: 665.
+    ("test.cli_on_host", 665),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5559,7 +5616,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
     // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
-    ("test.detcore_unit_on_host", 3034),
+    // And the same blocking-classification unit: 3035.
+    // And the same eleven readmission units: 3046.
+    // And the same prefix-record unit: 3047.
+    // And the same record-serde round-trip unit: 3048.
+    // And the same seven popped-event readmission units: 3055.
+    // And the same two prehook-handoff scheduler units: 3057, listed.
+    // And the same six background-start units: 3063, listed.
+    // And the same two untaken-background-start units: 3065.
+    // And the same prefix-record unit: 3066.
+    // And the same two record-serde round-trip units: 3068.
+    // And the same three summarized-desync units: 3071.
+    ("test.detcore_unit_on_host", 3071),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6179,7 +6247,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738: the same nine added cases: 1927 - 14 = 1913.
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
-    ("test.regular_crates_on_host", 1915),
+    // And the same desync-notes round-trip unit: 1916.
+    // And the same summary-JSON unit as test.regular_crates (#4878): 1917.
+    ("test.regular_crates_on_host", 1917),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
