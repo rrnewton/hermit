@@ -203,7 +203,7 @@ case $container in
         HERMIT_BIN="$B/hermit/hermit" HERMIT_INSTALL_DIR="$B/hermit/install" "${bundle_env[@]}" \
         timeout --kill-after=10 "$deadline" \
         "$B/bin/test-harness" run --repo-root "$B/src" --source-sha "$SHA" \
-        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --no-retry \
+        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt \
         --results "$out/results.jsonl" --junit "$out/junit.xml" --tpx-json "$out/tpx.jsonl" \
         "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
@@ -284,7 +284,7 @@ exec "$@"'
         HERMIT_BIN=/src/bundle/hermit/hermit HERMIT_INSTALL_DIR=/src/bundle/hermit/install "${inner_bundle_env[@]}" \
         timeout --kill-after=10 "$deadline" \
         /src/bundle/bin/test-harness run --repo-root /src/bundle/src --source-sha "$SHA" \
-        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --no-retry \
+        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt \
         --results "$o/results.jsonl" --junit "$o/junit.xml" --tpx-json "$o/tpx.jsonl" \
         "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
