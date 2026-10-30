@@ -27,10 +27,22 @@ pub use detcore_model::config::*;
 /// configuration's, is not embedded: these runtimes are loaded into the guest,
 /// where every byte they grow by moves the guest's own mappings.
 pub fn config_wire_fingerprint() -> String {
-    fingerprint_with_revision(
-        &detcore_model::config::config_wire_fingerprint(),
-        crate::tool_global::GLOBAL_RPC_REVISION,
-    )
+    // The material is immutable for this loaded image: the model overrides
+    // environment-dependent defaults, and the RPC revision is compiled in.
+    // Reuse it when a forked in-guest tool reconnects on the guest's clone
+    // stack; rebuilding Clap's canonical Config there can exhaust that stack.
+    // SaBRe's parent compatibility check finishes before an intercepted clone
+    // can run, so its child inherits an initialized value. Each connection
+    // still compares the coordinator's fingerprint with this local value.
+    static FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FINGERPRINT
+        .get_or_init(|| {
+            fingerprint_with_revision(
+                &detcore_model::config::config_wire_fingerprint(),
+                crate::tool_global::GLOBAL_RPC_REVISION,
+            )
+        })
+        .clone()
 }
 
 /// What differs when a coordinator announced `expected` as its
