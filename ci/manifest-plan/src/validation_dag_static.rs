@@ -4476,7 +4476,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the third is new and never listed here) = 739, re-measured at this integration head.
     // The 4843 overshoot fix adds one cli case: 739 + 1 = 740, re-measured at this integration head.
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
-    ("test.cli", 742),
+    // PR 4753 adds a_recording_from_before_readlinkat_was_recorded_is_refused_by_version: 742 + 1 = 743.
+    ("test.cli", 743),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5044,7 +5045,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4853 transplant relocation: 660 - 2 = 658.
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
-    ("test.cli_on_host", 661),
+    // The same PR 4753 case: 661 + 1 = 662.
+    ("test.cli_on_host", 662),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

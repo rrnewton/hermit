@@ -899,7 +899,14 @@ impl RecordVersion {
 // numbering so a replay under another one is refused. A recording made
 // before the numbering existed names no guest IDs, so an older replayer
 // would key its threads differently and diverge; it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x196);
+// 0x196 -> 0x197 (the next value above main's 0x196; the lander may renumber it
+// per its ledger at landing): readlinkat is recorded and replayed as readlink
+// is. The recorder records the bytes the kernel copied out, or the error, as a
+// Bytes event, and replay writes them back without running the call. An older
+// recording holds no event for a readlinkat, so this replayer would take
+// another call's event for it, and an older replayer would leave each
+// readlinkat's event unread and shift every later one; it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x197);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -924,7 +931,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x196);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x196;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x197;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
