@@ -3240,8 +3240,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // On main 16a66895f with #4862 (2871), this change's sixteen units and
     // preemptions' a_schedule_prefix_keeps_the_jumps_its_events_reach: 2888.
     // On main 32f85d391 with #4862 (2889), the same seventeen units: 2906.
-    // On main bc60c6a37 with #4862 (3012), the same seventeen units: 3029, listed.
-    ("test.detcore_unit", 3091),
+    // On main dc85ec16a with #4862 (3043), the same seventeen units: 3060.
+    // And record_serde's time_skips_round_trip_through_the_record_serde and
+    // format_version_round_trips_through_the_record_serde: 3062, listed.
+    ("test.detcore_unit", 3093),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5701,8 +5703,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same recorded-jump unit: 2830, listed.
     // The same units on main 16a66895f: 2888.
     // The same units on main 32f85d391 (2889): 2906.
-    // The same units on main bc60c6a37 (3012): 3029, listed.
-    ("test.detcore_unit_on_host", 3091),
+    // The same units on main dc85ec16a (3043): 3060.
+    // And the same two record serde round trips: 3062, listed.
+    ("test.detcore_unit_on_host", 3093),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
