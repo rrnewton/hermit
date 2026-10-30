@@ -180,10 +180,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -255,10 +254,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -472,10 +470,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -547,10 +544,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -694,10 +690,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -769,10 +764,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -843,10 +837,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -915,10 +908,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -983,10 +975,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1054,10 +1045,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1119,10 +1109,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1197,10 +1186,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1264,10 +1252,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1408,10 +1395,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1574,10 +1560,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1708,10 +1693,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1783,10 +1767,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1858,10 +1841,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1932,10 +1914,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2000,10 +1981,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2145,10 +2125,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2213,10 +2192,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2362,10 +2340,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2605,10 +2582,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2680,10 +2656,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2758,10 +2733,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3038,10 +3012,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3113,10 +3086,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3181,10 +3153,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3258,10 +3229,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3329,10 +3299,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3405,11 +3374,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'Record/replay qualification is separate from the initial strict-verification migration'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3565,10 +3532,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3640,10 +3606,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3708,10 +3673,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3776,10 +3740,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -3844,10 +3807,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4156,10 +4118,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4224,10 +4185,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4292,10 +4252,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4360,10 +4319,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4428,10 +4386,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4589,10 +4546,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4740,10 +4696,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4814,10 +4769,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4888,10 +4842,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -4956,10 +4909,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5024,10 +4976,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5092,10 +5043,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5177,10 +5127,9 @@ test:
         backends_disabled:
           native: This guest asserts interrupted-pause semantics under strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5243,11 +5192,9 @@ test:
         backends_disabled:
           native: This guest asserts cross-task signal delivery to pause and nanosleep under strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: Record/replay runs Detcore with backend_supports_blocked_wait_signal_interruption false, where a cross-task signal does not end an emulated pause, so the guest hangs under record as it did before https://github.com/rrnewton/hermit/issues/3982.
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay configures Detcore with backend_supports_blocked_wait_signal_interruption false, so a cross-task signal does not end an emulated pause and the recording hangs (https://github.com/rrnewton/hermit/issues/3982)
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5322,11 +5269,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'Record/replay qualification is separate from the initial strict-verification migration'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5387,10 +5332,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5455,10 +5399,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5523,10 +5466,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5596,10 +5538,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5685,11 +5626,9 @@ test:
         backends_disabled:
           native: This probe asserts Linux errno precedence and Detcore pipe policy, not native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is separate from this errno-precedence assertion.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this errno-precedence assertion
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5756,10 +5695,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5891,10 +5829,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -5960,16 +5897,14 @@ test:
           native: THIS GUEST IS EXPECTED TO FAIL NATIVELY AND THAT IS THE POINT. It asserts that Hermit refuses PR_SET_NO_NEW_PRIVS with ENOSYS; Linux accepts it and returns 0, so a native run exits 1. That measured native failure is the cell's negative control, not a gap to be closed.
         ci_disabled_reason: Permanently off by design. The guest asserts a Hermit-specific refusal, so naked/native is its negative control and must stay red; selecting it in CI would assert the opposite of the contract.
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this cell's strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: Off pending its own qualification. This cell's contract is the prctl option policy under strict verification; record/replay of that contract has not been measured and asserting it untested would be a false claim.
       chaos:
         ci: false
         backends_enabled: []
@@ -6032,16 +5967,14 @@ test:
           native: Native is the uninstrumented baseline; the contract is the hermit run
         ci_disabled_reason: 'NOT-EXERCISED (by design): this entry asserts the Linux answers under Hermit on every backend and nothing about native nondeterminism, so there is no naked oracle to run. The guest exits 0 natively under any credentials.'
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this cell's strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: Off pending its own qualification. This cell's contract is the capability-set prctls under strict verification; record/replay of that contract has not been measured and asserting it untested would be a false claim.
       chaos:
         ci: false
         backends_enabled: []
@@ -6113,10 +6046,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -6883,10 +6815,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -6962,10 +6893,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7037,10 +6967,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7114,10 +7043,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7191,10 +7119,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7259,10 +7186,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7327,10 +7253,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7462,10 +7387,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7537,10 +7461,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7611,10 +7534,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7686,10 +7608,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7758,10 +7679,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -7836,10 +7756,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8042,10 +7961,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8183,11 +8101,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: This added regular-file sink is qualified for verify only; record/replay has not been measured.
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8265,10 +8181,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8333,10 +8248,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8401,10 +8315,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8476,10 +8389,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8551,10 +8463,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8626,10 +8537,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8701,10 +8611,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8842,10 +8751,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8910,10 +8818,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -8978,10 +8885,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -9126,10 +9032,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -9180,14 +9085,20 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - in-guest-trap
+          - liteinst
         backends_disabled:
           dbt: The in-guest discovery records an anonymous inode as an ordinary file, so the received signalfd's blocking read would hang (the defect the ptrace and KVM receipt path fails closed on)
           sabre: The in-guest discovery records an anonymous inode as an ordinary file, so the received signalfd's blocking read would hang (the defect the ptrace and KVM receipt path fails closed on)
-          liteinst: The in-guest discovery records an anonymous inode as an ordinary file, so the received signalfd's blocking read would hang (the defect the ptrace and KVM receipt path fails closed on)
-          in-guest-trap: The in-guest discovery records an anonymous inode as an ordinary file, so the received signalfd's blocking read would hang (the defect the ptrace and KVM receipt path fails closed on)
         expected_stdout:
           ptrace: "received eventfd=1 semaphore=1 nonblocking=1 signalfd=1\neventfd read=8 errno=0\neventfd value=5\neventfd write=8 errno=0\nsemaphore read 16=8 errno=0\nsemaphore value=1\nnonblocking F_GETFL=2050 errno=0\nnonblocking F_SETFL 0=0 errno=0\nnonblocking now=0\nsignalfd read 2 records=128 errno=0\nsignalfd signo=10\ndone\n"
           kvm: "sender signalfd sendmsg errno=38\nreceived eventfd=1 semaphore=1 nonblocking=1 signalfd=0\neventfd read=8 errno=0\neventfd value=5\neventfd write=8 errno=0\nsemaphore read 16=8 errno=0\nsemaphore value=1\nnonblocking F_GETFL=2050 errno=0\nnonblocking F_SETFL 0=0 errno=0\nnonblocking now=0\nsignalfd not received\ndone\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each was CLEAN on the nightly pressure sweeps of 2026-10-29 and 2026-10-30 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): the ptrace verify row is the native output, measured on Linux 7.1.3.'
@@ -9446,11 +9357,9 @@ test:
         backends_disabled:
           native: The native values are per-run host session and group ids; this cell pins the container's values, not native variation
       replay:
-        ci: false
-        ci_disabled_reason: Record/replay qualification for session identity is a separate question from pinning the values the container reports today.
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification for session identity is separate from pinning the observed values
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -9517,10 +9426,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -9668,10 +9576,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -9740,11 +9647,9 @@ test:
         backends_disabled:
           native: This guest asserts sibling-woken rt_sigsuspend semantics under strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: This scheduler-signal fixture is qualified for verify only; record/replay has not been measured.
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10036,10 +9941,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10104,10 +10008,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10172,10 +10075,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10240,10 +10142,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10308,10 +10209,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10376,10 +10276,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10453,10 +10352,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10594,10 +10492,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10662,10 +10559,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10737,10 +10633,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -10812,10 +10707,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -11103,10 +10997,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -11171,10 +11064,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -11317,10 +11209,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -11385,10 +11276,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -11453,10 +11343,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -11521,10 +11410,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -11596,10 +11484,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -11663,10 +11550,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12087,10 +11973,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12156,11 +12041,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'Record/replay qualification is separate from the initial strict-verification migration'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12234,10 +12117,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12380,10 +12262,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12454,10 +12335,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12602,11 +12482,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12682,11 +12560,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12765,11 +12641,9 @@ test:
         backends_disabled:
           native: Native Linux is used as a focused correctness oracle; repeated native execution is not a nondeterminism contract
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the strict personality-domain contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12837,11 +12711,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -12978,11 +12850,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13050,11 +12920,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13122,11 +12990,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13198,11 +13064,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13271,11 +13135,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13343,11 +13205,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13415,11 +13275,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13492,11 +13350,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13564,11 +13420,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13636,11 +13490,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13708,11 +13560,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13785,11 +13635,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13857,11 +13705,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -13936,11 +13782,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -14367,11 +14211,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -14505,11 +14347,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -14577,11 +14417,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -14649,11 +14487,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -14721,11 +14557,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -14793,11 +14627,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -14865,11 +14697,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -14939,11 +14769,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15019,11 +14847,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15091,11 +14917,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15169,11 +14993,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15241,11 +15063,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15313,11 +15133,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15385,11 +15203,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15457,11 +15273,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15532,11 +15346,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15604,11 +15416,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15676,11 +15486,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15748,11 +15556,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15820,11 +15626,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15892,11 +15696,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -15964,11 +15766,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16036,11 +15836,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16108,11 +15906,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16180,11 +15976,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16252,11 +16046,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16390,11 +16182,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16462,11 +16252,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16534,11 +16322,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16614,11 +16400,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16686,11 +16470,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16758,11 +16540,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16830,11 +16610,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16910,11 +16688,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -16982,11 +16758,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17126,11 +16900,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17198,11 +16970,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17270,11 +17040,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17342,11 +17110,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17422,11 +17188,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17500,11 +17264,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17578,11 +17340,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17725,11 +17485,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17803,11 +17561,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17884,11 +17640,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -17961,11 +17715,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18039,11 +17791,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18117,11 +17867,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18189,11 +17937,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18261,11 +18007,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18333,11 +18077,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18405,11 +18147,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18477,11 +18217,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18555,11 +18293,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18633,11 +18369,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18711,11 +18445,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18789,11 +18521,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18867,11 +18597,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -18945,11 +18673,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19023,11 +18749,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19106,11 +18830,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19269,11 +18991,9 @@ test:
         backends_disabled:
           native: Native Linux intentionally exposes the host-dependent default rather than the Detcore pin
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is separate from the initial strict-verification regression cell.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification regression cell
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19352,11 +19072,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19435,11 +19153,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19518,11 +19234,9 @@ test:
         backends_disabled:
           native: Native execution cannot apply Hermit environment or mount controls
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is separate from these scheduled run controls.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from these scheduled run controls
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19608,11 +19322,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19691,11 +19403,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19774,11 +19484,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19852,11 +19560,9 @@ test:
         backends_disabled:
           native: 'A native run necessarily differs from itself: unvirtualized st_ino/st_dev come from the real host filesystem and the timestamps are wall-clock, so native is a useful smoke check but not a discriminating oracle for a contract whose whole claim is that those fields are virtualized and repeatable'
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from strict verification and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict verification
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -19933,11 +19639,9 @@ test:
         backends_disabled:
           native: Native output is IDENTICAL to Hermit's here (measured), because the probe is relocation-invariant by construction -- so a native run is a useful sanity check but not a discriminating oracle, and gating on it would assert nothing
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: Record/replay qualification is separate from strict verification / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict verification
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -20008,11 +19712,9 @@ test:
         backends_disabled:
           native: The native run is the reference this fixture is compared against, not a case it asserts
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: Record/replay of signal-terminated children is not part of this contract'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay of signal-terminated children is not part of this contract
           dbt: Record/replay of signal-terminated children is not part of this contract
           kvm: Record/replay of signal-terminated children is not part of this contract
           sabre: Record/replay of signal-terminated children is not part of this contract
@@ -20080,11 +19782,9 @@ test:
         backends_disabled:
           native: The native run is the reference this fixture is compared against, not a case it asserts
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: Record/replay of hardware-trap termination is not part of this contract'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay of hardware-trap termination is not part of this contract
           dbt: Record/replay of hardware-trap termination is not part of this contract
           kvm: Record/replay of hardware-trap termination is not part of this contract
           sabre: Record/replay of hardware-trap termination is not part of this contract
@@ -20255,11 +19955,9 @@ test:
         backends_disabled:
           native: 'Native is used here as a correctness oracle only: it never splits this transfer (one full write), so repeated native execution is not a split-pattern contract'
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: Record/replay qualification is separate from the strict split-pattern contract / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the strict split-pattern contract
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -20326,11 +20024,9 @@ test:
         backends_disabled:
           native: Measured stable 5/5 natively on this host, so native repetition is not a nondeterminism contract; the value of this entry is cross-backend, not native-vs-hermit
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: Record/replay qualification of event delivery is tracked separately / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification of event delivery is tracked separately
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -20395,11 +20091,9 @@ test:
         backends_disabled:
           native: This row asserts strict-verify determinism; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: Record/replay qualification is separate from strict-verification entry / Record/replay is unsupported by DBT / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict-verification entry
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -20464,11 +20158,9 @@ test:
         backends_disabled:
           native: This row asserts strict-verify determinism; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: Record/replay qualification is separate from strict-verification entry / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict-verification entry
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -20533,11 +20225,9 @@ test:
         backends_disabled:
           native: This row asserts strict-verify determinism; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: Record/replay qualification is separate from strict-verification entry / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict-verification entry
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -20683,11 +20373,9 @@ test:
         backends_disabled:
           native: Native run-to-run variation is the PREMISE of this guest, not an assertion it makes; it is demonstrated in the fixture comment rather than gated here
       replay:
-        ci: false
-        ci_disabled_reason: "NOT-EXERCISED: record/replay qualification is separate from the initial strict-verification fixture and has not been measured for this guest."
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict verification
           dbt: Record/replay is unsupported by the DynamoRIO (DBT) backend
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -20755,16 +20443,14 @@ test:
           native: Native is the uninstrumented baseline; the contract is the hermit run
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict verification
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       chaos:
         ci: false
         backends_enabled: []
@@ -20827,16 +20513,14 @@ test:
           native: Native is the uninstrumented baseline; the contract is the hermit run
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict verification
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       chaos:
         ci: false
         backends_enabled: []
@@ -20915,16 +20599,14 @@ test:
           native: 'Native creation-order leakage is the PREMISE of this guest (measured: order_identical=0, seams_rev=n-1), recorded in the fixture header rather than gated here'
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict verification
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
         # --require-small-determinized and --require-large-determinized assert
         # strict mode's sorted directory order. A recording keeps the host's
         # order and replay reproduces it, so replay checks replay fidelity with
@@ -20992,16 +20674,14 @@ test:
           native: Native is the uninstrumented baseline; the contract is the hermit run
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from strict verification
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       chaos:
         ci: false
         backends_enabled: []
@@ -21058,11 +20738,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -21133,11 +20811,9 @@ test:
         backends_disabled:
           native: This contract asserts deterministic output under Hermit, not native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -21208,11 +20884,9 @@ test:
         backends_disabled:
           native: This contract asserts deterministic output under Hermit, not native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -21293,11 +20967,9 @@ test:
         backends_disabled:
           native: This contract asserts deterministic output under Hermit, not native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -21372,11 +21044,9 @@ test:
         backends_disabled:
           native: This contract asserts deterministic output under Hermit, not native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -21532,11 +21202,9 @@ test:
         backends_disabled:
           native: This contract asserts deterministic output under Hermit, not native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -21604,11 +21272,9 @@ test:
         backends_disabled:
           native: This contract asserts deterministic output under Hermit, not native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -21682,11 +21348,9 @@ test:
         backends_disabled:
           native: This contract asserts deterministic output under Hermit, not native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -21754,11 +21418,9 @@ test:
         backends_disabled:
           native: This contract asserts deterministic output under Hermit, not native nondeterminism
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -21828,11 +21490,9 @@ test:
         backends_disabled:
           native: Native scheduling always preempts the spinner, so it asserts nothing this cell guards
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this preemption check and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is a separate exercise from this preemption check
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay qualification is a separate exercise from this preemption check
           sabre: Record/replay qualification is a separate exercise from this preemption check

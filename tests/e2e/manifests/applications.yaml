@@ -66,10 +66,9 @@ test:
             - --max-timeslice=disabled
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 with the default 50 x 20 ms workload, then 3 of 3 with the 53 x 5 ms workload ptrace, KVM and DBT run, which they now share (https://github.com/rrnewton/hermit/issues/3745)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Focused time and entropy sentinels own the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -141,10 +140,9 @@ test:
             - --max-timeslice=disabled
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Strict verification owns the examples-directory parity contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -194,25 +192,28 @@ test:
       verify:
         ci:
           kvm: true
+          ptrace: true
         timeout_seconds:
           kvm: 74
+          ptrace: 127
         cpu_timeout_seconds:
           kvm: 25
+          ptrace: 62
         slow_reason:
           kvm: Across 58 retained typed passing rows, nearest-rank p90 was 18.271 wall seconds and 16.656796 CPU seconds; ceil(4x wall)=74 and ceil(1.5x CPU)=25.
+          ptrace: One local sample at the flip head on the measurement host recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" (test-harness run, 2026-10-30) measured 40.920 CPU seconds and 42.271 wall seconds across the two verify runs; ceil(1.5x CPU)=62 and ceil(3x wall)=127. The cell was also CLEAN on the nightly pressure sweeps of 2026-10-29 and 2026-10-30.
         backends_enabled:
           - kvm
+          - ptrace
         backends_disabled:
-          ptrace: This test specifically asserts the KVM execution path
           dbt: This test specifically asserts the KVM execution path
           sabre: This test specifically asserts the KVM execution path
           liteinst: This test specifically asserts the KVM execution path
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: This is a KVM integration test
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -263,16 +264,15 @@ test:
         backends_enabled:
           - dbt
           - kvm
+          - ptrace
         backends_disabled:
-          ptrace: This test specifically asserts the KVM execution path
           sabre: This test specifically asserts the KVM execution path
           liteinst: This test specifically asserts the KVM execution path
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: This is a KVM integration test
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -332,10 +332,9 @@ test:
           liteinst: LiteInst multi-exec toolchain qualification must ratchet after the ptrace reference path
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Strict verification owns this toolchain transaction's blocking determinism contract
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -394,10 +393,9 @@ test:
           liteinst: LiteInst multi-exec Git qualification must ratchet after the ptrace reference path
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Strict verification owns this repository transaction's blocking determinism contract
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe

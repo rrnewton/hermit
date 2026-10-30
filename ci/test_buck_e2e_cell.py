@@ -1371,7 +1371,8 @@ class ContainerChoiceTest(unittest.TestCase):
                                                "c-programs-environment-and-workdir-verify-ptrace",
                                                "c-programs-environment-and-workdir-verify-kvm",
                                                "c-programs-environment-and-workdir-verify-liteinst",
-                                               "c-programs-environment-and-workdir-verify-in-guest-trap"})
+                                               "c-programs-environment-and-workdir-verify-in-guest-trap",
+                                               "c-programs-environment-and-workdir-replay-ptrace"})
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))

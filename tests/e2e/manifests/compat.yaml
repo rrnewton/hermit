@@ -1691,10 +1691,6 @@ corpus:
       wall seconds together through the retired command
     except:
       - reason: >-
-          The rr corpus ran these programs with the argv of the -direct
-          row of the same name, which this run type runs instead
-        rows: [lua, perl, df]
-      - reason: >-
           Its own check fails when a receive path delivers NETLINK_SOCK_DIAG
           socket inodes unzeroed, which is Detcore's run-mode metadata
           sanitizer. Record and replay disable metadata virtualization by
