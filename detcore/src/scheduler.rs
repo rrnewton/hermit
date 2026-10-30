@@ -36758,11 +36758,14 @@ mod test {
                 if failed_before {
                     report(&sched);
                 }
-                let guard = GuestDeadlockUnwindGuard::install(Box::new(move || {
+                let guard = TerminalOutcomeUnwindGuard::install(Box::new(move |_| {
                     report(&reporter);
                     won
                 }));
-                assert_eq!(unwind_guest_deadlock(&sched), Some(won));
+                assert_eq!(
+                    unwind_terminal_outcome(&sched, TerminalOutcome::GuestDeadlock),
+                    Some(won)
+                );
                 drop(guard);
             });
             let log = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
@@ -36777,7 +36780,10 @@ mod test {
                 .collect();
             if won {
                 assert!(lines.is_empty(), "won: {log}");
-                assert!(log.contains("unwinding the deadlocked guest"), "won: {log}");
+                assert!(
+                    log.contains("unwinding the guest after GuestDeadlock"),
+                    "won: {log}"
+                );
             } else {
                 let label = if failed_before {
                     "lost after an earlier failure"

@@ -6429,7 +6429,7 @@ mod tests {
 
     /// A child that exited the deadline status is `--timeout`'s deadline
     /// (`class=run-timeout`) unless its scheduler noted a virtual timeout
-    /// before exiting, which is then the guest's outcome with its bound; a
+    /// before exiting, which is then the virtual timeout with its bound; a
     /// note of any other outcome does not turn the deadline into it. Drop
     /// the note from `deadline_exit` and the first assertion fails; read the
     /// status alone and the second does.

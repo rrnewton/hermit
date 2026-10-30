@@ -14304,7 +14304,7 @@ fn finish_mapped_verification_log(
 /// skid overshoot keeps its refusal.
 pub(super) fn rejected_first_run(error: Error, guest_deadlock: bool) -> Error {
     if guest_deadlock && error.downcast_ref::<SkidOvershootError>().is_none() {
-        error.context(GuestDeadlock)
+        error.context(SchedulerOutcome(detcore::TerminalOutcome::GuestDeadlock))
     } else {
         error
     }

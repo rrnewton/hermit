@@ -367,7 +367,8 @@ outside the container virtual time does not pass at all, so the wall-clock
 rungs stay in place.
 
 On ptrace the scheduler hands the stop to the run's owner, which tears the
-parked guest down and finishes the run as it does for a guest deadlock (below).
+parked guest down and finishes the run as it does for a deadlock under
+Hermit's model (below).
 KVM's scheduler exits the container child 124 directly. That status is also
 `--timeout`'s fallback's, so a run with the bound maps a note the child shares
 with its parent (a `MAP_SHARED` cell mapped before the clone, and cleared

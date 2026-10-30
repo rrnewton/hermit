@@ -1951,7 +1951,7 @@ mod tests {
             (
                 detcore::TerminalOutcome::GuestDeadlock,
                 detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
-                "HERMIT_GUEST_DEADLOCK class=guest-deadlock",
+                "HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model",
             ),
             (
                 timeout,
@@ -1985,7 +1985,7 @@ mod tests {
     }
 
     /// A deadlock whose teardown recorded its own failure stays a failed
-    /// ptrace run (`ptrace_completion::completed_guest_deadlock`), which the
+    /// ptrace run (`ptrace_completion::completed_terminal_outcome`), which the
     /// container child reports with kind `Error`. The CLI reports that as
     /// Hermit's failure, 125 and `HERMIT_INTERNAL_FAILURE`, never with the
     /// deadlock's class line or 121.

@@ -41851,7 +41851,7 @@ const VIRTUAL_TIMEOUT_SLEEP_STDOUT: &str = "tick 0\ntick 1\ntick 2\ntick 3\n";
 /// an elapsed virtual time past it, the quantity the bound measures. A guest
 /// that spins without a system call is stopped by the same bound, through its
 /// preemption turns. A guest that deadlocks under a bound it does not reach
-/// still ends with the guest-deadlock outcome (ptrace, `--strict`).
+/// still ends with the deadlock under Hermit's model (ptrace, `--strict`).
 #[test]
 fn a_virtual_timeout_stops_a_guest_that_never_ends() {
     let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
@@ -41971,7 +41971,7 @@ fn a_virtual_timeout_stops_a_guest_that_never_ends() {
         "{log}"
     );
     assert!(
-        log.contains("HERMIT_GUEST_DEADLOCK class=guest-deadlock")
+        log.contains("HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model")
             && !log.contains("class=virtual-timeout"),
         "{log}"
     );

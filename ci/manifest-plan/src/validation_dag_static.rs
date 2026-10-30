@@ -1890,10 +1890,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // re-measured at this integration head.
     // PR 4836 adds run::detlog_anon_is_ptrace_only: 1242 + 1 = 1243, re-measured at this integration head.
     // PR 4619 adds seven hermit-run units: 1243 + 7 = 1250, re-measured at this integration head.
-    // 1095, listed. (--virtual-timeout renamed the last three to
+    // --virtual-timeout renames three of them, keeping the count, to
     // tests::terminal_outcomes_use_their_own_exit_and_marker,
     // ptrace_completion::tests::a_terminal_outcome_completes_with_its_status_and_the_captured_output
-    // and error::tests::a_terminal_outcome_is_the_guests_only_once_the_run_finished.)
+    // and error::tests::a_terminal_outcome_is_the_guests_only_once_the_run_finished.
     // And --virtual-timeout's
     // container::tests::a_deadline_exit_is_a_virtual_timeout_only_with_its_note,
     // terminal_outcome_note::tests::a_virtual_timeout_noted_by_an_exiting_child_reaches_its_parent_once

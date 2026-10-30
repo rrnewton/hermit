@@ -819,21 +819,18 @@ pub(crate) fn clean_terminal_outcome(
         _ => None,
     }
 }
-/// What a failed run completes with instead: the deadlock's result when its
-/// teardown was clean ([`is_clean_guest_deadlock`]) and kept what the caller
-/// asked for. `None` leaves it a failed run, whose primary
-/// `classify_ptrace_primary` reports as Hermit's failure (125): a deadlock
+/// What a failed run completes with instead: the terminal outcome's result
+/// when its teardown was clean ([`clean_terminal_outcome`]) and kept what the
+/// caller asked for. `None` leaves it a failed run, whose primary
+/// `classify_ptrace_primary` reports as Hermit's failure (125): an outcome
 /// whose teardown recorded `secondaries` failures of its own among them.
-pub(crate) fn completed_guest_deadlock<R: GuestDeadlockResult>(
+pub(crate) fn completed_terminal_outcome<R: TerminalOutcomeResult>(
     primary: &reverie::Error,
     secondaries: usize,
     captured: Option<&CapturedPrefix>,
 ) -> Option<R> {
-    if is_clean_guest_deadlock(primary, secondaries) {
-        R::guest_deadlock(captured)
-    } else {
-        None
-    }
+    clean_terminal_outcome(primary, secondaries)
+        .and_then(|outcome| R::terminal_outcome(outcome, captured))
 }
 async fn consume<R: TerminalOutcomeResult>(
     mut outcome: ToolRunOutcome<detcore::GlobalState, R>,
@@ -847,11 +844,11 @@ async fn consume<R: TerminalOutcomeResult>(
                 return match completion.result {
                     Ok(result) => Ok((result, completion.global_state)),
                     Err(failure)
-                        if let Some(outcome) = clean_terminal_outcome(
+                        if let Some(result) = completed_terminal_outcome::<R>(
                             failure.primary(),
                             failure.secondary().len(),
-                        ) && let Some(result) =
-                            R::terminal_outcome(outcome, failure.captured_prefix()) =>
+                            failure.captured_prefix(),
+                        ) =>
                     {
                         // The deadlock's outcome, not a failed run: the caller
                         // finishes the run (summary, recording) as for an exit.

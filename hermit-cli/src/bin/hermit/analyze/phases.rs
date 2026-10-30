@@ -1587,7 +1587,10 @@ impl AnalyzeOpts {
     /// trial fails with the deadlock's own outcome.
     pub fn trial_matches(&self, out: &Output, guest_deadlock: bool) -> anyhow::Result<bool> {
         if guest_deadlock {
-            return Err(Error::new(crate::container::GuestDeadlock).context(
+            return Err(Error::new(crate::container::SchedulerOutcome(
+                detcore::TerminalOutcome::GuestDeadlock,
+            ))
+            .context(
                 "an analyze trial ended on a deadlock under Hermit's model, which is \
                  neither on nor off target",
             ));
@@ -2339,8 +2342,10 @@ mod tests {
             let error = options.trial_matches(&output, true).unwrap_err();
             assert!(
                 error
-                    .downcast_ref::<crate::container::GuestDeadlock>()
-                    .is_some(),
+                    .downcast_ref::<crate::container::SchedulerOutcome>()
+                    .is_some_and(|crate::container::SchedulerOutcome(outcome)| {
+                        *outcome == detcore::TerminalOutcome::GuestDeadlock
+                    }),
                 "{target:?}: {error:#}"
             );
             assert!(

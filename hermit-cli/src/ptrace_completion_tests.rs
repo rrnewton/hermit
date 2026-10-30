@@ -856,15 +856,19 @@ fn a_terminal_outcome_completes_with_its_status_and_the_captured_output() {
 /// clean teardown completes with 121.
 #[test]
 fn a_deadlock_whose_teardown_failed_stays_hermits_failure() {
-    let primary = reverie::Error::Tool(Error::new(GuestDeadlocked::new(None)));
+    let primary = reverie::Error::Tool(Error::new(SchedulerEndedRun::new(
+        detcore::TerminalOutcome::GuestDeadlock,
+        None,
+    )));
     let captured = CapturedPrefix::default();
     for secondaries in [1, 2] {
         assert!(
-            completed_guest_deadlock::<reverie::ExitStatus>(&primary, secondaries, None).is_none(),
+            completed_terminal_outcome::<reverie::ExitStatus>(&primary, secondaries, None)
+                .is_none(),
             "{secondaries} teardown failure(s)"
         );
         assert!(
-            completed_guest_deadlock::<reverie::process::Output>(
+            completed_terminal_outcome::<reverie::process::Output>(
                 &primary,
                 secondaries,
                 Some(&captured)
@@ -878,13 +882,13 @@ fn a_deadlock_whose_teardown_failed_stays_hermits_failure() {
         FailureKind::Error
     );
     assert_eq!(
-        completed_guest_deadlock::<reverie::ExitStatus>(&primary, 0, None),
+        completed_terminal_outcome::<reverie::ExitStatus>(&primary, 0, None),
         Some(reverie::ExitStatus::Exited(
             detcore_model::HERMIT_GUEST_DEADLOCK_EXIT
         ))
     );
     assert_eq!(
-        completed_guest_deadlock::<reverie::process::Output>(&primary, 0, Some(&captured))
+        completed_terminal_outcome::<reverie::process::Output>(&primary, 0, Some(&captured))
             .map(|output| output.status),
         Some(reverie::ExitStatus::Exited(
             detcore_model::HERMIT_GUEST_DEADLOCK_EXIT
