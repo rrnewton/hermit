@@ -4133,9 +4133,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// no peer credentials (any non-`AF_UNIX` socket, whose peer pid is 0) are
     /// left as they were. Best-effort and read-only: an injection that fails
     /// leaves the socket unmarked, and nothing the guest sees changes. Only
-    /// plain runs read the mark (`polls_guest_state_only` feeds the scheduler's
-    /// idle detection; record/replay polls run as external waits), so only
-    /// they pay for it.
+    /// plain runs read the mark for the scheduler's new idle-poller detection,
+    /// so only they pay for it. Record/replay retains its earlier internal-FD
+    /// polling and FIFO-open decisions without consulting these marks.
     pub(crate) async fn classify_guest_held_peer<G: Guest<Self>>(
         &self,
         guest: &mut G,

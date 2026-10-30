@@ -17832,24 +17832,28 @@ impl Scheduler {
         // replay of a record that lists its jumps answers the same, but makes
         // only the recorded jumps (`TimeSkipMode::Driven`); a replay of an older
         // record lets only a FIFO open ask, as before (`TimeSkipMode::Legacy`).
-        let legacy = self.time_skip_mode == TimeSkipMode::Legacy;
+        // Binary record/replay keeps the prior FIFO-only policy too: no new
+        // idle-poller trigger, requester freshness rule, or poll-deadline
+        // target changes the clock of an existing recording.
+        let legacy_poll_policy =
+            self.recordreplay_modes || self.time_skip_mode == TimeSkipMode::Legacy;
         let reason = if wants_alone {
             Some(TimeSkipReason::FifoOpenAlone)
-        } else if idle_poll && !legacy {
+        } else if idle_poll && !legacy_poll_policy {
             Some(TimeSkipReason::IdleGuestPollers)
         } else {
             None
         };
         let mut alone = false;
         let others = reason.and_then(|_| {
-            if legacy {
+            if legacy_poll_policy {
                 self.alone_until_with(dtid, Some(u64::MAX), false)
             } else {
                 self.alone_until(dtid, previous_commit)
             }
         });
         if let (Some(reason), Some(others_poll_deadline)) = (reason, others) {
-            let poll_deadline = if legacy {
+            let poll_deadline = if legacy_poll_policy {
                 None
             } else {
                 others_poll_deadline
@@ -20856,6 +20860,97 @@ mod test {
                 requester: poller,
             })
         );
+    }
+
+    /// Binary record/replay retains internal pollers for FIFO-open decisions,
+    /// but the new idle-poller trigger must not change its recorded clock.
+    #[test]
+    fn record_replay_does_not_request_the_new_idle_poller_time_jump() {
+        for (recordreplay, replaying) in [(false, false), (true, false), (true, true)] {
+            let config = Config {
+                recordreplay_modes: recordreplay,
+                replaying,
+                ..Config::default()
+            };
+            let mut sched = Scheduler::new(&config);
+            assert_eq!(sched.time_skip_mode, TimeSkipMode::Compute);
+            let poller = DetTid::from_raw(3);
+            committing_idle_poller(&mut sched, poller, None);
+            assert!(
+                sched.is_idle_guest_poll(
+                    &sched.next_turns[&poller].req.try_read().unwrap().unwrap()
+                )
+            );
+            queued_poller(&mut sched, DetTid::from_raw(5), true);
+            let sleeper = DetTid::from_raw(7);
+            register_known_thread(&mut sched, sleeper);
+            sched
+                .blocked
+                .timed_waiters
+                .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+            let answer = turn_answer(&mut sched, poller);
+            assert!(matches!(answer, Some(SchedResponse::Go(_))), "{answer:?}");
+            assert_eq!(
+                sched.pending_time_skip,
+                (!recordreplay).then_some(PendingTimeSkip {
+                    reason: TimeSkipReason::IdleGuestPollers,
+                    poll_deadline: None,
+                    requester: poller,
+                }),
+                "record={recordreplay}, replay={replaying}"
+            );
+        }
+    }
+
+    /// The prior record/replay FIFO rule did not require the opener's own
+    /// previous commit to be fresh, and used only the timed-waiter deadline.
+    /// Preserve that exact decision beside an internal poller and a sleeper.
+    #[test]
+    fn record_replay_keeps_the_prior_fifo_jump_on_a_first_or_stale_commit() {
+        for replaying in [false, true] {
+            for previous in [None, Some(0)] {
+                let config = Config {
+                    recordreplay_modes: true,
+                    replaying,
+                    ..Config::default()
+                };
+                let mut sched = Scheduler::new(&config);
+                let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+                let start = global_time.lock().unwrap().as_nanos();
+                let deadline = start + LogicalTime::from_nanos(2_000_000_000);
+                sched.progress_epoch = 10;
+                sched.last_progress = 10;
+                let opener = DetTid::from_raw(3);
+                fifo_open_poll(&mut sched, opener);
+                if let Some(previous) = previous {
+                    sched.last_commit_at.insert(opener, previous);
+                } else {
+                    sched.last_commit_at.remove(&opener);
+                }
+                let mut request = sched.next_turns[&opener].req.try_read().unwrap().unwrap();
+                // Even a stray new hint cannot shorten the old FIFO jump.
+                request.poll_deadline = Some(start + LogicalTime::from_nanos(1_000_000_000));
+                sched.next_turns.get_mut(&opener).unwrap().req = Ivar::full(Ok(request));
+                queued_poller(&mut sched, DetTid::from_raw(5), true);
+                let sleeper = DetTid::from_raw(7);
+                register_known_thread(&mut sched, sleeper);
+                sched.blocked.timed_waiters.insert(deadline, sleeper);
+                let answer = turn_answer(&mut sched, opener);
+                assert!(matches!(answer, Some(SchedResponse::Go(_))), "{answer:?}");
+                let pending = PendingTimeSkip {
+                    reason: TimeSkipReason::FifoOpenAlone,
+                    poll_deadline: None,
+                    requester: opener,
+                };
+                assert_eq!(
+                    sched.pending_time_skip,
+                    Some(pending),
+                    "replay={replaying}, previous={previous:?}"
+                );
+                sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+                assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+            }
+        }
     }
 
     /// Beside a thread that can still run, an idle poller's commit requests

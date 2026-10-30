@@ -1590,6 +1590,110 @@ async fn internal_pipe_poll_authority_depends_on_revocable_guest_held_provenance
     }
 }
 
+/// Binary record/replay keeps the prior internal-FD classification used by
+/// FIFO opens, but never reads the new guest-held marks. This exercises the
+/// shared production refresh and direct poll-array classifier with a real
+/// descriptor table and guest-memory array, including clearing stale flags.
+#[test]
+fn record_replay_poll_classification_keeps_only_its_prior_internal_fd_authority() {
+    for (recordreplay, replaying) in [(false, false), (true, false), (true, true)] {
+        for kind in ["pipe", "socketpair", "eventfd", "external"] {
+            for held in [false, true] {
+                let mut guest = turn_guest(true, Some(0));
+                guest.config.recordreplay_modes = recordreplay;
+                guest.config.replaying = replaying;
+                let fd = crate::fd::DetFd::new(
+                    8,
+                    nix::fcntl::OFlag::O_RDWR,
+                    match kind {
+                        "pipe" => crate::fd::FdType::Pipe,
+                        "eventfd" => crate::fd::FdType::Eventfd,
+                        _ => crate::fd::FdType::Socket,
+                    },
+                    crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 900),
+                );
+                fd.set_physically_nonblocking();
+                if kind == "socketpair" {
+                    fd.set_socketpair_endpoint();
+                }
+                if held {
+                    fd.set_guest_held();
+                }
+                guest
+                    .thread
+                    .file_metadata
+                    .lock()
+                    .unwrap()
+                    .file_handles
+                    .insert(8, fd);
+                let mut pollfd = libc::pollfd {
+                    fd: 8,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let address = &mut pollfd as *mut libc::pollfd as usize;
+                assert_eq!(
+                    crate::syscalls::helpers::poll_targets_guest_held(&mut guest, Some(address), 1),
+                    held && !recordreplay,
+                    "{kind}, held={held}, record={recordreplay}, replay={replaying}: direct poll classifier"
+                );
+                let calls: Vec<(Syscall, bool)> = vec![
+                    (reverie::syscalls::Read::new().with_fd(8).into(), false),
+                    (reverie::syscalls::Write::new().with_fd(8).into(), false),
+                    (reverie::syscalls::Writev::new().with_fd(8).into(), false),
+                    #[cfg(target_arch = "x86_64")]
+                    (
+                        reverie::syscalls::Poll::new()
+                            .with_fds(AddrMut::from_raw(address))
+                            .with_nfds(1)
+                            .into(),
+                        true,
+                    ),
+                    (
+                        reverie::syscalls::Ppoll::new()
+                            .with_fds(AddrMut::from_raw(address))
+                            .with_nfds(1)
+                            .into(),
+                        true,
+                    ),
+                ];
+                for (call, array) in calls {
+                    let mut resources = Resources::new(THREAD);
+                    resources.polls_guest_state_only = true;
+                    resources.relies_on_guest_held_marks = true;
+                    crate::syscalls::helpers::refresh_guest_poll_state(
+                        &mut guest,
+                        call,
+                        &mut resources,
+                    );
+                    let prior_internal = !array && matches!(kind, "pipe" | "socketpair");
+                    assert_eq!(
+                        resources.polls_guest_state_only,
+                        if recordreplay { prior_internal } else { held },
+                        "{}, {kind}, held={held}, record={recordreplay}, replay={replaying}: readiness authority",
+                        call.name()
+                    );
+                    assert_eq!(
+                        resources.relies_on_guest_held_marks,
+                        held && !recordreplay,
+                        "{}, {kind}, record={recordreplay}: mark authority",
+                        call.name()
+                    );
+                }
+                let mut primitive = Resources::new(THREAD);
+                primitive.polls_guest_state_only = true;
+                crate::syscalls::helpers::refresh_guest_poll_state(
+                    &mut guest,
+                    reverie::syscalls::SchedYield::new().into(),
+                    &mut primitive,
+                );
+                assert!(primitive.polls_guest_state_only);
+                assert!(!primitive.relies_on_guest_held_marks);
+            }
+        }
+    }
+}
+
 /// D50 reader 1's waiting side, a parked pipe write, scalar and vectored:
 /// under the gate it installs no private mask (no `rt_sigprocmask` is
 /// injected), and once an attempt would wait for room, a deliverable signal

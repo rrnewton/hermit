@@ -7071,10 +7071,6 @@ impl<T> ThreadState<T> {
         fds
     }
 
-    /// Mark every listener in this table eligible for accept in turn as passed
-    /// over `SCM_RIGHTS` (`DetFd::set_exported`), for a message whose
-    /// descriptors Detcore could not read.
-    // TODO-HUMAN-REVIEW(PR-3908)
     /// Whether a descriptor of this table other than `fd` names, through a
     /// guest-held description (`DetFd::is_guest_held`), the object at host
     /// device `dev` and inode `inode`: the same socket end, or either end of
@@ -7090,6 +7086,10 @@ impl<T> ThreadState<T> {
         })
     }
 
+    /// Mark every listener in this table eligible for accept in turn as passed
+    /// over `SCM_RIGHTS` (`DetFd::set_exported`), for a message whose
+    /// descriptors Detcore could not read.
+    // TODO-HUMAN-REVIEW(PR-3908)
     pub(crate) fn mark_accept_in_turn_listeners_exported(&self) {
         for detfd in self.metadata().file_handles.values() {
             if detfd.is_accept_in_turn_eligible() {

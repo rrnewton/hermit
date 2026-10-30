@@ -1507,13 +1507,14 @@ const GUEST_HELD_POLL_MAX_FDS: usize = 1024;
 /// Linux ignores an entry with a negative descriptor. An empty array, one
 /// larger than `GUEST_HELD_POLL_MAX_FDS` or one Detcore cannot read counts as
 /// not guest-held, which keeps the call's classification as it was. It feeds
-/// only `Resources::polls_guest_state_only`.
+/// only `Resources::polls_guest_state_only`. Record/replay retains its prior
+/// classification and does not use these new guest-held marks.
 pub(crate) fn poll_targets_guest_held<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     fds: Option<usize>,
     nfds: usize,
 ) -> bool {
-    if nfds == 0 || nfds > GUEST_HELD_POLL_MAX_FDS {
+    if guest.config().recordreplay_modes || nfds == 0 || nfds > GUEST_HELD_POLL_MAX_FDS {
         return false;
     }
     let Some(address) = fds.and_then(Addr::<u8>::from_raw) else {
@@ -1534,14 +1535,17 @@ pub(crate) fn poll_targets_guest_held<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 }
 
 /// Refresh only descriptor-based idle-poll authority, independently of the
-/// syscall's record/replay routing. Pipes and socketpairs also rely on the
-/// guest-held mark: SCM export revokes that authority for queued requests.
+/// syscall's record/replay routing. In plain runs, pipes and socketpairs also
+/// rely on the guest-held mark: SCM export revokes that authority for queued
+/// requests. Record/replay retains its pre-existing internal-FD classification
+/// for FIFO-open decisions, without enabling the new idle-poller jumps.
 /// Non-FD primitives retain the proof supplied by their own handlers.
 pub(crate) fn refresh_guest_poll_state<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     call: Syscall,
     resources: &mut Resources,
 ) {
+    let recordreplay = guest.config().recordreplay_modes;
     let held = match call {
         #[cfg(target_arch = "x86_64")]
         Syscall::Poll(call) => poll_targets_guest_held(
@@ -1554,10 +1558,16 @@ pub(crate) fn refresh_guest_poll_state<G: Guest<Detcore<T>>, T: RecordOrReplay>(
             call.fds().map(|fds| fds.as_raw()),
             call.nfds() as usize,
         ),
-        _ if get_fd(call).is_some() => syscall_targets_guest_held_fd(guest, call),
+        _ if get_fd(call).is_some() => {
+            if recordreplay {
+                syscall_targets_internal_fd(guest, call)
+            } else {
+                syscall_targets_guest_held_fd(guest, call)
+            }
+        }
         _ => return,
     };
-    resources.relies_on_guest_held_marks = held;
+    resources.relies_on_guest_held_marks = held && !recordreplay;
     resources.polls_guest_state_only = held;
 }
 
