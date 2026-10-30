@@ -20107,6 +20107,116 @@ fn run_ptrace_nonleader_exec_displaces_runnable_leader() {
     nonleader_exec::run_runnable_leader();
 }
 
+/// A faithful replay of a preemption record without callback checkpoints, the
+/// form `--replay-preemptions-from` still admits from older recordings, that
+/// finds a thread past a recorded slice end refuses the run by name instead of
+/// panicking. The record is a `--chaos` recording of
+/// tests/c/chaos_spinner_and_new_thread.c with its callback checkpoints
+/// removed and six of the spinner's slice ends moved to just after the slice
+/// end before them, a nanosecond apart and still in order, so the spinner
+/// reaches one of them already past it in virtual time. Detcore used to panic
+/// there (`Cannot set end of timeslice ...`, task exit 101, hermit exit 125);
+/// the run now exits 122 with `HERMIT_REPLAY_SLICE_END_ALREADY_DUE`, keeping
+/// that detail and its hints.
+///
+/// PMU SUBJECT: the recording's slice ends come from the PMU timer, so without
+/// a PMU the recording has too few to edit and this case fails its own premise
+/// check. test.cli and test.cli_on_host skip it by exact name;
+/// privileged-test.pmu_cli_cases runs it after privileged-pmu.preemption has
+/// shown the PMU works.
+#[test]
+fn a_checkpoint_free_replay_past_a_recorded_slice_end_is_refused_by_name() {
+    let _guard = hermit_run_guard();
+    let guest = chaos_spinner_and_new_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("chaos.json");
+    let edited = directory.path().join("checkpoint-free.json");
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let recording = [
+        "run",
+        "--base-env=minimal",
+        "--epoch=2000-12-31T23:59:59Z",
+        "--chaos",
+        "--seed=1",
+        "--max-timeslice=2000",
+        &record_arg,
+        "--",
+        guest,
+    ];
+    // Both runs see only the epoch this test gives them: a harness that pins
+    // HERMIT_EPOCH would otherwise give the replay another one.
+    let recorded = hermit_test::hermit_output(
+        "checkpoint-free replay record",
+        hermit_command(&recording)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
+    assert_success(&recorded, &recording);
+
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let object = json.as_object_mut().unwrap();
+    assert!(
+        object.remove("callback_checkpoints").is_some(),
+        "the recording carries no callback checkpoints to remove"
+    );
+    let spinner = object["per_thread"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .max_by_key(|thread| thread["prio_changes"].as_array().map_or(0, Vec::len))
+        .unwrap();
+    let changes = spinner["prio_changes"].as_array_mut().unwrap();
+    assert!(
+        changes.len() > 12,
+        "the chaos recording has too few preemption points to edit: {changes:?}"
+    );
+    let before = changes[4][0].as_u64().unwrap();
+    for (offset, change) in changes[5..11].iter_mut().enumerate() {
+        change[0] = (before + offset as u64 + 1).into();
+    }
+    fs::write(&edited, json.to_string()).unwrap();
+
+    let replay_arg = format!("--replay-preemptions-from={}", edited.display());
+    let replay = [
+        "run",
+        "--base-env=minimal",
+        "--chaos",
+        "--seed=1",
+        "--max-timeslice=2000",
+        &replay_arg,
+        "--",
+        guest,
+    ];
+    let replayed = hermit_test::hermit_output(
+        "checkpoint-free replay",
+        hermit_command(&replay)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
+    let stderr = stderr(&replayed);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    // EXIT-CLASS: hermit
+    assert_eq!(replayed.status.code(), Some(122), "{stderr}");
+    assert!(
+        stderr.contains("HERMIT_REPLAY_SLICE_END_ALREADY_DUE: dtid "),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "the thread is already at or past this row's recorded end, in a record \
+             without callback checkpoints. Cannot set end of timeslice to "
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("needs --replay-edited-preemptions."),
+        "{stderr}"
+    );
+}
+
 /// The panic of <https://github.com/rrnewton/hermit/issues/3413>, end to end.
 ///
 /// A `--chaos` recording carries per-thread preemption points: timeslice ends

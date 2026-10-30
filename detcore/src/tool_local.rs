@@ -7307,6 +7307,34 @@ impl<T> ThreadState<T> {
         );
     }
 
+    /// Stop a faithful `--replay-preemptions-from` replay that finds this
+    /// thread already at or past the recorded end of the slice it would
+    /// start, by RCB count or by virtual time: main's own boundary, unchanged.
+    /// The run no longer follows the record, and `reason` says which end and
+    /// why. A callback-annotated record (`Config::annotated_priority_replay`)
+    /// keeps the task panic: its checkpoints normally refuse a departure by
+    /// name before any end is due. A record without callback checkpoints,
+    /// which `--replay-preemptions-from` still admits, ends the run with
+    /// `HERMIT_REPLAY_SLICE_END_ALREADY_DUE` instead, naming the
+    /// priority-history row. Either is decided from the record and this
+    /// thread's virtual time and RCB count alone.
+    fn stop_at_due_replay_end(&self, cfg: &Config, reason: std::fmt::Arguments<'_>) -> ! {
+        use crate::preemptions::callback_history::ActiveRow;
+        if cfg.annotated_priority_replay {
+            panic!("{reason}");
+        }
+        let row = match self.active_priority_row() {
+            Some(ActiveRow::Row(row)) => row.to_string(),
+            row => format!("{row:?}"),
+        };
+        refuse_due_replay_end(format_args!(
+            "HERMIT_REPLAY_SLICE_END_ALREADY_DUE: dtid {} priority-history row {row}: the thread \
+             is already at or past this row's recorded end, in a record without callback \
+             checkpoints. {reason}",
+            self.dettid,
+        ))
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     /// Choose the logical target and PMU maximum deadlines for the next timeslice.
     ///
@@ -7428,11 +7456,14 @@ impl<T> ThreadState<T> {
                         if let Some(target_rcbs) = replay_rcb_end
                             && target_rcbs < current_rcbs
                         {
-                            panic!(
-                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}. \
-                                 An edited record, not the recording of this run's schedule, needs \
-                                 --replay-edited-preemptions.",
-                                target_rcbs, self.dettid, current_rcbs
+                            self.stop_at_due_replay_end(
+                                cfg,
+                                format_args!(
+                                    "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}. \
+                                     An edited record, not the recording of this run's schedule, needs \
+                                     --replay-edited-preemptions.",
+                                    target_rcbs, self.dettid, current_rcbs
+                                ),
                             )
                         }
                         let exact_deadline_is_now =
@@ -7448,13 +7479,16 @@ impl<T> ThreadState<T> {
                             // reaching this with such a record means the replay
                             // really diverged. A record without an epoch cannot
                             // be checked up front; say what usually causes it.
-                            panic!(
-                                "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}. \
-                                 The replayed preemption record's timeslice ends are absolute virtual times; if it was \
-                                 recorded under a different virtual-time epoch, replay it with that --epoch \
-                                 (https://github.com/rrnewton/hermit/issues/3413). An edited record, not the \
-                                 recording of this run's schedule, needs --replay-edited-preemptions.",
-                                end_time, self.dettid, current_ns
+                            self.stop_at_due_replay_end(
+                                cfg,
+                                format_args!(
+                                    "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}. \
+                                     The replayed preemption record's timeslice ends are absolute virtual times; if it was \
+                                     recorded under a different virtual-time epoch, replay it with that --epoch \
+                                     (https://github.com/rrnewton/hermit/issues/3413). An edited record, not the \
+                                     recording of this run's schedule, needs --replay-edited-preemptions.",
+                                    end_time, self.dettid, current_ns
+                                ),
                             )
                         }
                         self.end_of_timeslice = Some(end_time);
@@ -7663,6 +7697,17 @@ impl<T> ThreadState<T> {
     pub fn guest_past_first_execve(&self) -> bool {
         self.past_global_first_execve
     }
+}
+
+/// End the run with a named refusal (`exit_on_scheduler_refusal`) for a
+/// faithful replay at or past a recorded slice end
+/// (`ThreadState::stop_at_due_replay_end`); a unit test sees it as a panic
+/// with the same text.
+fn refuse_due_replay_end(refusal: std::fmt::Arguments<'_>) -> ! {
+    #[cfg(test)]
+    panic!("{refusal}");
+    #[cfg(not(test))]
+    crate::scheduler::exit_on_scheduler_refusal(&refusal)
 }
 
 /// The first recorded slice of an edited record (`--replay-edited-preemptions`)
@@ -9112,6 +9157,138 @@ mod timeslice_tests {
     #[test]
     fn a_faithful_replay_past_larger_rcb_ends_stops_with_skid_panic_enabled() {
         assert_faithful_rcb_ends_stop(true);
+    }
+
+    /// A faithful replay of a record without callback checkpoints that finds
+    /// a thread past a recorded slice end, by its RCB count or by its virtual
+    /// time, refuses the run with `HERMIT_REPLAY_SLICE_END_ALREADY_DUE`,
+    /// naming the row, instead of a task panic
+    /// (`ThreadState::stop_at_due_replay_end`). A callback-annotated record
+    /// keeps the panic's text unchanged: its checkpoints normally refuse a
+    /// departure before it gets here.
+    #[test]
+    fn a_checkpoint_free_replay_past_a_recorded_end_refuses_by_name() {
+        let message_of = |run: &mut dyn FnMut()| {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+                .expect_err("a faithful replay must not pass a recorded end");
+            panic.downcast_ref::<String>().unwrap().clone()
+        };
+        let refusal = "HERMIT_REPLAY_SLICE_END_ALREADY_DUE: dtid 5 priority-history row 0: \
+                       the thread is already at or past this row's recorded end, in a record \
+                       without callback checkpoints. ";
+        for annotated_priority_replay in [false, true] {
+            let config = Config {
+                target_timeslice: nz(10_000),
+                max_timeslice: nz(100_000),
+                annotated_priority_replay,
+                ..Default::default()
+            };
+            // Past the row's RCB target.
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let now = state.thread_logical_time.as_nanos();
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_prio_changes(vec![
+                        (now + Duration::from_nanos(100), DEFAULT_PRIORITY),
+                        (now + Duration::from_nanos(200), DEFAULT_PRIORITY),
+                    ])
+                    .with_preemption_rcbs(vec![40, 80])
+                    .into_iter(),
+            );
+            state.committed_clock_value = 51;
+            let rcbs = message_of(&mut || {
+                state.next_timeslice(&config);
+            });
+            // Past the row's end time, its RCB target still ahead.
+            let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+                .thread_logical_time
+                .as_nanos();
+            let history = ThreadHistory::new()
+                .with_prio_changes(vec![
+                    (start + Duration::from_nanos(100), DEFAULT_PRIORITY),
+                    (start + Duration::from_nanos(10_000), DEFAULT_PRIORITY),
+                ])
+                .with_preemption_rcbs(vec![20, 40]);
+            let time = message_of(&mut || {
+                replay_from_500ns(&config, history.clone());
+            });
+            for (message, reason) in [
+                (
+                    &rcbs,
+                    "Cannot set RCB end of timeslice to 40 for thread 5, when current RCB count is already 51. ",
+                ),
+                (&time, "Cannot set end of timeslice to "),
+            ] {
+                let expected = if annotated_priority_replay {
+                    reason.to_owned()
+                } else {
+                    format!("{refusal}{reason}")
+                };
+                assert!(message.starts_with(&expected), "{message}");
+                assert!(
+                    message.contains("needs --replay-edited-preemptions."),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    /// The boundary is main's, unchanged, and inclusive in time: a recorded
+    /// end exactly at the thread's virtual time is already due. A time-only
+    /// row at its end, and a row at its end time whose RCB target is still
+    /// ahead, are refused like a passed end (a task panic for an annotated
+    /// record). A row whose RCB target the thread has reached exactly is main's
+    /// equal-RCB exception (`exact_deadline_is_now`): it installs as an instant
+    /// slice and the replay goes on, in either mode.
+    #[test]
+    fn a_checkpoint_free_replay_at_a_recorded_end_is_refused_unless_its_rcb_target_is_reached() {
+        let message_of = |run: &mut dyn FnMut()| {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+                .expect_err("a recorded end already due must not be installed");
+            panic.downcast_ref::<String>().unwrap().clone()
+        };
+        let refusal = "HERMIT_REPLAY_SLICE_END_ALREADY_DUE: dtid 5 priority-history row 0: \
+                       the thread is already at or past this row's recorded end, in a record \
+                       without callback checkpoints. Cannot set end of timeslice to ";
+        for annotated_priority_replay in [false, true] {
+            let config = Config {
+                target_timeslice: nz(10_000),
+                max_timeslice: nz(100_000),
+                annotated_priority_replay,
+                ..Default::default()
+            };
+            // A thread at virtual time `now` with 10 committed RCBs, replaying
+            // one row that ends at `now` with RCB target `rcbs`.
+            let at_its_end = |rcbs: Option<u64>| {
+                let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+                let now = state.thread_logical_time.as_nanos();
+                state.committed_clock_value = 10;
+                state.preemption_points = Some(
+                    ThreadHistory::new()
+                        .with_prio_changes(vec![(now, DEFAULT_PRIORITY + 1)])
+                        .with_preemption_rcbs(rcbs.into_iter().collect())
+                        .into_iter(),
+                );
+                (state, now)
+            };
+            for rcbs in [None, Some(11)] {
+                let (mut state, _) = at_its_end(rcbs);
+                let message = message_of(&mut || {
+                    state.next_timeslice(&config);
+                });
+                let expected = if annotated_priority_replay {
+                    "Cannot set end of timeslice to "
+                } else {
+                    refusal
+                };
+                assert!(message.starts_with(expected), "{rcbs:?}: {message}");
+            }
+            let (mut state, now) = at_its_end(Some(10));
+            assert_eq!(state.next_timeslice(&config), Some(DEFAULT_PRIORITY + 1));
+            assert_eq!(state.end_of_timeslice, Some(now));
+            assert_eq!(state.replay_rcb_end, Some(10));
+            assert!(state.timeslice_expired());
+        }
     }
 
     /// Edited histories retain the semantics of

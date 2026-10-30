@@ -530,7 +530,10 @@ Advanced investigations can save preemption decisions with
 `--replay-preemptions-from=FILE`. A record edited after it was recorded (for
 example, with preemptions removed, as `hermit analyze --minimize` does) can
 bring a thread to recorded slices that have already ended. A faithful replay
-never does, so Hermit stops it there; add `--replay-edited-preemptions` to skip
+never does, so Hermit stops it there (for a record without callback
+checkpoints, with `HERMIT_REPLAY_SLICE_END_ALREADY_DUE`, exit 122, naming the
+row whose recorded end the thread is at or past); add
+`--replay-edited-preemptions` to skip
 those slices and go on with the first recorded slice still ahead, at its
 priority (at a thread's start, the record's first priority holds until that
 slice ends). `hermit analyze` adds it to the records it edits.
