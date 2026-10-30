@@ -22006,6 +22006,7 @@ mod test {
                         start_rip: None,
                         end_rip: detcore_model::schedule::InstructionPointer::new(12345),
                         end_time: Some(LogicalTime::from_nanos(123)),
+                        instruction_offset: None,
                     };
                     let mut sched = plain_replay_with_writer(vec![terminal.clone(), next.clone()]);
                     if boundary {
