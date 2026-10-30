@@ -652,6 +652,7 @@ fn combined_output(output: &Output) -> String {
 
 fn assert_no_refusal_report(output: &Output, report: &Path) -> String {
     let combined = combined_output(output);
+    // EXIT-CLASS: hermit (the policy refusal's own exit status)
     assert_eq!(output.status.code(), Some(122), "{combined}");
     assert!(
         combined.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
@@ -708,6 +709,8 @@ fn completed_refusal_fixture_seed(guest: &Path) -> u64 {
                 assert!(combined.contains("b-first"), "{combined}");
                 return seed;
             }
+            // EXIT-CLASS: guest. The a-first fixture guest exits 122 itself;
+            // the assertion above refuses a hermit policy refusal here.
             Some(122) => assert!(combined.contains("a-first"), "{combined}"),
             status => panic!("seed {seed}: unexpected setup status {status:?}\n{combined}"),
         }
@@ -770,6 +773,7 @@ fn analyze_ends_with_a_refused_target_run() {
         .arg(hermit_test::hermit_binary())
         .args(["run", "--timeout=3", "--", "/bin/sh", "-c", "exit 122"]);
     let ordinary = hermit_test::hermit_output("ordinary guest exit 122", &mut ordinary);
+    // EXIT-CLASS: guest. The guest's own `exit 122`, forwarded by hermit.
     assert_eq!(ordinary.status.code(), Some(122));
     assert!(!combined_output(&ordinary).contains("HERMIT_POLICY_REFUSAL"));
 

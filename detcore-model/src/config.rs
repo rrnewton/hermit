@@ -3415,7 +3415,7 @@ mod legacy_backend_json {
     /// `eager_lone_preemptions` came after it too. DBT has no PMU timer, so
     /// the option has no effect there; it is never written and reads as
     /// false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 39] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 40] = [
         // `chaos_timeslice_range` came after it too: the scheduler draws the
         // slices, not the runtime, so it is never written and reads as unset.
         // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
@@ -3423,6 +3423,9 @@ mod legacy_backend_json {
         // `guest_ids` came after it too: DBT numbers its guest itself, so it
         // is never written and reads as `GuestIds::Namespace`, its serde
         // default.
+        // `detlog_anon` came after it too: a coordinator-side ptrace-only
+        // diagnostic the other backends refuse, so it is never written and
+        // reads as absent, its serde default.
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3462,6 +3465,7 @@ mod legacy_backend_json {
         "chaos_timeslice_draw",
         "chaos_timeslice",
         "guest_ids",
+        "detlog_anon",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3621,6 +3625,7 @@ mod legacy_backend_json {
                 Some(
                     "in_guest_detlog_forward_policy"
                     | "launch_image"
+                    | "detlog_anon"
                     | "scheduler_turn_cost"
                     | "virtual_timeout"
                     | "pipe_wake_latency"
@@ -3949,7 +3954,8 @@ mod legacy_backend_json {
                 | "chaos_timeslice_range"
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"
-                | "guest_ids" => Ok(()),
+                | "guest_ids"
+                | "detlog_anon" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -4747,8 +4753,8 @@ mod tests {
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
     /// `scheduler_turn_cost`, `cap_preemption_charge`,
-    /// `inherited_seccomp` or `replay_edited_preemptions`, which is the
-    /// key order the encoder writes.
+    /// `inherited_seccomp`, `replay_edited_preemptions` or `detlog_anon`,
+    /// which is the key order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -4800,7 +4806,8 @@ mod tests {
                 | "chaos_timeslice_range"
                 | "chaos_timeslice_draw"
                 | "chaos_timeslice"
-                | "guest_ids" => {}
+                | "guest_ids"
+                | "detlog_anon" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -4832,11 +4839,11 @@ mod tests {
         // `annotated_priority_replay`, `virtual_cpus`, `replay_edited_preemptions`,
         // `notice_host_network_abstract_binds`, `eager_lone_preemptions`,
         // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
-        // `guest_ids`, `virtual_timeout` and `strict_schedule_boundaries`
-        // none: fourteen more keys and thirty-eight fewer, so twenty-four keys fewer
-        // than fields.
+        // `guest_ids`, `virtual_timeout`, `detlog_anon` and
+        // `strict_schedule_boundaries` none: fourteen more keys and
+        // thirty-nine fewer, so twenty-five keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 24);
+        assert_eq!(fields.len(), keys.len() + 25);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
