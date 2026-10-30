@@ -149,6 +149,9 @@ mod tests {
         // Retypes `GlobalResponse::StartNewThread`: the boxed history, the
         // first slice and its instruction offset.
         (20, "546b33a36932da9a", "846052997d97693f"),
+        // Retypes `GlobalResponse::StartNewThread`: the thread's replay
+        // history with its check-in marks (#4902).
+        (21, "c954a325eabb4ddc", "846052997d97693f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
