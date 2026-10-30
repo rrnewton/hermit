@@ -3999,7 +3999,10 @@ mod legacy_backend_json {
     /// as well, so it is never written and reads as off.
     /// `stacktrace_at_schedule_positions` came after it too. It is never
     /// written and reads as false: the DBT runtime takes no stack traces.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 52] = [
+    /// `chaos_instruction_offset` came after it as well: the ptrace backend's
+    /// precise timer takes its single steps, and `hermit run` refuses it on
+    /// every other backend, so it is never written and reads as 0.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 53] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4052,6 +4055,7 @@ mod legacy_backend_json {
         "rewrite_exclusives_in_memory",
         "count_store_exclusives",
         "stacktrace_at_schedule_positions",
+        "chaos_instruction_offset",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -4205,9 +4209,9 @@ mod legacy_backend_json {
                     | "stacktrace_at_schedule_positions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
-                Some("in_guest_reserved_signals" | "access_trace_from") => {
-                    seed.deserialize(U64Deserializer::new(0)).map(Some)
-                }
+                Some(
+                    "in_guest_reserved_signals" | "access_trace_from" | "chaos_instruction_offset",
+                ) => seed.deserialize(U64Deserializer::new(0)).map(Some),
                 // On, as its serde default is.
                 Some("signal_state_copy") => {
                     seed.deserialize(BoolDeserializer::new(true)).map(Some)
@@ -4563,7 +4567,8 @@ mod legacy_backend_json {
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
                 | "count_store_exclusives"
-                | "stacktrace_at_schedule_positions" => Ok(()),
+                | "stacktrace_at_schedule_positions"
+                | "chaos_instruction_offset" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -5560,7 +5565,8 @@ mod tests {
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
                 | "count_store_exclusives"
-                | "stacktrace_at_schedule_positions" => {}
+                | "stacktrace_at_schedule_positions"
+                | "chaos_instruction_offset" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -5599,11 +5605,11 @@ mod tests {
         // `access_trace_max_bytes`, `replay_continue_fairly`,
         // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
-        // `stacktrace_at_schedule_positions`
+        // `stacktrace_at_schedule_positions`, `chaos_instruction_offset`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-one fewer, so thirty-seven keys fewer than fields.
+        // fifty-two fewer, so thirty-eight keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 37);
+        assert_eq!(fields.len(), keys.len() + 38);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5888,6 +5894,51 @@ mod tests {
         assert_eq!(
             from_legacy_backend_json(&array).unwrap().guest_ids,
             crate::pid::GuestIds::Namespace
+        );
+    }
+
+    /// `chaos_instruction_offset` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads back as 0 from
+    /// both the object and the array form.
+    #[test]
+    fn chaos_instruction_offset_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            chaos: true,
+            chaos_instruction_offset: 16,
+            ..off.clone()
+        };
+        let chaos = Config {
+            chaos: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&chaos).unwrap());
+        assert!(!json.contains("chaos_instruction_offset"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        assert!(
+            !to_legacy_backend_json(&off)
+                .unwrap()
+                .contains("chaos_instruction_offset")
         );
     }
 
