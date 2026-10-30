@@ -25,6 +25,7 @@ use serde::de::value::SeqAccessDeserializer;
 use serde::de::value::StringDeserializer;
 use serde::ser::SerializeMap;
 
+use super::BackgroundStart;
 use super::HostObservedCount;
 use super::PreemptionRecord;
 use super::ThreadHistory;
@@ -67,6 +68,12 @@ struct RawRecord {
     host_inputs: Option<HostInputSet>,
     #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    background_starts: Vec<BackgroundStart>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
@@ -443,6 +450,156 @@ mod tests {
                     marker
                 );
             }
+        }
+    }
+
+    /// `rejoins` (rrnewton/hermit#4751) reads back from a flat record written
+    /// before the record's serde moved into `RawRecord`, and survives writing
+    /// and reading the current form, plain and inside the incomplete-record
+    /// envelope, and the whole record compares equal each time. So do the
+    /// popped events a readmission names: an empty list
+    /// is written, so that it stays apart from a readmission that names none
+    /// (`None`, as in older records), which is not. Likewise a record whose
+    /// run logged no readmission keeps its empty list, apart from a record
+    /// written before the field existed, which reads as having none.
+    #[test]
+    fn rejoins_round_trip_through_the_record_serde() {
+        let old =
+            r#"{"per_thread":{},"global":[],"rejoins":[{"turn":4,"wakes":1,"calls":[[3,2]]}]}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        let expected = vec![crate::scheduler::rejoin_log::Rejoin {
+            turn: 4,
+            wakes: 1,
+            calls: vec![(DetTid::from_raw(3), 2)],
+            popped: None,
+        }];
+        assert_eq!(record.rejoins.as_ref(), Some(&expected));
+        let mut whole = PreemptionRecord::from_sched_events(Vec::new());
+        whole.rejoins = Some(expected.clone());
+        assert_eq!(record, whole);
+        for marker in [None, Some(7)] {
+            let mut copy = record.clone();
+            copy.replay_departed_at = marker;
+            let written = serde_json::to_string(&copy).unwrap();
+            let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(read.rejoins.as_ref(), Some(&expected), "{written}");
+            assert_eq!(read.replay_departed_at(), marker, "{written}");
+            assert_eq!(read, copy, "{written}");
+        }
+
+        use crate::scheduler::rejoin_log::PoppedEvent;
+        use crate::scheduler::rejoin_log::TimedEventId;
+        let mut named = record;
+        named.rejoins = Some(vec![
+            crate::scheduler::rejoin_log::Rejoin {
+                popped: Some(vec![
+                    PoppedEvent {
+                        event: TimedEventId::Thread(DetTid::from_raw(5)),
+                        deadline: crate::types::LogicalTime::from_nanos(1_000),
+                    },
+                    PoppedEvent {
+                        event: TimedEventId::Posix(crate::types::DetPid::from_raw(3), 1),
+                        deadline: crate::types::LogicalTime::from_nanos(2_500),
+                    },
+                ]),
+                ..expected[0].clone()
+            },
+            crate::scheduler::rejoin_log::Rejoin {
+                turn: 5,
+                popped: Some(Vec::new()),
+                ..expected[0].clone()
+            },
+            crate::scheduler::rejoin_log::Rejoin {
+                turn: 6,
+                ..expected[0].clone()
+            },
+        ]);
+        for marker in [None, Some(7)] {
+            let mut copy = named.clone();
+            copy.replay_departed_at = marker;
+            let written = serde_json::to_string(&copy).unwrap();
+            assert_eq!(written.matches(r#""popped":"#).count(), 2, "{written}");
+            let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(read.rejoins, named.rejoins, "{written}");
+            assert_eq!(read, copy, "{written}");
+        }
+
+        let fresh = PreemptionWriter::new(None).into_string();
+        assert!(fresh.contains(r#""rejoins":[]"#), "{fresh}");
+        let mut logged_none = named;
+        logged_none.rejoins = Some(Vec::new());
+        for marker in [None, Some(7)] {
+            let mut copy = logged_none.clone();
+            copy.replay_departed_at = marker;
+            let written = serde_json::to_string(&copy).unwrap();
+            assert!(written.contains(r#""rejoins":[]"#), "{written}");
+            let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(read.rejoins, Some(Vec::new()), "{written}");
+            assert_eq!(read, copy, "{written}");
+        }
+        for older in [
+            r#"{"per_thread":{},"global":[]}"#,
+            r#"{"incomplete_preemption_record":{"version":1,"replay_departed_at":0,"record":{"per_thread":{},"global":[]}}}"#,
+        ] {
+            let read: PreemptionRecord = serde_json::from_str(older).unwrap();
+            assert_eq!(read.rejoins, None, "{older}");
+            let mut whole = PreemptionRecord::from_sched_events(Vec::new());
+            whole.replay_departed_at = read.replay_departed_at;
+            assert_eq!(read, whole, "{older}");
+        }
+    }
+
+    /// `format_version` (rrnewton/hermit#4847) reads back from a flat record
+    /// written before the record's serde moved into `RawRecord`, and survives
+    /// writing and reading the current form, plain and inside the
+    /// incomplete-record envelope, and the whole record compares equal each
+    /// time.
+    #[test]
+    fn format_version_round_trips_through_the_record_serde() {
+        let format = crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        let old = format!(r#"{{"per_thread":{{}},"global":[],"format_version":{format}}}"#);
+        let record: PreemptionRecord = serde_json::from_str(&old).unwrap();
+        assert_eq!(record.format_version, Some(format));
+        let mut whole = PreemptionRecord::from_sched_events(Vec::new());
+        whole.format_version = Some(format);
+        assert_eq!(record, whole);
+        for marker in [None, Some(7)] {
+            let mut copy = record.clone();
+            copy.replay_departed_at = marker;
+            let written = serde_json::to_string(&copy).unwrap();
+            let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(read.format_version, Some(format), "{written}");
+            assert_eq!(read.replay_departed_at(), marker, "{written}");
+            assert_eq!(read, copy, "{written}");
+        }
+    }
+
+    /// `background_starts` (rrnewton/hermit#4847) reads back from a flat
+    /// record written before the record's serde moved into `RawRecord`, and
+    /// survives writing and reading the current form, plain and inside the
+    /// incomplete-record envelope, and the whole record compares equal each
+    /// time.
+    #[test]
+    fn background_starts_round_trip_through_the_record_serde() {
+        let old = r#"{"per_thread":{},"global":[],"background_starts":[{"after":1,"thread":3,"call":2}]}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        let expected = vec![BackgroundStart {
+            after: 1,
+            thread: DetTid::from_raw(3),
+            call: 2,
+        }];
+        assert_eq!(record.background_starts, expected);
+        let mut whole = PreemptionRecord::from_sched_events(Vec::new());
+        whole.background_starts = expected.clone();
+        assert_eq!(record, whole);
+        for marker in [None, Some(7)] {
+            let mut copy = record.clone();
+            copy.replay_departed_at = marker;
+            let written = serde_json::to_string(&copy).unwrap();
+            let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(read.background_starts, expected, "{written}");
+            assert_eq!(read.replay_departed_at(), marker, "{written}");
+            assert_eq!(read, copy, "{written}");
         }
     }
 }
