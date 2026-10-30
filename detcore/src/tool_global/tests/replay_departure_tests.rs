@@ -126,7 +126,7 @@ async fn stale_filing_cleanup(stale: bool) -> (anyhow::Result<()>, Option<u64>, 
             if stale {
                 current
             } else {
-                current - Duration::from_nanos(1)
+                epoch + Duration::from_nanos(9_999)
             },
         ),
         Ok(()),
