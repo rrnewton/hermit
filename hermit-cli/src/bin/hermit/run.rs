@@ -618,6 +618,24 @@ fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'
     }
 }
 
+/// Whether the harness volatile-file fallback may name a divergence on
+/// `backend`: only backends that lack Detcore host-input attribution —
+/// exactly the non-`passthru_opt` `Some` arms of
+/// [`unobserved_guest_execution`] (DBT, SaBRe, LiteInst, in-guest-trap).
+/// ptrace/e9patch/KVM observe every open Detcore subscribes to and
+/// already produce placed Detcore evidence (and retry on it), so the
+/// harness must not supplement them: a replacement that merely
+/// coincides with a genuine nondeterminism would launder it into a
+/// retry. `--passthru-opt` does not widen this set — it disables
+/// Detcore attribution on every backend, which is a reason to name
+/// nothing, not to let the coarser harness predicate name it instead.
+fn harness_fallback_applies(backend: Backend) -> bool {
+    matches!(
+        backend,
+        Backend::Dbt | Backend::Sabre | Backend::Liteinst | Backend::InGuestTrap
+    )
+}
+
 /// Reverie ptrace's private page, `[start, end)`, which Reverie maps in every
 /// guest process (reverie-ptrace `cp::PRIVATE_PAGE_OFFSET` and
 /// `cp::PRIVATE_PAGE_SIZE`, which that crate keeps private). It holds the
@@ -4467,6 +4485,29 @@ fn passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend() {
             unobserved_guest_execution(backend, false).is_some(),
             "{backend:?}"
         );
+    }
+}
+
+/// Conclude-level gate: the harness fallback applies exactly to the
+/// backends lacking Detcore attribution, never to ptrace/e9patch/KVM.
+/// Combined with `effective_host_input_change` (lib tests: DBT-style +
+/// diverged + swap yields evidence; ptrace-style yields none), this is
+/// the gate `conclude_verification` consults.
+#[test]
+fn harness_fallback_applies_only_without_detcore_attribution() {
+    for backend in [
+        Backend::Dbt,
+        Backend::Sabre,
+        Backend::Liteinst,
+        Backend::InGuestTrap,
+    ] {
+        assert!(harness_fallback_applies(backend), "{backend:?}");
+        // Same set as the non-passthru unobserved set.
+        assert!(unobserved_guest_execution(backend, false).is_some());
+    }
+    for backend in [Backend::Ptrace, Backend::E9patch, Backend::Kvm] {
+        assert!(!harness_fallback_applies(backend), "{backend:?}");
+        assert_eq!(unobserved_guest_execution(backend, false), None);
     }
 }
 
@@ -13048,6 +13089,11 @@ impl RunOpts {
         run1_options.fatal_core_run_label = Some("run1");
         run2_options.fatal_core_run_label = Some("run2");
 
+        // Volatile captures bracket each run's container setup (see
+        // `harness_host_input_change`): `before` here, before run 1's
+        // setup; `mid` after run 1, before run 2's setup; `after` after
+        // run 2. A replacement before->mid is the run-1 window
+        // (including post-processing), mid->after the run-2 window.
         let volatile_before = VolatileHostInputs::capture_volatile();
         // Captured BEFORE run 1 so the same values can be put back before run 2.
         // See the restore call below for the measurement this exists for.
@@ -13195,6 +13241,7 @@ impl RunOpts {
             .map(take_verify_summary_before_next_run)
             .transpose()?
             .flatten();
+        // After run 1 (incl. post-processing), before run 2's setup.
         let volatile_mid = VolatileHostInputs::capture_volatile();
         let host_inputs1 = host_inputs_path.as_deref().map(read_host_inputs);
         if let Some(file) = &host_inputs_file {
@@ -13373,6 +13420,7 @@ impl RunOpts {
             .map(|(first, second)| super::backends::DbtVerificationComparison::new(first, second));
 
         let summary2 = summary2_path.and_then(read_verify_summary);
+        // After run 2: closes the run-2 window opened by `volatile_mid`.
         let volatile_after = VolatileHostInputs::capture_volatile();
         let outcome = conclude_verification(
             VerificationConclusion {
@@ -15473,9 +15521,11 @@ pub(super) struct VerificationConclusion<'a> {
     pub(super) backend: Backend,
     /// Whether both runs used `--passthru-opt`.
     pub(super) passthru_opt: bool,
-    /// Harness-observed volatile change (`/etc/ld.so.cache`, `/etc/group`)
-    /// across the pair, for backends whose loader reads them before
-    /// Detcore records opens (DBT). Same typed evidence as Detcore's.
+    /// Harness-observed volatile replacement (`/etc/ld.so.cache`,
+    /// `/etc/group`) across the pair, for backends whose loader reads
+    /// them before Detcore records opens. Same typed evidence as
+    /// Detcore's; consumed in `conclude_verification` only when
+    /// `harness_fallback_applies(backend)`.
     pub(super) harness_host_input_change: Option<hermit::canonical_verdict::InfrastructureError>,
 }
 
@@ -15610,13 +15660,16 @@ pub(super) fn conclude_verification(
             }
             unobserved.is_none()
         });
-    // Backend-independent fallback: harness stat'ed the volatile files
-    // around each run, so a change there is host-side even when the
-    // backend's loader read it before Detcore could record an open.
+    // Harness fallback, only for backends lacking Detcore host-input
+    // attribution (`harness_fallback_applies`): the harness stat'ed the
+    // volatile files around each run, so a replacement there is
+    // host-side even when the backend's loader read it before Detcore
+    // could record an open. ptrace/KVM keep the Detcore-only path above.
     let host_input_change = hermit::host_input_change::effective_host_input_change(
         host_input_change,
         harness_host_input_change,
         outcome.verdict == Verdict::Diverged,
+        harness_fallback_applies(backend),
     );
 
     // Emit the machine-readable verdict (if requested) before collapsing the

@@ -299,7 +299,25 @@ fn finished_open(human: &str) -> Option<(u64, u64)> {
 /// the dynamic-linker cache (read by every loader, including DBT's, before
 /// Detcore interception) and the group database (frozen for the guest, but
 /// read by host-side launchers). The harness snapshots these itself.
+///
+/// Only a REPLACEMENT is named, matching the Detcore pattern walk
+/// ([`find_pattern_difference`]): a new `(dev, ino)`, or the file appearing
+/// or disappearing. An in-place change of size or mtime that keeps the
+/// host inode is not named — it does not shift Hermit's deterministic
+/// inode numbering, and naming it would launder a genuine divergence that
+/// merely coincides with a touch (see
+/// `a_change_that_keeps_the_host_inode_is_not_named`).
 pub const VOLATILE_HOST_INPUT_PATHS: [&str; 2] = ["/etc/ld.so.cache", "/etc/group"];
+
+/// Identity reported for the absent side of an appearance/disappearance.
+/// No real file has inode 0, so this cannot be mistaken for a present file.
+pub const ABSENT_HOST_FILE_IDENTITY: HostFileIdentity = HostFileIdentity {
+    dev: 0,
+    ino: 0,
+    size: 0,
+    mtime_sec: 0,
+    mtime_nsec: 0,
+};
 
 /// Host identity of `path` now, or `None` when it cannot be stat'ed.
 pub fn host_file_identity(path: &Path) -> Option<HostFileIdentity> {
@@ -332,19 +350,34 @@ impl VolatileHostInputs {
     pub fn capture_volatile() -> Self {
         Self::capture(&VOLATILE_HOST_INPUT_PATHS.map(Path::new))
     }
+    /// First replacement between two captures: a different `(dev, ino)`,
+    /// or a present<->absent transition (reported against
+    /// [`ABSENT_HOST_FILE_IDENTITY`]). An in-place size/mtime change that
+    /// keeps the inode is not a replacement and is not returned.
     fn changed(&self, other: &Self) -> Option<(String, HostFileIdentity, HostFileIdentity)> {
         self.entries
             .iter()
             .zip(&other.entries)
             .find_map(|((p, a), (_, b))| match (a, b) {
-                (Some(a), Some(b)) if a != b => Some((p.clone(), *a, *b)),
+                (Some(a), Some(b)) if (a.dev, a.ino) != (b.dev, b.ino) => Some((p.clone(), *a, *b)),
+                (Some(a), None) => Some((p.clone(), *a, ABSENT_HOST_FILE_IDENTITY)),
+                (None, Some(b)) => Some((p.clone(), ABSENT_HOST_FILE_IDENTITY, *b)),
                 _ => None,
             })
     }
 }
 
-/// First volatile change across a verify pair: `before`->`mid` is run 1,
-/// `mid`->`after` is run 2. Same typed evidence as the Detcore path.
+/// First volatile replacement across a verify pair, as an evidence
+/// window pair. The captures bracket each run's container setup, not
+/// just guest execution: `before` is taken before run 1's setup, `mid`
+/// after run 1 finishes (including its post-processing) and before
+/// run 2's setup, and `after` after run 2 finishes. So `before`->`mid`
+/// is the run-1 window and `mid`->`after` is the run-2 window, and the
+/// [`VerificationRun`] in the evidence names that window. That field
+/// keeps the semantics the manifest runner's retry reason consumes
+/// ("changed during run N"); it does not claim the replacement
+/// happened while the guest itself was executing. Same typed evidence
+/// as the Detcore path.
 pub fn harness_host_input_change(
     before: &VolatileHostInputs,
     mid: &VolatileHostInputs,
@@ -368,15 +401,23 @@ pub fn harness_host_input_change(
 }
 
 /// Effective evidence for a pair: Detcore's placed change wins; otherwise
-/// the harness volatile change, only on divergence. Stateless — the
-/// one-retry budget is the caller's (manifest runner), so a second
-/// divergence with this evidence stays a failure, never a loop.
+/// the harness volatile change, only on divergence and only when
+/// `harness_applies` — i.e. the backend lacks Detcore host-input
+/// attribution (DBT, SaBRe, LiteInst, in-guest-trap; see
+/// `unobserved_guest_execution` in the CLI). Backends with Detcore
+/// attribution (ptrace, e9patch, KVM) keep the Detcore-only path: they
+/// already retry on a placed change, and a harness replacement that
+/// coincides with a genuine nondeterminism must not launder it into a
+/// retry. Stateless — the one-retry budget is the caller's (manifest
+/// runner), so a second divergence with this evidence stays a failure,
+/// never a loop.
 pub fn effective_host_input_change(
     detcore: Option<InfrastructureError>,
     harness: Option<InfrastructureError>,
     diverged: bool,
+    harness_applies: bool,
 ) -> Option<InfrastructureError> {
-    detcore.or_else(|| harness.filter(|_| diverged))
+    detcore.or_else(|| harness.filter(|_| diverged && harness_applies))
 }
 
 pub fn explains_divergence(
@@ -810,15 +851,94 @@ mod tests {
             harness,
             Some(InfrastructureError::HostInputChanged { .. })
         ));
-        // Diverged pair -> evidence (runner consumes this for one retry).
-        assert!(effective_host_input_change(None, harness.clone(), true).is_some());
+        // DBT-style backend (harness applies) + diverged -> evidence
+        // (runner consumes this for one retry).
+        assert!(effective_host_input_change(None, harness.clone(), true, true).is_some());
         // Matched pair -> no evidence; second diverged pair still just
         // evidence (no loop state here; runner's budget makes it FAIL).
         assert_eq!(
-            effective_host_input_change(None, harness.clone(), false),
+            effective_host_input_change(None, harness.clone(), false, true),
             None
         );
-        assert!(effective_host_input_change(None, harness, true).is_some());
+        assert!(effective_host_input_change(None, harness.clone(), true, true).is_some());
+        // ptrace-style backend (harness does not apply) + swap + diverged
+        // -> NO harness evidence: the Detcore gate is preserved and a
+        // genuine divergence coinciding with a swap is not laundered.
+        assert_eq!(
+            effective_host_input_change(None, harness.clone(), true, false),
+            None
+        );
+        assert_eq!(
+            effective_host_input_change(None, harness, false, false),
+            None
+        );
+    }
+
+    /// An in-place rewrite that keeps the host inode — longer contents,
+    /// new mtime, same file — is not a replacement and is not named,
+    /// aligning the harness predicate with
+    /// `a_change_that_keeps_the_host_inode_is_not_named`.
+    #[test]
+    fn harness_in_place_touch_keeping_the_inode_is_not_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("ld.so.cache");
+        std::fs::write(&cache, "v1").unwrap();
+        let paths: Vec<&Path> = vec![&cache];
+        let before = VolatileHostInputs::capture(&paths);
+        // Rewrite in place: truncating write to the same inode.
+        std::fs::write(&cache, "v1-but-much-longer-in-place").unwrap();
+        let after = VolatileHostInputs::capture(&paths);
+        assert_eq!(
+            before.entries[0].1.unwrap().ino,
+            after.entries[0].1.unwrap().ino
+        );
+        assert_ne!(before.entries[0].1, after.entries[0].1);
+        assert_eq!(harness_host_input_change(&before, &after, &after), None);
+        assert_eq!(harness_host_input_change(&before, &before, &after), None);
+    }
+
+    /// Appearing or disappearing is a replacement: the file the next run
+    /// would read is not the file the previous run read (or vice versa).
+    #[test]
+    fn harness_absent_transitions_are_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("ld.so.cache");
+        let paths: Vec<&Path> = vec![&cache];
+        let absent = VolatileHostInputs::capture(&paths);
+        std::fs::write(&cache, "v1").unwrap();
+        let present = VolatileHostInputs::capture(&paths);
+        // absent -> present, in the run-1 window.
+        match harness_host_input_change(&absent, &present, &present).unwrap() {
+            InfrastructureError::HostInputChanged {
+                run,
+                before: b,
+                after: a,
+                ..
+            } => {
+                assert_eq!(run, VerificationRun::Run1);
+                assert_eq!(b, ABSENT_HOST_FILE_IDENTITY);
+                assert_ne!(a.ino, 0);
+            }
+            other => panic!("{other:?}"),
+        }
+        // present -> absent, in the run-2 window.
+        std::fs::remove_file(&cache).unwrap();
+        let gone = VolatileHostInputs::capture(&paths);
+        match harness_host_input_change(&present, &present, &gone).unwrap() {
+            InfrastructureError::HostInputChanged {
+                run,
+                before: b,
+                after: a,
+                ..
+            } => {
+                assert_eq!(run, VerificationRun::Run2);
+                assert_ne!(b.ino, 0);
+                assert_eq!(a, ABSENT_HOST_FILE_IDENTITY);
+            }
+            other => panic!("{other:?}"),
+        }
+        // absent -> absent names nothing.
+        assert_eq!(harness_host_input_change(&absent, &absent, &absent), None);
     }
 
     /// A change of size or time that keeps the host inode is not the
