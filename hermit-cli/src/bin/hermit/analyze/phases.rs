@@ -1323,6 +1323,9 @@ impl AnalyzeOpts {
         self.adopt_recorded_epoch(&recordings)?;
         // Every trial charges expired timed waits as the target did.
         self.adopt_expired_wait_charge(run1.as_deref())?;
+        // And with one guest random seed: theirs, else --run1-seed's
+        // (https://github.com/rrnewton/hermit/issues/4868).
+        self.adopt_trial_rng_seed(&recordings)?;
         // Every trial registers queued sleeps as the target did.
         self.adopt_recorded_timeslice(&recordings)?;
         self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
@@ -2673,6 +2676,199 @@ mod tests {
                 "{case}: {error:#}"
             );
         }
+    }
+
+    /// A preemption record written to `dir` under `name`, recorded under the
+    /// given guest random seed (`None` for a record without one).
+    fn record_with_rng_seed(dir: &Path, name: &str, seed: Option<u64>) -> PathBuf {
+        let path = record_with_epoch(dir, name, None);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        if let Some(seed) = seed {
+            value["rng_seed"] = serde_json::Value::from(seed);
+        }
+        std::fs::write(&path, value.to_string()).unwrap();
+        path
+    }
+
+    /// Through `prepare`: `hermit analyze <analyze_args> -- <run_args>
+    /// /bin/true`, or its refusal.
+    fn prepared_with(
+        dir: &Path,
+        analyze_args: &[String],
+        run_args: &[&str],
+    ) -> anyhow::Result<AnalyzeOpts> {
+        let mut argv = vec!["hermit".to_owned(), "analyze".to_owned()];
+        argv.extend(analyze_args.iter().cloned());
+        argv.push("--".to_owned());
+        argv.extend(run_args.iter().map(|arg| arg.to_string()));
+        argv.push("/bin/true".to_owned());
+        let args = crate::Args::try_parse_from(&argv).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        options.prepare(&args.global)?;
+        options.tmp_dir = Some(dir.to_path_buf());
+        Ok(*options)
+    }
+
+    /// Every run analyze makes from `--run1-preemptions`/`--run2-preemptions`
+    /// records gives the guest the random seed they were recorded under, as
+    /// `hermit run` replaying one does: the target trial and the baseline
+    /// alike (https://github.com/rrnewton/hermit/issues/4868). Before, they
+    /// gave it the run arguments' seed, 0 unless given. Records under two
+    /// seeds, a different explicit `--rng-seed`, and a `--run1-seed` target
+    /// under another guest random seed are refused before any trial; a
+    /// `--run2-seed` baseline takes the records' seed.
+    #[test]
+    fn analyze_replays_records_with_the_guest_random_seed_they_were_recorded_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let run1 = |seed: Option<u64>| {
+            format!(
+                "--run1-preemptions={}",
+                record_with_rng_seed(dir, "run1", seed).display()
+            )
+        };
+        let run2 = |seed: Option<u64>| {
+            format!(
+                "--run2-preemptions={}",
+                record_with_rng_seed(dir, "run2", seed).display()
+            )
+        };
+
+        // Records without a seed change nothing.
+        let unseeded = prepared_with(dir, &[run1(None), run2(None)], &[]).unwrap();
+        assert_eq!(unseeded.run_arg, ["--expired-wait-charge=each"]);
+
+        // The recorded seed reaches the target trial and the baseline, from
+        // either record, also over the run arguments' --seed, which seeds the
+        // scheduler.
+        for (first, second, run_args) in [
+            (Some(7), Some(7), &[][..]),
+            (Some(7), None, &[][..]),
+            (None, Some(7), &[][..]),
+            (Some(7), None, &["--seed=3"][..]),
+        ] {
+            let seeded = prepared_with(dir, &[run1(first), run2(second)], run_args).unwrap();
+            assert_eq!(
+                seeded.trial_rng_seeds_for_test(),
+                (7, 7),
+                "{first:?} / {second:?} / {run_args:?}"
+            );
+        }
+
+        // An equal explicit --rng-seed adds no second one; a different one is
+        // refused, naming the remedy.
+        let explicit = prepared_with(dir, &[run1(Some(7))], &["--rng-seed=7"]).unwrap();
+        assert_eq!(explicit.run_arg, ["--expired-wait-charge=each"]);
+        refused(
+            prepared_with(dir, &[run1(Some(7))], &["--rng-seed=3"]).unwrap_err(),
+            "pass --rng-seed=7",
+        );
+
+        // Records under two seeds are refused, naming both.
+        refused(
+            prepared_with(dir, &[run1(Some(7)), run2(Some(1))], &[]).unwrap_err(),
+            "was recorded under the guest random seed 7 and --run2-preemptions",
+        );
+
+        // A target named by --run1-seed runs under that seed's guest random
+        // seed unless --rng-seed is given: a different one is refused, naming
+        // the record to make again, while an equal one or an explicit
+        // --rng-seed equal to the record's is accepted. A --run2-seed baseline
+        // is a fresh run and takes the record's seed.
+        let seed = |option: &str, seed: u64| format!("--{option}-seed={seed}");
+        let error = prepared_with(dir, &[seed("run1", 1), run2(Some(7))], &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("Record --run2-preemptions ")
+                && error.to_string().contains("again with --rng-seed=1"),
+            "{error:#}"
+        );
+        refused(error, "--run1-seed 1 runs with the guest random seed 1");
+        let baseline = prepared_with(dir, &[run1(Some(7)), seed("run2", 1)], &[]).unwrap();
+        assert_eq!(baseline.trial_rng_seeds_for_test(), (7, 7));
+        let same = prepared_with(dir, &[seed("run1", 7), run2(Some(7))], &[]).unwrap();
+        assert_eq!(same.trial_rng_seeds_for_test(), (7, 7));
+        let pinned =
+            prepared_with(dir, &[run1(Some(7)), seed("run2", 1)], &["--rng-seed=7"]).unwrap();
+        assert_eq!(pinned.trial_rng_seeds_for_test(), (7, 7));
+
+        // A record the run arguments replay takes part as well.
+        let replayed = format!(
+            "--replay-preemptions-from={}",
+            record_with_rng_seed(dir, "replayed", Some(7)).display()
+        );
+        let from_run_arguments = prepared_with(dir, &[run1(None)], &[&replayed]).unwrap();
+        assert_eq!(from_run_arguments.trial_rng_seeds_for_test(), (7, 7));
+        refused(
+            prepared_with(dir, &[run1(Some(1))], &[&replayed]).unwrap_err(),
+            "--replay-preemptions-from",
+        );
+
+        // The schedules analyze writes for its trials carry the seed, so a
+        // replay of one by `hermit run` gives the guest the same values.
+        let seeded = prepared_with(dir, &[run1(Some(7))], &[]).unwrap();
+        let schedule = dir.join("trial.json");
+        seeded.write_trial_schedule(Vec::new(), &schedule).unwrap();
+        assert_eq!(
+            detcore::preemptions::read_recorded_rng_seed(&schedule).unwrap(),
+            Some(7)
+        );
+    }
+
+    /// Without seeded records, every trial of a target named by `--run1-seed`
+    /// gives the guest that run's random seed: the minimization, bisection
+    /// and stack-trace trials took the run arguments' seed instead, 0 unless
+    /// given, and a `--run2-seed` baseline its own
+    /// (https://github.com/rrnewton/hermit/issues/4868). A `--run2-seed`
+    /// baseline beside any other target takes that target's seed. An explicit
+    /// `--rng-seed` is kept.
+    #[test]
+    fn analyze_trials_of_a_seeded_target_take_its_guest_random_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let run1 = prepared_with(dir, &["--run1-seed=5".to_owned()], &[]).unwrap();
+        assert_eq!(run1.run_arg, ["--expired-wait-charge=each", "--rng-seed=5"]);
+        assert_eq!(run1.trial_rng_seeds_for_test(), (5, 5));
+        let both = prepared_with(
+            dir,
+            &["--run1-seed=5".to_owned(), "--run2-seed=9".to_owned()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(both.trial_rng_seeds_for_test(), (5, 5));
+        let explicit =
+            prepared_with(dir, &["--run1-seed=5".to_owned()], &["--rng-seed=3"]).unwrap();
+        assert_eq!(explicit.run_arg, ["--expired-wait-charge=each"]);
+        assert_eq!(explicit.trial_rng_seeds_for_test(), (3, 3));
+
+        // Phase 4 builds the --run2-seed baseline from the baseline options by
+        // setting only `seed`, which leaves the pinned guest random seed.
+        let mut baseline = RunData::new_baseline(&both, "run2-probe".to_owned()).unwrap();
+        baseline.runopts.det_opts.det_config.seed = 9;
+        assert_eq!(baseline.runopts.det_opts.det_config.rng_seed(), 5);
+
+        // A --run2-seed baseline beside a target the run arguments name
+        // (`--seed`) takes the target's seed too, as it does beside a record
+        // that stores none.
+        let run2_only = prepared_with(dir, &["--run2-seed=9".to_owned()], &["--seed=4"]).unwrap();
+        assert_eq!(
+            run2_only.run_arg,
+            ["--expired-wait-charge=each", "--rng-seed=4"]
+        );
+        assert_eq!(run2_only.trial_rng_seeds_for_test(), (4, 4));
+        let unseeded_record = format!(
+            "--run1-preemptions={}",
+            record_with_rng_seed(dir, "unseeded", None).display()
+        );
+        let beside_record = prepared_with(
+            dir,
+            &[unseeded_record, "--run2-seed=9".to_owned()],
+            &["--seed=4"],
+        )
+        .unwrap();
+        assert_eq!(beside_record.trial_rng_seeds_for_test(), (4, 4));
     }
 
     /// Analyze refuses, before any trial, a `--run1-preemptions` record made

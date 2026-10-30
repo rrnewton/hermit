@@ -985,16 +985,7 @@ impl AnalyzeOpts {
     /// and change nothing. Each recording is named by its option, such as
     /// `--good`, and its path.
     pub fn adopt_recorded_epoch(&mut self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
-        let run_cmd = std::iter::once("hermit-run").chain(
-            self.run_arg
-                .iter()
-                .chain(&self.run_args)
-                .map(String::as_str),
-        );
-        let matches = RunOpts::command()
-            .try_get_matches_from(run_cmd)
-            .context("cannot parse the trials' run arguments")?;
-        let parsed = RunOpts::from_arg_matches(&matches)?;
+        let (matches, parsed) = self.parse_trial_run_arguments()?;
         let mut epochs = Vec::new();
         for (option, path) in recordings {
             let epoch =
@@ -1158,6 +1149,164 @@ impl AnalyzeOpts {
         ))
     }
 
+    /// The trials' run arguments (`run_arg`, then `run_args`), parsed as
+    /// `hermit run` parses them, with the matches that say where each value
+    /// came from.
+    fn parse_trial_run_arguments(&self) -> anyhow::Result<(clap::ArgMatches, RunOpts)> {
+        let run_cmd = std::iter::once("hermit-run").chain(
+            self.run_arg
+                .iter()
+                .chain(&self.run_args)
+                .map(String::as_str),
+        );
+        let matches = RunOpts::command()
+            .try_get_matches_from(run_cmd)
+            .context("cannot parse the trials' run arguments")?;
+        let parsed = RunOpts::from_arg_matches(&matches)?;
+        Ok((matches, parsed))
+    }
+
+    /// Give every trial one guest random seed (`--rng-seed`): the one the
+    /// replayed records were made under, else the one the target run named by
+    /// `--run1-seed` uses. `hermit run` adopts a record's seed when it replays
+    /// one (`RunOpts::adopt_replayed_rng_seed`), but trials start through
+    /// `RunOpts::run`, which does not, and the baseline, search, minimization
+    /// and stack-trace trials take their seeds from the run arguments. The
+    /// seed decides what the guest reads as randomness (getrandom,
+    /// `/dev/urandom`), so a trial that gave the guest another seed than the
+    /// run it replays read other random values, could take other branches,
+    /// and left the schedule it was replaying
+    /// (https://github.com/rrnewton/hermit/issues/4868).
+    ///
+    /// The records are the given recordings (each named by its option, such
+    /// as `--good`, and its path) and any record the run arguments replay
+    /// (`--replay-preemptions-from`, `--replay-schedule-from`). Records written
+    /// before the seed was stored carry none and take no part. When none
+    /// carries one and a run is named by a seed, the target's seed is pinned:
+    /// `--run1-seed`'s, else the run arguments'. A `--run2-seed` baseline thus
+    /// always differs from the target in its schedule alone. An explicit
+    /// `--rng-seed` in the run arguments is kept.
+    ///
+    /// Refused before any trial, as a policy refusal:
+    /// - records made under two different guest random seeds: every trial
+    ///   gives the guest one, so no trial follows both;
+    /// - an explicit `--rng-seed` that differs from the records';
+    /// - a target named by `--run1-seed` whose guest random seed (that seed,
+    ///   unless `--rng-seed` is given) differs from the records': the target
+    ///   and the trials replaying the records could not both see the recorded
+    ///   random values.
+    pub fn adopt_trial_rng_seed(&mut self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+        let (_, parsed) = self.parse_trial_run_arguments()?;
+        let config = &parsed.det_opts.det_config;
+        let in_run_arguments = [
+            (
+                "--replay-preemptions-from",
+                config.replay_preemptions_from.clone(),
+            ),
+            (
+                "--replay-schedule-from",
+                config.replay_schedule_from.clone(),
+            ),
+        ];
+        let mut recorded: Option<u64> = None;
+        let mut sources: Vec<String> = Vec::new();
+        for (option, path) in recordings
+            .iter()
+            .map(|(option, path)| (*option, path.to_path_buf()))
+            .chain(
+                in_run_arguments
+                    .into_iter()
+                    .filter_map(|(option, path)| Some((option, path?))),
+            )
+        {
+            let Some(seed) =
+                detcore::preemptions::read_recorded_rng_seed(&path).map_err(anyhow::Error::msg)?
+            else {
+                continue;
+            };
+            let source = format!("{option} {}", path.display());
+            match recorded {
+                None => recorded = Some(seed),
+                Some(first) if first != seed => {
+                    return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(
+                        format!(
+                            "{} was recorded under the guest random seed {first} and {source} \
+                             under {seed}. Every trial gives the guest one random seed, so no \
+                             trial could follow both records. Record both runs with the same \
+                             --rng-seed (their --seed, which also seeds the scheduler, may \
+                             differ).",
+                            sources[0],
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+            sources.push(source);
+        }
+        let explicit = config.rng_seed;
+        let Some(recorded) = recorded else {
+            // A run named by a seed would give the guest that seed's random
+            // values; the trials (and the other run) give it one seed: the
+            // target's.
+            if explicit.is_none() && (self.run1_seed.is_some() || self.run2_seed.is_some()) {
+                let seed = self.run1_seed.unwrap_or(config.rng_seed());
+                self.run_arg.push(format!("--rng-seed={seed}"));
+            }
+            return Ok(());
+        };
+        let named = format!(
+            "{} {}",
+            sources.join(" and "),
+            if sources.len() == 1 { "was" } else { "were" }
+        );
+        if let Some(explicit) = explicit
+            && explicit != recorded
+        {
+            return Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "the explicit --rng-seed={explicit} in the run arguments differs from the \
+                     guest random seed {recorded} that {named} recorded under. The guest would \
+                     read other random values than the recorded run did, so the trials cannot \
+                     follow the recording. Omit --rng-seed to replay with the recorded seed, or \
+                     pass --rng-seed={recorded}."
+                )),
+            );
+        }
+        // The target named by --run1-seed is that seed's run, guest random
+        // values included; a --run2-seed baseline is a fresh run and takes the
+        // trials' seed, as it does without records.
+        if let Some(seed) = self.run1_seed {
+            let guest_seed = explicit.unwrap_or(seed);
+            if guest_seed != recorded {
+                return Err(
+                    anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                        "--run1-seed {seed} runs with the guest random seed {guest_seed}, but \
+                         {named} recorded under {recorded}. The target and the trials replaying \
+                         the recording could not both see the guest's recorded random values. \
+                         Record {} again with --rng-seed={guest_seed}, or pass \
+                         --rng-seed={recorded} in the run arguments to run --run1-seed {seed} under \
+                         the recording's guest random seed (which may change its outcome).",
+                        sources.join(" and "),
+                    )),
+                );
+            }
+        }
+        if explicit.is_none() {
+            self.run_arg.push(format!("--rng-seed={recorded}"));
+        }
+        Ok(())
+    }
+
+    /// The guest random seed every trial gives the guest
+    /// ([`Self::adopt_trial_rng_seed`]): the effective `--rng-seed` of the
+    /// trials' run arguments.
+    pub fn trial_rng_seed(&self) -> u64 {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .rng_seed()
+    }
+
     /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
     /// for off).
     pub fn trial_pipe_wake_latency(&self) -> Option<u64> {
@@ -1222,7 +1371,10 @@ impl AnalyzeOpts {
     /// copy setting and `--expired-wait-charge`, as every record analyze
     /// writes must be: a record that omitted one would be accepted when
     /// replayed under another value
-    /// (<https://github.com/rrnewton/hermit/issues/4380>).
+    /// (<https://github.com/rrnewton/hermit/issues/4380>). It also carries the
+    /// trials' guest random seed, so that `hermit run` or `hermit bisect`
+    /// replaying it gives the guest the trials' random values
+    /// (<https://github.com/rrnewton/hermit/issues/4868>).
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
         record
             .with_pipe_wake_latency(self.trial_pipe_wake_latency())
@@ -1231,6 +1383,7 @@ impl AnalyzeOpts {
                 self.trial_expired_wait_charge() == ExpiredWaitCharge::Once,
             )
             .with_cap_preemption_charge(self.trial_cap_preemption_charge())
+            .with_rng_seed(Some(self.trial_rng_seed()))
     }
 
     /// Whether the trials cap preemption charges (`--cap-preemption-charge`
@@ -1352,6 +1505,18 @@ impl AnalyzeOpts {
             .det_config
             .epoch
             .to_rfc3339()
+    }
+
+    /// The guest random seed the target trial (run 1) and the baseline run
+    /// give the guest: the effective `--rng-seed` of their configurations.
+    #[cfg(test)]
+    pub(crate) fn trial_rng_seeds_for_test(&self) -> (u64, u64) {
+        let run1 = RunData::new_run1_target(self, "seed-probe".to_owned()).unwrap();
+        let baseline = RunData::new_baseline(self, "seed-probe".to_owned()).unwrap();
+        (
+            run1.runopts.det_opts.det_config.rng_seed(),
+            baseline.runopts.det_opts.det_config.rng_seed(),
+        )
     }
 
     /// Refuses (exit 122) `--save-config` and `--summary-json` in the run
