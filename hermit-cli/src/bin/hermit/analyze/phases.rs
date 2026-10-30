@@ -35,6 +35,7 @@ use reverie::process::Output;
 
 use crate::analyze::consts::*;
 use crate::analyze::race_report::TracedReplay;
+use crate::analyze::race_report::first_thread_difference;
 use crate::analyze::races::RacingAccesses;
 use crate::analyze::races::render_racing_accesses;
 use crate::analyze::rundata::RunData;
@@ -1164,37 +1165,33 @@ fn replay_positions(
     )
 }
 
-/// The first event at which two realized schedules run different threads,
-/// if both reach one: where two replays that share a schedule prefix part.
-fn first_thread_difference(first: &[SchedEvent], second: &[SchedEvent]) -> Option<usize> {
-    first
-        .iter()
-        .zip(second)
-        .position(|(a, b)| a.dettid != b.dettid)
-}
-
-/// The first of the first `until` events of `requested` at which `realized`
-/// ran another event, or ended.
-pub(super) fn departure(
+/// Where `realized` stops matching `requested` event for event in its first
+/// `until` events: where it left them ([`follow`]), or, before that, the
+/// first event it recorded at another position, after a branch event the
+/// schedule leaves out. The racing-accesses section reads a replay's access
+/// trace by the replay's own event numbers ([`TraceRequest::ran`]), so a
+/// replay whose events moved, though it followed its schedule, must be
+/// compared as it ran, as one that left its schedule is.
+pub(super) fn positional_departure(
     requested: &[SchedEvent],
     realized: &[SchedEvent],
     until: usize,
 ) -> Option<Departure> {
-    let until = until.min(requested.len());
-    for (index, expected) in requested[..until].iter().enumerate() {
-        match realized.get(index) {
-            None => return Some(Departure::Ended { events: index }),
-            Some(ran) if !same_event(expected, ran) => {
-                return Some(Departure::OtherEvent {
-                    index,
-                    expected: expected.clone(),
-                    ran: ran.clone(),
-                });
-            }
-            Some(_) => {}
-        }
+    let (positions, left_schedule) = follow(requested, realized, until);
+    match positions
+        .iter()
+        .enumerate()
+        .position(|(event, position)| event != *position)
+    {
+        // The event recorded at that position is a branch event `follow`
+        // passed over, not the schedule's.
+        Some(index) => Some(Departure::OtherEvent {
+            index,
+            expected: requested[index].clone(),
+            ran: realized[index].clone(),
+        }),
+        None => left_schedule,
     }
-    None
 }
 
 /// The thread a stack was taken on, as the guest numbers it (which is the
@@ -1617,7 +1614,11 @@ impl AnalyzeOpts {
         baseline: &StackReplay,
         target: &StackReplay,
     ) -> Result<RealizedPair, String> {
-        let Some(event) = first_thread_difference(&baseline.realized, &target.realized) else {
+        // An event both realized schedules reach: where the shorter one ends,
+        // the other runs on alone, and no pair parts there.
+        let Some(event) = first_thread_difference(&baseline.realized, &target.realized)
+            .filter(|&event| event < baseline.realized.len().min(target.realized.len()))
+        else {
             return Err(
                 "the schedules the two replays realized do not run different threads at any \
                  event both reach"
@@ -1739,9 +1740,14 @@ impl AnalyzeOpts {
             .into_inner()
             .into_global();
         let (left_schedule, shifted_at, ran) = replay_positions(schedule, &realized, index);
+        // The racing-accesses section reads the access trace by the replay's
+        // own event numbers, so it is fed where they stop matching the
+        // schedule's ([`positional_departure`]), not where the replay left it:
+        // a replay that only moved its events after a branch event the
+        // schedule leaves out is compared as it ran.
         let traced = request.map(|request| {
             request.ran_with(
-                departure(schedule, &realized, index + 1),
+                positional_departure(schedule, &realized, index + 1),
                 realized.clone(),
                 &realized_path,
             )
@@ -2144,7 +2150,9 @@ impl AnalyzeOpts {
             thread,
             decision,
             &continued,
-            target_continued.as_ref().map(|(with, _, _)| with.as_slice()),
+            target_continued
+                .as_ref()
+                .map(|(with, _, _)| with.as_slice()),
         );
         let (at, moved) = match &plan {
             Stack2Plan::Instead { at, partner } => (*at, partner.clone()),
@@ -5447,6 +5455,58 @@ mod tests {
         );
     }
 
+    /// The racing-accesses section reads a replay's access trace by the
+    /// replay's own event numbers, so it is fed where those stop matching
+    /// the schedule's ([`positional_departure`]): where the replay left its
+    /// schedule, or before that, the first event a branch event the schedule
+    /// leaves out moved, which the stacks' [`follow`] passes over.
+    #[test]
+    fn the_racing_accesses_section_is_fed_where_the_positions_stop_matching() {
+        let tid = DetTid::from_raw;
+        let other = |thread: i32, rip: usize| SchedEvent {
+            dettid: tid(thread),
+            op: detcore_model::schedule::Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: detcore::types::InstructionPointer::new(rip),
+            end_time: None,
+        };
+        let requested = vec![
+            other(3, 0x10),
+            other(3, 0x20),
+            SchedEvent::branches(tid(5), 4),
+        ];
+        let realized = vec![
+            other(3, 0x10),
+            SchedEvent::branches(tid(3), 1598),
+            other(3, 0x20),
+            SchedEvent::branches(tid(5), 9),
+        ];
+        assert_eq!(follow(&requested, &realized, 3).1, None);
+        assert_eq!(
+            positional_departure(&requested, &realized, 3),
+            Some(Departure::OtherEvent {
+                index: 1,
+                expected: requested[1].clone(),
+                ran: realized[1].clone(),
+            })
+        );
+        // Through events before the branch, the positions still match.
+        assert_eq!(positional_departure(&requested, &realized, 1), None);
+        // Without a moved event, where the replay left its schedule.
+        assert_eq!(positional_departure(&requested, &requested, 3), None);
+        assert_eq!(
+            positional_departure(&requested, &realized[..2], 3),
+            follow(&requested, &realized[..2], 3).1
+        );
+        let mut elsewhere = realized.clone();
+        elsewhere[1] = SchedEvent::branches(tid(9), 1598);
+        assert_eq!(
+            positional_departure(&requested, &elsewhere, 3),
+            follow(&requested, &elsewhere, 3).1
+        );
+    }
+
     /// A replay that re-inserted a branch took its stacks one position
     /// early, on other threads than the pair's: those stacks are not kept,
     /// even under the caveat, and the opening does not call the pair a race.
@@ -5525,14 +5585,33 @@ mod tests {
 
     /// Two replays that share a schedule prefix part at the first event at
     /// which their realized schedules run different threads; a count that
-    /// differs on one thread is not that.
+    /// differs on one thread is not that. Where one realized schedule only
+    /// ends first, the racing-accesses section compares the two from its
+    /// end ([`first_thread_difference`]), but no pair of operations parts
+    /// there, so the report takes no realized pair's stacks.
     #[test]
     fn realized_schedules_part_at_their_first_thread_difference() {
         let passing = events(&[3, 3, 5, 3, 7]);
         let mut failing = events(&[3, 3, 5, 7, 3, 3]);
         failing[2].count = 99;
         assert_eq!(first_thread_difference(&passing, &failing), Some(3));
-        assert_eq!(first_thread_difference(&passing, &passing[..4]), None);
+        assert_eq!(first_thread_difference(&passing, &passing[..4]), Some(4));
+        let replay = |realized: &[SchedEvent]| StackReplay {
+            met_target: false,
+            stacks: [None, None],
+            left_schedule: None,
+            shifted_at: None,
+            ran: [None, None],
+            realized: realized.to_vec(),
+            realized_path: PathBuf::new(),
+            traced: None,
+        };
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let refused = options
+            .realized_pair(&replay(&passing), &replay(&passing[..4]))
+            .err()
+            .expect("no pair parts where one realized schedule ends");
+        assert!(refused.contains("at any event both reach"), "{refused}");
     }
 
     /// The opening of an order-of-events report claims a race only when its

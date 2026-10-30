@@ -41,7 +41,7 @@ use reverie::PrettyBacktrace;
 use reverie::syscalls::Sysno;
 
 use crate::analyze::phases::Departure;
-use crate::analyze::phases::departure;
+use crate::analyze::phases::positional_departure;
 use crate::analyze::phases::stack_thread;
 use crate::analyze::race_watch::Candidate;
 use crate::analyze::race_watch::SideView;
@@ -119,7 +119,7 @@ impl TraceRequest {
         };
         match read {
             Ok(realized) => {
-                let departure = departure(requested, &realized, until);
+                let departure = positional_departure(requested, &realized, until);
                 self.ran_with(departure, realized, realized_path)
             }
             Err(error) => {
@@ -1137,8 +1137,8 @@ fn check_replay(
             TrialEnd::Missed
         }
     });
-    let left =
-        realized_schedule(&path).map(|realized| departure(schedule, &realized, reversal.replay));
+    let left = realized_schedule(&path)
+        .map(|realized| positional_departure(schedule, &realized, reversal.replay));
     (ended, left)
 }
 
@@ -1319,7 +1319,7 @@ fn realized_window(
 
 /// The first index at which `a` and `b` run different threads, or at which
 /// the shorter one ends; `None` when they run the same threads throughout.
-fn first_thread_difference(a: &[SchedEvent], b: &[SchedEvent]) -> Option<usize> {
+pub(super) fn first_thread_difference(a: &[SchedEvent], b: &[SchedEvent]) -> Option<usize> {
     a.iter()
         .zip(b)
         .position(|(x, y)| x.dettid != y.dettid)
@@ -1892,6 +1892,58 @@ mod tests {
             reason.starts_with("the target replay's realized schedule")
                 && reason.contains("cannot be read"),
             "{reason}"
+        );
+    }
+
+    /// A replay that ran every event of its schedule but recorded a branch
+    /// event the schedule leaves out before one of them numbers the events
+    /// after it one higher than the schedule does, and its access trace
+    /// with them. Such a replay is read as one that left its schedule there,
+    /// so the two replays are compared as they ran, from where their
+    /// realized schedules part, rather than at the schedule's numbers.
+    #[test]
+    fn a_replay_whose_events_moved_is_compared_as_it_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = detcore::types::DetTid::from_raw;
+        let read = SchedEvent::syscall(tid(5), Sysno::read, SyscallPhase::Prehook);
+        let requested = vec![
+            SchedEvent::branches(tid(3), 10),
+            read.clone(),
+            SchedEvent::branches(tid(3), 10),
+        ];
+        let moved = vec![
+            SchedEvent::branches(tid(3), 10),
+            SchedEvent::branches(tid(5), 7),
+            read.clone(),
+            SchedEvent::branches(tid(3), 10),
+        ];
+        let replay = |role: &'static str, realized: &[SchedEvent]| {
+            let path = dir.path().join(format!("{role}_out.preempts"));
+            PreemptionRecord::from_sched_events(realized.to_vec())
+                .write_to_disk(&path)
+                .unwrap();
+            TraceRequest {
+                role,
+                trace: Ok(dir.path().join(format!("{role}.access"))),
+            }
+            .ran(&requested, &path, requested.len())
+        };
+        let target = replay("target", &moved);
+        let baseline = replay("baseline", &requested);
+        assert_eq!(baseline.departure, None);
+        assert!(
+            matches!(
+                target.departure,
+                Some(Departure::OtherEvent { index: 1, .. })
+            ),
+            "{:?}",
+            target.departure
+        );
+        let (split, note) = realized_window(2, &target, &baseline).expect("compared as they ran");
+        assert_eq!(split, 2);
+        assert!(
+            note.contains("the two replays are compared as they ran, from event 2"),
+            "{note}"
         );
     }
 
