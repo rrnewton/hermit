@@ -33840,6 +33840,50 @@ mod shared_consumer_tests {
     fn actual_shared_cli_population_requires_the_workdir_consumer_and_every_resource() {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         let full = dagrun::select_steps_by_labels(&cfg, &["full".into()]).unwrap();
+        let scope = SelectiveScope {
+            backends: vec!["ptrace".into()],
+            backend_lanes: vec!["privileged".into()],
+            ..SelectiveScope::default()
+        };
+        let selected = select_from_committed_decision(
+            &full,
+            full.steps.len(),
+            SelectDecision::Nodes(BTreeSet::from(["test.cli".into()]), scope.clone()),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let selected_tags: BTreeSet<String> = selected.steps.iter().map(Step::tag).collect();
+        for tag in [
+            "privileged-test.pmu_cli_cases",
+            "privileged-test.pmu_chaos_cli_cases",
+        ] {
+            assert!(selected_tags.contains(tag), "missing {tag}");
+        }
+        let chaos = full
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-test.pmu_chaos_cli_cases")
+            .unwrap();
+        for dependency in &chaos.deps {
+            assert!(selected_tags.contains(dependency), "missing {dependency}");
+        }
+        let portable = select_from_committed_decision(
+            &full,
+            full.steps.len(),
+            SelectDecision::Nodes(
+                BTreeSet::from(["test.cli".into()]),
+                SelectiveScope {
+                    backend_lanes: vec!["portable".into()],
+                    ..scope
+                },
+            ),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(!portable
+            .steps
+            .iter()
+            .any(|step| step.tag() == "privileged-test.pmu_chaos_cli_cases"));
         assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
             .unwrap();
         let isolated = full
