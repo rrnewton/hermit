@@ -1044,6 +1044,8 @@ mod tests {
 
 #[cfg(test)]
 mod replay_departure_tests {
+    use detcore::types::SchedEvent;
+
     use super::*;
 
     #[test]
