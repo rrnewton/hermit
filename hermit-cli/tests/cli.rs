@@ -23445,6 +23445,21 @@ HERMIT_SKID_OVERSHOOT rcb_actual=40078066 rcb_target=39999950 skid_margin=1000 o
 HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2
 ";
 
+#[test]
+fn skid_retry_record_matches_the_retry_rollup_schema() {
+    let record: serde_json::Value =
+        serde_json::from_str(&skid_overshoot::retry_record_json("loop test", 3, true)).unwrap();
+    assert_eq!(record["test"], "loop test");
+    assert_eq!(record["attempts"], 3);
+    assert_eq!(record["retries"], 2);
+    assert_eq!(record["final_outcome"], "PASS");
+    assert_eq!(record["flaky_pass"], true);
+    let failed: serde_json::Value =
+        serde_json::from_str(&skid_overshoot::retry_record_json("loop test", 2, false)).unwrap();
+    assert_eq!(failed["flaky_pass"], false);
+    assert_eq!(failed["final_outcome"], "FAIL");
+}
+
 /// [`retry_typed_skid_refusal`] runs an attempt again only after a typed
 /// skid-overshoot refusal: a different failure, including another exit 122
 /// refusal, ends the loop at once and is returned for the caller's checks
