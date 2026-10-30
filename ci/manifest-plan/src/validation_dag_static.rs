@@ -3279,8 +3279,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // for main's prefix records: 3399 + 1 = 3400.
     // Rebased onto main ffe313b16: 3410 + 1 = 3411.
     // Rebased onto main fbf9d5f0c: 3454 + 1 = 3455.
-    // Rebased onto main fcd62385f: 3465 + 16 = 3481.
-    ("test.detcore_unit", 3481),
+    // for main's prefix records: 3295.
+    // And record_serde's
+    // a_flat_records_post_crash_timeslice_survives_plain_and_marked_round_trips
+    // and a_flat_records_post_crash_switches_survive_plain_and_marked_round_trips,
+    // for main's RawRecord remote: 3400 + 2 = 3402.
+    // Rebased onto main ffe313b16: 3411 + 2 = 3413.
+    // Rebased onto main fbf9d5f0c: 3455 + 2 = 3457.
+    // Rebased onto main fcd62385f: 3465 + 18 = 3483.
+    ("test.detcore_unit", 3483),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5909,8 +5916,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same prefix-record unit: 3399 + 1 = 3400.
     // Rebased onto main ffe313b16: 3410 + 1 = 3411.
     // Rebased onto main fbf9d5f0c: 3454 + 1 = 3455.
-    // Rebased onto main fcd62385f: 3465 + 16 = 3481.
-    ("test.detcore_unit_on_host", 3481),
+    // And the same prefix-record unit: 3295.
+    // And the same two record-serde round-trip units: 3400 + 2 = 3402.
+    // Rebased onto main ffe313b16: 3411 + 2 = 3413.
+    // Rebased onto main fbf9d5f0c: 3455 + 2 = 3457.
+    // Rebased onto main fcd62385f: 3465 + 18 = 3483.
+    ("test.detcore_unit_on_host", 3483),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
