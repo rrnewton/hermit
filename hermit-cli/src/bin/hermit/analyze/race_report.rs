@@ -1543,7 +1543,7 @@ mod tests {
         let write_trace = |name: &str| {
             let path = dir.path().join(name);
             let lines = [
-                r#"{"kind":"header","format":"hermit-access-trace","version":1,"from":0}"#,
+                r#"{"kind":"header","format":"hermit-access-trace","version":2,"from":0}"#,
                 r#"{"kind":"syscall","pre":1,"post":2,"tid":3,"pid":3,"nth":1,"sysno":"getpid","args":[0,0,0,0,0,0],"result":3}"#,
                 r#"{"kind":"syscall","pre":4,"post":5,"tid":5,"pid":3,"nth":1,"sysno":"getppid","args":[0,0,0,0,0,0],"result":1}"#,
                 r#"{"kind":"end","events":6,"records":2}"#,

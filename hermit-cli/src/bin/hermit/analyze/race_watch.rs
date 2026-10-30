@@ -1840,7 +1840,7 @@ WARNING: ThreadSanitizer: data race on vptr (ctor/dtor vs virtual call) (pid=3)
         AccessTrace {
             header: TraceHeader {
                 format: "hermit-access-trace".to_owned(),
-                version: 1,
+                version: 2,
                 from: 0,
             },
             end: Some(TraceEnd {
@@ -2767,7 +2767,8 @@ WARNING: ThreadSanitizer: data race on vptr (ctor/dtor vs virtual call) (pid=3)
                 code: 1,
                 addr: Some(addr),
                 sender: None,
-                delivery: detcore_model::access_trace::SignalDelivery::Fatal,
+                observed_disposition:
+                    detcore_model::access_trace::ObservedSignalDisposition::Default,
             })
         };
         assert!(trace_candidates(&trace(vec![fault(0)]), 10).is_empty());
