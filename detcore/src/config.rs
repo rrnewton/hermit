@@ -188,6 +188,11 @@ mod tests {
         // request's payload types. Renumbered to 24 at landing on top of
         // Train 6's revision 23; digest measured at this combined head.
         (24, "b31c27eec3d0d5b4", "f013e36743d8d9e6"),
+        // Retypes `GlobalResponse::StartNewThread` to carry the starting
+        // thread's replayed first timeslice
+        // (https://github.com/rrnewton/hermit/pull/4789; allocated 25 above
+        // main's 24; digests measured at this head).
+        (25, "210999c81d86a7ac", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
