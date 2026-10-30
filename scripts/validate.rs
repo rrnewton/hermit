@@ -21072,7 +21072,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             let e2e_retry_summary = test_id_summary(e2e, &[], &BTreeSet::new());
             if e2e_retry_summary.recovered.len() != 1
                 || e2e_retry_summary.recovered[0].id != "applications/example [ptrace/verify]"
-                || e2e_retry_summary.recovered[0].retry_classes != [RetryClass::AlwaysEligible]
+                || !e2e_retry_summary.recovered[0].retry_classes.is_empty()
                 || e2e_retry_summary.retry_occurrences != 1
             {
                 return Err(format!(
@@ -25783,8 +25783,30 @@ fn write_ledger_with_snapshot(
     add_raw_census(&mut record, census);
     if let Some(Ok(framework)) = &retries {
         let rollup = hermit_manifest_plan::ledger::RetryRollupV1::from_framework_retries(framework);
-        let (signal, top_flaky) =
-            hermit_manifest_plan::ledger::landing_signal(failures, validation_complete, &rollup);
+        // Nextest/test-runner retries live on the outcomes' test results,
+        // not in the manifest-cell census; count them before claiming clean.
+        let mut extra_retries = 0u64;
+        let mut extra_flaky = Vec::new();
+        for outcome in outcomes {
+            let Some(results) = &outcome.test_results else {
+                continue;
+            };
+            for test in results.iter() {
+                let retries = test.attempts.saturating_sub(1);
+                extra_retries += retries;
+                if retries > 0 && test.passed {
+                    extra_flaky.push(format!("{} ({} retries)", test.id, retries));
+                }
+            }
+        }
+        let (signal, top_flaky) = hermit_manifest_plan::ledger::landing_signal(
+            failures,
+            validation_complete,
+            result == "pass",
+            &rollup,
+            extra_retries,
+            extra_flaky,
+        );
         record["landing_signal"] = serde_json::json!(signal);
         record["flaky_tests"] = serde_json::json!(top_flaky);
         eprintln!(
@@ -26405,24 +26427,21 @@ fn retry_classes_for_test(
     observations: &[TestAttemptObservation],
     attempts: &[NodeAttempt],
 ) -> Vec<RetryClass> {
+    // Step 5 (owner policy, 2026-10-30): a later outer attempt alone no
+    // longer mints a retry class. Outer node reruns are not retries of a
+    // failing test; only an explicit historical `attempts[].retry_class`
+    // (recorded when an outer retry was actually granted) counts here.
+    // Innermost retries are counted separately (`retry_rollup_v1`).
     observations
         .iter()
         .filter(|observation| !observation.passed)
         .filter_map(|observation| {
-            let outer_class = attempts
+            attempts
                 .iter()
                 .find(|attempt| {
                     attempt.tag == observation.node && attempt.attempt == observation.attempt
                 })
-                .and_then(|attempt| attempt.retry_class);
-            outer_class.or_else(|| {
-                observations
-                    .iter()
-                    .any(|later| {
-                        later.node == observation.node && later.attempt > observation.attempt
-                    })
-                    .then_some(RetryClass::AlwaysEligible)
-            })
+                .and_then(|attempt| attempt.retry_class)
         })
         .collect()
 }
@@ -26617,20 +26636,21 @@ fn test_id_summary(
         let Some(last) = observations.last() else {
             continue;
         };
-        unclassified_outer_retry_occurrences +=
-            inner_retry_occurrences_for_test(&observations, attempts);
+        let unclassified = inner_retry_occurrences_for_test(&observations, attempts);
+        unclassified_outer_retry_occurrences += unclassified;
         let inner_retry_occurrences = observations
             .iter()
             .map(|observation| observation.inner_attempts.saturating_sub(1))
             .sum::<usize>();
         test_runner_retry_occurrences += inner_retry_occurrences;
         let retry_classes = retry_classes_for_test(&observations, attempts);
-        let was_retried = !retry_classes.is_empty() || inner_retry_occurrences > 0;
+        let was_retried =
+            !retry_classes.is_empty() || inner_retry_occurrences > 0 || unclassified > 0;
         let item = TestIdRetry {
             node,
             id,
             retry_classes,
-            inner_retry_occurrences,
+            inner_retry_occurrences: inner_retry_occurrences + unclassified,
         };
         if last.passed {
             if was_retried {

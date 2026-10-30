@@ -112,21 +112,25 @@ impl RetryRollupV1 {
 pub fn landing_signal(
     product_failures: usize,
     validation_complete: bool,
+    run_succeeded: bool,
     rollup: &RetryRollupV1,
+    extra_retries: u64,
+    extra_flaky_tests: Vec<String>,
 ) -> (&'static str, Vec<String>) {
-    if product_failures > 0 || !validation_complete {
+    if product_failures > 0 || !validation_complete || !run_succeeded {
         return ("red", Vec::new());
     }
-    if rollup.total_retries == 0 {
+    if rollup.total_retries == 0 && extra_retries == 0 {
         return ("green-clean", Vec::new());
     }
     let mut flaky: Vec<&RetryRecordV1> = rollup.tests.iter().filter(|t| t.flaky_pass).collect();
     flaky.sort_by(|a, b| b.retries.cmp(&a.retries).then_with(|| a.test.cmp(&b.test)));
-    let top = flaky
+    let mut top: Vec<String> = flaky
         .iter()
-        .take(10)
         .map(|t| format!("{} ({} retries)", t.test, t.retries))
         .collect();
+    top.extend(extra_flaky_tests);
+    top.truncate(10);
     ("green-flaky", top)
 }
 
@@ -170,9 +174,13 @@ mod tests {
     #[test]
     fn landing_signal_distinguishes_clean_flaky_and_red() {
         let clean = RetryRollupV1::from_records(vec![]);
-        assert_eq!(landing_signal(0, true, &clean), ("green-clean", vec![]));
-        assert_eq!(landing_signal(1, true, &clean).0, "red");
-        assert_eq!(landing_signal(0, false, &clean).0, "red");
+        assert_eq!(
+            landing_signal(0, true, true, &clean, 0, vec![]),
+            ("green-clean", vec![])
+        );
+        assert_eq!(landing_signal(1, true, true, &clean, 0, vec![]).0, "red");
+        assert_eq!(landing_signal(0, false, true, &clean, 0, vec![]).0, "red");
+        assert_eq!(landing_signal(0, true, false, &clean, 0, vec![]).0, "red");
         let flaky = RetryRollupV1::from_records(vec![RetryRecordV1 {
             test: "fixture/x".into(),
             mode: "verify".into(),
@@ -184,7 +192,19 @@ mod tests {
             final_outcome: "PASS".into(),
             flaky_pass: true,
         }]);
-        let (signal, top) = landing_signal(0, true, &flaky);
+        let (signal, top) = landing_signal(0, true, true, &flaky, 0, vec![]);
+        assert_eq!(
+            landing_signal(
+                0,
+                true,
+                true,
+                &clean,
+                2,
+                vec!["nextest/x (1 retries)".into()]
+            )
+            .0,
+            "green-flaky"
+        );
         assert_eq!(signal, "green-flaky");
         assert_eq!(top, ["fixture/x (1 retries)"]);
     }
