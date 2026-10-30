@@ -472,7 +472,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_malformed_corpus_is_refused, placeholders_resolve_or_refuse,
     // a_direct_shell_word_expands_its_placeholders_in_the_shell,
     // runner::tests::a_shipped_compat_row_keeps_the_strict_compatibility_probe_flags,
-    // and test-harness a_no_retry_cell_is_not_retried_after_a_product_failure)
+    // and test-harness a_no_retry_manifest_cell_is_retried_after_a_product_failure)
     // retain all 757 prior identities.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // runner::tests::a_relative_hermit_bin_names_a_checkout_path, added when the
@@ -705,7 +705,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest_metadata::tests::a_reproducer_selects_exactly_its_cell_including_focused_run_types
     // retains all 899 (the same listing gives 703 with it).
     // runner::tests::a_replay_cell_is_not_retried_after_a_product_failure and
-    // test-harness tests::a_replay_cell_is_not_retried_after_a_product_failure
+    // test-harness tests::a_replay_cell_is_retried_after_a_product_failure
     // retain all 900 (the same listing gives 705 with them).
     // Folding the rr-compat-only run type into each row's own test removes
     // manifest_corpus::tests::a_replay_variant_runs_only_its_replay_cell_with_its_budget,

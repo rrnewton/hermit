@@ -548,8 +548,10 @@ class IngestTest(unittest.TestCase):
 
     def test_an_execution_holds_at_most_one_row_and_only_for_its_own_cell(self):
         # One execution may hold several rows, one per harness attempt.
+        second = row(X, "PASS", "rx1")
+        second["attempt"] = 2
         _, rows, _ = self.accepted(
-            {"RUN": [execution(X, 100, "PASS", "rx1", rows=[row(X, "FAIL", "rx1"), row(X, "PASS", "rx1")]), Y_PASSES]}
+            {"RUN": [execution(X, 100, "PASS", "rx1", rows=[row(X, "FAIL", "rx1"), second]), Y_PASSES]}
         )
         self.assertEqual(
             [(attempt, outcome) for cell, attempt, outcome, _run in rows if cell == X],
