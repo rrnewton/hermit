@@ -3161,8 +3161,24 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 435da682062387e10bf1d775d49a45a3284377c9 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 435da682062387e10bf1d775d49a45a3284377c9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 237e3cd4479e152d8ce418fae22160206b5f8ff5 (2026-10-30): from 435da682062387e10bf1d775d49a45a3284377c9.
+# Interval: Reverie main 435da682..1a76af3a (guarded stack assertions
+# through a shared caller 2c17beb7, tests only, and its LiteInst catalog row
+# db112715; honoring a nonreturning asynchronous terminal injection in DBT
+# 296092e9; three LinuxEmu test commits 8d976b0f, f8e32b1a and 49cd10b7; and
+# LinuxEmu's inotify cookie pass-through 1a76af3a), then this slice: the
+# tool_reads_every_guest_writable_page capability (51745db4) and LinuxEmu's
+# FIONREAD forwarding and faulting-iovec copy-back (237e3cd4). The
+# reverie-dbt tree changed (296092e9, and one test in reverie-dbt/src/lib.rs)
+# and the committed inventory is 1043; the root Cargo.toml gained one
+# workspace exclude. The existing SDK budget carries, not runtime
+# equivalence.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, c1f267db, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 237e3cd4479e152d8ce418fae22160206b5f8ff5 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 237e3cd4479e152d8ce418fae22160206b5f8ff5 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

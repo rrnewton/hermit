@@ -9388,6 +9388,8 @@ mod tests {
     /// on ptrace. `reports_kernel_child_exit_signals` is true for ptrace,
     /// e9patch and SaBRe, whose signal callbacks see the kernel's child-exit
     /// SIGCHLD with its siginfo and can suppress or rewrite it.
+    /// `tool_reads_every_guest_writable_page` is true for ptrace, e9patch and
+    /// KVM, whose tools can read every page their guests can write.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
@@ -9435,6 +9437,11 @@ mod tests {
             // trampolines keep the original syscall instruction), whose
             // rt_sigreturns reach the seccomp stop that reports them.
             "reports_sigreturns": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // ptrace's PTRACE_PEEKDATA reads every mapped page, and KVM's
+            // tool every page its guest can access; the in-process backends
+            // read with process_vm_readv, which refuses a write-only page.
+            "tool_reads_every_guest_writable_page":
+                matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
             // ptrace (and so e9patch) sets DR0-DR3 on x86-64; every other
             // backend sets no hardware watchpoints.
             "hardware_watchpoints": if cfg!(target_arch = "x86_64") {

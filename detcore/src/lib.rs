@@ -6896,10 +6896,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             // An address space that allocates or applies a protection key may
             // hold pages its guest cannot write although Hermit's copies can
-            // (`MemoryMetadata::protection_keys`).
-            SyscallClassification::PassThrough
-                if matches!(call.number(), Sysno::pkey_alloc | Sysno::pkey_mprotect) =>
-            {
+            // (`MemoryMetadata::protection_keys`). A key exists only once
+            // pkey_alloc returns one: a failed allocation (EINVAL, ENOSPC, or
+            // a backend without protection keys answering ENOSYS) allocates
+            // nothing, so it is not recorded.
+            SyscallClassification::PassThrough if call.number() == Sysno::pkey_alloc => {
+                let result = self.passthrough(guest, call).await;
+                if matches!(result, Ok(key) if key >= 0) {
+                    guest.thread_state().note_protection_keys();
+                }
+                result
+            }
+            // pkey_mprotect is recorded before it runs, whatever it returns:
+            // a call that fails part way (ENOMEM after some VMAs changed) can
+            // have applied the key to some pages, and Linux does not say
+            // which.
+            SyscallClassification::PassThrough if call.number() == Sysno::pkey_mprotect => {
                 guest.thread_state().note_protection_keys();
                 self.passthrough(guest, call).await
             }

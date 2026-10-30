@@ -3150,7 +3150,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The socketpair readiness increment adds one detcore unit: 2999 + 1 = 3000, re-measured at this integration head.
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
-    ("test.detcore_unit", 3017),
+    // The inotify fault-boundary repair adds three detcore units: 3017 + 3 = 3020, by nextest list.
+    ("test.detcore_unit", 3020),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5543,7 +5544,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same socketpair readiness unit: 2999 + 1 = 3000.
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
-    ("test.detcore_unit_on_host", 3017),
+    // The same three inotify fault-boundary units: 3017 + 3 = 3020.
+    ("test.detcore_unit_on_host", 3020),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

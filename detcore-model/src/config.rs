@@ -38,10 +38,11 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 
 /// The capabilities a [`Config`] has before the host prepares it for the
 /// backend that runs it: ptrace's, the backend Detcore's own tests use, except
-/// that eight facts stay off (`supports_blocked_wait_signal_interruption` and
+/// that nine facts stay off (`supports_blocked_wait_signal_interruption` and
 /// the four split out of it, which [`set_kernel_signal_facts`] clears
 /// together, `delivers_preemption_timer_events`,
-/// `runs_guest_code_between_injections`, `reports_sigreturns`). Until
+/// `runs_guest_code_between_injections`, `reports_sigreturns`,
+/// `tool_reads_every_guest_writable_page`). Until
 /// `supports_blocked_wait_signal_interruption`,
 /// `delivers_preemption_timer_events` and
 /// `runs_guest_code_between_injections` became backend capabilities they were
@@ -50,7 +51,11 @@ const fn default_backend_capabilities() -> BackendCapabilities {
 /// behaviour, and the four readings of the first with it. A configuration
 /// nobody prepared cannot know that sigreturns are reported, so that is off
 /// too (the DBT runtime's standalone
-/// fallback starts from these). `reports_kernel_child_exit_signals` keeps
+/// fallback starts from these). Nor can it know that its tool reads every
+/// page the guest can write, so that is off as well: a Tool that takes the
+/// fact for false only trusts less of what it reads (inotify fault recovery
+/// then keeps just the bytes before a page it cannot read).
+/// `reports_kernel_child_exit_signals` keeps
 /// ptrace's value, as `reports_child_exit_publication` does: it took over the
 /// child-exit ledger's gates from that field, so such a configuration behaves
 /// as before. The host copies the running backend's own answer over all of
@@ -61,6 +66,7 @@ pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     backend.delivers_preemption_timer_events = false;
     backend.runs_guest_code_between_injections = false;
     backend.reports_sigreturns = false;
+    backend.tool_reads_every_guest_writable_page = false;
     backend
 };
 
@@ -278,8 +284,8 @@ pub struct Config {
     /// capabilities. The host copies the running backend's answer into this
     /// field before the run starts. The default,
     /// [`DEFAULT_BACKEND_CAPABILITIES`], describes a ptrace-hosted guest, the
-    /// backend Detcore's own tests use, with the three host-set facts and
-    /// `reports_sigreturns` off.
+    /// backend Detcore's own tests use, with the three host-set facts,
+    /// `reports_sigreturns` and `tool_reads_every_guest_writable_page` off.
     ///
     /// JSON that the guest can see is written by [`to_legacy_backend_json`],
     /// which carries this field as the separate keys used before it existed;
@@ -3442,6 +3448,13 @@ impl LegacyBackendKeys {
         // only by the versioned envelope of `encode_backend_config_json`,
         // never by these keys.
         backend.hardware_watchpoints = 0;
+        // Added after the legacy form froze, with no legacy key: it reads
+        // back as false, DBT's value (DBT's tool reads guest memory with
+        // process_vm_readv, which refuses a write-only page), so a DBT
+        // configuration stays exact. A backend that reads every page its
+        // guest can write (ptrace, KVM) is preserved only by the versioned
+        // envelope of `encode_backend_config_json`.
+        backend.tool_reads_every_guest_writable_page = false;
         backend
     }
 }
@@ -4387,6 +4400,7 @@ mod tests {
         assert!(!config.backend.host_timed_signals_are_physical);
         assert!(!config.backend.delivers_preemption_timer_events);
         assert!(!config.backend.runs_guest_code_between_injections);
+        assert!(!config.backend.tool_reads_every_guest_writable_page);
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
         assert!(!config.in_guest_site_patching_off);
@@ -4472,6 +4486,7 @@ mod tests {
         // The legacy form carries no width for `hardware_watchpoints`: it
         // reads back as 0, the minimal width (see `LegacyBackendKeys::capabilities`).
         backend.hardware_watchpoints = 0;
+        backend.tool_reads_every_guest_writable_page = false;
         backend
     }
 
@@ -4530,7 +4545,9 @@ mod tests {
             ),
             ("SABRE", BackendCapabilities::SABRE, true),
             ("DBT", BackendCapabilities::DBT, true),
-            ("KVM", BackendCapabilities::KVM, false),
+            // KVM's tool reads every page its guest can write, which the
+            // legacy form reads back as false.
+            ("KVM", BackendCapabilities::KVM, true),
         ] {
             for sequentialize_threads in [false, true] {
                 let sent = Config {
@@ -5118,8 +5135,8 @@ mod tests {
     /// configuration reads back as false
     /// (`supports_blocked_wait_signal_interruption` and the four split out of
     /// it, `delivers_preemption_timer_events`,
-    /// `runs_guest_code_between_injections`, `reports_sigreturns`) never enter
-    /// it, whatever their
+    /// `runs_guest_code_between_injections`, `reports_sigreturns`,
+    /// `tool_reads_every_guest_writable_page`) never enter it, whatever their
     /// value: the legacy string keeps its bytes, and they read
     /// back as false from both the object and the array form.
     #[test]
@@ -5133,6 +5150,7 @@ mod tests {
         on.backend.delivers_preemption_timer_events = true;
         on.backend.runs_guest_code_between_injections = true;
         on.backend.reports_sigreturns = true;
+        on.backend.tool_reads_every_guest_writable_page = true;
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         for key in [
@@ -5144,6 +5162,7 @@ mod tests {
             "delivers_preemption_timer_events",
             "runs_guest_code_between_injections",
             "reports_sigreturns",
+            "tool_reads_every_guest_writable_page",
         ] {
             assert!(!json.contains(key), "{json}");
         }
@@ -5162,6 +5181,7 @@ mod tests {
             assert!(!backend.delivers_preemption_timer_events);
             assert!(!backend.runs_guest_code_between_injections);
             assert!(!backend.reports_sigreturns);
+            assert!(!backend.tool_reads_every_guest_writable_page);
             assert_eq!(backend, legacy_expressible(BackendCapabilities::DBT));
         }
     }
