@@ -3054,7 +3054,7 @@ impl GlobalState {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let id = self
                     .next_guest_id
-                    .fetch_update(SeqCst, SeqCst, |id| {
+                    .try_update(SeqCst, SeqCst, |id| {
                         (id > 0).then(|| id.checked_add(1).unwrap_or(0))
                     })
                     .ok()?;
@@ -12053,6 +12053,8 @@ mod tests {
     /// exhausted, including when initialization cannot represent base + 1.
     #[tokio::test]
     async fn automatic_guest_ids_stop_instead_of_wrapping() {
+        use std::sync::atomic::Ordering::SeqCst;
+
         let config = |base| Config {
             guest_ids: detcore_model::pid::GuestIds::Chosen {
                 base,
