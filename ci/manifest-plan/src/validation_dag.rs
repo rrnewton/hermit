@@ -624,6 +624,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
+    "privileged-test.pmu_chaos_cli_cases",
     "privileged-test.pmu_detcore_time_cases",
     "privileged-cpuid.cpu_profile_v3",
     "test.pmu_integration_cases",

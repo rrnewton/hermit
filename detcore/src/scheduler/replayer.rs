@@ -589,19 +589,19 @@ impl Replayer {
     fn release_schedule(&mut self, current_ix: u64) -> ReplayAction {
         let dropped = self.cursor.by_ref().count();
         self.release = Some(Release {
-            event,
+            event: current_ix,
             unreplayed: dropped,
         });
         tracing::warn!(
             "[tracereplay] {} observed events in a row matched none of the replayed schedule's next event, through event #{} (events are numbered, and unmatched ones counted, without polling retries); the replay no longer follows the schedule ({} recorded events left unreplayed)",
             UNMATCHED_EVENTS_BEFORE_RELEASE,
-            event,
+            current_ix,
             dropped
         );
         if self.replay_exhausted_panic {
             eprintln!(
                 "[detcore] The replay left its schedule at event #{} (numbered without polling retries) with {} recorded events left; stopping (--replay-exhausted-panic)",
-                event, dropped
+                current_ix, dropped
             );
             return ReplayAction::Stop(StopReason::ReplayExausted);
         }
