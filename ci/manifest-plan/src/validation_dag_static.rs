@@ -1278,7 +1278,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's
     // only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end
     // (--chaos-instruction-offset): 1958.
-    ("test.regular_crates", 1958),
+    // And chaos_instruction_offset_never_enters_the_legacy_form: 1959.
+    ("test.regular_crates", 1959),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5347,8 +5348,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same detcore-model builder unit: 1937 + 1 = 1938.
     // Rebased onto main c1f3085da: 1941 + 1 = 1942.
     // Rebased onto main fcd62385f: 1942 + 1 = 1943.
-    // And the cases added since, as this twin's entry further down counts: 1944.
-    ("test.regular_crates_on_host", 1944),
+    // And the cases added since, as this twin's entry further down counts: 1945.
+    ("test.regular_crates_on_host", 1945),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6591,7 +6592,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main c1f3085da: 1941 + 1 = 1942.
     // Rebased onto main fcd62385f: 1942 + 1 = 1943.
     // And the same --chaos-instruction-offset detcore-model unit: 1944.
-    ("test.regular_crates_on_host", 1944),
+    // And the same legacy-form unit: 1945.
+    ("test.regular_crates_on_host", 1945),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
