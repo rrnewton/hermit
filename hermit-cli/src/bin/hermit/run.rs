@@ -5975,7 +5975,7 @@ fn scheduler_turn_cost_parses_round_trips_and_is_refused_for_dbt() {
 
 #[test]
 fn virtual_timeout_with_debugger_is_refused_before_dispatch_and_validation() {
-    for debugger in ["--gdbserver", "--dap-listen=127.0.0.1:0"] {
+    for debugger in ["--dap-listen=127.0.0.1:0", "--gdbserver"] {
         for bounded in [false, true] {
             let mut argv = vec!["fakehermit", debugger];
             if bounded {

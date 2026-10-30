@@ -950,7 +950,11 @@ fn failure_exit_code(error: &Error) -> i32 {
     // A fail-closed policy stopping the run is hermit working; reporting it as
     // HERMIT_INTERNAL_FAILURE_EXIT tells the operator to file a bug against a
     // shutdown path that behaved exactly as designed.
-    if error.downcast_ref::<PolicyRefusal>().is_some() {
+    if error.downcast_ref::<PolicyRefusal>().is_some()
+        || error
+            .downcast_ref::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>()
+            .is_some()
+    {
         return detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
     }
     // A signal death reports 128 + signo, the status the shell would have shown
@@ -999,7 +1003,11 @@ fn classify_failure(error: &Error) -> String {
     // only the status separates them. Ordering matters: a refusal that fell
     // through to the arm below would be reported as an accident, which is the
     // defect this exists to remove.
-    if error.downcast_ref::<PolicyRefusal>().is_some() {
+    if error.downcast_ref::<PolicyRefusal>().is_some()
+        || error
+            .downcast_ref::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>()
+            .is_some()
+    {
         // NOT HERMIT_INTERNAL_FAILURE: hermit did not fail. It refused, on
         // purpose, and printed why immediately above this line.
         return "HERMIT_POLICY_REFUSAL class=policy-refusal".to_string();
@@ -2006,6 +2014,32 @@ mod tests {
         let class = classify_failure(&error);
         assert!(class.starts_with("HERMIT_INTERNAL_FAILURE "), "{class}");
         assert_ne!(class, detcore_model::HERMIT_MODEL_DEADLOCK_LINE);
+    }
+
+    #[test]
+    fn a_debugger_virtual_timeout_refusal_is_policy_before_container_startup() {
+        for contextual in [false, true] {
+            let mut error = Error::new(detcore_model::virtual_timeout::VirtualTimeoutWithDebugger);
+            if contextual {
+                error = error.context("before debugger startup");
+            }
+            assert_eq!(
+                failure_exit_code(&error),
+                detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+            );
+            assert_eq!(
+                classify_failure(&error),
+                "HERMIT_POLICY_REFUSAL class=policy-refusal"
+            );
+        }
+        // Matching prose does not turn an unrelated error into a policy verdict.
+        let prose =
+            Error::msg(detcore_model::virtual_timeout::VirtualTimeoutWithDebugger.to_string());
+        assert_eq!(failure_exit_code(&prose), HERMIT_INTERNAL_FAILURE_EXIT);
+        assert_eq!(
+            classify_failure(&prose),
+            "HERMIT_INTERNAL_FAILURE class=cli-error"
+        );
     }
 
     #[test]

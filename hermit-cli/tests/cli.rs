@@ -42919,6 +42919,11 @@ fn virtual_timeout_with_debugger_refuses_before_guest_or_listener_startup() {
             log.contains("use --timeout for a wall-clock bound"),
             "{log}"
         );
+        assert!(
+            log.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{log}"
+        );
+        assert!(!log.contains("HERMIT_INTERNAL_FAILURE"), "{log}");
         assert!(!log.contains("Failed to bind"), "{log}");
         assert!(!log.contains("class=run-timeout"), "{log}");
     }
