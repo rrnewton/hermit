@@ -192,9 +192,9 @@ use hermit::Error;
 use hermit::ExitStatus;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 
-use self::analyze::AnalyzeFailure;
 use self::analyze::AnalyzeOpts;
 use self::analyze::AnalyzeVerdict;
+use self::analyze::failure_class_line;
 use self::analyze::precondition_class;
 use self::bisect::BisectOpts;
 use self::container::ContainerChildExit;
@@ -1034,9 +1034,10 @@ fn failure_exit_code(error: &Error) -> i32 {
     if error.downcast_ref::<AnalyzeVerdict>().is_some() {
         return 0;
     }
-    // Analyze could not conclude because replay or its search failed: still
-    // Hermit failing, under a class line that says which.
-    if error.downcast_ref::<AnalyzeFailure>().is_some() {
+    // Analyze could not conclude because replay or its search failed, or
+    // its search could replay no schedule between its closest pair: still
+    // 125, under a class line that says which.
+    if failure_class_line(error).is_some() {
         return HERMIT_INTERNAL_FAILURE_EXIT;
     }
     match error.downcast_ref::<GuestProgramFault>() {
@@ -1108,8 +1109,8 @@ fn classify_failure(error: &Error) -> String {
     if let Some(verdict) = error.downcast_ref::<AnalyzeVerdict>() {
         return verdict.class_line();
     }
-    if let Some(failure) = error.downcast_ref::<AnalyzeFailure>() {
-        return failure.class_line();
+    if let Some(line) = failure_class_line(error) {
+        return line;
     }
     // ONE discriminant, read once, covering all three flattenings.
     if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {
@@ -2327,6 +2328,25 @@ mod tests {
             assert_eq!(
                 classify_failure(&error),
                 format!("HERMIT_INTERNAL_FAILURE class={class}")
+            );
+        }
+        // A search that could replay no schedule between its closest pair did
+        // not decide whether its endpoints are separable: `hermit bisect`
+        // ends 125, undecided, not 2, through added context too.
+        let infeasible = crate::schedule_search::NoFeasibleSchedule {
+            pass: 1,
+            edit_distance: 4,
+            swap_distance: 2,
+            tried: Vec::new(),
+        };
+        for error in [
+            Error::new(infeasible.clone()),
+            Error::new(infeasible).context("bisecting"),
+        ] {
+            assert_eq!(failure_exit_code(&error), HERMIT_INTERNAL_FAILURE_EXIT);
+            assert_eq!(
+                classify_failure(&error),
+                "HERMIT_INTERNAL_FAILURE class=no-feasible-splice"
             );
         }
         let verdict = Error::new(AnalyzeVerdict::no_deciding_event("no event decides", None));

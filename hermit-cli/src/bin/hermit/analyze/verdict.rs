@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::analyze::phases::describe_continuation;
+use crate::schedule_search::NoFeasibleSchedule;
 use crate::schedule_search::NoSingleSwap;
 
 /// What an analysis concluded: the `verdict` field of its report.
@@ -396,6 +397,23 @@ impl AnalyzeFailure {
         };
         format!("HERMIT_INTERNAL_FAILURE class={class}")
     }
+}
+
+/// The class line of a search that could not conclude, the first line on
+/// stderr of its exit 125: an [`AnalyzeFailure`]'s, or `class=no-feasible-splice`
+/// for a search that could replay no schedule between its closest pair
+/// ([`NoFeasibleSchedule`]). That search did not decide whether its endpoints
+/// are separable, so it is not `endpoints-not-separable`. Analyze answers it
+/// with a prefix search; `hermit bisect`, which has no target run to search,
+/// ends with it.
+pub fn failure_class_line(error: &anyhow::Error) -> Option<String> {
+    if let Some(failure) = error.downcast_ref::<AnalyzeFailure>() {
+        return Some(failure.class_line());
+    }
+    if error.downcast_ref::<NoFeasibleSchedule>().is_some() {
+        return Some("HERMIT_INTERNAL_FAILURE class=no-feasible-splice".to_owned());
+    }
+    None
 }
 
 impl std::fmt::Display for AnalyzeFailure {

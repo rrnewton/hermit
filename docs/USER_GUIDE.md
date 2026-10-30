@@ -987,6 +987,7 @@ line that says which. The class line is the first line on stderr:
 | 123 | `HERMIT_LOG_CAP class=log-cap` | `--max-log-bytes` ended the analysis. |
 | 125 | `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible` | `--selfcheck` found a difference, or a jittered schedule never replayed the same way twice: replay, Hermit's or this host's (`hermit host-capabilities` says whether its branch counter is exact), did not reproduce a run. |
 | 125 | `HERMIT_INTERNAL_FAILURE class=search-did-not-converge` | The event-level search did not converge within its passes. |
+| 125 | `HERMIT_INTERNAL_FAILURE class=no-feasible-splice` | `hermit bisect` only: no schedule between the search's closest pair could be replayed, so it did not decide whether `--good` and `--bad` are separable. Analyze attempts a prefix search within the target schedule instead. |
 | 125 | another `HERMIT_INTERNAL_FAILURE class=...` | Hermit failed. |
 | 128 + N | none | Signal N (SIGTERM, SIGINT or SIGHUP) stopped the analysis. |
 

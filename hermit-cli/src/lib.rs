@@ -405,7 +405,10 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible`
 //              (--selfcheck found a difference, or a jittered schedule never
 //              replayed the same way twice), `class=search-did-not-converge`,
-//              or another `HERMIT_INTERNAL_FAILURE class=` for Hermit failing.
+//              `class=no-feasible-splice` (bisect: no schedule between the
+//              closest pair could be replayed, so the search did not decide;
+//              analyze attempts a prefix search instead), or another
+//              `HERMIT_INTERNAL_FAILURE class=` for Hermit failing.
 //   128 + N    analyze stopped by signal N (SIGTERM, SIGINT or SIGHUP).
 //
 // ⚠️ NO CODE IS EXCLUSIVELY HERMIT'S. Every value in 0..=255 is a legal guest
