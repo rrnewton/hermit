@@ -548,18 +548,22 @@ fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() 
 #[test]
 fn the_privileged_c_programs_description_names_every_selected_cell() {
     let plan = read_json("ci/expected-e2e-plan.json");
-    let backends = plan["cells"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|cell| {
-            field(cell, "lane") == "privileged" && field(cell, "category") == SUCCESSOR_BUCKET
-        })
-        .map(|cell| {
-            assert_eq!(field(cell, "test"), "c-programs/cpuid-probe", "{cell}");
-            field(cell, "backend").to_string()
-        })
-        .collect::<Vec<_>>();
+    let (mut backends, mut replay_backends) = (Vec::new(), Vec::new());
+    for cell in plan["cells"].as_array().unwrap() {
+        if field(cell, "lane") != "privileged" || field(cell, "category") != SUCCESSOR_BUCKET {
+            continue;
+        }
+        assert_eq!(field(cell, "test"), "c-programs/cpuid-probe", "{cell}");
+        match field(cell, "mode") {
+            "verify" => backends.push(field(cell, "backend").to_string()),
+            "replay" => replay_backends.push(field(cell, "backend").to_string()),
+            mode => panic!("unexpected cpuid-probe mode {mode}: {cell}"),
+        }
+    }
+    // The 2026-10-30 flip made the cpuid-probe ptrace replay cell required;
+    // the nodes' shared selector runs it too, so the description must name it
+    // alongside the verify cells rather than absorbing it into their count.
+    assert_eq!(replay_backends, ["ptrace"], "cpuid-probe replay cells");
     let count = ["zero", "one", "two", "three", "four", "five", "six"][backends.len()];
     let dag = read_json("ci/dag/validate.json");
     let mut seen = 0;
@@ -584,6 +588,10 @@ fn the_privileged_c_programs_description_names_every_selected_cell() {
         for backend in &backends {
             assert!(description.contains(backend), "{backend}: {description}");
         }
+        assert!(
+            description.contains("plus the cpuid-probe replay cell on ptrace"),
+            "replay cell not named: {description}"
+        );
     }
     // 4 with privileged-e2e.manifest_c_programs_buck, the full-buck-e2e import
     // twin, which runs its counterpart's arguments and leads with its description.

@@ -1358,8 +1358,10 @@ mod tests {
     /// three-run survey on 2026-10-09, 76 of the 77 rows the rr lane never
     /// listed as passing. Each is the replay cell of its row's own test,
     /// carrying the full and rr run types (the full validation selects them
-    /// since 2026-10-20) and none of the verify cell's settings. 212 are
-    /// selected, and the 3 seen to fail stay enabled with `ci: false` and the
+    /// since 2026-10-20) and none of the verify cell's settings. 215 are
+    /// selected (212 plus compat/df, compat/lua and compat/perl, whose
+    /// replay cells the 338-cell flip of 2026-10-30 made required), and the
+    /// 3 seen to fail stay enabled with `ci: false` and the
     /// issue of their failure (`UNSELECTED_REPLAY`).
     /// A row moved into or out of the run type, a second test for a program,
     /// the rr run type reaching a verify cell, or a cell quietly unselected or
@@ -1420,7 +1422,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((gated, refused), (212, UNSELECTED_REPLAY.len()));
+        assert_eq!((gated, refused), (215, UNSELECTED_REPLAY.len()));
     }
 
     /// The replay cells seen to fail, each with its issue: lsof in the

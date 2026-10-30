@@ -93,6 +93,8 @@ use crate::timeouts::DEFAULTS_FILE;
 #[cfg(test)]
 use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
+use crate::timeouts::FLIP_2026_10_30_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
 use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
@@ -15627,6 +15629,9 @@ fi
         // disabled (https://github.com/rrnewton/hermit/issues/3745), again with
         // the default timeouts. Its SaBRe verify cell left the required
         // population when SaBRe was archived on 2026-10-25 (crate::archived).
+        // Its ptrace replay cell joins on 2026-10-30 with the 338-cell flip
+        // of sweep-clean cells, with the default timeouts (22 CPU s, 57 s
+        // wall, like its verify cells) and no calibration change.
         assert_eq!(
             regular_sink,
             BTreeSet::from([
@@ -15635,6 +15640,7 @@ fi
                 ("verify", Some("kvm")),
                 ("verify", Some("liteinst")),
                 ("verify", Some("ptrace")),
+                ("replay", Some("ptrace")),
             ])
         );
         // https://github.com/rrnewton/hermit/pull/3231 qualifies three new
@@ -15883,6 +15889,7 @@ fi
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
             .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
             .chain(&DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS)
+            .chain(&FLIP_2026_10_30_TIMEOUT_CALIBRATIONS)
             .map(|calibration| {
                 (
                     (calibration.test, calibration.mode, calibration.backend),

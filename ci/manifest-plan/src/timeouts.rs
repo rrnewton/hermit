@@ -162,7 +162,9 @@ pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 214;
 /// type's 59/60 s bounds, except java, javac and rustc at 59/177 (the replay
 /// section's `slow` group, 2026-10-21): 212 selected after two clean nightly
 /// pressure sweeps, and 3 enabled with `ci: false` (lsof, cscope and zip-unzip).
-pub const COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT: usize = 215;
+/// The 338-cell flip of 2026-10-30 selected df, lua and perl as well: 215
+/// selected, 218 enabled.
+pub const COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT: usize = 218;
 /// Ptrace replay cells selected when
 /// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
 /// replayer `select` and `pselect6`. Before it, replay of both programs
@@ -316,6 +318,54 @@ pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
 /// KVM cells whose qualification evidence needs a bound above the ordinary
 /// default. This is separate from the earlier full retained-data census so its
 /// source revision and sample count stay explicit.
+/// Three cells the 338-cell flip of 2026-10-30 made required with measured
+/// bounds above the ordinary default, from local samples on the host named in
+/// docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts", at the flip
+/// head (test-harness run, 2026-10-30); each cell was also CLEAN on the
+/// nightly pressure sweeps of 2026-10-29 and 2026-10-30. Configured bounds
+/// follow the manifest-declared rules recorded in each cell's reason:
+/// ceil(1.5x measured CPU) and ceil(3x measured wall), except
+/// python-io-subprocess-time, whose CPU bound is ceil(1.5 x 22.0) = 33
+/// because the validate-context measurement is the 22.0 stop itself.
+pub const FLIP_2026_10_30_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 3] = [
+    TimeoutCalibration {
+        test: "applications/kvm-python-examples",
+        mode: "verify",
+        backend: "ptrace",
+        samples: 1,
+        p90_cpu_usec: 40_920_000,
+        p90_wall_millis: 42_271,
+        required_cpu_seconds: 62,
+        required_wall_seconds: 127,
+        configured_cpu_seconds: 62,
+        configured_wall_seconds: 127,
+    },
+    TimeoutCalibration {
+        test: "data-handling/zstd-multithread",
+        mode: "verify",
+        backend: "dbt",
+        samples: 2,
+        p90_cpu_usec: 27_269_000,
+        p90_wall_millis: 29_307,
+        required_cpu_seconds: 41,
+        required_wall_seconds: 88,
+        configured_cpu_seconds: 41,
+        configured_wall_seconds: 88,
+    },
+    TimeoutCalibration {
+        test: "language-runtimes/python-io-subprocess-time",
+        mode: "verify",
+        backend: "dbt",
+        samples: 1,
+        p90_cpu_usec: 19_841_000,
+        p90_wall_millis: 21_226,
+        required_cpu_seconds: 33,
+        required_wall_seconds: 64,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 64,
+    },
+];
+
 pub const KVM_RATCHET_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCalibration {
     test: "applications/timed-progress-bar",
     mode: "verify",
