@@ -67,8 +67,8 @@ struct RawRecord {
     host_inputs: Option<HostInputSet>,
     #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    rejoins: Vec<crate::scheduler::rejoin_log::Rejoin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
@@ -453,7 +453,9 @@ mod tests {
     /// and reading the current form, plain and inside the incomplete-record
     /// envelope. So do the popped events a readmission names: an empty list
     /// is written, so that it stays apart from a readmission that names none
-    /// (`None`, as in older records), which is not.
+    /// (`None`, as in older records), which is not. Likewise a record whose
+    /// run logged no readmission keeps its empty list, apart from a record
+    /// written before the field existed, which reads as having none.
     #[test]
     fn rejoins_round_trip_through_the_record_serde() {
         let old =
@@ -465,20 +467,20 @@ mod tests {
             calls: vec![(DetTid::from_raw(3), 2)],
             popped: None,
         }];
-        assert_eq!(record.rejoins, expected);
+        assert_eq!(record.rejoins.as_ref(), Some(&expected));
         for marker in [None, Some(7)] {
             let mut copy = record.clone();
             copy.replay_departed_at = marker;
             let written = serde_json::to_string(&copy).unwrap();
             let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
-            assert_eq!(read.rejoins, expected, "{written}");
+            assert_eq!(read.rejoins.as_ref(), Some(&expected), "{written}");
             assert_eq!(read.replay_departed_at(), marker, "{written}");
         }
 
         use crate::scheduler::rejoin_log::PoppedEvent;
         use crate::scheduler::rejoin_log::TimedEventId;
         let mut named = record;
-        named.rejoins = vec![
+        named.rejoins = Some(vec![
             crate::scheduler::rejoin_log::Rejoin {
                 popped: Some(vec![
                     PoppedEvent {
@@ -501,7 +503,7 @@ mod tests {
                 turn: 6,
                 ..expected[0].clone()
             },
-        ];
+        ]);
         for marker in [None, Some(7)] {
             let mut copy = named.clone();
             copy.replay_departed_at = marker;
@@ -509,6 +511,26 @@ mod tests {
             assert_eq!(written.matches(r#""popped":"#).count(), 2, "{written}");
             let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
             assert_eq!(read.rejoins, named.rejoins, "{written}");
+        }
+
+        let fresh = PreemptionWriter::new(None).into_string();
+        assert!(fresh.contains(r#""rejoins":[]"#), "{fresh}");
+        let mut logged_none = named;
+        logged_none.rejoins = Some(Vec::new());
+        for marker in [None, Some(7)] {
+            let mut copy = logged_none.clone();
+            copy.replay_departed_at = marker;
+            let written = serde_json::to_string(&copy).unwrap();
+            assert!(written.contains(r#""rejoins":[]"#), "{written}");
+            let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(read.rejoins, Some(Vec::new()), "{written}");
+        }
+        for older in [
+            r#"{"per_thread":{},"global":[]}"#,
+            r#"{"incomplete_preemption_record":{"version":1,"replay_departed_at":0,"record":{"per_thread":{},"global":[]}}}"#,
+        ] {
+            let read: PreemptionRecord = serde_json::from_str(older).unwrap();
+            assert_eq!(read.rejoins, None, "{older}");
         }
     }
 }
