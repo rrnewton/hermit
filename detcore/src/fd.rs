@@ -4947,6 +4947,70 @@ mod tests {
         );
     }
 
+    /// A guest-made socket's provenance (`DetFd::is_guest_created`) lives on
+    /// its description, which a queued message keeps after the sender closed
+    /// its copy: the receipt joins that description, as Linux installs the
+    /// sender's file, and shares its provenance, as a duplicate does. A
+    /// message Linux may have released is never joined
+    /// (`TakenRights::joinable`): the received socket is then a description
+    /// of its own, which starts without it.
+    #[test]
+    fn a_receipt_shares_the_provenance_of_the_description_its_message_kept() {
+        let (left, right, sent) = pair_and_sent(DetTid::from_raw(10), FdType::Socket);
+        sent.set_guest_created();
+        let id = sent.open_file_id();
+        let _handle = queue_and_close(&left, sent, true);
+        let taken = right
+            .take_queued_rights(&[(1, 50)], false, false, false, None)
+            .unwrap();
+        assert!(taken.joinable);
+        let received = taken.sent[0]
+            .open_file
+            .as_ref()
+            .unwrap()
+            .descriptor(7, false)
+            .expect("the queued message keeps the description");
+        assert_eq!(received.open_file_id(), id, "the receipt joins it");
+        assert!(
+            received.is_guest_created(),
+            "and shares the sender's provenance"
+        );
+
+        // Two messages name one file, and the first was taken by a call
+        // Detcore could not match: Linux may have released the message whose
+        // copy is received, so the receipt joins nothing.
+        let (left, right, sent) = pair_and_sent(DetTid::from_raw(12), FdType::Socket);
+        sent.set_guest_created();
+        for _ in 0..2 {
+            assert!(matches!(
+                left.queue_rights_to_peer(
+                    vec![SentDescriptor {
+                        file: (1, 50),
+                        open_file: Some(sent.in_flight_open_file(true)),
+                        lock_copy: None,
+                    }],
+                    1
+                ),
+                Ok(())
+            ));
+        }
+        right.lose_lockstep_if_queued(1, false);
+        let taken = right
+            .take_queued_rights(&[(1, 50)], false, false, false, None)
+            .unwrap();
+        assert!(!taken.joinable, "a message Linux may have released");
+        let own = DetFd::new(
+            7,
+            OFlag::O_RDWR,
+            FdType::Socket,
+            OpenFileId::new(DetTid::from_raw(12), 3),
+        );
+        assert!(
+            !own.is_guest_created(),
+            "a description of its own starts without provenance"
+        );
+    }
+
     /// Under record and replay a queued message keeps the ownership existing
     /// recordings were made with: it holds nothing, so a description only it
     /// names is gone for every decision, a receipt's join and a pending

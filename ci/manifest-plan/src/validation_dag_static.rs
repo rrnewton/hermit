@@ -3163,9 +3163,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::test::a_trace_replay_grant_after_a_failed_attempt_is_no_attempt: 2749.
     // Measured with this change's eleven units on #4862's rebased head: 2825.
     // The same eleven units on #4862's head on main 32f85d391 (2889): 2900.
-    // The same eleven units on #4862's head on main dc85ec16a (3043): 3054,
-    // listed.
-    ("test.detcore_unit", 3054),
+    // The same eleven units on #4862's head on main dc85ec16a (3043): 3054.
+    // And fd's
+    // a_receipt_shares_the_provenance_of_the_description_its_message_kept:
+    // 3055, listed.
+    ("test.detcore_unit", 3055),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5587,8 +5589,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same TraceReplay-grant unit: 2749.
     // The same eleven units: 2825.
     // The same eleven units on main 32f85d391 (2889): 2900.
-    // The same eleven units on main dc85ec16a (3043): 3054, listed.
-    ("test.detcore_unit_on_host", 3054),
+    // The same eleven units on main dc85ec16a (3043): 3054.
+    // And the same receipt unit: 3055, listed.
+    ("test.detcore_unit_on_host", 3055),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

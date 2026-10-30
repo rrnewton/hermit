@@ -62,19 +62,25 @@
 //   joined-listener the same, with the original kept open, so the received
 //               copy joins it: neither copy's poll is classified.
 //   received-connect an unconnected socket a forked child made and passed
-//               over a socketpair, closing its copy, so the received socket
-//               is not one this process made: this process connects it to
-//               its own listener, and neither its poll nor the accepted
-//               end's is classified, since its maker could have kept a copy.
+//               over a socketpair (a guest-held channel), closing its copy.
+//               The queued message keeps the child's open file, so the
+//               received socket joins it, as Linux installs the sender's
+//               file, and shares its provenance: a guest made it, and it
+//               crossed only a guest-held channel, so every holder of it has
+//               been a guest. This process connects it to its own listener,
+//               and both its poll and the accepted end's are classified.
 //   received-listener a socket received the same way, which this process
-//               binds and listens on: neither a client this process makes
-//               and connects to it nor the accepted end is classified, since
-//               the listener's maker could have kept a copy and accepted.
+//               binds and listens on: a client this process makes and
+//               connects to it, and the accepted end, are classified, for
+//               the same reason.
 //   forwarded-socket a client socket a forked child connected to this
 //               process's listener, passed over a socketpair (a guest-held
-//               channel) after the child closed its own copy, so the received
-//               copy joins nothing: its credentials name this process, but
-//               peer credentials do not show who else holds the open file, so
+//               channel) after the child closed its own copy. The received
+//               copy joins the child's open file, which the queued message
+//               keeps, and shares its mark: none, since the child's connect
+//               found the listener's credentials naming this process, not the
+//               child. A receipt never marks a socket from its credentials,
+//               which name its peer, not every holder of its open file, so
 //               its poll is never classified.
 //
 // Use a bogus 'RUN' directive so this test isn't disabled:
@@ -281,8 +287,8 @@ static int receive_descriptor(int fd) {
 static void reap(pid_t child);
 
 // A stream socket a forked child made and passed over a socketpair, which
-// the child closes, exiting, before this process receives it: the received
-// socket joins nothing.
+// the child closes, exiting, before this process receives it: the queued
+// message keeps the child's open file, which the received socket joins.
 static int receive_a_childs_socket(void) {
   int pair[2];
   assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
