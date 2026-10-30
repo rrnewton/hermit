@@ -3415,7 +3415,7 @@ mod legacy_backend_json {
     /// `eager_lone_preemptions` came after it too. DBT has no PMU timer, so
     /// the option has no effect there; it is never written and reads as
     /// false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 38] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 39] = [
         // `chaos_timeslice_range` came after it too: the scheduler draws the
         // slices, not the runtime, so it is never written and reads as unset.
         // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
@@ -4832,11 +4832,11 @@ mod tests {
         // `annotated_priority_replay`, `virtual_cpus`, `replay_edited_preemptions`,
         // `notice_host_network_abstract_binds`, `eager_lone_preemptions`,
         // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
-        // `guest_ids` and `strict_schedule_boundaries`
-        // none: fourteen more keys and thirty-seven fewer, so twenty-three keys fewer
+        // `guest_ids`, `virtual_timeout` and `strict_schedule_boundaries`
+        // none: fourteen more keys and thirty-eight fewer, so twenty-four keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 23);
+        assert_eq!(fields.len(), keys.len() + 24);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

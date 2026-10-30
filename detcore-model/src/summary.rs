@@ -405,6 +405,8 @@ impl RunSummary {
             store_exclusives,
             store_exclusives_unavailable,
             guest_deadlock,
+            guest_ids,
+            host_id_tasks,
             virtual_timeout_ns,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;

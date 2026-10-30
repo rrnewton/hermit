@@ -18738,6 +18738,8 @@ impl Scheduler {
                 store_exclusives: None,
                 store_exclusives_unavailable: None,
                 guest_deadlock,
+                guest_ids: None,
+                host_id_tasks: 0,
                 virtual_timeout_ns,
             },
             info_reprio_descrip,
