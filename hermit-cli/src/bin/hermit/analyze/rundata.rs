@@ -3384,6 +3384,11 @@ mod tests {
         for keep_tmp in [false, true] {
             let outside = tempfile::tempdir().unwrap();
             let user_schedule = outside.path().join("mine.preempts");
+            // Main's trials read the record their run arguments replay when
+            // they are built (`RunData::new_baseline`), so it exists first.
+            PreemptionRecord::from_sched_events(Vec::new())
+                .write_to_disk(&user_schedule)
+                .unwrap();
             let replay = format!("--replay-schedule-from={}", user_schedule.display());
             let mut options =
                 AnalyzeOpts::try_parse_from(["analyze", "--", replay.as_str(), "/bin/true"])
