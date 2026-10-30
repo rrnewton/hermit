@@ -422,6 +422,17 @@ impl ReplayHostInputs {
         &self.changes[found..]
     }
 
+    /// A captured input's private copy could not be checked at shutdown.
+    /// Do not let its stable origin hide that loss of evidence: the existing
+    /// identity-only fallback must compare the physical object instead. Only
+    /// the first open awaiting settlement is changed; changes already found
+    /// by `observe` remain reported.
+    pub(crate) fn restore_snapshot_identity(&mut self, path: &str, physical: HostFileIdentity) {
+        if let Some((_, identity)) = self.pending.iter_mut().find(|(pending, _)| pending == path) {
+            *identity = physical;
+        }
+    }
+
     /// The changes found so far: those reported at their opens, in the order
     /// of those opens, then those [`Self::finish`] found.
     pub(crate) fn changes(&self) -> &[HostInputChange] {

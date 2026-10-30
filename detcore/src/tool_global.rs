@@ -1259,7 +1259,9 @@ pub struct GlobalState {
     // (`crate::host_inputs::content_at_end`): its index there and where the
     // tool found the file at the open. Read once every guest process has
     // exited, by `settle_host_inputs`, never while the guest runs.
-    host_input_sources: Mutex<Vec<(usize, PathBuf)>>,
+    // The physical identity remains separate from a captured input's origin:
+    // it authenticates the file read at settlement, not the published source.
+    host_input_sources: Mutex<Vec<(usize, PathBuf, HostFileIdentity)>>,
 
     // Whether `settle_host_inputs` has run.
     host_inputs_settled: AtomicBool,
@@ -2451,20 +2453,27 @@ impl GlobalState {
             first.entry(record.path.clone()).or_insert(index);
         }
         let mut interpreters: Vec<HostInputRecord> = Vec::new();
-        for (index, source) in sources {
-            let record = &mut records[index];
-            if first.get(&record.path) != Some(&index) {
+        let mut authenticated_snapshots: HashMap<HostFileIdentity, bool> = HashMap::new();
+        for (index, source, physical) in &sources {
+            let record = &mut records[*index];
+            if first.get(&record.path) != Some(index) {
                 continue;
             }
-            record.content = crate::host_inputs::content_at_end(
-                &source,
-                &record.path,
-                record.identity,
-                &mutated,
-            );
+            record.content =
+                crate::host_inputs::content_at_end(source, &record.path, *physical, &mutated);
+            if record.identity != *physical {
+                let authenticated = self.cfg.host_input_snapshots.iter().any(|snapshot| {
+                    snapshot.physical == *physical
+                        && record.content.as_deref() == Some(snapshot.content.as_str())
+                });
+                authenticated_snapshots
+                    .entry(*physical)
+                    .and_modify(|valid| *valid &= authenticated)
+                    .or_insert(authenticated);
+            }
             if record.exec
                 && let Some((interpreter, host)) =
-                    crate::host_inputs::interpreter_at_end(&record.path, &source, record.identity)
+                    crate::host_inputs::interpreter_at_end(&record.path, source, *physical)
                 // One record per interpreter, which every image of a
                 // dynamically linked run names, read once.
                 && !first.contains_key(&interpreter)
@@ -2487,6 +2496,20 @@ impl GlobalState {
                 });
             }
         }
+        let mut failed_snapshots = Vec::new();
+        for (index, _, physical) in sources {
+            let record = &mut records[index];
+            if record.identity != physical && authenticated_snapshots.get(&physical) != Some(&true)
+            {
+                // Revoke provenance on every open, including later opens that
+                // supply no content of their own. Missing evidence or a digest
+                // mismatch must not leave an unchecked origin in the log.
+                record.identity = physical;
+                if first.get(&record.path) == Some(&index) {
+                    failed_snapshots.push((record.path.clone(), physical));
+                }
+            }
+        }
         records.extend(interpreters.iter().cloned());
         let mut contents: HashMap<String, Option<String>> = HashMap::new();
         for record in records.iter() {
@@ -2499,6 +2522,9 @@ impl GlobalState {
             return;
         };
         let mut replay = replay.lock().unwrap_or_else(PoisonError::into_inner);
+        for (path, physical) in failed_snapshots {
+            replay.restore_snapshot_identity(&path, physical);
+        }
         let mut changes = Vec::new();
         for interpreter in &interpreters {
             changes.extend(
@@ -3291,6 +3317,21 @@ impl GlobalState {
             kernel_object,
         } = request
         {
+            let physical = identity;
+            // A pathname alone is never provenance. The launcher owns and
+            // pins these exact copies; a user mount or a changed copy cannot
+            // match. Without a source for the later content check, retain the
+            // physical identity throughout.
+            let identity = source
+                .as_ref()
+                .filter(|_| regular && !kernel_object)
+                .and_then(|_| {
+                    self.cfg
+                        .host_input_snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.physical == physical)
+                })
+                .map_or(physical, |snapshot| snapshot.origin);
             let change = self.replay_host_inputs.as_ref().and_then(|replay| {
                 let mutated = self
                     .host_mutations
@@ -3313,7 +3354,7 @@ impl GlobalState {
                 self.host_input_sources
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .push((records.len(), PathBuf::from(source)));
+                    .push((records.len(), PathBuf::from(source), physical));
             }
             records.push(HostInputRecord {
                 path,
@@ -21311,6 +21352,189 @@ mod tests {
             changed,
             [edited.to_str().unwrap(), replaced.to_str().unwrap()]
         );
+    }
+
+    #[tokio::test]
+    async fn captured_host_inputs_publish_origins_only_for_authenticated_snapshot_bytes() {
+        use detcore_model::host_input::HostInputSnapshot;
+
+        for case in [
+            "kept",
+            "alias",
+            "wrong-object",
+            "no-source",
+            "replaced",
+            "removed",
+            "modified",
+            "already-changed",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let origin_path = directory.path().join("origin");
+            let copy = directory.path().join("copy");
+            let other = directory.path().join("other");
+            for path in [&origin_path, &copy, &other] {
+                std::fs::write(path, b"original").unwrap();
+            }
+            let alias = directory.path().join("alias");
+            std::fs::hard_link(&copy, &alias).unwrap();
+            let identity_of =
+                |path: &Path| HostFileIdentity::from_stat(&crate::util::raw_stat(path).unwrap());
+            let origin = identity_of(&origin_path);
+            let physical = identity_of(&copy);
+            let opened = if case == "wrong-object" {
+                identity_of(&other)
+            } else {
+                physical
+            };
+            let guest_path = if case == "alias" {
+                "/another-name"
+            } else {
+                "/etc/ld.so.cache"
+            };
+            let content = crate::Digest::new(b"original").to_string();
+            let mut recorded_identity = origin;
+            if case == "already-changed" {
+                recorded_identity.size += 1;
+            }
+            let recorded = directory.path().join("recorded.json");
+            let mut writer = crate::preemptions::PreemptionWriter::new(Some(recorded.clone()));
+            writer.set_host_inputs(crate::host_inputs::input_set(
+                &[HostInputRecord {
+                    path: guest_path.into(),
+                    dtid: 3,
+                    syscall: 1,
+                    identity: recorded_identity,
+                    // Exercise the identity fallback, including a changed copy
+                    // whose preserved stat would otherwise keep equal origins.
+                    content: None,
+                    exec: false,
+                    kernel_object: false,
+                }],
+                &BTreeSet::new(),
+            ));
+            writer.flush().unwrap();
+            let config = Config {
+                sequentialize_threads: true,
+                record_host_inputs: true,
+                replay_preemptions_from: Some(recorded),
+                host_input_snapshots: vec![HostInputSnapshot {
+                    physical,
+                    origin,
+                    content: content.clone(),
+                }],
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let dettid = DetTid::from_raw(3);
+            let before = state.global_time.lock().unwrap().as_nanos();
+            for syscall in [1, 2] {
+                state
+                    .receive_rpc(
+                        reverie::Tid::from_raw(3),
+                        (
+                            DetTime::new(&config),
+                            MmId::initial(dettid),
+                            GlobalRequest::RecordHostInput {
+                                path: guest_path.into(),
+                                syscall,
+                                identity: opened,
+                                source: (case != "no-source").then(|| {
+                                    match case {
+                                        "wrong-object" => &other,
+                                        "alias" => &alias,
+                                        _ => &copy,
+                                    }
+                                    .to_str()
+                                    .unwrap()
+                                    .to_owned()
+                                }),
+                                regular: true,
+                                exec: false,
+                                kernel_object: false,
+                            },
+                        ),
+                    )
+                    .await;
+            }
+            assert_eq!(state.global_time.lock().unwrap().as_nanos(), before);
+            let at_open = state.host_inputs.lock().unwrap()[0].identity;
+            assert_eq!(
+                at_open,
+                if matches!(case, "wrong-object" | "no-source") {
+                    opened
+                } else {
+                    origin
+                },
+                "{case}"
+            );
+            assert!(
+                state.host_inputs.lock().unwrap()[0].content.is_none(),
+                "no live-guest read"
+            );
+            if case == "replaced" {
+                std::fs::rename(&other, &copy).unwrap();
+            } else if case == "removed" {
+                std::fs::remove_file(&copy).unwrap();
+            } else if matches!(case, "modified" | "already-changed") {
+                let mtime = std::fs::metadata(&copy).unwrap().modified().unwrap();
+                std::fs::write(&copy, b"modified").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&copy)
+                    .unwrap()
+                    .set_modified(mtime)
+                    .unwrap();
+                assert_eq!(
+                    identity_of(&copy),
+                    physical,
+                    "the digest, not stat, must reject this copy"
+                );
+            }
+            state.settle_host_inputs();
+            let records = state.host_inputs.lock().unwrap();
+            assert_eq!(records.len(), 2);
+            let observed = &records[0];
+            let trusted = matches!(case, "kept" | "alias");
+            assert_eq!(
+                observed.identity,
+                if trusted { origin } else { opened },
+                "{case}"
+            );
+            assert_eq!(records[1].identity, observed.identity, "later open: {case}");
+            assert_eq!(records[1].content, None, "only the first open is hashed");
+            match case {
+                "no-source" | "replaced" | "removed" => {
+                    assert_eq!(observed.content, None, "{case}")
+                }
+                "modified" | "already-changed" => assert_eq!(
+                    observed.content,
+                    Some(crate::Digest::new(b"modified").to_string())
+                ),
+                _ => assert_eq!(
+                    observed.content.as_deref(),
+                    Some(content.as_str()),
+                    "{case}"
+                ),
+            }
+            let replay = state.replay_host_inputs.as_ref().unwrap().lock().unwrap();
+            let changes = replay.changes();
+            assert_eq!(
+                changes.len(),
+                usize::from(!matches!(case, "kept" | "alias")),
+                "{case}: {changes:?}"
+            );
+            if let Some(change) = changes.first() {
+                assert_eq!(
+                    change.now,
+                    if case == "already-changed" {
+                        origin
+                    } else {
+                        opened
+                    },
+                    "{case}"
+                );
+            }
+        }
     }
 
     /// A host-input observation, and a report of a path the guest rebound,

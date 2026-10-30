@@ -35,7 +35,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// The host's identity for a file at the moment the guest opened it.
+/// The host's identity for a file at the moment it was opened or captured.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct HostFileIdentity {
     /// The host `st_dev`.
@@ -63,6 +63,20 @@ impl HostFileIdentity {
     }
 }
 
+/// A private copy of a captured host input. The launcher supplies this only
+/// for a copy it owns: `physical` authenticates the object the guest opened,
+/// while `origin` names the object whose bytes were captured. Aliases of the
+/// copy have the same provenance; an unrelated object at its usual guest path
+/// does not. This is host-only state, never a guest or record-format payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostInputSnapshot {
+    pub physical: HostFileIdentity,
+    pub origin: HostFileIdentity,
+    /// SHA-256 of the captured bytes, checked before origin attribution is
+    /// retained at shutdown, even if a rewrite preserved size and mtime.
+    pub content: String,
+}
+
 impl std::fmt::Display for HostFileIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -80,7 +94,8 @@ impl std::fmt::Display for HostFileIdentity {
 
 /// One host file a guest opened: the path it named, made absolute against its
 /// working directory or directory descriptor, the host identity of the file
-/// the open reached, and the open itself, as the thread (`dtid`) and that
+/// the open reached (or the captured origin of an authenticated launcher-owned
+/// snapshot), and the open itself, as the thread (`dtid`) and that
 /// thread's syscall number (`syscall`, the `finish syscall #N` of the run's
 /// log) that made it. A path that is not UTF-8 is recorded lossily.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

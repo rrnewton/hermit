@@ -3694,10 +3694,18 @@ fn an_adopted_ld_so_cache_role_becomes_the_runs_snapshot() {
         "{refused:#}"
     );
     let adopted = std::sync::Arc::clone(ro.shared_inputs.as_ref().unwrap());
+    let (sealed_bytes, sealed_identity) = adopted
+        .read_role(LD_SO_CACHE_ROLE, Path::new(LD_SO_CACHE_PATH))
+        .unwrap()
+        .unwrap();
+    assert_eq!(sealed_bytes, host);
     ro.adopt_shared_ld_so_cache(&adopted).unwrap();
     assert_eq!(
         ro.ld_so_cache_snapshot,
-        Some(super::container::LdSoCacheSnapshot::from_bytes(host))
+        Some(super::container::LdSoCacheSnapshot::from_captured(
+            host,
+            sealed_identity
+        ))
     );
     assert!(ro.mounts(tmpfs.path()).is_ok());
 }
@@ -13035,9 +13043,12 @@ impl RunOpts {
         &mut self,
         adopted: &super::verify_inputs::AdoptedInputs,
     ) -> Result<(), Error> {
-        if let Some(bytes) = adopted.read_role(LD_SO_CACHE_ROLE, Path::new(LD_SO_CACHE_PATH))? {
-            self.ld_so_cache_snapshot =
-                Some(super::container::LdSoCacheSnapshot::from_bytes(bytes));
+        if let Some((bytes, origin)) =
+            adopted.read_role(LD_SO_CACHE_ROLE, Path::new(LD_SO_CACHE_PATH))?
+        {
+            self.ld_so_cache_snapshot = Some(super::container::LdSoCacheSnapshot::from_captured(
+                bytes, origin,
+            ));
         }
         Ok(())
     }
@@ -15168,6 +15179,9 @@ pub(super) fn complete_container_config(
         .and_then(IdentityGuard::directory_placeholder)
         .map(Path::to_path_buf);
     config.container_procfs = identity_sources.is_some();
+    config.host_input_snapshots = identity_sources
+        .map(IdentityGuard::host_input_snapshots)
+        .unwrap_or_default();
     match view {
         Some(view) => {
             config.mountinfo_root_rewrites = view.root_rewrites;

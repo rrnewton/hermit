@@ -681,7 +681,11 @@ impl AdoptedInputs {
     /// --input ROLE:PATH`) for `role`, or `None` when the set has none. That
     /// object must come from [`SealedFiles`] and record `path`, so a role
     /// cannot stand for a different file.
-    pub(crate) fn read_role(&self, role: &str, path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn read_role(
+        &self,
+        role: &str,
+        path: &std::path::Path,
+    ) -> Result<Option<(Vec<u8>, detcore_model::host_input::HostFileIdentity)>> {
         let mut found = self.objects.iter().filter(|(meta, _)| meta.role == role);
         let Some((meta, fd)) = found.next() else {
             return Ok(None);
@@ -703,15 +707,21 @@ impl AdoptedInputs {
             path.display()
         );
         // A fresh open description: its own offset, from the start.
+        // Provenance is the authenticated sealed object, not a new stat of
+        // `meta.path`, whose contents may since have been replaced.
+        let mut file = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+        let identity = detcore_model::host_input::HostFileIdentity::from_stat(
+            &nix::sys::stat::fstat(file.as_raw_fd())?,
+        );
         let mut bytes = Vec::new();
-        File::open(format!("/proc/self/fd/{}", fd.as_raw_fd()))?.read_to_end(&mut bytes)?;
+        file.read_to_end(&mut bytes)?;
         ensure!(
             bytes.len() as u64 == meta.size,
             "the shared input {role:?} read {} bytes, not its sealed {}",
             bytes.len(),
             meta.size
         );
-        Ok(Some(bytes))
+        Ok(Some((bytes, identity)))
     }
     /// Presence DATA only, so callers can reject a mapped package in a
     /// non-mapped domain before retaining unrelated generic inputs.
@@ -1276,9 +1286,18 @@ mod tests {
         };
         let inputs = adopted(SealedFiles::PRODUCER);
         std::fs::write(&path, b"replaced on the host").unwrap();
+        let (bytes, origin) = inputs.read_role("ld-so-cache", &path).unwrap().unwrap();
+        assert_eq!(bytes, b"sealed cache");
+        let physical = detcore_model::host_input::HostFileIdentity::from_stat(
+            &nix::sys::stat::fstat(inputs.objects[0].1.as_raw_fd()).unwrap(),
+        );
         assert_eq!(
-            inputs.read_role("ld-so-cache", &path).unwrap().as_deref(),
-            Some(&b"sealed cache"[..])
+            origin, physical,
+            "the sealed holder, not the now-replaced host path"
+        );
+        assert_eq!(
+            inputs.read_role("ld-so-cache", &path).unwrap().unwrap().1,
+            origin
         );
         assert_eq!(inputs.read_role("absent", &path).unwrap(), None);
         let elsewhere = dir.path().join("other");

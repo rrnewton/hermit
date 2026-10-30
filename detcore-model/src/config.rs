@@ -1430,6 +1430,16 @@ pub struct Config {
     #[clap(skip)]
     pub host_input_log: Option<PathBuf>,
 
+    /// Captured inputs that the launcher copied into private container files.
+    /// Only the host global state consumes these identities, just like
+    /// `host_input_log`; guest-side tools still report the actual open's stat.
+    /// Never serialized: every backend constructs that global state from this
+    /// in-process config. Physical identities remain necessary for deferred
+    /// content checks even when records publish the captured input's origin.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub host_input_snapshots: Vec<crate::host_input::HostInputSnapshot>,
+
     /// A guest address range, `[start, end)`, holding code whose syscalls
     /// the backend lets through without Detcore seeing them, which the guest
     /// cannot otherwise use without faulting. With

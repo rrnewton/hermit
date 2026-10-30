@@ -11,6 +11,7 @@ use std::ffi::CString;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -33,6 +34,8 @@ use detcore_model::container_mounts::Installation;
 use detcore_model::container_mounts::assign_installed_rows;
 use detcore_model::container_mounts::check_installed_rows;
 use detcore_model::container_mounts::owned_mounts;
+use detcore_model::host_input::HostFileIdentity;
+use detcore_model::host_input::HostInputSnapshot;
 use hermit::Context;
 use hermit::Error;
 use hermit::FailureKind;
@@ -618,6 +621,7 @@ impl MountInfoRootSource {
 pub(super) struct IdentityGuard {
     _group_file: Option<tempfile::NamedTempFile>,
     _ld_so_cache: Option<tempfile::NamedTempFile>,
+    ld_so_cache_origin: Option<HostInputSnapshot>,
     _nscd_dir: Option<tempfile::TempDir>,
     mountinfo_roots: Vec<MountInfoRootSource>,
     user_mount_targets: Vec<PathBuf>,
@@ -710,6 +714,7 @@ impl IdentityGuard {
         Self {
             _group_file: None,
             _ld_so_cache: None,
+            ld_so_cache_origin: None,
             _nscd_dir: None,
             mountinfo_roots: Vec::new(),
             user_mount_targets: Vec::new(),
@@ -724,6 +729,13 @@ impl IdentityGuard {
     /// mounts, if it mounts one (`DetConfig::directory_placeholder`).
     pub(super) fn directory_placeholder(&self) -> Option<&Path> {
         self.directory_placeholder.as_deref()
+    }
+
+    /// The exact private cache object and the input from which it was copied.
+    /// A later user mount needs no pathname exception: its raw identity will
+    /// not match this still-owned file, even at `/etc/ld.so.cache`.
+    pub(super) fn host_input_snapshots(&self) -> Vec<HostInputSnapshot> {
+        self.ld_so_cache_origin.iter().cloned().collect()
     }
 
     /// Record that the container's setup mounts the placeholder directory at
@@ -1236,13 +1248,13 @@ fn frozen_ld_so_cache(
         Some(snapshot) => snapshot.clone(),
         None => LdSoCacheSnapshot::of_host()?,
     };
-    let Some(contents) = snapshot.0 else {
+    let Some(captured) = snapshot.0 else {
         return Ok(None);
     };
     let mut cache = tempfile::NamedTempFile::new()
         .context("Failed to create the frozen dynamic-linker cache for the guest")?;
     cache
-        .write_all(&contents)
+        .write_all(&captured.bytes)
         .context("Failed to populate the frozen dynamic-linker cache for the guest")?;
     cache
         .as_file()
@@ -1261,22 +1273,70 @@ fn frozen_ld_so_cache(
 /// (https://github.com/rrnewton/hermit/issues/4693) -- so the caller of both
 /// runs takes one snapshot and gives it to each.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct LdSoCacheSnapshot(Option<std::sync::Arc<Vec<u8>>>);
+pub(super) struct LdSoCacheSnapshot(Option<std::sync::Arc<CapturedLdSoCache>>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct CapturedLdSoCache {
+    bytes: Vec<u8>,
+    origin: Option<HostFileIdentity>,
+}
 
 impl LdSoCacheSnapshot {
     /// The host's cache now.
     pub(super) fn of_host() -> Result<Self, Error> {
-        match fs::read(LD_SO_CACHE) {
+        Self::of_path(Path::new(LD_SO_CACHE))
+    }
+
+    fn of_path(path: &Path) -> Result<Self, Error> {
+        match File::open(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
-            read => Ok(Self(Some(std::sync::Arc::new(
-                read.context("Failed to read the host dynamic-linker cache")?,
-            )))),
+            opened => Self::capture(
+                opened.context("Failed to open the host dynamic-linker cache")?,
+                |file, bytes| {
+                    file.read_to_end(bytes)
+                        .context("Failed to read the host dynamic-linker cache")?;
+                    Ok(())
+                },
+            ),
         }
     }
 
-    /// A cache another process already sealed (`hermit verify-inputs`).
+    fn capture(
+        mut file: File,
+        read: impl FnOnce(&mut File, &mut Vec<u8>) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        let before = nix::sys::stat::fstat(file.as_raw_fd())?;
+        let mut bytes = Vec::new();
+        read(&mut file, &mut bytes)?;
+        let after = nix::sys::stat::fstat(file.as_raw_fd())?;
+        let origin = HostFileIdentity::from_stat(&before);
+        anyhow::ensure!(
+            origin == HostFileIdentity::from_stat(&after)
+                && (before.st_ctime, before.st_ctime_nsec) == (after.st_ctime, after.st_ctime_nsec)
+                && u64::try_from(origin.size).ok() == Some(bytes.len() as u64),
+            "the host dynamic-linker cache changed while it was captured"
+        );
+        Ok(Self::from_captured(bytes, origin))
+    }
+
+    /// Bytes with a known captured origin, including the authenticated sealed
+    /// descriptor supplied by `hermit verify-inputs`. A sealed holder's identity
+    /// is stable for its children, not across independently created holders;
+    /// it does not claim to be the current host pathname's identity.
+    pub(super) fn from_captured(bytes: Vec<u8>, origin: HostFileIdentity) -> Self {
+        Self(Some(std::sync::Arc::new(CapturedLdSoCache {
+            bytes,
+            origin: Some(origin),
+        })))
+    }
+
+    /// Synthetic test bytes have no host-file provenance to invent.
+    #[cfg(test)]
     pub(super) fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self(Some(std::sync::Arc::new(bytes)))
+        Self(Some(std::sync::Arc::new(CapturedLdSoCache {
+            bytes,
+            origin: None,
+        })))
     }
 }
 
@@ -1341,7 +1401,19 @@ pub(super) fn identity_hardening_mounts_on(
         );
         None
     };
-    let ld_so_cache = frozen_ld_so_cache(ld_so_cache)?;
+    let snapshot = match ld_so_cache {
+        Some(snapshot) => snapshot.clone(),
+        None => LdSoCacheSnapshot::of_host()?,
+    };
+    let ld_so_cache = frozen_ld_so_cache(Some(&snapshot))?;
+    let ld_so_cache_origin = match (&ld_so_cache, snapshot.0.as_ref()) {
+        (Some(cache), Some(captured)) if captured.origin.is_some() => Some(HostInputSnapshot {
+            physical: HostFileIdentity::from_stat(&nix::sys::stat::fstat(cache.as_raw_fd())?),
+            origin: captured.origin.unwrap(),
+            content: detcore::Digest::new(&captured.bytes).to_string(),
+        }),
+        _ => None,
+    };
     if let Some(cache) = &ld_so_cache {
         mountinfo_roots.push(MountInfoRootSource::new(
             cache.path(),
@@ -1377,6 +1449,7 @@ pub(super) fn identity_hardening_mounts_on(
         IdentityGuard {
             _group_file: group_file,
             _ld_so_cache: ld_so_cache,
+            ld_so_cache_origin,
             _nscd_dir: nscd_dir,
             mountinfo_roots,
             user_mount_targets: Vec::new(),
@@ -6569,6 +6642,10 @@ mod tests {
             .as_ref()
             .expect("a snapshot with bytes gets a frozen copy");
         assert_eq!(fs::read(cache.path()).unwrap(), b"not the host's cache");
+        assert!(
+            guard.host_input_snapshots().is_empty(),
+            "unknown origin stays unknown"
+        );
         assert_eq!(
             mounts
                 .iter()
@@ -6580,11 +6657,70 @@ mod tests {
         let (mounts, guard) = identity_hardening_mounts(Some(&LdSoCacheSnapshot(None)))
             .expect("identity hardening mounts should be constructible");
         assert!(guard._ld_so_cache.is_none());
+        assert!(guard.host_input_snapshots().is_empty());
         assert!(
             mounts
                 .iter()
                 .all(|mount| mount.get_target() != Path::new(LD_SO_CACHE)),
             "a snapshot of a host without a cache binds none: {mounts:?}"
+        );
+    }
+
+    #[test]
+    fn a_cache_snapshot_keeps_its_origin_across_copies_and_source_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ld.so.cache");
+        fs::write(&path, b"captured cache").unwrap();
+        let source = File::open(&path).unwrap();
+        let origin =
+            HostFileIdentity::from_stat(&nix::sys::stat::fstat(source.as_raw_fd()).unwrap());
+        let snapshot = LdSoCacheSnapshot::of_path(&path).unwrap();
+        let replacement = directory.path().join("new");
+        fs::write(&replacement, b"different host cache").unwrap();
+        fs::rename(replacement, &path).unwrap();
+        let (_, first) = identity_hardening_mounts(Some(&snapshot)).unwrap();
+        let (_, second) = identity_hardening_mounts(Some(&snapshot)).unwrap();
+        let first_identity = &first.host_input_snapshots()[0];
+        let second_identity = &second.host_input_snapshots()[0];
+        assert_ne!(first_identity.physical, second_identity.physical);
+        for (guard, identity) in [(&first, first_identity), (&second, second_identity)] {
+            assert_eq!(identity.origin, origin);
+            assert_ne!(identity.physical, origin);
+            assert_eq!(
+                identity.content,
+                detcore::Digest::new(b"captured cache").to_string()
+            );
+            assert_eq!(
+                fs::read(guard._ld_so_cache.as_ref().unwrap().path()).unwrap(),
+                b"captured cache"
+            );
+        }
+        assert_ne!(LdSoCacheSnapshot::of_path(&path).unwrap(), snapshot);
+        assert_eq!(
+            LdSoCacheSnapshot::of_path(&directory.path().join("absent")).unwrap(),
+            LdSoCacheSnapshot(None)
+        );
+    }
+
+    #[test]
+    fn a_cache_capture_refuses_an_in_place_change_during_its_read() {
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        source.write_all(b"original").unwrap();
+        let refused =
+            LdSoCacheSnapshot::capture(File::open(source.path()).unwrap(), |file, bytes| {
+                file.read_to_end(bytes)?;
+                // Keep both size and mtime: ctime must still expose this rewrite.
+                let mtime = source.as_file().metadata()?.modified()?;
+                fs::write(source.path(), b"modified")?;
+                source.as_file().set_modified(mtime)?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("changed while it was captured"),
+            "{refused}"
         );
     }
 
@@ -6597,6 +6733,7 @@ mod tests {
         let guard = IdentityGuard {
             _group_file: Some(actual),
             _ld_so_cache: None,
+            ld_so_cache_origin: None,
             _nscd_dir: None,
             mountinfo_roots: vec![matching],
             user_mount_targets: Vec::new(),
@@ -6675,6 +6812,7 @@ mod tests {
         let guard = IdentityGuard {
             _group_file: Some(actual),
             _ld_so_cache: None,
+            ld_so_cache_origin: None,
             _nscd_dir: None,
             mountinfo_roots: vec![same_target_wrong_source],
             user_mount_targets: Vec::new(),
