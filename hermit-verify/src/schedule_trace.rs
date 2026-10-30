@@ -601,6 +601,17 @@ mod tests {
         }
     }
 
+    fn synthetic_chosen_reserved_input() -> serde_json::Value {
+        // A recognized descriptor for synthetic editor inputs, not a live
+        // setup receipt or a way to qualify an existing recording.
+        serde_json::json!({
+            "contract": "sealed-private-input-v1",
+            "base": "0x71010000",
+            "page_bytes": 4096,
+            "abi": "x86_64",
+        })
+    }
+
     #[test]
     fn identity_interpolation_preserves_chosen_guest_ids() {
         use detcore_model::pid::GuestIds;
@@ -617,6 +628,10 @@ mod tests {
         let mut input =
             serde_json::to_value(PreemptionRecord::from_sched_events(events.clone())).unwrap();
         input["guest_ids"] = serde_json::to_value(ids).unwrap();
+        let unmarked = input.clone();
+        let unmarked_path = directory.path().join("unmarked.json");
+        std::fs::write(&unmarked_path, serde_json::to_vec(&unmarked).unwrap()).unwrap();
+        input["reserved_input"] = synthetic_chosen_reserved_input();
         std::fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
         assert_eq!(
             detcore::preemptions::read_recorded_guest_ids(&path).unwrap(),
@@ -631,7 +646,41 @@ mod tests {
             .interpolated_record()
             .unwrap();
             assert_eq!(record.guest_ids(), Some(ids));
+            assert_eq!(
+                record.reserved_input().as_json(),
+                Some(&input["reserved_input"])
+            );
             assert_eq!(record.into_global(), events);
+            // Identity and endpoint shortcuts must still refuse the original
+            // unmarked fixture, including either unmarked input position.
+            for (file_a, file_b, source) in [
+                (&unmarked_path, &unmarked_path, "first"),
+                (&unmarked_path, &path, "first"),
+                (&path, &unmarked_path, "second"),
+            ] {
+                let error = InterpolateOpts {
+                    interpolate,
+                    file_a: file_a.clone(),
+                    file_b: file_b.clone(),
+                }
+                .interpolated_record()
+                .unwrap_err();
+                assert!(
+                    error.to_string().starts_with(&format!(
+                        "HERMIT_CHOSEN_JSON_INPUT_PROVENANCE: {source} transformation input: missing reserved_input provenance"
+                    )),
+                    "{error}"
+                );
+            }
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                serde_json::to_vec(&input).unwrap()
+            );
+            assert_eq!(
+                std::fs::read(&unmarked_path).unwrap(),
+                serde_json::to_vec(&unmarked).unwrap()
+            );
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
         }
     }
 
@@ -677,6 +726,12 @@ mod tests {
                         .unwrap();
                 if let Some(ids) = ids {
                     record["guest_ids"] = ids.clone();
+                    if matches!(
+                        serde_json::from_value::<GuestIds>(ids.clone()),
+                        Ok(GuestIds::Chosen { .. })
+                    ) {
+                        record["reserved_input"] = synthetic_chosen_reserved_input();
+                    }
                 }
                 std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
                 path
@@ -704,6 +759,8 @@ mod tests {
                         record.guest_ids().unwrap_or_default(),
                         detcore::preemptions::read_recorded_guest_ids(file_a).unwrap()
                     );
+                    let first: PreemptionRecord = serde_json::from_slice(&before.0).unwrap();
+                    assert_eq!(record.reserved_input(), first.reserved_input());
                     assert_eq!(record.into_global(), events);
                 } else {
                     let error = interpolation.run(&options).unwrap_err();
