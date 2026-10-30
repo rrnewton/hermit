@@ -21356,6 +21356,10 @@ mod tests {
 
     #[tokio::test]
     async fn captured_host_inputs_publish_origins_only_for_authenticated_snapshot_bytes() {
+        use std::path::Path;
+
+        use detcore_model::host_input::HostFileIdentity;
+        use detcore_model::host_input::HostInputRecord;
         use detcore_model::host_input::HostInputSnapshot;
 
         for case in [
