@@ -1597,11 +1597,13 @@ mod event_tests {
                         return Ok(0);
                     }
                     Syscall::Fcntl(call) => {
-                        assert_eq!(call.fd(), probe.accepted_fd);
-                        assert!(matches!(
-                            call.cmd(),
-                            reverie::syscalls::FcntlCmd::F_SETFL(_)
-                        ));
+                        assert!(call.fd() == FD || call.fd() == probe.accepted_fd);
+                        // R/R classifies both peers. A began with the fixture's
+                        // O_RDONLY flags; accept4 asked only for SOCK_NONBLOCK.
+                        let reverie::syscalls::FcntlCmd::F_SETFL(flags) = call.cmd() else {
+                            panic!("unexpected peer classification probe");
+                        };
+                        assert_eq!(flags, OFlag::O_NONBLOCK.bits());
                         return Ok(0);
                     }
                     _ => {}
@@ -2481,6 +2483,21 @@ mod event_tests {
                     },
                     "carried-FD Stat membership: record={recordreplay_modes}, replay={replaying}, invalidated={invalidate_other_name}"
                 );
+                let fcntls: Vec<_> = calls
+                    .iter()
+                    .filter(|(call, _)| *call == Sysno::fcntl)
+                    .map(|(_, fd)| *fd)
+                    .collect();
+                let expected_fcntls = if recordreplay_modes {
+                    if invalidate_other_name {
+                        vec![FD, ACCEPTED]
+                    } else {
+                        vec![ACCEPTED]
+                    }
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(fcntls, expected_fcntls, "peer classification probes");
                 let observed: Vec<_> = calls
                     .iter()
                     .copied()
