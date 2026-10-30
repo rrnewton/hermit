@@ -2457,10 +2457,11 @@ impl GlobalState {
     /// themselves, once, when every guest process has exited (the callers
     /// run after the scheduler has finished): for the first open of each
     /// path whose file the tool could name, the content
-    /// `crate::host_inputs::content_at_end` reads, and for each exec image,
-    /// its program interpreter, which joins the records as an exec record
-    /// (`crate::host_inputs::interpreter_at_end`). Reading while the guest
-    /// ran would raise inotify events in the guest's watches. A schedule
+    /// `crate::host_inputs::content_at_end` reads. An exec's image and
+    /// program interpreter were recorded at the exec, with the identities
+    /// the process ran with (`Detcore::record_exec_host_inputs`). Reading
+    /// while the guest ran would raise inotify events in the guest's
+    /// watches. A schedule
     /// replay then decides the opens it left (`ReplayHostInputs::finish`)
     /// and reports each change it finds, as an open's change is reported.
     fn settle_host_inputs(&self) {
@@ -2486,7 +2487,6 @@ impl GlobalState {
         for (index, record) in records.iter().enumerate() {
             first.entry(record.path.clone()).or_insert(index);
         }
-        let mut interpreters: Vec<HostInputRecord> = Vec::new();
         let mut authenticated_snapshots: HashMap<HostFileIdentity, bool> = HashMap::new();
         for (index, source, physical) in &sources {
             let record = &mut records[*index];
@@ -2505,30 +2505,6 @@ impl GlobalState {
                     .and_modify(|valid| *valid &= authenticated)
                     .or_insert(authenticated);
             }
-            if record.exec
-                && let Some((interpreter, host)) =
-                    crate::host_inputs::interpreter_at_end(&record.path, source, *physical)
-                // One record per interpreter, which every image of a
-                // dynamically linked run names, read once.
-                && !first.contains_key(&interpreter)
-                && !interpreters.iter().any(|known| known.path == interpreter)
-                && let Ok(stat) = crate::util::raw_stat(&host)
-            {
-                let identity = HostFileIdentity::from_stat(&stat);
-                interpreters.push(HostInputRecord {
-                    content: crate::host_inputs::content_at_end(
-                        &host,
-                        &interpreter,
-                        identity,
-                        &mutated,
-                    ),
-                    path: interpreter,
-                    identity,
-                    exec: true,
-                    kernel_object: false,
-                    ..record.clone()
-                });
-            }
         }
         let mut failed_snapshots = Vec::new();
         for (index, _, physical) in sources {
@@ -2544,7 +2520,6 @@ impl GlobalState {
                 }
             }
         }
-        records.extend(interpreters.iter().cloned());
         let mut contents: HashMap<String, Option<String>> = HashMap::new();
         for record in records.iter() {
             contents
@@ -2560,19 +2535,6 @@ impl GlobalState {
             replay.restore_snapshot_identity(&path, physical);
         }
         let mut changes = Vec::new();
-        for interpreter in &interpreters {
-            changes.extend(
-                replay
-                    .observe(
-                        &interpreter.path,
-                        interpreter.identity,
-                        true,
-                        false,
-                        &mutated,
-                    )
-                    .cloned(),
-            );
-        }
         changes.extend_from_slice(
             replay.finish(|path| contents.get(path).cloned().flatten(), &mutated),
         );

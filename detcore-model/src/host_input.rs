@@ -115,10 +115,12 @@ pub struct HostInputRecord {
     /// leaves it out; a [`HostInputSet`] keeps it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exec: bool,
-    /// Whether the open reached a kernel object ([`is_kernel_object`]) by
-    /// the descriptor's own path, whatever the guest spelled (`/etc/mtab`
-    /// names `/proc/self/mounts`). A [`HostInputSet`] leaves it out, as it
-    /// leaves out a path spelled under `/proc`, `/sys` or `/dev`.
+    /// Whether the open reached a kernel object: by the descriptor's own
+    /// path ([`is_kernel_object`]), whatever the guest spelled (`/etc/mtab`
+    /// names `/proc/self/mounts`), or by the file's type, a FIFO, a socket or
+    /// a device wherever it is, which holds no bytes to compare and whose
+    /// times move with every write to it. A [`HostInputSet`] leaves it out,
+    /// as it leaves out a path spelled under `/proc`, `/sys` or `/dev`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kernel_object: bool,
 }

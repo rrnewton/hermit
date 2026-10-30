@@ -20305,7 +20305,8 @@ fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
         "{recorded}"
     );
     // The program the kernel exec'd is in the set too, under the path its
-    // `/proc/<pid>/exe` link names, and so is the ELF interpreter it names.
+    // `/proc/<pid>/exe` link names, and so is the ELF interpreter it names,
+    // under the path of the file the kernel mapped (symbolic links resolved).
     let holds = |path: &str| {
         recorded["host_inputs"]["files"]
             .as_array()
@@ -20320,9 +20321,11 @@ fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
         program.display()
     );
     if let Some(interpreter) = elf_program_interpreter(&program) {
+        let interpreter = fs::canonicalize(interpreter).unwrap();
         assert!(
-            holds(&interpreter),
-            "the recording does not hold {interpreter}: {recorded}"
+            holds(interpreter.to_str().unwrap()),
+            "the recording does not hold {}: {recorded}",
+            interpreter.display()
         );
     }
 
@@ -20547,6 +20550,238 @@ fn a_schedule_replay_of_a_guest_using_its_private_tmp_names_no_host_input() {
         "{} {}",
         tmp(&other),
         tmp(&recorded)
+    );
+}
+
+/// A recording keeps the ELF interpreter its guest ran with, whatever
+/// replaces it before the run ends, and a replay that runs with the
+/// replacement names it as changed, as it names a file the guest opened.
+/// The guest's image names a copy of the host's dynamic loader as its
+/// interpreter, and the test replaces that copy with another file (the same
+/// bytes and one more) while the recorded guest waits on its stdin, after
+/// the kernel loaded the first copy. Taking the interpreter's status when the
+/// run ends recorded the replacement, and the replay, which runs with it,
+/// found nothing changed. Skipped on overlayfs, where the interpreter may not
+/// be identified and then is not recorded.
+#[test]
+fn a_schedule_replay_names_an_interpreter_replaced_during_the_recording() {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let plain = program_break_guest(
+        "host-input-interpreter-plain",
+        "host_input_interpreter_wait.c",
+        &[],
+    );
+    let Some(loader) = elf_program_interpreter(&plain) else {
+        eprintln!("skipping: the test guest is not dynamically linked");
+        return;
+    };
+    let loader = fs::canonicalize(loader).unwrap();
+    let temporary = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let directory = fs::canonicalize(temporary.path()).unwrap();
+    // On overlayfs a maps line names the underlying file, whose inode number
+    // a stat through the overlay need not report, so Hermit may not identify
+    // the interpreter it maps and then records none.
+    let name = std::ffi::CString::new(directory.to_str().unwrap()).unwrap();
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `name` is NUL-terminated and `filesystem` is written before it
+    // is read.
+    assert_eq!(
+        unsafe { libc::statfs(name.as_ptr(), filesystem.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: statfs returned 0, so it filled `filesystem`.
+    if unsafe { filesystem.assume_init() }.f_type == libc::OVERLAYFS_SUPER_MAGIC {
+        eprintln!("skipping: {} is on overlayfs", directory.display());
+        return;
+    }
+    let interpreter = directory.join("ld.so");
+    // Put a copy of the loader, with `extra` appended, at `interpreter` under
+    // a new inode, as a package manager replaces a file.
+    let install = |extra: &[u8]| {
+        let staged = directory.join("ld.so.staged");
+        fs::copy(&loader, &staged).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&staged)
+            .unwrap()
+            .write_all(extra)
+            .unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&staged, &interpreter).unwrap();
+        fs::metadata(&interpreter).unwrap()
+    };
+    let first = install(b"");
+    let linker = format!("-Wl,--dynamic-linker={}", interpreter.display());
+    let guest = program_break_guest(
+        "host-input-interpreter-wait",
+        "host_input_interpreter_wait.c",
+        &[&linker],
+    );
+    let schedule = directory.join("schedule.json");
+    let run = |schedule_arg: String, summary: &Path, replace: bool| {
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let args = [
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            &schedule_arg,
+            &summary_arg,
+            "--",
+            guest.to_str().unwrap(),
+        ];
+        let mut child = hermit_command(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start hermit");
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        out.read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n", "{args:?}");
+        if replace {
+            install(b"\0");
+        }
+        child.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        let mut rest = String::new();
+        out.read_to_string(&mut rest).unwrap();
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{args:?}: {status}\n{err}");
+        assert_eq!(rest, "read 3\n", "{args:?}");
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(summary).unwrap()).unwrap();
+        (err, summary)
+    };
+    let entry = |summary: &serde_json::Value| {
+        summary["host_inputs"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == interpreter.to_str().unwrap())
+            .unwrap_or_else(|| panic!("no entry for the interpreter: {summary}"))
+            .clone()
+    };
+
+    let (_, recorded) = run(
+        format!("--record-preemptions-to={}", schedule.display()),
+        &directory.join("record.json"),
+        true,
+    );
+    let second = fs::metadata(&interpreter).unwrap();
+    assert_ne!(first.ino(), second.ino());
+    let file = entry(&recorded);
+    assert_eq!(
+        (file["ino"].as_u64(), file["size"].as_u64()),
+        (Some(first.ino()), Some(first.len())),
+        "the recording must keep the interpreter the guest ran with: {file}"
+    );
+
+    let (err, replayed) = run(
+        format!("--replay-preemptions-from={}", schedule.display()),
+        &directory.join("replay.json"),
+        false,
+    );
+    let changed: Vec<&serde_json::Value> = replayed["host_inputs_changed"]
+        .as_array()
+        .map(|changes| {
+            changes
+                .iter()
+                .filter(|change| change["path"] == interpreter.to_str().unwrap())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(changed.len(), 1, "{replayed}");
+    assert_eq!(
+        (
+            changed[0]["recorded"]["ino"].as_u64(),
+            changed[0]["now"]["ino"].as_u64()
+        ),
+        (Some(first.ino()), Some(second.ino())),
+        "{replayed}"
+    );
+    assert_eq!(
+        err.lines()
+            .filter(|line| line.starts_with("HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING"))
+            .filter(|line| line.contains(&format!("host input {} changed", interpreter.display())))
+            .count(),
+        1,
+        "{err}"
+    );
+}
+
+/// A FIFO the guest opens is not a host input: it holds no bytes the run's
+/// end could read or a replay compare, and its times move with every write
+/// to it, the recorded run's own among them. A guest that writes into a host
+/// FIFO and reads the byte back is recorded and replayed with no host input
+/// named as changed and the same digest, and neither run's set holds the
+/// FIFO. Compared by its identity, the FIFO was named as changed on every
+/// replay, for the recorded run's own write.
+#[test]
+fn a_schedule_replay_leaves_out_a_fifo_its_guest_writes() {
+    let guest = program_break_guest("host-input-fifo", "host_input_fifo_write_read.c", &[]);
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let fifo = directory.path().join("fifo");
+    let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: `name` is a NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let schedule = directory.path().join("schedule.json");
+    let fifo_path = fifo.to_str().unwrap();
+    let run = |schedule_arg: String, summary: &Path| {
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let args = [
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            &schedule_arg,
+            &summary_arg,
+            "--",
+            guest.to_str().unwrap(),
+            fifo_path,
+        ];
+        let output = hermit_test::hermit_output(
+            "host-input FIFO schedule run",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), "read x\n", "{args:?}");
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(summary).unwrap()).unwrap();
+        (stderr(&output), summary)
+    };
+    let holds_fifo = |summary: &serde_json::Value| {
+        summary["host_inputs"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == fifo_path)
+    };
+    let (_, recorded) = run(
+        format!("--record-preemptions-to={}", schedule.display()),
+        &directory.path().join("record.json"),
+    );
+    let (err, replayed) = run(
+        format!("--replay-preemptions-from={}", schedule.display()),
+        &directory.path().join("replay.json"),
+    );
+    assert!(!holds_fifo(&recorded), "{recorded}");
+    assert!(!holds_fifo(&replayed), "{replayed}");
+    assert_eq!(replayed.get("host_inputs_changed"), None, "{replayed}");
+    assert!(
+        !err.contains("HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING"),
+        "{err}"
+    );
+    assert_eq!(
+        replayed["host_inputs"]["digest"], recorded["host_inputs"]["digest"],
+        "{replayed}"
     );
 }
 
