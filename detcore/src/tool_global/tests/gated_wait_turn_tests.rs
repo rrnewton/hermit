@@ -2180,6 +2180,7 @@ async fn under_the_gate_a_send_to_a_kernel_run_call_is_refused_once_or_sent() {
                 Some(DetPid::from_raw(PEER.as_raw())),
                 true,
                 PEER,
+                false,
             )
             .await;
         let refusals = guest
@@ -2222,6 +2223,7 @@ async fn under_the_gate_a_send_to_a_kernel_run_call_is_refused_once_or_sent() {
                 Some(DetPid::from_raw(PEER.as_raw())),
                 true,
                 PEER,
+                false,
             )
             .await;
         assert!(
@@ -2907,6 +2909,7 @@ async fn under_the_gate_a_send_to_a_kernel_run_call_keeps_the_kernel_s_earlier_e
                 Some(DetPid::from_raw(peer)),
                 false,
                 PEER,
+                false,
             )
             .await;
         check(name, result, &guest, errno);
@@ -2948,6 +2951,7 @@ async fn under_the_gate_a_send_to_a_kernel_run_call_keeps_the_kernel_s_earlier_e
                 Some(DetPid::from_raw(peer)),
                 true,
                 PEER,
+                false,
             )
             .await;
         check(name, result, &guest, errno);

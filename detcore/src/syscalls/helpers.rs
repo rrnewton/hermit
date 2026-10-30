@@ -380,9 +380,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             "Guest proceeding to execute potentially blocking call {}...",
             call.name()
         );
-        let res = self
-            .record_or_replay_preserving_tool_errors(guest, run)
-            .await;
+        let res = {
+            // This explicit child owner was created before grant release and
+            // owns these exact background leases. It replaces the enclosing
+            // callback's observation binding only for this native operation.
+            let mut native_guest = reverie::NativeOperationGuest::<_, Self>::optional(
+                guest,
+                input_access
+                    .as_ref()
+                    .map(|access| access.native_operation()),
+            )?;
+            self.record_or_replay_preserving_tool_errors(&mut native_guest, run)
+                .await
+        };
         let native_returned = res.is_ok() || matches!(&res, Err(Error::Errno(_)));
         if native_returned && let Some(access) = &input_access {
             access.returned()?;

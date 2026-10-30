@@ -3896,6 +3896,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         T::stream_role()
     }
 
+    fn observes_native_syscalls(config: &Config) -> bool {
+        matches!(
+            config.guest_ids,
+            detcore_model::pid::GuestIds::Chosen { .. }
+        )
+    }
+
+    fn observe_native_syscall(
+        &self,
+        _state: &Self::ThreadState,
+        facts: &dyn reverie::native_syscall::NativeSyscallFacts,
+        call: &reverie::native_syscall::NativeSyscallCall,
+    ) -> Result<Option<std::sync::Arc<dyn reverie::native_syscall::NativeSyscallObserver>>, Error>
+    {
+        crate::reserved_input::observe_native_syscall(facts, call)
+    }
+
     fn facility_admission(config: &Config) -> Result<(), reverie::Error> {
         // This is an operational pre-start hook. subscriptions and the
         // capability queries remain pure, including when called by another
@@ -5677,6 +5694,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .pre_handler_hook_observed(guest, false, CheckIn::Event, Some(boundary_entry))
             .await;
 
+        // Bind this exact callback after its original grant. Nested backend
+        // signal callbacks receive the backend Guest, never this operation.
+        // Namespace runs use the forwarding None arm without capability checks.
+        let input_operation = crate::reserved_input::NativeCallOperation::begin(guest, call)?;
+        let mut native_guest = reverie::NativeOperationGuest::<_, Self>::optional(
+            guest,
+            input_operation
+                .as_ref()
+                .map(|operation| operation.binding()),
+        )?;
+        let guest = &mut native_guest;
+        let result = async {
         // Linux's restart of an interrupted wait is the thread's very next syscall,
         // so the record a wait kept for it lives only until then
         // (`handle_restart_syscall`).
@@ -5975,7 +6004,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .transpose()
             {
                 Some(refusal) => {
-                    syscall_histogram::mark_refused::<T, G>(guest);
+                    syscall_histogram::mark_refused::<T, _>(guest);
                     Some(refusal)
                 }
                 None => match self.answer_rendered_procfs_operation(guest, &call).await {
@@ -6003,11 +6032,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Box::pin(f).await polls `f` exactly as `f.await` does: no await
         // moves and no arm changes behaviour. `syscall_hot_path_tests` bounds
         // the result.
-        let descriptor_acquisition =
-            crate::reserved_input::DescriptorAcquisition::begin(guest, call)?;
         let res = match classify_syscall(call.number()) {
             _ if sigalrm_refusal.is_some() => {
-                syscall_histogram::mark_refused::<T, G>(guest);
+                syscall_histogram::mark_refused::<T, _>(guest);
                 Err(sigalrm_refusal.expect("checked").into())
             }
             _ if rendered_procfs_answer.is_some() => rendered_procfs_answer.expect("checked"),
@@ -6165,7 +6192,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // error and exits 2. vmsplice keeps ENOSYS.
             SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
                 if panic_on_unsupported_syscalls {
-                    syscall_histogram::mark_refused::<T, G>(guest);
+                    syscall_histogram::mark_refused::<T, _>(guest);
                     if call.number() == Sysno::vmsplice {
                         Err(Error::Errno(Errno::ENOSYS))
                     } else {
@@ -6216,7 +6243,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_privileged_admin_refused_syscall(call.number()) =>
             {
-                syscall_histogram::mark_refused::<T, G>(guest);
+                syscall_histogram::mark_refused::<T, _>(guest);
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6225,7 +6252,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_process_isolation_refused_syscall(call.number()) =>
             {
-                syscall_histogram::mark_refused::<T, G>(guest);
+                syscall_histogram::mark_refused::<T, _>(guest);
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6242,7 +6269,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_privileged_observation_refused_syscall(call.number()) =>
             {
-                syscall_histogram::mark_refused::<T, G>(guest);
+                syscall_histogram::mark_refused::<T, _>(guest);
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6270,7 +6297,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_mount_ns_admin_refused_syscall(call.number()) =>
             {
-                syscall_histogram::mark_refused::<T, G>(guest);
+                syscall_histogram::mark_refused::<T, _>(guest);
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -7218,11 +7245,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
             }
         };
-        if (res.is_ok() || matches!(&res, Err(Error::Errno(_))))
-            && let Some(acquisition) = descriptor_acquisition
-        {
-            acquisition.completed(guest)?;
-        }
         // A Tool error/cancellation deliberately retains an unresolved import.
         // The restart checkpoint (A5 step 3c.1c, design D40, placed by IR-2):
         // under the in-guest delivery gate, a wait a signal ended gets the
@@ -7238,8 +7260,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // the handler's latest refusal, and only if no consumer took it
         // first; it is not a general guard (see
         // `fail_on_tool_decided_injection`).
-        crate::syscalls::helpers::fail_on_tool_decided_injection::<T, G>(guest, call.number());
-        syscall_histogram::finish::<T, G>(guest, call.number(), &res, injected_at_entry);
+        crate::syscalls::helpers::fail_on_tool_decided_injection::<T, _>(guest, call.number());
+        syscall_histogram::finish::<T, _>(guest, call.number(), &res, injected_at_entry);
 
         // A copy may already have changed guest memory before reporting a
         // terminal backend error. Do not perform even the syscall-result
@@ -7434,8 +7456,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
             .await;
 
-        // Signal phase 1, step I4: a due SIGALRM entry is delivered here.
-        self.complete_syscall(guest, res).await
+            // Signal phase 1, step I4: a due SIGALRM entry is delivered here.
+            self.complete_syscall(guest, res).await
+        }
+        .await;
+        // Every return in the body above has finished decoder/copyout and its
+        // existing posthook. No later physical call may use this operation.
+        if let Some(operation) = &input_operation {
+            operation.close();
+            if result.is_ok() || matches!(&result, Err(Error::Errno(_))) {
+                operation.readmitted()?;
+            }
+        }
+        // Tool failure/cancellation retains unresolved access and history.
+        result
     }
 
     async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(

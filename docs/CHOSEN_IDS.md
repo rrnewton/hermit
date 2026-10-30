@@ -90,8 +90,24 @@ through the existing strict refusal or disclosed tolerant host-ID route.
 | Mutable ancillary export | A potentially external `sendmsg` or `sendmmsg` with no immutable native header/control import retains process-memory and shared-description export uncertainty for the run, even if an earlier readable snapshot listed no descriptors. The current injection preparation does not certify an immutable native lookup, even for a sampled guest-held socket under a serial grant, so that case retains the same cost. A negative descriptor or zero `sendmmsg` count is a no-import control. The send itself is unchanged. |
 | Kernel-armed SIGKILL | Parent-death SIGKILL, descriptor SIGKILL notification and POSIX timer SIGKILL lose proof before arming. New PID-namespace-init and effective child-exit SIGKILL causes activate at verified birth, so the creating NEWPID operation retains its positive contract. Once active these causes are monotone and run-wide, including across exec. Supervisors, zygotes and kill-on-notification workloads can lose later Chosen support. |
 | Unclassified descriptor acquisition on a possibly shared native file table | A blocking `recvmsg` import or FIFO open can prevent Chosen run-wide until classification and readmission. A proved private table removes only another task's slot-use hazard, not prearmed notification or foreign effects. Fresh socket, socketpair, pipe, pipe2 and native accept results have their mandatory fresh-object classification. |
+| An actual native descriptor acquisition without proved installed membership | `native-description-proof-unavailable` remains run-wide after the acquisition. An emulated or refused call, independently proved no effect, complete native membership capture, and fresh native socket/pipe/accept do not acquire this cause. A readable mutable ancillary snapshot is not complete native membership. |
+| Writable process-memory authority and a prior unbound native write in the same file-table history | The combination retains `forced-reserved-write` run-wide. It also applies when an unrelated ordinary native write completed before the process-memory descriptor was acquired; remembering that write avoids making the decision depend on host-timed overlap. Opening the descriptor alone, an unissued or independently proved-not-run write, and an actually issued write whose file table is proved unshared at the final stopped boundary do not establish this combination. A copied table inherits completed history and operations pending at the copy, not later parent-only activity. |
+| An observed application syscall with unsupported or unverified native ABI | `native-syscall-abi-unverified` remains run-wide. The native syscall is unchanged; no compat or x32 number is interpreted as a native ABI number. Subsequent strict Chosen rewrites refuse by name, and tolerant Chosen uses its existing native-ID route. Native-ABI controls and default/non-Chosen admission remain unchanged. Workload frequency is unmeasured. |
 | Original clone3 whose lifecycle input is not immutable | `clone-input-unverified` is published before the unchanged native call. Proved no-child completion retires it; unproved birth/outcome retains monotone `clone-lifecycle-unverified`. It is not counted as a Chosen success and does not alter native error precedence. |
 | Unproved terminal ownership or frozen unknown-target native access | Retained with its actual local/global scope. Ordinary singleton SIGPIPE and local-only group exits do not acquire a blanket global cause. The frequency of unknown-target cases in real workloads is unmeasured. |
+
+For parent-death, descriptor-notification and POSIX-timer SIGKILL, later disarm,
+a failed configuration call, or exec does not recover the lost proof. The
+prospective NEWPID and effective child-exit cases, including CLONE_PARENT
+inheritance, activate only on verified consumption/birth; proved no-child
+completion does not activate them.
+
+Native background callbacks only retain evidence. Process-memory capability
+and write history, and permanent unavailability derived from them, are
+published under the existing grant, at deterministic readmission or at an
+authenticated terminal fence, before the last covering transient guard is
+retired. Neither callback arrival order nor a later benign descriptor census
+clears retained history.
 
 A background read or write whose native descriptor lookup is unbound also holds a
 transient unknown-target lease: a shared-table peer may replace the descriptor
@@ -101,6 +117,28 @@ only after native completion, copyout and deterministic readmission. Immutable
 negative descriptors, zero counts and native-invalid scalar positional offsets
 are no-access controls. This is separate from a permanent force-write or
 exported-authority cause; it does not replace either persistent obligation.
+This temporary restriction also applies to concurrent Chosen work in another
+address space while a private-table background read/write is outstanding.
+Later Chosen work is admitted again when that operation ends safely, unless a
+separate persistent cause applies. Cancellation releases the guard only after
+authenticated native effects have ended and the existing readmission or exact
+terminal fence has completed; dropping a Tool future does not release it. A
+call that never settles can retain the guard for its entire lifetime.
+
+Each background operation also retains the exact syscall number, operands and
+ABI admitted before it releases its turn, including Hermit's own rewrites. If
+a debugger or another preparation path changes that request afterward, the
+final native boundary refuses the operation as an ownership failure before
+issuing it; it does not fabricate an errno or fall back to an unguarded call.
+An unchanged request keeps its existing behavior. Edits made while the caller
+still holds its grant can be classified there; this is not a general refusal
+of debugger edits.
+
+If a pending private-table descriptor acquisition is inherited by a copied
+child before its native membership is classified, only the copied address
+space acquires an additional guard. It remains tied to the original pending
+operation and ends after its classification and readmission or exact terminal
+fence. This does not turn every private acquisition into a global guard.
 
 Initial-state admission also requires actual-object evidence for writable
 `cgroup.kill`, preopened `/proc/sysrq-trigger`, native CPU/RTTIME limits and
@@ -109,6 +147,12 @@ alone is insufficient. Uninspectable physical state gives named unavailability;
 Hermit does not change the limits, descriptor flags or arming syscall to make
 admission succeed. Guest exports that grant untracked continuing authority
 retain their named exposure.
+
+Descriptor history is inspected even when a separate initial check, such as
+native rseq, already prevents staging. An unproved initial descriptor history
+keeps its original local unavailability through relevant table copies and exec;
+a later benign descriptor census cannot certify that earlier history. This is
+separate from a local rseq registration, which a verified successful exec resets.
 
 A signal-handler Chosen clone nested while an outer input transaction is
 still Preparing receives `input-transaction-busy`: strict/required Chosen

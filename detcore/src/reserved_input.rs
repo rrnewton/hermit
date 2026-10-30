@@ -13,12 +13,20 @@
 //! the operations that can observe a page and supplies logical readmission.
 //! A host completion alone is deliberately not a lease-retirement event.
 
+mod acquisition;
 mod objects;
+mod operation;
+pub(crate) use operation::NativeCallOperation;
+pub(crate) use operation::NativeOperations;
 mod persistent;
 pub(crate) use objects::admit_initial;
 pub(crate) use objects::descriptor_cause;
 pub(crate) use persistent::before_descriptor_export;
 pub(crate) use persistent::before_native_call;
+pub(crate) use persistent::install_native_history;
+pub(crate) use persistent::observe_initial_descriptors;
+pub(crate) use persistent::observe_native_syscall;
+pub(crate) use persistent::register_initial_history;
 use reverie::Guest;
 use reverie::reserved_input::InputCallInput;
 use reverie::reserved_input::InputExpectedSharing;
@@ -204,111 +212,12 @@ pub(crate) fn after_fatal_commit<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     }
 }
 
-/// An import may publish a new slot while its owner is descheduled. A private
-/// native table removes only that sibling-use window, not the imported OFD's
-/// independent notification or control-object effects.
-pub(crate) struct DescriptorAcquisition {
-    control: ReservedInputControl,
-    task: InputTaskId,
-    lease: Option<reverie::reserved_input::InputAccessLease>,
-}
-
-impl DescriptorAcquisition {
-    pub(crate) fn begin<T: RecordOrReplay, G: Guest<Detcore<T>>>(
-        guest: &G,
-        call: Syscall,
-    ) -> Result<Option<Self>, reverie::Error> {
-        use reverie::reserved_input::InputAccess;
-        use reverie::reserved_input::InputAccessDirection;
-        use reverie::reserved_input::InputAccessLifetime;
-        use reverie::reserved_input::InputSpan;
-        let possible_import = match call.name() {
-            "open" | "openat" | "openat2" | "creat" | "dup" | "dup2" | "dup3" | "recvmsg"
-            | "recvmmsg" | "pidfd_getfd" | "ioctl" => true,
-            "fcntl" => {
-                let (_, args) = call.into_parts();
-                matches!(args.arg1 as i32, libc::F_DUPFD | libc::F_DUPFD_CLOEXEC)
-            }
-            // Successful native socket/socketpair/pipe/pipe2/accept/accept4
-            // publish genuinely fresh descriptions. Their kernel success
-            // contract, not a stale numeric-listener probe, supplies C1.
-            _ => false,
-        };
-        if !possible_import {
-            return Ok(None);
-        }
-        let Some((control, task)) = capability(guest) else {
-            return Ok(None);
-        };
-        let lease = if control.files_proven_unshared(task) {
-            None
-        } else {
-            Some(
-                control
-                    .acquire_access(
-                        task,
-                        InputAccess {
-                            target: InputTarget::Unknown,
-                            span: InputSpan::Unknown,
-                            direction: InputAccessDirection::ReadWrite,
-                            lifetime: InputAccessLifetime::Transient,
-                            cause: "unclassified-descriptor-acquisition".into(),
-                        },
-                    )
-                    .map_err(anyhow::Error::new)?,
-            )
-        };
-        Ok(Some(Self {
-            control,
-            task,
-            lease,
-        }))
-    }
-
-    /// Inspect actual retained descriptions after the entire handler/copyout,
-    /// before a later posthook can release this readmission. No guest msghdr,
-    /// DetFd classification, or syscall return number authenticates the OFD.
-    pub(crate) fn completed<T: RecordOrReplay, G: Guest<Detcore<T>>>(
-        self,
-        guest: &G,
-    ) -> Result<(), reverie::Error> {
-        match guest.reserved_input_descriptors() {
-            Ok(snapshot) => {
-                for descriptor in &snapshot.descriptors {
-                    if let Some(cause) =
-                        descriptor_cause(descriptor.facts(), snapshot.mountinfo.as_deref().ok())
-                    {
-                        expose_global(guest, cause)?;
-                    }
-                }
-                // Pins drop before readmission is retired; inspection must
-                // not keep an OFD alive across a later guest last-close.
-            }
-            Err(_) => expose_global(guest, "native-description-proof-unavailable")?,
-        }
-        if let Some(lease) = self.lease {
-            self.control
-                .complete_access_after_return(&lease, self.task)
-                .map_err(anyhow::Error::new)?;
-            let grant = self
-                .control
-                .current_grant(self.task)
-                .ok_or_else(|| anyhow::anyhow!("descriptor classification lacks readmission"))?;
-            self.control
-                .readmit_access(lease, self.task, grant)
-                .map_err(anyhow::Error::new)?;
-        }
-        Ok(())
-    }
-}
-
 /// The registry retains these obligations even if the callback future drops.
 /// Only a returned native operation followed by genuine logical readmission
 /// can retire a transient lease; host completion timing is not a decision.
 pub(crate) struct BackgroundAccess {
-    control: ReservedInputControl,
-    task: InputTaskId,
-    leases: Vec<reverie::reserved_input::InputAccessLease>,
+    operation: NativeCallOperation,
+    request: reverie::native_syscall::NativeOperation,
 }
 
 impl BackgroundAccess {
@@ -326,9 +235,19 @@ impl BackgroundAccess {
         let registration = control
             .registration(task)
             .ok_or_else(|| anyhow::anyhow!("reserved-input background owner is not registered"))?;
-        let mut leases = Vec::new();
+        let operation = NativeCallOperation::begin_background(guest, call)?
+            .expect("the same registered Chosen capability was just checked");
+        // Bind the actual already-substituted physical request while this
+        // task still holds its grant. Final native preparation must preserve
+        // these operands/ABI; it may not silently move beyond these leases.
+        let request = guest.bind_native_request(&operation.binding(), call)?;
+        let intended = request.bound_request().ok_or_else(|| {
+            anyhow::anyhow!("background native request has no pre-release binding")
+        })?;
         let mut accesses = background_accesses(call);
-        if persistent::background_descriptor_effect_is_unverified(guest, call) {
+        if !persistent::native_abi_is_verified(intended.abi, intended.number)
+            || persistent::background_descriptor_effect_is_unverified(guest, call)
+        {
             // A pinned description observed now does not bind the later
             // native fdget after this task releases its turn. The extra
             // lease covers a possible late import/dup2 destination as well
@@ -357,38 +276,26 @@ impl BackgroundAccess {
                 lifetime: InputAccessLifetime::Transient,
                 cause: format!("background-{}-input", call.name()).into(),
             };
-            leases.push(
-                control
-                    .acquire_access(task, declaration)
-                    .map_err(anyhow::Error::new)?,
-            );
+            let lease = control
+                .acquire_access(task, declaration)
+                .map_err(anyhow::Error::new)?;
+            operation.bind_access(lease)?;
         }
-        Ok(Some(Self {
-            control,
-            task,
-            leases,
-        }))
+        Ok(Some(Self { operation, request }))
+    }
+
+    pub(crate) fn native_operation(&self) -> reverie::native_syscall::NativeOperation {
+        self.request.clone()
     }
 
     pub(crate) fn returned(&self) -> Result<(), reverie::Error> {
-        for lease in &self.leases {
-            self.control
-                .complete_access_after_return(lease, self.task)
-                .map_err(anyhow::Error::new)?;
-        }
-        Ok(())
+        self.operation.returned()
     }
 
     pub(crate) fn readmitted(self) -> Result<(), reverie::Error> {
-        let grant = self.control.current_grant(self.task).ok_or_else(|| {
-            anyhow::anyhow!("reserved-input background return lacks a live readmission")
-        })?;
-        for lease in self.leases {
-            self.control
-                .readmit_access(lease, self.task, grant)
-                .map_err(anyhow::Error::new)?;
-        }
-        Ok(())
+        // Publish actual native facts at the existing continuation, while all
+        // buffer/foreign-destination exclusions are still retained.
+        self.operation.readmitted()
     }
 }
 

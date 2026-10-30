@@ -1315,6 +1315,9 @@ pub struct Scheduler {
     /// Native-generation input control, installed locally before guest start.
     /// This is not a scheduler resource or a serialized capability.
     pub(crate) reserved_input_control: Option<reverie::reserved_input::ReservedInputControl>,
+    /// Local strong ownership for cancelled native operations until their
+    /// existing exact-generation exit/exec fence. Never serialized.
+    pub(crate) reserved_input_operations: Option<Arc<crate::reserved_input::NativeOperations>>,
     /// Actual native registrations, bound before logical retirement can act.
     pub(crate) reserved_input_tasks: BTreeMap<DetTid, reverie::reserved_input::InputTaskId>,
     pub(crate) reserved_input_native_tasks: BTreeMap<i32, reverie::reserved_input::InputTaskId>,
@@ -5125,6 +5128,7 @@ impl Scheduler {
             ),
             turn: 0,
             reserved_input_control: None,
+            reserved_input_operations: None,
             reserved_input_tasks: BTreeMap::new(),
             reserved_input_native_tasks: BTreeMap::new(),
             reserved_input_tool_tasks: BTreeMap::new(),
@@ -6484,11 +6488,21 @@ impl Scheduler {
         self.reserved_input_settled_tasks
             .extend(tasks.iter().copied());
         let all_settled: Vec<_> = self.reserved_input_settled_tasks.iter().copied().collect();
+        let operations = self
+            .reserved_input_operations
+            .as_ref()
+            .expect("installed input control requires native operation ownership");
+        operations
+            .terminal_fenced(&all_settled)
+            .unwrap_or_else(|error| {
+                panic!("reserved-input terminal operation lacks effects/publication proof: {error}")
+            });
         control
             .settle_fenced_tasks(&all_settled)
             .unwrap_or_else(|error| {
                 panic!("reserved-input completed fence lacks native settlement: {error}")
             });
+        operations.fence_settled(&all_settled);
         self.reserved_input_freezes
             .retain(|_, (task, _)| !tasks.contains(task));
     }
@@ -6525,6 +6539,56 @@ impl Scheduler {
             // Already queued Exit fences carry their exact task, not `tid`.
             self.reserved_input_freezes.remove(&tid);
         }
+    }
+
+    /// Publish the turn the replacement image already owns, after its old
+    /// image's fences and logical identity handoff. A successful exec callback
+    /// or registered task alone is not execution authority. This changes no
+    /// request, turn, clock, mask or current-owner selection.
+    pub(crate) fn publish_reserved_input_exec_authority(
+        &self,
+        tid: DetTid,
+        process: DetPid,
+        mm: MmId,
+    ) -> anyhow::Result<()> {
+        let Some(control) = &self.reserved_input_control else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            tid == process
+                && self.registered_process(tid) == Some(process)
+                && self.thread_mm(tid) == Some(mm)
+                && self.rpc_incarnation_matches(tid, mm)
+                && self.holds_serial_grant(tid),
+            "exec input authority has no matching current serial owner"
+        );
+        let task = *self
+            .reserved_input_tasks
+            .get(&tid)
+            .ok_or_else(|| anyhow::anyhow!("exec input authority has no logical task binding"))?;
+        let registration = control.registration(task).ok_or_else(|| {
+            anyhow::anyhow!("exec input authority has no retained native generation")
+        })?;
+        anyhow::ensure!(
+            self.reserved_input_tool_tasks.get(&tid) == Some(&task)
+                && self
+                    .reserved_input_native_tasks
+                    .get(&registration.native_tid)
+                    == Some(&task)
+                && registration.tool_tid == Some(tid.as_raw())
+                && registration.tool_pid == Some(process.as_raw())
+                && !self.reserved_input_settled_tasks.contains(&task)
+                && !self.reserved_input_freezes.contains_key(&tid),
+            "exec input authority differs from the completed image binding"
+        );
+        if control.current_grant(task).is_some() {
+            // An idempotent notification must not renew a grant consumed by a
+            // live input operation. Still reject a frozen or retired identity.
+            control.native_request_grant(task)?;
+        } else {
+            control.grant(task, reverie::reserved_input::InputGrantKind::Ordinary)?;
+        }
+        Ok(())
     }
 
     /// Remove a thread from the deterministic scheduler.  In order to call this, the precondition

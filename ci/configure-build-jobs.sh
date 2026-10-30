@@ -3169,8 +3169,28 @@ fi
 # build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
 # This pin changes no tool selection or native recipe; limits retained.
 # This is budget carry, not a native cache HIT or a fresh timing sample.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3d6dd4be69a01c7ff80039e7736a350a4e525865 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3d6dd4be69a01c7ff80039e7736a350a4e525865 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# F1 CARRY TO 01e1ca4f2e0bc828dd5cb7e51117538c07ab0dd8: native recipe input objects equal 3d6dd4be69a01c7ff80039e7736a350a4e525865.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+# F1 CARRY TO 61db78e2e0b2e140d620de6b465f6ba07ef2b5ec: native recipe input objects equal 01e1ca4f2e0bc828dd5cb7e51117538c07ab0dd8.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+# F1 CARRY TO 3c76566c09cb543cc04fb71bc9d3823c614eb7f5: native recipe input objects equal 61db78e2e0b2e140d620de6b465f6ba07ef2b5ec.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+# F1 CARRY TO 92a45068a62fbd28a038a5c56decc21bb7648428: native recipe input objects equal 3c76566c09cb543cc04fb71bc9d3823c614eb7f5.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+# F1 CARRY TO 26b7b1b9e74bb26aa3d6d1a08bf36e0640365c41: native recipe input objects equal 92a45068a62fbd28a038a5c56decc21bb7648428.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 26b7b1b9e74bb26aa3d6d1a08bf36e0640365c41 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 26b7b1b9e74bb26aa3d6d1a08bf36e0640365c41 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

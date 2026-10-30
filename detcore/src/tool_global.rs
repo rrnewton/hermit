@@ -2716,6 +2716,9 @@ impl GlobalTool for GlobalState {
         if scheduler.reserved_input_control.is_some() {
             return Err(anyhow::anyhow!("reserved-input control installed twice").into());
         }
+        crate::reserved_input::install_native_history(&control)?;
+        scheduler.reserved_input_operations =
+            Some(crate::reserved_input::NativeOperations::install(&control)?);
         scheduler.reserved_input_control = Some(control);
         Ok(())
     }
@@ -2759,7 +2762,24 @@ impl GlobalTool for GlobalState {
         &self,
         facts: &reverie::reserved_input::InputNativeFacts,
     ) -> Result<reverie::reserved_input::InputAdmission, reverie::Error> {
-        Ok(crate::reserved_input::admit_initial(facts))
+        let control = self
+            .sched
+            .lock()
+            .unwrap()
+            .reserved_input_control
+            .clone()
+            .ok_or_else(|| {
+                anyhow::anyhow!("initial native admission precedes control installation")
+            })?;
+        crate::reserved_input::register_initial_history(&control, facts.task)?;
+        let admission = crate::reserved_input::admit_initial(facts);
+        let descriptors = crate::reserved_input::observe_initial_descriptors(&control, facts)?;
+        Ok(match (admission, descriptors) {
+            (reverie::reserved_input::InputAdmission::Qualified, Some(cause)) => {
+                reverie::reserved_input::InputAdmission::Unqualified(cause)
+            }
+            (admission, _) => admission,
+        })
     }
 
     fn on_reserved_input_setup(
@@ -4262,6 +4282,17 @@ impl GlobalState {
                             input.take().map(|input| input.lease.identity().clone());
                     }
                 }
+                // The actual exec bound a fresh native input generation, but
+                // did not create a scheduler turn. Re-publish only the serial
+                // authority this exact new image already owns, after all old
+                // image fences, while the existing scheduler mutex is held.
+                sched
+                    .publish_reserved_input_exec_authority(dtid, detpid, request_mm)
+                    .unwrap_or_else(|error| {
+                        crate::scheduler::exit_on_scheduler_refusal(&format!(
+                            "HERMIT_CHOSEN_INPUT_AUTHORITY: {error}"
+                        ))
+                    });
                 R::MarkPastFirstExecve(Box::new(overrides))
             }
             // Requested by the parent thread:
@@ -13020,6 +13051,7 @@ mod tests {
     mod fatal_delivery_tests;
     mod gated_wait_turn_tests;
     mod guest_mask_publication_tests;
+    mod reserved_input_exec_tests;
     mod sigkill_deregistration_tests;
     mod stopping_refusal_tests;
     mod temporary_mask_publication_tests;

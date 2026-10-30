@@ -28,6 +28,9 @@ mod chosen_input_memory;
 #[path = "common/chosen_terminal.rs"]
 mod chosen_terminal;
 
+#[path = "common/chosen_exec_timer.rs"]
+mod chosen_exec_timer;
+
 // The binary loads hermit_binary.rs once, through kvm_synchronous_fault, and
 // skid_overshoot.rs once, through hermit_binary.rs.
 use hermit_test::skid_overshoot;

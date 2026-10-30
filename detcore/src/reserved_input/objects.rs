@@ -186,7 +186,7 @@ mod tests {
             fd: 300,
             status_flags: Ok(libc::O_WRONLY),
             async_signal: Ok(0),
-            async_owner: Ok((libc::F_OWNER_PID, 0)),
+            async_owner: Ok((crate::host_timed_producers::F_OWNER_PID, 0)),
             identity: Ok((libc::makedev(0, 23), 91, libc::S_IFREG | 0o200)),
             filesystem: Ok(filesystem),
             mount_id: Ok(27),

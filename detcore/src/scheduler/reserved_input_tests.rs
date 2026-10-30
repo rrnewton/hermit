@@ -16,6 +16,121 @@ use super::Scheduler;
 use crate::config::Config;
 use crate::types::DetTid;
 
+fn exec_authority_fixture() -> (
+    Scheduler,
+    ReservedInputControl,
+    reverie::reserved_input::InputTaskId,
+    DetTid,
+    crate::types::MmId,
+) {
+    let control = ReservedInputControl::new_backend().unwrap();
+    let native = control.backend_register_root(123, 123).unwrap();
+    let tid = DetTid::from_raw(17);
+    let mm = crate::types::MmId::initial(tid).for_exec(tid);
+    control
+        .backend_bind_tool_identity(native.task, tid.as_raw(), tid.as_raw())
+        .unwrap();
+    let mut scheduler = Scheduler::new(&Config::default());
+    scheduler.reserved_input_control = Some(control.clone());
+    scheduler.reserved_input_tool_tasks.insert(tid, native.task);
+    scheduler
+        .reserved_input_native_tasks
+        .insert(123, native.task);
+    scheduler.thread_tree.add_child(tid, tid, true);
+    scheduler.record_thread_mm(tid, mm);
+    scheduler.install_test_exec_incarnation(tid, mm);
+    scheduler.register_thread_for_test(tid);
+    scheduler.set_running_for_test(tid);
+    (scheduler, control, native.task, tid, mm)
+}
+
+#[test]
+fn exec_input_publication_requires_current_turn_and_exact_replacement_binding() {
+    for invalid in 0..10 {
+        let (mut scheduler, control, task, tid, mm) = exec_authority_fixture();
+        let mut request_mm = mm;
+        let mut process = tid;
+        match invalid {
+            0 => scheduler.set_running_for_test(DetTid::from_raw(18)),
+            1 => scheduler.next_turns[&tid]
+                .req
+                .put(Ok(crate::resources::Resources::new(tid))),
+            2 => {
+                scheduler
+                    .blocked
+                    .external_io_blockers
+                    .insert(tid, crate::resources::ExternalOpId::new(tid, 1));
+            }
+            3 => request_mm = mm.for_exec(tid),
+            4 => process = DetTid::from_raw(18),
+            5 => {
+                scheduler.reserved_input_tool_tasks.remove(&tid);
+            }
+            6 => {
+                scheduler.reserved_input_native_tasks.remove(&123);
+            }
+            7 => {
+                scheduler.reserved_input_settled_tasks.insert(task);
+            }
+            8 => {
+                control.freeze_tasks(&[task]).unwrap();
+            }
+            9 => scheduler.install_test_exec_incarnation(tid, mm.for_exec(tid)),
+            _ => unreachable!(),
+        }
+        let before = (scheduler.turn, scheduler.committed_time);
+        assert!(
+            scheduler
+                .publish_reserved_input_exec_authority(tid, process, request_mm)
+                .is_err(),
+            "invalid case {invalid} acquired authority"
+        );
+        assert_eq!(control.current_grant(task), None, "case {invalid}");
+        assert_eq!((scheduler.turn, scheduler.committed_time), before);
+    }
+}
+
+#[test]
+fn exec_input_publication_preserves_an_existing_consumed_grant() {
+    let (scheduler, control, task, tid, mm) = exec_authority_fixture();
+    let before = (scheduler.turn, scheduler.committed_time);
+    scheduler
+        .publish_reserved_input_exec_authority(tid, tid, mm)
+        .unwrap();
+    let grant = control.current_grant(task).unwrap();
+    let scope = control.begin_operation(task, 23).unwrap();
+    scheduler
+        .publish_reserved_input_exec_authority(tid, tid, mm)
+        .unwrap();
+    assert_eq!(control.current_grant(task), Some(grant));
+    assert_eq!(
+        control.begin_operation(task, 24).unwrap_err().reason(),
+        "input-grant-unavailable"
+    );
+    assert_eq!((scheduler.turn, scheduler.committed_time), before);
+    assert!(scheduler.next_turns[&tid].req.is_empty());
+    control.finish_operation(scope).unwrap();
+}
+
+impl Scheduler {
+    /// Script the physical-copy provenance used by the real post-exec
+    /// take-back handler. This is a policy fixture, not a native signal send.
+    pub(crate) fn install_exec_input_timer_take_back_for_test(&mut self, tid: DetTid) {
+        self.discarded_at_send.lists.append_timer(
+            super::discarded_at_send::QueueId::Thread(tid),
+            libc::SIGUSR1,
+            super::signal_lists::TimerEntry {
+                process: self.registered_process(tid).unwrap(),
+                timer: 1,
+                gen_at_send: 1,
+                periodic_at_send: false,
+            },
+            Some(false),
+        );
+        super::TIMER_COPIES_RECORDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn reserved_input_fence_keeps_late_group_members_until_all_exact_fences_complete() {
     let control = ReservedInputControl::new_backend().unwrap();
@@ -28,6 +143,8 @@ fn reserved_input_fence_keeps_late_group_members_until_all_exact_fences_complete
         .backend_register_child(parent.task, 12, 10, Some(true), Some(true))
         .unwrap();
     let mut scheduler = Scheduler::new(&Config::default());
+    scheduler.reserved_input_operations =
+        Some(crate::reserved_input::NativeOperations::install(&control).unwrap());
     scheduler.reserved_input_control = Some(control.clone());
     scheduler
         .reserved_input_tasks
@@ -62,6 +179,8 @@ fn reserved_input_fence_uses_the_retained_old_generation_not_a_reused_number() {
     let old = control.backend_register_root(11, 11).unwrap();
     let mut scheduler = Scheduler::new(&Config::default());
     let tid = DetTid::from_raw(11);
+    scheduler.reserved_input_operations =
+        Some(crate::reserved_input::NativeOperations::install(&control).unwrap());
     scheduler.reserved_input_control = Some(control.clone());
     scheduler.reserved_input_tasks.insert(tid, old.task);
     scheduler.freeze_reserved_input_thread(tid);
@@ -102,6 +221,8 @@ fn reserved_input_fence_cannot_use_another_generations_terminal_receipt() {
     assert_ne!(old.task, replacement.task);
     let mut scheduler = Scheduler::new(&Config::default());
     let tid = DetTid::from_raw(11);
+    scheduler.reserved_input_operations =
+        Some(crate::reserved_input::NativeOperations::install(&control).unwrap());
     scheduler.reserved_input_control = Some(control.clone());
     scheduler.reserved_input_tasks.insert(tid, replacement.task);
     scheduler.freeze_reserved_input_thread(tid);
@@ -134,6 +255,8 @@ fn reserved_input_nonleader_exec_settles_old_images_before_binding_the_survivor(
     let caller = DetTid::from_raw(18);
     let mm = crate::types::MmId::initial(leader);
     let mut scheduler = Scheduler::new(&Config::default());
+    scheduler.reserved_input_operations =
+        Some(crate::reserved_input::NativeOperations::install(&control).unwrap());
     scheduler.reserved_input_control = Some(control.clone());
     for (tid, native) in [(leader, leader_native), (caller, caller_native)] {
         control
