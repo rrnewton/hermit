@@ -19275,8 +19275,14 @@ int main(int argc, char **argv) {
                 .unwrap()
                 .success()
         );
-        let socket = root.join("phase.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        // Bind a short pathname inside this isolated test child. The C
+        // fixture also runs in root; restore cwd before checking the bind.
+        let previous_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let socket = Path::new("phase.sock");
+        let listener = UnixListener::bind(socket);
+        std::env::set_current_dir(previous_cwd).unwrap();
+        let listener = listener.unwrap();
         listener.set_nonblocking(true).unwrap();
         let request = ProcessRequest::new(
             InvocationRole::Execution {
