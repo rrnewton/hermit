@@ -6100,12 +6100,18 @@ impl Scheduler {
                             // immediate_fatal_exit();
                         }
                     }
+                    // The recorded slice length is the next thread's
+                    // (`timeslices`, handed to it with its grant). The thread
+                    // that switches keeps its own slice end: at a prehook it
+                    // runs on into its call, and taking the next thread's
+                    // length as its own would end a slice its recording did
+                    // not have once the call returned.
                     self.timeslices.insert(new_tid, timeslice_remaining);
                     return ConsumeResult {
                         keep_running: !is_now,
                         print_stack,
                         event_ix: ix,
-                        timeslice_remaining,
+                        timeslice_remaining: None,
                     };
                 }
             };
@@ -21907,10 +21913,9 @@ mod test {
                         let consumed = sched.consume_schedevent(&observed);
                         assert!(consumed.keep_running, "the exit grant supplies the handoff");
                         assert_eq!(consumed.event_ix, 0);
-                        assert_eq!(
-                            consumed.timeslice_remaining,
-                            (!boundary).then(|| LogicalTime::from_rcbs(123))
-                        );
+                        // The recorded slice length is the parent's, staged
+                        // for it below; the exiting thread takes none.
+                        assert_eq!(consumed.timeslice_remaining, None);
                         assert_eq!(sched.recorded_event_count, 0);
                     }
                     assert_eq!((sched.turn, sched.committed_time), before);
@@ -22229,6 +22234,34 @@ mod test {
         (Replayer::new(events), prehook)
     }
 
+    /// A schedule replay's context switch at a prehook stages the next
+    /// thread's recorded slice length for that thread alone (`timeslices`).
+    /// The switching thread runs on into its call with its own slice end.
+    /// Before, it took the next thread's length as its own deadline: once its
+    /// call returned past it, it ended a slice its recording did not have, and
+    /// that scheduler turn's charge moved the clock the guest reads.
+    #[test]
+    fn a_prehook_context_switch_leaves_the_switching_thread_its_own_slice() {
+        let mut sched = Scheduler::new(&Config::default());
+        let (caller, next, following) = (
+            DetTid::from_raw(3),
+            DetTid::from_raw(7),
+            DetTid::from_raw(9),
+        );
+        for tid in [caller, next, following] {
+            register_known_thread(&mut sched, tid);
+        }
+        let (replayer, prehook) = exec_replay(caller, next, following, Some(123));
+        sched.replayer = Some(replayer);
+        let consumed = sched.consume_schedevent(&prehook);
+        assert!(consumed.keep_running);
+        assert_eq!(consumed.timeslice_remaining, None);
+        assert_eq!(
+            sched.timeslices.get(&next),
+            Some(&Some(LogicalTime::from_rcbs(123)))
+        );
+    }
+
     #[tokio::test]
     async fn transferred_exec_reconnect_restores_replay_pre_hook_continuation_grant() {
         for branches in [Some(123), None] {
@@ -22250,7 +22283,7 @@ mod test {
             let consumed = sched.consume_schedevent(&prehook);
             assert!(consumed.keep_running);
             assert_eq!(consumed.event_ix, 0);
-            assert_eq!(consumed.timeslice_remaining, duration);
+            assert_eq!(consumed.timeslice_remaining, None);
             assert_eq!(sched.priorities[&caller], REPLAY_DEFERRED_PRIORITY);
             assert_eq!(sched.priorities[&leader], REPLAY_FOREGROUND_PRIORITY);
             assert_eq!(sched.timeslices.get(&leader), Some(&duration));
