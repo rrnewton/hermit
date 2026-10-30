@@ -768,11 +768,18 @@ test:
     modes:
       verify:
         ci: true
+        # KVM qualified 2026-10-29: 21 of 21 canonical strict verify pairs at Hermit
+        # a69361ae, the tree that enabled this cell (bitwise parity, 1185 INFO records
+        # each side); stdout and every syscall return value identical to ptrace's.
+        # The reason this cell was disabled, "KVM requires the privileged runner",
+        # no longer held: this manifest's portable KVM verify cells run in the
+        # portable lane's own nodes (34 of them, all PASS, in the full validation
+        # of 6090709d), and the hosted portable node passes --exclude-backend kvm.
         backends_enabled:
           - ptrace
           - dbt
+          - kvm
         backends_disabled:
-          kvm: KVM requires the privileged runner
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
           sabre: SaBRe coverage is owned by its backend compatibility partition
@@ -1313,11 +1320,18 @@ test:
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
         ci: true
+        # KVM qualified 2026-10-29: 21 of 21 canonical strict verify pairs at Hermit
+        # a69361ae, the tree that enabled this cell (bitwise parity, 668 INFO records
+        # each side); stdout and every syscall return value identical to ptrace's.
+        # The reason this cell was disabled, "KVM requires the privileged runner",
+        # no longer held: this manifest's portable KVM verify cells run in the
+        # portable lane's own nodes (34 of them, all PASS, in the full validation
+        # of 6090709d), and the hosted portable node passes --exclude-backend kvm.
         backends_enabled:
           - ptrace
           - dbt
+          - kvm
         backends_disabled:
-          kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

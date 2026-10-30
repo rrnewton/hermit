@@ -7008,6 +7008,13 @@
           "category": "c-programs",
           "test": "c-programs/pty-nr-count",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pty-nr-count",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -17130,6 +17137,13 @@
           "category": "compat",
           "test": "compat/xargs",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/xargs",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -23063,6 +23077,13 @@
           "category": "compat",
           "test": "compat/xargs",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/xargs",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -25994,6 +26015,13 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/signal-order",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/signal-order",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -27303,6 +27331,13 @@
           "category": "system-utils",
           "test": "system-utils/overflow-gid-resolves",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/overflow-gid-resolves",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -27346,6 +27381,13 @@
           "test": "system-utils/proc-random-uuid",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/proc-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -60903,6 +60945,13 @@
           "category": "c-programs",
           "test": "c-programs/pty-nr-count",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pty-nr-count",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -71007,6 +71056,13 @@
           "category": "compat",
           "test": "compat/xargs",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/xargs",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -71744,6 +71800,13 @@
           "test": "determinism-stress-c/signal-order",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/signal-order",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -73023,6 +73086,13 @@
           "category": "system-utils",
           "test": "system-utils/overflow-gid-resolves",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/overflow-gid-resolves",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -73066,6 +73136,13 @@
           "test": "system-utils/proc-random-uuid",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/proc-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

@@ -7735,14 +7735,17 @@ test:
     modes:
       verify:
         ci: true
+        # KVM qualified 2026-10-29: 21 of 21 canonical strict verify pairs at Hermit
+        # a69361ae, the tree that enabled this cell (bitwise parity, 207 INFO records
+        # each side); stdout and every syscall return value identical to ptrace's.
         backends_enabled:
           - ptrace
           - sabre
           - dbt
+          - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

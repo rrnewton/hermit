@@ -1476,7 +1476,15 @@ corpus:
     # (K3a of https://github.com/rrnewton/hermit/issues/4213): 10 of 10.
     # kill, lsirq, lsmod and sysctl-random-uuid joined after running clean,
     # 3 of 3, on each of the five nightly pressure sweeps from 2026-10-21 to
-    # 2026-10-25 (Hermit 9b30cb9a to 7903351d).
+    # 2026-10-25 (Hermit 9b30cb9a to 7903351d). xargs joined on 2026-10-29
+    # after 21 of 21 canonical strict verify pairs at Hermit a69361ae, the
+    # tree that enabled it, using at most 0.52 of the default 22 CPU seconds
+    # (the 2026-10-13 runs had exceeded them). Its stdout and every syscall
+    # return value are identical to ptrace's. 3 of its 130 syscall output
+    # buffers differ, each a valid Linux answer that depends on timing: the
+    # revents of xargs's startup poll of 4 descriptors, and two pipe mtimes
+    # (xargs's fstat of fd 0, expr's of fd 1) that KVM gives exactly 500
+    # microseconds later than ptrace.
     - backend: kvm
       rows:
         [
@@ -1502,8 +1510,8 @@ corpus:
           sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, sysctl-random-uuid, tac, tar,
           tar-roundtrip, taskset, tcl, tee, test, time, timeout, top, touch, tr,
           "true", truncate, tsort, tty, uname, unexpand, uniq, uptime, users,
-          uuidgen, vmstat, wc, wc-lines, wget-localhost, whoami, xmllint, xxd,
-          xz, xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
+          uuidgen, vmstat, wc, wc-lines, wget-localhost, whoami, xargs, xmllint,
+          xxd, xz, xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
         ]
       disabled_reason: >-
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green
@@ -1512,9 +1520,6 @@ corpus:
         rustc: >-
           Exceeded the default 22-second CPU budget in 10 of 10 KVM verify
           runs on 2026-10-13; the lane's own cell gives this heavy row 599
-        xargs: >-
-          Exceeded the default 22-second CPU budget in 10 of 10 KVM verify
-          runs on 2026-10-13
         flock: >-
           KVM refuses every flock lock operation by name (ENOSYS with the
           typed refusal UnsupportedOperation::Flock): it cannot keep a host
