@@ -100,6 +100,8 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -525,6 +527,129 @@ static void* call_after_the_leader(void* arg) {
   exit(one_call(call->argc, call->argv));
 }
 
+/* A public foreground-write neighbor of the reserved-input C/W guard.
+ * Open the capability before sharing; never write through it. A child's
+ * F_SETFD is visible in the parent only with a genuinely shared fd table.
+ * The socket stays nonblocking and its one-byte write must finish, not fall
+ * back to background I/O or silently skip the later Chosen clone. */
+static void cw_require(int condition, const char *step) {
+  if (!condition) {
+    dprintf(2, "cw-neighbor failed: %s (errno %d)\n", step, errno);
+    _exit(91);
+  }
+}
+
+struct cw_message {
+  pid_t observed;
+  int cloexec;
+};
+
+static void cw_read_exact(int fd, void *buffer, size_t length) {
+  size_t received = 0;
+  while (received != length) {
+    ssize_t n = read(fd, (char *)buffer + received, length - received);
+    if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+      sched_yield();
+      continue;
+    }
+    cw_require(n > 0, "socket read");
+    received += (size_t)n;
+  }
+}
+
+static int cw_neighbor(int argc, char **argv) {
+  if (argc != 4) return 64;
+  int capability = strcmp(argv[2], "proc") == 0;
+  int shared = strcmp(argv[3], "shared") == 0;
+  if ((!capability && strcmp(argv[2], "ordinary") != 0) ||
+      (!shared && strcmp(argv[3], "copied") != 0)) return 64;
+  int fd = open(capability ? "/proc/thread-self/mem" : "/dev/null", O_RDWR);
+  cw_require(fd >= 0, "open capability before sharing");
+  cw_require((fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDWR, "writable access");
+  cw_require(fcntl(fd, F_GETFD) == 0, "initial descriptor flags");
+  struct stat st;
+  struct statfs fs;
+  cw_require(fstat(fd, &st) == 0 && fstatfs(fd, &fs) == 0, "object facts");
+  if (capability) {
+    cw_require(S_ISREG(st.st_mode) && (unsigned long)fs.f_type == 0x9fa0,
+               "actual proc regular object");
+    volatile unsigned char sentinel = 0x53;
+    unsigned char observed = 0;
+    cw_require(pread(fd, &observed, 1, (off_t)(uintptr_t)&sentinel) == 1 &&
+                   observed == sentinel,
+               "proc mem retains this address space");
+  } else {
+    cw_require(S_ISCHR(st.st_mode) && (unsigned long)fs.f_type != 0x9fa0,
+               "ordinary descriptor is not proc memory");
+  }
+  int pair[2];
+  cw_require(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, pair) == 0,
+             "fresh nonblocking socketpair");
+  cw_require((fcntl(pair[0], F_GETFL) & O_NONBLOCK) != 0 &&
+                 (fcntl(pair[1], F_GETFL) & O_NONBLOCK) != 0,
+             "guest-visible nonblocking endpoints");
+  unsigned long flags = (shared ? CLONE_FILES : 0) | SIGCHLD;
+  long child = syscall(SYS_clone, flags, 0, 0, 0, 0);
+  cw_require(child >= 0, "first register-only clone");
+  if (child == 0) {
+    cw_require(fcntl(fd, F_SETFD, FD_CLOEXEC) == 0, "child changes fd flags");
+    struct cw_message message = {(pid_t)syscall(SYS_getpid), fcntl(fd, F_GETFD)};
+    cw_require(message.observed > 0 && message.cloexec == FD_CLOEXEC,
+               "child identity and fd flags");
+    cw_require(write(pair[1], &message, sizeof message) == (ssize_t)sizeof message,
+               "first child acknowledgement write");
+    char token = 0;
+    cw_read_exact(pair[1], &token, 1);
+    cw_require(token == 'Z', "exact parent byte");
+    syscall(SYS_exit, 0);
+    __builtin_unreachable();
+  }
+  struct cw_message message;
+  cw_read_exact(pair[0], &message, sizeof message);
+  cw_require(message.observed == child && message.cloexec == FD_CLOEXEC,
+             "actual child identity");
+  cw_require(fcntl(fd, F_GETFD) == (shared ? FD_CLOEXEC : 0),
+             "actual shared versus copied descriptor table");
+  /* The child cannot exit normally before consuming this byte. It has not
+   * changed the OFD or socket membership; the empty stream has room. */
+  cw_require(write(pair[0], "Z", 1) == 1, "parent synchronous socket write");
+  int status = -1;
+  pid_t waited = waitpid((pid_t)child, &status, 0);
+  cw_require(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+             "first child status");
+  long later = syscall(SYS_clone, (unsigned long)SIGCHLD, 0, 0, 0, 0);
+  cw_require(later >= 0, "later register-only clone");
+  if (later == 0) {
+    struct cw_message second = {(pid_t)syscall(SYS_getpid), fcntl(fd, F_GETFD)};
+    cw_require(write(pair[1], &second, sizeof second) == (ssize_t)sizeof second,
+               "later child identity write");
+    syscall(SYS_exit, 0);
+    __builtin_unreachable();
+  }
+  struct cw_message second;
+  cw_read_exact(pair[0], &second, sizeof second);
+  status = -1;
+  pid_t later_waited = waitpid((pid_t)later, &status, 0);
+  cw_require(second.observed == later && later != child && later != first &&
+                 child != first && later_waited == later && WIFEXITED(status) &&
+                 WEXITSTATUS(status) == 0 &&
+                 second.cloexec == (shared ? FD_CLOEXEC : 0),
+             "later child identity, inherited table, and wait result");
+  printf("first process %d\n", first);
+  printf("cw capability %s\n", capability ? "proc" : "ordinary");
+  printf("cw table %s\n", shared ? "shared" : "copied");
+  show("cw first returned", child);
+  report("cw first observed", message.observed, child);
+  report("cw first waited", waited, child);
+  puts("cw socket Z");
+  show("cw later returned", later);
+  report("cw later observed", second.observed, later);
+  report("cw later waited", later_waited, later);
+  cw_require(close(fd) == 0 && close(pair[0]) == 0 && close(pair[1]) == 0,
+             "close retained objects");
+  return mismatches == 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
   if (argc > 1 && strcmp(argv[1], "external-holder") == 0) {
     return external_holder(argc, argv);
@@ -533,6 +658,9 @@ int main(int argc, char** argv) {
   int external = argc == 4 && strcmp(argv[1], "collide-external") == 0;
   setvbuf(stdout, NULL, _IONBF, 0);
   first = getpid();
+  if (argc > 1 && strcmp(argv[1], "cw-neighbor") == 0) {
+    return cw_neighbor(argc, argv);
+  }
   if (argc > 2 && strcmp(argv[1], "leader-gone") == 0) {
     static struct deferred_call call;
     call.argc = argc - 1;

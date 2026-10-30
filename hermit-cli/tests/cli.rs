@@ -10408,6 +10408,112 @@ fn native_chosen_ids_fixture(guest_args: &[&str]) -> Output {
     hermit_test::hermit_output(&label, &mut command)
 }
 
+/// C plus a real CLONE_FILES table and an ordinary synchronous socket write
+/// must preserve the later Chosen clone. This is a public foreground neighbor,
+/// not a claimed public eligible-background-W reproducer.
+#[test]
+fn no_namespace_foreground_socket_write_with_proc_memory_preserves_chosen_ids() {
+    fn expected(base: i64, capability: &str, table: &str, first: i64, later: i64) -> String {
+        format!(
+            "first process {base}\ncw capability {capability}\ncw table {table}\n\
+             cw first returned {first:+}\ncw first observed {first:+}\ncw first waited {first:+}\n\
+             cw socket Z\ncw later returned {later:+}\ncw later observed {later:+}\n\
+             cw later waited {later:+}\n"
+        )
+    }
+    fn value(output: &Output, prefix: &str) -> i64 {
+        let text = stdout(output);
+        let rows = text
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "{prefix}: {text}");
+        rows[0].parse().unwrap()
+    }
+    fn no_fallback(output: &Output) {
+        let log = stderr(output);
+        assert!(
+            !log.contains("got a host ID")
+                && !log.contains("host-ID report(s) accepted")
+                && !log.contains("forced-reserved-write")
+                && !log.contains("its reserved input is unavailable"),
+            "{log}"
+        );
+    }
+    for (capability, table) in [
+        ("proc", "shared"),
+        ("ordinary", "shared"),
+        ("proc", "copied"),
+    ] {
+        let guest_args = ["cw-neighbor", capability, table];
+        let native = native_chosen_ids_fixture(&guest_args);
+        assert_success(&native, &guest_args);
+        // The native helper is PID 1 in its own fresh PID namespace; this
+        // fixture creates exactly two children and no threads or helper tasks.
+        assert_eq!(
+            stdout(&native),
+            expected(1, capability, table, 1, 2),
+            "{}",
+            stderr(&native)
+        );
+
+        let chosen =
+            no_namespace_in_own_pid_namespace(&["--pid-base=5000", "--summary"], &guest_args);
+        assert_success(&chosen, &guest_args);
+        assert_eq!(
+            stdout(&chosen),
+            expected(5000, capability, table, 1, 2),
+            "{}",
+            stderr(&chosen)
+        );
+        assert!(stderr(&chosen).contains(
+            "Guest process IDs: chosen by Hermit from 5000 in creation order (clone3 set_tid)"
+        ));
+        no_fallback(&chosen);
+    }
+
+    let guest_args = ["cw-neighbor", "proc", "shared"];
+    // Automatic Chosen remains supported without an explicit base. Require
+    // the reported base and exact creation-order offsets, never host fallback.
+    let automatic = no_namespace_in_own_pid_namespace(&["--summary"], &guest_args);
+    assert_success(&automatic, &guest_args);
+    let base = value(&automatic, "first process ");
+    assert!(base > 0);
+    assert_eq!(stdout(&automatic), expected(base, "proc", "shared", 1, 2));
+    assert!(stderr(&automatic).contains(&format!(
+        "Guest process IDs: chosen by Hermit from {base} in creation order (clone3 set_tid)"
+    )));
+    no_fallback(&automatic);
+
+    // Ordinary/default Namespace execution has no Chosen-numbering claim.
+    // Still require the exact behavior and equality of every observed/waited
+    // ID; do not pretend its kernel allocation follows the Chosen base rule.
+    let guest = chosen_guest_ids_guest().to_str().unwrap();
+    let namespace_args = [
+        "run",
+        "--summary",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "cw-neighbor",
+        "proc",
+        "shared",
+    ];
+    let namespace = hermit(&namespace_args);
+    assert_success(&namespace, &namespace_args);
+    let base = value(&namespace, "first process ");
+    let first = value(&namespace, "cw first returned ");
+    let later = value(&namespace, "cw later returned ");
+    assert!(base > 0 && base + first > 0 && base + later > 0);
+    assert!(first != 0 && later != 0 && first != later);
+    assert_eq!(
+        stdout(&namespace),
+        expected(base, "proc", "shared", first, later)
+    );
+    assert!(!stderr(&namespace).contains("Guest process IDs: chosen"));
+    no_fallback(&namespace);
+}
+
 /// Establish a collision after launch with a task outside Detcore. The
 /// guest requests the next ID and waits for the native supervisor's ack.
 fn no_namespace_with_external_id_holder(args: &[&str]) -> Output {
