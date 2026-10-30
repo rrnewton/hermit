@@ -27,6 +27,7 @@ use serde::ser::SerializeMap;
 
 use super::HostObservedCount;
 use super::PreemptionRecord;
+use super::RecordedTimedWaitSpread;
 use super::ThreadHistory;
 use super::callback_history;
 use crate::types::DetTid;
@@ -57,6 +58,8 @@ struct RawRecord {
     guest_ids: Option<detcore_model::pid::GuestIds>,
     #[serde(skip)]
     replay_departed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timed_wait_spread: Option<RecordedTimedWaitSpread>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,6 +68,8 @@ struct RawRecord {
     expired_wait_runs_charged_once: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_inputs: Option<HostInputSet>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    queued_sleeps_registered_at_first_pass: bool,
     #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
 }
@@ -360,6 +365,150 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<PreemptionRecord>(&rewritten).unwrap(),
                 record
+            );
+        }
+    }
+
+    /// The rule that registered queued sleeps (`--sleep-registration`) is a
+    /// run setting, kept by the raw record under its old attributes: a record
+    /// written before the field existed reads as `when-chosen` and writes back
+    /// byte for byte, a `first-pass` record writes the field and reads it
+    /// back, and an incomplete record keeps it inside its envelope's payload.
+    /// So a reader of the marked record, of its settings, of a copy, or of a
+    /// file holding it never takes the `when-chosen` default for a
+    /// `first-pass` run, which would replay its timed wakes in other passes.
+    #[test]
+    fn the_sleep_registration_rule_survives_the_raw_record_and_the_envelope() {
+        let old = r#"{"per_thread":{},"global":[]}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        assert!(!record.queued_sleeps_registered_at_first_pass());
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let written =
+            serde_json::to_string(&record.with_queued_sleeps_registered_at_first_pass(true))
+                .unwrap();
+        assert_eq!(
+            written,
+            r#"{"per_thread":{},"global":[],"queued_sleeps_registered_at_first_pass":true}"#
+        );
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert!(back.queued_sleeps_registered_at_first_pass());
+
+        let directory = tempfile::tempdir().unwrap();
+        for first_pass in [false, true] {
+            let mut writer =
+                PreemptionWriter::new(None).with_queued_sleeps_registered_at_first_pass(first_pass);
+            writer.mark_replay_departed(7);
+            let text = writer.into_string();
+            let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let payload = &envelope[ENVELOPE]["record"];
+            assert_eq!(
+                payload.get("queued_sleeps_registered_at_first_pass"),
+                first_pass.then_some(&serde_json::Value::Bool(true)),
+                "{text}"
+            );
+            let marked: PreemptionRecord = serde_json::from_str(&text).unwrap();
+            assert_eq!(marked.replay_departed_at(), Some(7));
+            assert_eq!(marked.queued_sleeps_registered_at_first_pass(), first_pass);
+            assert_eq!(
+                serde_json::from_str::<PreemptionRecord>(&serde_json::to_string(&marked).unwrap())
+                    .unwrap(),
+                marked
+            );
+            assert_eq!(
+                settings_value(&marked).unwrap()["queued_sleeps_registered_at_first_pass"]
+                    .as_bool()
+                    .unwrap_or(false),
+                first_pass
+            );
+            for copy in [
+                marked.clone_preemptions_only(),
+                marked.schedule_prefix(0),
+                marked.normalize(),
+                marked.with_schedule(vec![]).unwrap(),
+            ] {
+                assert_eq!(copy.queued_sleeps_registered_at_first_pass(), first_pass);
+            }
+            for boundaries in [false, true] {
+                let recording = if boundaries {
+                    Recording::Boundaries(
+                        BoundaryRecording::new(
+                            marked.clone(),
+                            detcore_model::schedule::boundary::Schedule::new(vec![]).unwrap(),
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    Recording::Legacy(marked.clone())
+                };
+                let path = directory
+                    .path()
+                    .join(format!("{boundaries}-{first_pass}.json"));
+                recording.write(&path).unwrap();
+                assert_eq!(read_recorded_replay_departure(&path).unwrap(), Some(7));
+                assert_eq!(
+                    crate::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(&path)
+                        .unwrap(),
+                    first_pass
+                );
+                let stripped =
+                    crate::preemptions::strip_times_from_events_file(&path, None).unwrap();
+                assert_eq!(
+                    crate::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(
+                        &stripped
+                    )
+                    .unwrap(),
+                    first_pass
+                );
+            }
+        }
+    }
+
+    /// The `--chaos-timed-wait-spread` and its seed are a run setting, kept by
+    /// the raw record under their old attributes and at their old place, after
+    /// `guest_ids`: a flat record written before the incomplete-record envelope
+    /// existed reads them, writes back byte for byte and reads back as the
+    /// same record, plain and inside the envelope's payload, and the settings
+    /// reader finds them in a file of either form. So a reader never takes the
+    /// spread as off for a spread run, which would replay its waits unspread.
+    #[test]
+    fn the_timed_wait_spread_survives_the_raw_record_and_the_envelope() {
+        let setting = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: Some(7),
+        };
+        let flat = r#"{"per_thread":{},"global":[],"chaos_timeslice":1000,"timed_wait_spread":{"spread":12.5,"seed":7},"rng_seed":3}"#;
+        let record: PreemptionRecord = serde_json::from_str(flat).unwrap();
+        assert_eq!(record.timed_wait_spread(), Some(setting));
+        assert_eq!(record.replay_departed_at(), None);
+        let written = serde_json::to_string(&record).unwrap();
+        assert_eq!(written, flat);
+        assert_eq!(
+            serde_json::from_str::<PreemptionRecord>(&written).unwrap(),
+            record
+        );
+
+        let enveloped = format!(
+            r#"{{"incomplete_preemption_record":{{"version":1,"replay_departed_at":7,"record":{flat}}}}}"#
+        );
+        let marked: PreemptionRecord = serde_json::from_str(&enveloped).unwrap();
+        assert_eq!(marked.replay_departed_at(), Some(7));
+        assert_eq!(marked.timed_wait_spread(), Some(setting));
+        let rewritten = serde_json::to_string(&marked).unwrap();
+        assert_eq!(rewritten, enveloped);
+        let back: PreemptionRecord = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(back, marked);
+        let mut unmarked = back.clone();
+        unmarked.replay_departed_at = None;
+        assert_eq!(unmarked, record);
+
+        let directory = tempfile::tempdir().unwrap();
+        for (name, text) in [("flat.json", flat.to_owned()), ("marked.json", enveloped)] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                crate::preemptions::read_recorded_timed_wait_spread(&path),
+                Ok(Some(setting)),
+                "{name}"
             );
         }
     }

@@ -40,6 +40,7 @@ pub mod sigkill_retirement;
 pub(crate) mod signal_control;
 pub(crate) mod signal_lists;
 mod sleep_signal;
+mod timed_wait_spread;
 pub mod timed_waiters;
 pub(crate) mod work_span;
 
@@ -108,6 +109,7 @@ use crate::config::RunsPostFork;
 use crate::cpu_set::CpuSet;
 use crate::cpu_set::TaskAffinity;
 use crate::cpu_set::TaskCpus;
+use crate::detlog;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
@@ -1378,6 +1380,30 @@ pub struct Scheduler {
     /// run on, which is why the length is taken at the grant.
     preemption_cap: Option<(DetTid, u64)>,
 
+    /// Whether a queued plain sleep is registered as a timed waiter at the
+    /// first quiescent pass that finds it queued
+    /// (`step2_register_queued_sleeps`), as `--sleep-registration` says
+    /// (`Config::queued_sleeps_registered_at_first_pass`): by default on
+    /// outside race search, and off under `--chaos` or a heuristic that does
+    /// not select by priority, and under `hermit record`/`hermit replay`,
+    /// where a sleep is registered only when step 3 chooses its thread before
+    /// its deadline, as before. A sleeper left unregistered behind
+    /// better-priority threads runs later, and real sleep-ordered races in
+    /// timing-sensitive tests reproduced under chaos only with that (measured
+    /// in rrnewton/hermit#4682). A replay that leaves the option unset takes
+    /// the value its record states
+    /// (`PreemptionRecord::queued_sleeps_registered_at_first_pass`), and a
+    /// recording stores it.
+    queued_sleeps_registered_at_first_pass: bool,
+
+    /// `--chaos-timed-wait-spread`: the seeded wake thresholds of timed waits
+    /// (`Scheduler::file_timed_wait`). `None` with the option unset.
+    timed_wait_spread: Option<timed_wait_spread::TimedWaitSpread>,
+    /// The thread whose spread wait came due before its deadline in this
+    /// pass's step 2b and was queued again at the deadline
+    /// (`reach_promised_deadline`), for `replay_waits_for_a_requeued_wake`.
+    promised_wake_requeued: Option<DetTid>,
+
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
 
@@ -1605,6 +1631,10 @@ pub struct Scheduler {
     /// under `models_signal_targets`. False on every run today: no host sets
     /// the gate before step 3c.1f.
     in_guest_signal_delivery: bool,
+    /// While a timed signal is dispatched (`dispatch_timed_signal`), the
+    /// time it was due; `None` for a send at the commit point itself, whose
+    /// time is `committed_time`. See `signal_sent_at`.
+    signal_sent_at: Option<LogicalTime>,
 
     /// The in-guest runtime's reserved signals
     /// (`Config::in_guest_reserved_signals`), which never end a parked wait
@@ -2154,6 +2184,11 @@ pub struct Scheduler {
     /// (`send_wakes`).
     #[cfg(test)]
     pub(crate) test_send_wakes: Vec<DetTid>,
+
+    /// When each captured send (`test_sent_signals`) was sent
+    /// (`signal_sent_at`).
+    #[cfg(test)]
+    pub(crate) test_send_times: Vec<LogicalTime>,
 
     /// The set each thread polling `rt_sigtimedwait` waits for: a signal in
     /// it is taken at the thread's next poll whatever its mask, so the
@@ -4224,6 +4259,12 @@ pub async fn do_a_turn_blocking(
                         {
                             return Err(SkipTurn);
                         }
+                        // Before this refresh's pop, as before any pop: under
+                        // first-pass registration this also registers a sleep
+                        // queued since the first maintenance step (a resumed
+                        // observation), which the ordinary loop leaves to step 3
+                        // or the next pass.
+                        state.step2_register_queued_sleeps();
                         if !timed_event_processed {
                             timed_event_processed = state.step2b_process_timed(&global_time);
                         }
@@ -4241,7 +4282,12 @@ pub async fn do_a_turn_blocking(
                     }
                     match maintenance {
                         0 => {
+                            // Before anything can pop a timed event, as the
+                            // ordinary loop's step 2 does.
+                            state.step2_register_queued_sleeps();
                             state.step2_drain_prefix()?;
+                            // And for a sleep the drain admitted.
+                            state.step2_register_queued_sleeps();
                             maintenance = 1;
                             continue;
                         }
@@ -4877,6 +4923,22 @@ impl Scheduler {
             }
             _ => cfg.expired_wait_runs_charged_once(),
         };
+        // A replay that leaves `--sleep-registration` unset registers queued
+        // sleeps as its record says (a record that does not say, older or
+        // written by a `when-chosen` run, by default race search, registered
+        // them when chosen); any other run as
+        // `Config::queued_sleeps_registered_at_first_pass` says. `hermit run`
+        // has refused an explicit value that disagrees with the record
+        // (`preemptions::requests_first_pass_sleep_registration`). And only
+        // where the scheduler reads a sleeper's signal state: elsewhere a
+        // parked sleep would be ended by any signal the scheduler sends it,
+        // including one Linux ignores or the sleeper blocks, so a sleep is
+        // registered when chosen there whatever the rule. Hermit refuses such
+        // a launch before the guest starts; for any other caller the record
+        // still states what this scheduler does.
+        let queued_sleeps_registered_at_first_pass =
+            crate::preemptions::requests_first_pass_sleep_registration(cfg)
+                && cfg.reads_sleeper_signal_state();
         // The strict verifier explicitly selects the complete protocol. Ordinary
         // producers and the recovery/editor path keep the legacy representation.
         let boundaries = cfg.strict_schedule_boundaries;
@@ -4889,7 +4951,14 @@ impl Scheduler {
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
                 .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_chaos_timeslice(cfg.chaos_timeslice)
-                .with_guest_ids(cfg.guest_ids);
+                .with_guest_ids(cfg.guest_ids)
+                .with_queued_sleeps_registered_at_first_pass(queued_sleeps_registered_at_first_pass)
+                .with_timed_wait_spread(cfg.chaos_timed_wait_spread.map(|spread| {
+                    crate::preemptions::RecordedTimedWaitSpread {
+                        spread,
+                        seed: Some(cfg.sched_seed()),
+                    }
+                }));
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -4953,6 +5022,7 @@ impl Scheduler {
             recorded_host_inputs,
             replay_priorities_released: false,
             released_callback_checkpoints: BTreeMap::new(),
+            queued_sleeps_registered_at_first_pass,
             recorded_event_count: 0,
             stacktrace_events,
             stop_after_turn: cfg.stop_after_turn,
@@ -4997,6 +5067,10 @@ impl Scheduler {
             turn_clocks: BTreeMap::new(),
             preemption_cap: None,
             guest_held_marks_revoked: false,
+            promised_wake_requeued: None,
+            timed_wait_spread: cfg
+                .chaos_timed_wait_spread
+                .map(|spread| timed_wait_spread::TimedWaitSpread::new(spread, cfg.sched_seed())),
             blocked: Default::default(),
             vfork_barriers: Default::default(),
             background_entry_barriers: Default::default(),
@@ -5032,6 +5106,7 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.models_signal_targets(),
             in_guest_signal_delivery: cfg.in_guest_signal_delivery,
+            signal_sent_at: None,
             in_guest_reserved_signals: cfg.in_guest_reserved_signals,
             host_timed_signals: Default::default(),
             host_timed_signals_everywhere: startup_host_timed_signals(cfg),
@@ -5160,6 +5235,8 @@ impl Scheduler {
             test_sent_signals: None,
             #[cfg(test)]
             test_send_wakes: Vec::new(),
+            #[cfg(test)]
+            test_send_times: Vec::new(),
             sigtimedwait_sets: Default::default(),
             undelivered_scheduler_signals: Default::default(),
             thread_timer_copies: Default::default(),
@@ -8505,8 +8582,77 @@ impl Scheduler {
         );
         // A futex with timeout waits in both the futex_waiters and timed_events structures:
         if let Some(target_time) = maybe_timeout {
-            self.blocked.timed_waiters.insert(target_time, *dettid);
+            self.file_timed_wait(*dettid, target_time);
         }
+    }
+
+    /// Queue a thread's timed wait (a sleep's `SleepUntil` or a futex wait's
+    /// timeout) to end at `deadline`, or, under `--chaos-timed-wait-spread`,
+    /// at the wake threshold drawn for it (`timed_wait_spread`). A threshold
+    /// before the deadline is promised the deadline, which
+    /// `Scheduler::reach_promised_deadline` makes the clock reach before the
+    /// waiter runs.
+    fn file_timed_wait(&mut self, dettid: DetTid, deadline: LogicalTime) {
+        // A schedule replay spreads the waits its schedule covers, as its
+        // recording did, and no wait filed after the schedule has run out:
+        // the run then continues without chaos decisions, as `hermit analyze`
+        // continues a replayed prefix, and the spread is one of them.
+        let past_the_schedule = self.replayer.as_ref().is_some_and(|r| r.ran_out());
+        let Some(spread) = self
+            .timed_wait_spread
+            .as_mut()
+            .filter(|_| !past_the_schedule)
+        else {
+            self.blocked.timed_waiters.insert(deadline, dettid);
+            return;
+        };
+        let (wake, factor) = spread.wake_threshold(dettid, self.committed_time, deadline);
+        if wake != deadline {
+            detlog!(
+                "[sched] CHAOSWAIT dtid {} deadline {} spread by {} to {} (committed time {})",
+                dettid,
+                deadline,
+                factor,
+                wake,
+                self.committed_time
+            );
+        }
+        self.blocked
+            .timed_waiters
+            .insert_spread(wake, deadline, dettid);
+    }
+
+    /// A spread wait's threshold `wake` came due before its `deadline`
+    /// (`file_timed_wait`): advance the global clock to the deadline, as if
+    /// every other thread had been descheduled for the rest of the wait, and
+    /// queue the wait at its deadline, where the ordinary path wakes it once
+    /// committed time reaches it. The waiter thus never observes less than
+    /// the duration it asked for. The jump is taken at a fixed point of the
+    /// schedule (a popped timed event, with every thread parked), so both
+    /// runs of `--verify` and a replay take it alike.
+    fn reach_promised_deadline(
+        &mut self,
+        global_time: &Mutex<GlobalTime>,
+        dettid: DetTid,
+        wake: LogicalTime,
+        deadline: LogicalTime,
+    ) {
+        let mut gtime = global_time.lock().unwrap();
+        let now = gtime.as_nanos();
+        if deadline > now {
+            gtime.add_extra_time(deadline.duration_since(now));
+        }
+        detlog!(
+            "[sched] CHAOSWAIT dtid {} woke at {} before its deadline {}; global time {} -> {}",
+            dettid,
+            wake,
+            deadline,
+            now,
+            gtime.as_nanos()
+        );
+        drop(gtime);
+        self.blocked.timed_waiters.insert(deadline, dettid);
+        self.promised_wake_requeued = Some(dettid);
     }
 
     /// Reschedule a single thread that has been blocked on futex.
@@ -9527,14 +9673,38 @@ impl Scheduler {
         }
     }
 
+    /// Under `--replay-schedule-from`, whether the thread the schedule runs
+    /// next went back to sleep in this pass's step 2b: a spread wait that came
+    /// due before its deadline popped and was queued again at the deadline
+    /// (`reach_promised_deadline`). Its recording ran no other thread before
+    /// it, since its next event is that thread's, so the pass ends without a
+    /// commit. The next pass's step 1 brings committed time to the deadline,
+    /// where the thread wakes, as it did in the recording. Without the wait,
+    /// the pass gives the turn to another queued thread, which the recording
+    /// did not run there, and the replay leaves its schedule.
+    fn replay_waits_for_a_requeued_wake(&self) -> bool {
+        self.promised_wake_requeued.is_some_and(|requeued| {
+            self.replayer
+                .as_ref()
+                .and_then(|replayer| replayer.next_resume())
+                .is_some_and(|(tid, _)| tid == requeued)
+        })
+    }
+
     fn step2_process_blocked(
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
+        // Before anything can pop a timed event.
+        self.step2_register_queued_sleeps();
         // Before anything can return or pop a timer (`sigalrm`).
         self.step2_sigalrm_ledger();
         self.step2_release_signaled_background()?;
         self.step2_drain_prefix()?;
+        // Again for a sleep the drain admitted (a new thread whose first call
+        // is a sleep), so that it too is a timed waiter before step 3 can
+        // choose by priority.
+        self.step2_register_queued_sleeps();
         // A signal the drain placed that armed a background thread ends the
         // pass before any timer pops: the release barrier requeues that thread
         // at the top of the next one. A `ChildExit` target is then chosen with
@@ -9559,7 +9729,11 @@ impl Scheduler {
         // pops one due timed event, the replayed thread's last if others pop
         // ahead of it.
         let held_for_replayed_wake = self.replay_fast_forward_to_recorded_wake(global_time);
+        self.promised_wake_requeued = None;
         self.step2b_process_timed(global_time);
+        if self.replay_waits_for_a_requeued_wake() {
+            return Err(SkipTurn);
+        }
         if !held_for_replayed_wake {
             self.step2b_restore_due_pollers();
             self.upgrade_pollers_on_time();
@@ -10217,6 +10391,74 @@ impl Scheduler {
         readied
     }
 
+    /// Register every queued plain sleep (a request for `SleepUntil` alone,
+    /// not yet due and not indefinite) as a timed waiter, at the first
+    /// quiescent pass that finds it queued, and take its thread out of the run
+    /// queue until the wake pops: what `block_for_one_resource` does to a
+    /// sleeper step 3 chooses early.
+    ///
+    /// A sleep used to become a timed waiter only when step 3 chose its thread
+    /// before its deadline and `block_for_one_resource` skipped it. Whether
+    /// that happened depended on the thread's priority: a sleeper behind a
+    /// runnable thread of better priority stayed unregistered until it fell
+    /// due, then ran without its wake ever popping. A pass pops one due timed
+    /// event (`step2b_process_timed`), so in that pass another due event, such
+    /// as an interval timer's signal, popped in its place, a pass earlier than
+    /// it would beside a registered sleeper. A schedule replay
+    /// (`--replay-schedule-from`) chooses threads by its own priorities, not
+    /// the recording's, so it registered sleepers at other passes than its
+    /// recording and fired signals at other points (a 300 us `ITIMER_REAL`
+    /// beside a sleeping thread left its schedule after a few hundred events).
+    /// Registered when first queued, a sleeper's deadline is in the timed
+    /// events from the pass after its request, whatever the priorities, as a
+    /// Linux hrtimer is armed when the sleep starts.
+    ///
+    /// Determinism: every thread has parked (step 1), so the run queue and
+    /// each queued request are fixed, and the deadline is the guest's own
+    /// request. Threads are taken in run-queue order, but a timed waiter's
+    /// place depends only on its deadline and thread id
+    /// (`TimedEvents::insert`), so the order adds nothing.
+    ///
+    /// Under race search (`queued_sleeps_registered_at_first_pass` off by
+    /// default, `--sleep-registration`) a sleep is registered only when
+    /// chosen, as before; a replay follows its record.
+    fn step2_register_queued_sleeps(&mut self) {
+        if !self.queued_sleeps_registered_at_first_pass {
+            return;
+        }
+        let committed = self.committed_time;
+        let sleeps: Vec<(LogicalTime, DetTid)> = self
+            .run_queue
+            .tids()
+            .filter(|tid| !self.pending_run_queue_removals.contains_key(*tid))
+            .filter_map(|tid| {
+                let target = self.next_turns.get(tid)?.req.try_read_with(|req| {
+                    let rs = req.as_ref().ok()?;
+                    match rs.resources.iter().next() {
+                        Some((ResourceID::SleepUntil(target), _)) if rs.resources.len() == 1 => {
+                            Some(*target)
+                        }
+                        _ => None,
+                    }
+                })??;
+                (target > committed
+                    && !target.is_indefinite()
+                    && self.blocked.timed_waiters.thread_deadline(*tid).is_none())
+                .then_some((target, *tid))
+            })
+            .collect();
+        for (target, tid) in sleeps {
+            debug!(
+                "[dtid {}] queued sleep registered as a timed waiter at {}",
+                tid, target
+            );
+            // Through `file_timed_wait`, like a sleep registered when chosen,
+            // so `--chaos-timed-wait-spread` spreads it too.
+            self.file_timed_wait(tid, target);
+            assert!(self.run_queue.remove_tid(tid));
+        }
+    }
+
     /// Check whether it is time for the *earliest* time-based event to execute INSTEAD of
     /// dispatching from the normal run queue.  Manipulates scheduler data structures
     /// accordingly.
@@ -10229,7 +10471,14 @@ impl Scheduler {
             .pop_if_before(self.committed_time)
         {
             match evt {
-                TimedEvent::ThreadEvt(tid) => self.wake_timed_event(time_ns, tid),
+                TimedEvent::ThreadEvt(tid) => {
+                    match self.blocked.timed_waiters.take_promise(tid, time_ns) {
+                        Some(deadline) => {
+                            self.reach_promised_deadline(global_time, tid, time_ns, deadline)
+                        }
+                        None => self.wake_timed_event(time_ns, tid),
+                    }
+                }
                 TimedEvent::SignalEvt(id, tid, sig) => {
                     let observed_now = global_time.lock().unwrap().as_nanos();
                     self.dispatch_timed_signal(time_ns, id, tid, sig, true, observed_now)
@@ -12056,6 +12305,7 @@ impl Scheduler {
             if self.send_wakes(dettid) {
                 self.test_send_wakes.push(dettid);
             }
+            self.test_send_times.push(self.signal_sent_at());
             return;
         }
         // Whether a SIGCHLD is already pending in the shared queue, read before
@@ -12669,6 +12919,31 @@ impl Scheduler {
                 // sibling took the process-directed copy, and a `pause` that
                 // found no signal for itself never returned
                 // (https://github.com/rrnewton/hermit/issues/4333).
+                // A `nanosleep` whose deadline had passed when the signal
+                // was sent is already over: its wake is due and pops at the
+                // next pass, and the sleep returns 0 there. Linux's
+                // `do_nanosleep` returns 0 once the timer has fired (`if
+                // (!t->task) return 0`), and the signal is delivered as the
+                // call returns. Woken here, it answered EINTR with nothing
+                // left to sleep (https://github.com/rrnewton/hermit/pull/4682).
+                // The time is the signal's own (`signal_sent_at`): a timed
+                // signal due before the deadline, popped in a pass whose
+                // committed time is already past it, still ends the sleep.
+                // The deadline is read from the filed request on every
+                // backend, as it needs no signal state.
+                if let Some(deadline) = self.filed_nanosleep_deadline(dettid)
+                    && deadline <= self.signal_sent_at()
+                {
+                    debug!(
+                        "[dtid {}] signal {} sent at {} after its parked sleep's deadline {}; \
+                         the sleep completes at its wake.",
+                        dettid,
+                        signal,
+                        self.signal_sent_at(),
+                        deadline
+                    );
+                    return;
+                }
                 let parked_sleep = self.signal_sleep(dettid).is_some();
                 if parked_sleep && !gated_wakes {
                     // Under the gate, as a queued sleep above.
@@ -12766,7 +13041,7 @@ impl Scheduler {
         let live = match self.signal_sleep(dettid) {
             Some(sleep_signal::SignalSleep::Pause) => true,
             Some(sleep_signal::SignalSleep::Nanosleep { deadline }) => {
-                deadline > self.committed_time
+                deadline > self.signal_sent_at()
             }
             None => false,
         };
@@ -15339,7 +15614,14 @@ impl Scheduler {
                 };
 
                 match evt {
-                    TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(event_ns, dtid),
+                    TimedEvent::ThreadEvt(dtid) => {
+                        match self.blocked.timed_waiters.take_promise(dtid, event_ns) {
+                            Some(deadline) => {
+                                self.reach_promised_deadline(global_time, dtid, event_ns, deadline)
+                            }
+                            None => self.wake_timed_event(event_ns, dtid),
+                        }
+                    }
                     TimedEvent::SignalEvt(id, dtid, sig) => {
                         self.dispatch_timed_signal(event_ns, id, dtid, sig, false, observed_now)
                     }
@@ -15768,7 +16050,13 @@ impl Scheduler {
                         "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} which wanted resource {:?} (blocking)",
                         self.turn, dettid, rid
                     );
-                    self.blocked.timed_waiters.insert(*target_ns, dettid);
+                    // Under first-pass registration, usually registered already:
+                    // `step2_register_queued_sleeps` takes a queued plain sleep out
+                    // of the run queue at step 2, and this is a defensive fallback
+                    // for one queued after that within the same pass (no such path
+                    // is known). Under `when-chosen` registration (race search,
+                    // record and replay) this is where a sleep is registered.
+                    self.file_timed_wait(dettid, *target_ns);
                     self.skip_turn_blocked(dettid)
                 }
             }
@@ -17562,9 +17850,11 @@ impl Scheduler {
     ///   - a timed wait or timer (`timed_waiters`);
     ///   - a backed-off poller's timeout (`poll_deadlines`);
     ///   - the deadline of a sleep or poll another thread has requested but
-    ///     not yet had a turn for. A sleep becomes a timed waiter only at the
-    ///     turn that commits its request, so one queued behind the granted
-    ///     thread would otherwise wait out that thread's whole slice.
+    ///     not yet had a turn for. Under first-pass registration a plain sleep
+    ///     is a timed waiter from the first pass after its request
+    ///     (`step2_register_queued_sleeps`); one queued later in a pass, an
+    ///     unregistered one under `when-chosen` registration, or a poll,
+    ///     would otherwise wait out the granted thread's whole slice.
     ///
     /// Only deadlines still ahead of `now` count, from threads that will take
     /// another turn: a passed one (including a yield's `SleepUntil(0)`) marks
@@ -26635,6 +26925,394 @@ mod test {
         LogicalTime::from_nanos(NOW_NS + offset_ns)
     }
 
+    /// A sleep the step-2 drain admits (a new thread whose first call is a
+    /// sleep) is a timed waiter in the same pass, before step 3 can choose by
+    /// priority: registration runs again after the drain
+    /// (https://github.com/rrnewton/hermit/pull/4682).
+    #[test]
+    fn a_sleep_the_drain_admits_registers_in_the_same_pass() {
+        let config = first_pass_config();
+        let mut scheduler = Scheduler::new(&config);
+        assert!(scheduler.queued_sleeps_registered_at_first_pass);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        scheduler.committed_time = at(0);
+        let worker = DetTid::from_raw(3);
+        queue_request(&mut scheduler, worker, Resources::new(worker));
+        let newborn = DetTid::from_raw(5);
+        queue_request(&mut scheduler, newborn, sleep_request(newborn, at(7_000)));
+        // Admitted by the drain rather than already queued.
+        assert!(scheduler.run_queue.remove_tid(newborn));
+        scheduler.admit_to_run_queue(newborn, AdmitIntent::Fixed(AdmitSide::Front));
+        for tid in [worker, newborn] {
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(newborn),
+            Some(at(7_000))
+        );
+        assert!(!scheduler.run_queue.contains_tid(newborn));
+        assert!(scheduler.run_queue.contains_tid(worker));
+    }
+
+    /// First-pass registration applies only where the guest's signal state can
+    /// be read: with neither modeled signal targets nor the in-guest gate, a
+    /// queued plain sleep stays queued at the first pass instead of parking
+    /// where a signal could only wake it unclassified, also when the rule asks
+    /// for the first pass (hermit refuses that launch; a library caller gets
+    /// registration when chosen). With either, it registers.
+    #[test]
+    fn first_pass_registration_needs_a_readable_signal_state() {
+        use crate::config::SleepRegistration;
+        let unreadable = |sleep_registration| Config {
+            sequentialize_threads: true,
+            sleep_registration,
+            ..Config::default()
+        };
+        let gated = Config {
+            in_guest_signal_delivery: true,
+            ..unreadable(None)
+        };
+        for (case, config, registers) in [
+            ("default", unreadable(None), false),
+            (
+                "first-pass asked for",
+                unreadable(Some(SleepRegistration::FirstPass)),
+                false,
+            ),
+            ("modeled targets", first_pass_config(), true),
+            ("in-guest gate", gated, true),
+        ] {
+            let mut scheduler = Scheduler::new(&config);
+            assert_eq!(
+                scheduler.queued_sleeps_registered_at_first_pass, registers,
+                "{case}"
+            );
+            let sleeper = DetTid::from_raw(5);
+            queue_request(
+                &mut scheduler,
+                sleeper,
+                sleep_request(sleeper, LogicalTime::from_nanos(7_000)),
+            );
+            scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+            scheduler.step2_register_queued_sleeps();
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                registers.then_some(LogicalTime::from_nanos(7_000)),
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.run_queue.contains_tid(sleeper),
+                !registers,
+                "{case}"
+            );
+        }
+    }
+
+    /// A run's record states how its queued sleeps were registered, which is
+    /// what the scheduler does: on a backend that reads no sleeper's signal
+    /// state, by default or when the first pass is asked for, a sleep is
+    /// registered when chosen and the record says so; where the state is read,
+    /// at the first pass, and the record says that.
+    #[test]
+    fn a_record_says_how_its_queued_sleeps_were_registered() {
+        use crate::config::SleepRegistration;
+        let dbt = |sleep_registration| Config {
+            sequentialize_threads: true,
+            backend: BackendCapabilities::DBT,
+            record_preemptions: true,
+            sleep_registration,
+            ..Config::default()
+        };
+        let readable = Config {
+            record_preemptions: true,
+            ..first_pass_config()
+        };
+        for (case, config, registers) in [
+            ("DBT, default", dbt(None), false),
+            (
+                "DBT, first-pass asked for",
+                dbt(Some(SleepRegistration::FirstPass)),
+                false,
+            ),
+            ("ptrace-like, default", readable, true),
+        ] {
+            let mut scheduler = Scheduler::new(&config);
+            let sleeper = DetTid::from_raw(5);
+            queue_request(
+                &mut scheduler,
+                sleeper,
+                sleep_request(sleeper, LogicalTime::from_nanos(7_000)),
+            );
+            scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+            scheduler.step2_register_queued_sleeps();
+            let registered = scheduler
+                .blocked
+                .timed_waiters
+                .thread_deadline(sleeper)
+                .is_some();
+            assert_eq!(registered, registers, "{case}");
+            let written = scheduler.preemption_writer.take().unwrap().into_string();
+            assert_eq!(
+                written.contains("\"queued_sleeps_registered_at_first_pass\":true"),
+                registers,
+                "{case}: {written}"
+            );
+        }
+    }
+
+    /// A configuration under which queued sleeps register at the first pass
+    /// by default: serialized threads on a backend whose kernel signal targets
+    /// the scheduler predicts, as a prepared ptrace run has
+    /// (`Config::queued_sleeps_registered_at_first_pass`).
+    fn first_pass_config() -> Config {
+        Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| detcore_model::config::set_kernel_signal_facts(backend, true))
+    }
+
+    /// A queued plain sleep is a timed waiter from the first quiescent pass
+    /// that finds it queued, whatever the priorities, and its thread leaves
+    /// the run queue until the wake pops. A due sleep (a yield), a sleep with
+    /// no deadline and any other request stay as they are. When the sleep
+    /// falls due beside another timed event with a later deadline, the pass
+    /// pops the sleeper's wake, not the other event: before, an unregistered
+    /// sleeper behind a runnable thread let the later event pop first. Under
+    /// `--chaos` the sleep stays queued, as before.
+    #[test]
+    fn a_queued_sleep_is_a_timed_waiter_from_the_first_pass() {
+        let config = first_pass_config();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        scheduler.committed_time = at(0);
+        let worker = DetTid::from_raw(3);
+        queue_request(&mut scheduler, worker, Resources::new(worker));
+        let sleeper = DetTid::from_raw(5);
+        queue_request(&mut scheduler, sleeper, sleep_request(sleeper, at(7_000)));
+        let yielder = DetTid::from_raw(7);
+        queue_request(
+            &mut scheduler,
+            yielder,
+            sleep_request(yielder, LogicalTime::from_nanos(0)),
+        );
+        let pause = DetTid::from_raw(9);
+        queue_request(
+            &mut scheduler,
+            pause,
+            sleep_request(pause, LogicalTime::INDEFINITE),
+        );
+        // Another timed event, due after the sleep.
+        let later = DetTid::from_raw(11);
+        scheduler.blocked.timed_waiters.insert(at(8_000), later);
+        for tid in [worker, sleeper, yielder, pause, later] {
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(at(7_000))
+        );
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+        for tid in [worker, yielder, pause] {
+            assert_eq!(scheduler.blocked.timed_waiters.thread_deadline(tid), None);
+            assert!(scheduler.run_queue.contains_tid(tid));
+        }
+        // A second pass registers nothing again.
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(at(7_000))
+        );
+
+        // Both fall due: the pass pops the earlier, the sleeper's wake.
+        scheduler.committed_time = at(9_000);
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            None
+        );
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(later),
+            Some(at(8_000)),
+            "one timed event pops per pass"
+        );
+
+        // Under --chaos a queued sleep stays queued, unregistered, until step
+        // 3 chooses its thread (here beside a runnable thread, so the pass
+        // does not jump to the sleep's deadline for want of work).
+        let chaos = Config {
+            chaos: true,
+            ..Default::default()
+        };
+        let mut scheduler = Scheduler::new(&chaos);
+        scheduler.committed_time = at(0);
+        queue_request(&mut scheduler, worker, Resources::new(worker));
+        queue_request(&mut scheduler, sleeper, sleep_request(sleeper, at(7_000)));
+        for tid in [worker, sleeper] {
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            None
+        );
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+    }
+
+    /// A replay that leaves `--sleep-registration` unset registers queued
+    /// sleeps as its record says, whatever its own options: a record of a
+    /// plain run (which stores the rule) makes even a `--chaos` replay
+    /// register at the first pass, and a record that does not say (a chaos
+    /// recording, or one older than the rule) makes even a plain replay
+    /// register a sleep only when chosen. An explicit value decides; a run
+    /// that replays nothing takes the default from `--chaos` and the
+    /// heuristic; a recording stores the rule.
+    #[test]
+    fn a_replay_registers_queued_sleeps_as_its_record_says() {
+        let dir = tempfile::tempdir().unwrap();
+        for (recorded, chaos) in [(true, true), (false, false), (true, false), (false, true)] {
+            let path = dir.path().join(format!("record-{recorded}-{chaos}.json"));
+            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+                .with_queued_sleeps_registered_at_first_pass(recorded);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            for schedule in [true, false] {
+                let config = Config {
+                    chaos,
+                    replay_schedule_from: schedule.then(|| path.clone()),
+                    replay_preemptions_from: (!schedule).then(|| path.clone()),
+                    ..first_pass_config()
+                };
+                assert_eq!(
+                    Scheduler::new(&config).queued_sleeps_registered_at_first_pass,
+                    recorded,
+                    "recorded {recorded}, --chaos {chaos}, schedule replay {schedule}"
+                );
+            }
+        }
+        // An explicit `--sleep-registration` decides, record or not (`hermit
+        // run` refuses one that disagrees with the record before this).
+        use crate::config::SleepRegistration;
+        let path = dir.path().join("record-true-true.json");
+        for (registration, first_pass) in [
+            (SleepRegistration::FirstPass, true),
+            (SleepRegistration::WhenChosen, false),
+        ] {
+            for replay in [None, Some(path.clone())] {
+                let config = Config {
+                    chaos: true,
+                    sleep_registration: Some(registration),
+                    replay_schedule_from: replay.clone(),
+                    ..first_pass_config()
+                };
+                assert_eq!(
+                    Scheduler::new(&config).queued_sleeps_registered_at_first_pass,
+                    first_pass,
+                    "{registration:?}, replaying {replay:?}"
+                );
+            }
+        }
+        // A replay that also records stores the rule it replayed under.
+        let replaying_recorder = Config {
+            chaos: true,
+            replay_schedule_from: Some(path.clone()),
+            record_preemptions: true,
+            ..first_pass_config()
+        };
+        let scheduler = Scheduler::new(&replaying_recorder);
+        assert!(scheduler.queued_sleeps_registered_at_first_pass);
+        assert!(
+            scheduler
+                .preemption_writer
+                .unwrap()
+                .into_string()
+                .contains("\"queued_sleeps_registered_at_first_pass\":true")
+        );
+        // A heuristic that does not select by priority is race search too.
+        let random = Config {
+            sched_heuristic: crate::config::SchedHeuristic::Random,
+            ..first_pass_config()
+        };
+        assert!(!Scheduler::new(&random).queued_sleeps_registered_at_first_pass);
+        for chaos in [false, true] {
+            // On a prepared ptrace run (`first_pass_config`): elsewhere the
+            // default registers when chosen.
+            let config = Config {
+                chaos,
+                record_preemptions: true,
+                ..first_pass_config()
+            };
+            let scheduler = Scheduler::new(&config);
+            assert_eq!(scheduler.queued_sleeps_registered_at_first_pass, !chaos);
+            let written = scheduler.preemption_writer.unwrap().into_string();
+            assert_eq!(
+                written.contains("\"queued_sleeps_registered_at_first_pass\":true"),
+                !chaos,
+                "{written}"
+            );
+        }
+    }
+
+    /// Registration does not depend on priorities: a sleeper queued behind a
+    /// runnable thread of better priority and one queued ahead of it are
+    /// registered at the same pass, with the same deadline. A sleeper whose
+    /// thread is pending removal is left alone.
+    #[test]
+    fn a_queued_sleep_registers_whatever_the_priorities() {
+        let config = first_pass_config();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let worker = DetTid::from_raw(3);
+        let sleeper = DetTid::from_raw(5);
+        let mut orders = Vec::new();
+        for (worker_priority, sleeper_priority) in [(1, 9_999), (9_999, 1)] {
+            let case =
+                format!("worker priority {worker_priority}, sleeper priority {sleeper_priority}");
+            let mut scheduler = Scheduler::new(&config);
+            scheduler.committed_time = at(0);
+            for (tid, request, priority) in [
+                (worker, Resources::new(worker), worker_priority),
+                (sleeper, sleep_request(sleeper, at(7_000)), sleeper_priority),
+            ] {
+                queue_request(&mut scheduler, tid, request);
+                assert!(scheduler.run_queue.remove_tid(tid));
+                scheduler.priorities.insert(tid, priority);
+                scheduler.runqueue_push_back(tid);
+            }
+            orders.push(scheduler.run_queue.tids().copied().collect::<Vec<_>>());
+            let _ = scheduler.step2_process_blocked(&global_time);
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                Some(at(7_000)),
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+                vec![worker],
+                "{case}"
+            );
+        }
+        assert_eq!(orders, vec![vec![worker, sleeper], vec![sleeper, worker]]);
+
+        // A thread pending removal is left alone: its old queue entry is
+        // still there until the drain takes it.
+        let mut scheduler = Scheduler::new(&config);
+        scheduler.committed_time = at(0);
+        queue_request(&mut scheduler, sleeper, sleep_request(sleeper, at(7_000)));
+        scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+        scheduler
+            .pending_run_queue_removals
+            .insert(sleeper, RemovalDisposition::ReplaceThenAdmit);
+        scheduler.step2_register_queued_sleeps();
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            None
+        );
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+    }
+
     /// The deadline hint of hermit#4121 is the time from `committed_time` to
     /// the earliest pending deadline, wherever it is pending.
     #[test]
@@ -27136,6 +27814,200 @@ mod test {
             scheduler.step2_process_blocked(&global_time).is_ok(),
             "the wake is due, so the pass goes on to a turn"
         );
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
+    /// A scheduler under `--chaos --chaos-timed-wait-spread=10` (or without
+    /// the spread for `None`) with `sleeper` asleep from now until 1 ms from
+    /// now, filed through `file_timed_wait`; returns the clock, the start and
+    /// the deadline.
+    fn spread_sleeper(
+        seed: Option<u64>,
+        sleeper: DetTid,
+    ) -> (Scheduler, Arc<Mutex<GlobalTime>>, LogicalTime, LogicalTime) {
+        let config = Config {
+            chaos: true,
+            chaos_timed_wait_spread: seed.map(|_| 10.0),
+            sched_seed: seed,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        scheduler.committed_time = start;
+        scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+        scheduler.next_turns.insert(
+            sleeper,
+            ThreadNextTurn {
+                dettid: sleeper,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        let deadline = start + LogicalTime::from_nanos(1_000_000);
+        scheduler.file_timed_wait(sleeper, deadline);
+        (scheduler, global_time, start, deadline)
+    }
+
+    /// The first spread factor of `sleeper` under `seed`, and the first seed
+    /// in 0..256 whose factor satisfies `pick`.
+    fn spread_seed(sleeper: DetTid, pick: impl Fn(f64) -> bool) -> (u64, f64) {
+        (0..256)
+            .map(|seed| {
+                (
+                    seed,
+                    timed_wait_spread::timed_wait_factor(seed, sleeper, 0, 10.0),
+                )
+            })
+            .find(|(_, factor)| pick(*factor))
+            .expect("a seed with such a factor")
+    }
+
+    /// `--chaos-timed-wait-spread`: a wait whose threshold comes before its
+    /// deadline pops at the threshold, the clock advances to its deadline
+    /// before it runs, and it wakes once committed time reaches the deadline;
+    /// a threshold past the deadline oversleeps and wakes with no jump; and
+    /// without the option the wait is queued at its deadline.
+    #[test]
+    fn a_spread_wait_wakes_at_its_threshold_and_never_before_its_deadline() {
+        let sleeper = DetTid::from_raw(5);
+        let (scheduler, _, _, deadline) = spread_sleeper(None, sleeper);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(deadline)
+        );
+
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
+        let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(wake)
+        );
+        // Other threads' work moves the clock to the threshold.
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(wake.duration_since(start));
+        scheduler.committed_time = wake;
+        assert!(scheduler.step2b_process_timed(&global_time));
+        assert_eq!(
+            global_time.lock().unwrap().as_nanos(),
+            deadline,
+            "the clock reaches the deadline before the waiter runs"
+        );
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(deadline)
+        );
+        scheduler.committed_time = deadline;
+        assert!(scheduler.step2b_process_timed(&global_time));
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        let (seed, factor) = spread_seed(sleeper, |factor| factor > 2.0);
+        let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
+        let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(deadline.duration_since(start));
+        scheduler.committed_time = deadline;
+        assert!(
+            !scheduler.step2b_process_timed(&global_time),
+            "an overslept wait is not woken at its deadline"
+        );
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(wake.duration_since(deadline));
+        scheduler.committed_time = wake;
+        assert!(scheduler.step2b_process_timed(&global_time));
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), wake, "no jump");
+    }
+
+    /// A schedule replay spreads a wait it files while recorded events
+    /// remain, as its recording did, and files one at its deadline once its
+    /// schedule has run out: the run then continues without chaos decisions,
+    /// as `hermit analyze` continues a replayed prefix.
+    #[test]
+    fn a_schedule_replay_spreads_no_wait_filed_past_its_schedule() {
+        let sleeper = DetTid::from_raw(5);
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        let event = SchedEvent::syscall(sleeper, Sysno::nanosleep, SyscallPhase::Posthook);
+        for (events, spread) in [(vec![event], true), (vec![], false)] {
+            let config = Config {
+                chaos_timed_wait_spread: Some(10.0),
+                sched_seed: Some(seed),
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            scheduler.replayer = Some(Replayer::new(events));
+            let start = scheduler.committed_time;
+            let deadline = start + LogicalTime::from_nanos(1_000_000);
+            scheduler.file_timed_wait(sleeper, deadline);
+            let expected = if spread {
+                start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64)
+            } else {
+                deadline
+            };
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                Some(expected),
+                "recorded events left: {spread}"
+            );
+        }
+    }
+
+    /// A schedule replay whose next event is a spread sleeper's waits, in a
+    /// pass of its own, for the sleeper that step 2b put back to sleep until
+    /// its deadline, as its recording did, and does not wait for one when the
+    /// schedule runs another thread next.
+    #[test]
+    fn a_schedule_replay_waits_for_its_next_thread_put_back_to_sleep() {
+        let sleeper = DetTid::from_raw(5);
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        for (next, waits) in [(sleeper, true), (DetTid::from_raw(7), false)] {
+            let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
+            let event = SchedEvent::syscall(next, Sysno::nanosleep, SyscallPhase::Posthook);
+            scheduler.replayer = Some(Replayer::new(vec![event]));
+            assert!(!scheduler.replay_waits_for_a_requeued_wake());
+            let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
+            global_time
+                .lock()
+                .unwrap()
+                .add_extra_time(wake.duration_since(start));
+            scheduler.committed_time = wake;
+            assert!(scheduler.step2b_process_timed(&global_time));
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                Some(deadline)
+            );
+            assert_eq!(
+                scheduler.replay_waits_for_a_requeued_wake(),
+                waits,
+                "next event by {next}"
+            );
+        }
+    }
+
+    /// With nothing runnable, the empty-queue fast-forward of a spread wait
+    /// moves the clock to the threshold and then to the deadline, and the
+    /// next pass wakes the waiter there: the clock never stops between them.
+    #[test]
+    fn an_empty_queue_fast_forwards_a_spread_wait_to_its_deadline() {
+        let sleeper = DetTid::from_raw(5);
+        let (seed, _) = spread_seed(sleeper, |factor| factor < 0.5);
+        let (mut scheduler, global_time, _, deadline) = spread_sleeper(Some(seed), sleeper);
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
         assert!(scheduler.run_queue.contains_tid(sleeper));
         assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
     }
@@ -42409,6 +43281,129 @@ mod test {
                 deadline,
                 &format!("committed {committed}"),
             );
+        }
+    }
+
+    /// A signal the scheduler sends at a commit point (`--signal-at`, a
+    /// parent-death signal) to a parked `nanosleep` whose deadline has passed
+    /// but whose wake has not popped yet leaves the sleep to complete at its
+    /// wake, with 0, as Linux's `do_nanosleep` returns 0 once its timer has
+    /// fired; the signal is delivered as the call returns. Before the deadline
+    /// the same signal wakes the sleep to answer it
+    /// (https://github.com/rrnewton/hermit/pull/4682).
+    #[test]
+    fn a_scheduler_signal_after_a_parked_nanosleep_deadline_leaves_it_to_complete() {
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for committed in [deadline, deadline + LogicalTime::from_nanos(1)] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+            scheduler.committed_time = committed;
+            set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+            scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+            let case = format!("committed {committed}");
+            assert_sleep_parked(&scheduler, target, deadline, &case);
+            assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+            assert!(!scheduler.blocked.woken_sleeps.contains(&target), "{case}");
+        }
+        let mut scheduler = gated_scheduler();
+        let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+        scheduler.committed_time = LogicalTime::from_nanos(4_999_999_999);
+        set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+        scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![SigWrapper::from(Signal::SIGUSR1)],
+            "before the deadline"
+        );
+        assert!(
+            scheduler.blocked.timed_waiters.is_empty(),
+            "before the deadline"
+        );
+    }
+
+    /// A timed signal is judged by when it was due, not by the committed time
+    /// of the pass that pops it: a pass pops one due event, so an alarm due
+    /// before a parked `nanosleep`'s deadline can pop when committed time is
+    /// already past the deadline, and it still ends the sleep, as Linux ends
+    /// a sleep for a signal that arrives before its timer fires. One due at or
+    /// after the deadline leaves the sleep to its wake. `dispatch_timed_signal`
+    /// sets the due time for the length of the dispatch and restores it
+    /// (https://github.com/rrnewton/hermit/pull/4682).
+    #[test]
+    fn a_timed_signal_due_before_a_parked_nanosleep_deadline_ends_it_whenever_it_pops() {
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for (due, woken) in [
+            (LogicalTime::from_nanos(4_999_000_000), true),
+            (deadline, false),
+        ] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+            scheduler.committed_time = LogicalTime::from_nanos(5_001_000_000);
+            set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+            scheduler.signal_sent_at = Some(due);
+            assert_eq!(scheduler.signal_sent_at(), due);
+            scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+            let case = format!("due {due}");
+            if woken {
+                assert_eq!(
+                    scheduler.inbound_signals(target),
+                    vec![SigWrapper::from(Signal::SIGUSR1)],
+                    "{case}"
+                );
+                assert!(scheduler.blocked.timed_waiters.is_empty(), "{case}");
+            } else {
+                assert_sleep_parked(&scheduler, target, deadline, &case);
+                assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+            }
+        }
+        // Outside a timed dispatch, the send time is the commit point's.
+        let mut scheduler = gated_scheduler();
+        scheduler.committed_time = deadline;
+        assert_eq!(scheduler.signal_sent_at, None);
+        assert_eq!(scheduler.signal_sent_at(), deadline);
+    }
+
+    /// On a backend that reads no sleeper's signal state, a signal sent at or
+    /// after a parked `nanosleep`'s deadline still leaves it to its wake: the
+    /// deadline is read from the filed request, which needs no signal state.
+    /// This holds for the default and for an explicit `first-pass`, which
+    /// registers there too (https://github.com/rrnewton/hermit/pull/4682).
+    #[test]
+    fn a_signal_after_a_parked_nanosleep_deadline_leaves_it_to_complete_on_any_backend() {
+        use crate::config::SleepRegistration;
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        for registration in [None, Some(SleepRegistration::FirstPass)] {
+            for committed in [deadline, deadline + LogicalTime::from_nanos(1)] {
+                let cfg = Config {
+                    sequentialize_threads: true,
+                    backend: BackendCapabilities::DBT,
+                    sleep_registration: registration,
+                    ..Config::default()
+                };
+                let mut scheduler = Scheduler::new(&cfg);
+                let case = format!("{registration:?}, committed {committed}");
+                assert!(
+                    !scheduler.models_signal_targets && !scheduler.in_guest_signal_delivery,
+                    "{case}"
+                );
+                assert_eq!(
+                    cfg.queued_sleeps_registered_at_first_pass(),
+                    registration.is_some(),
+                    "{case}"
+                );
+                let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+                assert_eq!(scheduler.signal_sleep(target), None, "{case}");
+                scheduler.committed_time = committed;
+                scheduler.wake_signaled_guest_as(target, Signal::SIGUSR1, false);
+                assert_eq!(
+                    scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+                    vec![(deadline, TimedEvent::ThreadEvt(target))],
+                    "{case}"
+                );
+                assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+            }
         }
     }
 

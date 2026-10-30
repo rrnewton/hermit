@@ -4792,6 +4792,15 @@ fn child_wait_cross_signal_rejects_conflicting_ownership_before_rewrite() {
 }
 
 /// A scheduler for `backend` with sequentialized threads set as given.
+/// KVM's capabilities with a synthetic report of the guest's signal state
+/// (production KVM reports none), under which the scheduler registers queued
+/// sleeps at the first pass (`Config::reads_sleeper_signal_state`).
+fn kvm_reading_signal_state() -> BackendCapabilities {
+    let mut backend = BackendCapabilities::KVM;
+    backend.kernel_signal_targets_are_predictable = true;
+    backend
+}
+
 fn scheduler_for(backend: BackendCapabilities, sequentialize_threads: bool) -> Scheduler {
     Scheduler::new(&Config {
         sequentialize_threads,
@@ -4964,6 +4973,150 @@ fn backends_without_signal_control_never_enter_the_controlled_loop() {
         assert_eq!(s.turn, 1, "{name}");
         assert_eq!(s.controlled_turn_entries, u64::from(controlled), "{name}");
     }
+}
+
+/// The controlled turn loop registers a queued plain sleep as a timed waiter
+/// before its first pop, as the ordinary loop's step 2 does: a sleep queued
+/// ahead of a runnable thread leaves the run queue and is a timed waiter at
+/// its deadline after one turn, which the runnable thread takes.
+#[test]
+fn the_controlled_loop_registers_a_queued_sleep() {
+    use futures::FutureExt;
+
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass registration
+    // applies in the controlled loop (`Config::reads_sleeper_signal_state`).
+    let mut s = scheduler_for(kvm_reading_signal_state(), true);
+    s.install_signal_control(
+        Some(BackendSignalControl {
+            process: Arc::new(Backend::default()),
+        }),
+        true,
+    )
+    .expect("KVM takes the control");
+    assert!(s.signal_control_installed());
+    let (sleeper, _, _) = add(&mut s, 100, 100);
+    let (runner, _, _) = add(&mut s, 100, 101);
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    // Well past the turn's charge, so the sleep is not yet due.
+    let deadline = global.lock().unwrap().as_nanos() + LogicalTime::from_nanos(1_000_000_000);
+    let mut sleep = Resources::new(sleeper);
+    sleep.insert(ResourceID::SleepUntil(deadline), Permission::W);
+    s.next_turns[&sleeper].req.put(Ok(sleep));
+    s.runqueue_push_back(sleeper);
+    s.next_turns[&runner].req.put(Ok(Resources::new(runner)));
+    s.runqueue_push_back(runner);
+    let scheduler = Arc::new(Mutex::new(s));
+    let result = do_a_turn_blocking(scheduler.clone(), global, &Ok(Resources::new(runner)))
+        .now_or_never()
+        .expect("a quiescent request must not block the turn")
+        .expect("the runnable thread must commit");
+    assert_eq!(result.tid, runner);
+    let s = scheduler.lock().unwrap();
+    assert_eq!(s.controlled_turn_entries, 1);
+    assert_eq!(
+        s.blocked.timed_waiters.thread_deadline(sleeper),
+        Some(deadline)
+    );
+    assert!(!s.run_queue.contains_tid(sleeper));
+}
+
+/// The controlled loop's refresh registers a sleep filed after its first
+/// maintenance step, before the refresh can pop a timed event: here a thread
+/// the drain admitted with no request yet holds the loop until it files a
+/// sleep, which the refresh makes a timed waiter while the runnable thread
+/// takes the turn. On KVM first-pass registration is asked for: the scheduler
+/// reads no sleeper's signal state there, so it is not the default
+/// (https://github.com/rrnewton/hermit/pull/4682).
+#[test]
+fn the_controlled_loop_refresh_registers_a_sleep_filed_during_maintenance() {
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass registration
+    // applies in the controlled loop (`Config::reads_sleeper_signal_state`).
+    let mut s = scheduler_for(kvm_reading_signal_state(), true);
+    s.install_signal_control(
+        Some(BackendSignalControl {
+            process: Arc::new(Backend::default()),
+        }),
+        true,
+    )
+    .expect("KVM takes the control");
+    let (runner, _, _) = add(&mut s, 100, 100);
+    let (late, _, _) = add(&mut s, 100, 101);
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let deadline = global.lock().unwrap().as_nanos() + LogicalTime::from_nanos(1_000_000_000);
+    s.next_turns[&runner].req.put(Ok(Resources::new(runner)));
+    s.runqueue_push_back(runner);
+    // Admitted by the first maintenance step's drain, its request still to come.
+    s.admit_to_run_queue(late, AdmitIntent::Fixed(AdmitSide::Back));
+    let scheduler = Arc::new(Mutex::new(s));
+    let last_turn = Ok(Resources::new(runner));
+    let mut turn = Box::pin(do_a_turn_blocking(scheduler.clone(), global, &last_turn));
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        turn.as_mut().poll(&mut cx).is_pending(),
+        "the loop waits for the admitted thread's request"
+    );
+    let mut sleep = Resources::new(late);
+    sleep.insert(ResourceID::SleepUntil(deadline), Permission::W);
+    scheduler.lock().unwrap().next_turns[&late]
+        .req
+        .put(Ok(sleep));
+    let Poll::Ready(result) = turn.as_mut().poll(&mut cx) else {
+        panic!("a quiescent request must not block the turn");
+    };
+    let result = result.expect("the runnable thread must commit");
+    assert_eq!(result.tid, runner);
+    let s = scheduler.lock().unwrap();
+    assert_eq!(
+        s.blocked.timed_waiters.thread_deadline(late),
+        Some(deadline)
+    );
+    assert!(!s.run_queue.contains_tid(late));
+}
+
+/// The controlled loop's first maintenance step registers a sleep its drain
+/// admits (a new thread whose first call is a sleep), before step 3 can
+/// choose by priority, as the ordinary loop's step 2 does
+/// (https://github.com/rrnewton/hermit/pull/4682).
+#[test]
+fn the_controlled_loop_registers_a_sleep_its_drain_admits() {
+    use futures::FutureExt;
+
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass registration
+    // applies in the controlled loop (`Config::reads_sleeper_signal_state`).
+    let mut s = scheduler_for(kvm_reading_signal_state(), true);
+    s.install_signal_control(
+        Some(BackendSignalControl {
+            process: Arc::new(Backend::default()),
+        }),
+        true,
+    )
+    .expect("KVM takes the control");
+    let (runner, _, _) = add(&mut s, 100, 100);
+    let (newborn, _, _) = add(&mut s, 100, 101);
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let deadline = global.lock().unwrap().as_nanos() + LogicalTime::from_nanos(1_000_000_000);
+    s.next_turns[&runner].req.put(Ok(Resources::new(runner)));
+    s.runqueue_push_back(runner);
+    let mut sleep = Resources::new(newborn);
+    sleep.insert(ResourceID::SleepUntil(deadline), Permission::W);
+    s.next_turns[&newborn].req.put(Ok(sleep));
+    s.admit_to_run_queue(newborn, AdmitIntent::Fixed(AdmitSide::Back));
+    let scheduler = Arc::new(Mutex::new(s));
+    let result = do_a_turn_blocking(scheduler.clone(), global, &Ok(Resources::new(runner)))
+        .now_or_never()
+        .expect("a quiescent request must not block the turn")
+        .expect("the runnable thread must commit");
+    assert_eq!(result.tid, runner);
+    let s = scheduler.lock().unwrap();
+    assert_eq!(
+        s.blocked.timed_waiters.thread_deadline(newborn),
+        Some(deadline)
+    );
+    assert!(!s.run_queue.contains_tid(newborn));
 }
 
 /// Where a real timer goes is decided by the installed control alone. Without

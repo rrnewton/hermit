@@ -954,6 +954,10 @@ mod tests {
             &["--chaos-slowdown-max-factor=4.0"],
         ),
         ("chaos-epoch-length-ns", &["--chaos-epoch-length-ns=100"]),
+        (
+            "chaos-timed-wait-spread",
+            &["--chaos-timed-wait-spread=2.5"],
+        ),
         ("record-preemptions", &["--record-preemptions"]),
         (
             "strict-schedule-boundaries",
@@ -1019,6 +1023,7 @@ mod tests {
         ("futex-wake-yields", &["--futex-wake-yields"]),
         ("pipe-wake-latency", &["--pipe-wake-latency=1000000"]),
         ("expired-wait-charge", &["--expired-wait-charge=once"]),
+        ("sleep-registration", &["--sleep-registration=when-chosen"]),
         (
             "work-span-report",
             &["--work-span-report=/tmp/work-span.json"],

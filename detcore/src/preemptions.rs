@@ -36,6 +36,36 @@ use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 
+/// The `--chaos-timed-wait-spread` a record was produced under
+/// ([`PreemptionRecord`]): the spread, and the scheduler seed of the run when
+/// the scheduler wrote the record (`None` in a record `hermit analyze`
+/// assembles from its trials, whose seeds it keeps itself).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RecordedTimedWaitSpread {
+    /// The spread `R`: factors are drawn from `[1/R, R]`.
+    pub spread: f64,
+    /// The scheduler seed the factors were drawn from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+}
+
+/// Compared bit for bit: a spread is a configuration value read back exactly,
+/// not a measurement.
+impl PartialEq for RecordedTimedWaitSpread {
+    fn eq(&self, other: &Self) -> bool {
+        self.spread.to_bits() == other.spread.to_bits() && self.seed == other.seed
+    }
+}
+
+impl Eq for RecordedTimedWaitSpread {}
+
+impl std::hash::Hash for RecordedTimedWaitSpread {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.spread.to_bits().hash(state);
+        self.seed.hash(state);
+    }
+}
+
 /// A record of all the preemptions and other scheduling events that occur during execution.
 #[derive(PartialEq, Default, Debug, Eq, Clone, Hash)]
 pub struct PreemptionRecord {
@@ -99,6 +129,13 @@ pub struct PreemptionRecord {
     /// completeness. Newly marked JSON uses a mandatory envelope that old
     /// readers reject, and marked non-human serialization is refused.
     replay_departed_at: Option<u64>,
+    /// The `--chaos-timed-wait-spread` of the run that produced this record,
+    /// and the scheduler seed its draws came from when the scheduler wrote
+    /// it. Every spread wait's factor is a pure function of the two, so a
+    /// replay under the same values redraws exactly the recorded factors, and
+    /// one under others is refused. `None` when the option was off, which
+    /// writes the record exactly as before the field existed.
+    timed_wait_spread: Option<RecordedTimedWaitSpread>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
@@ -128,6 +165,16 @@ pub struct PreemptionRecord {
     /// it. `None` for records written before the field existed, and for
     /// records synthesized in memory.
     host_inputs: Option<HostInputSet>,
+    /// Whether the run that produced this record registered a queued plain
+    /// sleep as a timed waiter at the first scheduler pass that found it
+    /// queued (`Scheduler::queued_sleeps_registered_at_first_pass`): a run
+    /// under `--sleep-registration=first-pass`, by default one outside race
+    /// search. `false`, which writes the record exactly as before the field
+    /// existed and is what a record without it means, is the rule of every
+    /// run before it and of `when-chosen` runs: a sleep is registered only
+    /// when its thread is chosen before its deadline. A replay that leaves
+    /// `--sleep-registration` unset registers as its record says.
+    queued_sleeps_registered_at_first_pass: bool,
     /// The store-exclusives that failed in the run that produced this record
     /// (aarch64, `STREX_FAIL_SPEC`). Each retried a load/store exclusive loop
     /// and so added retired branches the run's preemption points count, so a
@@ -182,11 +229,13 @@ impl PreemptionRecord {
             chaos_timeslice: None,
             guest_ids: None,
             replay_departed_at: None,
+            timed_wait_spread: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
+            queued_sleeps_registered_at_first_pass: false,
         }
     }
 
@@ -245,12 +294,14 @@ impl PreemptionRecord {
             cap_preemption_charge,
             chaos_timeslice,
             guest_ids,
+            timed_wait_spread,
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
             host_inputs,
             store_exclusive_failures: _,
             replay_departed_at,
+            queued_sleeps_registered_at_first_pass,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -295,6 +346,7 @@ impl PreemptionRecord {
             cap_preemption_charge: *cap_preemption_charge,
             chaos_timeslice: *chaos_timeslice,
             guest_ids: *guest_ids,
+            timed_wait_spread: *timed_wait_spread,
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
@@ -303,6 +355,7 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             // A prefix of an inexact record is inexact too.
             replay_departed_at: *replay_departed_at,
+            queued_sleeps_registered_at_first_pass: *queued_sleeps_registered_at_first_pass,
         }
     }
 
@@ -326,6 +379,20 @@ impl PreemptionRecord {
     /// The same record, stating the timeslice its run drew.
     pub fn with_chaos_timeslice(mut self, timeslice: Option<u64>) -> Self {
         self.chaos_timeslice = timeslice;
+        self
+    }
+
+    /// Whether the run this record came from registered queued sleeps at the
+    /// first pass (`false` for registration when chosen, and for records that
+    /// do not say).
+    pub fn queued_sleeps_registered_at_first_pass(&self) -> bool {
+        self.queued_sleeps_registered_at_first_pass
+    }
+
+    /// The same record, stating how the run it came from registered queued
+    /// sleeps.
+    pub fn with_queued_sleeps_registered_at_first_pass(mut self, first_pass: bool) -> Self {
+        self.queued_sleeps_registered_at_first_pass = first_pass;
         self
     }
 
@@ -431,6 +498,19 @@ impl PreemptionRecord {
         self
     }
 
+    /// The same record, stating the `--chaos-timed-wait-spread` of the
+    /// trials it came from, as it states the pipe-wake latency.
+    pub fn with_timed_wait_spread(mut self, spread: Option<RecordedTimedWaitSpread>) -> Self {
+        self.timed_wait_spread = spread;
+        self
+    }
+
+    /// The `--chaos-timed-wait-spread` this record was produced under
+    /// (`None` for off).
+    pub fn timed_wait_spread(&self) -> Option<RecordedTimedWaitSpread> {
+        self.timed_wait_spread
+    }
+
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
     pub fn extract_all(&self) -> BTreeMap<DetTid, ThreadHistory> {
         self.per_thread.clone()
@@ -502,12 +582,14 @@ impl PreemptionRecord {
             guest_ids: self.guest_ids,
             // A record derived from an inexact one is inexact too.
             replay_departed_at: self.replay_departed_at,
+            timed_wait_spread: self.timed_wait_spread,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
             host_inputs: self.host_inputs.clone(),
             // A count of this run's host, not part of the preemptions.
             store_exclusive_failures: HostObservedCount::default(),
+            queued_sleeps_registered_at_first_pass: self.queued_sleeps_registered_at_first_pass,
         }
     }
 
@@ -571,11 +653,13 @@ impl PreemptionRecord {
             chaos_timeslice: None,
             guest_ids: None,
             replay_departed_at: None,
+            timed_wait_spread: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
+            queued_sleeps_registered_at_first_pass: false,
         }
     }
 
@@ -1238,6 +1322,47 @@ mod tests {
         }
     }
 
+    /// How a run registered queued sleeps rides in a preemption record only
+    /// when it registered them at the first pass
+    /// (`--sleep-registration=first-pass`, by default outside race search),
+    /// so a `when-chosen` record is written exactly as before; a record that
+    /// does not say means a sleep was registered only when its thread was
+    /// chosen.
+    #[test]
+    fn the_sleep_registration_rule_round_trips() {
+        let unsaid = PreemptionRecord::from_sched_events(Vec::new());
+        assert!(!unsaid.queued_sleeps_registered_at_first_pass());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        for first_pass in [false, true] {
+            let written = PreemptionWriter::new(None)
+                .with_queued_sleeps_registered_at_first_pass(first_pass)
+                .into_string();
+            assert_eq!(
+                written.contains("queued_sleeps_registered_at_first_pass"),
+                first_pass,
+                "{written}"
+            );
+            let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(back.queued_sleeps_registered_at_first_pass(), first_pass);
+            assert_eq!(
+                back.clone_preemptions_only()
+                    .queued_sleeps_registered_at_first_pass(),
+                first_pass
+            );
+            std::fs::write(&path, &written).unwrap();
+            assert_eq!(
+                read_recorded_queued_sleeps_registered_at_first_pass(&path),
+                Ok(first_pass)
+            );
+        }
+        std::fs::write(&path, serde_json::to_string(&unsaid).unwrap()).unwrap();
+        assert_eq!(
+            read_recorded_queued_sleeps_registered_at_first_pass(&path),
+            Ok(false)
+        );
+    }
+
     /// The signal-state copy setting rides in a preemption record as the
     /// pipe-wake latency does, and a replay under the other setting is
     /// refused; a record that does not say (older, or synthesized) is not.
@@ -1402,6 +1527,72 @@ mod tests {
             hasher.finish()
         };
         assert_eq!(hash(&back), hash(&without));
+    }
+
+    /// The timed-wait spread and its seed round-trip through the writer, the
+    /// record and the settings reader; a record without them is written as
+    /// before; a replay under another spread, or another seed where both
+    /// name one, is refused.
+    #[test]
+    fn the_timed_wait_spread_round_trips_and_is_compared() {
+        let unsaid = PreemptionRecord::from_sched_events(Vec::new());
+        assert_eq!(unsaid.timed_wait_spread(), None);
+        assert!(
+            !serde_json::to_string(&unsaid)
+                .unwrap()
+                .contains("timed_wait_spread")
+        );
+        let setting = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: Some(7),
+        };
+        let written = PreemptionWriter::new(None)
+            .with_timed_wait_spread(Some(setting))
+            .into_string();
+        assert!(
+            written.contains(r#""timed_wait_spread":{"spread":12.5,"seed":7}"#),
+            "{written}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.timed_wait_spread(), Some(setting));
+        assert_eq!(
+            back.clone_preemptions_only().timed_wait_spread(),
+            Some(setting)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, &written).unwrap();
+        assert_eq!(read_recorded_timed_wait_spread(&path), Ok(Some(setting)));
+        let unseeded = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: None,
+        };
+        for (recorded, spread, seed, refused) in [
+            (None, None, Some(1), false),
+            (Some(setting), Some(12.5), Some(7), false),
+            (Some(setting), Some(12.5), None, false),
+            (Some(unseeded), Some(12.5), Some(1), false),
+            (Some(setting), None, Some(7), true),
+            (None, Some(12.5), Some(7), true),
+            (Some(setting), Some(12.0), Some(7), true),
+            (Some(setting), Some(12.5), Some(8), true),
+        ] {
+            let refusal =
+                timed_wait_spread_mismatch("--replay-schedule-from=x", recorded, spread, seed);
+            assert_eq!(
+                refusal.is_some(),
+                refused,
+                "{recorded:?} replayed with {spread:?} and seed {seed:?}: {refusal:?}"
+            );
+        }
+        let refusal = timed_wait_spread_mismatch(
+            "--replay-schedule-from=x",
+            Some(setting),
+            Some(12.5),
+            Some(8),
+        )
+        .unwrap();
+        assert!(refusal.contains("Replay with --sched-seed=7"), "{refusal}");
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1719,6 +1910,51 @@ mod tests {
                     &prefix.host_inputs,
                 ),
                 (true, Some(1234567), true, &record.host_inputs),
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// The rule that registered queued sleeps is a setting of the whole run,
+    /// as the other run settings are: a prefix of the schedule keeps it,
+    /// whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_sleep_registration_rule() {
+        let tid = DetTid::from_raw(3);
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_queued_sleeps_registered_at_first_pass(true);
+        for len in [0, 1, 2, 9] {
+            assert!(
+                record
+                    .schedule_prefix(len)
+                    .queued_sleeps_registered_at_first_pass,
+                "prefix of {len} events"
+            );
+        }
+    }
+
+    /// The timed-wait spread and the seed its draws came from are settings of
+    /// the whole run, as the other run settings are: a prefix of the schedule
+    /// keeps them, whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_timed_wait_spread() {
+        let setting = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: Some(7),
+        };
+        let tid = DetTid::from_raw(3);
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_timed_wait_spread(Some(setting));
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).timed_wait_spread,
+                Some(setting),
                 "prefix of {len} events"
             );
         }
@@ -2103,6 +2339,22 @@ impl PreemptionWriter {
     /// host ID after all states `GuestIds::Host`.
     pub fn set_guest_ids(&mut self, ids: detcore_model::pid::GuestIds) {
         self.inner.guest_ids = (ids != detcore_model::pid::GuestIds::Namespace).then_some(ids);
+    }
+
+    /// Store whether the run registered queued sleeps at the first pass
+    /// (`Scheduler::queued_sleeps_registered_at_first_pass`; `false` leaves
+    /// the record as it was before the field existed).
+    pub fn with_queued_sleeps_registered_at_first_pass(mut self, first_pass: bool) -> Self {
+        self.inner.queued_sleeps_registered_at_first_pass = first_pass;
+        self
+    }
+
+    /// Store the run's `--chaos-timed-wait-spread` and scheduler seed
+    /// (`None` for off, which leaves the record as it was before the field
+    /// existed).
+    pub fn with_timed_wait_spread(mut self, spread: Option<RecordedTimedWaitSpread>) -> Self {
+        self.inner.timed_wait_spread = spread;
+        self
     }
 
     /// Does the record have zero entries?
@@ -2501,6 +2753,59 @@ pub fn cap_preemption_charge_mismatch(
     })
 }
 
+/// Read only the `--chaos-timed-wait-spread` stored in a preemption record
+/// file, as [`read_recorded_epoch`] reads the epoch. `Ok(None)` means the
+/// record was made with the option off, or before the field existed.
+pub fn read_recorded_timed_wait_spread(
+    path: &Path,
+) -> Result<Option<RecordedTimedWaitSpread>, String> {
+    #[derive(Deserialize)]
+    struct SpreadOnly {
+        #[serde(default)]
+        timed_wait_spread: Option<RecordedTimedWaitSpread>,
+    }
+    Ok(boundary_recording::read_settings::<SpreadOnly>(path)?.timed_wait_spread)
+}
+
+/// The refusal of a replay that would not redraw a record's spread-wait
+/// factors, naming the record by `source` (an option and a path), or `None`
+/// when it would: the replay's `--chaos-timed-wait-spread` (`spread`) must be
+/// the recorded one, and where both the record and the replay name a
+/// scheduler seed (`seed`), so must the seed. Absent and off are the same.
+pub fn timed_wait_spread_mismatch(
+    source: &str,
+    recorded: Option<RecordedTimedWaitSpread>,
+    spread: Option<f64>,
+    seed: Option<u64>,
+) -> Option<String> {
+    let show = |spread: Option<f64>| match spread {
+        Some(spread) => format!("--chaos-timed-wait-spread={spread}"),
+        None => "no --chaos-timed-wait-spread".to_owned(),
+    };
+    let redirect = |spread: Option<f64>| match spread {
+        Some(spread) => format!("Replay with --chaos-timed-wait-spread={spread}"),
+        None => "Drop --chaos-timed-wait-spread".to_owned(),
+    };
+    let recorded_spread = recorded.map(|recorded| recorded.spread);
+    if recorded_spread.map(f64::to_bits) != spread.map(f64::to_bits) {
+        return Some(format!(
+            "{source} was recorded with {} and would be replayed with {}. The spread draws \
+             every timed wait's wake time, so the replay cannot reproduce the run. {}.",
+            show(recorded_spread),
+            show(spread),
+            redirect(recorded_spread),
+        ));
+    }
+    match (recorded.and_then(|recorded| recorded.seed), seed) {
+        (Some(recorded), Some(seed)) if recorded != seed => Some(format!(
+            "{source} was recorded with --chaos-timed-wait-spread drawn from scheduler seed \
+             {recorded} and would be replayed with seed {seed}, which draws other timed-wait \
+             wake times. Replay with --sched-seed={recorded}."
+        )),
+        _ => None,
+    }
+}
+
 /// Read only whether the signal-state copy was on in the run that wrote a
 /// preemption record file, as [`read_recorded_epoch`] reads the epoch.
 /// `Ok(None)` for a record written before the field existed.
@@ -2636,6 +2941,88 @@ pub fn draw_chaos_timeslice(
     let drawn = range.log_uniform(prng.random::<f64>()).round() as u64;
     std::num::NonZeroU64::new(drawn.clamp(range.min.get(), range.max.get()))
         .expect("the range starts at one RCB")
+}
+
+/// Read only whether the run that wrote a preemption record file registered
+/// queued sleeps at the first pass, as [`read_recorded_epoch`] reads the
+/// epoch. `Ok(false)` for a record that does not say: one written before the
+/// field existed, or by a run under the `when-chosen` rule (by default race
+/// search), both of which registered a sleep only when its thread was chosen.
+pub fn read_recorded_queued_sleeps_registered_at_first_pass(path: &Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct RegistrationOnly {
+        #[serde(default)]
+        queued_sleeps_registered_at_first_pass: bool,
+    }
+    Ok(boundary_recording::read_settings::<RegistrationOnly>(path)?
+        .queued_sleeps_registered_at_first_pass)
+}
+
+/// Whether `config` asks for queued sleeps to be registered at the first
+/// pass, before the backend's limit: a replay that leaves
+/// `--sleep-registration` unset takes its record's rule (a record that cannot
+/// be read counts as `when-chosen`; the replay's own loader fails on it), and
+/// any other run `Config::queued_sleeps_registered_at_first_pass`.
+/// `Scheduler::new` registers at the first pass only when this holds and the
+/// scheduler reads a sleeper's signal state
+/// (`Config::reads_sleeper_signal_state`), and hermit refuses a launch where
+/// this holds and that does not, before the guest starts.
+pub fn requests_first_pass_sleep_registration(config: &crate::config::Config) -> bool {
+    let replayed = config
+        .replay_schedule_from
+        .as_ref()
+        .or(config.replay_preemptions_from.as_ref());
+    match replayed {
+        Some(path) if config.sleep_registration.is_none() && !config.recordreplay_modes => {
+            read_recorded_queued_sleeps_registered_at_first_pass(path).unwrap_or(false)
+        }
+        _ => config.queued_sleeps_registered_at_first_pass(),
+    }
+}
+
+/// The refusal of a replay whose explicit `--sleep-registration` differs from
+/// the rule a record states (`recorded_first_pass`, as
+/// [`read_recorded_queued_sleeps_registered_at_first_pass`] reads it), naming
+/// the record by `source` (an option and a path), or `None` when they agree or
+/// the replay leaves the option unset, and so takes the record's rule. For a
+/// search (`hermit analyze`, `hermit bisect`), which runs every trial under
+/// one rule, the remedy names the recordings instead.
+pub fn sleep_registration_mismatch(
+    source: &str,
+    recorded_first_pass: bool,
+    replay: Option<detcore_model::config::SleepRegistration>,
+    search: bool,
+) -> Option<String> {
+    let replay = replay?;
+    let recorded = detcore_model::config::SleepRegistration::from_registered_at_first_pass(
+        recorded_first_pass,
+    );
+    (recorded != replay).then(|| {
+        let remedy = if search {
+            format!(
+                "A search replays every trial under one rule, its target's unless its run \
+                 arguments give one. Re-record this one under that rule \
+                 (`hermit run --sleep-registration={} --record-preemptions-to=...`), or, if it \
+                 is the target, pass --sleep-registration={} in the run arguments.",
+                replay.as_str(),
+                recorded.as_str()
+            )
+        } else {
+            format!(
+                "Replay with --sleep-registration={}, or leave the option out to take the \
+                 record's.",
+                recorded.as_str()
+            )
+        };
+        format!(
+            "{source} was recorded with --sleep-registration={} and would be replayed with \
+             --sleep-registration={}. The rule decides when a sleeping thread's wake enters the \
+             timed events, and so which timed event fires in each pass, so the replay cannot \
+             reproduce the run. {remedy}",
+            recorded.as_str(),
+            replay.as_str(),
+        )
+    })
 }
 
 /// The refusal of a replay whose signal-state copy setting differs from the
