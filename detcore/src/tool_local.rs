@@ -9791,7 +9791,8 @@ mod timeslice_tests {
 
     /// The shape of a stalled Android emulator replay (`--chaos
     /// --preemption-timeout=1000`): a slice ended at the branch count of the
-    /// next recorded end, whose time was still ahead, so that end was
+    /// next recorded end, whose time was still ahead by at most one RCB (the
+    /// slack `timeslice_expired` allows at a recorded count), so that end was
     /// followed and its slice was over at once (adjacent zero-RCB slices);
     /// but the thread's time had not moved, so the second change point would
     /// have been filed at the instant of the first. It is caught before it
@@ -9808,8 +9809,8 @@ mod timeslice_tests {
         let start = state.thread_logical_time.as_nanos();
         let history = ThreadHistory::new()
             .with_prio_changes(vec![
-                (start + Duration::from_nanos(70), DEFAULT_PRIORITY + 1),
-                (start + Duration::from_nanos(80), DEFAULT_PRIORITY + 2),
+                (start + Duration::from_nanos(40), DEFAULT_PRIORITY + 1),
+                (start + Duration::from_nanos(50), DEFAULT_PRIORITY + 2),
                 (start + Duration::from_nanos(500), DEFAULT_PRIORITY + 3),
             ])
             .with_preemption_rcbs(vec![4, 4, 40]);
