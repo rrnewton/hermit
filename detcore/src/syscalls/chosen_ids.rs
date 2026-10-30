@@ -511,7 +511,7 @@ impl AddedIdEvidence {
         let mut observed = [0; CLONE_ARGS_SIZE_VER2];
         let expected = ChosenIdCall::with_set_tid(self.args, array, self.set_tid.len());
         memory
-            .read_exact_with_user_access(address.cast::<u8>().into(), &mut observed)
+            .read_exact_with_user_access(address.cast::<u8>(), &mut observed)
             .is_ok()
             && observed == expected
             && read_guest_set_tid(memory, tid, &observed).as_ref() == Ok(&self.set_tid)
