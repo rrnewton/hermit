@@ -4638,7 +4638,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_schedule_replay_names_a_stdio_kind_changed_since_the_recording: 746.
     // Rebased onto main fcd62385f: 794 + 1 = 795.
     // Rebased onto main 2baafbdf5: 796 + 1 = 797.
-    ("test.cli", 797),
+    // And a_verify_run_records_the_stdio_kinds_its_guest_was_given: 747.
+    // Rebased onto main fcd62385f: 795 + 1 = 796.
+    // Rebased onto main 2baafbdf5: 797 + 1 = 798.
+    ("test.cli", 798),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5295,11 +5298,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
     // And the same stdio-kind replay test: 665.
+    // And the same captured-run stdio-kind test: 666.
+    // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
     // Kept equal to the second test.regular_crates_on_host entry below: 1919.
     // Rebased onto main fcd62385f: 713 + 1 = 714.
     // Rebased onto main 2baafbdf5: 715 + 1 = 716.
-    ("test.cli_on_host", 716),
+    // Rebased onto main fcd62385f: 714 + 1 = 715.
+    // Rebased onto main 2baafbdf5: 716 + 1 = 717.
+    ("test.cli_on_host", 717),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
