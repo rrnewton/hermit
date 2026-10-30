@@ -1898,11 +1898,21 @@ test:
           native: The guard asserts Hermit's virtual clock; the host clock is not the contract
       verify:
         ci: true
+        # KVM qualified 2026-10-29: the KVM launch now keeps the program's file as
+        # its executable (Reverie 9c29d1d3), so the guest's execv of /proc/self/exe
+        # works, as under ptrace; before, it failed with ENOENT. 21 of 21 canonical
+        # strict verify pairs on the host (bitwise parity, 649 INFO records each
+        # side), with stdout, every clock sample included, identical to ptrace's.
+        # In the pinned root it passes on both backends, but its clock samples run
+        # 10 to 30 us later on KVM: with glibc 2.42 a KVM guest makes one more call
+        # in each image that starts threads, because KVM answers
+        # madvise(MADV_GUARD_INSTALL) with ENOSYS
+        # (https://github.com/rrnewton/reverie/issues/1216).
         backends_enabled:
           - ptrace
           - dbt
+          - kvm
         backends_disabled:
-          kvm: Enable once the KVM post-exec clock path is qualified against the ptrace baseline
           sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
           liteinst: The preload runtime does not survive the guest's own re-exec
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

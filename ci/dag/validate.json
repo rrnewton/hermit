@@ -26932,6 +26932,13 @@
           "category": "system-utils",
           "test": "system-utils/clock-exec-continuity",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/clock-exec-continuity",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -72646,6 +72653,13 @@
           "test": "system-utils/clock-exec-continuity",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/clock-exec-continuity",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

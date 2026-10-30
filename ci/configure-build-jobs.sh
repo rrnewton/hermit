@@ -3161,8 +3161,16 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0c35d21fca4485fac3194071b13b6e34f6573f1b ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0c35d21fca4485fac3194071b13b6e34f6573f1b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 9c29d1d30dbdc1d115228f7dac56fa4936e9525e (2026-10-29): from 0c35d21fca4485fac3194071b13b6e34f6573f1b.
+# Interval: one commit, a KVM launcher's install of a file with its exec
+# filename (9c29d1d3), in reverie-kvm and reverie-linuxemu only. The
+# reverie-dbt tree is unchanged; reverie-dbt/vendor/dynamorio,
+# reverie-dbt/build.rs, reverie-dbt/native and third-party/ are
+# byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, c1f267db, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9c29d1d30dbdc1d115228f7dac56fa4936e9525e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9c29d1d30dbdc1d115228f7dac56fa4936e9525e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
