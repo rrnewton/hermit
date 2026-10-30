@@ -1895,7 +1895,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4607 adds two hermit-run units: 1273 + 2 = 1275, re-measured at this integration head.
     // The loader-cache provenance fix adds two hermit-run units: 1275 + 2 = 1277, re-measured at this integration head.
     // PR 4738 adds two hermit-run units: 1277 + 2 = 1279, re-measured at this integration head.
-    ("test.hermit_unit", 1279),
+    // PR 4896 adds two hermit-run units: 1279 + 2 = 1281, re-measured at this integration head.
+    ("test.hermit_unit", 1281),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5895,7 +5896,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4607 units: 1267 + 2 = 1269.
     // The same two loader-cache provenance units: 1269 + 2 = 1271.
     // The same two PR 4738 units: 1271 + 2 = 1273.
-    ("test.hermit_unit_on_host", 1273),
+    // The same two PR 4896 units: 1273 + 2 = 1275.
+    ("test.hermit_unit_on_host", 1275),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
