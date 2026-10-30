@@ -514,6 +514,8 @@ impl Tool for Replayer {
             None => EventStreamId::root(),
             Some((_, state)) => state.child_stream_ids.next(&state.stream_id),
         };
+        // Its mappings keep shared files' backings alive.
+        mmap::track_task(child.as_raw());
         // We have to unwrap because there is no way to handle errors here.
         ReplayerThreadState {
             events: EventReader::open(&self.data, &stream_id).unwrap_or_else(|err| {

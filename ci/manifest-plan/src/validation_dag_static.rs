@@ -1219,7 +1219,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
-    ("test.regular_crates", 1929),
+    // And three hermit-replay units of the shared-file backing (replayer::mmap::tests): 1929 + 3 = 1932.
+    // And four more of them (the listed view, an incomplete listing, a named backing, the
+    // seccomp check) and recorder::mmap::tests::a_descriptors_access_mode_is_read_from_its_fdinfo: 1937.
+    ("test.regular_crates", 1937),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3724,7 +3727,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/issues/4262: record_exec_discards_posix_timer_copies_as_on_linux and
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
     // And record_chaos_schedule_replays_under_its_seed: 221.
-    ("test.record_replay", 226),
+    // And record_replay_shares_memory_between_mappings_of_one_memfd: 227.
+    // And the ten shared-mapping shapes of tests/c/record_replay_shared_mappings.c
+    // (overlap both ways, adjacent span, head and tail unmap, a moved source,
+    // pwrite before a remap and before a read, a forked child, a full table): 237.
+    // And four more (a thread's own descriptor table, a new PID namespace, a read-only
+    // mprotect, a guest asking for a seccomp filter): 241.
+    ("test.record_replay", 241),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -6163,7 +6172,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738: the same nine added cases: 1927 - 14 = 1913.
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
-    ("test.regular_crates_on_host", 1915),
+    // The three shared-file backing units: 1932 - 14 = 1918.
+    // And the same five more units: 1923.
+    ("test.regular_crates_on_host", 1923),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
