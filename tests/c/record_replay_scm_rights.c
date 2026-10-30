@@ -25,8 +25,9 @@
  *         thread sends each a pipe read end, in the reverse of their thread
  *         order, opening an eventfd after each send. The first receiver then
  *         waits in an infinite poll on another received pipe end and on its
- *         socket until the main thread writes to that pipe after a sleep, and
- *         last receives the main thread's goodbye in a blocking recv.
+ *         socket until the main thread writes to that pipe after a sleep. It
+ *         acknowledges the completed poll and pipe read on that same socket;
+ *         only then does the main thread send its goodbye for a blocking recv.
  *
  *   eventfd: sends blocking eventfds over a socketpair. Within the process,
  *         a count written through the received descriptor is read through the
@@ -237,8 +238,9 @@ struct stream_receiver {
 /* Connects, waits in a blocking recvmsg for a pipe read end, and reads the
  * one byte the server left in that pipe. The first receiver then waits in an
  * infinite poll on a second received pipe end and on its socket, until the
- * server writes to that pipe after a sleep, and last receives the server's
- * goodbye in a blocking recv. */
+ * server writes to that pipe after a sleep. It acknowledges the completed
+ * poll and pipe read on that same socket before receiving the server's goodbye
+ * in a blocking recv. */
 static void* receive_stream(void* arg) {
   struct stream_receiver* receiver = arg;
   int client = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -264,6 +266,9 @@ static void* receive_stream(void* arg) {
         (fds[0].revents & POLLIN) != 0,
         (fds[1].revents & POLLIN) != 0,
         buf);
+    /* Sending in the reverse direction does not make this socket readable.
+     * The server waits for this byte before it can make the socket readable. */
+    check(send(client, "P", 1, 0) == 1, "send poll acknowledgement");
     memset(buf, 0, sizeof(buf));
     check(recv(client, buf, 3, MSG_WAITALL) == 3, "blocking recv");
     printf("stream socket: recv=%s\n", buf);
@@ -311,6 +316,13 @@ static void stream_mode(void) {
   sleep_ms(10);
   check(write(late[1], "late", 4) == 4, "late write");
   sleep_ms(10);
+  char acknowledgement = 0;
+  ssize_t acknowledgement_size = recv(conns[0], &acknowledgement, 1, MSG_WAITALL);
+  check(acknowledgement_size == 1, "receive poll acknowledgement");
+  check(acknowledgement == 'P', "poll acknowledgement content");
+  if (acknowledgement_size != 1 || acknowledgement != 'P') {
+    exit(1);
+  }
   check(send(conns[0], "bye", 3, 0) == 3, "send goodbye");
 
   char got[RECEIVERS + 1] = {0};

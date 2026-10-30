@@ -5203,8 +5203,12 @@ fn record_replay_registers_descriptors_received_over_scm_rights() {
 /// namespace diverged". A socket whose peer is a guest is now polled in the
 /// caller's turn, as a socketpair end is. The first receiver's infinite poll
 /// on a received pipe end and its socket is a `poll` call, which still runs
-/// as before (polling such a `poll` in the turn is left out). Each replay of
-/// each of three recordings must print what a native run prints.
+/// as before (polling such a `poll` in the turn is left out). After that poll
+/// and its pipe read, the receiver acknowledges completion on the same socket.
+/// The sender waits for that byte before sending its goodbye, so the fixed
+/// readiness output does not rely on the second 10 ms sleep ordering the two.
+/// Each record and replay of each of three rounds must print the expected
+/// native output.
 #[test]
 fn record_replay_receives_descriptors_over_a_guests_own_unix_listener() {
     let _guard = hermit_record_lock();
