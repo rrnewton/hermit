@@ -1,0 +1,482 @@
+{
+ "rows": {
+  "1172": {
+   "sha": "0dd3006af7b9",
+   "ahead": "12",
+   "behind": "107",
+   "cherry_plus": 12,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-ptrace/src/cp/consts.rs",
+    "reverie-ptrace/src/plain_guest_regression_tests.rs",
+    "reverie-ptrace/src/regs.rs",
+    "reverie-ptrace/src/sigtrap_state.rs",
+    "reverie-ptrace/src/task.rs",
+    "reverie-ptrace/src/timer.rs",
+    "reverie-ptrace/tests/answered_syscall_skipped.rs",
+    "reverie-ptrace/tests/fixtures/plain_guest_regression.c",
+    "reverie-ptrace/tests/injected_syscall_group_stop.rs",
+    "reverie-ptrace/tests/sigtrap_state_timer_steps.rs",
+    "reverie-ptrace/tests/sigtrap_state_unsealed.rs",
+    "reverie-ptrace/tests/sigtrap_steps/mod.rs"
+   ],
+   "stat": "12 files changed, 3797 insertions(+), 215 deletions(-)",
+   "conflict": true,
+   "conflict_files": [
+    "reverie-ptrace/src/task.rs",
+    "Auto-merging reverie-ptrace/src/task.rs",
+    "CONFLICT (content): Merge conflict in reverie-ptrace/src/task.rs",
+    "Auto-merging reverie-ptrace/src/timer.rs"
+   ],
+   "pids": [
+    "19d5dd1974f1389f26dea4d68f6bfd6ea60b968e",
+    "2167b4c8c4bb394decefc4438c0f806c3bb84273",
+    "25626727ac7c9c0a65ef877f44bbd35fd43ee826",
+    "25f355d11fceb7f355db3feb48b66123654a46c5",
+    "48a401fc96b00f6614066ec6f41f169dc7fd27ea",
+    "9aed857cde12003d260098c1f347dccc861906ef",
+    "cba15fb38e6d34b9baff6f7a98d8d2b689d894dc",
+    "d0c9b9b6155a45337e7db2c01052e96ba4f14810",
+    "d271b3a8077b265fbb5a08573cb89c6ce0956afa",
+    "d3d58c5cd4a434bd4bbdb0a0cb2677c8a937d0f7",
+    "dc0b36f544df17439beaa7967be4451450ec3e28",
+    "f38765dfe877d488ed281bfbf82755be6abf467a"
+   ]
+  },
+  "1168": {
+   "sha": "aa943c4d5255",
+   "ahead": "11",
+   "behind": "107",
+   "cherry_plus": 11,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-ptrace/src/cp/consts.rs",
+    "reverie-ptrace/src/plain_guest_regression_tests.rs",
+    "reverie-ptrace/src/regs.rs",
+    "reverie-ptrace/src/sigtrap_state.rs",
+    "reverie-ptrace/src/task.rs",
+    "reverie-ptrace/tests/answered_syscall_skipped.rs",
+    "reverie-ptrace/tests/fixtures/plain_guest_regression.c",
+    "reverie-ptrace/tests/sigtrap_state_timer_steps.rs",
+    "reverie-ptrace/tests/sigtrap_state_unsealed.rs",
+    "reverie-ptrace/tests/sigtrap_steps/mod.rs"
+   ],
+   "stat": "10 files changed, 1782 insertions(+), 91 deletions(-)",
+   "conflict": true,
+   "conflict_files": [
+    "reverie-ptrace/src/task.rs",
+    "Auto-merging reverie-ptrace/src/task.rs",
+    "CONFLICT (content): Merge conflict in reverie-ptrace/src/task.rs"
+   ],
+   "pids": [
+    "2167b4c8c4bb394decefc4438c0f806c3bb84273",
+    "25626727ac7c9c0a65ef877f44bbd35fd43ee826",
+    "25f355d11fceb7f355db3feb48b66123654a46c5",
+    "9aed857cde12003d260098c1f347dccc861906ef",
+    "ac96d75ac1054ca2d04a7d5b95e75cd71179bcd9",
+    "cba15fb38e6d34b9baff6f7a98d8d2b689d894dc",
+    "d0c9b9b6155a45337e7db2c01052e96ba4f14810",
+    "d271b3a8077b265fbb5a08573cb89c6ce0956afa",
+    "d3d58c5cd4a434bd4bbdb0a0cb2677c8a937d0f7",
+    "dc0b36f544df17439beaa7967be4451450ec3e28",
+    "f38765dfe877d488ed281bfbf82755be6abf467a"
+   ]
+  },
+  "1167": {
+   "sha": "53a37a3bd709",
+   "ahead": "11",
+   "behind": "107",
+   "cherry_plus": 11,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-ptrace/src/cp/consts.rs",
+    "reverie-ptrace/src/plain_guest_regression_tests.rs",
+    "reverie-ptrace/src/regs.rs",
+    "reverie-ptrace/src/sigtrap_state.rs",
+    "reverie-ptrace/src/task.rs",
+    "reverie-ptrace/src/timer.rs",
+    "reverie-ptrace/tests/answered_syscall_skipped.rs",
+    "reverie-ptrace/tests/fixtures/plain_guest_regression.c",
+    "reverie-ptrace/tests/sigtrap_state_timer_steps.rs",
+    "reverie-ptrace/tests/sigtrap_state_unsealed.rs",
+    "reverie-ptrace/tests/sigtrap_steps/mod.rs"
+   ],
+   "stat": "11 files changed, 2159 insertions(+), 103 deletions(-)",
+   "conflict": true,
+   "conflict_files": [
+    "reverie-ptrace/src/task.rs",
+    "Auto-merging reverie-ptrace/src/task.rs",
+    "CONFLICT (content): Merge conflict in reverie-ptrace/src/task.rs",
+    "Auto-merging reverie-ptrace/src/timer.rs"
+   ],
+   "pids": [
+    "2167b4c8c4bb394decefc4438c0f806c3bb84273",
+    "25626727ac7c9c0a65ef877f44bbd35fd43ee826",
+    "25f355d11fceb7f355db3feb48b66123654a46c5",
+    "48a401fc96b00f6614066ec6f41f169dc7fd27ea",
+    "9aed857cde12003d260098c1f347dccc861906ef",
+    "cba15fb38e6d34b9baff6f7a98d8d2b689d894dc",
+    "d0c9b9b6155a45337e7db2c01052e96ba4f14810",
+    "d271b3a8077b265fbb5a08573cb89c6ce0956afa",
+    "d3d58c5cd4a434bd4bbdb0a0cb2677c8a937d0f7",
+    "dc0b36f544df17439beaa7967be4451450ec3e28",
+    "f38765dfe877d488ed281bfbf82755be6abf467a"
+   ]
+  },
+  "1158": {
+   "sha": "47c95ff5b98a",
+   "ahead": "10",
+   "behind": "107",
+   "cherry_plus": 10,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-ptrace/src/cp/consts.rs",
+    "reverie-ptrace/src/plain_guest_regression_tests.rs",
+    "reverie-ptrace/src/regs.rs",
+    "reverie-ptrace/src/sigtrap_state.rs",
+    "reverie-ptrace/src/task.rs",
+    "reverie-ptrace/tests/answered_syscall_skipped.rs",
+    "reverie-ptrace/tests/fixtures/plain_guest_regression.c",
+    "reverie-ptrace/tests/sigtrap_state_timer_steps.rs",
+    "reverie-ptrace/tests/sigtrap_state_unsealed.rs",
+    "reverie-ptrace/tests/sigtrap_steps/mod.rs"
+   ],
+   "stat": "10 files changed, 1626 insertions(+), 85 deletions(-)",
+   "conflict": false,
+   "conflict_files": [],
+   "pids": [
+    "2167b4c8c4bb394decefc4438c0f806c3bb84273",
+    "25626727ac7c9c0a65ef877f44bbd35fd43ee826",
+    "25f355d11fceb7f355db3feb48b66123654a46c5",
+    "9aed857cde12003d260098c1f347dccc861906ef",
+    "cba15fb38e6d34b9baff6f7a98d8d2b689d894dc",
+    "d0c9b9b6155a45337e7db2c01052e96ba4f14810",
+    "d271b3a8077b265fbb5a08573cb89c6ce0956afa",
+    "d3d58c5cd4a434bd4bbdb0a0cb2677c8a937d0f7",
+    "dc0b36f544df17439beaa7967be4451450ec3e28",
+    "f38765dfe877d488ed281bfbf82755be6abf467a"
+   ]
+  },
+  "1157": {
+   "sha": "c4fc7202f462",
+   "ahead": "8",
+   "behind": "72",
+   "cherry_plus": 8,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-liteinst-artifact/src/lib.rs",
+    "reverie-ptrace/src/branch_step.rs",
+    "reverie-ptrace/src/lib.rs",
+    "reverie-ptrace/src/task.rs",
+    "reverie-ptrace/src/testing.rs",
+    "reverie-ptrace/src/timer.rs",
+    "reverie-ptrace/tests/branch_step.rs",
+    "reverie-ptrace/tests/branch_step_fallback.rs",
+    "reverie-ptrace/tests/exclusive_step.rs",
+    "reverie/src/perf.rs",
+    "safeptrace/src/lib.rs",
+    "safeptrace/src/regs.rs"
+   ],
+   "stat": "12 files changed, 2300 insertions(+), 28 deletions(-)",
+   "conflict": false,
+   "conflict_files": [],
+   "pids": [
+    "08ec632fbfd0cd51514b10d212c913697cb1325a",
+    "1a0d6847fe46218e42e8425bfb00612f2dd74a51",
+    "1e37e86fbebcc9d52b58dcf4162db1c2262dfd0b",
+    "28aa504aaf0d21808223537df97fe54c31b31036",
+    "4fe48cdf52ee55a8674b6185adb98405dbf576fb",
+    "9be27c02584abf19ea77b7b26057a732c8557dd1",
+    "a21ff4aabe7e69921205b2dd8eb0d20402664093",
+    "aa748fa84fef533ed4ce1236e18f96b271041ca0"
+   ]
+  },
+  "1156": {
+   "sha": "001571ae56e7",
+   "ahead": "7",
+   "behind": "107",
+   "cherry_plus": 7,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-ptrace/src/cp/consts.rs",
+    "reverie-ptrace/src/plain_guest_regression_tests.rs",
+    "reverie-ptrace/src/regs.rs",
+    "reverie-ptrace/src/sigtrap_state.rs",
+    "reverie-ptrace/src/task.rs",
+    "reverie-ptrace/tests/answered_syscall_skipped.rs",
+    "reverie-ptrace/tests/fixtures/plain_guest_regression.c",
+    "reverie-ptrace/tests/sigtrap_state_timer_steps.rs",
+    "reverie-ptrace/tests/sigtrap_state_unsealed.rs",
+    "reverie-ptrace/tests/sigtrap_steps/mod.rs"
+   ],
+   "stat": "10 files changed, 1335 insertions(+), 78 deletions(-)",
+   "conflict": false,
+   "conflict_files": [],
+   "pids": [
+    "25626727ac7c9c0a65ef877f44bbd35fd43ee826",
+    "25f355d11fceb7f355db3feb48b66123654a46c5",
+    "cba15fb38e6d34b9baff6f7a98d8d2b689d894dc",
+    "d271b3a8077b265fbb5a08573cb89c6ce0956afa",
+    "d3d58c5cd4a434bd4bbdb0a0cb2677c8a937d0f7",
+    "dc0b36f544df17439beaa7967be4451450ec3e28",
+    "f38765dfe877d488ed281bfbf82755be6abf467a"
+   ]
+  },
+  "1153": {
+   "sha": "e1b54ae6eb90",
+   "ahead": "2",
+   "behind": "8",
+   "cherry_plus": 2,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-kvm/src/preemption_timer.rs",
+    "reverie-liteinst-artifact/src/lib.rs",
+    "reverie-ptrace/src/timer.rs",
+    "reverie/src/pmu_config.rs"
+   ],
+   "stat": "4 files changed, 244 insertions(+), 67 deletions(-)",
+   "conflict": false,
+   "conflict_files": [],
+   "pids": [
+    "867b20654a47090df74de81dab01a916e1bc6140",
+    "ccd76c5a5a7265e0018cf89208f247c463b8d3ce"
+   ]
+  },
+  "1150": {
+   "sha": "8d4b7d7055fb",
+   "ahead": "5",
+   "behind": "107",
+   "cherry_plus": 5,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-ptrace/src/cp/consts.rs",
+    "reverie-ptrace/src/plain_guest_regression_tests.rs",
+    "reverie-ptrace/src/regs.rs",
+    "reverie-ptrace/src/sigtrap_state.rs",
+    "reverie-ptrace/src/task.rs",
+    "reverie-ptrace/tests/answered_syscall_skipped.rs",
+    "reverie-ptrace/tests/fixtures/plain_guest_regression.c",
+    "reverie-ptrace/tests/sigtrap_state_timer_steps.rs",
+    "reverie-ptrace/tests/sigtrap_state_unsealed.rs",
+    "reverie-ptrace/tests/sigtrap_steps/mod.rs"
+   ],
+   "stat": "10 files changed, 1054 insertions(+), 67 deletions(-)",
+   "conflict": false,
+   "conflict_files": [],
+   "pids": [
+    "25626727ac7c9c0a65ef877f44bbd35fd43ee826",
+    "cba15fb38e6d34b9baff6f7a98d8d2b689d894dc",
+    "d271b3a8077b265fbb5a08573cb89c6ce0956afa",
+    "dc0b36f544df17439beaa7967be4451450ec3e28",
+    "f38765dfe877d488ed281bfbf82755be6abf467a"
+   ]
+  },
+  "1149": {
+   "sha": "bc2cebde5c30",
+   "ahead": "4",
+   "behind": "107",
+   "cherry_plus": 4,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-ptrace/src/cp/consts.rs",
+    "reverie-ptrace/src/plain_guest_regression_tests.rs",
+    "reverie-ptrace/src/regs.rs",
+    "reverie-ptrace/src/sigtrap_state.rs",
+    "reverie-ptrace/src/task.rs",
+    "reverie-ptrace/tests/answered_syscall_skipped.rs",
+    "reverie-ptrace/tests/fixtures/plain_guest_regression.c",
+    "reverie-ptrace/tests/sigtrap_state_timer_steps.rs"
+   ],
+   "stat": "8 files changed, 768 insertions(+), 51 deletions(-)",
+   "conflict": false,
+   "conflict_files": [],
+   "pids": [
+    "25626727ac7c9c0a65ef877f44bbd35fd43ee826",
+    "cba15fb38e6d34b9baff6f7a98d8d2b689d894dc",
+    "d271b3a8077b265fbb5a08573cb89c6ce0956afa",
+    "dc0b36f544df17439beaa7967be4451450ec3e28"
+   ]
+  },
+  "1145": {
+   "sha": "ff765efa7eaf",
+   "ahead": "6",
+   "behind": "72",
+   "cherry_plus": 6,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-liteinst-artifact/src/lib.rs",
+    "reverie-ptrace/src/branch_step.rs",
+    "reverie-ptrace/src/lib.rs",
+    "reverie-ptrace/src/task.rs",
+    "reverie-ptrace/src/testing.rs",
+    "reverie-ptrace/src/timer.rs",
+    "reverie-ptrace/tests/branch_step.rs",
+    "reverie-ptrace/tests/branch_step_fallback.rs",
+    "reverie/src/perf.rs",
+    "safeptrace/src/lib.rs",
+    "safeptrace/src/regs.rs"
+   ],
+   "stat": "11 files changed, 1627 insertions(+), 28 deletions(-)",
+   "conflict": false,
+   "conflict_files": [],
+   "pids": [
+    "08ec632fbfd0cd51514b10d212c913697cb1325a",
+    "1a0d6847fe46218e42e8425bfb00612f2dd74a51",
+    "1e37e86fbebcc9d52b58dcf4162db1c2262dfd0b",
+    "28aa504aaf0d21808223537df97fe54c31b31036",
+    "9be27c02584abf19ea77b7b26057a732c8557dd1",
+    "a21ff4aabe7e69921205b2dd8eb0d20402664093"
+   ]
+  },
+  "1141": {
+   "sha": "418becc511e7",
+   "ahead": "3",
+   "behind": "72",
+   "cherry_plus": 3,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-liteinst-artifact/src/lib.rs",
+    "reverie/src/pmu_config.rs"
+   ],
+   "stat": "2 files changed, 57 insertions(+), 6 deletions(-)",
+   "conflict": false,
+   "conflict_files": [],
+   "pids": [
+    "b8cd1e53df16537c59ed24cccc16d5a7151b6c2f",
+    "c359dd2d494f2c3edd41c06d71b73aa0683917a0",
+    "dc142dee2d169f5934cfa025a92f41b06f221b79"
+   ]
+  },
+  "1137": {
+   "sha": "52449e346e3b",
+   "ahead": "3",
+   "behind": "8",
+   "cherry_plus": 3,
+   "cherry_minus": 0,
+   "files": [
+    "reverie-liteinst-artifact/src/lib.rs",
+    "reverie/src/pmu_config.rs"
+   ],
+   "stat": "2 files changed, 126 insertions(+), 10 deletions(-)",
+   "conflict": false,
+   "conflict_files": [],
+   "pids": [
+    "262252659f33631d28d888cb97c1061ac168e570",
+    "316bc7418ff2933792e17270df03377c0a8efa78",
+    "e39a33605b07d0fa555774e18599a61280bc5955"
+   ]
+  }
+ },
+ "overlaps": [
+  [
+   1172,
+   1168,
+   10
+  ],
+  [
+   1172,
+   1167,
+   11
+  ],
+  [
+   1172,
+   1158,
+   10
+  ],
+  [
+   1172,
+   1156,
+   7
+  ],
+  [
+   1172,
+   1150,
+   5
+  ],
+  [
+   1172,
+   1149,
+   4
+  ],
+  [
+   1168,
+   1167,
+   10
+  ],
+  [
+   1168,
+   1158,
+   10
+  ],
+  [
+   1168,
+   1156,
+   7
+  ],
+  [
+   1168,
+   1150,
+   5
+  ],
+  [
+   1168,
+   1149,
+   4
+  ],
+  [
+   1167,
+   1158,
+   10
+  ],
+  [
+   1167,
+   1156,
+   7
+  ],
+  [
+   1167,
+   1150,
+   5
+  ],
+  [
+   1167,
+   1149,
+   4
+  ],
+  [
+   1158,
+   1156,
+   7
+  ],
+  [
+   1158,
+   1150,
+   5
+  ],
+  [
+   1158,
+   1149,
+   4
+  ],
+  [
+   1157,
+   1145,
+   6
+  ],
+  [
+   1156,
+   1150,
+   5
+  ],
+  [
+   1156,
+   1149,
+   4
+  ],
+  [
+   1150,
+   1149,
+   4
+  ]
+ ]
+}

@@ -13771,6 +13771,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(result)
     }
 
+<<<<<<< HEAD
     /// Run `call`, a binder `ioctl`, the way Linux runs it, without letting
     /// a half that waits for another process hold the caller's turn. Returns
     /// its result and whether any half ran on the background path.
@@ -13862,6 +13863,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// statfs: report deterministic filesystem statistics.
     ///
+=======
+>>>>>>> c740cadb59 (Put handle_statfs's first doc line back above handle_statfs)
     /// Run `call`, a binder `ioctl`, the way Linux runs it, without letting
     /// a half that waits for another process hold the caller's turn. Returns
     /// its result and whether any half ran on the background path.
@@ -13951,6 +13954,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(matches!(ready, Ok(count) if count > 0))
     }
 
+    /// statfs: report deterministic filesystem statistics.
+    ///
     /// The kernel's `statfs` reflects live host state: the free-block counts
     /// (`f_bfree`, `f_bavail`), the free-inode count (`f_ffree`) and the device
     /// id (`f_fsid`) all vary between runs as the underlying host filesystem
