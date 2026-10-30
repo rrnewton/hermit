@@ -1627,6 +1627,10 @@ pub struct RunOpts {
     /// task meanwhile; a call Hermit cannot issue with a chosen ID, such as one under a seccomp
     /// filter of the guest's own or in a PID namespace of the guest's) ends the run. Both refusals
     /// exit with status 122 and name the cause.
+    /// Chosen IDs also require a host probe to show that legacy clone validates its original
+    /// exit signal before Hermit rewrites the call. If that result is absent or inconclusive,
+    /// required IDs are refused; automatic selection warns and uses host IDs. Use a host that
+    /// passes the probe, or omit `--no-namespace` and `--pid-base` for a new run in a PID namespace.
     ///
     /// Without this option, the run takes the first window no host task holds and no other run
     /// has reserved, starting just behind the kernel's PID allocation cursor (so that host

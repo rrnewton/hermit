@@ -30,6 +30,10 @@
 //! reaches it last) and going down, then from the top; it reports the base it
 //! took. With none, or without the capability, it warns and the guest gets
 //! host IDs.
+//!
+//! Chosen IDs also require the host to validate a legacy clone's original
+//! exit signal before the conversion to clone3 can replace it. Admission
+//! probes that behavior; a kernel version string does not establish it.
 
 use std::collections::BTreeSet;
 
@@ -93,6 +97,9 @@ trait HostIds {
     fn taken(&self) -> BTreeSet<i32>;
     /// What holds `id` on the host.
     fn holder(&self, id: i32) -> String;
+    /// Whether legacy clone validates its original exit signal before the
+    /// chosen-ID conversion may replace that signal.
+    fn legacy_clone_signal_validation(&self) -> Result<(), String>;
     /// Whether this process can create a child with process ID `id`.
     fn can_choose(&self, id: i32) -> Result<(), String>;
     /// Whether this process may choose IDs at all: [`Self::can_choose`],
@@ -139,6 +146,10 @@ impl HostIds for Host {
 
     fn holder(&self, id: i32) -> String {
         detcore::chosen_id_holder(id)
+    }
+
+    fn legacy_clone_signal_validation(&self) -> Result<(), String> {
+        check_legacy_clone_signal_validation(probe_legacy_clone_errno)
     }
 
     fn can_choose(&self, id: i32) -> Result<(), String> {
@@ -234,6 +245,30 @@ fn resolve_with(
             )));
         }
         _ => {}
+    }
+    // The conversion in Detcore preserves early signal validation only on
+    // hosts that demonstrate it. Refuse/fall back before drawing the cursor,
+    // reserving windows or probing a chosen PID; Namespace returned above.
+    if let Err(cause) = host.legacy_clone_signal_validation() {
+        if required.is_none() && !strict {
+            return Ok((
+                GuestIds::Host,
+                Some(host_ids_warning(&format!(
+                    "{cause}. Use a host that passes this validation probe, or omit \
+                     --no-namespace to use a PID namespace"
+                ))),
+            ));
+        }
+        let asked = match required {
+            Some(Required::PidBase(_)) => "--pid-base",
+            Some(Required::Replay { source, .. }) => source,
+            None => "--strict",
+        };
+        return Err(Error::new(PolicyRefusal).context(format!(
+            "{asked} with --no-namespace requires chosen guest process IDs, but Hermit cannot \
+             safely choose them: {cause}. Use a host that passes this validation probe. For a \
+             new recording or run, omit --no-namespace and --pid-base to use a PID namespace"
+        )));
     }
     let pid_base = required.map(|required| required.base());
     let size = window_ids(pid_max);
@@ -336,6 +371,87 @@ fn host_ids_warning(cause: &str) -> String {
     )
 }
 
+/// Admission needs both observations: an invalid signal's EINVAL alone
+/// could instead come from an unrelated validation or policy failure.
+fn check_legacy_clone_signal_validation(
+    mut probe: impl FnMut(i32) -> Result<i32, String>,
+) -> Result<(), String> {
+    let valid = probe(libc::SIGCHLD);
+    let invalid = probe(65);
+    if valid == Ok(libc::EFAULT) && invalid == Ok(libc::EINVAL) {
+        return Ok(());
+    }
+    let describe = |result: Result<i32, String>| match result {
+        Ok(libc::EFAULT) => format!("EFAULT ({})", libc::EFAULT),
+        Ok(libc::EINVAL) => format!("EINVAL ({})", libc::EINVAL),
+        Ok(errno) => format!(
+            "errno {errno} ({})",
+            std::io::Error::from_raw_os_error(errno)
+        ),
+        Err(cause) => format!("probe failed: {cause}"),
+    };
+    Err(format!(
+        "legacy clone exit-signal validation is unsupported or unproven: SIGCHLD probe returned \
+         {}, signal 65 probe returned {}; expected EFAULT ({}) then EINVAL ({})",
+        describe(valid),
+        describe(invalid),
+        libc::EFAULT,
+        libc::EINVAL,
+    ))
+}
+
+/// Use CLONE_PIDFD with an output address outside the Linux user address
+/// range, so copy_process fails before kernel_clone can wake a new task.
+/// Unlike a null pointer, usize::MAX does not rely on the zero page being
+/// unmapped. No CLONE_PARENT means neither init restrictions nor reparenting
+/// can confuse the probe.
+///
+/// Linux v6.16 copy_process writes the pidfd at kernel/fork.c:2210:
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?id=038d61fd642278bab63ee8ef722c50d10ab01e8f#n2210>.
+/// Failure releases the pidfd/PID at line 2430 and returns an error, before
+/// kernel_clone could wake the task at line 2630. Its kernel_clone lacks
+/// original-signal validation, so both probes reach EFAULT. Linux v7.1.3
+/// kernel_clone checks the signal first, yielding EINVAL for 65:
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?id=199c9959d3a9b53f346c221757fc7ac507fbac50#n2702>.
+/// This may allocate/release an internal host PID before EFAULT; it allocates
+/// no guest-chosen ID. Unexpected success is reaped and never admits Chosen.
+fn probe_legacy_clone_errno(signal: i32) -> Result<i32, String> {
+    // SAFETY: a fork-like clone without CLONE_VM. The invalid output pointer
+    // should prevent creation; a defensive child path only calls _exit.
+    let child = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            (libc::CLONE_PIDFD | signal) as libc::c_ulong,
+            0usize,
+            usize::MAX,
+            0usize,
+            0usize,
+        )
+    };
+    if child == 0 {
+        unsafe { libc::_exit(0) }
+    }
+    if child < 0 {
+        return std::io::Error::last_os_error()
+            .raw_os_error()
+            .ok_or_else(|| "legacy clone failed without an OS error number".to_owned());
+    }
+    let mut status = 0;
+    // SAFETY: wait only for this unexpected child, including a clone child
+    // whose exit signal was not SIGCHLD. Its only userspace action is _exit.
+    while unsafe { libc::waitpid(child as libc::pid_t, &mut status, libc::__WALL) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!(
+                "legacy clone unexpectedly created child {child}; could not reap it: {error}"
+            ));
+        }
+    }
+    Err(format!(
+        "legacy clone unexpectedly created child {child}; reaped with wait status {status}"
+    ))
+}
+
 /// The ID the kernel gives a new task next: that of a child made with a
 /// plain fork-like `clone` that exits at once and is reaped here.
 fn probe_cursor() -> Option<i32> {
@@ -418,6 +534,7 @@ fn probe_chosen_pid(id: i32) -> Result<(), (Option<i32>, String)> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::cell::RefCell;
 
     use super::*;
@@ -426,8 +543,11 @@ mod tests {
         pid_max: i32,
         taken: BTreeSet<i32>,
         can_choose: Result<(), &'static str>,
+        legacy_validation: Result<(), &'static str>,
+        validation_checks: Cell<usize>,
         probed: RefCell<Vec<i32>>,
         cursor: Option<i32>,
+        cursor_reads: Cell<usize>,
         /// Windows another run holds, and those this one reserved.
         held: RefCell<BTreeSet<i32>>,
     }
@@ -438,8 +558,11 @@ mod tests {
                 pid_max: 32768,
                 taken: BTreeSet::new(),
                 can_choose: Ok(()),
+                legacy_validation: Ok(()),
+                validation_checks: Cell::new(0),
                 probed: RefCell::new(Vec::new()),
                 cursor: Some(20000),
+                cursor_reads: Cell::new(0),
                 held: RefCell::new(BTreeSet::new()),
             }
         }
@@ -455,6 +578,10 @@ mod tests {
         fn holder(&self, id: i32) -> String {
             format!("process {id} (sshd)")
         }
+        fn legacy_clone_signal_validation(&self) -> Result<(), String> {
+            self.validation_checks.set(self.validation_checks.get() + 1);
+            self.legacy_validation.map_err(str::to_owned)
+        }
         fn can_choose(&self, id: i32) -> Result<(), String> {
             self.probed.borrow_mut().push(id);
             self.can_choose.map_err(str::to_owned)
@@ -463,6 +590,7 @@ mod tests {
             self.can_choose(id)
         }
         fn cursor(&self) -> Option<i32> {
+            self.cursor_reads.set(self.cursor_reads.get() + 1);
             self.cursor
         }
         fn reserve(&self, index: i32, size: i32) -> Result<(), String> {
@@ -490,14 +618,148 @@ mod tests {
         format!("{error:#}")
     }
 
+    /// Source-modelled Linux v6.16 reaches the invalid pidfd output write
+    /// for both signals; it does not prove the early validation the chosen
+    /// conversion requires. Exercise the actual production resolver.
+    #[test]
+    fn chosen_ids_require_legacy_clone_signal_validation() {
+        let cause = "legacy clone exit-signal validation is unsupported: SIGCHLD probe returned \
+                     EFAULT (14), signal 65 probe returned EFAULT (14)";
+        for (required, strict, named) in [
+            (Some(Required::PidBase(1000)), false, "--pid-base"),
+            (None, true, "--strict"),
+            (
+                Some(Required::Replay {
+                    source: "--replay-schedule-from chosen.json",
+                    base: 1000,
+                }),
+                false,
+                "--replay-schedule-from chosen.json",
+            ),
+        ] {
+            let mut host = FakeHost::new();
+            host.legacy_validation = Err(cause);
+            assert_eq!(host.legacy_clone_signal_validation(), Err(cause.to_owned()));
+            host.validation_checks.set(0);
+            let error = refusal(resolve_with(true, required, strict, &host));
+            assert!(error.contains(cause), "{error}");
+            assert!(error.contains(named), "{error}");
+            assert!(
+                error.contains("Use a host that passes this validation probe"),
+                "{error}"
+            );
+            assert!(error.contains("use a PID namespace"), "{error}");
+            assert_eq!(host.validation_checks.get(), 1);
+            assert_eq!(host.cursor_reads.get(), 0);
+            assert!(host.probed.borrow().is_empty());
+            assert!(host.held.borrow().is_empty());
+        }
+    }
+
     #[test]
     fn a_namespace_numbers_the_guest_itself() {
-        let host = FakeHost::new();
+        let mut host = FakeHost::new();
+        host.legacy_validation = Err("legacy validation unavailable");
         assert_eq!(
             resolve_with(false, None, true, &host).unwrap(),
             (GuestIds::Namespace, None)
         );
         assert!(host.probed.borrow().is_empty());
+        assert_eq!(host.validation_checks.get(), 0);
+        assert_eq!(host.cursor_reads.get(), 0);
+        assert!(host.held.borrow().is_empty());
+    }
+
+    #[test]
+    fn unproven_clone_validation_uses_host_ids_only_with_a_warning() {
+        for cause in [
+            "legacy clone exit-signal validation is unsupported: both probes returned EFAULT",
+            "legacy clone validation probe failed: permission denied",
+        ] {
+            let mut host = FakeHost::new();
+            host.legacy_validation = Err(cause);
+            let (ids, warning) = resolve_with(true, None, false, &host).unwrap();
+            assert_eq!(ids, GuestIds::Host);
+            let warning = warning.expect("Host fallback must be explicit");
+            assert!(warning.contains(cause), "{warning}");
+            assert!(warning.contains("use a PID namespace"), "{warning}");
+            assert!(warning.contains("Pass --pid-base to refuse"), "{warning}");
+            assert_eq!(host.validation_checks.get(), 1);
+            assert_eq!(host.cursor_reads.get(), 0);
+            assert!(host.probed.borrow().is_empty());
+            assert!(host.held.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_clone_validation_requires_the_exact_probe_pair() {
+        let mut signals = Vec::new();
+        assert!(
+            check_legacy_clone_signal_validation(|signal| {
+                signals.push(signal);
+                Ok(if signal == libc::SIGCHLD {
+                    libc::EFAULT
+                } else {
+                    libc::EINVAL
+                })
+            })
+            .is_ok()
+        );
+        assert_eq!(signals, [libc::SIGCHLD, 65]);
+
+        // The older source's pair, unrelated EINVAL, and failed probes
+        // cannot establish early original-signal validation.
+        for (pair, expected) in [
+            (
+                [Ok(libc::EFAULT), Ok(libc::EFAULT)],
+                ["EFAULT (14)", "EFAULT (14)"],
+            ),
+            (
+                [Ok(libc::EINVAL), Ok(libc::EINVAL)],
+                ["EINVAL (22)", "EINVAL (22)"],
+            ),
+            (
+                [Ok(libc::EPERM), Ok(libc::EINVAL)],
+                [
+                    "errno 1 (Operation not permitted (os error 1))",
+                    "EINVAL (22)",
+                ],
+            ),
+            (
+                [Ok(libc::EFAULT), Ok(libc::ENOSYS)],
+                [
+                    "EFAULT (14)",
+                    "errno 38 (Function not implemented (os error 38))",
+                ],
+            ),
+            (
+                [
+                    Err("unexpected child was reaped".to_owned()),
+                    Ok(libc::EINVAL),
+                ],
+                ["probe failed: unexpected child was reaped", "EINVAL (22)"],
+            ),
+            (
+                [Ok(libc::EFAULT), Err("probe failed".to_owned())],
+                ["EFAULT (14)", "probe failed: probe failed"],
+            ),
+        ] {
+            let mut results = pair.into_iter();
+            let mut signals = Vec::new();
+            let error = check_legacy_clone_signal_validation(|signal| {
+                signals.push(signal);
+                results.next().unwrap()
+            })
+            .expect_err("only the measured validation pair admits Chosen");
+            assert_eq!(signals, [libc::SIGCHLD, 65]);
+            assert!(error.contains("unsupported or unproven"), "{error}");
+            for (label, outcome) in ["SIGCHLD", "signal 65"].into_iter().zip(expected) {
+                assert!(
+                    error.contains(&format!("{label} probe returned {outcome}")),
+                    "{error}"
+                );
+            }
+        }
     }
 
     /// A pid_max under two windows (Linux allows down to 301) leaves no whole

@@ -146,6 +146,8 @@ impl ChosenIdCall {
 /// An exit signal above 64 is inexpressible on kernels that accept it in
 /// legacy `clone`. Beside `CLONE_PARENT`/`CLONE_THREAD`, return EINVAL before
 /// discarding the original signal, matching Linux v7.1.3 `kernel_clone`.
+/// The CLI admits Chosen only after probing this early signal validation;
+/// hosts without it are refused or use the explicit Host-ID fallback.
 /// A `clone3` call is rewritten only when it passes no `set_tid` of
 /// its own and its size is one of the three versions; Detcore then fills in
 /// `set_tid`, extending a first-version struct to the second.
@@ -248,9 +250,10 @@ impl LegacyClone {
         let shares_parent = (libc::CLONE_THREAD | libc::CLONE_PARENT) as u64;
         // Linux v7.1.3 kernel/fork.c:2702, kernel_clone, validates the
         // original signal before copy_process replaces it for these flags:
-        // https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v7.1.3#n2702
-        // v6.16 validated only clone3's signal. This conversion follows the
-        // newer rule; Namespace/Host calls bypass it and retain native results.
+        // https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?id=199c9959d3a9b53f346c221757fc7ac507fbac50#n2702
+        // v6.16 validated only clone3's signal. Chosen-ID admission probes
+        // the required early validation before a guest starts; Namespace/Host
+        // calls bypass this conversion and retain native results.
         if self.flags & shares_parent != 0 && self.exit_signal > 64 {
             return ChosenIdCall::Invalid(Errno::EINVAL);
         }
