@@ -2048,7 +2048,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And phases::tests::a_budget_hit_after_the_decision_reports_it: 1325.
     // And phases::tests::a_trial_budget_that_ends_at_the_stack_trace_runs_reports_the_decision: 1326.
     // PR 4746's refusal-journal revision adds a_refusal_the_guest_reached_is_journaled_through_run_error_and_resumes_as_the_same_error: 1326 + 1 = 1327.
-    ("test.hermit_unit", 1327),
+    // And its race_report switch adds a_refusal_the_stack_replay_reached_uses_the_stacks_it_took: 1327 + 1 = 1328.
+    ("test.hermit_unit", 1328),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6388,7 +6389,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same decided-budget test: 1319.
     // And the same cut-path decided-budget test: 1320.
     // The same revision's case: 1320 + 1 = 1321.
-    ("test.hermit_unit_on_host", 1321),
+    // The same race_report case: 1321 + 1 = 1322.
+    ("test.hermit_unit_on_host", 1322),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
