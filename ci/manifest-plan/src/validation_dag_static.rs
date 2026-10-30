@@ -1216,7 +1216,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validate at that tip (1913 executed, all passed).
     // PR 4679 adds two detcore-model units and three inventory-driven
     // manifest-plan cases: 1913 + 5 = 1918, re-measured at this integration head.
-    ("test.regular_crates", 1918),
+    // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
+    ("test.regular_crates", 1927),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1893,7 +1894,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4865 adds one hermit-run unit: 1272 + 1 = 1273, re-measured at this integration head.
     // PR 4607 adds two hermit-run units: 1273 + 2 = 1275, re-measured at this integration head.
     // The loader-cache provenance fix adds two hermit-run units: 1275 + 2 = 1277, re-measured at this integration head.
-    ("test.hermit_unit", 1277),
+    // PR 4738 adds two hermit-run units: 1277 + 2 = 1279, re-measured at this integration head.
+    ("test.hermit_unit", 1279),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3136,7 +3138,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4861 adds two detcore units: 2953 + 2 = 2955, re-measured at this integration head.
     // PR 4862 adds three detcore units: 2955 + 3 = 2958, re-measured at this integration head.
     // The loader-cache provenance fix adds one detcore unit: 2958 + 1 = 2959, re-measured at this integration head.
-    ("test.detcore_unit", 2959),
+    // PR 4738 adds twenty detcore units: 2959 + 20 = 2979, re-measured at this integration head.
+    ("test.detcore_unit", 2979),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4454,7 +4457,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4725 adds thirteen cli cases: 714 + 13 = 727, re-measured at this integration head.
     // PR 4679: re-measured at this integration head by the cli binary's own
     // list under the node's skip filters, minus ignored cases: 738.
-    ("test.cli", 738),
+    // PR 4738 adds three cli cases: 738 + 3 = 741, re-measured at this integration head.
+    ("test.cli", 741),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5013,7 +5017,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same thirteen PR 4725 cli cases: 633 + 13 = 646.
     // PR 4679: the same re-measurement as test.cli with the hosted
     // exclusions applied: 657.
-    ("test.cli_on_host", 657),
+    // The same three PR 4738 cases: 657 + 3 = 660.
+    ("test.cli_on_host", 660),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5502,7 +5507,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4861 units: 2953 + 2 = 2955.
     // The same three PR 4862 units: 2955 + 3 = 2958.
     // The same loader-cache provenance unit: 2958 + 1 = 2959.
-    ("test.detcore_unit_on_host", 2959),
+    // The same twenty PR 4738 units: 2959 + 20 = 2979.
+    ("test.detcore_unit_on_host", 2979),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5888,7 +5894,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same one PR 4865 unit: 1266 + 1 = 1267.
     // The same two PR 4607 units: 1267 + 2 = 1269.
     // The same two loader-cache provenance units: 1269 + 2 = 1271.
-    ("test.hermit_unit_on_host", 1271),
+    // The same two PR 4738 units: 1271 + 2 = 1273.
+    ("test.hermit_unit_on_host", 1273),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6112,7 +6119,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hosted twin executes 1913 - 14 = 1899.
     // PR 4679: the same five added cases as test.regular_crates, with all
     // fourteen hosted exclusions present exactly once: 1918 - 14 = 1904.
-    ("test.regular_crates_on_host", 1904),
+    // PR 4738: the same nine added cases: 1927 - 14 = 1913.
+    ("test.regular_crates_on_host", 1913),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
