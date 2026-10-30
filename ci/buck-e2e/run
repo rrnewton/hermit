@@ -29,8 +29,9 @@
 # HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files before
 # the run, after it, and after judging it: Buck builds the release hermit from the working
 # tree, and every row records SOURCE_SHA as a clean source tree.
-# Tpx retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
-# ingest.py turns a retried cell's executions into attempts 1 and 2. EXTRA args go to
+# The harness owns retries (owner policy, 2026-10-30): Tpx retries are off
+# (--retry 0) and the harness retries a failed cell once itself; ingest.py
+# numbers harness attempts in order. EXTRA args go to
 # every `buck2 test` before the `--` (e.g. @shim/modes/hybrid).
 # An RE worker can lack a capability a cell needs that the plan cannot route on, because
 # workers differ: `hermit run --strict` on ptrace refuses where the branch counter is
@@ -126,7 +127,7 @@ for previous in re local all rerun-local; do
     rm -f -- "$work/$previous".{log,rc,test_id,times,event-log.pb.zst}
 done
 extra=("$@")
-tpx=(-- --retry 1 --no-retry-on-skip)
+tpx=(-- --retry 0 --no-retry-on-skip)
 
 invoke() { # invoke NAME TARGET... [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
     local name=$1
@@ -196,7 +197,7 @@ if [[ -s $work/withheld-on-re || -s $work/withheld-retries ]]; then
             "${retries[*]}" >&2
         tpx=(-- --retry 0 --no-retry-on-skip)
         invoke retry-local "${retries[@]/#/"//ci/buck-e2e:"}" -c hermit_e2e.routing=local
-        tpx=(-- --retry 1 --no-retry-on-skip)
+        tpx=(-- --retry 0 --no-retry-on-skip)
         reruns+=(retry-local)
     fi
     collect "${reruns[@]}"

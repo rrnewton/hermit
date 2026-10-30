@@ -659,7 +659,7 @@ def main():
         where = f"the execution of {cell} that ended at {end}"
         if result is not None and result.get("cell") != cell:
             sys.exit(f"ingest: {where} has a result.json for {result.get('cell')}")
-        if len(rows) > 1 or any(cell_of(row) != cell for row in rows):
+        if any(cell_of(row) != cell for row in rows):
             sys.exit(f"ingest: {where} has {len(rows)} rows, for cells {sorted({cell_of(row) for row in rows})}; "
                      f"a cell runs the harness, which writes one row per attempt, for that cell")
         ids = [row.get("run_id") for row in rows] + ([result.get("run_id")] if result is not None else [])

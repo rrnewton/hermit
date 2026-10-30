@@ -547,16 +547,18 @@ class IngestTest(unittest.TestCase):
                                    f"cannot tell their artifacts apart: ['{X} at 100'] (1)")
 
     def test_an_execution_holds_at_most_one_row_and_only_for_its_own_cell(self):
-        cases = [
-            ("two rows", [row(X, "FAIL", "rx1"), row(X, "PASS", "rx1")]),
-            ("another cell's row", [row(Y, "PASS", "rx1")]),
-        ]
-        for name, rows in cases:
-            with self.subTest(name):
-                self.refused(
-                    {"RUN": [execution(X, 100, "PASS", "rx1", rows=rows), Y_PASSES]},
-                    "a cell runs the harness, which writes one row per attempt, for that cell",
-                )
+        # One execution may hold several rows, one per harness attempt.
+        _, rows, _ = self.accepted(
+            {"RUN": [execution(X, 100, "PASS", "rx1", rows=[row(X, "FAIL", "rx1"), row(X, "PASS", "rx1")]), Y_PASSES]}
+        )
+        self.assertEqual(
+            [(attempt, outcome) for cell, attempt, outcome, _run in rows if cell == X],
+            [(1, "FAIL"), (2, "PASS")],
+        )
+        self.refused(
+            {"RUN": [execution(X, 100, "PASS", "rx1", rows=[row(Y, "PASS", "rx1")]), Y_PASSES]},
+            "a cell runs the harness, which writes one row per attempt, for that cell",
+        )
 
     def test_a_result_json_for_another_cell_is_refused(self):
         result = {"cell": Y, "run_id": "rx1", "evidence_complete": True, "producer_completion": VALID}

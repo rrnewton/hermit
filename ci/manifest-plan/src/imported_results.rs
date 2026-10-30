@@ -238,14 +238,15 @@ fn stale_reason(context: &RunContext, cell: &SelectedCell, row: &CellResult) -> 
         }
         Err(error) => return Some(format!("cannot resolve this cell's timeouts: {error}")),
     }
-    // Each producer execution is its own --no-retry harness run, so its CPU
-    // observations are bound to that run's id and outer attempt 1; the
-    // ingest's attempt number is assigned afterwards.
-    if row.cpu_observations.is_none() {
+    // Validate the row against the attempt its own CPU observations are
+    // bound to: a harness retry's second attempt is bound to attempt 2,
+    // while a row ingest renumbered from a separate producer execution is
+    // bound to that execution's attempt 1.
+    let Some(observations) = &row.cpu_observations else {
         return Some("imported row has no CPU observations".into());
-    }
+    };
     let mut as_executed = row.clone();
-    as_executed.attempt = 1;
+    as_executed.attempt = observations.binding.outer_attempt;
     if let Err(error) = as_executed.require_cpu_observations() {
         return Some(format!(
             "imported row's CPU observations do not belong to its own execution: {error}"
