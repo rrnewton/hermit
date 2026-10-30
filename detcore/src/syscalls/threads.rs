@@ -774,20 +774,46 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    match fatal_delivery_observation(guest, signal, may_retire_others) {
+        FatalDeliveryObservation::Fatal { may_retire_others } => Some(may_retire_others),
+        FatalDeliveryObservation::Nonfatal | FatalDeliveryObservation::Unknown => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FatalDeliveryObservation {
+    Nonfatal,
+    Fatal { may_retire_others: bool },
+    Unknown,
+}
+
+/// Keep unavailable native/copy evidence distinct from a known nonfatal
+/// disposition. The old scheduler decision retains its exact Option mapping.
+pub(crate) fn fatal_delivery_observation<G, T>(
+    guest: &G,
+    signal: i32,
+    may_retire_others: bool,
+) -> FatalDeliveryObservation
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     let copied = super::signal_shadow::copied_dispositions_for(guest, signal)
         .map(|copied| default_action_ends_process(copied.ignored, copied.caught, signal));
     if copied == Some(false) {
-        return None;
+        return FatalDeliveryObservation::Nonfatal;
     }
     let kernel = (copied.is_none() || may_retire_others)
         .then(|| read_thread_signal_state(guest.pid(), guest.tid()).ok())
         .flatten();
-    let ends = copied
-        .unwrap_or_else(|| kernel.is_some_and(|state| state.default_action_ends_process(signal)));
-    ends.then(|| {
-        may_retire_others
-            && kernel.is_some_and(|state| state.delivery_carries_out_a_fatal_default(signal))
-    })
+    match copied.or_else(|| kernel.map(|state| state.default_action_ends_process(signal))) {
+        Some(true) => FatalDeliveryObservation::Fatal {
+            may_retire_others: may_retire_others
+                && kernel.is_some_and(|state| state.delivery_carries_out_a_fatal_default(signal)),
+        },
+        Some(false) => FatalDeliveryObservation::Nonfatal,
+        None => FatalDeliveryObservation::Unknown,
+    }
 }
 
 fn signal_has_uncatchable_default_disposition(signal: SigWrapper) -> bool {
@@ -2323,6 +2349,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::SetTidAddress,
     ) -> Result<i64, Error> {
         let address = call.tidptr().map_or(0, |pointer| pointer.as_raw());
+        crate::reserved_input::expose_local_overlap(
+            guest,
+            address as u64,
+            4,
+            "clear-tid-reserved-reference",
+        )?;
         let result = self
             .record_or_replay(guest, Syscall::SetTidAddress(call))
             .await?;
@@ -2358,6 +2390,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let head = call.head().map(AddrMut::as_raw);
         let len = call.len();
+        if let Some(head) = head {
+            crate::reserved_input::expose_local_overlap(
+                guest,
+                head as u64,
+                len as u64,
+                "robust-list-reserved-reference",
+            )?;
+        }
         let res = self
             .record_or_replay(guest, Syscall::SetRobustList(call))
             .await?;
@@ -2783,6 +2823,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ExitGroup,
     ) -> Result<i64, Error> {
+        crate::reserved_input::before_exit_group(guest)?;
         // One of the last points where this process's unsent warnings can
         // still be reported (`crate::guest_log`).
         crate::guest_log::flush_unsent();
@@ -8875,12 +8916,16 @@ async fn inject_traced_clone<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 ) -> CloneInjection {
     use syscalls::family::CloneFamily;
     if !flags.contains(CloneFlags::CLONE_UNTRACED) {
-        return CloneInjection::Ran(guest.inject(Syscall::from(clone_family)).await);
+        return CloneInjection::Ran(
+            crate::reserved_input::inject_original_clone(guest, Syscall::from(clone_family)).await,
+        );
     }
     match clone_family {
         CloneFamily::Clone(clone) => {
             let traced = clone.with_flags(clone.flags() - nix::sched::CloneFlags::CLONE_UNTRACED);
-            CloneInjection::Ran(guest.inject(Syscall::Clone(traced)).await)
+            CloneInjection::Ran(
+                crate::reserved_input::inject_original_clone(guest, Syscall::Clone(traced)).await,
+            )
         }
         CloneFamily::Clone3(clone) => inject_traced_clone3(guest, clone).await,
         #[cfg(not(target_arch = "aarch64"))]
@@ -8918,7 +8963,9 @@ async fn inject_traced_clone3<T: RecordOrReplay, G: Guest<Detcore<T>>>(
             && crate::syscalls::read_guest_exact(&guest.memory(), args.cast(), &mut bytes).is_ok()
     });
     if !readable {
-        return CloneInjection::Ran(guest.inject(Syscall::Clone3(clone)).await);
+        return CloneInjection::Ran(
+            crate::reserved_input::inject_original_clone(guest, Syscall::Clone3(clone)).await,
+        );
     }
     let refused = |why: &str| {
         CloneInjection::Refused(format!(
@@ -8988,13 +9035,15 @@ async fn inject_traced_clone3<T: RecordOrReplay, G: Guest<Detcore<T>>>(
             return refused(&format!("the stack below it cannot be written ({errno})"));
         }
     };
-    let result = guest
-        .inject(Syscall::Clone3(
+    let result = crate::reserved_input::inject_original_clone(
+        guest,
+        Syscall::Clone3(
             clone
                 .with_args(AddrMut::from_raw(scratch.as_raw()))
                 .with_size(len),
-        ))
-        .await;
+        ),
+    )
+    .await;
     restore_staged_clone_args(guest, scratch, &saved);
     drop(guard);
     CloneInjection::Ran(result)

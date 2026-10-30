@@ -158,6 +158,10 @@ unsafe fn run_inner_with_capture(
         &mut mm_cancel::Cancellation,
     >,
 ) -> anyhow::Result<ExitStatus> {
+    // This path creates GlobalTool/RPC state without the library dispatcher.
+    // Admission belongs before any mapped guest or native launcher exists.
+    detcore::preemptions::validate_config_replay_inputs(&config)?;
+    <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
     check_mapped_command(&command)?;
     let (mut capture, forwarded) = match execution {
         Some(CapturedExecution { request, forwarded }) => (Some(request), forwarded),

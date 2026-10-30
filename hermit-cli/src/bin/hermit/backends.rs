@@ -930,6 +930,11 @@ impl DbtInvocation {
         binds: Vec<(PathBuf, PathBuf)>,
         options: &super::run::RunOpts,
     ) -> Result<Self, Error> {
+        // This adapter also launches DBT directly, without the library's
+        // dispatch. Admit while the concrete Tool type is available and
+        // before preparing a native client, RPC server or guest process.
+        detcore::preemptions::validate_config_replay_inputs(config)?;
+        <detcore::Detcore as reverie::Tool>::facility_admission(config)?;
         // The DBT backend drives a single Detcore external scheduler, so it cannot
         // honor a request to relax thread sequentialization. Fail loudly rather
         // than silently ignoring the flag.

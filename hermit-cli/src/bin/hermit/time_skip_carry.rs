@@ -27,8 +27,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use detcore::preemptions::PreemptionRecord;
+use detcore::preemptions::ReservedInputMetadata;
 use detcore::preemptions::TimeSkip;
 use detcore::types::SchedEvent;
+use detcore_model::pid::GuestIds;
 
 /// Every recorded schedule seen so far: the hash of each prefix of its events,
 /// and its jumps in stream order, none for a schedule that made none.
@@ -45,6 +47,8 @@ struct Source {
     /// Entry `i` hashes the recording's first `i` events (`prefix_hashes`).
     prefix_hashes: Vec<u64>,
     skips: Vec<TimeSkip>,
+    guest_ids: GuestIds,
+    reserved_input: ReservedInputMetadata,
 }
 
 /// One [`TimeSkipSources`] that every copy of the analyze options shares.
@@ -103,6 +107,8 @@ impl TimeSkipSources {
         let source = Source {
             prefix_hashes: prefix_hashes(record.schedevents()),
             skips: record.time_skips().unwrap_or_default().to_vec(),
+            guest_ids: record.guest_ids().unwrap_or_default(),
+            reserved_input: record.reserved_input().clone(),
         };
         if !self.sources.contains(&source) {
             self.sources.push(source);
@@ -130,17 +136,46 @@ impl TimeSkipSources {
             .unwrap_or(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)))
     }
 
-    /// The jumps a replay of `events` must make: those of the remembered
-    /// recording whose events `events` repeats furthest, up to the end of the
-    /// shared events, in stream order. The run that recorded a jump was in the
-    /// state those events lead to when it jumped, so a replay of the same
-    /// events is too. One recording's jumps, validated when it was read, are
-    /// never mixed with another's, which could disagree. Ties go to the
-    /// recording remembered first.
-    pub fn carried(&self, events: &[SchedEvent]) -> Vec<TimeSkip> {
-        if self.sources.is_empty() {
-            return Vec::new();
+    /// Admit all Chosen source metadata before a trial or endpoint shortcut.
+    /// Non-Chosen metadata is opaque and adds no new source-admission rule.
+    pub fn validate_reserved_inputs(&self) -> anyhow::Result<()> {
+        if !self
+            .sources
+            .iter()
+            .any(|source| matches!(source.guest_ids, GuestIds::Chosen { .. }))
+        {
+            return Ok(());
         }
+        if let Some(first) = self.sources.first() {
+            for source in &self.sources {
+                if let Some(refusal) = detcore::preemptions::guest_ids_mismatch(
+                    "transformation source",
+                    first.guest_ids,
+                    source.guest_ids,
+                ) {
+                    anyhow::bail!("{refusal}");
+                }
+                first
+                    .reserved_input
+                    .require_same_for_chosen(&source.reserved_input)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Carry the same source's numbering/provenance as its selected prefix.
+    /// This copies a producer declaration; it never creates one from defaults.
+    pub fn trial_identity_metadata(
+        &self,
+        events: &[SchedEvent],
+    ) -> anyhow::Result<Option<(GuestIds, ReservedInputMetadata)>> {
+        self.validate_reserved_inputs()?;
+        Ok(self
+            .selected(events)
+            .map(|(_, source)| (source.guest_ids, source.reserved_input.clone())))
+    }
+
+    fn selected(&self, events: &[SchedEvent]) -> Option<(usize, &Source)> {
         let hashes = prefix_hashes(events);
         let mut best: Option<(usize, &Source)> = None;
         for source in &self.sources {
@@ -149,7 +184,18 @@ impl TimeSkipSources {
                 best = Some((shared, source));
             }
         }
-        let Some((shared, source)) = best else {
+        best
+    }
+
+    /// The jumps a replay of `events` must make: those of the remembered
+    /// recording whose events `events` repeats furthest, up to the end of the
+    /// shared events, in stream order. The run that recorded a jump was in the
+    /// state those events lead to when it jumped, so a replay of the same
+    /// events is too. One recording's jumps, validated when it was read, are
+    /// never mixed with another's, which could disagree. Ties go to the
+    /// recording remembered first.
+    pub fn carried(&self, events: &[SchedEvent]) -> Vec<TimeSkip> {
+        let Some((shared, source)) = self.selected(events) else {
             return Vec::new();
         };
         source
@@ -307,5 +353,108 @@ mod tests {
         sources.remember(&PreemptionRecord::from_sched_events(events(&[5])));
         let error = sources.trial_format().unwrap_err();
         assert!(error.to_string().contains("different timing formats"));
+    }
+
+    fn with_metadata(record: PreemptionRecord, metadata: serde_json::Value) -> PreemptionRecord {
+        let mut value = serde_json::to_value(record).unwrap();
+        value["reserved_input"] = metadata;
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// The chosen prefix selects one source's opaque metadata and jumps
+    /// together. A non-Chosen future value is not a new admission failure.
+    #[test]
+    fn metadata_follows_the_same_source_as_its_time_skips() {
+        let first = with_metadata(
+            PreemptionRecord::from_sched_events(events(&[3, 5, 7]))
+                .with_current_format()
+                .with_time_skips(vec![skip(1, 1000)]),
+            serde_json::json!({"future": [null, 17]}),
+        );
+        let second = with_metadata(
+            PreemptionRecord::from_sched_events(events(&[3, 5, 9]))
+                .with_current_format()
+                .with_time_skips(vec![skip(2, 2000)]),
+            serde_json::Value::Null,
+        );
+        let mut sources = TimeSkipSources::default();
+        sources.remember(&first);
+        sources.remember(&second);
+        for source in [&first, &second] {
+            let (ids, metadata) = sources
+                .trial_identity_metadata(source.schedevents())
+                .unwrap()
+                .unwrap();
+            assert_eq!(ids, GuestIds::Namespace);
+            assert_eq!(&metadata, source.reserved_input());
+            assert_eq!(
+                sources.carried(source.schedevents()),
+                source.time_skips().unwrap()
+            );
+            assert_eq!(sources.trial_format().unwrap(), Some(3));
+        }
+    }
+
+    /// Even when the output exactly matches a qualified endpoint, every
+    /// Chosen source must have the same recognized producer declaration.
+    #[test]
+    fn chosen_sources_are_admitted_before_an_identity_trial() {
+        let metadata = serde_json::json!({
+            "contract": "sealed-private-input-v1", "base": "0x71010000",
+            "abi": "x86_64", "page_bytes": 4096
+        });
+        let ids = GuestIds::Chosen {
+            base: 5000,
+            refuse_host_ids: true,
+        };
+        let record = PreemptionRecord::from_sched_events(events(&[3, 5, 7]))
+            .with_current_format()
+            .with_time_skips(vec![skip(1, 1000)])
+            .with_guest_ids(ids);
+        let qualified = with_metadata(record.clone(), metadata.clone());
+        for other in [
+            record.clone(),
+            with_metadata(record.clone(), serde_json::Value::Null),
+            with_metadata(
+                record.clone(),
+                serde_json::json!({"contract": "future-input"}),
+            ),
+            with_metadata(
+                record,
+                serde_json::json!({
+                    "contract": "sealed-private-input-v1", "base": "0x71010000",
+                    "abi": "aarch64", "page_bytes": 4096
+                }),
+            ),
+        ] {
+            for sources_in_order in [[&qualified, &other], [&other, &qualified]] {
+                let mut sources = TimeSkipSources::default();
+                for source in sources_in_order {
+                    sources.remember(source);
+                }
+                let error = sources
+                    .trial_identity_metadata(qualified.schedevents())
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"),
+                    "{error}"
+                );
+            }
+        }
+        let mut sources = TimeSkipSources::default();
+        sources.remember(&qualified);
+        assert_eq!(
+            sources
+                .trial_identity_metadata(qualified.schedevents())
+                .unwrap(),
+            Some((ids, qualified.reserved_input().clone()))
+        );
+        assert_eq!(
+            sources.carried(qualified.schedevents()),
+            qualified.time_skips().unwrap()
+        );
+        assert_eq!(sources.trial_format().unwrap(), Some(3));
     }
 }

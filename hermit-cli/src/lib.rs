@@ -57,6 +57,8 @@ pub mod xstate_probe;
 /// Diagnostic writes that never wait for a reader; they live in detcore, whose
 /// own stderr writer reads the same flag.
 pub use detcore::nonwaiting_write;
+#[cfg(test)]
+mod chosen_input_tests;
 pub mod physical_exit_watch;
 pub mod preemption_admission;
 pub mod proc_mount;
@@ -3126,6 +3128,8 @@ async fn run_sabre(
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
 ) -> Result<Output, Error> {
+    <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
+    detcore::preemptions::validate_config_replay_inputs(&config)?;
     let path_evidence_file = std::env::var_os(SABRE_PATH_EVIDENCE_ENV).map(PathBuf::from);
     // Whether this run passes the plugin a DETLOG socket (below), in which case
     // every Tool image must forward on it; see
@@ -4424,6 +4428,8 @@ async fn run_dbt(
     print_summary: bool,
     capture_output: bool,
 ) -> Result<Output, Error> {
+    <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
+    detcore::preemptions::validate_config_replay_inputs(&config)?;
     if !config.sequentialize_threads {
         return Err(anyhow!(
             "the dbt backend requires sequentialized threads; remove \
@@ -5163,6 +5169,10 @@ async fn dispatch_backend(
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
+    detcore::preemptions::validate_config_replay_inputs(&config)?;
+    // Do this while the actual Tool type is available, before a DBT/SaBRe
+    // launcher erases it to GlobalTool or constructs an RPC server.
+    <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return Ok(run_kvm(
@@ -5526,6 +5536,8 @@ async fn dispatch_output_backend(
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     detcore_model::virtual_timeout::refuse_debugger(config.virtual_timeout, config.gdbserver)?;
     crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
+    detcore::preemptions::validate_config_replay_inputs(&config)?;
+    <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return run_kvm(

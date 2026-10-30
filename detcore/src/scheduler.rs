@@ -34,6 +34,8 @@ pub(crate) mod process_signal_receiver;
 pub(crate) mod real_timer;
 mod rejoin_log;
 mod replayer;
+#[cfg(test)]
+mod reserved_input_tests;
 pub mod runqueue;
 mod sigalrm;
 pub mod sigkill_retirement;
@@ -1310,6 +1312,30 @@ enum TimeSkipMode {
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
+    /// Native-generation input control, installed locally before guest start.
+    /// This is not a scheduler resource or a serialized capability.
+    pub(crate) reserved_input_control: Option<reverie::reserved_input::ReservedInputControl>,
+    /// Actual native registrations, bound before logical retirement can act.
+    pub(crate) reserved_input_tasks: BTreeMap<DetTid, reverie::reserved_input::InputTaskId>,
+    pub(crate) reserved_input_native_tasks: BTreeMap<i32, reverie::reserved_input::InputTaskId>,
+    /// Backend-reported Tool identities awaiting their existing logical birth
+    /// or exec replacement. An exec report does not overwrite the old image
+    /// that its logical teardown still owns.
+    pub(crate) reserved_input_tool_tasks: BTreeMap<DetTid, reverie::reserved_input::InputTaskId>,
+    /// Exact generations whose original logical fences already completed.
+    /// A later group intent may include one of these retained old owners.
+    reserved_input_settled_tasks: BTreeSet<reverie::reserved_input::InputTaskId>,
+    /// Keep the complete existing Exit barrier population until both barrier
+    /// families have passed; individual host observations do not thaw it.
+    reserved_input_exit_waiters: BTreeSet<reverie::reserved_input::InputTaskId>,
+    /// Retained terminal intents; an individual physical exit cannot thaw them.
+    reserved_input_freezes: BTreeMap<
+        DetTid,
+        (
+            reverie::reserved_input::InputTaskId,
+            reverie::reserved_input::InputFreezeCohort,
+        ),
+    >,
     /// Monotonically count upwards.
     pub turn: u64,
 
@@ -4830,6 +4856,7 @@ fn validate_strict_boundary_config(cfg: &Config) -> Result<(), &'static str> {
 impl Scheduler {
     /// Create a new scheduler based on the configuration.
     pub fn new(cfg: &Config) -> Self {
+        crate::record_or_replay::admit_chosen_input_stream(cfg, reverie::ToolStreamRole::Plain);
         if let Err(refusal) =
             detcore_model::virtual_timeout::refuse_debugger(cfg.virtual_timeout, cfg.gdbserver)
         {
@@ -4864,6 +4891,11 @@ impl Scheduler {
                     }
                     panic!("{error:?}")
                 });
+                // Validate the exact decoded record installed below. A CLI
+                // pathname preflight cannot authorize a later unchecked read.
+                recording
+                    .validate_replay_inputs(&path.display().to_string(), cfg.guest_ids)
+                    .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
                 recording
                     .require_faithful_replay()
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
@@ -5092,6 +5124,13 @@ impl Scheduler {
                 cfg.sched_sticky_random_param,
             ),
             turn: 0,
+            reserved_input_control: None,
+            reserved_input_tasks: BTreeMap::new(),
+            reserved_input_native_tasks: BTreeMap::new(),
+            reserved_input_tool_tasks: BTreeMap::new(),
+            reserved_input_settled_tasks: BTreeSet::new(),
+            reserved_input_exit_waiters: BTreeSet::new(),
+            reserved_input_freezes: BTreeMap::new(),
             next_turns: Default::default(),
             physical_thread_pidfds: Default::default(),
             procfs_kernel_ids: Default::default(),
@@ -5347,6 +5386,31 @@ impl Scheduler {
                 std::io::ErrorKind::InvalidInput,
                 "host process and thread IDs must be positive",
             ));
+        }
+        if let Some(control) = &self.reserved_input_control {
+            let task = self
+                .reserved_input_native_tasks
+                .get(&physical_tid)
+                .copied()
+                .ok_or_else(|| {
+                    std::io::Error::other("reserved-input native registration missing")
+                })?;
+            let registration = control
+                .registration(task)
+                .ok_or_else(|| std::io::Error::other("reserved-input native generation missing"))?;
+            if registration.native_tid != physical_tid || registration.native_pid != physical_pid {
+                return Err(std::io::Error::other(
+                    "reserved-input native registration identity mismatch",
+                ));
+            }
+            if registration.tool_tid != Some(dettid.as_raw()) {
+                return Err(std::io::Error::other(
+                    "reserved-input Tool/native registration identity mismatch",
+                ));
+            }
+            // Logical birth/reconnect binds this generation separately. In
+            // particular this physical registration can precede completion
+            // of the old exec image's logical teardown.
         }
         if let Some((known_mm, known_pid, known_tid, _)) = self.physical_thread_pidfds.get(&dettid)
         {
@@ -6345,9 +6409,122 @@ impl Scheduler {
             self.timeslices.remove(tid);
         }
         self.parent_death_exec_survivor = None;
+        if succeeded {
+            // The existing successful exec edge has accounted this exact old
+            // sibling set. The backend additionally authenticates their native
+            // effects; the replacement image is a different retained owner.
+            self.settle_reserved_input_fence(&retired);
+        }
         self.remove_exec_vfork_barriers(&retired);
         self.finish_exec_alarm(process);
         retired
+    }
+
+    fn freeze_reserved_input_thread(&mut self, tid: DetTid) {
+        let Some(control) = &self.reserved_input_control else {
+            return;
+        };
+        let task = *self.reserved_input_tasks.get(&tid).unwrap_or_else(|| {
+            panic!("reserved-input logical retirement lacks native binding for {tid}")
+        });
+        if self.reserved_input_settled_tasks.contains(&task) {
+            // Logical kill is idempotent. A duplicate callback for this
+            // already fenced exact generation must not install a new freeze.
+            return;
+        }
+        if let Some((bound, _)) = self.reserved_input_freezes.get(&tid) {
+            assert_eq!(
+                *bound, task,
+                "reserved-input retired incarnation was replaced before settlement"
+            );
+            return;
+        }
+        let cohort = control
+            .freeze_tasks(&[task])
+            .unwrap_or_else(|error| panic!("reserved-input retirement freeze failed: {error}"));
+        self.reserved_input_freezes.insert(tid, (task, cohort));
+    }
+
+    /// Called only by an already completed scheduler cohort fence. Native
+    /// receipts are an additional requirement, never a replacement fence.
+    fn settle_reserved_input_fence(&mut self, tids: &[DetTid]) {
+        if self.reserved_input_control.is_none() {
+            return;
+        }
+        let tasks: Vec<_> = tids
+            .iter()
+            .map(|tid| {
+                if let Some((frozen, _)) = self.reserved_input_freezes.get(tid) {
+                    // Exec may already have published a new image under this
+                    // logical/native number. The fence still owns the exact
+                    // displaced incarnation captured at logical retirement.
+                    *frozen
+                } else {
+                    *self.reserved_input_tasks.get(tid).unwrap_or_else(|| {
+                        panic!("reserved-input completed fence lacks native binding for {tid}")
+                    })
+                }
+            })
+            .collect();
+        self.settle_reserved_input_tasks(&tasks);
+    }
+
+    fn settle_reserved_input_tasks(&mut self, tasks: &[reverie::reserved_input::InputTaskId]) {
+        let Some(control) = &self.reserved_input_control else {
+            return;
+        };
+        for task in tasks {
+            assert!(
+                control.observe_exit_effects(*task).unwrap_or_else(|error| {
+                    panic!("reserved-input completed fence has no native effects proof: {error}")
+                }),
+                "reserved-input completed fence precedes native exit effects"
+            );
+        }
+        self.reserved_input_settled_tasks
+            .extend(tasks.iter().copied());
+        let all_settled: Vec<_> = self.reserved_input_settled_tasks.iter().copied().collect();
+        control
+            .settle_fenced_tasks(&all_settled)
+            .unwrap_or_else(|error| {
+                panic!("reserved-input completed fence lacks native settlement: {error}")
+            });
+        self.reserved_input_freezes
+            .retain(|_, (task, _)| !tasks.contains(task));
+    }
+
+    fn queue_reserved_input_exit_fence(&mut self, tid: DetTid) {
+        if self.reserved_input_control.is_none() {
+            return;
+        }
+        let task = self
+            .reserved_input_freezes
+            .get(&tid)
+            .map(|(task, _)| *task)
+            .or_else(|| self.reserved_input_tasks.get(&tid).copied())
+            .unwrap_or_else(|| panic!("reserved-input Exit fence lacks native binding for {tid}"));
+        self.reserved_input_exit_waiters.insert(task);
+    }
+
+    /// Consume the actual backend-to-Tool identity report at an existing
+    /// logical birth or completed exec replacement, without a new RPC field.
+    fn bind_reserved_input_task(&mut self, tid: DetTid) {
+        if self.reserved_input_control.is_none() {
+            return;
+        }
+        let task = *self.reserved_input_tool_tasks.get(&tid).unwrap_or_else(|| {
+            panic!("reserved-input logical registration lacks Tool identity for {tid}")
+        });
+        if self
+            .reserved_input_tasks
+            .insert(tid, task)
+            .is_some_and(|old| old != task)
+        {
+            // Any *unfenced* old incarnation stays retained in the native
+            // registry. Dropping this local lookup handle never thaws it.
+            // Already queued Exit fences carry their exact task, not `tid`.
+            self.reserved_input_freezes.remove(&tid);
+        }
     }
 
     /// Remove a thread from the deterministic scheduler.  In order to call this, the precondition
@@ -6358,6 +6535,9 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
+        // Before removing blocking ownership, pending-vfork state, a turn or
+        // its receiver: callback cancellation is not native access retirement.
+        self.freeze_reserved_input_thread(*dtid);
         if let Some(owners) = &mut self.boundary_owners {
             owners.retire(*dtid, mm);
         }
@@ -7117,6 +7297,7 @@ impl Scheduler {
                 self.timeslices.remove(sibling);
             }
             self.parent_death_exec_survivor = None;
+            self.settle_reserved_input_fence(&siblings);
             siblings
         };
         self.transfer_replay_copies(caller, new_leader, &siblings);
@@ -7126,6 +7307,10 @@ impl Scheduler {
                 .get_mut(&caller)
                 .expect("exec caller must retain a scheduler registration")
                 .child_tid_addr = child_tid_addr;
+
+            self.freeze_reserved_input_thread(caller);
+            self.settle_reserved_input_fence(&[caller]);
+            self.bind_reserved_input_task(new_leader);
 
             self.remove_exec_vfork_barriers(&siblings);
             return siblings;
@@ -7267,6 +7452,8 @@ impl Scheduler {
         self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
         self.timeslices.remove(&caller);
         retired.push(caller);
+        self.settle_reserved_input_fence(&[caller]);
+        self.bind_reserved_input_task(new_leader);
         self.remove_exec_vfork_barriers(&retired);
         retired
     }
@@ -7563,6 +7750,7 @@ impl Scheduler {
     /// Record the address-space identity `dettid` registered with
     /// (`thread_mms`).
     pub(crate) fn record_thread_mm(&mut self, dettid: DetTid, mm: MmId) {
+        self.bind_reserved_input_task(dettid);
         self.thread_mms.insert(dettid, mm);
     }
 
@@ -7586,6 +7774,7 @@ impl Scheduler {
         {
             return false;
         }
+        self.bind_reserved_input_task(tid);
         self.thread_mms.insert(tid, mm);
         self.exec_incarnations.insert(tid, mm);
         true
@@ -7813,10 +8002,18 @@ impl Scheduler {
             return false;
         }
         self.hold_turns_until_the_kernel_ends(dettid, mm);
-        if !self.defer_exec_sibling_retirement(dettid, detpid, mm)
-            && !self.thread_is_logically_killed(dettid)
-        {
-            self.logically_kill_thread(&dettid, &detpid, mm);
+        if !self.defer_exec_sibling_retirement(dettid, detpid, mm) {
+            if !self.thread_is_logically_killed(dettid) {
+                self.logically_kill_thread(&dettid, &detpid, mm);
+            }
+            if self.committed_exits.contains(&dettid) {
+                // Ptrace's ordinary deregistration follows its actual native
+                // terminal observation; it need not install the physical-pidfd
+                // barrier used by in-guest backends. Settle only at the same
+                // existing post-Exit barrier cut, with the exact-generation
+                // effects certificate still independently required there.
+                self.queue_reserved_input_exit_fence(dettid);
+            }
         }
         true
     }
@@ -9444,6 +9641,12 @@ impl Scheduler {
         self.step2a_wait_for_background_entry()?;
         self.step2a_wait_for_exited_leaders()?;
         self.step2a_wait_for_exited_threads()?;
+        if !self.reserved_input_exit_waiters.is_empty() {
+            let settled: Vec<_> = std::mem::take(&mut self.reserved_input_exit_waiters)
+                .into_iter()
+                .collect();
+            self.settle_reserved_input_tasks(&settled);
+        }
         // After every barrier, as a timer's signal is sent: a thread on its
         // way into a background call under a temporary mask has installed
         // it, so host timing cannot choose which thread takes the signal.
@@ -9483,6 +9686,7 @@ impl Scheduler {
             }
         }
         for thread in settled {
+            self.queue_reserved_input_exit_fence(thread);
             self.exited_thread_barriers.remove(&thread);
         }
         if let Some(reason) = stuck {
@@ -9535,6 +9739,7 @@ impl Scheduler {
             }
         }
         for leader in settled {
+            self.queue_reserved_input_exit_fence(leader);
             self.exited_leader_barriers.remove(&leader);
         }
         if let Some(reason) = stuck {

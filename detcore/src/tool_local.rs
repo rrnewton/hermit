@@ -785,6 +785,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let call = translated
             .as_ref()
             .map_or(syscall, |translated| translated.call);
+        crate::reserved_input::before_native_call(guest, call)?;
         let result = if crate::record_or_replay::injects_only::<T>() {
             // What the tool's handler would have done (`NoopTool`), here:
             // the same single injection of the same call, awaited at the

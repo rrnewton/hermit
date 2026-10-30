@@ -181,6 +181,7 @@ impl BisectOpts {
             // Refuse before the first trial, rather than silently downgrading
             // a format-3 prefix's charging rule to a legacy/format-2 rule.
             sources.trial_format()?;
+            sources.validate_reserved_inputs()?;
         }
         let mut good = good.into_global();
         let mut bad = bad.into_global();

@@ -27,6 +27,7 @@ use serde::ser::SerializeMap;
 
 use super::HostObservedCount;
 use super::PreemptionRecord;
+use super::ReservedInputMetadata;
 use super::ThreadHistory;
 use super::TimeSkip;
 use super::callback_history;
@@ -56,6 +57,8 @@ struct RawRecord {
     chaos_timeslice: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     guest_ids: Option<detcore_model::pid::GuestIds>,
+    #[serde(default, skip_serializing_if = "ReservedInputMetadata::is_missing")]
+    reserved_input: ReservedInputMetadata,
     #[serde(skip)]
     replay_departed_at: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

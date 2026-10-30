@@ -22,6 +22,12 @@ mod timerfd_virtual_time;
 #[path = "common/first_instruction_cpuid.rs"]
 mod first_instruction_cpuid;
 
+#[path = "common/chosen_input_memory.rs"]
+mod chosen_input_memory;
+
+#[path = "common/chosen_terminal.rs"]
+mod chosen_terminal;
+
 // The binary loads hermit_binary.rs once, through kvm_synchronous_fault, and
 // skid_overshoot.rs once, through hermit_binary.rs.
 use hermit_test::skid_overshoot;
@@ -56202,5 +56208,238 @@ fn run_refuses_incomplete_replay_before_guest_execution() {
                 "refused exploration created a verification artifact"
             );
         }
+    }
+}
+/// Legacy Chosen fixtures are explicit admission negatives. They must fail
+/// before ID probes, input consumption or a target instruction, by their
+/// provenance policy rather than a schedule mismatch/desync.
+#[test]
+fn chosen_json_requires_provenance_before_the_cli_starts_the_guest() {
+    let directory = tempfile::tempdir().unwrap();
+    let schedule = directory.path().join("legacy-chosen.json");
+    let marker = directory.path().join("guest-started");
+    for metadata in [None, Some(serde_json::json!({"contract": "future-input"}))] {
+        let mut value = serde_json::json!({
+            "per_thread": {}, "global": [],
+            "guest_ids": detcore_model::pid::GuestIds::Chosen { base: 5000, refuse_host_ids: true },
+            "format_version": 3,
+            "time_skips": []
+        });
+        if let Some(metadata) = metadata {
+            value["reserved_input"] = metadata;
+        }
+        fs::write(&schedule, serde_json::to_vec(&value).unwrap()).unwrap();
+        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
+            let args = [
+                "run",
+                "--no-namespace",
+                "--max-timeslice=disabled",
+                option,
+                schedule.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf started > \"$1\"",
+                "admission-marker",
+                marker.to_str().unwrap(),
+            ];
+            let output = hermit(&args);
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{args:?}: {output:?}"
+            );
+            let diagnostic = stderr(&output);
+            assert!(
+                diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("guest has not started"), "{diagnostic}");
+            assert!(
+                !diagnostic.to_ascii_lowercase().contains("desync"),
+                "{diagnostic}"
+            );
+            assert!(!marker.exists(), "refused guest wrote its start marker");
+        }
+    }
+}
+
+/// This direct exec path constructs no Detcore and never consumes a schedule.
+/// Its previously ignored replay options remain ignored, even when their paths
+/// do not exist. The ordinary Detcore path is covered by the refusal above.
+#[test]
+fn namespace_only_keeps_ignoring_schedule_inputs() {
+    let directory = tempfile::tempdir().unwrap();
+    let absent = directory.path().join("absent-schedule.json");
+    let args = [
+        "run",
+        "--namespace-only",
+        "--replay-schedule-from",
+        absent.to_str().unwrap(),
+        "--",
+        "/bin/echo",
+        "namespace-only-started",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "namespace-only-started\n");
+    assert!(!stderr(&output).contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
+}
+
+/// This declaration must come from the real target-image setup callback. The
+/// fixture exercises threads, fork, vfork and clone3; replay must retain the
+/// producer's complete events and timing metadata through either loader and
+/// when both actual inputs are supplied. Synthetic JSON is not the producer.
+#[test]
+fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let recording = directory.path().join("qualified.json");
+    let record_flag = format!("--record-preemptions-to={}", recording.display());
+    let epoch = "--epoch=2026-01-01T00:00:00Z";
+    let recorded = no_namespace_in_own_pid_namespace(
+        &[
+            "--pid-base=5000",
+            "--max-timeslice=disabled",
+            epoch,
+            &record_flag,
+        ],
+        &[],
+    );
+    assert_success(&recorded, &["qualified producer"]);
+    let original: serde_json::Value =
+        serde_json::from_slice(&fs::read(&recording).unwrap()).unwrap();
+    assert_eq!(
+        original["reserved_input"],
+        serde_json::json!({
+            "contract": "sealed-private-input-v1",
+            "base": "0x71010000",
+            "page_bytes": unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
+            "abi": std::env::consts::ARCH,
+        })
+    );
+    assert_eq!(original["guest_ids"]["Chosen"]["base"], 5000);
+    assert_eq!(original["format_version"], 3);
+    let event_count = original["global"].as_array().unwrap().len();
+    assert!(event_count > 0, "{original}");
+    let schedule_flag = format!("--replay-schedule-from={}", recording.display());
+    let priority_flag = format!("--replay-preemptions-from={}", recording.display());
+    for route in ["schedule", "priority", "both"] {
+        let output_record = directory.path().join(format!("replayed-{route}.json"));
+        let summary = directory.path().join(format!("summary-{route}.json"));
+        let output_flag = format!("--record-preemptions-to={}", output_record.display());
+        let summary_flag = format!("--summary-json={}", summary.display());
+        let mut args = vec![
+            "--max-timeslice=disabled",
+            epoch,
+            &output_flag,
+            &summary_flag,
+        ];
+        if route != "priority" {
+            args.push(&schedule_flag);
+        }
+        if route != "schedule" {
+            args.push(&priority_flag);
+        }
+        let replayed = no_namespace_in_own_pid_namespace(&args, &[]);
+        assert_success(&replayed, &args);
+        assert_eq!(
+            stdout(&replayed),
+            stdout(&recorded),
+            "{route}: {}",
+            stderr(&replayed)
+        );
+        let actual: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output_record).unwrap()).unwrap();
+        for field in [
+            "reserved_input",
+            "guest_ids",
+            "format_version",
+            "time_skips",
+            "global",
+            "per_thread",
+        ] {
+            assert_eq!(actual[field], original[field], "{route}: changed {field}");
+        }
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+        assert_eq!(summary["schedevent_desynced"], 0, "{route}: {summary}");
+        if route != "priority" {
+            assert_eq!(
+                summary["schedevent_replayed"], event_count,
+                "{route}: {summary}"
+            );
+        }
+        assert!(
+            !stderr(&replayed).contains("got a host ID"),
+            "{route}: {}",
+            stderr(&replayed)
+        );
+    }
+}
+
+/// These bytes were produced by the retained pre-facility 49487f73 ELF. The
+/// complete old recording is refused by name on every CLI replay route, before
+/// the target can write its marker. A schema constructed by this test would not
+/// establish the old-producer compatibility boundary.
+#[test]
+fn authentic_legacy_chosen_json_is_refused_before_cli_target_start() {
+    let directory = tempfile::tempdir().unwrap();
+    let schedule = directory.path().join("authentic-legacy.json");
+    let marker = directory.path().join("guest-started");
+    let bytes = include_bytes!("fixtures/chosen-before-reserved-input.json");
+    fs::write(&schedule, bytes).unwrap();
+    let original: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(original["guest_ids"]["Chosen"]["base"], 5000);
+    assert_eq!(original["format_version"], 3);
+    assert_eq!(original["global"].as_array().unwrap().len(), 96);
+    assert!(!original.as_object().unwrap().contains_key("reserved_input"));
+    for route in ["schedule", "priority", "both"] {
+        let mut args = vec!["run", "--no-namespace", "--max-timeslice=disabled"];
+        if route != "priority" {
+            args.extend(["--replay-schedule-from", schedule.to_str().unwrap()]);
+        }
+        if route != "schedule" {
+            args.extend(["--replay-preemptions-from", schedule.to_str().unwrap()]);
+        }
+        args.extend([
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf started > \"$1\"",
+            "admission-marker",
+            marker.to_str().unwrap(),
+        ]);
+        let output = hermit(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{route}: {output:?}"
+        );
+        let diagnostic = stderr(&output);
+        assert!(
+            diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"),
+            "{route}: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("missing reserved_input provenance"),
+            "{route}: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("guest has not started"),
+            "{route}: {diagnostic}"
+        );
+        assert!(
+            !diagnostic.to_ascii_lowercase().contains("desync"),
+            "{route}: {diagnostic}"
+        );
+        assert!(
+            !marker.exists(),
+            "{route}: legacy replay executed its target"
+        );
+        assert_eq!(
+            fs::read(&schedule).unwrap(),
+            bytes,
+            "{route}: input fixture was changed"
+        );
     }
 }

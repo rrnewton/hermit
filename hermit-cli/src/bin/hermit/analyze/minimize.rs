@@ -94,6 +94,9 @@ impl AnalyzeOpts {
         let tids: Vec<DetTid> = pr.all_threads();
         let init_schedule: PreemptionRecord = pr.load_all();
         super::rundata::RunData::require_complete_record(&init_schedule, preempts_path)?;
+        // An unchanged endpoint is still a transformation input: an old
+        // Chosen record must not acquire provenance through minimization.
+        init_schedule.validate_combined_reserved_inputs(&init_schedule)?;
         let mut round: u64 = 0;
 
         // All the preemption points we don't know about yet.  Are they critical?
@@ -242,7 +245,11 @@ impl AnalyzeOpts {
                             }
                             Ok(())
                         })?;
-                    self.stamp_trial_record(PreemptionRecord::from_vecs(&btmap))
+                    self.stamp_trial_record(
+                        PreemptionRecord::from_vecs(&btmap)
+                            .with_guest_ids(init_schedule.guest_ids().unwrap_or_default())
+                            .with_reserved_input(init_schedule.reserved_input().clone()),
+                    )
                 };
                 if let Err(e) = pr_new.validate() {
                     bail!(

@@ -77,6 +77,7 @@ pub(crate) mod inotify;
 pub(crate) mod socket_timestamp_ioctl;
 pub(crate) mod sysinfo;
 mod threads;
+pub(crate) use threads::FatalDeliveryObservation;
 /// Where a futex wait takes its deadline from; a `restart_syscall` resumes an
 /// interrupted wait with the deadline it kept.
 pub(crate) use threads::FutexDeadline;
@@ -87,6 +88,7 @@ pub(crate) use threads::KernelSignalState;
 pub(crate) use threads::SignalQueue;
 pub(crate) use threads::default_action_ends_process;
 pub(crate) use threads::fatal_default_delivery;
+pub(crate) use threads::fatal_delivery_observation;
 pub(crate) use threads::forget_thread_status;
 pub(crate) use threads::host_signal_state_reads_refused;
 pub(crate) use threads::ignored_at_generation;

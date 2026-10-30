@@ -346,6 +346,12 @@ impl<T: RecordOrReplay> Detcore<T> {
              InternalIOPolling path",
             call.name()
         );
+        // Classify the actual substituted native buffers before releasing
+        // the turn. EntryImport snapshots alone do not make indirect kernel
+        // inputs immutable. The lease survives native return and decoder
+        // copyout until the matching continuation really admits this task.
+        let input_access = crate::reserved_input::BackgroundAccess::acquire(guest, run)?;
+        crate::reserved_input::before_native_call(guest, run)?;
         {
             let mut rsrcs = Resources::new(dettid);
             // With sequentialization enabled, only truly EXTERNAL endpoints reach here.
@@ -377,6 +383,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let res = self
             .record_or_replay_preserving_tool_errors(guest, run)
             .await;
+        let native_returned = res.is_ok() || matches!(&res, Err(Error::Errno(_)));
+        if native_returned && let Some(access) = &input_access {
+            access.returned()?;
+        }
         crate::race_probe::delay(crate::race_probe::BG_POST_CALL).await;
         // N.B. BlockingExternalIO is a "oneshot" resource, so no need to release
         // explicitly here:
@@ -395,6 +405,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ContinuationMask::Restored => {}
             }
             resource_request(guest, rsrcs).await;
+        }
+        if native_returned && let Some(access) = input_access {
+            // Synchronous retirement, before any subsequent yield or RPC.
+            access.readmitted()?;
         }
         res
     }
@@ -3179,7 +3193,17 @@ where
                     .record_or_replay_preserving_tool_errors(guest, call)
                     .await
             }
-            None => guest.inject_with_retry(call).await.map_err(Error::from),
+            None => {
+                // The preceding placeholder inspection can await. Publish
+                // persistent/reference effects at the actual issue cut,
+                // not from the descriptor or ancillary view before it.
+                match crate::reserved_input::before_native_call(guest, call.into()) {
+                    Ok(()) => guest.inject_with_retry(call).await.map_err(Error::from),
+                    // Keep the normal EntryImport restoration below even
+                    // when native issue is refused before it begins.
+                    Err(error) => Err(error),
+                }
+            }
         };
         if let Err(error) = put_back_entry_import(guest, &entry_import, displaced, res.is_ok()) {
             break Err(error);

@@ -37,7 +37,10 @@
 
 use reverie::Error;
 use reverie::Guest;
-use reverie::Stack;
+use reverie::reserved_input::InputInjectionError;
+use reverie::reserved_input::InputUnavailable;
+use reverie::reserved_input::InputWrite;
+use reverie::reserved_input::ReservedInputImage;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
@@ -495,10 +498,9 @@ impl AddedIdEvidence {
         })
     }
 
-    fn staged_matches<M: MemoryAccess>(
+    fn staged_matches(
         &self,
-        memory: &M,
-        tid: i32,
+        image: &ReservedInputImage,
         rewritten: &syscalls::Clone3,
         array: u64,
     ) -> bool {
@@ -510,12 +512,105 @@ impl AddedIdEvidence {
         };
         let mut observed = [0; CLONE_ARGS_SIZE_VER2];
         let expected = ChosenIdCall::with_set_tid(self.args, array, self.set_tid.len());
-        memory
-            .read_exact_with_user_access(address.cast::<u8>(), &mut observed)
-            .is_ok()
+        let mut entries = vec![0; self.set_tid.len() * std::mem::size_of::<libc::pid_t>()];
+        image.read(address.as_raw() as u64, &mut observed)
             && observed == expected
-            && read_guest_set_tid(memory, tid, &observed).as_ref() == Ok(&self.set_tid)
+            && image.read(array, &mut entries)
+            && entries
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|entry| i32::from_ne_bytes(*entry))
+                .eq(self.set_tid.iter().copied())
     }
+}
+
+/// Construct a complete future image without touching application memory.
+/// Native inputs/outputs, including effective tagged aliases, may not name
+/// this page. Only fields whose native flags make them active are excluded.
+fn reserved_clone_image(
+    layout: reverie::reserved_input::ReservedInputLayout,
+    original: Syscall,
+    args: [u8; CLONE_ARGS_SIZE_VER2],
+    entries: &[libc::pid_t],
+    size: usize,
+) -> Result<(ReservedInputImage, syscalls::Clone3, u64), InputUnavailable> {
+    use crate::reserved_input::Span;
+    use crate::reserved_input::effective_spans;
+    let page = Span::bytes(layout.base, layout.page_bytes as u64);
+    let excludes = |address: u64, bytes: u64| {
+        effective_spans(address, bytes)
+            .into_iter()
+            .any(|span| span.overlaps(page))
+    };
+    let field = |offset: usize| u64::from_ne_bytes(args[offset..offset + 8].try_into().unwrap());
+    let flags = field(0);
+    if let Syscall::Clone3(call) = original {
+        let address = call.args().map_or(0, |address| address.as_raw() as u64);
+        if excludes(address, call.size() as u64) {
+            return Err(InputUnavailable::new(
+                "clone-original-input-overlaps-reserved-page",
+            ));
+        }
+    }
+    if field(72) != 0
+        && field(72)
+            .checked_mul(4)
+            .is_none_or(|bytes| excludes(field(64), bytes))
+    {
+        return Err(InputUnavailable::new(
+            "clone-set-tid-input-overlaps-reserved-page",
+        ));
+    }
+    for (active, offset) in [
+        (libc::CLONE_PIDFD as u64, 8),
+        (
+            (libc::CLONE_CHILD_SETTID | libc::CLONE_CHILD_CLEARTID) as u64,
+            16,
+        ),
+        (libc::CLONE_PARENT_SETTID as u64, 24),
+    ] {
+        if flags & active != 0 && excludes(field(offset), 4) {
+            return Err(InputUnavailable::new(
+                "clone-native-output-overlaps-reserved-page",
+            ));
+        }
+    }
+    if field(48) != 0 && excludes(field(40), field(48)) {
+        return Err(InputUnavailable::new(
+            "clone-child-stack-overlaps-reserved-page",
+        ));
+    }
+    if flags & libc::CLONE_SETTLS as u64 != 0 && excludes(field(56), 1) {
+        return Err(InputUnavailable::new("clone-tls-overlaps-reserved-page"));
+    }
+    if entries.len() > MAX_SET_TID {
+        return Err(InputUnavailable::new("clone-set-tid-image-too-large"));
+    }
+    let mut array = [0; MAX_SET_TID * std::mem::size_of::<libc::pid_t>()];
+    for (entry, bytes) in entries.iter().zip(array.chunks_exact_mut(4)) {
+        bytes.copy_from_slice(&entry.to_ne_bytes());
+    }
+    let array_address = layout.base;
+    let args_address = layout.base + array.len() as u64;
+    let staged_args = ChosenIdCall::with_set_tid(args, array_address, entries.len());
+    let image = ReservedInputImage::new(
+        layout,
+        &[
+            InputWrite {
+                offset: 0,
+                bytes: &array,
+            },
+            InputWrite {
+                offset: array.len(),
+                bytes: &staged_args,
+            },
+        ],
+    )?;
+    let rewritten = syscalls::Clone3::new()
+        .with_args(AddrMut::from_raw(args_address as usize))
+        .with_size(size);
+    Ok((image, rewritten, array_address))
 }
 
 /// How a clone-family call is issued, as [`Detcore::plan_clone_id`] decides.
@@ -907,7 +1002,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         reason: &str,
     ) -> Result<i64, Errno> {
         self.vfork_gets_host_id(guest, reason).await;
-        let result = guest.inject(call).await;
+        let result = crate::reserved_input::inject_original_clone(guest, call).await;
         if let Err(errno) = result
             && !is_restart(errno)
         {
@@ -928,7 +1023,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Errno> {
-        let result = guest.inject(call).await;
+        let result = crate::reserved_input::inject_original_clone(guest, call).await;
         if let Ok(child) = result {
             self.gave_host_id(
                 guest,
@@ -950,12 +1045,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         vfork: bool,
     ) -> Result<i64, Errno> {
         match plan {
-            ClonePlan::Kernel | ClonePlan::GuestChosen => guest.inject(call).await,
+            ClonePlan::Kernel | ClonePlan::GuestChosen => {
+                crate::reserved_input::inject_original_clone(guest, call).await
+            }
             ClonePlan::AsMade { reason } => {
                 if vfork {
                     return self.issue_reported_vfork(guest, call, &reason).await;
                 }
-                let result = guest.inject(call).await;
+                let result = crate::reserved_input::inject_original_clone(guest, call).await;
                 if let Ok(child) = result {
                     self.gave_host_id(guest, child, &reason).await;
                 }
@@ -976,9 +1073,61 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Prepare and issue one native attempt with an owned immutable image.
+    /// A successful mechanism result certifies full-page write/readback and
+    /// settled ownership even when the native syscall returned an errno.
+    async fn stage_chosen_clone<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        args: [u8; CLONE_ARGS_SIZE_VER2],
+        set_tid: &[libc::pid_t],
+        size: usize,
+        attribution: Option<&AddedIdEvidence>,
+    ) -> Result<(Result<i64, Errno>, bool), InputInjectionError> {
+        let (control, task) = crate::reserved_input::capability(guest)
+            .ok_or_else(|| InputUnavailable::new("reserved-input-facility-unavailable"))?;
+        let layout = control
+            .layout(task)
+            .ok_or_else(|| InputUnavailable::new("reserved-input-layout-unqualified"))?;
+        let (image, rewritten, array) = reserved_clone_image(layout, call, args, set_tid, size)?;
+        // Compare F2's complete expected struct/array against the future view.
+        // The backend uses that same immutable image for preparation and
+        // native readback; there is no Tool callback after page publication.
+        let input_matches =
+            attribution.is_some_and(|proof| proof.staged_matches(&image, &rewritten, array));
+        let scope = control.begin_operation(task, guest.thread_state().stats.syscall_count)?;
+        let args_address = rewritten.args().expect("fixed reserved address").as_raw();
+        let args_offset = args_address - layout.base as usize;
+        let description = crate::reserved_input::clone_description(
+            rewritten.into(),
+            Some((
+                args_address as u64,
+                &image.bytes()[args_offset..args_offset + CLONE_ARGS_SIZE_VER2],
+            )),
+            guest.reserved_input_process_exit_signal().ok(),
+        );
+        let receipt = match control.prepare_injection(&scope, description) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                control.finish_operation(scope)?;
+                return Err(error.into());
+            }
+        };
+        let result = guest
+            .inject_staged_input(rewritten, &scope, image, receipt)
+            .await;
+        // No synthetic grant: finish only releases this operation's consumed
+        // capability after the native ledger proves its physical obligations.
+        control
+            .finish_operation(scope)
+            .map_err(|error| InputInjectionError::Fatal(error.to_string()))?;
+        result.map(|native| (native, input_matches))
+    }
+
     /// Issue the guest's clone-family call `call` as `clone3` creating its
-    /// task with the `set_tid` array `chosen` names, through scratch memory in
-    /// the guest.
+    /// task with the `set_tid` array `chosen` names, through backend-owned
+    /// sealed input, never through a borrowed application stack.
     ///
     /// The added ID can introduce `EEXIST` when held, `EPERM` without the
     /// capability to choose it, or `EINVAL` when out of range. EINVAL may be
@@ -1056,32 +1205,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .issue_as_made(guest, call, &cause, untraced, vfork)
                 .await;
         }
-        let mut entries = [0 as libc::pid_t; MAX_SET_TID];
-        entries[..set_tid.len()].copy_from_slice(&set_tid);
-        let mut stack = guest.stack().await;
-        let array = stack.push(entries);
-        let args = stack.push(ChosenIdCall::with_set_tid(
-            args,
-            array.as_raw() as u64,
-            set_tid.len(),
-        ));
-        let cause = match stack.commit() {
-            Ok(scratch) => {
-                let rewritten = syscalls::Clone3::new()
-                    .with_args(AddrMut::from_raw(args.as_raw()))
-                    .with_size(size);
-                if attribution.as_ref().is_some_and(|evidence| {
-                    !evidence.staged_matches(
-                        &guest.memory(),
-                        guest.tid().as_raw(),
-                        &rewritten,
-                        array.as_raw() as u64,
-                    )
-                }) {
+        let cause = match self
+            .stage_chosen_clone(guest, call, args, &set_tid, size, attribution.as_ref())
+            .await
+        {
+            Ok((result, staged_matches)) => {
+                if !staged_matches {
                     attribution = None;
                 }
-                let result = guest.inject(rewritten).await;
-                drop(scratch);
                 // No child exists after EINVAL. Recheck the same allocated
                 // value, not a PID obtained from the failed syscall result.
                 // Matching samples do not exclude pid_max ABA; the admitted
@@ -1154,7 +1285,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     },
                 }
             }
-            Err(error) => format!("its scratch memory could not be written: {error}"),
+            Err(InputInjectionError::Unavailable(error)) => {
+                format!("its reserved input is unavailable: {error}")
+            }
+            Err(InputInjectionError::Fatal(error)) => {
+                // The backend has already failed the run before permitting a
+                // continuation. This must not become a guest errno or retry.
+                panic!("reserved-input native ownership failure: {error}")
+            }
         };
         // A run that needs every ID chosen ends here, before the guest's own
         // call could create a task with a host ID (and, for vfork, run it).
@@ -1199,7 +1337,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if vfork {
             return self.issue_reported_vfork(guest, call, cause).await;
         }
-        let original = guest.inject(call).await;
+        let original = crate::reserved_input::inject_original_clone(guest, call).await;
         if let Ok(child) = original {
             self.gave_host_id(guest, child, cause).await;
         }

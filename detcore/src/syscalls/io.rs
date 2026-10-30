@@ -4340,6 +4340,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return;
         }
         let (sent, unread) = sent_descriptors(guest, headers);
+        crate::reserved_input::before_descriptor_export(guest, &sent, unread)
+            .unwrap_or_else(|error| panic!("reserved-input export publication failed: {error}"));
         if !sent.is_empty() || unread {
             guest.thread_state_mut().passed_descriptors_out_unreported = true;
             clear_guest_created(guest, &sent);
@@ -4367,6 +4369,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             && !config.recordreplay_modes
             && matches!(call, Syscall::Sendmsg(_) | Syscall::Sendmmsg(_))
         {
+            // The native ancillary import and descriptor lookup can happen
+            // after another task changed them. The old poll-reliance report
+            // is not a persistent-reference certificate.
+            crate::reserved_input::before_descriptor_export(guest, &[], true).unwrap_or_else(
+                |error| panic!("reserved-input export publication failed: {error}"),
+            );
             guest.thread_state_mut().passed_descriptors_out_unreported = true;
         }
     }
@@ -4385,9 +4393,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(crate) fn passes_descriptors_out_now<G: Guest<Self>>(guest: &mut G, call: Syscall) -> bool {
         let config = guest.config();
         if !config.sequentialize_threads || config.recordreplay_modes {
-            return false;
-        }
-        if guest.thread_state().passed_descriptors_out_reported {
             return false;
         }
         let (sockfd, headers): (RawFd, Vec<usize>) = match call {
@@ -4416,6 +4421,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             return false;
         }
         let (sent, unread) = sent_descriptors(guest, &headers);
+        crate::reserved_input::before_descriptor_export(guest, &sent, unread)
+            .unwrap_or_else(|error| panic!("reserved-input export publication failed: {error}"));
+        if guest.thread_state().passed_descriptors_out_reported {
+            return false;
+        }
         if sent.is_empty() && !unread {
             return false;
         }

@@ -13,6 +13,11 @@ dependency.
 Compatibility is substantial but incomplete, especially for less common Linux
 system calls.
 
+Chosen IDs for `--no-namespace` have a reserved-input admission contract,
+including named refusals for legacy Chosen schedule JSON and raw Chosen binary
+record/replay. See [Chosen process IDs](CHOSEN_IDS.md) for the supported scope,
+native-rseq incompatibility, observable mapping and remaining boundaries.
+
 ## Supported Environment
 
 Hermit supports x86_64 Linux. It requires:

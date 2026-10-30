@@ -3140,7 +3140,7 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 641887661b506b4d856489eb06787bc5b4f40a28 (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
+# CARRY TO 0c35d21fca4485fac3194071b13b6e34f6573f1b (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
 # Interval: reverie train (1111, 1116, 1136, 1147, 1148, 1152, 1155,
 # 1160, 1161, 1162, 1178, 1179). The reverie-dbt tree is unchanged;
 # reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
@@ -3161,18 +3161,16 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-# CARRY TO de4e3baa94acf31ad270fb452e03aead294f833a (2026-10-30): from 641887661b506b4d856489eb06787bc5b4f40a28.
-# Interval: Reverie main 64188766..dc415e98 (one commit, dc415e98, which
-# fixes a reverie-dbt evidence test in reverie-dbt/src/evidence.rs), then
-# this slice: LinuxEmu's FIONREAD forwarding on inotify and its
-# faulting-iovec copy-back (de4e3baa). The reverie-dbt tree changed
-# (dc415e98) and the committed inventory stays 1043.
-# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
-# and third-party/ are byte-identical by git object id between the pins
-# (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
-# carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != de4e3baa94acf31ad270fb452e03aead294f833a ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie de4e3baa94acf31ad270fb452e03aead294f833a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# F1 CARRY TO d4307cec5902cbdc38a48f6222833a593003b525: native recipe input objects equal 0c35d21fca4485fac3194071b13b6e34f6573f1b.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+# F1 CARRY TO 3d6dd4be69a01c7ff80039e7736a350a4e525865: native recipe input objects equal d4307cec5902cbdc38a48f6222833a593003b525.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3d6dd4be69a01c7ff80039e7736a350a4e525865 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3d6dd4be69a01c7ff80039e7736a350a4e525865 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

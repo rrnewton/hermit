@@ -274,6 +274,10 @@ async fn run_captured(physical: PhysicalRun, captured: &mut CapturedNativeOutput
         print_summary,
         summary_json,
     } = physical;
+    // This path bypasses the ordinary typed dispatcher. Check the real
+    // configuration before stdin replay, global state or native execution.
+    detcore::preemptions::validate_config_replay_inputs(&config)?;
+    <detcore::Detcore as reverie::Tool>::facility_admission(&config)?;
     replay_native_stdin(&mut command)?;
     detcore::native_exec::validate_native_exec_host_configuration(&config)
         .map_err(|e| anyhow::anyhow!("native host Config refused: {e:?}"))?;

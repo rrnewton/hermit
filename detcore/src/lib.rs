@@ -85,6 +85,7 @@ pub mod race_probe;
 pub mod random;
 mod record_or_replay;
 pub mod refused_signal_controls;
+mod reserved_input;
 mod resources;
 mod scheduler;
 mod shared_open_files;
@@ -173,7 +174,10 @@ use rand::RngExt as _;
 use raw_cpuid::CpuIdResult;
 #[cfg(target_arch = "x86_64")]
 use raw_cpuid::cpuid;
+pub use record_or_replay::ChosenBinaryInputRefusal;
 pub use record_or_replay::RecordOrReplay;
+pub use record_or_replay::admit_chosen_input_stream;
+pub use record_or_replay::require_chosen_input_stream;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
@@ -2242,16 +2246,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`ptrace_signal` requeues a blocked one) and no gdbserver client
         // can change or cancel it at the resume.
         let may_retire_others = crate::syscalls::retires_others_at_fatal_delivery(&self.cfg);
-        let retired_the_others = (may_retire_others
+        let asks_about_fatal_delivery = may_retire_others
             || self.cfg.pipe_wake_latency_in_effect().is_some()
-            || self.cfg.virtual_timeout.is_some())
-            && match crate::syscalls::fatal_default_delivery(guest, signal.raw(), may_retire_others)
-            {
-                Some(retire_others) => {
-                    tool_global::commit_fatal_delivery(guest, retire_others).await
+            || self.cfg.virtual_timeout.is_some();
+        let input_facility = crate::reserved_input::capability(guest).is_some();
+        let fatal_observation = if input_facility {
+            crate::syscalls::fatal_delivery_observation(guest, signal.raw(), may_retire_others)
+        } else if asks_about_fatal_delivery {
+            match crate::syscalls::fatal_default_delivery(guest, signal.raw(), may_retire_others) {
+                Some(may_retire_others) => {
+                    crate::syscalls::FatalDeliveryObservation::Fatal { may_retire_others }
                 }
-                None => false,
+                None => crate::syscalls::FatalDeliveryObservation::Nonfatal,
+            }
+        } else {
+            crate::syscalls::FatalDeliveryObservation::Unknown
+        };
+        if input_facility
+            && fatal_observation != crate::syscalls::FatalDeliveryObservation::Nonfatal
+        {
+            crate::reserved_input::freeze_group(guest).unwrap_or_else(|error| {
+                panic!("reserved-input pre-delivery ownership failure: {error}")
+            });
+        }
+        let retired_the_others = asks_about_fatal_delivery
+            && match fatal_observation {
+                crate::syscalls::FatalDeliveryObservation::Fatal {
+                    may_retire_others: retire_others,
+                } => tool_global::commit_fatal_delivery(guest, retire_others).await,
+                _ => false,
             };
+        crate::reserved_input::after_fatal_commit(guest, fatal_observation, retired_the_others)
+            .unwrap_or_else(|error| {
+                panic!("reserved-input post-delivery ownership failure: {error}")
+            });
         // A timer entry's siginfo, with its overrun counted now that the
         // delivery's turn is granted, where the handler's time begins.
         if timer_entry {
@@ -3863,6 +3891,32 @@ fn posthook_checkpoint(
 impl<T: RecordOrReplay> Tool for Detcore<T> {
     type GlobalState = GlobalState;
     type ThreadState = ThreadState<T::ThreadState>;
+
+    fn stream_role() -> reverie::ToolStreamRole {
+        T::stream_role()
+    }
+
+    fn facility_admission(config: &Config) -> Result<(), reverie::Error> {
+        // This is an operational pre-start hook. subscriptions and the
+        // capability queries remain pure, including when called by another
+        // Tool to decide whether its own guarantees hold.
+        if let Err(refusal) =
+            crate::record_or_replay::require_chosen_input_stream(config, T::stream_role())
+        {
+            crate::scheduler::exit_on_scheduler_refusal(&refusal);
+        }
+        T::facility_admission(config)
+    }
+
+    fn reserved_input_requirement(
+        config: &Config,
+    ) -> Option<reverie::reserved_input::ReservedInputRequirement> {
+        matches!(
+            config.guest_ids,
+            detcore_model::pid::GuestIds::Chosen { .. }
+        )
+        .then(reverie::reserved_input::ReservedInputRequirement::sealed_page)
+    }
 
     fn native_mm_ownership(config: &Config) -> reverie::NativeMmOwnership {
         // Guest-local initialization and callback polling use the backend's
@@ -5949,6 +6003,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Box::pin(f).await polls `f` exactly as `f.await` does: no await
         // moves and no arm changes behaviour. `syscall_hot_path_tests` bounds
         // the result.
+        let descriptor_acquisition =
+            crate::reserved_input::DescriptorAcquisition::begin(guest, call)?;
         let res = match classify_syscall(call.number()) {
             _ if sigalrm_refusal.is_some() => {
                 syscall_histogram::mark_refused::<T, G>(guest);
@@ -5978,6 +6034,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
                 } else {
+                    let (_, args) = call.into_parts();
+                    // RSEQ_FLAG_UNREGISTER is the only known non-registering
+                    // operation. Unknown flags are not disjointness evidence.
+                    if args.arg2 != 1 {
+                        crate::reserved_input::expose_local_overlap(
+                            guest,
+                            args.arg0 as u64,
+                            args.arg1 as u64,
+                            "rseq-reserved-reference",
+                        )?;
+                        crate::reserved_input::expose_local(
+                            guest,
+                            "native-rseq-reference-unverified",
+                        )?;
+                    }
                     self.passthrough(guest, call).await
                 }
             }
@@ -7147,6 +7218,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
             }
         };
+        if (res.is_ok() || matches!(&res, Err(Error::Errno(_))))
+            && let Some(acquisition) = descriptor_acquisition
+        {
+            acquisition.completed(guest)?;
+        }
+        // A Tool error/cancellation deliberately retains an unresolved import.
         // The restart checkpoint (A5 step 3c.1c, design D40, placed by IR-2):
         // under the in-guest delivery gate, a wait a signal ended gets the
         // result the guest sees here, before anything below observes `res`.

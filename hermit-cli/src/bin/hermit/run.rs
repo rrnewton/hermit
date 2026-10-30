@@ -12316,6 +12316,8 @@ impl RunOpts {
         self.refuse_unready_exec_stop()?;
         // Analyze and other in-process callers bypass the outer CLI entry.
         self.refuse_an_invalid_replayed_record()?;
+        detcore::preemptions::validate_config_replay_inputs(&self.det_opts.det_config)?;
+        <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
         let mut options = self.clone();
         options.det_opts.det_config.annotated_priority_replay =
             options.annotated_priority_replay_admission()?;
@@ -12428,6 +12430,11 @@ impl RunOpts {
         self.guest_ids_drawn_from_host =
             guest_ids_drawn_from_host(self.no_namespace, ids, required.is_some() || self.strict);
         self.det_opts.det_config.guest_ids = ids;
+        // Namespace-only execs the command directly: it does not construct
+        // Detcore or read a schedule. Keep its ignored replay options ignored.
+        if !self.namespace_only {
+            detcore::preemptions::validate_config_replay_inputs(&self.det_opts.det_config)?;
+        }
         Ok(())
     }
 
@@ -12440,17 +12447,36 @@ impl RunOpts {
             return Ok(None);
         }
         let config = &self.det_opts.det_config;
-        let replayed = [
+        let mut replayed = None;
+        for (option, path) in [
             ("--replay-preemptions-from", &config.replay_preemptions_from),
             ("--replay-schedule-from", &config.replay_schedule_from),
-        ]
-        .into_iter()
-        .find_map(|(option, path)| Some((option, path.as_ref()?)));
-        let Some((option, path)) = replayed else {
-            return Ok(None);
-        };
-        let recorded = detcore::preemptions::read_recorded_guest_ids(path).map_err(Error::msg)?;
-        Ok(Some((format!("{option} {}", path.display()), recorded)))
+        ] {
+            let Some(path) = path else { continue };
+            let record = detcore::preemptions::boundary_recording::Recording::read(path)?;
+            let source = format!("{option} {}", path.display());
+            let recorded = record.guest_ids();
+            // Before host-ID probes/container setup, use the same full record
+            // to check its required layout and numbering. Final loaders repeat
+            // this on the immutable bytes they actually install.
+            let runtime_ids =
+                self.pid_base
+                    .map_or(recorded, |base| detcore_model::pid::GuestIds::Chosen {
+                        base,
+                        refuse_host_ids: true,
+                    });
+            record.validate_replay_inputs(&source, runtime_ids)?;
+            if let Some((_, previous)) = &replayed
+                && let Some(refusal) =
+                    detcore::preemptions::guest_ids_mismatch(&source, *previous, recorded)
+            {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+            if replayed.is_none() {
+                replayed = Some((source, recorded));
+            }
+        }
+        Ok(replayed)
     }
 
     fn warn_no_namespace(&self) {
@@ -12489,6 +12515,10 @@ impl RunOpts {
     {
         self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
+        if !self.namespace_only {
+            detcore::preemptions::validate_config_replay_inputs(&self.det_opts.det_config)?;
+            <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
+        }
         let gdbserver_port = self.bind_gdbserver_port()?;
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
             let mut container = Container::new();

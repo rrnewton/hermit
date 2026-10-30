@@ -2210,6 +2210,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         ) {
             return false;
         }
+        crate::reserved_input::before_exit_group(guest)
+            .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: true,
@@ -2426,6 +2428,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 return self.send_reserved_sigkill(guest, reservation, call).await;
             }
+            crate::reserved_input::before_signal_send(guest, call.sig(), false)?;
             return Ok(self.record_or_replay(guest, call).await?);
         }
         if tgid <= 0 {
@@ -2494,6 +2497,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         Some(DetPid::from_raw(process)),
                         false,
                         named,
+                        false,
                     )
                     .await;
             }
@@ -2525,6 +2529,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(DetPid::from_raw(process)),
                 false,
                 DetTid::from_raw(tgid),
+                false,
             )
             .await?
         } else if process == self.detpid.as_raw()
@@ -2566,6 +2571,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(DetPid::from_raw(process)),
                 false,
                 DetTid::from_raw(tgid),
+                false,
             )
             .await?
         } else {
@@ -2581,6 +2587,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(DetPid::from_raw(process)),
                 false,
                 DetTid::from_raw(tgid),
+                false,
             )
             .await?
         };
@@ -2765,6 +2772,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let call: syscalls::Syscall = call.into();
         let siginfo = sent_siginfo(guest, &call, sig);
         guest.thread_state_mut().own_signal_turn_hold = Some(sig);
+        crate::reserved_input::before_signal_send(guest, sig, false)?;
         let result = self.record_or_replay(guest, call).await;
         if result.is_err() {
             guest.thread_state_mut().own_signal_turn_hold = None;
@@ -3282,7 +3290,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(0);
         }
-        let _reserved = self
+        let reserved_exit = self
             .reserve_controlled_self_sigkill_exit(
                 guest,
                 call.sig(),
@@ -3321,6 +3329,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None,
                 true,
                 DetTid::from_raw(tid),
+                reserved_exit || exited_leader || tid <= 0 || tgid <= 0,
             )
             .await?;
         // The kernel accepted a SIGKILL that changes nothing: no thread takes
@@ -3418,7 +3427,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(0);
         }
-        let _reserved = self
+        let reserved_exit = self
             .reserve_controlled_self_sigkill_exit(
                 guest,
                 call.sig(),
@@ -3445,6 +3454,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None,
                 true,
                 DetTid::from_raw(tid),
+                reserved_exit || exited_leader || tid <= 0,
             )
             .await?;
         // As in `tgkill`, a SIGKILL to an exited leader changes nothing.
@@ -3546,6 +3556,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         target_process: Option<DetPid>,
         thread_directed: bool,
         named: DetTid,
+        terminal_covered: bool,
     ) -> Result<i64, Error>
     where
         G: Guest<Self>,
@@ -3612,6 +3623,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let token = self.discard_pre_send(guest, named, queue, raw_signal).await;
         let siginfo = sent_siginfo(guest, &syscall, raw_signal);
+        crate::reserved_input::before_signal_send(guest, raw_signal, terminal_covered)?;
         let result = self.record_or_replay(guest, syscall).await;
         if result.is_err()
             && let Some(undo) = undo
@@ -4286,6 +4298,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None,
                 true,
                 DetTid::from_raw(tid),
+                exited_leader || tid <= 0 || call.tgid() <= 0,
             )
             .await?;
         if exited_leader {
@@ -4518,6 +4531,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         Some(DetPid::from_raw(process)),
                         false,
                         named,
+                        false,
                     )
                     .await;
             }
@@ -4552,6 +4566,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(DetPid::from_raw(process)),
                 false,
                 DetTid::from_raw(tgid),
+                false,
             )
             .await?
         } else {
@@ -4568,6 +4583,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(DetPid::from_raw(process)),
                 false,
                 DetTid::from_raw(tgid),
+                false,
             )
             .await?
         };

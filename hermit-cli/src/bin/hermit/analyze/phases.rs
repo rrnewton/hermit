@@ -52,6 +52,19 @@ fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
     let mut pr2 = PreemptionReader::new(path2).load_all();
     pr1.preemptions_only();
     pr2.preemptions_only();
+    if matches!(pr1.guest_ids(), Some(detcore::GuestIds::Chosen { .. }))
+        || matches!(pr2.guest_ids(), Some(detcore::GuestIds::Chosen { .. }))
+    {
+        if pr1.validate_combined_reserved_inputs(&pr2).is_err() {
+            return false;
+        }
+    } else {
+        // Before this field existed, non-Chosen comparisons ignored this
+        // unknown JSON member. Keep that exact comparison domain: every old
+        // field below still participates, while full data equality elsewhere
+        // continues to distinguish opaque metadata for round-trip checks.
+        pr2 = pr2.with_reserved_input(pr1.reserved_input().clone());
+    }
     pr1 == pr2
 }
 
@@ -1668,6 +1681,62 @@ mod tests {
     use super::*;
     use crate::container::LogCapExceeded;
     use crate::container::PolicyRefusal;
+
+    #[test]
+    fn preemption_file_comparison_preserves_its_original_non_chosen_domain() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.json");
+        let second = directory.path().join("second.json");
+        let plain = PreemptionRecord::default().with_pipe_wake_latency(Some(3));
+        let mut future = serde_json::to_value(&plain).unwrap();
+        future["reserved_input"] = serde_json::json!({"future": [null, 17]});
+        let opaque: PreemptionRecord = serde_json::from_value(future).unwrap();
+        assert_ne!(
+            plain, opaque,
+            "full data equality must retain the new metadata"
+        );
+        plain.write_to_disk(&first).unwrap();
+        opaque.write_to_disk(&second).unwrap();
+        assert!(preempt_files_equal(&first, &second));
+        assert!(preempt_files_equal(&second, &first));
+        opaque
+            .clone()
+            .with_pipe_wake_latency(Some(4))
+            .write_to_disk(&second)
+            .unwrap();
+        assert!(
+            !preempt_files_equal(&first, &second),
+            "an original metadata mismatch still fails"
+        );
+
+        let ids = detcore::GuestIds::Chosen {
+            base: 5000,
+            refuse_host_ids: true,
+        };
+        let mut value = serde_json::to_value(plain.with_guest_ids(ids)).unwrap();
+        value["reserved_input"] = serde_json::json!({
+            "contract": "sealed-private-input-v1", "base": "0x71010000",
+            "abi": "x86_64", "page_bytes": 4096
+        });
+        let qualified: PreemptionRecord = serde_json::from_value(value.clone()).unwrap();
+        qualified.write_to_disk(&first).unwrap();
+        qualified.write_to_disk(&second).unwrap();
+        assert!(preempt_files_equal(&first, &second));
+        value["reserved_input"]["abi"] = serde_json::json!("aarch64");
+        serde_json::from_value::<PreemptionRecord>(value)
+            .unwrap()
+            .write_to_disk(&second)
+            .unwrap();
+        assert!(
+            !preempt_files_equal(&first, &second),
+            "Chosen layouts remain strict"
+        );
+        opaque.with_guest_ids(ids).write_to_disk(&second).unwrap();
+        assert!(
+            !preempt_files_equal(&first, &second),
+            "Chosen unknown metadata remains inadmissible"
+        );
+    }
 
     /// Capturing both stacks is not proof that the candidate completed. This
     /// drives the final adapter used by production reporting, including its

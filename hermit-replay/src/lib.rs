@@ -54,6 +54,7 @@ pub fn spawn_tracer(
     sequentialized_guest: bool,
 ) -> SpawnTracer {
     Box::pin(async move {
+        detcore::admit_chosen_input_stream(&config, reverie::ToolStreamRole::BinaryReplay);
         let mut builder = reverie_ptrace::TracerBuilder::<detcore::Detcore<Replayer>>::new(command)
             .config(config);
         if let Some(connection) = gdbserver {

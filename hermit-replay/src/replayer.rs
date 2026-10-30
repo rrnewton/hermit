@@ -495,6 +495,10 @@ impl Default for Replayer {
 
 #[reverie::tool]
 impl Tool for Replayer {
+    fn stream_role() -> reverie::ToolStreamRole {
+        reverie::ToolStreamRole::BinaryReplay
+    }
+
     type GlobalState = detcore::GlobalState;
     type ThreadState = ReplayerThreadState;
 

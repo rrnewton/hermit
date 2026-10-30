@@ -11,6 +11,7 @@
 pub mod boundary_recording;
 pub mod callback_history;
 mod record_serde;
+mod reserved_input;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -22,6 +23,11 @@ use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::collections::ReplayCursor;
 use detcore_model::host_input::HostInputSet;
+pub use reserved_input::RecordAdmissionRefusal;
+pub(crate) use reserved_input::ReservedInputLayout;
+pub use reserved_input::ReservedInputMetadata;
+pub use reserved_input::read_recorded_reserved_input;
+pub use reserved_input::validate_config_replay_inputs;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::trace;
@@ -99,6 +105,10 @@ pub struct PreemptionRecord {
     /// completeness. Newly marked JSON uses a mandatory envelope that old
     /// readers reject, and marked non-human serialization is refused.
     replay_departed_at: Option<u64>,
+    /// The actual private-input layout of the producing target images. This
+    /// standalone JSON member is deliberately absent from ThreadHistory/RPC.
+    /// Unknown values are retained for editing and non-Chosen replay.
+    reserved_input: ReservedInputMetadata,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
@@ -275,6 +285,7 @@ impl PreemptionRecord {
             chaos_timeslice: None,
             guest_ids: None,
             replay_departed_at: None,
+            reserved_input: ReservedInputMetadata::default(),
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -340,6 +351,7 @@ impl PreemptionRecord {
             cap_preemption_charge,
             chaos_timeslice,
             guest_ids,
+            reserved_input,
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
@@ -392,6 +404,7 @@ impl PreemptionRecord {
             cap_preemption_charge: *cap_preemption_charge,
             chaos_timeslice: *chaos_timeslice,
             guest_ids: *guest_ids,
+            reserved_input: reserved_input.clone(),
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
@@ -452,6 +465,8 @@ impl PreemptionRecord {
     ) -> Result<Self, String> {
         self.validate()?;
         other.validate()?;
+        self.validate_combined_reserved_inputs(other)
+            .map_err(|refusal| refusal.to_string())?;
         if self.format_version != other.format_version {
             return Err(format!(
                 "cannot interpolate record formats {:?} and {:?}: their replay rules differ; record both inputs with the same Hermit version and timing format",
@@ -483,9 +498,22 @@ impl PreemptionRecord {
             record
         };
         let mut record = metadata(self);
+        let mut other_metadata = metadata(other);
+        if !matches!(
+            self.guest_ids,
+            Some(detcore_model::pid::GuestIds::Chosen { .. })
+        ) && !matches!(
+            other.guest_ids,
+            Some(detcore_model::pid::GuestIds::Chosen { .. })
+        ) {
+            // Opaque provenance adds no admission rule to non-Chosen edits.
+            // Keep the selected source's value without interpreting a future
+            // descriptor or demanding that previously ignored fields agree.
+            other_metadata.reserved_input = record.reserved_input.clone();
+        }
         // HostObservedCount deliberately compares equal for ordinary replay
         // comparisons, so interpolation must check its stored value explicitly.
-        if record != metadata(other)
+        if record != other_metadata
             || self.store_exclusive_failures() != other.store_exclusive_failures()
         {
             return Err(
@@ -728,6 +756,7 @@ impl PreemptionRecord {
             guest_ids: self.guest_ids,
             // A record derived from an inexact one is inexact too.
             replay_departed_at: self.replay_departed_at,
+            reserved_input: self.reserved_input.clone(),
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
@@ -799,6 +828,7 @@ impl PreemptionRecord {
             chaos_timeslice: None,
             guest_ids: None,
             replay_departed_at: None,
+            reserved_input: ReservedInputMetadata::default(),
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -2338,6 +2368,7 @@ mod tests {
 #[derive(Debug)]
 pub struct PreemptionWriter {
     inner: PreemptionRecord,
+    reserved_input_qualification: reserved_input::ProducerQualification,
     boundary_records: Option<Vec<detcore_model::schedule::boundary::Record>>,
     dest: Option<PathBuf>,
     flushed: bool,
@@ -2349,9 +2380,44 @@ impl PreemptionWriter {
     pub fn new(path: Option<PathBuf>) -> Self {
         PreemptionWriter {
             inner: Default::default(),
+            reserved_input_qualification: Default::default(),
             boundary_records: None,
             dest: path,
             flushed: false,
+        }
+    }
+
+    /// Observe the actual authenticated target-image setup through the local
+    /// GlobalTool hook, never requested Config or a launcher bootstrap. A failed
+    /// or unproved executed image permanently removes this producer's mark.
+    pub(crate) fn observe_reserved_input_setup(
+        &mut self,
+        receipt: &reverie::reserved_input::InputSetupReceipt,
+    ) -> Result<(), RecordAdmissionRefusal> {
+        use reverie::reserved_input::InputAbi;
+        use reverie::reserved_input::InputSetupOutcome;
+        let layout = match &receipt.outcome {
+            InputSetupOutcome::Qualified(layout) => {
+                Some(ReservedInputLayout::from_authenticated_setup(
+                    match layout.abi {
+                        InputAbi::X86_64 => "x86_64",
+                        InputAbi::Aarch64 => "aarch64",
+                    },
+                    layout.base,
+                    layout.page_bytes as u64,
+                ))
+            }
+            InputSetupOutcome::Unqualified(_) => None,
+        };
+        match layout.transpose() {
+            Ok(layout) => {
+                self.inner.reserved_input = self.reserved_input_qualification.observe(layout);
+                Ok(())
+            }
+            Err(refusal) => {
+                self.inner.reserved_input = self.reserved_input_qualification.observe(None);
+                Err(refusal)
+            }
         }
     }
 

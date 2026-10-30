@@ -69,6 +69,9 @@ struct Reservation {
     /// Whether the victims include the sender's own process: such a send is
     /// committed at the sender's `Exit` grant, before it is sent.
     includes_sender: bool,
+    /// Native group intents installed before the reservation reply can let
+    /// the sender await or issue its kill. The registry retains late members.
+    input_freezes: Vec<reverie::reserved_input::InputFreezeCohort>,
 }
 
 /// A reserved send: its token, and whether the victims include the sender's
@@ -318,6 +321,23 @@ impl Scheduler {
         }
         let token = self.sigkill.next_token;
         self.sigkill.next_token += 1;
+        let mut input_freezes = Vec::new();
+        if let Some(control) = &self.reserved_input_control {
+            let mut frozen_processes = BTreeSet::new();
+            for victim in &victims {
+                if !frozen_processes.insert(victim.process) {
+                    continue;
+                }
+                let own = self.registered_process(sender) == Some(victim.process);
+                let owner = if own { sender } else { victim.tid };
+                let task = *self.reserved_input_tasks.get(&owner).unwrap_or_else(|| {
+                    panic!("reserved-input SIGKILL reservation lacks native binding for {owner}")
+                });
+                input_freezes.push(control.freeze_group(task, !own).unwrap_or_else(|error| {
+                    panic!("reserved-input SIGKILL reservation freeze failed: {error}")
+                }));
+            }
+        }
         for victim in &victims {
             self.sigkill.reserved.insert(victim.tid, token);
         }
@@ -328,6 +348,7 @@ impl Scheduler {
                 sender,
                 uid,
                 includes_sender,
+                input_freezes,
             },
         );
         Ok(SigkillReservation {
@@ -478,6 +499,21 @@ impl Scheduler {
             self.sigkill.reserved.remove(&victim.tid);
         }
         if !sent {
+            if let Some(control) = &self.reserved_input_control {
+                for cohort in reservation.input_freezes {
+                    // The native send failed and this reservation commits no
+                    // logical retirement. Cancel only if the owned registry
+                    // also proves no native terminal effect. A death already
+                    // observed remains frozen for its ordinary exact fence.
+                    if let Err(error) = control.cancel_freeze_before_effect(cohort) {
+                        assert_eq!(
+                            error.reason(),
+                            "input-retirement-has-native-effect",
+                            "reserved-input failed-send intent could not be accounted"
+                        );
+                    }
+                }
+            }
             // No thread died, so no robust list is walked.
             self.sigkill
                 .robust_lists
@@ -899,6 +935,16 @@ impl Scheduler {
     /// Once no committed victim's physical exit is outstanding, run every
     /// retained wake batch, before step2 drains anything.
     pub(crate) fn run_retained_sigkill_wakes(&mut self) {
+        if !self.sigkill_fence_holds() {
+            let accounted: Vec<_> = self
+                .sigkill
+                .accounted
+                .iter()
+                .filter(|tid| !self.sigkill.reserved.contains_key(tid))
+                .copied()
+                .collect();
+            self.settle_reserved_input_fence(&accounted);
+        }
         if !self.sigkill_fence_holds() && !self.sigkill.retained_wakes.is_empty() {
             self.run_retained_wakes_of(|_| true);
         }

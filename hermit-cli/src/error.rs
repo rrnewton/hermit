@@ -157,6 +157,8 @@ fn is_policy_refusal(err: &Error) -> bool {
     // (https://github.com/rrnewton/reverie/issues/1064).
     fn refuses(cause: &(dyn std::error::Error + 'static)) -> bool {
         cause.is::<detcore::UnsupportedSyscallError>()
+            || cause.is::<detcore::preemptions::RecordAdmissionRefusal>()
+            || cause.is::<detcore::ChosenBinaryInputRefusal>()
             || cause.is::<detcore::TerminalReplayRefusal>()
             || cause.is::<detcore::PriorityHistoryRefusal>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()

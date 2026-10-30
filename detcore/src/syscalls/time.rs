@@ -1322,6 +1322,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             cpu_clock::classify(raw_clock_id(clockid)),
             ClockIdClass::Cpu(_)
         );
+        if signo == Some(libc::SIGKILL) {
+            crate::reserved_input::expose_global(guest, "posix-timer-sigkill")?;
+        }
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
             timers.create(signo, thread, value, on_cpu_clock)

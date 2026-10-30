@@ -1264,14 +1264,35 @@ impl AnalyzeOpts {
     /// formats cannot preserve their different switch-in charging rules.
     /// An incompatible format or invalid record is refused before writing.
     pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
-        let (skips, format) = {
+        let (skips, format, identity) = {
             let sources = self.time_skip_sources.lock().unwrap();
             (
                 sources.carried(record.schedevents()),
                 sources.trial_format()?,
+                sources.trial_identity_metadata(record.schedevents())?,
             )
         };
-        let record = self.stamp_trial_record(record.with_format(format).with_time_skips(skips));
+        let (guest_ids, reserved_input) = identity.unwrap_or_else(|| {
+            (
+                record.guest_ids().unwrap_or_default(),
+                record.reserved_input().clone(),
+            )
+        });
+        if matches!(
+            record.guest_ids(),
+            Some(detcore_model::pid::GuestIds::Chosen { .. })
+        ) {
+            record
+                .reserved_input()
+                .require_same_for_chosen(&reserved_input)?;
+        }
+        let record = self.stamp_trial_record(
+            record
+                .with_format(format)
+                .with_time_skips(skips)
+                .with_guest_ids(guest_ids)
+                .with_reserved_input(reserved_input),
+        );
         record.validate().map_err(anyhow::Error::msg)?;
         record.write_to_disk(path).map_err(anyhow::Error::msg)
     }

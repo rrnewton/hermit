@@ -475,6 +475,10 @@ impl Tool for Recorder {
     type GlobalState = detcore::GlobalState;
     type ThreadState = RecorderThreadState;
 
+    fn stream_role() -> reverie::ToolStreamRole {
+        reverie::ToolStreamRole::BinaryRecord
+    }
+
     fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Self {
             data: cfg.replay_data.as_ref().unwrap().clone(),

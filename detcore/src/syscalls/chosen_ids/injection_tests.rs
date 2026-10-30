@@ -8,8 +8,9 @@
 
 //! Error attribution through the real chosen-ID injection path. The scripted
 //! kernel distinguishes rewritten arguments from the original call, whose
-//! outcome is independent. Heap-backed scratch here does not model the
-//! lifetime of memory borrowed from a real guest stack.
+//! outcome is independent. The scripted reserved-page transport exercises the
+//! real policy and registry protocol, but does not certify native force-write,
+//! ptrace cancellation, or newborn lifecycle handling.
 
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -19,7 +20,15 @@ use futures::FutureExt;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Pid;
+use reverie::Stack;
 use reverie::Tool;
+use reverie::reserved_input::InputAbi;
+use reverie::reserved_input::InputGrantKind;
+use reverie::reserved_input::InputOperationScope;
+use reverie::reserved_input::InputTaskId;
+use reverie::reserved_input::PhysicalInjectionReceipt;
+use reverie::reserved_input::ReservedInputControl;
+use reverie::reserved_input::ReservedInputLayout;
 use reverie::syscalls::LocalMemory;
 
 use super::*;
@@ -84,6 +93,8 @@ struct CloneGuest {
     proof_context: bool,
     registry_queries: Mutex<Vec<i32>>,
     refused_registry_query: Option<usize>,
+    input_control: ReservedInputControl,
+    input_task: InputTaskId,
 }
 
 impl CloneGuest {
@@ -93,10 +104,12 @@ impl CloneGuest {
                 base: 5000,
                 refuse_host_ids,
             },
+            sequentialize_threads: true,
             ..Config::default()
         };
         let mut original_args = Box::new([0; CLONE_ARGS_SIZE_VER2]);
         original_args[32..40].copy_from_slice(&(libc::SIGCHLD as u64).to_ne_bytes());
+        let (input_control, input_task) = Self::input_owner(5000);
         Self {
             thread: ThreadState::new(DetPid::from_raw(5000), &config, ()),
             config,
@@ -110,7 +123,31 @@ impl CloneGuest {
             proof_context: false,
             registry_queries: Mutex::new(Vec::new()),
             refused_registry_query: None,
+            input_control,
+            input_task,
         }
+    }
+
+    fn input_owner(tid: i32) -> (ReservedInputControl, InputTaskId) {
+        let control = ReservedInputControl::new_backend().unwrap();
+        let task = control.backend_register_root(tid, tid).unwrap().task;
+        control
+            .backend_set_layout(
+                task,
+                ReservedInputLayout {
+                    base: reverie::reserved_input::RESERVED_INPUT_BASE,
+                    page_bytes: 4096,
+                    #[cfg(target_arch = "x86_64")]
+                    abi: InputAbi::X86_64,
+                    #[cfg(target_arch = "aarch64")]
+                    abi: InputAbi::Aarch64,
+                },
+            )
+            .unwrap();
+        // A scripted real-grant boundary, not a production bypass. Direct
+        // missing-authority and lifecycle tests live in the native suite.
+        control.grant(task, InputGrantKind::Ordinary).unwrap();
+        (control, task)
     }
 
     fn original_call(&self) -> Syscall {
@@ -143,6 +180,7 @@ impl CloneGuest {
             &self.config,
             (),
         );
+        (self.input_control, self.input_task) = Self::input_owner(std::process::id() as i32);
         let ids = Box::new([1]);
         self.original_args[0..8]
             .copy_from_slice(&(libc::CLONE_NEWPID as u64 | (1 << 40)).to_ne_bytes());
@@ -234,12 +272,96 @@ impl Guest<Detcore> for CloneGuest {
         panic!("the chosen-ID path does not need guest registers")
     }
     async fn stack(&mut self) -> Self::Stack {
-        Scratch::default()
+        panic!("chosen-ID staging must not borrow the application stack")
     }
     async fn daemonize(&mut self) {
         panic!("the chosen-ID path must not daemonize")
     }
     async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+        self.scripted_call(call, None)
+    }
+    fn reserved_input_control(&self) -> Option<ReservedInputControl> {
+        Some(self.input_control.clone())
+    }
+    fn reserved_input_task(&self) -> Option<InputTaskId> {
+        Some(self.input_task)
+    }
+    async fn inject_observed<S: SyscallInfo>(
+        &mut self,
+        call: S,
+        receipt: PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, InputInjectionError> {
+        let (number, args) = call.into_parts();
+        self.input_control.backend_bind_injection(
+            &receipt,
+            self.input_task,
+            number as u64,
+            [
+                args.arg0 as u64,
+                args.arg1 as u64,
+                args.arg2 as u64,
+                args.arg3 as u64,
+                args.arg4 as u64,
+                args.arg5 as u64,
+            ],
+        )?;
+        self.input_control.backend_issued(receipt.id())?;
+        let result = self.scripted_call(Syscall::from_raw(number, args), None);
+        if result.is_ok() {
+            // A mock numeric PID is not a native retained birth.
+            self.input_control.backend_unknown_outcome(receipt.id())?;
+        } else {
+            self.input_control.backend_no_child(receipt.id())?;
+        }
+        Ok(result)
+    }
+    async fn inject_staged_input<S: SyscallInfo>(
+        &mut self,
+        call: S,
+        scope: &InputOperationScope,
+        image: ReservedInputImage,
+        receipt: PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, InputInjectionError> {
+        self.input_control
+            .backend_begin_preparation(&receipt, scope, image.clone())?;
+        assert_eq!(
+            self.input_control.backend_prepared_stopped(receipt.id())?,
+            image
+        );
+        self.input_control.backend_initializing(receipt.id())?;
+        // Scripted transport only. The real backend must independently read
+        // these bytes through the stopped guest before issuing its syscall.
+        self.input_control
+            .backend_verified_image(receipt.id(), image.bytes())?;
+        self.input_control.backend_issued(receipt.id())?;
+        let result = self.scripted_call(call, Some(&image));
+        assert!(
+            result.is_err(),
+            "the attribution fixture scripts no child birth"
+        );
+        self.input_control.backend_no_child(receipt.id())?;
+        Ok(result)
+    }
+    async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+        panic!("the chosen-ID path must not tail-inject")
+    }
+    fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+        panic!("the chosen-ID path must not set a timer")
+    }
+    fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+        panic!("the chosen-ID path must not set a timer")
+    }
+    fn read_clock(&mut self) -> Result<u64, Error> {
+        panic!("the chosen-ID path must not read a clock")
+    }
+}
+
+impl CloneGuest {
+    fn scripted_call<S: SyscallInfo>(
+        &mut self,
+        call: S,
+        image: Option<&ReservedInputImage>,
+    ) -> Result<i64, Errno> {
         let (number, args) = call.into_parts();
         let Syscall::Clone3(clone) = Syscall::from_raw(number, args) else {
             panic!("expected clone3, got {number}")
@@ -247,9 +369,13 @@ impl Guest<Detcore> for CloneGuest {
         assert_eq!(clone.size(), CLONE_ARGS_SIZE_VER2);
         let original = clone.args().unwrap().as_raw() == self.original_args.as_ptr() as usize;
         let mut bytes = [0; CLONE_ARGS_SIZE_VER2];
-        self.memory()
-            .read_exact(clone.args().unwrap().cast::<u8>(), &mut bytes)
-            .unwrap();
+        if let Some(image) = image {
+            assert!(image.read(clone.args().unwrap().as_raw() as u64, &mut bytes));
+        } else {
+            self.memory()
+                .read_exact(clone.args().unwrap().cast::<u8>(), &mut bytes)
+                .unwrap();
+        }
         self.attempts.push(original);
         if original {
             assert_eq!(bytes, self.original_expected);
@@ -271,7 +397,15 @@ impl Guest<Detcore> for CloneGuest {
             assert_eq!(&bytes[SET_TID_SIZE_OFFSET..80], &count.to_ne_bytes());
             let address = u64::from_ne_bytes(bytes[SET_TID_OFFSET..72].try_into().unwrap());
             let mut observed = vec![0; count as usize];
-            read_pid_array(&self.memory(), address as usize, &mut observed).unwrap();
+            if let Some(image) = image {
+                let mut bytes = vec![0; count as usize * 4];
+                assert!(image.read(address, &mut bytes));
+                for (entry, bytes) in observed.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    *entry = i32::from_ne_bytes(*bytes);
+                }
+            } else {
+                read_pid_array(&self.memory(), address as usize, &mut observed).unwrap();
+            }
             let expected = if self.proof_context {
                 vec![1, 5001]
             } else {
@@ -280,18 +414,6 @@ impl Guest<Detcore> for CloneGuest {
             assert_eq!(observed, expected);
             Err(self.rewritten_errno)
         }
-    }
-    async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
-        panic!("the chosen-ID path must not tail-inject")
-    }
-    fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
-        panic!("the chosen-ID path must not set a timer")
-    }
-    fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
-        panic!("the chosen-ID path must not set a timer")
-    }
-    fn read_clock(&mut self) -> Result<u64, Error> {
-        panic!("the chosen-ID path must not read a clock")
     }
 }
 

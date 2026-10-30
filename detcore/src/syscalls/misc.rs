@@ -712,6 +712,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                     .await;
                 }
+                if signal == libc::SIGKILL as libc::c_ulong {
+                    crate::reserved_input::expose_global(guest, "kernel-parent-death-sigkill")?;
+                }
                 let result = self.passthrough(guest, call.into()).await?;
                 if held {
                     crate::tool_global::parent_death_signal(guest, Some(0)).await;

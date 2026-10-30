@@ -249,6 +249,26 @@ impl Recording {
         }
     }
 
+    /// Check the full decoded input that this loader will install. The
+    /// standalone metadata remains outside every returned ThreadHistory.
+    pub fn validate_replay_inputs(
+        &self,
+        source: &str,
+        guest_ids: detcore_model::pid::GuestIds,
+    ) -> Result<(), super::RecordAdmissionRefusal> {
+        self.metadata().validate_replay_inputs(source, guest_ids)
+    }
+
+    /// The opaque private-input metadata, without flattening this envelope.
+    pub fn reserved_input(&self) -> &super::ReservedInputMetadata {
+        self.metadata().reserved_input()
+    }
+
+    /// Numbering stored alongside either complete event representation.
+    pub fn guest_ids(&self) -> detcore_model::pid::GuestIds {
+        self.metadata().guest_ids().unwrap_or_default()
+    }
+
     /// The recorded virtual-time epoch, if the recording states one.
     pub fn epoch(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.metadata().epoch()
@@ -305,8 +325,25 @@ impl Recording {
 pub(crate) struct HistoryReader(Recording);
 
 impl HistoryReader {
+    // Production installs only histories admitted for the actual numbering
+    // policy. Format/serialization tests also exercise the raw reader.
+    #[cfg(test)]
     pub(crate) fn read(path: &Path) -> anyhow::Result<Self> {
         Recording::read(path).map(Self)
+    }
+
+    /// Read and admit the same bytes used for priority replay. A policy error
+    /// retains its RecordAdmissionRefusal type for the pre-start exit-122 path.
+    pub(crate) fn read_for_replay(
+        path: &Path,
+        guest_ids: detcore_model::pid::GuestIds,
+    ) -> anyhow::Result<Self> {
+        let recording = Recording::read(path)?;
+        recording.validate_replay_inputs(
+            &format!("--replay-preemptions-from {}", path.display()),
+            guest_ids,
+        )?;
+        Ok(Self(recording))
     }
 
     /// The host files the recorded run's guest opened, if the recording says.

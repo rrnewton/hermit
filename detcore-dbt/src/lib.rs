@@ -1501,6 +1501,10 @@ unsafe fn runtime_background_init(
             // before GlobalState/Runtime/READY. Application RPC is unchanged.
             let (mut config, source) =
                 initial_dbt_config(mode, control.as_deref(), fingerprint.as_deref())?;
+            // The standalone runtime may bypass Hermit's typed launcher. This
+            // is a before-target-execution defense on the actual decoded
+            // Config, not evidence that no native loader process has started.
+            <Detcore as Tool>::facility_admission(&config).map_err(|error| error.to_string())?;
             match source {
                 ConfigSource::RpcHandshake => emit_lifecycle_marker(
                     emit_diagnostic,

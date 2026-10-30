@@ -11255,6 +11255,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // Before anything else, so a refused call has no other effect.
         let (call, _owner_copy) = self.screen_fcntl_owner(guest, call).await?;
+        if matches!(call.cmd(), F_SETSIG(signal) if signal == libc::SIGKILL) {
+            // Owner/O_ASYNC may be configured later or through an alias.
+            // Failed configuration cannot restore the lost lifetime proof.
+            crate::reserved_input::expose_global(guest, "async-descriptor-sigkill")?;
+        }
         // The owner of an asynchronous-I/O descriptor may be any process or
         // process group, and Linux signals it when data arrives, at a moment
         // set by host timing. Record the signals in this turn, before the call
@@ -14437,6 +14442,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A process Detcore saw exit and that is gone is ESRCH, as Linux
         // answers once it is reaped, whatever the host has reaped by now
         // (https://github.com/rrnewton/hermit/issues/4091).
+        let mut terminal_no_effect = false;
         if guest.config().sequentialize_threads
             && let Some(process) = process
         {
@@ -14444,6 +14450,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if targets.is_empty() && zombie == Some(false) {
                 return self.gone_pidfd_signal_answer(guest, call, signal).await;
             }
+            terminal_no_effect = targets.is_empty() && zombie == Some(true);
         }
         // The thread scope sends to the thread whose id is the pid, like
         // `tgkill(pid, pid)`; the process scope to its process.
@@ -14514,10 +14521,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                         Some(process),
                         true,
                         DetTid::from_raw(thread.as_raw()),
+                        exited_leader || terminal_no_effect,
                     )
                     .await?
                 }
-                _ => self.record_or_replay(guest, call).await?,
+                _ => {
+                    crate::reserved_input::before_signal_send(guest, signal, terminal_no_effect)?;
+                    self.record_or_replay(guest, call).await?
+                }
             };
             if exited_leader {
                 return Ok(value);
@@ -14596,10 +14607,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Some(process),
                     false,
                     DetTid::from_raw(process.as_raw()),
+                    false,
                 )
                 .await?
             }
-            None => self.record_or_replay(guest, call).await?,
+            None => {
+                crate::reserved_input::before_signal_send(guest, signal, terminal_no_effect)?;
+                self.record_or_replay(guest, call).await?
+            }
         };
         if let Some((thread, process)) = receiver {
             // Tell the scheduler, as `kill` does, so a receiver parked in a

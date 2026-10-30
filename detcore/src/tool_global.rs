@@ -1781,6 +1781,10 @@ impl GlobalState {
     }
 
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
+        // GlobalTool-only construction has erased the inner Tool type. It
+        // still rejects raw binary-mode Config; typed facility_admission is
+        // independently required to authenticate the actual stream role.
+        crate::record_or_replay::admit_chosen_input_stream(cfg, reverie::ToolStreamRole::Plain);
         if let Some(refusal) = crate::preemptions::annotated_replay_mode_refusal(cfg) {
             crate::scheduler::exit_on_scheduler_refusal(&refusal);
         }
@@ -1791,7 +1795,19 @@ impl GlobalState {
         let preemptions_to_replay: Option<HistoryReader> =
             cfg.replay_preemptions_from.as_ref().map(|path| {
                 // Keep ordinary file/JSON errors in their original panic class.
-                let history = HistoryReader::read(path).unwrap();
+                // This is a separate authoritative input from the scheduler
+                // replay above. Validate both when raw Config names both;
+                // never authorize one through an `.or(...)` of their paths.
+                let history =
+                    HistoryReader::read_for_replay(path, cfg.guest_ids).unwrap_or_else(|error| {
+                        if error
+                            .chain()
+                            .any(|cause| cause.is::<crate::preemptions::RecordAdmissionRefusal>())
+                        {
+                            crate::scheduler::exit_on_scheduler_refusal(&format!("{error:#}"));
+                        }
+                        panic!("{error:?}")
+                    });
                 history
                     .require_replay_mode(cfg.replay_edited_preemptions)
                     .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
@@ -2690,6 +2706,72 @@ impl GlobalTool for GlobalState {
 
     fn install_mapping_capture_run(&mut self, run: reverie::MappingCaptureRun) {
         self.mapping_capture_run = Some(run);
+    }
+
+    fn install_reserved_input_control(
+        &mut self,
+        control: reverie::reserved_input::ReservedInputControl,
+    ) -> Result<(), reverie::Error> {
+        let mut scheduler = self.sched.lock().unwrap();
+        if scheduler.reserved_input_control.is_some() {
+            return Err(anyhow::anyhow!("reserved-input control installed twice").into());
+        }
+        scheduler.reserved_input_control = Some(control);
+        Ok(())
+    }
+
+    fn on_reserved_input_task(
+        &self,
+        task: reverie::reserved_input::InputTaskRegistration,
+    ) -> Result<(), reverie::Error> {
+        // These are explicit backend-to-Tool bindings, not an assumption
+        // that a native PID is the scheduler's logical identity. The backend
+        // publishes them before either parent- or child-side registration.
+        let tool_tid = task
+            .tool_tid
+            .filter(|tid| *tid > 0)
+            .ok_or_else(|| anyhow::anyhow!("reserved-input report lacks Tool thread identity"))?;
+        let _tool_pid = task
+            .tool_pid
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| anyhow::anyhow!("reserved-input report lacks Tool process identity"))?;
+        let mut scheduler = self.sched.lock().unwrap();
+        let control = scheduler.reserved_input_control.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("reserved-input task reported before control installation")
+        })?;
+        if control.registration(task.task) != Some(task) {
+            return Err(
+                anyhow::anyhow!("reserved-input report differs from retained generation").into(),
+            );
+        }
+        scheduler
+            .reserved_input_native_tasks
+            .insert(task.native_tid, task.task);
+        // Preserve the old logical image until its original exec teardown
+        // fence completes. Birth/reconnect consumes this pending binding.
+        scheduler
+            .reserved_input_tool_tasks
+            .insert(DetTid::from_raw(tool_tid), task.task);
+        Ok(())
+    }
+
+    fn admit_reserved_input_initial_state(
+        &self,
+        facts: &reverie::reserved_input::InputNativeFacts,
+    ) -> Result<reverie::reserved_input::InputAdmission, reverie::Error> {
+        Ok(crate::reserved_input::admit_initial(facts))
+    }
+
+    fn on_reserved_input_setup(
+        &self,
+        receipt: reverie::reserved_input::InputSetupReceipt,
+    ) -> Result<(), reverie::Error> {
+        if let Some(writer) = self.sched.lock().unwrap().preemption_writer.as_mut() {
+            writer
+                .observe_reserved_input_setup(&receipt)
+                .map_err(anyhow::Error::new)?;
+        }
+        Ok(())
     }
 
     fn install_backend_signal_control(
@@ -9399,6 +9481,10 @@ where
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;
     if guest.config().sequentialize_threads {
+        // Native input authority follows this actual hand-off, not the fact
+        // that this thread once received a grant. Observation-only requests
+        // below cannot create replacement execution authority.
+        crate::reserved_input::invalidate(guest);
         if let Some(lease) = guest.signal_observation_lease() {
             if let Some(site) = guest.parked_signal_site() {
                 return parked::capable_resource_request(
@@ -9421,6 +9507,28 @@ where
             send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
         match resp.1 {
             GlobalResponse::RequestResources(x) => {
+                use reverie::reserved_input::InputGrantKind;
+                let pending = r.resources.keys().find_map(|resource| match resource {
+                    ResourceID::BlockingVfork(op) => Some(op.sequence),
+                    _ => None,
+                });
+                let background_or_terminal = r.resources.keys().any(|resource| {
+                    matches!(
+                        resource,
+                        ResourceID::BlockingExternalIO(_)
+                            | ResourceID::BlockingRtSigsuspend(_)
+                            | ResourceID::Exit { .. }
+                            | ResourceID::InGuestFatalAlarm
+                    )
+                });
+                if !background_or_terminal && !matches!(x, ResumeStatus::InGuestFatalAlarm) {
+                    crate::reserved_input::granted(
+                        guest,
+                        pending.map_or(InputGrantKind::Ordinary, |logical_operation| {
+                            InputGrantKind::PendingVfork { logical_operation }
+                        }),
+                    );
+                }
                 trace!(
                     "[detcore, dtid {}] UNBLOCKED, acquired resources: {:?}",
                     &dettid, r
@@ -9444,6 +9552,7 @@ where
     T: RecordOrReplay,
 {
     if guest.config().sequentialize_threads {
+        crate::reserved_input::invalidate(guest);
         let resp = send_and_update_time(guest, GlobalRequest::ReleaseAllResources).await;
         match resp.1 {
             GlobalResponse::ReleaseAllResources(x) => x,
@@ -9486,6 +9595,10 @@ where
                 // Publish only after the deterministic start grant. Before
                 // it, parent registration and this RPC can race in host time.
                 publish_runtime_private_memory(guest).await;
+                crate::reserved_input::granted(
+                    guest,
+                    reverie::reserved_input::InputGrantKind::Ordinary,
+                );
                 trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
                 preempts
             }
@@ -9684,6 +9797,98 @@ pub async fn create_vfork_child_thread<G, T>(
 /// thread has turn state.
 fn id_awaits_new_registration(sched: &Scheduler, dtid: DetTid) -> bool {
     sched.thread_was_registered(dtid) && !sched.next_turns.contains_key(&dtid)
+}
+
+#[cfg(test)]
+mod reserved_input_registration_tests {
+    use reverie::GlobalTool;
+    use reverie::reserved_input::ReservedInputControl;
+
+    use super::GlobalState;
+    use crate::Config;
+    use crate::types::DetTid;
+    use crate::types::MmId;
+
+    #[test]
+    fn input_registration_binds_explicit_tool_identity_without_a_physical_ids_rpc() {
+        let mut global = GlobalState::for_tests(&Config::default());
+        let control = ReservedInputControl::new_backend().unwrap();
+        global
+            .install_reserved_input_control(control.clone())
+            .unwrap();
+        let native = control.backend_register_root(123, 123).unwrap();
+        assert!(global.on_reserved_input_task(native).is_err());
+        let bound = control
+            .backend_bind_tool_identity(native.task, 5000, 5000)
+            .unwrap();
+        global.on_reserved_input_task(bound).unwrap();
+        let logical = DetTid::from_raw(5000);
+        {
+            let mut scheduler = global.sched.lock().unwrap();
+            assert!(!scheduler.reserved_input_tasks.contains_key(&logical));
+            scheduler.record_thread_mm(logical, MmId::initial(logical));
+            assert_eq!(scheduler.reserved_input_tasks[&logical], native.task);
+            assert_eq!(scheduler.physical_process_of(logical), None);
+            assert!(
+                !scheduler
+                    .reserved_input_tasks
+                    .contains_key(&DetTid::from_raw(123))
+            );
+        }
+        let child = control
+            .backend_register_child(native.task, 124, 123, Some(true), Some(true))
+            .unwrap();
+        let child = control
+            .backend_bind_tool_identity(child.task, 5001, 5000)
+            .unwrap();
+        global.on_reserved_input_task(child).unwrap();
+        {
+            let mut scheduler = global.sched.lock().unwrap();
+            let child_tid = DetTid::from_raw(5001);
+            scheduler.record_thread_mm(child_tid, MmId::initial(logical));
+            assert_eq!(scheduler.reserved_input_tasks[&child_tid], child.task);
+        }
+        let replacement = control
+            .backend_exec_replacement(native.task, child.task)
+            .unwrap();
+        let replacement = control
+            .backend_bind_tool_identity(replacement.task, 5000, 5000)
+            .unwrap();
+        global.on_reserved_input_task(replacement).unwrap();
+        let scheduler = global.sched.lock().unwrap();
+        assert_eq!(
+            scheduler.reserved_input_tool_tasks[&logical],
+            replacement.task
+        );
+        // The original logical exec fence still names both destroyed images.
+        assert_eq!(scheduler.reserved_input_tasks[&logical], native.task);
+        assert_eq!(
+            scheduler.reserved_input_tasks[&DetTid::from_raw(5001)],
+            child.task
+        );
+    }
+
+    #[test]
+    fn input_registration_rejects_a_tool_identity_not_bound_by_the_native_owner() {
+        let mut global = GlobalState::for_tests(&Config::default());
+        let control = ReservedInputControl::new_backend().unwrap();
+        global
+            .install_reserved_input_control(control.clone())
+            .unwrap();
+        let native = control.backend_register_root(123, 123).unwrap();
+        let mut forged = native;
+        forged.tool_tid = Some(5000);
+        forged.tool_pid = Some(5000);
+        assert!(global.on_reserved_input_task(forged).is_err());
+        assert!(
+            global
+                .sched
+                .lock()
+                .unwrap()
+                .reserved_input_tool_tasks
+                .is_empty()
+        );
+    }
 }
 
 /// Remove the thread from the scheduler.
