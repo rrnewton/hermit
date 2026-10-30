@@ -48,6 +48,23 @@ pub struct HostFileIdentity {
     pub mtime_sec: i64,
     /// The host `st_mtime`, nanoseconds.
     pub mtime_nsec: i64,
+    /// For a file Hermit copied before the run and the guest reads in its
+    /// place (a frozen snapshot, see
+    /// [`crate::config::Config::property_snapshot`]), a hash of the copy's
+    /// contents. The copy's own device, inode and modification time are new
+    /// in every run, so they are zero and this identifies the file instead:
+    /// two runs whose snapshots differ in content record different
+    /// identities. `None` for every other file. Always encoded, because the
+    /// identity also travels in positional (bincode) RPC messages; a JSON
+    /// record written before the field existed reads as `None`.
+    ///
+    /// Its JSON key is `snapshot_content`, not `content`: the identity is
+    /// flattened into records (`HostInputRecord`) that may carry a `content`
+    /// key of their own (a hash of a host file's bytes), and two fields of
+    /// one name in one record make serde refuse it as a duplicate field. A
+    /// renamed key costs the positional bincode encoding nothing.
+    #[serde(default, rename = "snapshot_content")]
+    pub content: Option<u64>,
 }
 
 impl HostFileIdentity {
@@ -59,6 +76,20 @@ impl HostFileIdentity {
             size: stat.st_size,
             mtime_sec: stat.st_mtime,
             mtime_nsec: stat.st_mtime_nsec,
+            content: None,
+        }
+    }
+
+    /// The identity of a snapshot copy of `size` bytes whose contents hash to
+    /// `content` (see [`Self::content`]).
+    pub fn of_snapshot(size: i64, content: u64) -> Self {
+        Self {
+            dev: 0,
+            ino: 0,
+            size,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            content: Some(content),
         }
     }
 }
@@ -79,6 +110,9 @@ pub struct HostInputSnapshot {
 
 impl std::fmt::Display for HostFileIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(content) = self.content {
+            return write!(f, "snapshot size {} content {:016x}", self.size, content);
+        }
         write!(
             f,
             "dev:ino {}:{}:{} size {} mtime {}.{:09}",
@@ -293,6 +327,7 @@ mod tests {
             size,
             mtime_sec: 1_700_000_000,
             mtime_nsec: 5,
+            content: None,
         }
     }
 
@@ -370,5 +405,106 @@ mod tests {
         assert!(line.starts_with("host input /etc/ld.so.cache changed since the recording"));
         assert!(line.contains("size 36887"), "{line}");
         assert!(line.contains("size 36839"), "{line}");
+    }
+
+    /// A record written before `content` existed reads with none; every
+    /// identity, with or without contents, round-trips through JSON and
+    /// through the positional bincode encoding the RPCs use; a snapshot's
+    /// identity names its contents.
+    #[test]
+    fn host_file_identities_without_and_with_contents() {
+        let old = r#"{"dev":33,"ino":7,"size":100,"mtime_sec":1,"mtime_nsec":2}"#;
+        let identity: HostFileIdentity = serde_json::from_str(old).unwrap();
+        assert_eq!(identity.content, None);
+        let snapshot = HostFileIdentity::of_snapshot(131072, 0x0123_4567_89ab_cdef);
+        for value in [identity, snapshot] {
+            let json = serde_json::to_string(&value).unwrap();
+            assert_eq!(
+                serde_json::from_str::<HostFileIdentity>(&json).unwrap(),
+                value
+            );
+            let config = bincode::config::legacy();
+            let bytes = bincode::serde::encode_to_vec(value, config).unwrap();
+            let (decoded, read): (HostFileIdentity, usize) =
+                bincode::serde::decode_from_slice(&bytes, config).unwrap();
+            assert_eq!((decoded, read), (value, bytes.len()));
+        }
+        assert_eq!(
+            snapshot.to_string(),
+            "snapshot size 131072 content 0123456789abcdef"
+        );
+        assert_ne!(snapshot, HostFileIdentity::of_snapshot(131072, 1));
+    }
+
+    /// A snapshot identity flattened into a host-input record, or a set
+    /// entry, that also carries its own `content` (the hash of a file's
+    /// bytes the run's end read) writes two distinct keys and reads back
+    /// whole. With both under `content`, serde refused every such record as
+    /// a duplicate field, and every replay of a recording with host inputs
+    /// with it.
+    #[test]
+    fn a_flattened_identity_does_not_clash_with_a_records_own_content() {
+        let snapshot = HostFileIdentity::of_snapshot(131072, 0x0123_4567_89ab_cdef);
+        let plain: HostFileIdentity =
+            serde_json::from_str(r#"{"dev":33,"ino":7,"size":100,"mtime_sec":1,"mtime_nsec":2}"#)
+                .unwrap();
+        let keys = |json: &str| -> serde_json::Map<String, serde_json::Value> {
+            serde_json::from_str(json).unwrap()
+        };
+        for (identity, content) in [
+            (snapshot, Some("ab".repeat(32))),
+            (snapshot, None),
+            (plain, Some("cd".repeat(32))),
+            (plain, None),
+        ] {
+            let record = HostInputRecord {
+                path: "/dev/__properties__/properties_serial".to_owned(),
+                dtid: 3,
+                syscall: 9,
+                identity,
+                content: content.clone(),
+                exec: false,
+                kernel_object: false,
+            };
+            let json = serde_json::to_string(&record).unwrap();
+            let fields = keys(&json);
+            assert_eq!(fields.contains_key("content"), content.is_some(), "{json}");
+            assert!(fields.contains_key("snapshot_content"), "{json}");
+            assert_eq!(
+                serde_json::from_str::<HostInputRecord>(&json).unwrap(),
+                record,
+                "{json}"
+            );
+            // A set entry is strict (`deny_unknown_fields` beside the
+            // flattened identity): it reads both keys too.
+            let entry = HostInput {
+                path: record.path.clone(),
+                identity,
+                content,
+            };
+            let json = serde_json::to_string(&entry).unwrap();
+            assert_eq!(
+                serde_json::from_str::<HostInput>(&json).unwrap(),
+                entry,
+                "{json}"
+            );
+            let unknown = json.replacen('{', r#"{"other":1,"#, 1);
+            assert!(serde_json::from_str::<HostInput>(&unknown).is_err());
+        }
+        // The snapshot's hash is keyed as written, as a number.
+        let record = HostInputRecord {
+            path: "/dev/__properties__/properties_serial".to_owned(),
+            dtid: 3,
+            syscall: 9,
+            identity: snapshot,
+            content: None,
+            exec: false,
+            kernel_object: false,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains(r#""snapshot_content":81985529216486895"#),
+            "{json}"
+        );
     }
 }
