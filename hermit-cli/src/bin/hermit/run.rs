@@ -61,6 +61,7 @@ use hermit::host_input_change::PatternDifference;
 use hermit::host_input_change::explains_divergence;
 use hermit::host_input_change::find_pattern_difference;
 use hermit::host_input_change::open_position;
+use hermit::host_input_change::open_position_for_path;
 use hermit::host_input_change::read_host_inputs;
 use reverie::process::Bind;
 use reverie::process::Command;
@@ -473,11 +474,9 @@ fn place_host_input_change(
             })
             .ok()
             .and_then(|bytes| {
-                open_position(
-                    &String::from_utf8_lossy(&bytes),
-                    difference.dtid,
-                    difference.syscall,
-                )
+                let text = String::from_utf8_lossy(&bytes);
+                open_position(&text, difference.dtid, difference.syscall)
+                    .or_else(|| open_position_for_path(&text, difference.syscall, &difference.path))
             })
     };
     let positions = [place(logs[0], "run 1"), place(logs[1], "run 2")];
@@ -612,7 +611,10 @@ fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'
         Backend::Liteinst | Backend::InGuestTrap => {
             Some("in-guest LiteInst's preload starts after an exec'd program's .preinit_array runs")
         }
-        Backend::Dbt => Some("DBT's launcher does not collect host inputs"),
+        // DBT's Detcore client initializes before the guest's first
+        // instruction and now collects host inputs through its private
+        // environment, so a change found there is attributable.
+        Backend::Dbt => None,
     }
 }
 
@@ -1330,6 +1332,12 @@ pub struct RunOpts {
     /// never serialized, like `resolved_happens_before`.
     #[clap(skip)]
     host_input_log: Option<PathBuf>,
+
+    /// Runtime-only: record host inputs even where `host_input_log` cannot
+    /// name the destination (DBT: the in-guest runtime learns the
+    /// guest-visible path from its private environment instead).
+    #[clap(skip)]
+    record_host_inputs: bool,
 
     /// Opt in to keeping a core file for each guest process that a
     /// core-dumping signal (SIGSEGV, SIGABRT, SIGBUS, ...) kills. The core is
@@ -12889,7 +12897,12 @@ impl RunOpts {
     ) -> Result<ExitStatus, Error> {
         #[cfg(feature = "dbt")]
         let dbt = if self.selected_backend() == Backend::Dbt {
-            Some(self.dbt_invocation()?.verification(_dbt_stdin)?)
+            // The adapter keeps its own copy of these options and runs both
+            // executions from it, so the host-input flag must be set here,
+            // before the invocation is built from them.
+            let mut options = self.clone();
+            options.record_host_inputs = true;
+            Some(options.dbt_invocation()?.verification(_dbt_stdin)?)
         } else {
             None
         };
@@ -13043,6 +13056,12 @@ impl RunOpts {
         let host_inputs_path = host_inputs_file.as_ref().map(descriptor_path);
         run1_options.host_input_log = host_inputs_path.clone();
         run2_options.host_input_log = host_inputs_path.clone();
+        if self.selected_backend() == Backend::Dbt {
+            // DBT's in-guest global cannot use the host descriptor path; it
+            // writes through its private environment instead (backends.rs).
+            run1_options.record_host_inputs = true;
+            run2_options.record_host_inputs = true;
+        }
         run1_options.fatal_core_run_label = Some("run1");
         run2_options.fatal_core_run_label = Some("run2");
 
@@ -13192,7 +13211,16 @@ impl RunOpts {
             .map(take_verify_summary_before_next_run)
             .transpose()?
             .flatten();
+        #[cfg(feature = "dbt")]
+        let dbt_host_inputs1 = dbt1.as_ref().and_then(|facts| {
+            facts.host_inputs.as_ref().map(|inputs| match inputs {
+                Ok(inputs) => Ok(inputs.clone()),
+                Err(error) => Err(std::io::Error::other(error.clone())),
+            })
+        });
         let host_inputs1 = host_inputs_path.as_deref().map(read_host_inputs);
+        #[cfg(feature = "dbt")]
+        let host_inputs1 = dbt_host_inputs1.or(host_inputs1);
         if let Some(file) = &host_inputs_file {
             file.set_len(0)
                 .context("emptying the host-input record before run 2")?;
@@ -13390,7 +13418,22 @@ impl RunOpts {
                 log: log2_path,
                 skid_overshoots: skid_overshoots_run2,
                 summary: summary2,
-                host_inputs: host_inputs_path.as_deref().map(read_host_inputs),
+                host_inputs: {
+                    #[cfg(feature = "dbt")]
+                    {
+                        let dbt_inputs = dbt2.as_ref().and_then(|facts| {
+                            facts.host_inputs.as_ref().map(|inputs| match inputs {
+                                Ok(inputs) => Ok(inputs.clone()),
+                                Err(error) => Err(std::io::Error::other(error.clone())),
+                            })
+                        });
+                        dbt_inputs.or_else(|| host_inputs_path.as_deref().map(read_host_inputs))
+                    }
+                    #[cfg(not(feature = "dbt"))]
+                    {
+                        host_inputs_path.as_deref().map(read_host_inputs)
+                    }
+                },
             },
         )?;
         drop(host_inputs_file);
@@ -14667,10 +14710,13 @@ impl RunOpts {
         // every run whose output a later run reproduces or is compared with:
         // a recorded schedule keeps the run's host-input set, a schedule
         // replay compares its opens against the recorded one, and a summary
-        // reports the set (`detcore_model::host_input::HostInputSet`). Not
-        // under DBT, whose runtime's configuration has no such field, so it
-        // would report an empty set that looks complete.
-        config.record_host_inputs = self.host_input_log.is_some()
+        // reports the set (`detcore_model::host_input::HostInputSet`). Under
+        // DBT the destination cannot travel in this config (`host_input_log`
+        // is `#[serde(skip)]`); the runtime learns the guest-visible path
+        // from its private environment and the launcher reads the records
+        // back from the bind-mounted stats directory.
+        config.record_host_inputs = self.record_host_inputs
+            || self.host_input_log.is_some()
             || (self.runtime_backend() != Backend::Dbt
                 && (config.record_preemptions_to.is_some()
                     || config.replay_preemptions_from.is_some()

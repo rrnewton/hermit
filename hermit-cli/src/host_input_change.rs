@@ -269,6 +269,27 @@ pub fn open_position(contents: &str, dtid: u64, syscall: u64) -> Option<usize> {
     found
 }
 
+/// Fallback placement by path and syscall number, for backends whose
+/// per-thread syscall numbering restarts across process images (DBT), so
+/// `(dtid, syscall)` names more than one finished open in the log. The
+/// open that found a new identity is the last finished open of `path`
+/// with that syscall number; without a match nothing is placed.
+pub fn open_position_for_path(contents: &str, syscall: u64, path: &str) -> Option<usize> {
+    let mut found = None;
+    for (position, human, event) in detcore::logdiff::log_record_events(contents).ok()? {
+        if !matches!(event, Some(DetLogEvent::SyscallResult { .. })) {
+            continue;
+        }
+        let Some((_, number)) = finished_open(human) else {
+            continue;
+        };
+        if number == syscall && human.contains(&format!("\"{path}\"")) {
+            found = Some(position);
+        }
+    }
+    found
+}
+
 /// The thread and that thread's syscall number of a finished open's record,
 /// read from the Hermit-written prefix where it first occurs.
 fn finished_open(human: &str) -> Option<(u64, u64)> {
