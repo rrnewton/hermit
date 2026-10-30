@@ -4348,7 +4348,7 @@ impl GlobalState {
                     )
                     .await
                 {
-                    SchedulerRpcResult::Continue((history, first_slice)) => {
+                    SchedulerRpcResult::Continue((history, first_slice, first_offset)) => {
                         let mut sched = self.lock_rpc_scheduler(false).await;
                         // A callback-annotated history replays from its
                         // first row only at the thread's birth.
@@ -4372,7 +4372,8 @@ impl GlobalState {
                                 .cloned()
                                 .unwrap_or_default(),
                         };
-                        let response = R::StartNewThread(history, first_slice);
+                        let response =
+                            R::StartNewThread(history.map(Box::new), first_slice, first_offset);
                         if sched.callback_history_active {
                             R::WithCallbackHistory(startup, Box::new(response))
                         } else {
@@ -6060,7 +6061,11 @@ impl GlobalState {
         request_mm: MmId,
         physical_ids: Option<(i32, i32)>,
         signal_identity: Option<reverie::SignalTaskIdentity>,
-    ) -> SchedulerRpcResult<(Option<ThreadHistory>, Option<LogicalTime>)> {
+    ) -> SchedulerRpcResult<(
+        Option<ThreadHistory>,
+        Option<LogicalTime>,
+        Option<crate::resources::InstructionOffset>,
+    )> {
         #[cfg(feature = "physical-mm-test-support")]
         self.initial_mm_checkpoint(initial_mm_probe::Point::ThreadStartup, dettid, request_mm)
             .await;
@@ -6233,12 +6238,19 @@ impl GlobalState {
             }
             _ => None,
         };
-        // A new thread installs no replay timeslice from its start grant,
-        // with or without an offset. Whatever the replayer gave it for that
-        // grant goes now, staged or moved by the grant: a signaled start
-        // grant consumes neither, and they must not reach a later grant
-        // (`Scheduler::forget_replay_timeslice`).
-        self.sched.lock().unwrap().forget_replay_timeslice(&dettid);
+        // A plain grant consumed the timeslice the replayer staged for this
+        // thread and moved the offset beside it to the granted offsets
+        // (`Scheduler::grant_replay_timeslice`). The thread installs that
+        // timeslice as its first slice (`finish_thread_start`), so it takes
+        // the offset with it, as a resumed exec does (`ResumeExec`). A
+        // control answer consumes neither: the staged pair waits for the
+        // thread's next grant, as it does for any grant
+        // (`Scheduler::grant_answer`).
+        let first_offset = self
+            .sched
+            .lock()
+            .unwrap()
+            .take_granted_replay_instruction_offset(dettid, first_slice);
         if let Some(pr) = &self.preemptions_to_replay {
             let (history, old_prio) = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
@@ -6262,9 +6274,9 @@ impl GlobalState {
                 history.initial_priority(),
                 old_prio,
             );
-            SchedulerRpcResult::Continue((Some(history), first_slice))
+            SchedulerRpcResult::Continue((Some(history), first_slice, first_offset))
         } else {
-            SchedulerRpcResult::Continue((None, first_slice))
+            SchedulerRpcResult::Continue((None, first_slice, first_offset))
         }
     }
 
@@ -7156,7 +7168,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 19;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 20;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -7970,8 +7982,18 @@ pub enum GlobalResponse {
     CreateChildThread(Option<MmId>),
     /// Includes optional preemption points for the new thread, and the
     /// length of its first timeslice when its start grant names one (a
-    /// schedule replay's recorded first slice; see `thread_start_request`).
-    StartNewThread(Option<ThreadHistory>, Option<LogicalTime>),
+    /// schedule replay's recorded first slice; see `thread_start_request`),
+    /// with the instruction offset its recorded timer was armed past its
+    /// branch target (`SchedEvent::instruction_offset`), which comes only
+    /// with a length. The history is boxed: once per thread, it would
+    /// otherwise make this the widest answer, and every per-syscall future
+    /// that holds a `GlobalResponse` that much larger
+    /// (`hot_path_futures_stay_small`).
+    StartNewThread(
+        Option<Box<ThreadHistory>>,
+        Option<LogicalTime>,
+        Option<crate::resources::InstructionOffset>,
+    ),
     DeregisterThread(()),
     SetChildTidAddress(()),
     SetSavedGuestSigmask(()),
@@ -9567,12 +9589,17 @@ where
 ///
 /// Returns: a history of the thread preemptions, for it to play back when --replay-preemptions-from
 /// is used, and the length of the thread's first timeslice when its start grant names one: a
-/// schedule replay's recorded first slice, which `finish_thread_start` installs.
+/// schedule replay's recorded first slice, which `finish_thread_start` installs, with the
+/// instruction offset beside it, if its recorded timer was armed past its branch target.
 pub async fn thread_start_request<G, T>(
     cfg: &Config,
     guest: &mut G,
     detpid: DetPid,
-) -> (Option<ThreadHistory>, Option<LogicalTime>)
+) -> (
+    Option<ThreadHistory>,
+    Option<LogicalTime>,
+    Option<crate::resources::InstructionOffset>,
+)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -9592,17 +9619,17 @@ where
         )
         .await;
         match resp.1 {
-            GlobalResponse::StartNewThread(preempts, first_slice) => {
+            GlobalResponse::StartNewThread(preempts, first_slice, first_offset) => {
                 // Publish only after the deterministic start grant. Before
                 // it, parent registration and this RPC can race in host time.
                 publish_runtime_private_memory(guest).await;
                 trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
-                (preempts, first_slice)
+                (preempts.map(|history| *history), first_slice, first_offset)
             }
             _ => unreachable!(),
         }
     } else {
-        (None, None)
+        (None, None, None)
     }
 }
 
@@ -9615,12 +9642,16 @@ where
 /// replayer's slice after any other event: the reset alone would give the
 /// thread a full `--max-timeslice`, so a first slice the recording ended
 /// sooner, at a timer before the thread's first syscall, would run past its
-/// recorded end.
+/// recorded end. Its instruction offset (`first_offset`) goes with it, as
+/// `trace_schedevent` installs the offset beside every later slice: a first
+/// slice whose recorded timer stopped the thread past its branch target ends
+/// there, not at the end of the recorded batch of branches.
 pub(crate) fn finish_thread_start<G, T>(
     cfg: &Config,
     guest: &mut G,
     history: Option<ThreadHistory>,
     first_slice: Option<LogicalTime>,
+    first_offset: Option<crate::resources::InstructionOffset>,
 ) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -9634,7 +9665,7 @@ pub(crate) fn finish_thread_start<G, T>(
     let deadline = guest.thread_state_mut().last_grant_deadline.take();
     cap_timeslice_at_deadline(guest, deadline);
     if let Some(length) = first_slice {
-        install_replayed_timeslice(guest, length);
+        install_replayed_timeslice(guest, length, first_offset);
     }
     crate::slice_boundary::grant::finish_start(guest.thread_state_mut(), reset)
         .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
@@ -10498,13 +10529,7 @@ pub async fn trace_schedevent_with_access<G, T>(
             }
 
             if let Some(timeslice) = timeslice {
-                install_replayed_timeslice(guest, timeslice);
-                // Where the recorded slice this timeslice replays had its
-                // timer armed past its branch target, or `None`: the timer
-                // `post_handler_hook` arms for this slice.
-                if guest.thread_state().past_global_first_execve {
-                    guest.thread_state_mut().replay_instruction_offset = instruction_offset;
-                }
+                install_replayed_timeslice(guest, timeslice, instruction_offset);
             }
         }
         _ => {
@@ -10516,9 +10541,15 @@ pub async fn trace_schedevent_with_access<G, T>(
 /// End the thread's current timeslice `length` from now, as the schedule
 /// replayer instructs (`ReplayAction::Continue` / `ContextSwitch`): after a
 /// traced event (`trace_schedevent`), or for a thread's first slice at its
-/// start (`finish_thread_start`).
-fn install_replayed_timeslice<G, T>(guest: &mut G, length: LogicalTime)
-where
+/// start (`finish_thread_start`). `offset` is where the recorded slice had its
+/// timer armed past its branch target, or `None`: the timer
+/// `post_handler_hook` arms for this slice. It is installed with the slice,
+/// or not at all.
+fn install_replayed_timeslice<G, T>(
+    guest: &mut G,
+    length: LogicalTime,
+    offset: Option<crate::resources::InstructionOffset>,
+) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
@@ -10543,6 +10574,7 @@ where
     if guest.config().max_timeslice.is_some() {
         guest.thread_state_mut().max_timeslice_end = Some(end_of_timeslice);
     }
+    guest.thread_state_mut().replay_instruction_offset = offset;
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -15003,7 +15035,7 @@ mod tests {
                 }
                 1 => assert_eq!(
                     super::thread_start_request(&config, &mut guest, process).await,
-                    (None, None)
+                    (None, None, None)
                 ),
                 2 => {
                     let response =
@@ -15047,7 +15079,7 @@ mod tests {
             // pending here, not armed and then erased by next_timeslice.
             assert_eq!(guest.thread.replay_rcb_end, None);
             assert_eq!(guest.thread.stats.timeslice_count, original_slices);
-            super::finish_thread_start(&config, &mut guest, None, None);
+            super::finish_thread_start(&config, &mut guest, None, None, None);
         }
         assert_eq!(guest.thread.replay_rcb_end, with_budget.then_some(91));
         assert_eq!(
@@ -15071,18 +15103,21 @@ mod tests {
         )
     }
 
-    /// The coordinator's half of a schedule replay's exec continuation: the
-    /// `ResumeExec` answer carries the instruction offset beside the timeslice
-    /// its grant consumed (`exec_identity::exec_continuation_slice` reads
-    /// both), through the real RPC and a scheduler turn. The replay pair is
-    /// staged by hand here: the leader transfer that stages it and
-    /// `reconnect_exec`'s installation are not exercised, and no recorded
-    /// trace holds a nonleader exec (`reconnect_exec` refuses one while
-    /// recording, EOPNOTSUPP). A new thread installs no replay timeslice from
-    /// its start grant, with or without an offset, so a start grant, plain or
-    /// signaled, leaves neither the staged pair nor a granted offset behind.
+    /// The coordinator's half of a schedule replay's exec continuation and of
+    /// a new thread's start: the `ResumeExec` answer carries the instruction
+    /// offset beside the timeslice its grant consumed
+    /// (`exec_identity::exec_continuation_slice` reads both), and so does the
+    /// `StartNewThread` answer, whose timeslice the thread installs as its
+    /// first slice (`finish_thread_start`), through the real RPC and a
+    /// scheduler turn. The replay pair is staged by hand here: the leader
+    /// transfer or context switch that stages it and the thread's
+    /// installation are not exercised, and no recorded trace holds a
+    /// nonleader exec (`reconnect_exec` refuses one while recording,
+    /// EOPNOTSUPP). A start grant answered with a pending signal consumes
+    /// neither: the staged pair waits for the thread's next grant, as for a
+    /// resource grant (`a_control_answer_leaves_the_replay_pair_staged_together`).
     #[tokio::test]
-    async fn a_resume_exec_answer_carries_its_grants_offset_and_a_start_grant_drops_it() {
+    async fn a_resume_exec_answer_and_a_start_grant_carry_their_grants_offset() {
         let offset = crate::resources::InstructionOffset {
             rcb_target: 120,
             instructions: 6,
@@ -15115,11 +15150,10 @@ mod tests {
             };
             let mut request = Box::pin(async {
                 if start {
-                    assert_eq!(
-                        super::thread_start_request(&config, &mut guest, process).await,
-                        None
-                    );
-                    None
+                    let (history, first_slice, first_offset) =
+                        super::thread_start_request(&config, &mut guest, process).await;
+                    assert_eq!(history, None);
+                    Some((first_slice, first_offset))
                 } else {
                     let response =
                         super::send_and_update_time(&mut guest, GlobalRequest::ResumeExec(process))
@@ -15154,24 +15188,34 @@ mod tests {
                 .expect("the grant's turn must commit");
             }
             let delivered = request.await;
-            if start {
-                assert_eq!(delivered, None);
-            } else {
-                assert_eq!(delivered, Some((Some(slice), Some(offset))));
-            }
             let scheduler = state.sched.lock().unwrap();
-            assert!(
-                !scheduler.timeslices.contains_key(&tid),
-                "case {case}: the timeslice outlived its grant"
-            );
-            assert!(
-                scheduler.replay_instruction_offsets.is_empty(),
-                "case {case}: the staged offset outlived its grant"
-            );
             assert!(
                 scheduler.granted_replay_instruction_offsets.is_empty(),
                 "case {case}: the granted offset outlived its grant"
             );
+            if case == 2 {
+                assert_eq!(delivered, Some((None, None)));
+                assert_eq!(
+                    scheduler.timeslices.get(&tid),
+                    Some(&Some(slice)),
+                    "a signaled start grant leaves the timeslice for the next grant"
+                );
+                assert_eq!(
+                    scheduler.replay_instruction_offsets.get(&tid),
+                    Some(&offset),
+                    "and the offset beside it"
+                );
+            } else {
+                assert_eq!(delivered, Some((Some(slice), Some(offset))), "case {case}");
+                assert!(
+                    !scheduler.timeslices.contains_key(&tid),
+                    "case {case}: the timeslice outlived its grant"
+                );
+                assert!(
+                    scheduler.replay_instruction_offsets.is_empty(),
+                    "case {case}: the staged offset outlived its grant"
+                );
+            }
         }
         // Without an offset the continuation's grant is as before.
         assert_eq!(
@@ -17112,7 +17156,10 @@ mod tests {
         if child_first {
             assert_eq!(
                 startup.as_mut().await,
-                (None, granted(GlobalResponse::StartNewThread(None, None)))
+                (
+                    None,
+                    granted(GlobalResponse::StartNewThread(None, None, None))
+                )
             );
         } else {
             assert_eq!(
@@ -17166,7 +17213,10 @@ mod tests {
         } else {
             assert_eq!(
                 startup.await,
-                (None, granted(GlobalResponse::StartNewThread(None, None)))
+                (
+                    None,
+                    granted(GlobalResponse::StartNewThread(None, None, None))
+                )
             );
         }
         let mut scheduler = state.sched.lock().unwrap();
@@ -17343,7 +17393,11 @@ mod tests {
             startup.await,
             (
                 None,
-                granted(GlobalResponse::StartNewThread(None, Some(first_slice)))
+                granted(GlobalResponse::StartNewThread(
+                    None,
+                    Some(first_slice),
+                    None
+                ))
             )
         );
         assert!(!state.sched.lock().unwrap().timeslices.contains_key(&child));
@@ -17388,7 +17442,7 @@ mod tests {
                 ppid: None,
                 private_memory: None,
             };
-            super::finish_thread_start(&config, &mut guest, None, first_slice);
+            super::finish_thread_start(&config, &mut guest, None, first_slice, None);
             guest.thread
         };
 
@@ -17409,6 +17463,66 @@ mod tests {
             (before_exec.end_of_timeslice, before_exec.max_timeslice_end),
             reset_slice
         );
+    }
+
+    /// The thread's side of a replayed first slice's instruction offset
+    /// (`finish_thread_start`): the offset the start grant carried beside the
+    /// first slice is installed with it (`ThreadState::replay_instruction_offset`),
+    /// as `trace_schedevent` installs the offset beside every later slice, so
+    /// the timer `post_handler_hook` arms for that slice stops where the
+    /// recording's did. Without a first slice, or before the first execve,
+    /// neither is installed.
+    #[test]
+    fn finish_thread_start_installs_a_replayed_first_slices_offset() {
+        let trace_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            trace_file.path(),
+            PreemptionRecord::from_sched_events(vec![]).to_string(),
+        )
+        .unwrap();
+        let (config, state, tid, process) = cancellation_test_state_with_config(
+            Config {
+                sequentialize_threads: true,
+                replay_schedule_from: Some(trace_file.path().to_path_buf()),
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true),
+        );
+        let length = LogicalTime::from_rcbs(83);
+        let offset = crate::resources::InstructionOffset {
+            rcb_target: 80,
+            instructions: 5,
+        };
+        let start = |first_slice: Option<LogicalTime>,
+                     first_offset: Option<crate::resources::InstructionOffset>,
+                     past_global_first_execve: bool| {
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            thread.past_global_first_execve = past_global_first_execve;
+            let mut guest = ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            };
+            super::finish_thread_start(&config, &mut guest, None, first_slice, first_offset);
+            guest.thread
+        };
+
+        let replayed = start(Some(length), Some(offset), true);
+        assert_eq!(replayed.replay_instruction_offset, Some(offset));
+        let end = replayed.thread_logical_time.as_nanos() + length;
+        assert_eq!(replayed.end_of_timeslice, Some(end));
+
+        let plain = start(Some(length), None, true);
+        assert_eq!(plain.replay_instruction_offset, None);
+        assert_eq!(plain.end_of_timeslice, Some(end));
+
+        let before_exec = start(Some(length), Some(offset), false);
+        assert_eq!(before_exec.replay_instruction_offset, None);
     }
 
     #[tokio::test]
@@ -17508,7 +17622,10 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
     }
@@ -17622,7 +17739,10 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
     }
 
@@ -17683,7 +17803,10 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
     }
 
@@ -17734,7 +17857,10 @@ mod tests {
         assert_eq!(first.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
     }
 
@@ -17786,7 +17912,10 @@ mod tests {
         assert_eq!(first_turn.tid, child);
         assert_eq!(
             first_start.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
         first_holder.advance_to(first_holder.as_nanos() + LogicalTime::from_nanos(500));
         let deregistered = state
@@ -17862,7 +17991,10 @@ mod tests {
         assert_eq!(second_turn.tid, child);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
     }
 
@@ -18117,7 +18249,10 @@ mod tests {
         assert_eq!(first.tid, leader);
         assert_eq!(
             startup.await,
-            (None, granted(GlobalResponse::StartNewThread(None, None)))
+            (
+                None,
+                granted(GlobalResponse::StartNewThread(None, None, None))
+            )
         );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
 
@@ -18288,7 +18423,7 @@ mod tests {
             start_response,
             (
                 Some(thread_before),
-                GlobalResponse::StartNewThread(None, None)
+                GlobalResponse::StartNewThread(None, None, None)
             )
         );
 
@@ -18757,7 +18892,7 @@ mod tests {
             start_response,
             (
                 Some(worker_clock.as_nanos()),
-                granted(GlobalResponse::StartNewThread(None, None))
+                granted(GlobalResponse::StartNewThread(None, None, None))
             )
         );
         {

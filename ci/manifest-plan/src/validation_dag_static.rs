@@ -3185,7 +3185,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hooks arming a schedule replay's recorded offset: 3049.
     // And a_record_is_read_only_in_a_format_this_hermit_reads and
     // an_edit_of_a_rows_only_record_keeps_it_rows_only: 3051.
-    // And a_resume_exec_answer_carries_its_grants_offset_and_a_start_grant_drops_it:
+    // And a_resume_exec_answer_and_a_start_grant_carry_their_grants_offset:
     // 3052.
     // And a_boundary_recording_holding_an_instruction_offset_is_malformed:
     // 3053.
@@ -3200,7 +3200,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tool_global's
     // a_start_grant_carries_the_threads_replayed_first_slice and
     // finish_thread_start_installs_a_replayed_first_slice: 3064, listed.
-    ("test.detcore_unit", 3064),
+    // And finish_thread_start_installs_a_replayed_first_slices_offset, with
+    // #4789 and #4845 combined: 3065.
+    ("test.detcore_unit", 3065),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5628,7 +5630,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same marked-record format unit: 3061.
     // And the same stated-format unit: 3062.
     // And the same two start-grant units: 3064, listed.
-    ("test.detcore_unit_on_host", 3064),
+    // And the same first-slice offset unit: 3065.
+    ("test.detcore_unit_on_host", 3065),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

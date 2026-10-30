@@ -1571,7 +1571,7 @@ async fn reused_exec_worker_start_waits_for_parent_registration_before_clock_or_
         startup.await,
         (
             None,
-            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None)))
+            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None, None)))
         )
     );
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 2);
@@ -1849,7 +1849,7 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
         startup.await,
         (
             None,
-            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None)))
+            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None, None)))
         )
     );
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 3);

@@ -701,7 +701,7 @@ mod tests {
                 ..Startup::default()
             },
             Box::new(crate::tool_global::GlobalResponse::StartNewThread(
-                None, None,
+                None, None, None,
             )),
         );
         let bytes = bincode::serde::encode_to_vec(&response, bincode::config::standard()).unwrap();

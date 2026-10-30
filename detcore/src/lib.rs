@@ -5493,9 +5493,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         // Except for the root task, let's block until it's our turn to go:
-        let (th, first_slice) = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
+        let (th, first_slice, first_offset) =
+            tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
-        tool_global::finish_thread_start(&self.cfg, guest, th, first_slice);
+        tool_global::finish_thread_start(&self.cfg, guest, th, first_slice, first_offset);
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no
         // RCB progress to record.  However, we call it for consistency with all the other handlers.
