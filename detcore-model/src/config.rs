@@ -4171,7 +4171,10 @@ mod legacy_backend_json {
     /// `property_snapshot` came after it too, and only hermit-cli sets it, on
     /// Android, where DBT does not run; it is never written and reads as
     /// unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 55] = [
+    /// `chaos_instruction_offset` came after it as well: the ptrace backend's
+    /// precise timer takes its single steps, and `hermit run` refuses it on
+    /// every other backend, so it is never written and reads as 0.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 56] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4227,6 +4230,7 @@ mod legacy_backend_json {
         "property_snapshot",
         "watch",
         "watch_from",
+        "chaos_instruction_offset",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -4380,9 +4384,12 @@ mod legacy_backend_json {
                     | "stacktrace_at_schedule_positions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
-                Some("in_guest_reserved_signals" | "access_trace_from" | "watch_from") => {
-                    seed.deserialize(U64Deserializer::new(0)).map(Some)
-                }
+                Some(
+                    "in_guest_reserved_signals"
+                    | "access_trace_from"
+                    | "watch_from"
+                    | "chaos_instruction_offset",
+                ) => seed.deserialize(U64Deserializer::new(0)).map(Some),
                 // None, as its serde default is.
                 Some("watch") => seed
                     .deserialize(serde_json::Value::Array(Vec::new()))
@@ -4747,7 +4754,8 @@ mod legacy_backend_json {
                 | "stacktrace_at_schedule_positions"
                 | "property_snapshot"
                 | "watch"
-                | "watch_from" => Ok(()),
+                | "watch_from"
+                | "chaos_instruction_offset" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -5764,7 +5772,8 @@ mod tests {
                 | "stacktrace_at_schedule_positions"
                 | "property_snapshot"
                 | "watch"
-                | "watch_from" => {}
+                | "watch_from"
+                | "chaos_instruction_offset" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -5803,11 +5812,12 @@ mod tests {
         // `access_trace_max_bytes`, `replay_continue_fairly`,
         // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
-        // `stacktrace_at_schedule_positions`, `property_snapshot`, `watch`, `watch_from`
+        // `stacktrace_at_schedule_positions`, `property_snapshot`, `watch`, `watch_from`,
+        // `chaos_instruction_offset`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-four fewer, so forty keys fewer than fields.
+        // fifty-five fewer, so forty-one keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 40);
+        assert_eq!(fields.len(), keys.len() + 41);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6097,6 +6107,51 @@ mod tests {
         assert_eq!(
             from_legacy_backend_json(&array).unwrap().guest_ids,
             crate::pid::GuestIds::Namespace
+        );
+    }
+
+    /// `chaos_instruction_offset` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads back as 0 from
+    /// both the object and the array form.
+    #[test]
+    fn chaos_instruction_offset_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            chaos: true,
+            chaos_instruction_offset: 16,
+            ..off.clone()
+        };
+        let chaos = Config {
+            chaos: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&chaos).unwrap());
+        assert!(!json.contains("chaos_instruction_offset"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        assert!(
+            !to_legacy_backend_json(&off)
+                .unwrap()
+                .contains("chaos_instruction_offset")
         );
     }
 
