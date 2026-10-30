@@ -5157,7 +5157,8 @@ fn describe_rejoin_calls(rejoin: &Rejoin) -> String {
 /// The readmissions a replayed preemption record carries, for a run that
 /// replays one (`--replay-preemptions-from`, `--replay-schedule-from`; the
 /// first when both name a record). `None` when the run replays no record, or
-/// the record stores none, which replays as before.
+/// the record stores no entry (an empty list, or none at all), which replays
+/// as before.
 fn replayed_rejoins(cfg: &Config) -> Option<std::collections::VecDeque<Rejoin>> {
     let path = cfg
         .replay_preemptions_from
@@ -5168,7 +5169,9 @@ fn replayed_rejoins(cfg: &Config) -> Option<std::collections::VecDeque<Rejoin>> 
             reason: format!("the record's readmissions cannot be read ({err})"),
         })
     });
-    (!rejoins.is_empty()).then(|| rejoins.into())
+    rejoins
+        .filter(|rejoins| !rejoins.is_empty())
+        .map(Into::into)
 }
 
 impl Scheduler {
@@ -30342,12 +30345,12 @@ mod test {
 
         assert_eq!(
             crate::preemptions::read_recorded_rejoins(&path).unwrap(),
-            vec![Rejoin {
+            Some(vec![Rejoin {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 9)],
                 popped: Some(Vec::new()),
-            }]
+            }])
         );
 
         // A replay of that record has the readmission due, and keeps the
