@@ -449,6 +449,23 @@ fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) 
 /// environment carries only what the guest was given.
 pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
 
+/// Guest-visible path (inside the bind-mounted DBT stats directory) the
+/// in-guest Detcore global writes this run's host-input records to, so the
+/// launcher can name a divergence a host file change caused, exactly as
+/// the ptrace/KVM descriptor path does. Set by Hermit only for `--verify`;
+/// carried in the private `HERMIT_DBT_` environment, never the guest's.
+/// `Config::host_input_log` itself is `#[serde(skip)]`, so it cannot
+/// travel in the coordinator frame or the serialized config.
+pub const HOST_INPUT_LOG_ENV: &str = "HERMIT_DBT_HOST_INPUT_LOG";
+
+/// Applies the [`HOST_INPUT_LOG_ENV`] override to a decoded configuration.
+fn apply_host_input_log(config: &mut Config, value: Option<std::ffi::OsString>) {
+    if let Some(path) = value.filter(|path| !path.is_empty()) {
+        config.host_input_log = Some(std::path::PathBuf::from(path));
+        config.record_host_inputs = true;
+    }
+}
+
 /// The coordinator's [`detcore::config_wire_fingerprint`], which this runtime
 /// compares with its own before it decodes the coordinator's first frame
 /// (`initial_dbt_config`). Detcore's configuration and its global RPC
@@ -1509,6 +1526,7 @@ unsafe fn runtime_background_init(
             // the protected report descriptor the guest children write aggregated
             // unsupported-syscall records to, and force the exit+report path so a
             // child terminates the process tree deterministically.
+            apply_host_input_log(&mut config, std::env::var_os(HOST_INPUT_LOG_ENV));
             let panic_on_unsupported_syscalls = callbacks.panic_on_unsupported_syscalls != 0;
             config.panic_on_unsupported_syscalls = panic_on_unsupported_syscalls;
             COPIED_PANIC_ON_UNSUPPORTED.store(panic_on_unsupported_syscalls, Ordering::Release);
@@ -3741,6 +3759,26 @@ mod tests {
             assert_eq!(received.max_timeslice, None);
             assert!(received.sequentialize_threads);
         }
+    }
+
+    #[test]
+    fn host_input_log_env_arms_recording_with_a_guest_path() {
+        let mut config = default_dbt_config();
+        apply_host_input_log(&mut config, None);
+        assert!(config.host_input_log.is_none() && !config.record_host_inputs);
+        apply_host_input_log(&mut config, Some(std::ffi::OsString::new()));
+        assert!(config.host_input_log.is_none());
+        apply_host_input_log(
+            &mut config,
+            Some("/tmp/.hermit-dbt-stats-0/host-inputs.jsonl".into()),
+        );
+        assert_eq!(
+            config.host_input_log.as_deref(),
+            Some(std::path::Path::new(
+                "/tmp/.hermit-dbt-stats-0/host-inputs.jsonl"
+            ))
+        );
+        assert!(config.record_host_inputs);
     }
 
     #[test]

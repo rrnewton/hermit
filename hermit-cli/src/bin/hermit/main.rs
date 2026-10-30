@@ -2303,7 +2303,7 @@ mod tests {
             .split_once("    /// The `--bind`s")
             .unwrap()
             .0;
-        assert!(common.contains("self.dbt_invocation()?.verification(_dbt_stdin)"));
+        assert!(common.contains("options.dbt_invocation()?.verification(_dbt_stdin)"));
         assert_eq!(common.matches("options.run_verify(").count(), 1);
         assert_eq!(common.matches("                execute(").count(), 2);
         assert_eq!(common.matches("&run1_options,").count(), 1);

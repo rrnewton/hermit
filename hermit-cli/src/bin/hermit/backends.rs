@@ -964,6 +964,16 @@ impl DbtInvocation {
         let mut config = config.clone();
         hermit::declare_dbt_launcher(&mut config, &drrun)
             .map_err(|error| Error::msg(format!("{error:#}")))?;
+        // For --verify, the global that keeps host-input records runs on
+        // the coordinator side of the container; give it the guest-visible
+        // stats path (bind-mounted to the launcher's sink), not the host
+        // descriptor path the ptrace/KVM runs use.
+        if config.record_host_inputs
+            && let Some(directory) =
+                dbt_stats_guest_directory(binds.iter().map(|(_, target)| target))
+        {
+            config.host_input_log = Some(directory.join("host-inputs.jsonl"));
+        }
         let config = &config;
         // The coordinator's first RPC frame carries this configuration to the
         // runtime. One that cannot be serialized (a path option that is not
@@ -1046,6 +1056,19 @@ impl DbtInvocation {
 
         let mut guest = StdCommand::new(program);
         environment.remove(OsStr::new("HERMIT_LOG_FILE"));
+        // For --verify, the in-guest global writes host-input records into
+        // the bind-mounted stats directory; the private prefix keeps this
+        // path out of the guest's own environment.
+        if config.record_host_inputs
+            && options.uses_container()
+            && let Some(directory) =
+                dbt_stats_guest_directory(binds.iter().map(|bind| &bind.target))
+        {
+            environment.insert(
+                detcore_dbt::HOST_INPUT_LOG_ENV.into(),
+                directory.join("host-inputs.jsonl").into_os_string(),
+            );
+        }
         // The runtime checks this against its own build before it reads the
         // configuration frame (`detcore_dbt::CONFIG_FINGERPRINT_ENV`); the
         // runner's private prefix keeps it from the guest.
@@ -1285,6 +1308,17 @@ impl DbtRunCompletion {
         output: &reverie::process::Output,
         run: VerificationRun,
     ) -> Result<DbtRunFacts, Error> {
+        // Read the host-input records before capture() consumes the sink:
+        // the in-guest global wrote them beside the stats records.
+        let host_inputs_path = self.stats.directory().join("host-inputs.jsonl");
+        let host_inputs = if host_inputs_path.exists() {
+            Some(
+                hermit::host_input_change::read_host_inputs(&host_inputs_path)
+                    .map_err(|error| error.to_string()),
+            )
+        } else {
+            None
+        };
         let stats = require_dbt_stats(&self.stats.capture())
             .map_err(|error| error.context(hermit::BackendRunFailure))?;
         if run == VerificationRun::Run1 && self.terminal_stdin && stats.stdin_reads() != 0 {
@@ -1298,6 +1332,7 @@ impl DbtRunCompletion {
         Ok(DbtRunFacts {
             stats,
             initialization_records: self.initialization_records,
+            host_inputs,
         })
     }
 }
@@ -1306,6 +1341,9 @@ impl DbtRunCompletion {
 pub(super) struct DbtRunFacts {
     stats: DbtBackendStatsSnapshot,
     initialization_records: usize,
+    /// This run's host-input records, when the in-guest global wrote them
+    /// (`Ok`), or why they could not be read; `None` when it wrote none.
+    pub(super) host_inputs: Option<Result<hermit::host_input_change::HostInputs, String>>,
 }
 
 /// Backend facts supplement the common comparison, never replace it. Decide
@@ -1518,10 +1556,12 @@ pub(super) fn conclude_dbt_verification(
         &DbtRunFacts {
             stats: first.stats,
             initialization_records: first.initialization_records,
+            host_inputs: None,
         },
         &DbtRunFacts {
             stats: second.stats,
             initialization_records: second.initialization_records,
+            host_inputs: None,
         },
     );
     let mut options = ComparisonOptions {
@@ -1604,6 +1644,22 @@ struct DbtExecution {
     launched: Option<(PathBuf, Option<PathBuf>, Option<OsString>)>,
 }
 
+/// The guest-visible DBT statistics directory: the first
+/// `/tmp/.hermit-dbt-stats-{slot}` overlapping none of the declared bind
+/// targets. Admission accepts only normal descendants of /tmp. Do not
+/// consult host contents: those differ between physical runs.
+#[cfg(feature = "dbt")]
+fn dbt_stats_guest_directory<'a>(targets: impl Iterator<Item = &'a PathBuf>) -> Option<PathBuf> {
+    let targets: Vec<&PathBuf> = targets.collect();
+    (0..=targets.len())
+        .map(|slot| PathBuf::from(format!("/tmp/.hermit-dbt-stats-{slot}")))
+        .find(|candidate| {
+            targets
+                .iter()
+                .all(|target| !candidate.starts_with(target) && !target.starts_with(candidate))
+        })
+}
+
 #[cfg(feature = "dbt")]
 impl DbtExecution {
     fn new(options: &super::run::RunOpts, test_workdir: bool) -> Self {
@@ -1670,16 +1726,7 @@ impl DbtExecution {
             return Ok(capture.configure(runner));
         }
         let binds = self.options.dbt_binds();
-        // Admission accepts only normal descendants of /tmp. Each declared
-        // target can overlap at most one of these direct sibling directories.
-        // Do not consult host contents: those differ between physical runs.
-        let directory = (0..=binds.len())
-            .map(|slot| PathBuf::from(format!("/tmp/.hermit-dbt-stats-{slot}")))
-            .find(|candidate| {
-                binds.iter().all(|(_, target)| {
-                    !candidate.starts_with(target) && !target.starts_with(candidate)
-                })
-            })
+        let directory = dbt_stats_guest_directory(binds.iter().map(|(_, target)| target))
             .ok_or_else(|| Error::msg("DBT statistics directory conflicts with declared binds"))?;
         self.statistics
             .replace(Some(Bind::new(capture.directory(), &directory)));
@@ -2900,6 +2947,7 @@ mod tests {
         let first = DbtRunFacts {
             stats: dbt_stats(100, 7, 7, 0, 42),
             initialization_records: 2,
+            host_inputs: None,
         };
         for (branches, images, mismatch, caller_owns_logs, initial_override) in [
             (100, 2, false, false, false),
@@ -2918,6 +2966,7 @@ mod tests {
             let second = DbtRunFacts {
                 stats: dbt_stats(branches, 7, 7, 0, 42),
                 initialization_records: images,
+                host_inputs: None,
             };
             let comparison = DbtVerificationComparison::new(&first, &second);
             let mut options = ComparisonOptions {
