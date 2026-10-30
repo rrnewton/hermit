@@ -899,7 +899,17 @@ impl RecordVersion {
 // numbering so a replay under another one is refused. A recording made
 // before the numbering existed names no guest IDs, so an older replayer
 // would key its threads differently and diverge; it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x196);
+// 0x196 -> 0x197 (coordinator-assigned for the combined guest-poll change):
+// Unix connections completed outside their turn, or normalized from EISCONN,
+// no longer establish a trustworthy pairing from the address read afterward.
+// Losing those pairings also changes binary record/replay: sends through a
+// known peer record fstat probes for carried SCM_RIGHTS descriptors, while an
+// unpaired send does not, and received aliases can follow different routing.
+// An older stream can therefore contain a different probe/turn sequence even
+// though the new idle-poller time jumps are excluded from binary record/replay.
+// Refuse that stream before starting the guest rather than desynchronizing it.
+// https://github.com/rrnewton/hermit/pull/4864
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x197);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -924,7 +934,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x196);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x196;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x197;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

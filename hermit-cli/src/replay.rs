@@ -634,6 +634,42 @@ mod tests {
         );
     }
 
+    /// Conservative Unix pairing changes which SCM_RIGHTS fstat probes enter
+    /// a binary recording. The preceding epoch must be refused before any
+    /// guest or event stream is opened, not accepted until a later desync.
+    #[tokio::test]
+    async fn replay_refuses_recordings_from_before_conservative_unix_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "exe": "/hermit-version-regression/must-not-start",
+            "program": "must-not-start",
+            "arg0": "must-not-start",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": 0x196,
+        });
+        fs::write(
+            dir.path().join(crate::consts::METADATA_NAME),
+            metadata.to_string(),
+        )
+        .unwrap();
+        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+            Ok(_) => panic!("replay accepted the pre-pairing 0x196 recording"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("Version mismatch, recording version RecordVersion(406)"),
+            "the old epoch must be refused before guest startup: {error}"
+        );
+        assert!(
+            error.contains(&format!("replayer version {RECORD_VERSION:?}")),
+            "the refusal must identify this replayer's epoch: {error}"
+        );
+    }
+
     /// A recording whose run recorded a replay refusal is refused before the
     /// guest starts, with the recorded reason
     /// (https://github.com/rrnewton/hermit/issues/3994).

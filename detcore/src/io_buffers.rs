@@ -1287,6 +1287,14 @@ mod event_tests {
 
     type RetryGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
+    /// Opt-in syscall scripting for the pairing-to-recorded-probe control.
+    /// Other EventGuest scenarios keep refusing these additional injections.
+    struct PairingProbe {
+        accepted_fd: i32,
+        carried_fd: i32,
+        calls: Vec<(Sysno, i32)>,
+    }
+
     struct EventGuest {
         config: Config,
         thread: ThreadState<()>,
@@ -1326,6 +1334,7 @@ mod event_tests {
         passes_out: Mutex<Vec<bool>>,
         /// What a `connect`'s second attempt returns.
         connect_completes: Result<i64, Errno>,
+        pairing_probe: Option<PairingProbe>,
     }
 
     impl EventGuest {
@@ -1570,6 +1579,34 @@ mod event_tests {
 
         async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
             let (number, args) = syscall.into_parts();
+            if let Some(probe) = &mut self.pairing_probe {
+                probe.calls.push((number, args.arg0 as i32));
+                match Syscall::from_raw(number, args) {
+                    Syscall::Accept4(_) => return Ok(i64::from(probe.accepted_fd)),
+                    Syscall::Fstat(call) => {
+                        assert_eq!(call.fd(), probe.carried_fd);
+                        // A valid fixed file identity, written into the same
+                        // guest stack buffer the production probe reserved.
+                        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                        stat.st_dev = 1;
+                        stat.st_ino = 123;
+                        stat.st_mode = libc::S_IFREG | 0o600;
+                        stat.st_nlink = 1;
+                        stat.st_size = 8;
+                        self.memory.write_value(call.stat().unwrap().0, &stat)?;
+                        return Ok(0);
+                    }
+                    Syscall::Fcntl(call) => {
+                        assert_eq!(call.fd(), probe.accepted_fd);
+                        assert!(matches!(
+                            call.cmd(),
+                            reverie::syscalls::FcntlCmd::F_SETFL(_)
+                        ));
+                        return Ok(0);
+                    }
+                    _ => {}
+                }
+            }
             if matches!(
                 number,
                 Sysno::io_uring_setup | Sysno::io_uring_enter | Sysno::io_uring_register
@@ -1757,6 +1794,7 @@ mod event_tests {
             export_wait_controls: Mutex::new(Vec::new()),
             passes_out: Mutex::new(Vec::new()),
             connect_completes: Ok(0),
+            pairing_probe: None,
         };
         (tool, guest)
     }
@@ -2316,6 +2354,158 @@ mod event_tests {
             connect_rewritten_while_it_waits(ConnectRun::OutsideTheTurn).await,
             (None, None, false)
         );
+    }
+
+    /// Actual connect/accept/send handlers decide whether a carried FD's
+    /// fstat reaches record_or_replay. NoopTool makes the scripted injection
+    /// observable here; this is dispatch coverage, not serialized log bytes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn binary_modes_lose_unattributed_pairs_before_sent_rights_probes() {
+        const LISTENER_A: i32 = 10;
+        const LISTENER_B: i32 = 11;
+        const CONNECTOR_B: i32 = 12;
+        const ACCEPTED: i32 = 14;
+        const CARRIED: i32 = 15;
+        for (recordreplay_modes, replaying) in [(false, false), (true, false), (true, true)] {
+            for invalidate_other_name in [false, true] {
+                let (_original_tool, mut guest) = event_guest(FdType::Socket, None);
+                guest.config.recordreplay_modes = recordreplay_modes;
+                guest.config.replaying = replaying;
+                guest.config.virtualize_metadata = false;
+                guest.config.virtualize_time = false;
+                assert!(guest.config.sequentialize_threads);
+                assert!(!guest.config.backend.tool_shares_guest_descriptor_table);
+                let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+                guest.pairing_probe = Some(PairingProbe {
+                    accepted_fd: ACCEPTED,
+                    carried_fd: CARRIED,
+                    calls: Vec::new(),
+                });
+                guest
+                    .thread
+                    .with_detfd(FD, |fd| fd.set_unix_type(libc::SOCK_STREAM))
+                    .unwrap();
+                for fd in [LISTENER_A, LISTENER_B, CONNECTOR_B, CARRIED] {
+                    let ty = if fd == CARRIED {
+                        FdType::Regular
+                    } else {
+                        FdType::Socket
+                    };
+                    let descriptor = DetFd::new(
+                        fd,
+                        OFlag::O_RDWR | OFlag::O_NONBLOCK,
+                        ty,
+                        OpenFileId::new(DetPid::from_raw(1), 200 + fd as u64),
+                    );
+                    if ty == FdType::Socket {
+                        descriptor.set_unix_type(libc::SOCK_STREAM);
+                        descriptor.set_physically_nonblocking();
+                    }
+                    guest
+                        .thread
+                        .file_metadata
+                        .lock()
+                        .unwrap()
+                        .file_handles
+                        .insert(fd, descriptor);
+                }
+                tool.note_unix_bind(&mut guest, LISTENER_A, NAME_A);
+                tool.note_unix_bind(&mut guest, LISTENER_B, NAME_B);
+                let length = put_unix_name(&guest.memory, NAME_B);
+                guest.send_attempts = 1; // the one scripted connect succeeds
+                assert_eq!(
+                    tool.handle_connect(
+                        &mut guest,
+                        reverie::syscalls::Connect::new()
+                            .with_fd(CONNECTOR_B)
+                            .with_uservaddr(AddrMut::from_raw(ADDRESS))
+                            .with_addrlen(length as i32),
+                    )
+                    .await
+                    .unwrap(),
+                    0
+                );
+                if invalidate_other_name {
+                    put_unix_name(&guest.memory, NAME_A);
+                    guest.send_attempts = 1;
+                    assert_eq!(
+                        tool.handle_connect(
+                            &mut guest,
+                            reverie::syscalls::Connect::new()
+                                .with_fd(FD)
+                                .with_uservaddr(AddrMut::from_raw(ADDRESS))
+                                .with_addrlen(length as i32),
+                        )
+                        .await
+                        .unwrap(),
+                        0
+                    );
+                }
+                assert_eq!(
+                    tool.handle_accept4(
+                        &mut guest,
+                        reverie::syscalls::Accept4::new()
+                            .with_sockfd(LISTENER_B)
+                            .with_flags(reverie::syscalls::SockFlag::SOCK_NONBLOCK),
+                    )
+                    .await
+                    .unwrap(),
+                    i64::from(ACCEPTED)
+                );
+                guest.memory.put_iovec(0, FIRST_DEST, 8);
+                put_message(&guest.memory, &rights_passing(CARRIED));
+                guest.send_attempts = 1;
+                assert_eq!(
+                    tool.handle_sendmsg(
+                        &mut guest,
+                        reverie::syscalls::Sendmsg::new()
+                            .with_fd(CONNECTOR_B)
+                            .with_msg(Addr::from_raw(MESSAGE)),
+                    )
+                    .await
+                    .unwrap(),
+                    1
+                );
+                let calls = &guest.pairing_probe.as_ref().unwrap().calls;
+                let fstats: Vec<_> = calls
+                    .iter()
+                    .filter(|(call, _)| *call == Sysno::fstat)
+                    .map(|(_, fd)| *fd)
+                    .collect();
+                assert_eq!(
+                    fstats,
+                    if invalidate_other_name {
+                        Vec::new()
+                    } else {
+                        vec![CARRIED]
+                    },
+                    "carried-FD Stat membership: record={recordreplay_modes}, replay={replaying}, invalidated={invalidate_other_name}"
+                );
+                let observed: Vec<_> = calls
+                    .iter()
+                    .copied()
+                    .filter(|(call, _)| {
+                        matches!(
+                            call,
+                            Sysno::connect | Sysno::accept4 | Sysno::sendmsg | Sysno::fstat
+                        )
+                    })
+                    .collect();
+                let mut expected = vec![(Sysno::connect, CONNECTOR_B)];
+                if invalidate_other_name {
+                    expected.push((Sysno::connect, FD));
+                }
+                expected.extend([(Sysno::accept4, LISTENER_B), (Sysno::sendmsg, CONNECTOR_B)]);
+                if !invalidate_other_name {
+                    expected.push((Sysno::fstat, CARRIED));
+                }
+                assert_eq!(observed, expected, "probe identity and ordering");
+                assert_eq!(
+                    tool.rights_peer_is_stream(&mut guest, CONNECTOR_B),
+                    (!invalidate_other_name).then_some(true)
+                );
+            }
+        }
     }
 
     fn readv(count: usize) -> Syscall {
