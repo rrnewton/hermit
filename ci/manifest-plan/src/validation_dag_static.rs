@@ -4459,7 +4459,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4679: re-measured at this integration head by the cli binary's own
     // list under the node's skip filters, minus ignored cases: 738.
     // PR 4738 adds three cli cases: 738 + 3 = 741, re-measured at this integration head.
-    ("test.cli", 741),
+    // The PR 4853 transplant relocates three timeslice cases to the PMU node: 741 - 2 listed here
+    // (the third is new and never listed here) = 739, re-measured at this integration head.
+    ("test.cli", 739),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4545,7 +4547,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_schedule_replay_ends_check_in_slices_where_the_record_did, whose
     // replay needs a PMU stop on a branch count to go wrong, joins them: 17,
     // listed.
-    ("privileged-test.pmu_cli_cases", 18),
+    // The PR 4853 transplant adds three timeslice cases here: 18 + 3 = 21, re-measured at this integration head.
+    ("privileged-test.pmu_cli_cases", 21),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -5019,7 +5022,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4679: the same re-measurement as test.cli with the hosted
     // exclusions applied: 657.
     // The same three PR 4738 cases: 657 + 3 = 660.
-    ("test.cli_on_host", 660),
+    // The same PR 4853 transplant relocation: 660 - 2 = 658.
+    ("test.cli_on_host", 658),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
