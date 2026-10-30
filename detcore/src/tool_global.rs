@@ -15,6 +15,7 @@ pub mod initial_mm_probe;
 pub(crate) mod mapping_capture;
 pub mod native_exec;
 mod parked;
+pub(crate) mod replay_departure;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -2345,6 +2346,17 @@ impl GlobalState {
             handle.await.expect("Global scheduler clean shutdown");
             debug!("Global state cleanup, continuing...");
         }
+        let departure = {
+            let scheduler = self.sched.lock().unwrap();
+            let summary = scheduler.replay_departure().cloned();
+            let publication_refusal = scheduler.replay_publication_refusal();
+            (summary.is_some() || publication_refusal.is_some()).then_some(
+                crate::ReplayDepartureError {
+                    summary,
+                    publication_refusal,
+                },
+            )
+        };
         let network_refusal = self.finish_network_trace();
         self.finish_access_trace();
         let banner =
@@ -2383,8 +2395,11 @@ impl GlobalState {
             Ok(summary) => summary,
             Err(error) => {
                 return crate::combine_finalization(
-                    Err(error),
-                    network_refusal.map_or(Ok(()), |refusal| Err(anyhow::anyhow!(refusal))),
+                    crate::combine_finalization(
+                        Err(error),
+                        network_refusal.map_or(Ok(()), |refusal| Err(anyhow::anyhow!(refusal))),
+                    ),
+                    departure.map_or(Ok(()), |refusal| Err(refusal.into())),
                 );
             }
         };
@@ -2422,7 +2437,7 @@ impl GlobalState {
             }
             std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
         }
-        Ok(())
+        departure.map_or(Ok(()), |refusal| Err(refusal.into()))
     }
 
     #[cfg(test)]
@@ -3013,6 +3028,9 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
+        if replay_departure::is_report(&gr.2) {
+            return self.accept_replay_departure(from, gr);
+        }
         #[cfg(target_arch = "aarch64")]
         if let GlobalRequest::StoreExclusive(report) = &gr.2 {
             return self.note_store_exclusive(report);
@@ -3268,6 +3286,9 @@ impl GlobalState {
         from: Tid,
         gr: <Self as GlobalTool>::Request,
     ) -> <Self as GlobalTool>::Response {
+        if replay_departure::is_report(&gr.2) {
+            return self.accept_replay_departure(from, gr);
+        }
         // This read stays inside the caller's existing grant. In particular,
         // it neither drains logs nor updates clocks or deadline ownership.
         if let GlobalRequest::MappingCapture(request) = &gr.2 {
@@ -3828,6 +3849,9 @@ impl GlobalState {
             }
             GlobalRequest::WithForwardedCount(..) => {
                 unreachable!("a counted request is unwrapped on arrival")
+            }
+            GlobalRequest::ReplayDeparture { .. } => {
+                unreachable!("replay findings use the authenticated neutral path")
             }
             GlobalRequest::ResumeExec(process) => {
                 let mut resources = Resources::new(dtid);
@@ -7229,7 +7253,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 18;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 19;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -8007,6 +8031,17 @@ pub enum GlobalRequest {
     /// Report a host-ID outcome or a conservative pre-vfork attempt while
     /// Detcore chooses IDs (`GlobalState::host_id_tasks`). Appended last.
     GaveHostId,
+    /// A faithful thread could not file its next change point. The receiver
+    /// derives identity/source/output coordinates, acknowledges within the
+    /// existing grant, and does not consume time or grant state. Appended last.
+    ReplayDeparture {
+        /// The previous change point filed by this thread.
+        previous: LogicalTime,
+        /// The attempted time, at or before the previous filing.
+        observed: LogicalTime,
+        /// The thread's actual slice counter at detection.
+        slice: u64,
+    },
 }
 
 /// Responses from the global object
@@ -8337,6 +8372,9 @@ pub enum GlobalResponse {
     NextGuestId(Option<i32>),
     /// The answer to `GlobalRequest::GaveHostId`. Appended last.
     GaveHostId(()),
+    /// An accepted finding or named refusal. Never carries a clock or grant.
+    /// Appended last; this is not a forwarding-health certificate.
+    ReplayDeparture(Result<(), replay_departure::Refusal>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -13145,6 +13183,7 @@ mod tests {
     mod guest_mask_publication_tests;
     mod replay_departure_tests;
     mod reserved_input_exec_tests;
+    mod replay_departure_transport;
     mod sigkill_deregistration_tests;
     mod stopping_refusal_tests;
     mod temporary_mask_publication_tests;

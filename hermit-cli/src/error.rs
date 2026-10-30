@@ -151,6 +151,11 @@ impl SerializableError {
 /// be the thing `kind` exists to avoid, and it would break the moment the message
 /// is reworded. This reaches through the one wrapper that hides the type.
 fn is_policy_refusal(err: &Error) -> bool {
+    // Anyhow typed context is downcastable through Anyhow, but is not
+    // necessarily exposed as that type by std::error::Error::source().
+    if detcore::ReplayDepartureError::in_error(err).is_some() {
+        return true;
+    }
     // Detcore's refusal of an unsupported syscall, and reverie-ptrace's end of
     // a run in which the guest made a syscall through Reverie's untraced
     // private-page stub, which no tool saw
@@ -162,6 +167,7 @@ fn is_policy_refusal(err: &Error) -> bool {
             || cause.is::<detcore::ChosenBinaryInputRefusal>()
             || cause.is::<detcore::TerminalReplayRefusal>()
             || cause.is::<detcore::PriorityHistoryRefusal>()
+            || cause.is::<detcore::ReplayDepartureError>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
             || is_chosen_root_id_taken(cause)
     }
@@ -201,7 +207,12 @@ pub(crate) fn classify_ptrace_primary(error: &reverie::Error) -> FailureKind {
         // teardown was clean (`ptrace_completion::clean_terminal_outcome`).
         // Left as the primary of a failed run, the teardown failed or never
         // confirmed, which is Hermit's failure.
-        reverie::Error::Tool(inner) if inner.is::<crate::SchedulerEndedRun>() => FailureKind::Error,
+        reverie::Error::Tool(inner)
+            if inner.is::<crate::SchedulerEndedRun>()
+                && detcore::ReplayDepartureError::in_error(inner).is_none() =>
+        {
+            FailureKind::Error
+        }
         reverie::Error::Tool(inner) => classify_unwrapped(inner),
         _ => FailureKind::Error,
     }

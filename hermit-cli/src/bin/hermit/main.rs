@@ -73,6 +73,11 @@ mod record_envelope;
 mod record_start;
 mod remove;
 mod replay;
+#[cfg(test)]
+mod replay_departure_classification_tests;
+#[cfg(test)]
+#[path = "../../replay_departure_test_fixture.rs"]
+mod replay_departure_test_fixture;
 mod run;
 mod run_config;
 mod run_timeout;
@@ -967,6 +972,9 @@ fn is_outer_policy_refusal(error: &Error) -> bool {
 /// positions are consistent: the code channel exists to tell hermit's failures
 /// apart from the guest's, not to subdivide hermit's own.
 fn failure_exit_code(error: &Error) -> i32 {
+    if detcore::ReplayDepartureError::in_error(error).is_some() {
+        return detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
+    }
     // A completed comparison with a recorded PMU skid overshoot is an
     // understood infrastructure failure. Hermit deliberately declines to
     // vouch for the result, so it uses the same coarse exit class as other
@@ -1017,6 +1025,16 @@ fn failure_exit_code(error: &Error) -> i32 {
 }
 
 fn classify_failure(error: &Error) -> String {
+    if let Some(departure) = detcore::ReplayDepartureError::in_error(error) {
+        return match departure.summary() {
+            Some(summary) => format!(
+                "HERMIT_POLICY_REFUSAL class=policy-refusal cause=replay-departure count={}",
+                summary.count
+            ),
+            None => "HERMIT_POLICY_REFUSAL class=policy-refusal cause=replay-departure-publication"
+                .to_owned(),
+        };
+    }
     if let Some(overshoot) = error.downcast_ref::<hermit::SkidOvershootError>() {
         return format!(
             "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={}",

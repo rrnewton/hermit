@@ -15450,7 +15450,10 @@ pub(super) fn rejected_first_run(
     terminal_outcome: Option<detcore::TerminalOutcome>,
 ) -> Error {
     match terminal_outcome {
-        Some(outcome) if error.downcast_ref::<SkidOvershootError>().is_none() => {
+        Some(outcome)
+            if error.downcast_ref::<SkidOvershootError>().is_none()
+                && detcore::ReplayDepartureError::in_error(&error).is_none() =>
+        {
             error.context(SchedulerOutcome(outcome))
         }
         _ => error,

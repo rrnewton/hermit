@@ -2409,6 +2409,14 @@ pub struct Scheduler {
     /// was specified in the Config, otherwise this remains empty.
     pub preemption_writer: Option<PreemptionWriter>,
 
+    /// Accepted faithful-replay findings. Runtime coordinator state only;
+    /// not a thread snapshot, resource request or scheduling input.
+    replay_departure: Option<detcore_model::replay_departure::Summary>,
+
+    /// First rejected publication, distinct from an accepted finding. This
+    /// refuses completion without granting authority or tainting a recording.
+    replay_publication_refusal: Option<(DetTid, crate::tool_global::replay_departure::Refusal)>,
+
     /// The access trace (`--record-access-trace-to`), written as events are
     /// recorded ([`Self::record_access`]). It never feeds a decision.
     pub access_trace: Option<crate::access_trace::AccessTraceWriter>,
@@ -4950,8 +4958,7 @@ enum ThreadStatus {
 }
 
 // The calls of `report_stale_replay_change_point` on this thread, which unit
-// tests read: the process-wide overshoot count is shared with tests running
-// beside them.
+// tests read. Actual completion authority is the coordinator's bounded report.
 #[cfg(test)]
 thread_local! {
     static STALE_CHANGE_POINT_REPORTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4959,22 +4966,18 @@ thread_local! {
 
 /// Reports a preemption replay's change point for `dettid` at `time`, not
 /// after its last recorded one at `last` ([`Scheduler::perform_priority_changepoint`]):
-/// a skid overshoot, counted where every overshoot is
-/// (`reverie::record_skid_overshoot`) so the run ends in the skid-overshoot
-/// policy refusal, and named with `reverie::SKID_OVERSHOOT_MARKER`. As with
-/// the timer's overshoot check, the refusal counts detections rather than
-/// distinct departures from the record.
+/// a replay departure, not evidence of timer skid. The caller records it in
+/// the same scheduler transaction; detections need not be distinct causes.
 #[cold]
 fn report_stale_replay_change_point(dettid: DetTid, time: LogicalTime, last: LogicalTime) {
     #[cfg(test)]
     STALE_CHANGE_POINT_REPORTS.with(|reports| reports.set(reports.get() + 1));
-    reverie::record_skid_overshoot();
     tracing::error!(
         "{} preemption replay: thread {} changed priority at {}, not after its last change \
          point at {}: a slice closed at the instant the last one did, which the replayed \
          record never does. The change point is left out of the new record; the rest of this \
          run does not replay the record exactly. {}",
-        reverie::SKID_OVERSHOOT_MARKER,
+        "HERMIT_REPLAY_DEPARTURE:",
         dettid,
         time,
         last,
@@ -5236,6 +5239,8 @@ impl Scheduler {
             priority_rows: BTreeMap::new(),
             priority_births: BTreeSet::new(),
             replayer,
+            replay_departure: None,
+            replay_publication_refusal: None,
             replays_preemptions: cfg.replay_preemptions_from.is_some(),
             replays_edited_preemptions: cfg.replay_preemptions_from.is_some()
                 && cfg.replay_edited_preemptions,
@@ -7852,6 +7857,49 @@ impl Scheduler {
         self.parked.running = Some(dettid);
     }
 
+    /// Exact observation-route invariants, without dropping arbitrary Debug
+    /// substrings. Accepted diagnostics and writer taint are asserted separately.
+    #[cfg(test)]
+    pub(crate) fn replay_observation_state_for_test(&self) -> Vec<String> {
+        vec![
+            format!("{:?}", (self.turn, self.committed_time, &self.turn_clocks)),
+            format!(
+                "{:?}",
+                (&self.run_queue, &self.next_turns, &self.priorities)
+            ),
+            format!(
+                "{:?}",
+                (&self.granted, &self.lone_grants, &self.deadline_hints)
+            ),
+            format!(
+                "{:?}",
+                (
+                    &self.timeslices,
+                    &self.boundary_budgets,
+                    &self.boundary_owners
+                )
+            ),
+            format!("{:?}", (&self.parked, &self.blocked, &self.work_span)),
+            format!("{:?}", (&self.fuzz_prng, &self.post_fork_prng)),
+            format!(
+                "{:?}",
+                (
+                    &self.published_masks,
+                    &self.published_dispositions,
+                    &self.runtime_private_memory
+                )
+            ),
+            format!(
+                "{:?}",
+                (
+                    &self.real_timers,
+                    &self.poll_deadlines,
+                    &self.poll_deadline_of
+                )
+            ),
+        ]
+    }
+
     #[cfg(test)]
     pub(crate) fn select_test_turn(
         &mut self,
@@ -8102,6 +8150,83 @@ impl Scheduler {
         self.runtime_private_memory
             .get(&(mm.creator(), mm.generation()))
             .cloned()
+    }
+
+    pub(crate) fn validate_replay_departure(
+        &self,
+        previous: LogicalTime,
+        observed: LogicalTime,
+    ) -> Result<(), crate::tool_global::replay_departure::Refusal> {
+        use crate::tool_global::replay_departure::Refusal;
+        if !self.replays_preemptions || self.replays_edited_preemptions {
+            return Err(Refusal::Mode);
+        }
+        if observed > previous {
+            return Err(Refusal::Advancing);
+        }
+        if self
+            .replay_departure
+            .as_ref()
+            .is_some_and(|report| report.count == u64::MAX)
+        {
+            return Err(Refusal::CountOverflow);
+        }
+        Ok(())
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/4860)
+    /// Both producers call under their existing scheduler ownership. No turn,
+    /// queue, clock or grant is changed; output provenance is marked immediately.
+    pub(crate) fn note_replay_departure(
+        &mut self,
+        source: detcore_model::replay_departure::Source,
+        thread: DetTid,
+        previous: LogicalTime,
+        observed: LogicalTime,
+        slice: Option<u64>,
+    ) -> Result<(), crate::tool_global::replay_departure::Refusal> {
+        self.validate_replay_departure(previous, observed)?;
+        let event = self.preemption_writer.as_mut().map(|writer| {
+            writer.mark_replay_departed(self.recorded_event_count);
+            self.recorded_event_count
+        });
+        match &mut self.replay_departure {
+            Some(report) => report.count = report.count.checked_add(1).expect("checked above"),
+            report @ None => {
+                *report = Some(detcore_model::replay_departure::Summary {
+                    count: 1,
+                    first: detcore_model::replay_departure::Finding {
+                        source,
+                        thread,
+                        previous,
+                        observed,
+                        slice,
+                        recorded_event_count: event,
+                    },
+                })
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replay_departure(&self) -> Option<&detcore_model::replay_departure::Summary> {
+        self.replay_departure.as_ref()
+    }
+
+    pub(crate) fn refuse_replay_publication(
+        &mut self,
+        thread: DetTid,
+        reason: crate::tool_global::replay_departure::Refusal,
+    ) {
+        self.replay_publication_refusal
+            .get_or_insert((thread, reason));
+    }
+
+    pub(crate) fn replay_publication_refusal(
+        &self,
+    ) -> Option<(DetTid, crate::tool_global::replay_departure::Refusal)> {
+        self.replay_publication_refusal
     }
 
     pub(crate) fn rpc_incarnation_matches(&self, dettid: DetTid, mm: MmId) -> bool {
@@ -17509,6 +17634,7 @@ impl Scheduler {
         // The global event this change point comes at, for a record that has
         // to leave it out (`PreemptionWriter::mark_replay_departed`).
         let event = self.recorded_event_count;
+        let mut departure = None;
         // Do not attempt to record preemptions/priorities when we're dictated by a raw schedule replay.
         if !self.has_schedule_replay()
             && let Some(pw) = &mut self.preemption_writer
@@ -17523,7 +17649,7 @@ impl Scheduler {
             // reach one at or before the instant of the thread's last, where
             // a slice closed with no time between: the record never did that,
             // so the replay is not exact. That is reported as one (the run
-            // ends in the skid-overshoot refusal), and neither the change
+            // ends in the replay-departure refusal), and neither the change
             // point nor the epoch transitions it carries are written: the new
             // record's rows and epochs must stay increasing, and its writer
             // asserts both. `set_current` still runs, so the next row's
@@ -17556,7 +17682,7 @@ impl Scheduler {
                 }
                 Some(last) if self.replays_preemptions => {
                     report_stale_replay_change_point(dettid, guest_time, last);
-                    pw.mark_replay_departed(event);
+                    departure = Some(last);
                 }
                 _ => {
                     for transition in chaos_epochs {
@@ -17572,6 +17698,17 @@ impl Scheduler {
                 }
             }
             pw.set_current(dettid, new_priority);
+        }
+
+        if let Some(previous) = departure {
+            self.note_replay_departure(
+                detcore_model::replay_departure::Source::SchedulerChangePoint,
+                dettid,
+                previous,
+                guest_time,
+                None,
+            )
+            .unwrap_or_else(|refusal| exit_on_scheduler_refusal(&refusal));
         }
 
         let popped = self.run_queue.commit_tentative_pop(); // Begun in step3.
@@ -20545,6 +20682,7 @@ impl Scheduler {
                 per_thread_timeslice,
                 // The backend, not the scheduler, measures dispatch.
                 dispatch_stats: None,
+                replay_departure: self.replay_departure.clone(),
                 // GlobalState records the effective run configuration.
                 preemption: None,
                 // GlobalState knows what the accounting point could not see
@@ -34225,6 +34363,45 @@ mod test {
             .unwrap()
             .register_thread(spinner, DEFAULT_PRIORITY);
         (scheduler, spinner)
+    }
+
+    #[test]
+    fn scheduler_departures_keep_the_first_coordinate_and_refuse_count_overflow() {
+        use crate::tool_global::replay_departure::Refusal;
+        let (mut scheduler, spinner) = replaying_and_recording_spinner(true);
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 1, 500);
+        assert_eq!(scheduler.replay_departure(), None);
+        let event = scheduler.recorded_event_count;
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 2, 500);
+        let first = scheduler.replay_departure().cloned().unwrap();
+        assert_eq!(first.count, 1);
+        assert_eq!(
+            first.first.source,
+            detcore_model::replay_departure::Source::SchedulerChangePoint
+        );
+        assert_eq!(first.first.thread, spinner);
+        assert_eq!(first.first.slice, None);
+        assert_eq!(first.first.observed, LogicalTime::from_nanos(500));
+        assert_eq!(first.first.previous, LogicalTime::from_nanos(500));
+        assert_eq!(first.first.recorded_event_count, Some(event));
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 3, 499);
+        assert_eq!(scheduler.replay_departure().unwrap().count, 2);
+        assert_eq!(scheduler.replay_departure().unwrap().first, first.first);
+        // Only the count is staged at its finite bound; the actual admission
+        // must refuse before changing the first finding, writer or scheduler.
+        scheduler.replay_departure.as_mut().unwrap().count = u64::MAX;
+        let before = format!("{scheduler:?}");
+        assert_eq!(
+            scheduler.note_replay_departure(
+                detcore_model::replay_departure::Source::SchedulerChangePoint,
+                spinner,
+                LogicalTime::from_nanos(500),
+                LogicalTime::from_nanos(499),
+                None,
+            ),
+            Err(Refusal::CountOverflow)
+        );
+        assert_eq!(format!("{scheduler:?}"), before);
     }
 
     /// In a replay, the second is a replay divergence: reported as a skid

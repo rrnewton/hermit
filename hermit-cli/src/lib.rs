@@ -96,6 +96,10 @@ pub(crate) fn run_in_fresh_process(name: &str) -> bool {
     true
 }
 mod ptrace_completion;
+#[cfg(test)]
+mod replay_departure_completion_tests;
+#[cfg(test)]
+mod replay_departure_test_fixture;
 mod timeout_survivors;
 
 pub use canonical_verdict::Verdict;
@@ -5020,7 +5024,12 @@ impl SchedulerEndedRun {
     pub fn split<T>(result: Result<T, Error>) -> Result<Result<T, SchedulerEndedRun>, Error> {
         match result {
             Ok(value) => Ok(Ok(value)),
-            Err(error) if error.downcast_ref::<SkidOvershootError>().is_some() => Err(error),
+            Err(error)
+                if error.downcast_ref::<SkidOvershootError>().is_some()
+                    || detcore::ReplayDepartureError::in_error(&error).is_some() =>
+            {
+                Err(error)
+            }
             Err(error) => error.downcast::<SchedulerEndedRun>().map(Err),
         }
     }
@@ -5341,18 +5350,46 @@ async fn dispatch_backend(
     let terminal_outcome = global_state.terminal_outcome();
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
-    global_state
+    let cleanup = global_state
         .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
-        .await
-        .map_err(|error| {
-            error.context(format!(
-                "ptrace cleanup after observed guest status {exit_status:?}"
-            ))
-        })?; // Before it's dropped by this function.
-    if let Some(outcome) = terminal_outcome {
-        return Err(Error::new(SchedulerEndedRun::new(outcome, None)));
+        .await;
+    let completed = match terminal_outcome {
+        Some(outcome) => Err(SchedulerEndedRun::new(outcome, None)),
+        None => Ok(exit_status),
+    };
+    complete_ptrace_run(completed, cleanup, exit_status)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/4860)
+// Both ptrace completion forms use this adapter. A pure departure retains the
+// owned terminal/output value under typed context, matching skid's refusal
+// priority. Composite cleanup/I/O failures keep their existing primary cause.
+fn complete_ptrace_run<T>(
+    completed: Result<T, SchedulerEndedRun>,
+    cleanup: Result<(), Error>,
+    status: ExitStatus,
+) -> Result<T, Error> {
+    match cleanup {
+        Ok(()) => completed.map_err(Error::new),
+        Err(error) => {
+            if error
+                .downcast_ref::<detcore::FinalizationFailure>()
+                .is_none()
+                && error.is::<detcore::ReplayDepartureError>()
+                && let Err(terminal) = completed
+            {
+                return Err(Error::new(terminal).context(
+                    error
+                        .downcast::<detcore::ReplayDepartureError>()
+                        .expect("type checked"),
+                ));
+            }
+            Err(error.context(format!(
+                "ptrace cleanup after observed guest status {status:?}"
+            )))
+        }
     }
-    Ok(exit_status)
 }
 
 /// Variant of `run` that also captures stdout/stderr.
@@ -5713,19 +5750,15 @@ async fn dispatch_output_backend(
     let terminal_outcome = global_state.terminal_outcome();
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
-    global_state
+    let cleanup = global_state
         .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
-        .await
-        .map_err(|error| {
-            error.context(format!(
-                "ptrace cleanup after observed guest status {:?}",
-                output.status
-            ))
-        })?;
-    if let Some(outcome) = terminal_outcome {
-        return Err(Error::new(SchedulerEndedRun::new(outcome, Some(output))));
-    }
-    Ok(output)
+        .await;
+    let status = output.status;
+    let completed = match terminal_outcome {
+        Some(outcome) => Err(SchedulerEndedRun::new(outcome, Some(output))),
+        None => Ok(output),
+    };
+    complete_ptrace_run(completed, cleanup, status)
 }
 
 /// Holds the context necessary to run high-level hermit functions.

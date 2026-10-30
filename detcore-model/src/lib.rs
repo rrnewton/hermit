@@ -335,6 +335,7 @@ pub mod network_trace;
 pub mod pedigree;
 pub mod pid;
 pub mod procfs;
+pub mod replay_departure;
 pub mod schedule;
 pub mod summary;
 pub mod syscall_histogram;

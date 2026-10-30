@@ -166,6 +166,7 @@ pub use detcore_model::pid::GuestIds;
 pub use digest::Digest;
 pub use finalization::FinalizationFailure;
 pub use finalization::PriorityHistoryRefusal;
+pub use finalization::ReplayDepartureError;
 pub use finalization::TerminalReplayRefusal;
 pub use finalization::combine_finalization;
 #[cfg(test)]
@@ -3284,7 +3285,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // no time in it). Filed, it was never granted and the replay
             // stalled until `--timeout`. Report it and run on without the
             // record's remaining ends for this thread: the run ends in the
-            // skid-overshoot refusal instead.
+            // replay-departure refusal instead. Publication is acknowledged before
+            // abandonment, even if no other resource request follows.
             if !replay_checkpoint && maybe_prio.is_some() {
                 let thread = guest.thread_state_mut();
                 if let Err(last) = thread.file_replay_change_point(&self.cfg, end_time) {
@@ -3295,7 +3297,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         end_time,
                         last,
                     );
-                    thread.abandon_replayed_slices(&self.cfg);
+                    let slice = thread.stats.timeslice_count;
+                    tool_global::replay_departure::publish(guest, last, end_time, slice).await;
+                    guest.thread_state_mut().abandon_replayed_slices(&self.cfg);
                     break;
                 }
             }

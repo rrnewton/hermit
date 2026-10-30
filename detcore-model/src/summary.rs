@@ -207,6 +207,12 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_stats: Option<DispatchStats>,
 
+    /// Accepted findings that make this faithful preemption replay incomplete.
+    /// Absent for ordinary runs and older JSON summaries; not part of Display
+    /// or the INFO view compared by verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_departure: Option<crate::replay_departure::Summary>,
+
     /// Per-syscall entries and outcomes over all guest threads, with the
     /// scope of what was observed ([`crate::syscall_histogram`]); its `calls`
     /// sum to `syscalls` ([`RunSummary::syscall_histogram_is_consistent`]).
@@ -407,6 +413,7 @@ impl RunSummary {
             guest_ids,
             host_id_tasks,
             virtual_timeout_ns,
+            replay_departure: _,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -552,6 +559,46 @@ mod tests {
     use super::RunSummary;
     use super::StoreExclusiveCounts;
     use super::TimesliceStats;
+
+    #[test]
+    fn replay_diagnostics_are_optional_json_and_never_change_compared_display() {
+        use crate::replay_departure::Finding;
+        use crate::replay_departure::Source;
+        use crate::replay_departure::Summary;
+        let plain = RunSummary::default();
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("replay_departure").is_none());
+        let decoded: RunSummary = serde_json::from_value(json.clone()).unwrap();
+        assert!(decoded.replay_departure.is_none());
+        let mut marked = plain.clone();
+        marked.replay_departure = Some(Summary {
+            count: 2,
+            first: Finding {
+                source: Source::ThreadFiling,
+                thread: crate::pid::DetTid::from_raw(3),
+                previous: crate::time::LogicalTime::from_nanos(101),
+                observed: crate::time::LogicalTime::from_nanos(100),
+                slice: Some(7),
+                recorded_event_count: Some(19),
+            },
+        });
+        assert_eq!(marked.to_string(), plain.to_string());
+        assert_eq!(marked.info(None).to_string(), plain.info(None).to_string());
+        let mut marked_json = serde_json::to_value(&marked).unwrap();
+        let roundtrip: RunSummary = serde_json::from_value(marked_json.clone()).unwrap();
+        assert_eq!(roundtrip.replay_departure, marked.replay_departure);
+        assert_eq!(
+            marked_json
+                .as_object_mut()
+                .unwrap()
+                .remove("replay_departure"),
+            Some(serde_json::to_value(marked.replay_departure.unwrap()).unwrap())
+        );
+        assert_eq!(
+            marked_json, json,
+            "every existing JSON field stays identical"
+        );
+    }
 
     #[test]
     fn path_evidence_json_is_exact() {

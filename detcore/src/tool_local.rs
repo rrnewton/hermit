@@ -10884,11 +10884,9 @@ pub(crate) const EDITED_RECORD_HINT: &str = "An edited record, not the recording
 
 /// Reports a preemption replay's thread about to file a change point at
 /// `time`, not after its last one at `last`
-/// ([`ThreadState::file_replay_change_point`]): a skid overshoot, counted
-/// where every overshoot is (`reverie::record_skid_overshoot`) so the run
-/// ends in the skid-overshoot policy refusal, and named with
-/// `reverie::SKID_OVERSHOOT_MARKER`. Panics instead under
-/// `--panic-on-rcb-overshoot`.
+/// ([`ThreadState::file_replay_change_point`]). This is not evidence of PMU
+/// skid. The caller publishes it to the coordinator before abandonment, unless
+/// `--panic-on-rcb-overshoot` preserves its synchronous stop here.
 #[cold]
 pub(crate) fn report_stale_replay_filing(
     panic_on_rcb_overshoot: bool,
@@ -10902,16 +10900,10 @@ pub(crate) fn report_stale_replay_filing(
          after its last change point at {}: the slice closed with no time in it, which the \
          replayed record never does. The thread files no change point here and runs on as \
          its final slice; the rest of this run does not replay the record exactly. {}",
-        reverie::SKID_OVERSHOOT_MARKER,
-        dettid,
-        slice,
-        time,
-        last,
-        EDITED_RECORD_HINT,
+        "HERMIT_REPLAY_DEPARTURE:", dettid, slice, time, last, EDITED_RECORD_HINT,
     );
     if panic_on_rcb_overshoot {
         panic!("{message}");
     }
-    reverie::record_skid_overshoot();
     tracing::error!("{message}");
 }

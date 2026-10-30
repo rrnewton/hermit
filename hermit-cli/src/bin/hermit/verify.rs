@@ -977,7 +977,9 @@ pub(crate) fn container_failed_report(
 /// error. Neither is an untyped error (a bad flag, an unreadable path), which
 /// leaves the pending stamp.
 pub(crate) fn run_failure_of(error: &Error) -> Option<RunFailure> {
-    if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
+    if detcore::ReplayDepartureError::in_error(error).is_some() {
+        Some(RunFailure::PolicyRefusal)
+    } else if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
         None
     } else if error
         .downcast_ref::<super::run::DeterminismLossRecorded>()
