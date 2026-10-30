@@ -293,6 +293,13 @@ pub struct AnalyzeOpts {
     /// (`crate::time_skip_carry`). Shared by every copy of these options.
     #[clap(skip)]
     pub time_skip_sources: crate::time_skip_carry::SharedTimeSkipSources,
+
+    /// The scheduler seed of the target run, which every trial whose
+    /// schedule analyze writes replays under
+    /// ([`AnalyzeOpts::adopt_trial_sched_seed`],
+    /// [`AnalyzeOpts::stamp_trial_record`]); `None` before it is known.
+    #[clap(skip)]
+    pub trial_sched_seed: Option<u64>,
 }
 
 /// `--trial-timeout`.
