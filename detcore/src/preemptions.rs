@@ -450,6 +450,16 @@ impl PreemptionRecord {
         self
     }
 
+    /// The same record, stating the scheduler seed (`--sched-seed`) of the
+    /// run it came from (`None` for unknown), as [`Self::with_rng_seed`]
+    /// states the guest random seed: a schedule analyze writes for a trial
+    /// carries the target run's, so that replaying it makes the choices the
+    /// schedule leaves open as the target did.
+    pub fn with_sched_seed(mut self, sched_seed: Option<u64>) -> Self {
+        self.sched_seed = sched_seed;
+        self
+    }
+
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
     pub fn extract_all(&self) -> BTreeMap<DetTid, ThreadHistory> {
         self.per_thread.clone()

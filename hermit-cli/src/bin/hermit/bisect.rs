@@ -143,6 +143,7 @@ impl BisectOpts {
             // the run arguments' --timeout alone.
             trial_timeout: crate::analyze::TrialTimeout::Off,
             endpoints: Default::default(),
+            trial_sched_seed: Default::default(),
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
@@ -169,6 +170,8 @@ impl BisectOpts {
         // trial's schedule is written anew without one too
         // (https://github.com/rrnewton/hermit/issues/4868).
         analyzer.adopt_trial_rng_seed(&[("--good", &self.good), ("--bad", &self.bad)])?;
+        // And with the failing schedule's scheduler seed.
+        analyzer.adopt_trial_sched_seed(Some(&self.bad))?;
         // Every replay registers queued sleeps as the failing schedule did.
         analyzer.adopt_recorded_timeslice(&[("--good", &self.good), ("--bad", &self.bad)])?;
         analyzer.refuse_recordings_under_another_pipe_wake_latency(&[

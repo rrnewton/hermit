@@ -731,6 +731,7 @@ impl AnalyzeOpts {
                 );
                 let target = self.do_search()?;
                 self.record_endpoint(&target);
+                self.adopt_found_target_sched_seed(&target);
                 Ok(target)
             } else {
                 bail!("FAILED. The run did not match the target criteria. Try --search.");
@@ -1326,6 +1327,8 @@ impl AnalyzeOpts {
         // And with one guest random seed: theirs, else --run1-seed's
         // (https://github.com/rrnewton/hermit/issues/4868).
         self.adopt_trial_rng_seed(&recordings)?;
+        // And the schedules analyze writes with the target's scheduler seed.
+        self.adopt_trial_sched_seed(run1.as_deref())?;
         // Every trial registers queued sleeps as the target did.
         self.adopt_recorded_timeslice(&recordings)?;
         self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
@@ -3117,6 +3120,90 @@ mod tests {
         prepared_seeds(&mut trial);
         let mut trial = trial.with_schedule_replay_from(other);
         assert_eq!(prepared_seeds(&mut trial), (6, 9, adopted(9)));
+    }
+
+    /// Every trial whose schedule analyze writes (bisection, swap, reordering
+    /// and stack-trace trials) replays it under the target run's scheduler
+    /// seed: written by `write_trial_schedule`, then prepared as
+    /// `RunData::launch` prepares it. The endpoints replay their own records'
+    /// scheduler seeds: the target 7, a `--run2-preemptions` baseline recorded
+    /// at another `--seed` 1, which is accepted. A baseline recorded under
+    /// another guest random seed is refused (`adopt_trial_rng_seed`). A target
+    /// named by `--run1-seed`, or found by `--search`, gives the written
+    /// schedules its seed.
+    #[test]
+    fn analyze_trials_take_the_targets_scheduler_seed_and_endpoints_their_own() {
+        use detcore_model::summary::AdoptedSeeds;
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let run1 = record_with_seeds(dir, "run1", 6, 7);
+        let run2 = record_with_seeds(dir, "run2", 6, 1);
+        let adopted = |sched| {
+            Some(AdoptedSeeds {
+                rng: None,
+                sched: Some(sched),
+            })
+        };
+        let written = |options: &AnalyzeOpts, name: &str| {
+            let mut trial = RunData::new_baseline(options, name.to_owned())
+                .unwrap()
+                .with_schedule_replay();
+            options
+                .write_trial_schedule(Vec::new(), trial.sched_path_in())
+                .unwrap();
+            let seeds = prepared_seeds(&mut trial);
+            (seeds, trial.repro_command())
+        };
+
+        let options = prepared_with(
+            dir,
+            &[
+                format!("--run1-preemptions={}", run1.display()),
+                format!("--run2-preemptions={}", run2.display()),
+            ],
+            &[],
+        )
+        .unwrap();
+        let (seeds, repro) = written(&options, "bisect_round");
+        assert_eq!(seeds, (6, 7, adopted(7)));
+        assert!(repro.contains(" --sched-seed=7"), "{repro}");
+        let mut target = RunData::new_run1_target(&options, "target".to_owned()).unwrap();
+        assert_eq!(prepared_seeds(&mut target), (6, 7, adopted(7)));
+        let mut baseline = RunData::new_baseline(&options, "run2_baseline".to_owned())
+            .unwrap()
+            .with_preempts_path_in(run2.clone());
+        assert_eq!(prepared_seeds(&mut baseline), (6, 1, adopted(1)));
+
+        let other_guest = record_with_seeds(dir, "run2_other_guest", 1, 1);
+        refused(
+            prepared_with(
+                dir,
+                &[
+                    format!("--run1-preemptions={}", run1.display()),
+                    format!("--run2-preemptions={}", other_guest.display()),
+                ],
+                &[],
+            )
+            .unwrap_err(),
+            "was recorded under the guest random seed 6 and --run2-preemptions",
+        );
+
+        let by_seed = record_with_seeds(dir, "run2_by_seed", 5, 1);
+        let mut options = prepared_with(
+            dir,
+            &[
+                "--run1-seed=5".to_owned(),
+                format!("--run2-preemptions={}", by_seed.display()),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(written(&options, "seed_round").0, (5, 5, adopted(5)));
+
+        let mut found = RunData::new_baseline(&options, "search_round".to_owned()).unwrap();
+        found.runopts.det_opts.det_config.sched_seed = Some(11);
+        options.adopt_found_target_sched_seed(&found);
+        assert_eq!(written(&options, "found_round").0, (5, 11, adopted(11)));
     }
 
     /// The trial that replays `--run1-preemptions` starts from the epoch the
