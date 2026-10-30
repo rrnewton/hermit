@@ -146,11 +146,8 @@ impl CloneGuest {
         let ids = Box::new([1]);
         self.original_args[0..8]
             .copy_from_slice(&(libc::CLONE_NEWPID as u64 | (1 << 40)).to_ne_bytes());
-        *self.original_args = ChosenIdCall::with_set_tid(
-            *self.original_args,
-            ids.as_ptr() as u64,
-            1,
-        );
+        *self.original_args =
+            ChosenIdCall::with_set_tid(*self.original_args, ids.as_ptr() as u64, 1);
         self.original_expected = *self.original_args;
         self.original_set_tid = Some(ids);
     }
@@ -319,11 +316,7 @@ async fn an_added_id_einval_takes_the_original_calls_own_result() {
     // A call with no added entry is still answered directly by the kernel.
     let mut guest = CloneGuest::new(false, Err(Errno::EINVAL));
     let ids = Box::new([i32::MAX]);
-    *guest.original_args = ChosenIdCall::with_set_tid(
-        *guest.original_args,
-        ids.as_ptr() as u64,
-        1,
-    );
+    *guest.original_args = ChosenIdCall::with_set_tid(*guest.original_args, ids.as_ptr() as u64, 1);
     guest.original_expected = *guest.original_args;
     guest.original_set_tid = Some(ids);
     let tool = Detcore::new(guest.tid(), &guest.config);
