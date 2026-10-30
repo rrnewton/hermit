@@ -100,12 +100,40 @@ fn present_envelope<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
 /// strict decoders, never a format; every other field is skipped unread. A
 /// format that is not a number, or a null envelope, reads as 1, and an
 /// envelope that is not an object is an error, each left to the record's
-/// ordinary decoding to report.
+/// ordinary decoding to report. A record marked incomplete
+/// (`PreemptionRecord::replay_departed_at`) is written inside an
+/// `incomplete_preemption_record` envelope, as a legacy record or as a
+/// slice-boundary recording's preemptions, and states its format only in that
+/// envelope's record.
 pub(super) fn probe_format(bytes: &[u8]) -> Result<u32, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Payload {
+        #[serde(default)]
+        format_version: Option<StatedFormat>,
+    }
+    #[derive(Deserialize)]
+    struct Marked {
+        #[serde(default)]
+        record: Option<Payload>,
+    }
     #[derive(Deserialize)]
     struct Preemptions {
         #[serde(default)]
         format_version: Option<StatedFormat>,
+        #[serde(default, deserialize_with = "present_envelope")]
+        incomplete_preemption_record: Option<Option<Marked>>,
+    }
+    impl Preemptions {
+        // A field beside the incomplete-record envelope is the decoder's to
+        // refuse, as one beside the slice-boundary envelope is.
+        fn stated(self) -> Option<StatedFormat> {
+            match self.incomplete_preemption_record {
+                Some(marked) => marked
+                    .and_then(|marked| marked.record)
+                    .and_then(|record| record.format_version),
+                None => self.format_version,
+            }
+        }
     }
     #[derive(Deserialize)]
     struct Envelope {
@@ -117,14 +145,20 @@ pub(super) fn probe_format(bytes: &[u8]) -> Result<u32, serde_json::Error> {
         #[serde(default)]
         format_version: Option<StatedFormat>,
         #[serde(default, deserialize_with = "present_envelope")]
+        incomplete_preemption_record: Option<Option<Marked>>,
+        #[serde(default, deserialize_with = "present_envelope")]
         slice_boundary_recording: Option<Option<Envelope>>,
     }
     let probe: Probe = serde_json::from_slice(bytes)?;
     let stated = match probe.slice_boundary_recording {
         Some(envelope) => envelope
             .and_then(|envelope| envelope.preemptions)
-            .and_then(|preemptions| preemptions.format_version),
-        None => probe.format_version,
+            .and_then(Preemptions::stated),
+        None => Preemptions {
+            format_version: probe.format_version,
+            incomplete_preemption_record: probe.incomplete_preemption_record,
+        }
+        .stated(),
     };
     Ok(stated.and_then(|format| format.0).unwrap_or(1))
 }
@@ -667,6 +701,45 @@ pub(super) mod tests {
         let legacy = serde_json::json!({"per_thread": {}, "global": [], "format_version": 99});
         assert_eq!(probe_format(legacy.to_string().as_bytes()).unwrap(), 99);
         assert!(refused(legacy.to_string().as_bytes()));
+    }
+
+    /// A record marked incomplete states its format inside main's
+    /// `incomplete_preemption_record` envelope, as a legacy record and as a
+    /// slice-boundary recording's preemptions. The probe reads it there, so a
+    /// newer format is refused as such, typed, before anything else is
+    /// decoded; a format this Hermit reads decodes as before.
+    #[test]
+    fn a_marked_record_states_its_format_inside_its_envelope() {
+        let refused = |bytes: &[u8]| {
+            Recording::decode(bytes).err().is_some_and(|error| {
+                error
+                    .chain()
+                    .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>())
+            })
+        };
+        let marked = |format: u32| {
+            serde_json::json!({"incomplete_preemption_record": {
+                "version": 1,
+                "replay_departed_at": 7,
+                "record": {"per_thread": {}, "global": [], "format_version": format},
+            }})
+        };
+        let legacy = marked(99).to_string();
+        assert_eq!(probe_format(legacy.as_bytes()).unwrap(), 99);
+        assert!(refused(legacy.as_bytes()));
+        let boundary = serde_json::json!({"slice_boundary_recording": {
+            "preemptions": marked(99),
+            "schedule": [],
+        }})
+        .to_string();
+        assert_eq!(probe_format(boundary.as_bytes()).unwrap(), 99);
+        assert!(refused(boundary.as_bytes()));
+        let current = marked(1).to_string();
+        assert_eq!(probe_format(current.as_bytes()).unwrap(), 1);
+        let Recording::Legacy(record) = Recording::decode(current.as_bytes()).unwrap() else {
+            panic!("a marked legacy record decodes as one");
+        };
+        assert_eq!(record.replay_departed_at(), Some(7));
     }
 
     #[test]
