@@ -1222,7 +1222,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's
     // only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end
     // (--chaos-instruction-offset): 1930.
-    ("test.regular_crates", 1930),
+    // And chaos_instruction_offset_never_enters_the_legacy_form: 1931.
+    ("test.regular_crates", 1931),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -6200,7 +6201,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // And the same --chaos-instruction-offset detcore-model unit: 1916.
-    ("test.regular_crates_on_host", 1916),
+    // And the same legacy-form unit: 1917.
+    ("test.regular_crates_on_host", 1917),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
