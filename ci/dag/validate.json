@@ -801,6 +801,41 @@
     },
     {
       "group": "build",
+      "job": "workspace",
+      "desc": "Prepare DBT native resources, then build every workspace target, the backend plugins and the one Hermit binary in the validate profile",
+      "description": "The one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first builds exactly the nextest preparation's guest build, `-p hermetic_infra_hermit_tests --bins`, in the same profile, so that build finds every unit it links already fresh. The workspace build cannot serve it: it resolves 14 shared dependencies with wider features (parking_lot gains send_guard, bytes serde, syn fold), which gives every reverie and hermit-detcore unit a new hash, and building hermit-install alone instead (def08d743) made the guest build compile them inside build.workspace_in_pinned_root, 46 s, so it was reverted. Until 2026-10-18 this first build was `-p detcore-dbt`, a superset of the guest build's units plus reverie-dbt's DynamoRIO build script (25.8 s) and detcore-dbt itself (24.4 s), both rebuilt by the workspace build anyway, which also builds reverie-dbt before hermit-install's build script reads its DynamoRIO cache (the cache publishes by atomic rename, so concurrent builders are safe). In the 32-job timings of 601df499 the first build took 55.9 s and the guest build's own units end at about 47 s; the workspace build's critical chain (163.4 s replayed) does not move when the DynamoRIO build script joins it, since it finishes before detcore-dbt can start. It then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names, and `nextest-binaries.rs prepare` lists every test executable from that one build and records each selection's subset, so no selection recompiles anything or relinks target/validate/hermit. Until 2026-09-30 sixteen per-selection Cargo invocations each re-resolved features and relinked Hermit, about 620 of this node's 830 seconds at d44bbbb79acd.  It cleans reverie-dbt only when ci/clean-stale-reverie-dbt.sh finds a recorded DynamoRIO install that no longer matches its own attestation (a target restored without reverie-dbt-native-cache), and it forces hermit-install to restage target/install_pkg (HERMIT_INSTALL_FORCE_RESTAGE), which a warm target does not carry. Until 2026-10-17 it cleaned reverie-dbt and detcore-sabre on every run for those two reasons, which rebuilt detcore-dbt, hermit and the cdylibs above them even when nothing they compile had changed. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/clean-stale-reverie-dbt.sh validate && export HERMIT_INSTALL_FORCE_RESTAGE=\"${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}\" && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p hermetic_infra_hermit_tests --bins && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/third-party-backends && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target",
+      "result_manifests": [],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1200,
+      "cpu_timeout": 7200,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 130.0,
+        "rss_baseline_bytes": 11663998976,
+        "hard_mem_max_bytes": 68719476736,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.workspace"
+    },
+    {
+      "group": "build",
       "job": "buck_release_artifact",
       "desc": "Prepare the opt-in Buck release artifact",
       "description": "Cargo mode is the default and this node is an inert, explicit branch. Buck mode runs only on the network-capable host, builds the feature-complete release target through the caller-bound public DotSlash launcher, reconciles the retained Buck event/stdout evidence, checks typed provenance and features, then publishes one content-addressed binary under ignored/. The network-disabled pinned-root producer depends on this node and may only install those exact verified bytes; no Buck failure falls back to Cargo.",
@@ -836,9 +871,45 @@
     },
     {
       "group": "build",
+      "job": "e2e_artifact",
+      "desc": "Publish the one Hermit binary at target/ci/hermit and as a verified content-addressed bundle with its backend resources",
+      "description": "This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case \"${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}\" in cargo) ./ci/nextest-binaries.rs assert full && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;; buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;; *) echo \"unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}\" >&2; exit 2 ;; esac && mkdir -p target/ci && install -m 755 \"$hermit_payload\" target/ci/hermit && sabre_source=target/install_pkg/rsrcs/libdetcore_sabre.so && sabre_before=$(sha256sum \"$sabre_source\" | cut -d' ' -f1) && install -m 755 \"$sabre_source\" target/ci/libdetcore_sabre.so && sabre_after=$(sha256sum \"$sabre_source\" | cut -d' ' -f1) && sabre_copy=$(sha256sum target/ci/libdetcore_sabre.so | cut -d' ' -f1) && test \"$sabre_before\" = \"$sabre_after\" && test \"$sabre_before\" = \"$sabre_copy\" && sha256sum target/ci/hermit target/ci/libdetcore_sabre.so target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision && ./ci/publish-hermit-e2e-artifact.sh target/ci/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg",
+      "result_manifests": [],
+      "deps": [
+        "build.buck_release_artifact",
+        "build.workspace",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 120,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 20.0,
+        "rss_baseline_bytes": 536870912,
+        "hard_mem_max_bytes": 2147483648,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "build.e2e_artifact"
+    },
+    {
+      "group": "build",
       "job": "host_hermit_link",
       "desc": "Link the host target/ci/hermit and artifact pointer to the one Hermit the pinned root published",
-      "description": "The strict compatibility corpus (e2e.manifest_compat) exercises programs installed on the host, which the pinned image does not carry, so it and its fixtures run on the host. It runs the one validate-profile Hermit that build.e2e_artifact_in_pinned_root published, not a second, host-built copy. This node points the host's target/ci/hermit at those exact bytes (ignored/hermetic/split/target is the pinned root's /src/target) and proves the binary runs here. It does because the binary's loader and libraries are the host nix store paths that ci/hermetic/build-image.sh built the image from; if nix garbage collection has removed them, the node fails and names the missing store paths. It also writes the host artifact pointer target/ci/hermit-e2e-artifact.path, naming the same content-addressed bundle by its host path, and verifies it with ci/verify-hermit-e2e-artifact.sh, so the corpus bucket reaches the binary and its resources through the same verified wrapper as every other manifest bucket.",
+      "description": "The focused compatibility run types (portablecompat, sabrecompat, supercompat, rrcompat) exercise programs installed on the host, which the pinned image does not carry, so they and their fixtures run on the host. (The full-profile bucket e2e.manifest_compat ran here too until 2026-10-30; the pinned image now carries every program its rows name, so it runs in the pinned root and no longer needs this link.) They run the one validate-profile Hermit that build.e2e_artifact_in_pinned_root published, not a second, host-built copy. This node points the host's target/ci/hermit at those exact bytes (ignored/hermetic/split/target is the pinned root's /src/target) and proves the binary runs here. It does because the binary's loader and libraries are the host nix store paths that ci/hermetic/build-image.sh built the image from; if nix garbage collection has removed them, the node fails and names the missing store paths. It also writes the host artifact pointer target/ci/hermit-e2e-artifact.path, naming the same content-addressed bundle by its host path, and verifies it with ci/verify-hermit-e2e-artifact.sh, so the corpus bucket reaches the binary and its resources through the same verified wrapper as every other manifest bucket.",
       "labels": [
         "full",
         "portable"
@@ -12269,13 +12340,13 @@
     {
       "group": "e2e",
       "job": "manifest_compat",
-      "desc": "Portable manifest bucket: compat, the strict compatibility corpus on the host",
-      "description": "The portable strict compatibility corpus (tests/e2e/manifests/compat.yaml): 189 programs installed on the validation host, each one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's strict --verify comparison (--verify-strict: bitwise INFO logs and I/O buffers), so each passing cell is an L2 reference whose log the parity post-pass compares every candidate backend against. 63 rows also have a verify cell on each in-guest LiteInst backend, liteinst and in-guest-trap (the corpus's `additional` entries: 126 cells, six of them on the sabre-compat-only rows df-direct, lua-direct and perl-direct, whose ptrace cells this node does not run), each under --max-timeslice=disabled, which in-guest LiteInst requires, and the global default budget; they need CPUID faulting and the in-guest Detcore runtime the e2e artifact ships, and passed 10 of 10 verify runs each in a local survey on 2026-10-08 (20 of the 63 are rows that passed 10 of 10 in the second survey at the heap-fix tree, with the compat fixtures prepared). Until 2026-10-07 the corpus used the stripped --verify comparison, below L2; measured at Hermit 0d25b6f7, all 189 cells passed --verify-strict in 4 of 4 full runs. It runs on the host, not in the pinned root, because 31 of the programs are not in the pinned image; the Hermit is the pinned root's validate-profile binary, verified through the host artifact pointer build.host_hermit_link publishes. compatprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/strict-compat. Every row is an ordinary cell whose failure fails the node; the five former diagnostic rows (df, ranlib, top, zstd, zstd-roundtrip) passed strict 4 of 4 at Hermit 0d25b6f7. Until 2026-10-01 these programs were 189 separate compat.<program> nodes; in the validation of Hermit 76980bac they took 92.8 s of wall and 60.3 CPU seconds in total, the slowest 3.0 s.",
+      "desc": "Portable manifest bucket: compat, the strict compatibility corpus in the pinned root",
+      "description": "The portable strict compatibility corpus (tests/e2e/manifests/compat.yaml): 189 programs installed on the validation host, each one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's strict --verify comparison (--verify-strict: bitwise INFO logs and I/O buffers), so each passing cell is an L2 reference whose log the parity post-pass compares every candidate backend against. 63 rows also have a verify cell on each in-guest LiteInst backend, liteinst and in-guest-trap (the corpus's `additional` entries: 126 cells, six of them on the sabre-compat-only rows df-direct, lua-direct and perl-direct, whose ptrace cells this node does not run), each under --max-timeslice=disabled, which in-guest LiteInst requires, and the global default budget; they need CPUID faulting and the in-guest Detcore runtime the e2e artifact ships, and passed 10 of 10 verify runs each in a local survey on 2026-10-08 (20 of the 63 are rows that passed 10 of 10 in the second survey at the heap-fix tree, with the compat fixtures prepared). Until 2026-10-07 the corpus used the stripped --verify comparison, below L2; measured at Hermit 0d25b6f7, all 189 cells passed --verify-strict in 4 of 4 full runs. Until 2026-10-30 it ran on the host, not in the pinned root, because 25 of the programs were not in the pinned image; the image now carries every program the rows name, so it runs in the pinned root like the other e2e buckets, against the pinned root's validate-profile binary directly. compatprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/strict-compat. Every row is an ordinary cell whose failure fails the node; the five former diagnostic rows (df, ranlib, top, zstd, zstd-roundtrip) passed strict 4 of 4 at Hermit 0d25b6f7. Until 2026-10-01 these programs were 189 separate compat.<program> nodes; in the validation of Hermit 76980bac they took 92.8 s of wall and 60.3 CPU seconds in total, the slowest 3.0 s.",
       "labels": [
         "full",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --ci-only --prebuilt --diagnostic-results --results \"$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml\"",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --ci-only --prebuilt --diagnostic-results --results \"$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "compat"
@@ -15169,13 +15240,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
           "mode": "verify",
           "backend": "dbt"
         },
@@ -15185,13 +15249,6 @@
           "test": "compat/logger",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -15631,13 +15688,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/mountpoint",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/mountpoint",
           "mode": "verify",
           "backend": "dbt"
         },
@@ -16527,13 +16577,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pkg-config",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "dbt"
         },
@@ -16543,13 +16586,6 @@
           "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -19079,13 +19115,14 @@
         }
       ],
       "deps": [
-        "build.host_hermit_link",
-        "build.rust_scripts",
+        "build.rust_scripts_in_pinned_root",
         "check.dbt_runtime_abi",
-        "compatprep.fixtures",
+        "compatprep.fixtures_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
-        "setup.manifest_plan"
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
       ],
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test"
@@ -21662,13 +21699,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
           "mode": "verify",
           "backend": "dbt"
         },
@@ -21678,13 +21708,6 @@
           "test": "compat/logger",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -22054,13 +22077,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/mountpoint",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/mountpoint",
           "mode": "verify",
           "backend": "dbt"
         },
@@ -22838,13 +22854,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pkg-config",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "dbt"
         },
@@ -22854,13 +22863,6 @@
           "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -25736,13 +25738,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/logger",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/logname",
           "mode": "replay",
           "backend": "ptrace"
@@ -25828,13 +25823,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/mktemp",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/mountpoint",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -26024,13 +26012,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pinky",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -46894,22 +46875,8 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
           "mode": "verify",
           "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -47182,13 +47149,6 @@
           "category": "compat",
           "test": "compat/mktemp",
           "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/mountpoint",
-          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -47776,22 +47736,8 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pkg-config",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -52616,7 +52562,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./tests/compat/prepare_real_compat_fixtures.sh $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures",
       "result_manifests": [],
       "deps": [
-        "build.host_hermit_link",
+        "build.e2e_artifact",
         "doc.doctests",
         "doc.rustdoc",
         "gate.manifest",
@@ -71061,8 +71007,8 @@
     {
       "group": "e2e",
       "job": "manifest_compat_buck",
-      "desc": "Portable manifest bucket: compat, the strict compatibility corpus on the host (Buck rows)",
-      "description": "The portable strict compatibility corpus (tests/e2e/manifests/compat.yaml): 189 programs installed on the validation host, each one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's strict --verify comparison (--verify-strict: bitwise INFO logs and I/O buffers), so each passing cell is an L2 reference whose log the parity post-pass compares every candidate backend against. 63 rows also have a verify cell on each in-guest LiteInst backend, liteinst and in-guest-trap (the corpus's `additional` entries: 126 cells, six of them on the sabre-compat-only rows df-direct, lua-direct and perl-direct, whose ptrace cells this node does not run), each under --max-timeslice=disabled, which in-guest LiteInst requires, and the global default budget; they need CPUID faulting and the in-guest Detcore runtime the e2e artifact ships, and passed 10 of 10 verify runs each in a local survey on 2026-10-08 (20 of the 63 are rows that passed 10 of 10 in the second survey at the heap-fix tree, with the compat fixtures prepared). Until 2026-10-07 the corpus used the stripped --verify comparison, below L2; measured at Hermit 0d25b6f7, all 189 cells passed --verify-strict in 4 of 4 full runs. It runs on the host, not in the pinned root, because 31 of the programs are not in the pinned image; the Hermit is the pinned root's validate-profile binary, verified through the host artifact pointer build.host_hermit_link publishes. compatprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/strict-compat. Every row is an ordinary cell whose failure fails the node; the five former diagnostic rows (df, ranlib, top, zstd, zstd-roundtrip) passed strict 4 of 4 at Hermit 0d25b6f7. Until 2026-10-01 these programs were 189 separate compat.<program> nodes; in the validation of Hermit 76980bac they took 92.8 s of wall and 60.3 CPU seconds in total, the slowest 3.0 s. Buck import twin: publishes the cells of e2e.manifest_compat from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_compat's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_compat.",
+      "desc": "Portable manifest bucket: compat, the strict compatibility corpus in the pinned root (Buck rows)",
+      "description": "The portable strict compatibility corpus (tests/e2e/manifests/compat.yaml): 189 programs installed on the validation host, each one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's strict --verify comparison (--verify-strict: bitwise INFO logs and I/O buffers), so each passing cell is an L2 reference whose log the parity post-pass compares every candidate backend against. 63 rows also have a verify cell on each in-guest LiteInst backend, liteinst and in-guest-trap (the corpus's `additional` entries: 126 cells, six of them on the sabre-compat-only rows df-direct, lua-direct and perl-direct, whose ptrace cells this node does not run), each under --max-timeslice=disabled, which in-guest LiteInst requires, and the global default budget; they need CPUID faulting and the in-guest Detcore runtime the e2e artifact ships, and passed 10 of 10 verify runs each in a local survey on 2026-10-08 (20 of the 63 are rows that passed 10 of 10 in the second survey at the heap-fix tree, with the compat fixtures prepared). Until 2026-10-07 the corpus used the stripped --verify comparison, below L2; measured at Hermit 0d25b6f7, all 189 cells passed --verify-strict in 4 of 4 full runs. Until 2026-10-30 it ran on the host, not in the pinned root, because 25 of the programs were not in the pinned image; the image now carries every program the rows name, so it runs in the pinned root like the other e2e buckets, against the pinned root's validate-profile binary directly. compatprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/strict-compat. Every row is an ordinary cell whose failure fails the node; the five former diagnostic rows (df, ranlib, top, zstd, zstd-roundtrip) passed strict 4 of 4 at Hermit 0d25b6f7. Until 2026-10-01 these programs were 189 separate compat.<program> nodes; in the validation of Hermit 76980bac they took 92.8 s of wall and 60.3 CPU seconds in total, the slowest 3.0 s. Buck import twin: publishes the cells of e2e.manifest_compat from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_compat's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_compat.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -73960,13 +73906,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/logger",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
           "mode": "verify",
           "backend": "dbt"
         },
@@ -73976,13 +73915,6 @@
           "test": "compat/logger",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -74422,13 +74354,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/mountpoint",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/mountpoint",
           "mode": "verify",
           "backend": "dbt"
         },
@@ -75318,13 +75243,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/pkg-config",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "dbt"
         },
@@ -75334,13 +75252,6 @@
           "test": "compat/pkg-config",
           "mode": "verify",
           "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -81730,6 +81641,44 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "compatprep.hermit_release_in_pinned_root"
+    },
+    {
+      "group": "compatprep",
+      "job": "fixtures_in_pinned_root",
+      "desc": "Prepare the fixture files the portable strict compatibility corpus reads",
+      "description": "Runs tests/compat/prepare_real_compat_fixtures.sh into $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures: a copy of README.md, compiled binutils, gprof, gcov and lsof inputs, a loopback HTTP server, df's mount fixture, and cargo/rustc links into the active toolchain, so the corpus rows of e2e.manifest_compat read run-owned files instead of the checkout. It starts after every non-guest Cargo node so the corpus's shell-build row cannot observe a concurrent target or cache mutation.",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./tests/compat/prepare_real_compat_fixtures.sh $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures'",
+      "result_manifests": [],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 420,
+      "cpu_timeout": 420,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 0.0,
+        "rss_baseline_bytes": 4294967296,
+        "hard_mem_max_bytes": 4294967296,
+        "classification": "light",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "compatprep.fixtures_in_pinned_root"
     },
     {
       "group": "quick-super-setup",

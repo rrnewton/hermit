@@ -119,12 +119,22 @@
       # provider while retaining the packages' runtime closures in the image.
       commandFixtureTools = {
         iostat = "${pkgs.sysstat}/bin/iostat";
+        ip = "${pkgs.iproute2}/bin/ip";
         lsmod = "${pkgs.kmod}/bin/lsmod";
         mpstat = "${pkgs.sysstat}/bin/mpstat";
         numactl = "${pkgs.numactl}/bin/numactl";
         numastat = "${pkgs.numactl}/bin/numastat";
         pidstat = "${pkgs.sysstat}/bin/pidstat";
+        sar = "${pkgs.sysstat}/bin/sar";
         ss = "${pkgs.iproute2}/bin/ss";
+        # jdk_headless is in guestTools for its closure, but its /bin links
+        # are not merged into the image root, so link the two compat rows'
+        # programs explicitly.
+        java = "${pkgs.jdk_headless}/bin/java";
+        javac = "${pkgs.jdk_headless}/bin/javac";
+        # The gcc wrapper in guestTools does not merge gcov into /bin; the
+        # unwrapped compiler carries it.
+        gcov = "${pkgs.gcc.cc}/bin/gcov";
       };
       commandFixtureLinks = pkgs.lib.concatStringsSep "\n" (pkgs.lib.mapAttrsToList
         (name: provider: ''
@@ -148,6 +158,15 @@
         bash coreutils diffutils findutils gnugrep gnused gawk
         openssl zstd gnutar gzip xz jq sqlite git perl python3 redis
         lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
+        # The strict compatibility corpus (tests/e2e/manifests/compat.yaml)
+        # runs in this root, so every program its rows name lives here, not
+        # on the host. Measured marginal closure at the pinned nixpkgs
+        # revision, 2026-10-30: the small packages below total about 23 MiB
+        # unpacked; clang (1.4 GiB) and jdk_headless (567 MiB) are the rest.
+        # crc32 is the perl Archive-Zip script, as it is on the host.
+        bc cpio dos2unix file zip unzip wget gettext lsof cscope flex
+        gnupatch attr acl time perlPackages.ArchiveZip libxml2.bin
+        clang jdk_headless
         # These outputs are not implied by their runtime libraries.
         bzip2.bin curl.bin glibc.bin hostname
       ];
@@ -216,10 +235,15 @@
             # /usr/bin/env; add exactly the audited compatibility paths.
             mkdir -p bin
             ln -s "${archCoreutils}/bin/arch" bin/arch
+            # The compat corpus's uptime row uses `uptime -p`, which only
+            # procps' uptime spells; coreutils' uptime (merged into /bin
+            # above) has no -p. Point /bin/uptime at procps, as on the host.
+            ln -sfnT "${pkgs.procps}/bin/uptime" bin/uptime
             ${commandFixtureLinks}
             for path in ${pkgs.lib.escapeShellArgs requiredGuestPaths}; do
               command="''${path##*/}"
               if [ "$command" = nodejs ]; then command=node; fi
+              mkdir -p ".''${path%/*}"
               ln -s "/bin/$command" ".''${path}"
             done
           '';

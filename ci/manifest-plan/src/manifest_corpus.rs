@@ -1422,7 +1422,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!((gated, refused), (215, UNSELECTED_REPLAY.len()));
+        // 215 gated on the flip-fixed base, minus the three replay cells
+        // deselected with the pinned-image move (logger, pkg-config,
+        // mountpoint) = 212.
+        assert_eq!((gated, refused), (212, UNSELECTED_REPLAY.len()));
     }
 
     /// The replay cells seen to fail, each with its issue: lsof in the
@@ -1431,7 +1434,7 @@ mod tests {
     /// shared /tmp. compat/flex and compat/timeout are selected since their
     /// replay stall (https://github.com/rrnewton/hermit/issues/3964) and false
     /// deadlock (https://github.com/rrnewton/hermit/issues/3963) were fixed.
-    const UNSELECTED_REPLAY: [(&str, &str); 3] = [
+    const UNSELECTED_REPLAY: [(&str, &str); 6] = [
         (
             "compat/lsof",
             "https://github.com/rrnewton/hermit/issues/3966",
@@ -1443,6 +1446,22 @@ mod tests {
         (
             "compat/zip-unzip",
             "https://github.com/rrnewton/hermit/issues/4536",
+        ),
+        // Deselected 2026-10-30 when the corpus moved into the pinned
+        // hermetic image: logger and pkg-config measure the pinned
+        // implementations (tracked in the bead), mountpoint's replay
+        // diverges on statmount (the issue).
+        (
+            "compat/logger",
+            "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md",
+        ),
+        (
+            "compat/pkg-config",
+            "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md",
+        ),
+        (
+            "compat/mountpoint",
+            "https://github.com/rrnewton/hermit/issues/4979",
         ),
     ];
 

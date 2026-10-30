@@ -27,8 +27,17 @@ cp "$PWD/README.md" "$FIXTURE_ROOT/README.md"
 # `--base-env=minimal` deliberately excludes the user's rustup directory. The
 # cargo workload still needs the active toolchain, so expose exactly cargo and
 # rustc through this run-owned fixture rather than passing through the host PATH.
-ln -s "$(rustup which cargo)" "$FIXTURE_ROOT/toolchain/cargo"
-ln -s "$(rustup which rustc)" "$FIXTURE_ROOT/toolchain/rustc"
+# On a host the active toolchain is rustup's; in the pinned root there is no
+# rustup and the toolchain is the image's own, on PATH. Resolve in whichever
+# environment prepares the fixtures, so the links always name binaries of the
+# environment the corpus will run in.
+if command -v rustup >/dev/null 2>&1; then
+    ln -s "$(rustup which cargo)" "$FIXTURE_ROOT/toolchain/cargo"
+    ln -s "$(rustup which rustc)" "$FIXTURE_ROOT/toolchain/rustc"
+else
+    ln -s "$(command -v cargo)" "$FIXTURE_ROOT/toolchain/cargo"
+    ln -s "$(command -v rustc)" "$FIXTURE_ROOT/toolchain/rustc"
+fi
 
 gcc -O2 -Wall -Wextra -Werror -Wl,--build-id=none \
     "$PWD/tests/compat/localhost_http_server.c" \

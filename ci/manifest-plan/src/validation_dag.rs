@@ -572,6 +572,10 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.liteinst_runtime",
     "build.manifest_guests",
     "compatprep.hermit_release",
+    // The compat fixtures snapshot the preparing environment's toolchain
+    // (tests/compat/prepare_real_compat_fixtures.sh), so the in-image corpus
+    // needs fixtures prepared in-image, not the host's rustup links.
+    "compatprep.fixtures",
 ];
 // Explicit execution destinations; hosted variants retain their original host commands.
 const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
@@ -749,13 +753,13 @@ const PROFILES: [Profile; 11] = [
         // the ordinary in-guest Detcore runtime's prebuild, which carries the
         // same two labels: 101/102 and 80/81 before.
         label: "full",
-        direct_steps: 102,
-        selected_steps: 103,
+        direct_steps: 105,
+        selected_steps: 106,
     },
     Profile {
         label: "portable",
-        direct_steps: 81,
-        selected_steps: 82,
+        direct_steps: 84,
+        selected_steps: 85,
     },
     Profile {
         label: "quick",
@@ -1145,10 +1149,14 @@ fn is_pinned_root_producer(step: &Step) -> bool {
 }
 
 /// Manifest bucket nodes that run on the validation host rather than in the
-/// pinned root: the compatibility corpus exercises programs installed on the
-/// host, 31 of which the pinned image does not carry.
+/// pinned root. The strict compatibility corpus's full-profile bucket
+/// (e2e.manifest_compat) is not one of them since 2026-10-30: the pinned
+/// image carries every program its rows name (measured delta before the
+/// move: 25 programs, about 2.0 GiB of closure, dominated by clang and the
+/// JDK), so it runs in the pinned root like the other e2e buckets. The
+/// focused run types below still run on the host against their own Hermit
+/// builds, by their own descriptions.
 pub const HOST_MANIFEST_RUNS: &[&str] = &[
-    "e2e.manifest_compat",
     "portablecompat.manifest_compat",
     "sabrecompat.manifest_compat",
     "supercompat.manifest_compat",
@@ -1201,9 +1209,10 @@ pub(crate) const HOST_HERMIT_LINK_TAG: &str = "build.host_hermit_link";
 /// Route the local host consumers of the Hermit producers to the pinned-root
 /// build.
 ///
-/// The strict compatibility rows exercise host-installed programs that the
-/// pinned image does not carry, so they, and the fixtures they read, still run
-/// on the host. They reach the one Hermit through build.host_hermit_link, which
+/// The focused compatibility run types exercise host-installed programs that
+/// the pinned image does not carry, so they, and the fixtures they read, still
+/// run on the host. They reach the one Hermit through build.host_hermit_link,
+/// which
 /// links the host's target/ci/hermit to the pinned root's published binary; that
 /// binary runs on the host because its loader and libraries are the host nix
 /// store paths the image was built from. No local host step may depend on the
@@ -4491,9 +4500,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // (441 + 1).
     // 443 with sabrecompat.sabre_examples, the archived SaBRe suite's tests
     // outside the per-commit smoke pair, in the SaBRe run type (442 + 1).
-    if cfg.steps.len() != 443 {
+    // 446 with compatprep.fixtures_in_pinned_root and its hosted split, so
+    // e2e.manifest_compat runs in the pinned root on fixtures prepared in the
+    // same environment (443 + 3).
+    if cfg.steps.len() != 446 {
         return Err(format!(
-            "superset has {} steps, expected 443",
+            "superset has {} steps, expected 446",
             cfg.steps.len()
         ));
     }
@@ -6731,8 +6743,8 @@ sys.exit(37)
             ),
             "{error}"
         );
-        // A host-run bucket reads the host's prepared scripts, so its required
-        // producer is build.rust_scripts, not the pinned-root one.
+        // Since 2026-10-30 the compat bucket runs in the pinned root, so its
+        // required producer is build.rust_scripts_in_pinned_root.
         let mut planted_missing_host_rust_script_dep = committed.clone();
         planted_missing_host_rust_script_dep
             .steps
@@ -6740,7 +6752,7 @@ sys.exit(37)
             .find(|step| step.tag() == "e2e.manifest_compat")
             .unwrap()
             .deps
-            .retain(|dependency| dependency != "build.rust_scripts");
+            .retain(|dependency| dependency != "build.rust_scripts_in_pinned_root");
         let error = assert_invariants(&planted_missing_host_rust_script_dep, &cells).unwrap_err();
         assert!(
             error.ends_with(
@@ -7110,8 +7122,9 @@ sys.exit(37)
         // nodes), and 101 with the two syscall conformance nodes (104), and
         // 99 again since that check runs in Reverie's own validate and CI
         // (102 full nodes), and 100 with build.liteinst_runtime_in_pinned_root
-        // (103 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 100);
+        // (103 full nodes), and 103 since e2e.manifest_compat moved into the
+        // pinned root on compatprep.fixtures_in_pinned_root (106 full nodes).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 103);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

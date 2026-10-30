@@ -10,19 +10,19 @@
     "all": {
       "cells": 3055,
       "applicable": 2244,
-      "selectable": 1763,
-      "population": 3005,
-      "population_candidate_selected": 1763,
-      "population_candidate_not_selected": 473,
-      "population_candidate_disabled": 769
+      "selectable": 1759,
+      "population": 2995,
+      "population_candidate_selected": 1759,
+      "population_candidate_not_selected": 471,
+      "population_candidate_disabled": 765
     },
     "by_backend": {
       "dbt": {
         "cells": 611,
         "applicable": 561,
-        "selectable": 559,
-        "population": 601,
-        "population_candidate_selected": 559,
+        "selectable": 557,
+        "population": 599,
+        "population_candidate_selected": 557,
         "population_candidate_not_selected": 1,
         "population_candidate_disabled": 41
       },
@@ -30,17 +30,17 @@
         "cells": 611,
         "applicable": 314,
         "selectable": 314,
-        "population": 601,
+        "population": 599,
         "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 287
+        "population_candidate_disabled": 285
       },
       "kvm": {
         "cells": 611,
         "applicable": 577,
-        "selectable": 575,
-        "population": 601,
-        "population_candidate_selected": 575,
+        "selectable": 573,
+        "population": 599,
+        "population_candidate_selected": 573,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 26
       },
@@ -48,18 +48,18 @@
         "cells": 611,
         "applicable": 315,
         "selectable": 315,
-        "population": 601,
+        "population": 599,
         "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 286
+        "population_candidate_disabled": 284
       },
       "sabre": {
         "cells": 611,
         "applicable": 477,
         "selectable": 0,
-        "population": 601,
+        "population": 599,
         "population_candidate_selected": 0,
-        "population_candidate_not_selected": 472,
+        "population_candidate_not_selected": 470,
         "population_candidate_disabled": 129
       }
     }
@@ -2055,11 +2055,11 @@
     {"test_id":"compat/ln","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/ln","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/ln","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
-    {"test_id":"compat/logger","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/logger","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/logger","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/logger","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/logger","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: logger --stderr --no-act exits 1 with no output under SaBRe"},
+    {"test_id":"compat/logger","backend":"dbt","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
+    {"test_id":"compat/logger","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
+    {"test_id":"compat/logger","backend":"kvm","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
+    {"test_id":"compat/logger","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
+    {"test_id":"compat/logger","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
     {"test_id":"compat/logname","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/logname","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its verify runs end as a named policy refusal on in-guest-trap: the row's shell runs /usr/bin/logname in a command substitution, a forked child that execs it, and the in-guest runtime refuses exec with a typed refusal that ends the run (HERMIT_POLICY_REFUSAL; hermit 16f99cd0, reverie 2f10ec67). It passed before only because that exec failed with EOPNOTSUPP in both runs, so the row printed logname:no-login-record without running logname."},
     {"test_id":"compat/logname","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -2275,11 +2275,11 @@
     {"test_id":"compat/pinky","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/pinky","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/pinky","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/pkg-config","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/pkg-config","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/pkg-config","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/pkg-config","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/pkg-config","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
+    {"test_id":"compat/pkg-config","backend":"dbt","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
+    {"test_id":"compat/pkg-config","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
+    {"test_id":"compat/pkg-config","backend":"kvm","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
+    {"test_id":"compat/pkg-config","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
+    {"test_id":"compat/pkg-config","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: In the pinned image, logger (nix util-linux) opens /dev/log even with --stderr --no-act and exits 1 with no journal socket present, and pkg-config is pkgconf, which emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
     {"test_id":"compat/pkill","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/pkill","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/pkill","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Not in the 2026-10-13 KVM survey: its KVM verify cell was not green on the compatibility ledger"},

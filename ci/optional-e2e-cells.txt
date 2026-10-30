@@ -4,7 +4,12 @@ c-programs/dbt-unsupported-syscall verify ptrace
 c-programs/signal-waitstatus-identity verify dbt
 c-programs/writev-determinism custom ptrace
 compat/cscope replay ptrace
+compat/logger replay ptrace
+compat/logger verify ptrace
 compat/lsof replay ptrace
+compat/mountpoint replay ptrace
+compat/pkg-config replay ptrace
+compat/pkg-config verify ptrace
 compat/zip-unzip replay ptrace
 data-handling/jq-json-transform naked -
 data-handling/sqlite-query-determinism naked -
