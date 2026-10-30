@@ -269,13 +269,12 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_ids: Option<crate::pid::GuestIds>,
 
-    /// How many guest tasks were created with a host ID although their IDs
-    /// were to be chosen (`guest_ids`): nonzero means the run's IDs are not
-    /// deterministic. Shown in the full report beside `guest_ids`. A vfork
-    /// is counted before its call, since its parent returns only once the
-    /// child has exec'd or exited, so one that then fails, or each attempt of
-    /// one that is restarted, is counted too: the count is of calls reported,
-    /// and can exceed the tasks created.
+    /// How many host-ID reports were accepted while IDs were to be chosen
+    /// (`guest_ids`): nonzero means chosen IDs are not guaranteed. Shown in
+    /// the full report beside `guest_ids`. This includes conservative reports
+    /// before vfork calls, whose parents return only once the child has
+    /// exec'd or exited. Failed and restarted attempts can therefore be
+    /// counted too; this is not a count of distinct created tasks.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub host_id_tasks: u64,
 }
@@ -452,8 +451,7 @@ impl RunSummary {
             if *host_id_tasks > 0 {
                 writeln!(
                     f,
-                    "  {host_id_tasks} task(s) got a host ID instead, so this run's process IDs \
-                     are not deterministic"
+                    "  {host_id_tasks} host-ID report(s) accepted; chosen process IDs are not guaranteed"
                 )?;
             }
         }

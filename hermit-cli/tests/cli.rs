@@ -10671,9 +10671,8 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
     assert_success(&warned, &["collide-external"]);
     assert!(
         stderr(&warned).contains("got a host ID, not a chosen one: ID ")
-            && stderr(&warned).contains(
-                "1 task(s) got a host ID instead, so this run's process IDs are not deterministic"
-            )
+            && stderr(&warned)
+                .contains("1 host-ID report(s) accepted; chosen process IDs are not guaranteed")
             && stdout(&warned).contains("0 mismatches"),
         "stdout:\n{}\nstderr:\n{}",
         stdout(&warned),
@@ -10871,7 +10870,7 @@ fn no_namespace_completes_a_guest_set_tid_with_the_chosen_id() {
     assert!(
         stdout(&tolerant).starts_with("clone3 no-caps: child ")
             && stdout(&tolerant).ends_with(", exit 0\n")
-            && stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+            && stderr(&tolerant).contains("1 host-ID report(s) accepted"),
         "stdout:\n{}\nstderr:\n{}",
         stdout(&tolerant),
         stderr(&tolerant)
@@ -10976,7 +10975,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         // Ordinary failed clones created no task. A vfork fallback reports
         // conservatively before injection, then corrects the warning on error.
         assert_eq!(
-            stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+            stderr(&tolerant).contains("1 host-ID report(s) accepted"),
             created || call == "vfork65",
             "{call}: {}",
             stderr(&tolerant)
@@ -10989,7 +10988,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
             );
             if !created {
                 let warning = format!(
-                    "failed with {} and created no task; the run's count of host-ID tasks includes it",
+                    "failed with {} and created no task; the run's count of accepted host-ID reports includes it",
                     reverie::Errno::EINVAL
                 );
                 assert!(
@@ -11015,7 +11014,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         )
     );
     assert!(
-        stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+        stderr(&tolerant).contains("1 host-ID report(s) accepted"),
         "newpid-fork: stdout:\n{}\nstderr:\n{}",
         stdout(&tolerant),
         stderr(&tolerant)
@@ -11069,7 +11068,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], call);
         assert_success(&tolerant, call);
         assert!(
-            stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+            stderr(&tolerant).contains("1 host-ID report(s) accepted"),
             "{call:?}: stdout:\n{}\nstderr:\n{}",
             stdout(&tolerant),
             stderr(&tolerant)

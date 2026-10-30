@@ -785,7 +785,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             warn!(
                 "[detcore, dtid {}] the vfork reported above failed with {errno} and created no \
-                 task; the run's count of host-ID tasks includes it",
+                 task; the run's count of accepted host-ID reports includes it",
                 guest.thread_state().dettid
             );
         }

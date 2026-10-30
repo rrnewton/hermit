@@ -1204,10 +1204,11 @@ pub struct GlobalState {
     /// the kernel numbers the guest or the positive ID space is exhausted.
     next_guest_id: AtomicI32,
 
-    /// How many guest tasks were created with a host ID although Detcore
-    /// chooses the IDs (`GuestIds::Chosen` without `refuse_host_ids`): the
-    /// run's IDs are then not deterministic, which the summary says and the
-    /// preemption record states, so that a replay refuses it.
+    /// How many host-ID reports Detcore accepted while choosing IDs
+    /// (`GuestIds::Chosen` without `refuse_host_ids`). This includes
+    /// conservative reports before vfork attempts that can fail or restart,
+    /// so it does not count distinct created tasks. The summary disclaims
+    /// chosen-ID guarantees and the preemption record makes replay refuse.
     host_id_tasks: AtomicU64,
 
     // used ports
@@ -7852,8 +7853,8 @@ pub enum GlobalRequest {
     /// Detcore chooses the IDs (`GuestIds::Chosen`), in the caller's turn.
     /// Appended last.
     NextGuestId,
-    /// A guest task was created with a host ID although Detcore chooses the
-    /// IDs (`GlobalState::host_id_tasks`). Appended last.
+    /// Report a host-ID outcome or a conservative pre-vfork attempt while
+    /// Detcore chooses IDs (`GlobalState::host_id_tasks`). Appended last.
     GaveHostId,
 }
 
@@ -10526,8 +10527,8 @@ where
     }
 }
 
-/// Tell the global state that a guest task was created with a host ID
-/// although Detcore chooses the IDs (`GlobalState::host_id_tasks`).
+/// Report a host-ID outcome or a conservative pre-vfork attempt while
+/// Detcore chooses IDs (`GlobalState::host_id_tasks`).
 pub(crate) async fn note_host_id_task<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
