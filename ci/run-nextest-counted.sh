@@ -557,12 +557,17 @@ fi
 skid_retry_record="$cpu_measurement_dir/skid-retries.log"
 : >"$skid_retry_record" || exit $?
 export HERMIT_SKID_RETRY_RECORD=$skid_retry_record
+# One RetryRecordV1 JSON line per retried test (ledger retry_rollup schema).
+export HERMIT_RETRY_RECORD_FILE="$cpu_measurement_dir/retry-records.jsonl"
+: >"$HERMIT_RETRY_RECORD_FILE" || exit $?
 nextest_status=0
 run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$cpu_wrapper" \
     "$cpu_attempt_records" "$cpu_binary_map" "$cpu_inventory" "$cpu_report" "$@" \
     || nextest_status=$?
 skid_retries=$(wc -l <"$skid_retry_record") || exit $?
 printf 'run-nextest-counted: skid-overshoot retries: %d\n' "$skid_retries" >&2
+retry_records=$(wc -l <"$HERMIT_RETRY_RECORD_FILE") || exit $?
+printf 'run-nextest-counted: retry records: %d (in %s)\n' "$retry_records" "$HERMIT_RETRY_RECORD_FILE" >&2
 if ((skid_retries > 0)); then
     sed 's/^/run-nextest-counted: skid-overshoot retry: /' "$skid_retry_record" >&2
 fi

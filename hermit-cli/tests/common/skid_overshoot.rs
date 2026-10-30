@@ -89,6 +89,51 @@ pub fn skid_overshoot_refusal(code: Option<i32>, stderr: &str) -> Option<&str> {
 /// that runner.
 pub const SKID_RETRY_RECORD_ENV: &str = "HERMIT_SKID_RETRY_RECORD";
 
+/// The file innermost harnesses append one `RetryRecordV1` JSON line per
+/// retried test to (see `ledger::retry_rollup`). Set by
+/// `ci/run-nextest-counted.sh` beside [`SKID_RETRY_RECORD_ENV`].
+pub const RETRY_RECORD_ENV: &str = "HERMIT_RETRY_RECORD_FILE";
+
+/// One `RetryRecordV1` JSON line for a test that needed `retries` skid
+/// retries and then finished with `final_pass`.
+pub fn retry_record_json(name: &str, attempts: u64, final_pass: bool) -> String {
+    let retries = attempts.saturating_sub(1);
+    let mut outcomes = vec!["ERROR"; retries as usize];
+    outcomes.push(if final_pass { "PASS" } else { "FAIL" });
+    let mut classes: Vec<Option<&str>> = vec![Some("skid_overshoot"); retries as usize];
+    classes.push(if final_pass {
+        None
+    } else {
+        Some("product_failure")
+    });
+    serde_json::json!({
+        "test": name, "mode": "nextest", "backend": null,
+        "attempts": attempts, "retries": retries,
+        "attempt_outcomes": outcomes, "attempt_classes": classes,
+        "final_outcome": if final_pass { "PASS" } else { "FAIL" },
+        "flaky_pass": final_pass && retries > 0,
+    })
+    .to_string()
+}
+
+/// Append the [`RETRY_RECORD_ENV`] line for a finished retried test.
+fn record_retry(name: &str, attempts: u64, final_pass: bool) {
+    use std::io::Write;
+    if attempts <= 1 {
+        return;
+    }
+    let Some(path) = std::env::var_os(RETRY_RECORD_ENV).filter(|path| !path.is_empty()) else {
+        return;
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("cannot open {RETRY_RECORD_ENV}={path:?}: {error}"));
+    file.write_all(format!("{}\n", retry_record_json(name, attempts, final_pass)).as_bytes())
+        .unwrap_or_else(|error| panic!("cannot write {RETRY_RECORD_ENV}={path:?}: {error}"));
+}
+
 /// The file the per-test CPU wrapper (ci/manifest-plan/src/bin/
 /// nextest-cpu-wrapper.rs) gives this test process. Each retry line written
 /// here earns the next attempt one more base CPU budget, so a retried run does
@@ -159,6 +204,7 @@ pub fn retry_typed_skid_refusal<T>(
                 continue;
             }
         }
+        record_retry(name, u64::from(number), output.status.code() == Some(0));
         return (number, output, kept);
     }
     unreachable!("the last attempt always returns")
