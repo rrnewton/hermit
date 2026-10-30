@@ -4490,7 +4490,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
     // The retry stack adds one cli case: 744 + 1 = 745.
     // And a_schedule_replay_names_a_stdio_kind_changed_since_the_recording: 746.
-    ("test.cli", 746),
+    // And a_verify_run_records_the_stdio_kinds_its_guest_was_given: 747.
+    ("test.cli", 747),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5064,7 +5065,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
     // The same retry-stack cli case: 663 + 1 = 664.
     // And the same stdio-kind replay test: 665.
-    ("test.cli_on_host", 665),
+    // And the same captured-run stdio-kind test: 666.
+    ("test.cli_on_host", 666),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
     // Kept equal to the second test.regular_crates_on_host entry below: 1919.
