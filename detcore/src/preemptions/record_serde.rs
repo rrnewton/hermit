@@ -456,4 +456,24 @@ mod tests {
             }
         }
     }
+
+    /// `segment_store_exclusives` rides in `RawRecord`: a plain record
+    /// written before the envelope reads it back, a plain record written now
+    /// keeps its bytes, and a marked record keeps the flag inside its
+    /// envelope.
+    #[test]
+    fn the_store_exclusive_segment_flag_survives_the_record_serde() {
+        let old = r#"{"per_thread":{},"global":[],"segment_store_exclusives":true}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        assert!(record.segment_store_exclusives());
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let mut writer = PreemptionWriter::new(None);
+        writer.record_segment_store_exclusives(true);
+        writer.mark_replay_departed(7);
+        let marked = writer.into_string();
+        assert!(marked.contains(ENVELOPE), "{marked}");
+        let back: PreemptionRecord = serde_json::from_str(&marked).unwrap();
+        assert!(back.segment_store_exclusives());
+        assert_eq!(back.replay_departed_at(), Some(7));
+    }
 }
