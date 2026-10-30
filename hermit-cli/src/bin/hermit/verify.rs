@@ -724,7 +724,29 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
         first_divergent_left_message: outcome.first_divergent_left_message.clone(),
         first_divergent_right_message: outcome.first_divergent_right_message.clone(),
         exact_branch_counter: None,
+        etc_snapshot_hash: None,
     }
+}
+
+/// The `/etc` snapshot hash every verification report this process writes
+/// carries, once [`record_etc_snapshot_hash`] has run (snapshot mode only).
+static ETC_SNAPSHOT_HASH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Record, once per process, the `/etc` snapshot hash that verification
+/// reports carry, so both compared executions provably presented identical
+/// `/etc` bytes. Called by `run` after the snapshot is pinned.
+pub(crate) fn record_etc_snapshot_hash(hash: Option<String>) {
+    let _ = ETC_SNAPSHOT_HASH.set(hash);
+}
+
+fn with_etc_snapshot_hash(report: &VerificationReport) -> VerificationReport {
+    let mut report = report.clone();
+    if report.etc_snapshot_hash.is_none()
+        && let Some(recorded) = ETC_SNAPSHOT_HASH.get()
+    {
+        report.etc_snapshot_hash = recorded.clone();
+    }
+    report
 }
 
 /// The `exact_branch_counter` verdict every verification report this process
@@ -1192,6 +1214,7 @@ pub fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(),
     use std::io::Write as _;
 
     let report = with_exact_branch_counter(report, EXACT_BRANCH_COUNTER.get());
+    let report = with_etc_snapshot_hash(&report);
     let json = serde_json::to_string(&report)?;
     // Same directory as the target so the rename below stays within one
     // filesystem and is therefore atomic.

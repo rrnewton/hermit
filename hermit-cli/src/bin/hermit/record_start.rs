@@ -42,7 +42,6 @@ use reverie::process::MountFlags;
 use super::container::IdentityGuard;
 use super::container::PlannedMount;
 use super::container::container_proc_mount;
-use super::container::identity_hardening_mounts;
 use super::container::namespace_container;
 use super::gdb_client::CLIENT_EXITED_BEFORE_CONNECTING;
 use super::gdb_client::GdbClientWatch;
@@ -499,7 +498,12 @@ impl StartOpts {
     ) -> Result<(Container, IdentityGuard), Error> {
         let mut container = namespace_container(true);
         network.configure(&mut container, false);
-        let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
+        let (mut identity_mounts, mut identity_guard, etc_hash) =
+            super::container::identity_hardening_mounts_with_mode(
+                None,
+                super::etc_snapshot::EtcMode::Snapshot,
+            )?;
+        super::verify::record_etc_snapshot_hash(etc_hash);
         for mount in &self.mount {
             let user_target = mount.get_target();
             identity_guard.discard_mounts_shadowed_by(&mut identity_mounts, user_target);

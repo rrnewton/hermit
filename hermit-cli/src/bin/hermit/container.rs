@@ -64,6 +64,7 @@ const DETERMINISTIC_GROUP_ROOT: &[u8] = b"/tmpvol/.hermit/etc/group";
 const DETERMINISTIC_LD_SO_CACHE_ROOT: &[u8] = b"/tmpvol/.hermit/etc/ld.so.cache";
 const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
 const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
+const DETERMINISTIC_ETC_ROOT: &[u8] = b"/tmpvol/.hermit/etc";
 
 /// Where a container holds Detcore's placeholder directory
 /// (`DetConfig::directory_placeholder`): procfs's `/proc/fs/nfsd`, a
@@ -1328,7 +1329,18 @@ fn frozen_ld_so_cache(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LdSoCacheSnapshot(Option<std::sync::Arc<Vec<u8>>>);
 
+/// Frozen `/etc/group` bytes (host bytes plus the overflow entry) for the
+/// `/etc` snapshot builder.
+pub(super) fn frozen_group_contents_for_snapshot() -> Result<Vec<u8>, Error> {
+    frozen_group_contents()
+}
+
 impl LdSoCacheSnapshot {
+    /// The snapshot bytes, when the host had a cache.
+    pub(super) fn bytes(&self) -> Option<&[u8]> {
+        self.0.as_ref().map(|arc| arc.as_slice())
+    }
+
     /// The host's cache now.
     pub(super) fn of_host() -> Result<Self, Error> {
         Self::from_path(Path::new(LD_SO_CACHE))
@@ -1471,6 +1483,76 @@ pub(super) fn identity_hardening_mounts(
             plan: MountPlan::Unrecorded,
             directory_placeholder: None,
         },
+    ))
+}
+
+/// The snapshot-mode `/etc` stack: a namespace-private tmpfs at `/etc`,
+/// then the snapshot bound read-only onto it. Extracted so the production
+/// path and the namespace test install byte-identical mounts.
+pub(super) fn snapshot_etc_mounts(snapshot_dir: &Path) -> Vec<Mount> {
+    vec![
+        Mount::tmpfs(Path::new("/etc")),
+        Mount::bind(snapshot_dir, Path::new("/etc")).readonly(),
+    ]
+}
+
+/// `identity_hardening_mounts` honouring `--etc-mode`. Host mode is exactly
+/// the legacy per-file frozen binds. Snapshot mode stacks a private tmpfs at
+/// guest `/etc` (its root dentry exists only in the guest namespace, so no
+/// host rename can detach it) and binds the shared hash-keyed snapshot
+/// read-only onto it; guest writes then fail `EROFS`. Returns the snapshot
+/// content hash in snapshot mode so callers can name it in run metadata.
+pub(super) fn identity_hardening_mounts_with_mode(
+    ld_so_cache: Option<&LdSoCacheSnapshot>,
+    mode: super::etc_snapshot::EtcMode,
+) -> Result<(Vec<Mount>, IdentityGuard, Option<String>), Error> {
+    super::etc_snapshot::refuse_minimal(mode)?;
+    if mode == super::etc_snapshot::EtcMode::Host {
+        let (mounts, guard) = identity_hardening_mounts(ld_so_cache)?;
+        return Ok((mounts, guard, None));
+    }
+    let group_bytes = frozen_group_contents()?;
+    let cache_snapshot = match ld_so_cache {
+        Some(s) => s.clone(),
+        None => LdSoCacheSnapshot::of_host()?,
+    };
+    let cache_bytes: Option<Vec<u8>> = cache_snapshot.0.as_ref().map(|arc| arc.as_ref().clone());
+    let (snapshot_dir, hash) =
+        super::etc_snapshot::ensure_snapshot(Some(&group_bytes), cache_bytes.as_deref())?;
+    let mut mounts = snapshot_etc_mounts(&snapshot_dir);
+    let mut mountinfo_roots = vec![MountInfoRootSource::new(
+        &snapshot_dir,
+        Path::new("/etc"),
+        DETERMINISTIC_ETC_ROOT,
+    )?];
+    let nscd_dir = if Path::new(NSCD_DIR).is_dir() {
+        let directory =
+            tempfile::TempDir::new().context("Failed to create the empty guest nscd directory")?;
+        let target = canonical_mount_target(Path::new(NSCD_DIR));
+        mountinfo_roots.push(MountInfoRootSource::new(
+            directory.path(),
+            &target,
+            DETERMINISTIC_NSCD_ROOT,
+        )?);
+        mounts.push(Mount::bind(directory.path(), target).readonly());
+        Some(directory)
+    } else {
+        None
+    };
+    Ok((
+        mounts,
+        IdentityGuard {
+            _group_file: None,
+            _ld_so_cache: None,
+            _nscd_dir: nscd_dir,
+            mountinfo_roots,
+            user_mount_targets: Vec::new(),
+            user_binds: Vec::new(),
+            host_rows: Vec::new(),
+            plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
+        },
+        Some(hash),
     ))
 }
 
@@ -7256,5 +7338,85 @@ mod tests {
         assert!(is_kill(I386_KILL, AUDIT_ARCH_I386));
         assert!(!is_kill(I386_KILL, 0xc000_003e));
         assert!(!is_kill(libc::SYS_getpid as i32, 0xc000_003e));
+    }
+
+    // Production topology: the exact `snapshot_etc_mounts` stack over a fake
+    // host /etc. An external mutator renames over the host source and over
+    // the host path that would be the guest target in the old topology; the
+    // guest /etc is a namespace-private tmpfs dentry, so neither rename can
+    // reach it, content+fstat stay identical and writes fail EROFS.
+    #[test]
+    fn snapshot_etc_survives_host_renames_and_refuses_writes() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
+        let fake = tempfile::TempDir::new().expect("create fake root");
+        let host_etc = fake.path().join("host-etc");
+        fs::create_dir_all(&host_etc).unwrap();
+        fs::write(host_etc.join("ld.so.cache"), b"SNAP-CACHE-V1").unwrap();
+        fs::write(host_etc.join("passwd"), b"root:x:0:0::/root:/bin/sh\n").unwrap();
+        let cache_root = fake.path().join("cache");
+        let (snapshot_dir, _hash) =
+            crate::etc_snapshot::ensure_snapshot_in(&cache_root, &host_etc, None, None)
+                .expect("build fake snapshot");
+        let ready = fake.path().join("ready");
+        let renamed = fake.path().join("renamed");
+        let incoming = host_etc.join(".new-cache");
+        fs::write(&incoming, b"HOST-CACHE-V2").unwrap();
+        let mut renamer = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("while [ ! -e \"$1\" ]; do sleep 0.01; done; mv \"$2\" \"$3\"; : > \"$4\"")
+            .arg("renamer")
+            .arg(&ready)
+            .arg(&incoming)
+            .arg(host_etc.join("ld.so.cache"))
+            .arg(&renamed)
+            .spawn()
+            .expect("spawn the external mutator");
+        let mut container = Container::new();
+        container.map_root();
+        container.mount(Mount::new("/").rprivate());
+        for mount in snapshot_etc_mounts(&snapshot_dir) {
+            container.mount(mount);
+        }
+        let facts = container
+            .checked_run(move || -> Result<(Vec<u8>, Vec<u8>, bool), String> {
+                let target = Path::new("/etc/ld.so.cache");
+                let file = File::open(target).map_err(|e| e.to_string())?;
+                let before = file
+                    .metadata()
+                    .map(|m| (m.dev(), m.ino()))
+                    .map_err(|e| e.to_string())?;
+                let first = fs::read(target).map_err(|e| e.to_string())?;
+                fs::write(&ready, b"ready").map_err(|e| e.to_string())?;
+                for _ in 0..1500 {
+                    if renamed.exists() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if !renamed.exists() {
+                    return Err("parent mutation never happened".to_string());
+                }
+                let after = file
+                    .metadata()
+                    .map(|m| (m.dev(), m.ino()))
+                    .map_err(|e| e.to_string())?;
+                if before != after {
+                    return Err(format!("fstat moved: {before:?} -> {after:?}"));
+                }
+                let second = fs::read(target).map_err(|e| e.to_string())?;
+                let write_blocked = fs::write(target, b"poison").is_err();
+                Ok((first, second, write_blocked))
+            })
+            .expect("run the snapshot scenario in its own namespace")
+            .expect("the snapshot scenario guest must complete");
+        renamer.wait().expect("the external mutator must finish");
+        assert_eq!(facts.0, b"SNAP-CACHE-V1");
+        assert_eq!(
+            facts.1, b"SNAP-CACHE-V1",
+            "host rename must not reach the snapshot"
+        );
+        assert!(facts.2, "writes to snapshot /etc must be refused (EROFS)");
     }
 }

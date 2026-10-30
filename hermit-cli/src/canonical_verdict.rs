@@ -463,6 +463,11 @@ pub struct VerificationReport {
     /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_branch_counter: Option<BranchCounterVerdict>,
+    /// Content hash of the `/etc` snapshot both compared executions
+    /// presented (`--etc-mode snapshot`); absent in host mode and in
+    /// reports written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etc_snapshot_hash: Option<String>,
 }
 
 /// [`VerificationReport::exact_branch_counter`]: present, and the producer's
@@ -510,6 +515,7 @@ impl VerificationReport {
             first_divergent_left_message: None,
             first_divergent_right_message: None,
             exact_branch_counter: None,
+            etc_snapshot_hash: None,
         }
     }
 
@@ -1254,6 +1260,7 @@ mod tests {
             first_divergent_left_message: None,
             first_divergent_right_message: None,
             exact_branch_counter: None,
+            etc_snapshot_hash: None,
         }
     }
 

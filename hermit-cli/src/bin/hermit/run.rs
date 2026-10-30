@@ -77,7 +77,6 @@ use super::container::PlannedMount;
 use super::container::PolicyRefusal;
 use super::container::apply_affinity;
 use super::container::container_proc_mount;
-use super::container::identity_hardening_mounts;
 use super::container::image_container;
 use super::container::namespace_container;
 use super::global_opts::GlobalOpts;
@@ -1791,6 +1790,20 @@ pub struct RunOpts {
     #[clap(long, default_value = "host", value_name = "str")]
     base_env: BaseEnv,
 
+    /// How the guest `/etc` is presented: `snapshot` (the default) binds a
+    /// shared read-only snapshot keyed by `/etc` content hash onto a private
+    /// tmpfs, so host replacements cannot reach the guest and writes fail
+    /// `EROFS`; `host` keeps today's live host `/etc` with per-file frozen
+    /// binds; `minimal` is not yet implemented and refuses by name.
+    #[clap(long, default_value = "snapshot", value_name = "host|snapshot|minimal")]
+    etc_mode: super::etc_snapshot::EtcMode,
+
+    /// The `/etc` snapshot content hash this run used (snapshot mode only),
+    /// named in verify JSON and run metadata so paired runs provably share
+    /// identical `/etc` bytes.
+    #[clap(skip)]
+    etc_snapshot_hash: Option<String>,
+
     /// Additionally append one or more environment variables to the container environment. If a
     /// name is provided without a value, pass that variable through from the host.
     #[clap(short = 'e', long, value_parser = parse_assignment, value_name="name[=val]")]
@@ -2286,6 +2299,12 @@ impl fmt::Display for RunOpts {
                 write!(f, " --base-env=minimal")?;
             }
             BaseEnv::Host => {} // default
+        }
+        match &self.etc_mode {
+            super::etc_snapshot::EtcMode::Snapshot => {} // default
+            other => {
+                write!(f, " --etc-mode={other}")?;
+            }
         }
         for (key, m_val) in &self.env {
             if let Some(val) = m_val {
@@ -11462,6 +11481,23 @@ impl RunOpts {
         if shared.ld_so_cache_snapshot.is_none() {
             shared.ld_so_cache_snapshot = Some(super::container::LdSoCacheSnapshot::of_host()?);
         }
+        // Both runs of a verification must present identical `/etc` bytes:
+        // pin the snapshot hash once here so a host change between the runs
+        // refuses by name instead of silently diverging them.
+        super::etc_snapshot::refuse_minimal(shared.etc_mode)?;
+        if shared.etc_mode == super::etc_snapshot::EtcMode::Snapshot
+            && shared.etc_snapshot_hash.is_none()
+        {
+            let group = super::container::frozen_group_contents_for_snapshot()?;
+            let cache_bytes: Option<Vec<u8>> = shared
+                .ld_so_cache_snapshot
+                .as_ref()
+                .and_then(|s| s.bytes().map(|b| b.to_vec()));
+            let (_, hash) =
+                super::etc_snapshot::ensure_snapshot(Some(&group), cache_bytes.as_deref())?;
+            shared.etc_snapshot_hash = Some(hash);
+            super::verify::record_etc_snapshot_hash(shared.etc_snapshot_hash.clone());
+        }
         Ok(shared)
     }
 
@@ -11490,9 +11526,23 @@ impl RunOpts {
                     .is_some_and(|inputs| inputs.has_role(LD_SO_CACHE_ROLE)),
             "the shared inputs seal /etc/ld.so.cache, but this run did not adopt it"
         );
-        let (mut identity_mounts, identity_sources) =
-            identity_hardening_mounts(self.ld_so_cache_snapshot.as_ref())?;
+        super::etc_snapshot::refuse_minimal(self.etc_mode)?;
+        let (mut identity_mounts, identity_sources, etc_hash) =
+            super::container::identity_hardening_mounts_with_mode(
+                self.ld_so_cache_snapshot.as_ref(),
+                self.etc_mode,
+            )?;
+        if let (Some(pinned), Some(actual)) = (&self.etc_snapshot_hash, &etc_hash) {
+            anyhow::ensure!(
+                pinned == actual,
+                "etc snapshot changed between verification runs: pinned {pinned}, now {actual}"
+            );
+        }
+        if self.etc_snapshot_hash.is_none() {
+            super::verify::record_etc_snapshot_hash(etc_hash.clone());
+        }
         let mut identity_sources = identity_sources;
+        let _ = etc_hash;
         let mut explicit_tmp_mount = false;
         let mut user_mounts = Vec::with_capacity(self.mount.len() + self.bind.len());
         let backend_mounts_from = self.mount.len().saturating_sub(self.backend_mounts.0);

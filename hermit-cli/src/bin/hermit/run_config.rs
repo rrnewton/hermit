@@ -1092,6 +1092,7 @@ mod tests {
         ),
         ("analyze-networking", &["--analyze-networking"]),
         ("base-env", &["--base-env=empty"]),
+        ("etc-mode", &["--etc-mode=host"]),
         (
             "env",
             &["-e", "A=1", "--env=B= two words ", "--env=PASS_THROUGH"],
