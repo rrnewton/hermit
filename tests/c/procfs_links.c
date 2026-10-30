@@ -27,8 +27,7 @@
  *   backend without such threads, KVM).
  *   --no-link-descriptor: skip the empty pathname on an `O_PATH` descriptor
  *   of the /proc/self link itself, which the kernel answers: KVM's own /proc
- *   refuses the open, DBT's kernel names its own pid, and the recorder does
- *   not record readlinkat.
+ *   refuses the open, and DBT's kernel names its own pid.
  *
  * Under Hermit it prints the targets, which must be the same on every
  * backend.

@@ -7297,8 +7297,7 @@ fn detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm() {
 /// pathname on an `O_PATH` descriptor of the `/proc/self` link, which KVM's
 /// own /proc cannot open and which DBT's kernel answers with its own pid
 /// (named as not checked). Record and replay on ptrace give the same output
-/// and match (but for that empty pathname: the recorder does not record
-/// readlinkat). Every backend that runs Detcore is compared
+/// and match, that empty pathname included. Every backend that runs Detcore is compared
 /// (`procfs_backends`), but one not available here, named as not compared, and
 /// one `PROCFS_NOT_YET` lists, named with its issue.
 #[test]
@@ -7373,20 +7372,14 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
             .map(|line| format!("{line}\n"))
             .collect::<String>()
     };
-    // Record and replay on ptrace give the guest the same answers. The
-    // recorder does not record readlinkat, so a replayed readlinkat of a
-    // descriptor that replay could not recreate (the O_PATH link) is not
-    // checked.
-    eprintln!(
-        "{test}: record: NOT CHECKED: readlinkat on an O_PATH descriptor of the \
-         /proc/self link"
-    );
+    // Record and replay on ptrace give the guest the same answers, including
+    // readlinkat on the O_PATH descriptor of the /proc/self link, which replay
+    // serves from the recording because it cannot recreate that descriptor.
     let args = [
         "record",
         "--verify",
         "--",
         guest.to_str().expect("guest path is UTF-8"),
-        "--no-link-descriptor",
     ];
     let recorded = hermit(&args);
     assert_success(&recorded, &args);
@@ -7466,6 +7459,53 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
             .map(|(backend, _)| *backend)
             .chain(["ptrace/record"])
             .collect::<Vec<_>>()
+    );
+}
+
+/// A recording made before readlinkat was recorded (RECORD_VERSION 0x196)
+/// holds no event for a readlinkat, while this replayer takes one Bytes event
+/// for each; replaying it would hand every readlinkat another call's event.
+/// The exact-match version gate refuses it by name instead. The fixture is a
+/// current recording of the procfs-links guest, whose readlinkat on an
+/// `O_PATH` descriptor of the `/proc/self` link the recorder records and
+/// replay serves, with only its metadata version rewritten; the untouched
+/// recording replays first, so the refusal comes from the version and not
+/// from a broken fixture.
+#[test]
+fn a_recording_from_before_readlinkat_was_recorded_is_refused_by_version() {
+    let guest = procfs_links_guest().to_str().expect("guest path is UTF-8");
+    let data = tempfile::tempdir().unwrap();
+    let directory = data.path().to_str().unwrap();
+    let record_args = ["record", "--data-dir", directory, "--", guest];
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
+    let accepted = hermit(&replay_args);
+    assert_success(&accepted, &replay_args);
+    let metadata_path = fs::read_dir(data.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("metadata.json"))
+        .find(|candidate| candidate.is_file())
+        .expect("no recording metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    assert_eq!(
+        metadata["version"], 0x197,
+        "RECORD_VERSION moved; point this test at the version that records readlinkat and the \
+         one before it"
+    );
+    metadata["version"] = serde_json::json!(0x196);
+    fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+    let refused = hermit(&replay_args);
+    assert!(
+        !refused.status.success(),
+        "a 0x196 recording was replayed:\n{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("Version mismatch, recording version RecordVersion(406)"),
+        "a 0x196 recording was not refused by the version gate:\n{}",
+        stderr(&refused)
     );
 }
 
@@ -39571,7 +39611,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x196, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x197, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];

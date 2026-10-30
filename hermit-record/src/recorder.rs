@@ -776,6 +776,7 @@ impl Tool for Recorder {
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             #[cfg(target_arch = "x86_64")]
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
+            Syscall::Readlinkat(syscall) => self.handle_readlinkat(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             #[cfg(target_arch = "x86_64")]
             Syscall::Mkdir(_) => self.handle_mkdir(guest, syscall).await,

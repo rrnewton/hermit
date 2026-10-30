@@ -1219,7 +1219,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
-    ("test.regular_crates", 1929),
+    // PR 4753 adds hermit-record-format's readlinkat_is_recorded_and_replayed_on_every_architecture: 1929 + 1 = 1930.
+    ("test.regular_crates", 1930),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4476,7 +4477,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the third is new and never listed here) = 739, re-measured at this integration head.
     // The 4843 overshoot fix adds one cli case: 739 + 1 = 740, re-measured at this integration head.
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
-    ("test.cli", 742),
+    // PR 4753 adds a_recording_from_before_readlinkat_was_recorded_is_refused_by_version: 742 + 1 = 743.
+    ("test.cli", 743),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5044,7 +5046,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4853 transplant relocation: 660 - 2 = 658.
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
-    ("test.cli_on_host", 661),
+    // The same PR 4753 case: 661 + 1 = 662.
+    ("test.cli_on_host", 662),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6163,7 +6166,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738: the same nine added cases: 1927 - 14 = 1913.
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
-    ("test.regular_crates_on_host", 1915),
+    // PR 4753: the same one added case: 1915 + 1 = 1916.
+    ("test.regular_crates_on_host", 1916),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
