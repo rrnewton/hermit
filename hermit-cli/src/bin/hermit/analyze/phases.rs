@@ -3816,30 +3816,29 @@ impl AnalyzeOpts {
             target.schedevents().len(),
             target_endpoint_run.sched_out_file_name(),
         );
-        let searched = self
-            .phase5_prefix_search(&target)
-            .map(|decision| PrefixDecision {
-                fallback,
-                ..decision
-            });
-        self.finish_prefix_search(searched)
+        self.finish_prefix_search(self.phase5_prefix_search(&target), fallback)
     }
 
     /// Report what the prefix search `searched` found: the deciding event, or
     /// a verdict that names none, which completes the analysis too. Any other
-    /// error ends it.
+    /// error ends it. Either report notes `fallback`, why analyze searched the
+    /// prefixes, if given.
     pub(super) fn finish_prefix_search(
         &self,
         searched: anyhow::Result<PrefixDecision>,
+        fallback: Option<String>,
     ) -> anyhow::Result<ExitStatus> {
         let decision = match searched {
-            Ok(decision) => decision,
+            Ok(decision) => PrefixDecision {
+                fallback,
+                ..decision
+            },
             Err(error) => {
                 let verdict = error.downcast::<AnalyzeVerdict>()?;
                 let verdict = self.with_timing_tried(verdict, |timing, continuation| {
                     self.try_alternative_timing(timing, continuation)
                 });
-                return self.write_verdict_and_exit(&verdict);
+                return self.write_verdict_and_exit(&verdict, fallback.as_deref());
             }
         };
         let report = self.phase6_record_prefix_outputs(decision)?;
@@ -3981,12 +3980,14 @@ impl AnalyzeOpts {
     }
 
     /// Report `verdict`, a completed analysis that names no event: print it
-    /// as analyze prints any report, write it to `--report-file`, if given,
-    /// and return the exit status of a successful analysis, with the class
-    /// line on stderr.
+    /// as analyze prints any report, with `note`, why analyze searched the
+    /// prefixes, if given, as a prefix report notes it; write it to
+    /// `--report-file`, if given, and return the exit status of a successful
+    /// analysis, with the class line on stderr.
     pub(super) fn write_verdict_and_exit(
         &self,
         verdict: &AnalyzeVerdict,
+        note: Option<&str>,
     ) -> anyhow::Result<ExitStatus> {
         println!(
             "\n------------------------------ hermit analyze report ------------------------------"
@@ -3994,11 +3995,15 @@ impl AnalyzeOpts {
         if let Some(warning) = &self.branch_counter_warning {
             println!("{warning}");
         }
-        println!("{verdict}");
+        let mut header = verdict.to_string();
+        if let Some(note) = note {
+            header.push_str(&format!("\nNote: {note}\n"));
+        }
+        println!("{header}");
         self.write_report_file(&Report {
             verdict: verdict.verdict(),
             verdict_reason: Some(verdict.reason().clone()),
-            header: verdict.to_string(),
+            header,
             additional_context: String::new(),
             baseline_run: false,
             critical_event1: None,
@@ -5343,7 +5348,7 @@ mod tests {
             let options = parse(extra, &[]);
             let searched = Err(Error::new(verdict.clone()));
             assert_eq!(
-                written(options.finish_prefix_search(searched), status),
+                written(options.finish_prefix_search(searched, None), status),
                 serde_json::json!({
                     "verdict": "no_deciding_event",
                     "verdict_reason": {"cause": "scheduler_alone"},
@@ -5354,13 +5359,34 @@ mod tests {
             );
         }
 
+        // Reached by the default search's fallback to the prefixes, the
+        // verdict notes why, as a prefix report from that path does.
+        let options = parse(&[], &[]);
+        let searched = Err(Error::new(verdict.clone()));
+        let fallback = "the default search did not bisect between the two runs: their \
+                        per-thread traces diverge. analyze searched within the failing schedule \
+                        instead (--prefix-search)."
+            .to_owned();
+        let json = written(
+            options.finish_prefix_search(searched, Some(fallback.clone())),
+            ExitStatus::SUCCESS,
+        );
+        assert_eq!(json["verdict"], "no_deciding_event");
+        assert_eq!(
+            json["header"],
+            format!("no event decides the outcome.\nNote: {fallback}\n")
+        );
+
         // A recording fixes the settings, so no trial tries others.
         let recorded = parse(
             &["--run1-preemptions=/nonexistent.preempts"],
             &["--pipe-wake-latency=50000"],
         );
         let searched = Err(Error::new(verdict.clone()));
-        let json = written(recorded.finish_prefix_search(searched), ExitStatus::SUCCESS);
+        let json = written(
+            recorded.finish_prefix_search(searched, None),
+            ExitStatus::SUCCESS,
+        );
         assert_eq!(
             json["verdict_reason"],
             serde_json::json!({
@@ -5384,7 +5410,10 @@ mod tests {
             assert_eq!(continuation, None);
             AlternativeTiming::Missed { trial: trial() }
         });
-        let json = written(options.write_verdict_and_exit(&shown), ExitStatus::SUCCESS);
+        let json = written(
+            options.write_verdict_and_exit(&shown, None),
+            ExitStatus::SUCCESS,
+        );
         assert_eq!(
             json["verdict_reason"],
             serde_json::json!({
@@ -5420,7 +5449,7 @@ mod tests {
             options.try_alternative_timing_with(timing, |_, _| Err(Error::new(RunTimeoutMarker)))
         });
         let json = written(
-            options.write_verdict_and_exit(&stopped),
+            options.write_verdict_and_exit(&stopped, None),
             ExitStatus::SUCCESS,
         );
         assert_eq!(
@@ -5449,9 +5478,10 @@ mod tests {
         ])
         .unwrap();
         let other = options
-            .finish_prefix_search(Err(
-                AnalyzePrecondition::no_prefix_continuation("none").into()
-            ))
+            .finish_prefix_search(
+                Err(AnalyzePrecondition::no_prefix_continuation("none").into()),
+                None,
+            )
             .unwrap_err();
         assert!(
             other.downcast_ref::<AnalyzePrecondition>().is_some(),
