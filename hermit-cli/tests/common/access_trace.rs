@@ -40,6 +40,10 @@ struct Guests {
     /// `tests/fixtures/access_trace_mix.c`: two threads race over a mutex, a
     /// pipe, a file, a mapping, a timer, a signal and a child.
     mix: PathBuf,
+    /// One supplied cache input shared by every compared run, if the host
+    /// has a cache. The default container makes a new copy for each run,
+    /// whose inode and mtime differ in the recorded host-input metadata.
+    ld_so_cache: Option<PathBuf>,
 }
 
 fn guests() -> &'static Guests {
@@ -65,6 +69,15 @@ fn guests() -> &'static Guests {
             assert!(status.success(), "compiling {} failed", source.display());
             output
         };
+        let ld_so_cache = match fs::read("/etc/ld.so.cache") {
+            Ok(contents) => {
+                let path = root.join("ld.so.cache");
+                fs::write(&path, contents).expect("snapshot the guest's dynamic-linker cache");
+                Some(path)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read the host's dynamic-linker cache: {error}"),
+        };
         Guests {
             racewrite: compile(
                 repository.join("tests/c/simple/racewrite_nostdlib.c"),
@@ -76,13 +89,28 @@ fn guests() -> &'static Guests {
                 &["-O0", "-g", "-pthread", "-D_GNU_SOURCE"],
                 "mix",
             ),
+            ld_so_cache,
         }
     })
 }
 
 fn run(args: &[String]) -> Output {
+    let mut args = args.to_vec();
+    if let Some(cache) = &guests().ld_so_cache {
+        // Keep the entire recorded file comparable, including input identity.
+        // This explicit mount replaces the implicit cache mount/provenance;
+        // the test covers one fixed supplied input, not default cache copying.
+        let guest = args.iter().position(|arg| arg == "--").unwrap();
+        args.insert(
+            guest,
+            format!(
+                "--mount=type=bind,source={},target=/etc/ld.so.cache,readonly",
+                cache.display()
+            ),
+        );
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args(args);
+    command.args(&args);
     hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command)
 }
 
