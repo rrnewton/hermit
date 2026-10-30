@@ -40,9 +40,8 @@ use reverie::syscalls::MemoryAccess;
 
 use crate::syscalls::scm_rights::Delivered;
 
-/// `BINDER_WRITE_READ`: `_IOWR('b', 1, struct binder_write_read)`, whose
-/// struct is six 64-bit words.
-pub(crate) const BINDER_WRITE_READ: u64 = 0xc030_6201;
+/// `_IOWR('b', 1, struct binder_write_read)`.
+pub(crate) const BINDER_WRITE_READ: u64 = binder_request(3, 1, size_of::<WriteRead>());
 
 /// `_IOR('r', 2, struct binder_transaction_data)`.
 const BR_TRANSACTION: u32 = 0x8040_7202;
@@ -72,11 +71,287 @@ const MAX_COMMAND_BYTES: usize = 64 * 1024;
 /// The most objects read from one transaction's offsets array.
 const MAX_OBJECTS: usize = 4096;
 
+/// `struct binder_write_read`, the argument of `BINDER_WRITE_READ`: six
+/// 64-bit words on a 64-bit kernel, in the uapi header's order.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WriteRead {
+    pub(crate) write_size: u64,
+    pub(crate) write_consumed: u64,
+    pub(crate) write_buffer: u64,
+    pub(crate) read_size: u64,
+    pub(crate) read_consumed: u64,
+    pub(crate) read_buffer: u64,
+}
+
+/// `struct binder_freeze_info`, the argument of `BINDER_FREEZE`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct FreezeInfo {
+    _pid: u32,
+    enable: u32,
+    timeout_ms: u32,
+}
+
+/// `_IOC(dir, 'b', nr, size)` for binder's own requests.
+const fn binder_request(dir: u64, nr: u64, size: usize) -> u64 {
+    (dir << 30) | ((size as u64) << 16) | ((b'b' as u64) << 8) | nr
+}
+
+/// `_IOW('b', 14, struct binder_freeze_info)`, its size from the structure
+/// rather than written out, so a test cannot share a wrong number.
+const BINDER_FREEZE: u64 = binder_request(1, 14, size_of::<FreezeInfo>());
+
+/// `_IOW('b', 7, __s32)`: become the context manager, handle 0.
+const BINDER_SET_CONTEXT_MGR: u64 = binder_request(1, 7, size_of::<i32>());
+/// `_IOW('b', 13, struct flat_binder_object)`: become the context manager,
+/// with the node's flags. `struct flat_binder_object` is 24 bytes: a 32-bit
+/// type and flags, then the 64-bit `binder`/`handle` union and `cookie`.
+const BINDER_SET_CONTEXT_MGR_EXT: u64 = binder_request(1, 13, 24);
+
+/// Every request `binder_ioctl` serves at v6.1 (drivers/android/binder.c),
+/// each with its argument's size as `include/uapi/linux/android/binder.h`
+/// spells it: `BINDER_WRITE_READ`, `SET_MAX_THREADS`, `SET_CONTEXT_MGR`,
+/// `THREAD_EXIT`, `VERSION`, `GET_NODE_DEBUG_INFO`, `GET_NODE_INFO_FOR_REF`,
+/// `SET_CONTEXT_MGR_EXT`, `FREEZE`, `GET_FROZEN_INFO`,
+/// `ENABLE_ONEWAY_SPAM_DETECTION` and `GET_EXTENDED_ERROR`. The header's
+/// `SET_IDLE_TIMEOUT` and `SET_IDLE_PRIORITY` are left out: the driver
+/// answers them `EINVAL` like any unknown request, and the first is the very
+/// word of dma-buf's `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`. The type byte `'b'`
+/// is shared with other drivers, dma-buf among them, so a request counts as
+/// binder's only when number, direction and size all match one of these;
+/// the descriptor is not consulted, as for `BINDER_WRITE_READ` elsewhere in
+/// this module.
+const BINDER_REQUESTS: [u64; 12] = [
+    BINDER_WRITE_READ,
+    binder_request(1, 5, size_of::<u32>()),
+    BINDER_SET_CONTEXT_MGR,
+    binder_request(1, 8, size_of::<i32>()),
+    binder_request(3, 9, size_of::<i32>()),
+    binder_request(3, 11, 24),
+    binder_request(3, 12, 24),
+    BINDER_SET_CONTEXT_MGR_EXT,
+    BINDER_FREEZE,
+    binder_request(3, 15, 12),
+    binder_request(1, 16, size_of::<u32>()),
+    binder_request(3, 17, 12),
+];
+
+/// Whether `request` is one of binder's own `ioctl` requests.
+pub(crate) fn is_binder_request(request: u64) -> bool {
+    BINDER_REQUESTS.contains(&(request & 0xffff_ffff))
+}
+
+/// What a run replays, for `--strict`'s binder policy (`strict_refusal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BinderReplay {
+    /// A fresh run: no record is replayed.
+    Fresh,
+    /// A preemption record that stores no readmissions: one made before they
+    /// were recorded, or one built or edited in memory.
+    WithoutReadmissions,
+    /// A preemption record whose run logged where each backgrounded call
+    /// rejoined: none at all when no call went to the background.
+    WithReadmissions,
+}
+
+/// `--strict`'s binder policy (`Config::strict_binder`) for one `ioctl`
+/// request: why the run must stop, or `None` to let the call run. `replay`
+/// says what the run replays, and is read only for a binder request.
+///
+/// - A guest that freezes other processes (`BINDER_FREEZE`) or becomes the
+///   context manager (`BINDER_SET_CONTEXT_MGR[_EXT]`) is a system service
+///   acting on processes outside Hermit: refused, replay or not.
+/// - Any other binder call is refused in a fresh run. A call that waits for
+///   another process finishes when the host's kernel delivers its work, and
+///   which call a process-wide transaction completes is the kernel's choice
+///   too, so no fresh run can promise to repeat. A replay of a record that
+///   stores readmissions holds each call to the turn its recording rejoined
+///   at, and runs.
+pub(crate) fn strict_refusal(
+    request: u64,
+    replay: impl FnOnce() -> BinderReplay,
+) -> Option<String> {
+    let request = request & 0xffff_ffff;
+    if !is_binder_request(request) {
+        return None;
+    }
+    if request == BINDER_FREEZE {
+        return Some(
+            "--strict refuses BINDER_FREEZE: a guest that freezes another process acts on \
+             processes outside Hermit, whose effects no run can repeat"
+                .to_string(),
+        );
+    }
+    if request == BINDER_SET_CONTEXT_MGR || request == BINDER_SET_CONTEXT_MGR_EXT {
+        return Some(
+            "--strict refuses BINDER_SET_CONTEXT_MGR: a guest that becomes binder's context \
+             manager serves processes outside Hermit, whose requests no run can repeat"
+                .to_string(),
+        );
+    }
+    match replay() {
+        BinderReplay::WithReadmissions => None,
+        BinderReplay::Fresh => Some(
+            "--strict refuses binder in a fresh run: a binder call that waits for another \
+             process finishes when this host's kernel delivers its work, so the run could not \
+             repeat. To reproduce a run that uses binder exactly, record it without --strict \
+             (hermit run --record-preemptions-to=RECORD ...) and replay the record under \
+             --strict (hermit run --strict --replay-preemptions-from=RECORD ...)"
+                .to_string(),
+        ),
+        BinderReplay::WithoutReadmissions => Some(
+            "--strict refuses binder in a replay of a record that stores no readmissions: a \
+             binder call that goes to the background here would have no recorded turn to \
+             rejoin at, so the replay could not repeat its recording. A record written \
+             before Hermit stored readmissions has none. A record built from events alone, \
+             edited, or cut to a prefix of its schedule (as the records of hermit analyze's \
+             trials are) cannot carry them. To replay binder under \
+             --strict, record the run again without --strict with this Hermit \
+             (hermit run --record-preemptions-to=RECORD ...), which stores them, and replay \
+             that whole record"
+                .to_string(),
+        ),
+    }
+}
+
+/// What the run replays (`--replay-preemptions-from`, else
+/// `--replay-schedule-from`), read once per process: every run, `--verify`
+/// half and analyze trial runs in its own (`replay_of`).
+pub(crate) fn binder_replay(cfg: &detcore_model::config::Config) -> BinderReplay {
+    static REPLAY: std::sync::OnceLock<BinderReplay> = std::sync::OnceLock::new();
+    *REPLAY.get_or_init(|| {
+        replay_of(
+            cfg.replay_preemptions_from
+                .as_deref()
+                .or(cfg.replay_schedule_from.as_deref()),
+        )
+    })
+}
+
+/// What replaying the record at `path`, if any, is for `--strict`'s binder
+/// policy. A record says whether its run logged readmissions
+/// (`read_recorded_rejoins` gives `Some` list): one that did stores them even
+/// when none of its calls went to the background, and its replay may use
+/// binder. A record that predates them, was built or edited in memory, or
+/// cannot be read, has none, and neither does one whose readmissions are out
+/// of order, which the scheduler refuses before any guest runs.
+fn replay_of(path: Option<&std::path::Path>) -> BinderReplay {
+    match path {
+        None => BinderReplay::Fresh,
+        Some(path) => match crate::preemptions::read_recorded_rejoins(path) {
+            Ok(Some(_)) => BinderReplay::WithReadmissions,
+            Ok(None) | Err(_) => BinderReplay::WithoutReadmissions,
+        },
+    }
+}
+
 /// Whether `request`, an `ioctl` request word, is `BINDER_WRITE_READ`.
 /// Only the low 32 bits are the request: the kernel's `cmd` is an
 /// `unsigned int`.
 pub(crate) fn is_write_read(request: u64) -> bool {
     request & 0xffff_ffff == BINDER_WRITE_READ
+}
+
+/// Why a binder `ioctl` waits in the kernel until another process acts, so
+/// that Detcore runs it as a blocking external call rather than in the
+/// caller's turn. `None` for every request that returns on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Blocking {
+    /// A `BINDER_WRITE_READ` whose read half waits for work for this thread:
+    /// a transaction, a reply, or a death notification
+    /// (`binder_thread_read` -> `binder_wait_for_work`).
+    Read,
+    /// A `BINDER_FREEZE` that waits for another process's outstanding
+    /// transactions to drain, up to its own timeout
+    /// (`binder_ioctl_freeze`).
+    Freeze,
+}
+
+/// `WriteRead` of the call whose argument is at `argument`, read from guest
+/// memory; `None` when it cannot be read.
+pub(crate) fn write_read<M: MemoryAccess>(memory: &M, argument: usize) -> Option<WriteRead> {
+    let address = Addr::<WriteRead>::from_raw(argument)?;
+    memory.read_value(address).ok()
+}
+
+impl WriteRead {
+    /// Whether this call has a read half, which is the half that waits.
+    pub(crate) fn reads(&self) -> bool {
+        self.read_size > self.read_consumed
+    }
+}
+
+/// Why `request` waits in the kernel, from the call's argument already read
+/// from guest memory: `None` when it returns on its own. `nonblocking` is the
+/// descriptor's `O_NONBLOCK`, which makes a read return `EAGAIN` instead of
+/// waiting (`binder_thread_read`). A read is classified as waiting whenever
+/// it asks for bytes; the caller may then find work already queued and run
+/// it in the caller's turn anyway.
+pub(crate) fn blocking(
+    request: u64,
+    write_read: Option<&WriteRead>,
+    freeze: Option<&[u32; 3]>,
+    nonblocking: bool,
+) -> Option<Blocking> {
+    match request & 0xffff_ffff {
+        BINDER_WRITE_READ if !nonblocking => write_read
+            .filter(|call| call.reads())
+            .map(|_| Blocking::Read),
+        BINDER_FREEZE => freeze
+            .filter(|info| info[1] != 0 && info[2] != 0)
+            .map(|_| Blocking::Freeze),
+        _ => None,
+    }
+}
+
+/// `struct binder_freeze_info` at `argument`, read from guest memory.
+pub(crate) fn freeze_info<M: MemoryAccess>(memory: &M, argument: usize) -> Option<[u32; 3]> {
+    let address = Addr::<[u32; 3]>::from_raw(argument)?;
+    memory.read_value(address).ok()
+}
+
+/// Count a binder call that runs as external input, and warn once per guest
+/// process (`process`, its thread-group id, which only keys the warning: the
+/// line does not print it, so it reads the same whatever IDs the run has)
+/// that its binder calls are: their
+/// results come from processes Hermit does not schedule, so two runs can
+/// differ wherever those processes do. The run's summary reports the count
+/// (`external_calls`).
+///
+/// Returns whether it warned. Which calls go to the background is decided by
+/// host timing (`run_binder_call`'s zero-timeout poll), so whether a process
+/// warns at all, and the count, can differ between runs; the line's text
+/// cannot.
+pub(crate) fn note_blocking(waits: Blocking, process: i32) -> bool {
+    EXTERNAL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static WARNED: std::sync::Mutex<std::collections::BTreeSet<i32>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let first = WARNED.lock().unwrap().insert(process);
+    if first {
+        let call = match waits {
+            Blocking::Read => "a binder read (BINDER_WRITE_READ)",
+            Blocking::Freeze => "a binder freeze (BINDER_FREEZE)",
+        };
+        tracing::warn!(
+            "[detcore] HERMIT_EXTERNAL_INPUT source=binder: {call} waits for another process, \
+             which Hermit does not schedule. It runs as a blocking external call, so when it \
+             finishes, and what it reads, are this host's, not the schedule's (warned once per \
+             guest process; the run summary counts every such call)"
+        );
+    }
+    first
+}
+
+/// Binder calls that ran as external input (`note_blocking`).
+static EXTERNAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many binder calls this run has run as external input so far, for the
+/// run summary. Counted where Detcore handles the guest's system calls, which
+/// on ptrace, the backend binder guests run on, is the process that makes the
+/// summary; another backend reports none.
+pub(crate) fn external_calls() -> u64 {
+    EXTERNAL_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The `read_consumed` of the `struct binder_write_read` at `argument`,
@@ -291,6 +566,172 @@ mod tests {
         object
     }
 
+    /// A read half that wants bytes blocks, unless the descriptor is
+    /// nonblocking; a write-only call and a freeze without a timeout do not.
+    #[test]
+    fn a_binder_call_blocks_when_it_waits_for_another_process() {
+        let reading = WriteRead {
+            read_size: 256,
+            ..WriteRead::default()
+        };
+        let writing = WriteRead {
+            write_size: 64,
+            ..WriteRead::default()
+        };
+        assert_eq!(
+            blocking(BINDER_WRITE_READ, Some(&reading), None, false),
+            Some(Blocking::Read)
+        );
+        assert_eq!(
+            blocking(BINDER_WRITE_READ, Some(&reading), None, true),
+            None
+        );
+        assert_eq!(
+            blocking(BINDER_WRITE_READ, Some(&writing), None, false),
+            None
+        );
+        // A read whose buffer the caller has already filled wants nothing.
+        let consumed = WriteRead {
+            read_size: 256,
+            read_consumed: 256,
+            ..WriteRead::default()
+        };
+        assert_eq!(
+            blocking(BINDER_WRITE_READ, Some(&consumed), None, false),
+            None
+        );
+        assert_eq!(
+            blocking(BINDER_FREEZE, None, Some(&[7, 1, 100]), false),
+            Some(Blocking::Freeze)
+        );
+        assert_eq!(blocking(BINDER_FREEZE, None, Some(&[7, 1, 0]), false), None);
+        assert_eq!(
+            blocking(BINDER_FREEZE, None, Some(&[7, 0, 100]), false),
+            None
+        );
+        // Binder's own other requests, and another driver's, wait for nothing.
+        let max_threads = binder_request(1, 5, size_of::<u32>());
+        assert_eq!(blocking(max_threads, Some(&reading), None, false), None);
+        assert_eq!(blocking(0x4004_6205, Some(&reading), None, false), None);
+    }
+
+    /// `--strict` refuses every binder call in a fresh run, naming the
+    /// replay route; a replay of a record that stores readmissions may make
+    /// them, except a freeze or becoming the context manager, which are
+    /// refused either way. Another driver's request is left alone, even one
+    /// that shares binder's type byte.
+    #[test]
+    fn strict_refuses_binder_except_in_a_replay_with_readmissions() {
+        use BinderReplay::*;
+        let version = binder_request(3, 9, size_of::<i32>());
+        for request in [BINDER_WRITE_READ, version] {
+            let refusal = strict_refusal(request, || Fresh).unwrap();
+            assert!(refusal.contains("fresh run"), "{refusal}");
+            assert!(refusal.contains("--replay-preemptions-from"), "{refusal}");
+            let refusal = strict_refusal(request, || WithoutReadmissions).unwrap();
+            assert!(refusal.contains("stores no readmissions"), "{refusal}");
+            // It names each kind of record that has none, and what to do.
+            for named in [
+                "written before Hermit stored readmissions",
+                "built from events alone",
+                "prefix of its schedule",
+                "record the run again",
+                "--record-preemptions-to",
+                "whole record",
+            ] {
+                assert!(refusal.contains(named), "{named}: {refusal}");
+            }
+            assert_eq!(strict_refusal(request, || WithReadmissions), None);
+        }
+        for request in [
+            BINDER_FREEZE,
+            BINDER_SET_CONTEXT_MGR,
+            BINDER_SET_CONTEXT_MGR_EXT,
+        ] {
+            for replay in [Fresh, WithoutReadmissions, WithReadmissions] {
+                let refusal = strict_refusal(request, || replay).unwrap();
+                assert!(!refusal.contains("fresh run"), "{refusal}");
+            }
+        }
+        // Another driver's requests are not read as binder's, and do not
+        // even look at what the run replays: one with BINDER_VERSION's type
+        // byte and number but another size; dma-buf's
+        // DMA_BUF_IOCTL_IMPORT_SYNC_FILE, _IOW('b', 3, 8 bytes), which is
+        // also the header's unserved BINDER_SET_IDLE_TIMEOUT; and the unserved
+        // BINDER_SET_IDLE_PRIORITY.
+        for other in [binder_request(3, 9, 8), 0x4008_6203, 0x4004_6206] {
+            assert!(!is_binder_request(other), "{other:#x}");
+            assert_eq!(
+                strict_refusal(other, || panic!("read the replay for {other:#x}")),
+                None
+            );
+        }
+        // Only the low 32 bits are the request.
+        assert!(is_binder_request(BINDER_WRITE_READ | 0xffff_ffff_0000_0000));
+    }
+
+    /// The record files `--strict`'s binder policy reads: one a run writes
+    /// stores its readmissions even when none of its calls went to the
+    /// background, so its replay may make binder calls. A record without
+    /// them, from a Hermit that did not log them, built from events alone,
+    /// cut to a prefix of its schedule, edited, or unreadable, is refused with
+    /// the advice to record again.
+    #[test]
+    fn a_current_record_without_backgrounded_calls_may_replay_binder_under_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let version = binder_request(3, 9, size_of::<i32>());
+        let event = crate::types::SchedEvent::branches(crate::types::DetTid::from_raw(3), 7);
+        let mut current = crate::preemptions::PreemptionWriter::new(None);
+        current.insert_schedevent(event.clone());
+        current.insert_schedevent(event.clone());
+        let synthesized =
+            crate::preemptions::PreemptionRecord::from_sched_events(vec![event]).to_string();
+        let current = current.into_string();
+        let whole: crate::preemptions::PreemptionRecord = serde_json::from_str(&current).unwrap();
+        let prefix = whole.schedule_prefix(1).to_string();
+        let edited = whole.clone_preemptions_only().to_string();
+        for (name, text, allowed) in [
+            ("current", current, true),
+            (
+                "legacy",
+                r#"{"per_thread":{},"global":[]}"#.to_string(),
+                false,
+            ),
+            ("synthesized", synthesized, false),
+            ("prefix", prefix, false),
+            ("edited", edited, false),
+            ("unreadable", "not a record".to_string(), false),
+        ] {
+            let path = dir.path().join(format!("{name}.json"));
+            std::fs::write(&path, &text).unwrap();
+            let replay = replay_of(Some(&path));
+            for request in [version, BINDER_WRITE_READ] {
+                let refusal = strict_refusal(request, || replay);
+                if allowed {
+                    assert_eq!(refusal, None, "{name}: {text}");
+                } else {
+                    let refusal = refusal.unwrap_or_else(|| panic!("{name}: {text}"));
+                    assert!(
+                        refusal.contains("stores no readmissions"),
+                        "{name}: {refusal}"
+                    );
+                }
+            }
+        }
+        assert_eq!(replay_of(None), BinderReplay::Fresh);
+    }
+
+    /// Every binder call that runs as external input is counted, and each
+    /// guest process is warned about once.
+    #[test]
+    fn external_binder_calls_are_counted_and_each_process_is_warned_once() {
+        let before = external_calls();
+        assert!(note_blocking(Blocking::Read, 1_000_001));
+        assert!(!note_blocking(Blocking::Read, 1_000_001));
+        assert!(note_blocking(Blocking::Freeze, 1_000_002));
+        assert!(external_calls() >= before + 3);
+    }
+
     /// The command codes are the uapi header's, from their `_IOR` parts.
     #[test]
     fn the_command_codes_encode_their_payload_sizes() {
@@ -300,8 +741,20 @@ mod tests {
         assert_eq!(BR_REPLY, ior(3, 64));
         let iowr = (3u64 << 30) | (48 << 16) | (u64::from(b'b') << 8) | 1;
         assert_eq!(BINDER_WRITE_READ, iowr);
+        let iow = (1u64 << 30) | (12 << 16) | (u64::from(b'b') << 8) | 14;
+        assert_eq!(BINDER_FREEZE, iow);
+        assert_eq!(BINDER_FREEZE, 0x400c_620e);
+        assert_eq!(BINDER_WRITE_READ, 0xc030_6201);
         assert!(is_write_read(BINDER_WRITE_READ | 0xffff_ffff_0000_0000));
         assert!(!is_write_read(0x4004_6205));
+        // The context-manager requests, and the read-write ones the strict
+        // policy recognizes by number, direction and size (BINDER_VERSION,
+        // BINDER_GET_EXTENDED_ERROR), as include/uapi/linux/android/binder.h
+        // spells them at v6.1.
+        assert_eq!(BINDER_SET_CONTEXT_MGR, 0x4004_6207);
+        assert_eq!(BINDER_SET_CONTEXT_MGR_EXT, 0x4018_620d);
+        assert!(is_binder_request(0xc004_6209));
+        assert!(is_binder_request(0xc00c_6211));
     }
 
     /// A reply carrying one descriptor object, after commands without
