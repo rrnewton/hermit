@@ -184,6 +184,9 @@ mod tests {
         (23, "f5746a0b0fe61e6d", "f013e36743d8d9e6"),
         // Retypes `GlobalResponse::StartNewThread` (#4789).
         (24, "00d6cb4bcf56e787", "f013e36743d8d9e6"),
+        // Retypes `GlobalResponse::StartNewThread`: the boxed history, the
+        // first slice and its instruction offset.
+        (25, "db340dbb601f2f3f", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
