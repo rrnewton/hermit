@@ -19924,7 +19924,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // (https://github.com/rrnewton/hermit/issues/4541): 101 selected. And
         // run_kvm_signal_permits_are_per_thread
         // (https://github.com/rrnewton/hermit/issues/4899): 102 selected.
-        ("privileged-only-test.cli_kvm", 102usize),
+        // run_kvm_virtual_timeout_is_reported_from_the_childs_note adds the
+        // 103rd selected test, including the non-CLI setup case.
+        ("privileged-only-test.cli_kvm", 103usize),
     ] {
         let step = privileged
             .steps
