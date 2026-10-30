@@ -573,8 +573,8 @@ mod tests {
             assert_ne!(result.schedevents(), second.schedevents());
             let mut expected = serde_json::to_value(&first).unwrap();
             expected["global"] = serde_json::to_value(result.schedevents()).unwrap();
-            expected["guest_ids"] =
-                serde_json::to_value(detcore_model::pid::GuestIds::Namespace).unwrap();
+            // Main's namespace numbering retains the legacy omitted field.
+            assert_eq!(result.guest_ids(), None);
             assert_eq!(serde_json::to_value(&result).unwrap(), expected);
             for (field, changed) in [
                 ("store_exclusive_failures", serde_json::json!(8)),
