@@ -1501,12 +1501,18 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             }
             "--portable-strict-compat-only" => focused.push(Focused::PortableStrictCompat),
             "--rr-compat-only" => focused.push(Focused::RrCompat),
-            "--sabre-compat-only" => fail(
-                "SaBRe validation is owned by the hermit-3rdparty-patching CI catalog; invoke that maintained owner with its actual static frontend and cohort",
-            ),
-            "--e9patch-compat-only" => fail(
-                "e9patch validation is owned by the hermit-3rdparty-patching CI catalog; invoke that maintained owner with its actual preprocess-to-ptrace frontend",
-            ),
+            "--sabre-compat-only" => {
+                eprintln!(
+                    "validate: SaBRe validation is owned by the hermit-3rdparty-patching CI catalog; invoke that maintained owner with its actual static frontend and cohort",
+                );
+                return Err(2);
+            }
+            "--e9patch-compat-only" => {
+                eprintln!(
+                    "validate: e9patch validation is owned by the hermit-3rdparty-patching CI catalog; invoke that maintained owner with its actual preprocess-to-ptrace frontend",
+                );
+                return Err(2);
+            }
             "--qemu-l2-only" => focused.push(Focused::QemuL2),
             "--privileged-only" => focused.push(Focused::PrivilegedOnly),
             "--hosted-portable-only" => focused.push(Focused::HostedPortable),
