@@ -1201,7 +1201,7 @@ pub struct GlobalState {
     /// The ID the next guest task gets when Detcore chooses the IDs
     /// (`GuestIds::Chosen`): one past the first process's at the start, one
     /// more for every clone-family call that asks (`NextGuestId`). Zero when
-    /// the kernel numbers the guest.
+    /// the kernel numbers the guest or the positive ID space is exhausted.
     next_guest_id: AtomicI32,
 
     /// How many guest tasks were created with a host ID although Detcore
@@ -1890,7 +1890,9 @@ impl GlobalState {
             next_guest_id: AtomicI32::new(
                 cfg.guest_ids
                     .base()
-                    .map_or(0, |base| base.saturating_add(1)),
+                    .filter(|base| *base > 0)
+                    .and_then(|base| base.checked_add(1))
+                    .unwrap_or(0),
             ),
             host_id_tasks: AtomicU64::new(0),
             used_ports: Mutex::new(HashSet::new()),
@@ -3044,13 +3046,18 @@ impl GlobalState {
     /// `clone3(set_tid)` choice. Registration survives exit and reaping, so
     /// an ID is never given out twice. Asked in the caller's turn, so the
     /// order of the takes is the guest's own order of clone-family calls.
-    /// `None` when the kernel numbers the guest.
+    /// `None` when the kernel numbers the guest or no positive ID remains.
     async fn take_guest_id(&self) -> Option<i32> {
         self.cfg.guest_ids.base()?;
         loop {
             let (id, registered) = {
                 let sched = self.lock_rpc_scheduler(false).await;
-                let id = self.next_guest_id.fetch_add(1, SeqCst);
+                let id = self
+                    .next_guest_id
+                    .fetch_update(SeqCst, SeqCst, |id| {
+                        (id > 0).then(|| id.checked_add(1).unwrap_or(0))
+                    })
+                    .ok()?;
                 (id, sched.thread_was_registered(DetTid::from_raw(id)))
             };
             let clocked = self
@@ -8172,7 +8179,7 @@ pub enum GlobalResponse {
     /// The answer to `GlobalRequest::TakeSigkillRobustList`. Appended last.
     TakeSigkillRobustList(Option<crate::syscalls::robust_list::RobustListSnapshot>),
     /// The answer to `GlobalRequest::NextGuestId`: the ID taken, or `None`
-    /// when the kernel numbers the guest. Appended last.
+    /// when the kernel numbers the guest or no positive ID remains. Appended last.
     NextGuestId(Option<i32>),
     /// The answer to `GlobalRequest::GaveHostId`. Appended last.
     GaveHostId(()),
@@ -10506,7 +10513,7 @@ where
 
 /// The ID the task that the caller's clone-family call is about to create
 /// gets, when Detcore chooses the IDs (`GuestIds::Chosen`); `None` when the
-/// kernel numbers the guest (`GlobalState::take_guest_id`).
+/// kernel numbers the guest or no positive ID remains (`GlobalState::take_guest_id`).
 pub(crate) async fn next_guest_id<G, T>(guest: &mut G) -> Option<i32>
 where
     G: Guest<Detcore<T>>,
@@ -12040,6 +12047,53 @@ mod tests {
         }
         assert_eq!(state.take_guest_id().await, Some(5002));
         assert_eq!(state.take_guest_id().await, Some(5003));
+    }
+
+    /// The last positive candidate may be taken only once. Exhaustion stays
+    /// exhausted, including when initialization cannot represent base + 1.
+    #[tokio::test]
+    async fn automatic_guest_ids_stop_instead_of_wrapping() {
+        let config = |base| Config {
+            guest_ids: detcore_model::pid::GuestIds::Chosen {
+                base,
+                refuse_host_ids: true,
+            },
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config(i32::MAX - 1), false);
+        assert_eq!(state.take_guest_id().await, Some(i32::MAX));
+        assert_eq!(state.next_guest_id.load(SeqCst), 0);
+        for _ in 0..3 {
+            assert_eq!(state.take_guest_id().await, None);
+            assert_eq!(state.next_guest_id.load(SeqCst), 0);
+        }
+        for base in [i32::MAX, 0, -1, i32::MIN] {
+            let state = GlobalState::initialize(&config(base), false);
+            assert_eq!(state.take_guest_id().await, None, "base {base}");
+            assert_eq!(state.take_guest_id().await, None, "base {base}");
+            assert_eq!(state.next_guest_id.load(SeqCst), 0);
+        }
+
+        // Both kinds of already-used ID remain excluded at exhaustion.
+        let state = GlobalState::initialize(&config(i32::MAX - 2), false);
+        let root = DetTid::from_raw(i32::MAX - 2);
+        let registered = DetTid::from_raw(i32::MAX - 1);
+        let clocked = DetTid::from_raw(i32::MAX);
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler.thread_tree.add_child(root, root, true);
+            scheduler.thread_tree.add_child(root, registered, true);
+            assert!(!scheduler.thread_was_registered(clocked));
+        }
+        {
+            let mut clock = state.global_time.lock().unwrap();
+            let now = clock.as_nanos();
+            clock.update_global_time(clocked, now, Default::default());
+            assert!(clock.contains_thread(clocked));
+        }
+        assert_eq!(state.take_guest_id().await, None);
+        assert_eq!(state.next_guest_id.load(SeqCst), 0);
+        assert_eq!(state.take_guest_id().await, None);
     }
 
     /// `response` as `receive_rpc` returns it after a turn was granted

@@ -55,6 +55,9 @@ use tracing::warn;
 use crate::Detcore;
 use crate::record_or_replay::RecordOrReplay;
 
+#[cfg(test)]
+mod injection_tests;
+
 /// `struct clone_args` through `cgroup`: `CLONE_ARGS_SIZE_VER2`
 /// (include/uapi/linux/sched.h), the largest size Detcore rewrites. A
 /// longer struct with nonzero bytes past it is `E2BIG` only on kernels that
@@ -596,14 +599,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(restarted) if restarted.call == call => restarted.id,
             _ => match crate::tool_global::next_guest_id(guest).await {
                 Some(id) => id,
-                // Both sides read the same configuration, so this does not
-                // happen; if it did, the task would get the kernel's ID.
+                // Exhaustion does not wrap to a nonpositive or reused ID.
+                // Keep the existing host-ID fallback or strict refusal.
                 None => {
                     return self
                         .host_id_planned(
                             guest,
                             sysno,
-                            "Detcore's global state chose no ID".to_owned(),
+                            "Detcore has no unused positive process ID left".to_owned(),
                             refuse_host_ids,
                             untraced,
                         )
@@ -849,12 +852,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// task with the `set_tid` array `chosen` names, through scratch memory in
     /// the guest.
     ///
-    /// The kernel validates the rewritten call as it would the guest's own:
-    /// the array adds only IDs, so once Detcore's ID is below pid_max (checked
-    /// first) it can add only two errors, `EEXIST` when that ID is held and
-    /// `EPERM` when the guest task may not choose IDs in Hermit's namespace.
-    /// Every other error, and those two when they are not the array's, is the
-    /// guest's answer. For those two, and when the scratch memory cannot be
+    /// The added ID can introduce `EEXIST` when held, `EPERM` without the
+    /// capability to choose it, or `EINVAL` when out of range. Reading pid_max
+    /// is only a preflight check: it can fail or race a later limit change.
+    /// For those ambiguous errors, and when the scratch memory cannot be
     /// written, a run that needs every ID chosen ends, before any task gets a
     /// host ID; any other run issues the guest's own call, whose task, if it
     /// creates one, has a host ID ([`Self::gave_host_id`]). A restart keeps
@@ -882,13 +883,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             untraced,
             guest_entries,
         } = chosen;
-        // An ID at or above pid_max is EINVAL from set_tid (alloc_pid), which
-        // the guest's own call would not get; decided here, before any call.
-        if let Some(id) = id
-            && let Some(pid_max) = pid_max()
-            && id >= pid_max
-        {
-            let cause = format!("ID {id} is not below pid_max, {pid_max}");
+        // Reject a known bad added ID before rewriting. A successful sample
+        // does not rule out a later EINVAL from alloc_pid.
+        if let Some(cause) = id.and_then(|id| chosen_id_range_refusal(id, pid_max())) {
             if refuse_host_ids {
                 refuse_host_id(
                     guest,
@@ -970,6 +967,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                              taken as the guest task's lacking CAP_SYS_ADMIN and \
                              CAP_CHECKPOINT_RESTORE there (for example in a user namespace of its \
                              own)",
+                            id.unwrap()
+                        ),
+                        Some(SetTidFailure::PossiblyOutOfRange) => format!(
+                            "the rewrite with ID {} in Hermit's PID namespace failed with EINVAL; \
+                             the added ID may no longer be within the kernel's PID range",
                             id.unwrap()
                         ),
                     },
@@ -1080,8 +1082,20 @@ fn pid_max() -> Option<i32> {
         .ok()
 }
 
+/// A preflight rejection, not proof that a later kernel allocation will
+/// accept this ID. A missing or changing pid_max leaves EINVAL ambiguous.
+fn chosen_id_range_refusal(id: i32, maximum: Option<i32>) -> Option<String> {
+    if id <= 0 {
+        Some(format!("chosen ID {id} is not positive"))
+    } else {
+        maximum
+            .filter(|maximum| id >= *maximum)
+            .map(|maximum| format!("ID {id} is not below pid_max, {maximum}"))
+    }
+}
+
 /// How the rewritten `clone3` may have failed because of the ID Detcore
-/// added to its `set_tid` array. Both are taken as that ID's, the
+/// added to its `set_tid` array. These are taken as that ID's, the
 /// conservative side: a run that needs every ID chosen then ends, and any
 /// other run issues the guest's own call, which gets its own answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1099,16 +1113,19 @@ enum SetTidFailure {
     /// in Hermit's). Another cause of the call's own (a guest entry, an LSM)
     /// cannot be told from it.
     NotPermitted,
+    /// `EINVAL`: alloc_pid rejects an out-of-range set_tid entry before
+    /// checking the capability. A sampled pid_max cannot rule this out.
+    PossiblyOutOfRange,
 }
 
-/// Whether `errno` may be the added ID's. Once the ID is below pid_max, an
-/// added entry can make the kernel fail only with `EEXIST` or `EPERM`
-/// (alloc_pid); any other error is the call's own, which the guest's call
-/// gets as well.
+/// Failures the added set_tid entry may cause (kernel/pid.c, alloc_pid).
+/// EINVAL is ambiguous even after the preflight range check. When fallback
+/// is permitted, only the original call can establish its own result.
 fn set_tid_failure(errno: Errno) -> Option<SetTidFailure> {
     match errno {
         Errno::EEXIST => Some(SetTidFailure::Taken),
         Errno::EPERM => Some(SetTidFailure::NotPermitted),
+        Errno::EINVAL => Some(SetTidFailure::PossiblyOutOfRange),
         _ => None,
     }
 }
@@ -1885,14 +1902,14 @@ mod tests {
         let call = RestartedCloneId::call(Sysno::clone, &args, 64);
         assert_eq!(call, RestartedCloneId::call(Sysno::clone, &args, 64));
         assert_ne!(call, RestartedCloneId::call(Sysno::clone, &other, 64));
-        assert_ne!(call, RestartedCloneId::call(Sysno::fork, &args, 64));
+        assert_ne!(call, RestartedCloneId::call(Sysno::clone3, &args, 64));
         assert_ne!(call, RestartedCloneId::call(Sysno::clone, &args, 88));
     }
 
-    /// The ID Detcore adds may fail the call only with EEXIST or EPERM, both
-    /// taken as that ID's; every other error is the call's own.
+    /// A range sample cannot establish that EINVAL is the original call's
+    /// error; the handler must obtain that call's own result on fallback.
     #[test]
-    fn only_eexist_and_eperm_may_be_the_added_ids() {
+    fn an_added_id_can_also_make_the_rewrite_invalid() {
         use super::SetTidFailure;
         assert_eq!(
             super::set_tid_failure(Errno::EEXIST),
@@ -1902,8 +1919,11 @@ mod tests {
             super::set_tid_failure(Errno::EPERM),
             Some(SetTidFailure::NotPermitted)
         );
+        assert_eq!(
+            super::set_tid_failure(Errno::EINVAL),
+            Some(SetTidFailure::PossiblyOutOfRange)
+        );
         for errno in [
-            Errno::EINVAL,
             Errno::EFAULT,
             Errno::EBADF,
             Errno::EACCES,
@@ -1912,6 +1932,14 @@ mod tests {
         ] {
             assert_eq!(super::set_tid_failure(errno), None, "{errno}");
         }
+        for maximum in [None, Some(100)] {
+            for id in [i32::MIN, -1, 0] {
+                assert!(super::chosen_id_range_refusal(id, maximum).is_some());
+            }
+            assert_eq!(super::chosen_id_range_refusal(99, maximum), None);
+        }
+        assert!(super::chosen_id_range_refusal(100, Some(100)).is_some());
+        assert_eq!(super::chosen_id_range_refusal(100, None), None);
     }
 
     /// A guest's own set_tid array is read only where the kernel would: an
