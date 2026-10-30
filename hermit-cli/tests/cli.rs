@@ -23496,12 +23496,14 @@ fn skid_retry_loop_retries_only_typed_refusals_up_to_its_bound() {
     let record_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let record = record_dir.path().join("skid-retries.log");
     let credit = record_dir.path().join("skid-credit");
+    let retry_records = record_dir.path().join("retry-records.jsonl");
     fs::write(&credit, "").unwrap();
     // SAFETY: Nextest runs each test in a process of its own, and this test
     // starts no thread before it sets the variables.
     unsafe {
         std::env::set_var(skid_overshoot::SKID_RETRY_RECORD_ENV, &record);
         std::env::set_var(skid_overshoot::SKID_RETRY_CREDIT_ENV, &credit);
+        std::env::set_var(skid_overshoot::RETRY_RECORD_ENV, &retry_records);
     }
     let mut calls = 0;
     let (attempt, output, ()) = retry_typed_skid_refusal("loop test", 5, || {

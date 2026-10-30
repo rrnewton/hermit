@@ -568,6 +568,10 @@ skid_retries=$(wc -l <"$skid_retry_record") || exit $?
 printf 'run-nextest-counted: skid-overshoot retries: %d\n' "$skid_retries" >&2
 retry_records=$(wc -l <"$HERMIT_RETRY_RECORD_FILE") || exit $?
 printf 'run-nextest-counted: retry records: %d (in %s)\n' "$retry_records" "$HERMIT_RETRY_RECORD_FILE" >&2
+if ((retry_records > 0)); then
+    # The measurement dir is removed on exit; keep the records in the log.
+    sed 's/^/run-nextest-counted: retry record: /' "$HERMIT_RETRY_RECORD_FILE" >&2
+fi
 if ((skid_retries > 0)); then
     sed 's/^/run-nextest-counted: skid-overshoot retry: /' "$skid_retry_record" >&2
 fi

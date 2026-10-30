@@ -8888,17 +8888,27 @@ fn add_framework_retries(
     record: &mut serde_json::Value,
     retries: Option<Result<hermit_manifest_plan::ledger::FrameworkRetriesV1, String>>,
 ) {
-    match retries.map(|retries| {
-        retries.and_then(|retries| serde_json::to_value(retries).map_err(|error| error.to_string()))
-    }) {
+    match retries {
         None => {}
-        Some(Ok(retries)) => record["framework_retries_v1"] = retries,
+        Some(Ok(retries)) => {
+            if let Ok(rollup) = serde_json::to_value(
+                hermit_manifest_plan::ledger::RetryRollupV1::from_framework_retries(&retries),
+            ) {
+                record["retry_rollup_v1"] = rollup;
+            }
+            match serde_json::to_value(retries) {
+                Ok(value) => record["framework_retries_v1"] = value,
+                Err(error) => record["framework_retries_error"] = error.to_string().into(),
+            }
+        }
         Some(Err(error)) => {
+            record["retry_rollup_error"] = error.clone().into();
             eprintln!("validate: framework retry summary unavailable: {error}");
             record["framework_retries_error"] = error.into();
         }
     }
 }
+
 #[cfg(test)]
 mod concurrent_validate_path_tests {
     use std::io::Write;
@@ -14546,19 +14556,16 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         hermit_manifest_plan::validation_dag::manifest_selector_flags("compat")
     );
     if bucket.cmd.matches(selector.as_str()).count() != 1
-        || !bucket.cmd.contains("run-in-pinned-root.sh")
+        || bucket.cmd.contains("run-in-pinned-root.sh")
         || bucket
             .env
             .get("HERMIT_E2E_EMPTY_WORKDIR")
             .map(String::as_str)
             != Some("/test")
-        || !bucket
-            .deps
-            .iter()
-            .any(|dep| dep == "compatprep.fixtures_in_pinned_root")
+        || !bucket.deps.iter().any(|dep| dep == "compatprep.fixtures")
     {
         return Err(format!(
-            "strict-compat bucket: e2e.manifest_compat must run `{selector}` once in the pinned root, in the isolated /test working directory, after compatprep.fixtures_in_pinned_root: env={:?} deps={:?} cmd={}",
+            "strict-compat bucket: e2e.manifest_compat must run `{selector}` once on the host, in the isolated /test working directory, after compatprep.fixtures: env={:?} deps={:?} cmd={}",
             bucket.env, bucket.deps, bucket.cmd
         ));
     }
@@ -14570,9 +14577,8 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // The full run's compat rows: the 193 of the portable strict corpus
     // extracted from validate.sh, the 25 of
     // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
-    // the super run type runs (218 - 4), less the logger and pkg-config
-    // rows deselected with the pinned-image move (214 - 2).
-    let expected = 212;
+    // the super run type runs (218 - 4).
+    let expected = 214;
     if rows.len() != expected {
         return Err(format!(
             "strict-compat bucket: compat.yaml has {} CI rows; the full run has {expected}",
@@ -16436,13 +16442,11 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|bucket| bucket.lane == "privileged" && bucket.category == "c-programs")
         .ok_or("node vacuity: required plan lost the privileged c-programs bucket")?;
-    // The checked-in bucket selects cpuid-probe verify for KVM, ptrace, DBT,
-    // and the two in-guest LiteInst backends (liteinst and in-guest-trap),
-    // which came back after the in-guest reset
-    // (https://github.com/rrnewton/hermit/issues/3745), plus the cpuid-probe
-    // replay cell on ptrace that the 338-cell flip of 2026-10-30 made
-    // required. All six need cpuid-faulting, so the bucket is withheld whole.
-    if privileged.selected != 6
+    // The checked-in bucket selects cpuid-probe for KVM, ptrace, DBT, and the
+    // two in-guest LiteInst backends (liteinst and in-guest-trap), which came
+    // back after the in-guest reset
+    // (https://github.com/rrnewton/hermit/issues/3745).
+    if privileged.selected != 5
         || !bucket_runs_nothing(privileged)
         || privileged.capabilities != vec!["cpuid-faulting".to_string()]
     {
@@ -16795,30 +16799,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     // ATTRIBUTION — cpuid-probe@kvm needs both capabilities and its siblings
     // only cpuid-faulting. A host lacking both withholds the privileged bucket
     // for the one capability every cell lacks, instead of refusing the run.
-    // The whole privileged plan no longer reaches that check on such a host:
-    // the 338-cell flip of 2026-10-30 added the kvm-python-examples and
-    // kvm-shell-environment replay cells on ptrace (cpuid-faulting) beside
-    // their kvm verify cells, so privileged/applications is now withheld by
-    // two capabilities with none shared, and the driver refuses it (the same
-    // fail-closed rule the full plan's portable buckets already obeyed).
-    let mut full_privileged = plan_for("privileged")?;
-    match withhold_vacuous_manifest_nodes(root, &mut full_privileged, &both_absent) {
-        Err(why)
-            if why.contains("privileged/applications")
-                && why.contains("no single capability shared") => {}
-        other => {
-            return Err(format!(
-                "host-inapplicable cells: the privileged plan with both capabilities absent \
-                 must refuse privileged/applications, whose flip-added replay cells mix \
-                 cpuid-faulting with the bucket's kvm cells; got {other:?}"
-            ));
-        }
-    }
-    // So the c-programs attribution is exercised on that bucket's node alone.
     let mut plan = plan_for("privileged")?;
-    plan.cfg
-        .steps
-        .retain(|step| step.tag() == "privileged-only-e2e.manifest_c_programs");
     withhold_vacuous_manifest_nodes(root, &mut plan, &both_absent)?;
     let c_programs = plan
         .host_inapplicable
@@ -16887,7 +16868,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         "  host-inapplicable cells: plan rows {kvm_total} kvm withheld / {c_programs_all} portable \
          c-programs counted, portable {} running recorded / {} withheld, full {} running \
          recorded / {} withheld, qualifying 2 complete / violating 2 NO_RESULT, attribution 1 \
-         shared / 4 refused",
+         shared / 3 refused",
         portable_partial.len(),
         portable_whole.len(),
         portable_partial.len() + privileged_partial.len(),
