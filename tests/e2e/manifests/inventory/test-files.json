@@ -536,6 +536,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/exit_with_waiter.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/exit_with_waiter.c is owned by hermit-cli/tests/cli.rs. a_recording_that_ends_inside_a_blocked_call_replays records each blocking mode (a thread blocked with no timeout in poll, ppoll, select, pselect6, epoll_wait, epoll_pwait, recv, read or accept while main returns) with record start --verify --verify-strict, plainly and under the bg_pre_call race probe, and requires native's line and bitwise parity. a_recording_cut_between_calls_is_refused_rather_than_parked cuts a poll recording's root event stream, and a_recording_killed_from_outside_is_refused_rather_than_parked kills the busy mode from outside during record; both require replay to fail at once. It stays a fixture because the tests compare native and Hermit output."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/external_signal_interrupt.c",
       "runner": "hermit-cli/tests/external_signal_interrupt.rs",
       "why": "tests/c/external_signal_interrupt.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The dedicated integration suite compiles this guest and signals it from outside Hermit, from a live sibling process or thread, and from ITIMER_REAL while it blocks in FUTEX_WAIT, select, wait4 or waitid, asserting the one RESULT line under both futex modes on the ptrace backend (https://github.com/rrnewton/hermit/issues/3146); its LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745). External delivery needs a host-side sender that finds the guest by argv[0], which a manifest cannot express."

@@ -14030,6 +14030,74 @@ impl Scheduler {
             .copied()
     }
 
+    /// `hermit replay`: the recording ends inside `dtid`'s call, which never
+    /// returned in it, because the thread died in the call when its process
+    /// exited or another thread's `execve` ended it. The replay tool reports
+    /// this from the call itself, and parks the thread only if the scheduler
+    /// accepts.
+    ///
+    /// A thread the scheduler has already removed (`logically_kill_thread`) is
+    /// being ended by an exit or another thread's `execve`; the report can
+    /// come that late for a call replay does not serve from the recording,
+    /// whose end the scheduler does not wait for. Such a thread is `Gone`: the
+    /// backend drops the call when the thread's exit is observed.
+    ///
+    /// Otherwise the thread is parked only for a background call
+    /// (`external_io_blockers`) that the rejoin log never readmits. A thread
+    /// that holds its turn cannot be
+    /// parked: no other thread could run, so the exit would never come. Record
+    /// runs one thread at a time, so only a kill from outside the guest can
+    /// end a turn holder inside its call; that recording is refused here. A
+    /// call the rejoin log readmits did return in the recording, so a report
+    /// for it is a divergence.
+    ///
+    /// On acceptance the scheduler stops waiting for the call if it is one
+    /// replay serves from the recording (`replay_log_served`); record never
+    /// waited for it either. While the scheduler waits for such a call it
+    /// commits no turn, so where the report lands in host time changes nothing
+    /// it commits. The thread stays in `external_io_blockers` until it dies,
+    /// as in record.
+    pub(crate) fn replay_call_never_returns(
+        &mut self,
+        dtid: DetTid,
+    ) -> Result<crate::tool_global::UnreturnedCall, String> {
+        use crate::tool_global::UnreturnedCall;
+        let Some(rejoins) = self.rejoin_replay.as_ref() else {
+            return Err("the scheduler is not replaying a recording".to_owned());
+        };
+        if !self.next_turns.contains_key(&dtid) {
+            debug!("[dtid {dtid}] the recording ends inside this thread's call; it is gone");
+            return Ok(UnreturnedCall::Gone);
+        }
+        let Some(op) = self.blocked.external_io_blockers.get(&dtid).copied() else {
+            return Err(
+                "the thread holds its turn: the call is not a background call, so only a \
+                 kill from outside the guest could have ended it, and a parked turn holder \
+                 would stop the replay"
+                    .to_owned(),
+            );
+        };
+        if let Some(rejoin) = rejoins
+            .iter()
+            .find(|rejoin| rejoin.calls.contains(&(dtid, op.sequence)))
+        {
+            return Err(format!(
+                "the recording readmits this call at turn {}, so it returned there",
+                rejoin.turn
+            ));
+        }
+        let waited = self.blocked.replay_log_served.remove(&dtid);
+        debug!(
+            "[dtid {dtid}] the recording ends inside this thread's background call; {}",
+            if waited {
+                "replay stops waiting for it to finish"
+            } else {
+                "replay was not waiting for it"
+            }
+        );
+        Ok(UnreturnedCall::Park)
+    }
+
     /// Whether `dtid`'s backgrounded call, or signal-less wait, has finished,
     /// by the test `step2c_process_io_blockers` applies to each blocker.
     fn blocker_has_finished(&self, dtid: DetTid) -> bool {
@@ -26292,6 +26360,73 @@ mod test {
         let (during, at) = fence_wake_turns(&mut scheduler, &gt, op_id, "pollers-only");
         assert!(during.is_empty());
         assert_eq!(at, vec![(31, 12), (33, 13), (35, 14)]);
+    }
+
+    /// A call replay serves from the recording holds the scheduler until it
+    /// finishes. One the recording ends inside never finishes: once the
+    /// replay tool reports it (`replay_call_never_returns`), the scheduler
+    /// stops waiting and lets other work run, as record did, while the
+    /// thread stays blocked in its background call.
+    #[test]
+    fn replay_stops_waiting_for_a_log_served_call_that_never_returns() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let mut scheduler = rejoin_fixture(op_id, Some(DetTid::from_raw(9)), false);
+        scheduler.blocked.replay_log_served.insert(op_id.tid);
+        replaying(&mut scheduler, &[]);
+        scheduler.turn = 12;
+        assert!(scheduler.replay_waits_before_maintenance());
+        assert!(scheduler.step2c_process_io_blockers().is_err());
+
+        assert_eq!(
+            scheduler.replay_call_never_returns(op_id.tid),
+            Ok(crate::tool_global::UnreturnedCall::Park)
+        );
+        assert!(!scheduler.replay_waits_before_maintenance());
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&op_id.tid),
+            Some(&op_id)
+        );
+    }
+
+    /// The report is refused, and the scheduler keeps its state, for a call
+    /// that is not a background call (a turn holder cannot be parked), for one
+    /// the rejoin log readmits (it returned in the recording), and outside
+    /// replay. A thread the scheduler has already removed is `Gone`.
+    #[test]
+    fn replay_refuses_a_call_that_never_returns_unless_it_is_a_background_call() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(25), 4);
+        let mut scheduler = rejoin_fixture(op_id, None, false);
+        scheduler.blocked.replay_log_served.insert(op_id.tid);
+        let refused = scheduler.replay_call_never_returns(op_id.tid);
+        assert!(refused.unwrap_err().contains("not replaying"));
+
+        replaying(&mut scheduler, &[]);
+        let turn_holder = DetTid::from_raw(9);
+        queue_worker(&mut scheduler, turn_holder);
+        let refused = scheduler.replay_call_never_returns(turn_holder);
+        assert!(refused.unwrap_err().contains("holds its turn"));
+        // A thread the scheduler has removed is being ended already.
+        assert_eq!(
+            scheduler.replay_call_never_returns(DetTid::from_raw(31)),
+            Ok(crate::tool_global::UnreturnedCall::Gone)
+        );
+
+        replaying(
+            &mut scheduler,
+            &[Rejoin {
+                turn: 14,
+                wakes: 0,
+                calls: vec![(op_id.tid, 4)],
+            }],
+        );
+        let refused = scheduler.replay_call_never_returns(op_id.tid);
+        assert!(
+            refused
+                .unwrap_err()
+                .contains("readmits this call at turn 14")
+        );
+        assert!(scheduler.blocked.replay_log_served.contains(&op_id.tid));
     }
 
     /// The same while a call replay serves from the recording is unfinished.
