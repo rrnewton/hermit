@@ -21849,6 +21849,7 @@ mod test {
                         start_rip: None,
                         end_rip: detcore_model::schedule::InstructionPointer::new(12345),
                         end_time: Some(LogicalTime::from_nanos(123)),
+                        stopless: false,
                     };
                     let mut sched = plain_replay_with_writer(vec![terminal.clone(), next.clone()]);
                     if boundary {
@@ -21915,7 +21916,7 @@ mod test {
                         assert!(consumed.keep_running, "the exit grant supplies the handoff");
                         assert_eq!(consumed.event_ix, 0);
                         assert_eq!(
-                            consumed.timeslice_remaining,
+                            consumed.timeslice_remaining.map(|end| end.length),
                             (!boundary).then(|| LogicalTime::from_rcbs(123))
                         );
                         assert_eq!(sched.recorded_event_count, 0);
