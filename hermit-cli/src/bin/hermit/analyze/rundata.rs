@@ -73,9 +73,6 @@ pub struct RunData {
     trial_bound: Option<NonZeroU64>,
     /// How long the run took, once it finished.
     wall: Option<Duration>,
-    /// The log file the run wrote, once it launched (`--verbose` or
-    /// `--selfcheck`).
-    logged_to: Option<PathBuf>,
 }
 
 impl RunData {
@@ -230,7 +227,6 @@ impl RunData {
         // /tmp -- but the fix is the same and costs nothing.
         let mut gopts = gopts;
         gopts.open_log_file()?;
-        self.logged_to = gopts.log_file.clone();
         let final_record_path = self
             .runopts
             .det_opts
@@ -336,8 +332,8 @@ impl RunData {
         }
         let wall = self.wall?;
         let log_bytes = self
-            .logged_to
-            .as_ref()
+            .trial_global_opts()
+            .log_file
             .and_then(|path| std::fs::metadata(path).ok())
             .map(|metadata| metadata.len());
         Some((wall, log_bytes))
@@ -400,7 +396,6 @@ impl RunData {
             log_level,
             trial_bound: None,
             wall: None,
-            logged_to: None,
         };
 
         // By default we save the config for every run.
@@ -607,7 +602,6 @@ impl RunData {
             is_a_match: Some(true),
             trial_bound: None,
             wall: None,
-            logged_to: None,
         }
     }
 
@@ -634,7 +628,6 @@ impl RunData {
             is_a_match: None,
             trial_bound: None,
             wall: None,
-            logged_to: None,
         }
     }
 
