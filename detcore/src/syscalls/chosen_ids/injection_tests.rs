@@ -11,6 +11,7 @@
 //! outcome is independent. Heap-backed scratch here does not model the
 //! lifetime of memory borrowed from a real guest stack.
 
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 
@@ -80,6 +81,9 @@ struct CloneGuest {
     rewritten_errno: Errno,
     attempts: Vec<bool>,
     host_id_reports: AtomicUsize,
+    proof_context: bool,
+    registry_queries: Mutex<Vec<i32>>,
+    refused_registry_query: Option<usize>,
 }
 
 impl CloneGuest {
@@ -103,6 +107,9 @@ impl CloneGuest {
             rewritten_errno: Errno::EINVAL,
             attempts: Vec::new(),
             host_id_reports: AtomicUsize::new(0),
+            proof_context: false,
+            registry_queries: Mutex::new(Vec::new()),
+            refused_registry_query: None,
         }
     }
 
@@ -118,12 +125,38 @@ impl CloneGuest {
         ClonePlan::Chosen(ChosenId {
             set_tid: vec![id],
             id: Some(id),
+            fresh_allocation: false,
             restart: None,
             args: *self.original_args,
             size: CLONE_ARGS_SIZE_VER2,
             untraced: false,
             guest_entries: false,
         })
+    }
+
+    fn enable_fresh_attempt(&mut self) {
+        self.config.sequentialize_threads = true;
+        self.proof_context = true;
+        let ids = Box::new([1]);
+        self.original_args[0..8]
+            .copy_from_slice(&(libc::CLONE_NEWPID as u64 | (1 << 40)).to_ne_bytes());
+        self.original_args = Box::new(ChosenIdCall::with_set_tid(
+            *self.original_args,
+            ids.as_ptr() as u64,
+            1,
+        ));
+        self.original_expected = *self.original_args;
+        self.original_set_tid = Some(ids);
+    }
+
+    fn fresh_plan(&self, id: i32) -> ClonePlan {
+        let ClonePlan::Chosen(mut chosen) = self.chosen(id) else {
+            unreachable!()
+        };
+        chosen.fresh_allocation = true;
+        chosen.set_tid = vec![1, id];
+        chosen.guest_entries = true;
+        ClonePlan::Chosen(chosen)
     }
 }
 
@@ -141,6 +174,17 @@ impl GlobalRPC<GlobalState> for CloneGuest {
             GlobalRequest::GaveHostId => {
                 self.host_id_reports.fetch_add(1, SeqCst);
                 (None, GlobalResponse::GaveHostId(()))
+            }
+            GlobalRequest::ThreadIdRefused(id) if self.proof_context => {
+                let mut queries = self.registry_queries.lock().unwrap();
+                queries.push(id.as_raw());
+                assert!(queries.len() <= 2, "only the before/after registry checks");
+                (
+                    None,
+                    GlobalResponse::ThreadIdRefused(
+                        self.refused_registry_query == Some(queries.len()),
+                    ),
+                )
             }
             // Stop at the real named-refusal boundary, before its process
             // exit; the test inspects the diagnostic and injected calls.
@@ -160,7 +204,13 @@ impl Guest<Detcore> for CloneGuest {
     type Stack = Scratch;
 
     fn tid(&self) -> Pid {
-        Pid::from_raw(5000)
+        if self.proof_context {
+            // Real readable maps/namespace links for the heap-backed fixture;
+            // the scripted RPC still names the exact candidate ID separately.
+            Pid::from_raw(std::process::id() as i32)
+        } else {
+            Pid::from_raw(5000)
+        }
     }
     fn pid(&self) -> Pid {
         self.tid()
@@ -213,13 +263,18 @@ impl Guest<Detcore> for CloneGuest {
                 &bytes[..SET_TID_OFFSET],
                 &self.original_args[..SET_TID_OFFSET]
             );
-            assert_eq!(&bytes[SET_TID_SIZE_OFFSET..80], &1_u64.to_ne_bytes());
+            assert_eq!(&bytes[80..], &self.original_args[80..]);
+            let count = if self.proof_context { 2_u64 } else { 1_u64 };
+            assert_eq!(&bytes[SET_TID_SIZE_OFFSET..80], &count.to_ne_bytes());
             let address = u64::from_ne_bytes(bytes[SET_TID_OFFSET..72].try_into().unwrap());
-            let id: i32 = self
-                .memory()
-                .read_value(Addr::from_raw(address as usize).unwrap())
-                .unwrap();
-            assert_eq!(id, 5001);
+            let mut observed = vec![0; count as usize];
+            read_pid_array(&self.memory(), address as usize, &mut observed).unwrap();
+            let expected = if self.proof_context {
+                vec![1, 5001]
+            } else {
+                vec![5001]
+            };
+            assert_eq!(observed, expected);
             Err(self.rewritten_errno)
         }
     }
@@ -312,4 +367,102 @@ async fn an_added_id_einval_is_a_named_refusal_when_host_ids_are_forbidden() {
     assert!(reason.0.contains("EINVAL"), "{reason:?}");
     assert_eq!(guest.attempts, [false]);
     assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+}
+
+/// The real injection path checks the captured original fields, staged
+/// guest-readable bytes, namespace depth and both registry responses. The
+/// scripted kernel's EINVAL is independent of the unused original-call result.
+/// This tests conditional attribution, not atomic sysctl stability or F1.
+#[tokio::test]
+async fn a_fresh_clone3_einval_keeps_the_guests_error_under_the_stable_pid_limit_contract() {
+    let mut guest = CloneGuest::new(true, Ok(6000));
+    guest.enable_fresh_attempt();
+    let tool = Detcore::new(guest.tid(), &guest.config);
+    let call = guest.original_call();
+    let plan = guest.fresh_plan(5001);
+    assert_eq!(
+        tool.inject_clone_planned(&mut guest, call, plan, false)
+            .await,
+        Err(Errno::EINVAL)
+    );
+    assert_eq!(guest.attempts, [false]);
+    assert_eq!(*guest.registry_queries.lock().unwrap(), [5001, 5001]);
+    assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+}
+
+/// A fresh value's evidence can become invalid. In particular a negative
+/// post-attempt registry refusal must not be mistaken for the guest's EINVAL.
+#[tokio::test]
+async fn an_added_id_without_attribution_evidence_still_refuses_strict_runs() {
+    // Start with the post-attempt failure so removing the attribution guard
+    // is caught at this actual boundary, after both exact-ID queries.
+    for refused_query in [2, 1] {
+        let mut guest = CloneGuest::new(true, Ok(6000));
+        guest.enable_fresh_attempt();
+        guest.refused_registry_query = Some(refused_query);
+        let tool = Detcore::new(guest.tid(), &guest.config);
+        let call = guest.original_call();
+        let plan = guest.fresh_plan(5001);
+        let refused =
+            std::panic::AssertUnwindSafe(tool.inject_clone_planned(&mut guest, call, plan, false))
+                .catch_unwind()
+                .await
+                .expect_err("an occupied added ID is not evidence of the guest's own EINVAL");
+        let reason = refused.downcast_ref::<PolicyRefused>().unwrap();
+        assert!(reason.0.contains("needs every guest process ID chosen"));
+        assert!(reason.0.contains("EINVAL"));
+        assert_eq!(guest.attempts, [false]);
+        assert_eq!(
+            *guest.registry_queries.lock().unwrap(),
+            vec![5001; refused_query]
+        );
+        assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+    }
+
+    // Reusing a restart ID does not inherit a fresh allocation's proof.
+    let mut guest = CloneGuest::new(true, Ok(6000));
+    guest.enable_fresh_attempt();
+    let tool = Detcore::new(guest.tid(), &guest.config);
+    let call = guest.original_call();
+    let ClonePlan::Chosen(mut chosen) = guest.fresh_plan(5001) else {
+        unreachable!()
+    };
+    chosen.fresh_allocation = false;
+    let refused = std::panic::AssertUnwindSafe(tool.inject_clone_planned(
+        &mut guest,
+        call,
+        ClonePlan::Chosen(chosen),
+        false,
+    ))
+    .catch_unwind()
+    .await
+    .expect_err("a restarted ID needs its own registration proof");
+    assert!(refused.downcast_ref::<PolicyRefused>().is_some());
+    assert_eq!(guest.attempts, [false]);
+    assert!(guest.registry_queries.lock().unwrap().is_empty());
+    assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+
+    // A definitely invalid added ID refuses before staging or injection.
+    for id in [
+        0,
+        -1,
+        pid_max().expect("the Linux test host exposes pid_max"),
+    ] {
+        let mut guest = CloneGuest::new(true, Ok(6000));
+        guest.enable_fresh_attempt();
+        let tool = Detcore::new(guest.tid(), &guest.config);
+        let call = guest.original_call();
+        let plan = guest.fresh_plan(id);
+        let refused =
+            std::panic::AssertUnwindSafe(tool.inject_clone_planned(&mut guest, call, plan, false))
+                .catch_unwind()
+                .await
+                .expect_err("an invalid added ID must not become the guest's EINVAL");
+        let reason = refused.downcast_ref::<PolicyRefused>().unwrap();
+        assert!(reason.0.contains("needs every guest process ID chosen"));
+        assert!(reason.0.contains("not positive") || reason.0.contains("not below pid_max"));
+        assert!(guest.attempts.is_empty());
+        assert!(guest.registry_queries.lock().unwrap().is_empty());
+        assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+    }
 }

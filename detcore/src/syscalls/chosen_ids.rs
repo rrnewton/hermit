@@ -54,6 +54,7 @@ use tracing::warn;
 
 use crate::Detcore;
 use crate::record_or_replay::RecordOrReplay;
+use crate::types::DetTid;
 
 #[cfg(test)]
 mod injection_tests;
@@ -392,6 +393,9 @@ pub(crate) struct ChosenId {
     /// The ID Detcore took for the task in Hermit's namespace, the array's
     /// last entry; `None` where the guest named every entry itself.
     id: Option<i32>,
+    /// This attempt took a fresh allocator value while holding its turn.
+    /// A saved restart ID has no such attempt-local registration proof.
+    fresh_allocation: bool,
     /// The call as a restart keeps its ID under (`RestartedCloneId::call`).
     restart: Option<Vec<u8>>,
     /// `struct clone_args`, `set_tid` still unset.
@@ -402,6 +406,116 @@ pub(crate) struct ChosenId {
     untraced: bool,
     /// The array begins with entries of the guest's own.
     guest_entries: bool,
+}
+
+/// Evidence that adding the outer entry did not introduce an EINVAL cause.
+///
+/// This is conditional on pid_max staying stable across this attempt. The
+/// before/after samples detect a visible change, not an ABA shrink and restore.
+/// External host-root sysctl mutation in an init/no-namespace run is outside
+/// this admitted environment; these samples are not an atomic stability proof.
+/// Linux alloc_pid checks the array length, each entry's range, and whether a
+/// namespace without a reaper is being given its first ID. The new last entry
+/// is in Hermit's already-active namespace; inner guest entries are unchanged.
+/// https://github.com/torvalds/linux/blob/v6.17/kernel/pid.c#L178
+///
+/// The fresh allocator value was not registered or clocked at allocation.
+/// The caller retains its serial turn, or installs the pending-vfork barrier
+/// before releasing it; no other guest can register that value before this
+/// failed birth. Thus ThreadIdRefused's zombie exception cannot hide a use of
+/// this fresh value. It is only an additional check, not a universal registry
+/// query. Saved restart IDs lack this attempt-local proof. Registration stays
+/// recorded after exit; clock components themselves can move during exec.
+#[derive(Debug)]
+struct AddedIdEvidence {
+    id: i32,
+    maximum: i32,
+    args: [u8; CLONE_ARGS_SIZE_VER2],
+    size: usize,
+    set_tid: Vec<libc::pid_t>,
+}
+
+impl AddedIdEvidence {
+    fn capture<M: MemoryAccess>(
+        memory: &M,
+        tid: i32,
+        call: &Syscall,
+        chosen: &ChosenId,
+        maximum: Option<i32>,
+    ) -> Option<Self> {
+        let id = chosen.id?;
+        let maximum = maximum?;
+        if !chosen.fresh_allocation || id <= 0 || id >= maximum {
+            return None;
+        }
+        // This proof preserves the original clone3 size and every original
+        // field. Legacy conversions and unknown later struct bytes need
+        // their own equivalence proof, so they retain the refusal policy.
+        let Syscall::Clone3(original) = call else {
+            return None;
+        };
+        if original.size() != chosen.size
+            || !(CLONE_ARGS_SIZE_VER1..=CLONE_ARGS_SIZE_VER2).contains(&chosen.size)
+        {
+            return None;
+        }
+        let Clone3Read::Bytes(bytes) = read_clone_args(memory, tid, original) else {
+            return None;
+        };
+        let mut original_args = [0; CLONE_ARGS_SIZE_VER2];
+        original_args[..bytes.len()].copy_from_slice(&bytes);
+        if original_args != chosen.args {
+            return None;
+        }
+        let flags = u64::from_ne_bytes(original_args[..8].try_into().unwrap());
+        let depth = pid_namespace_depth(tid, flags)?;
+        if chosen.set_tid.len() != depth + 1
+            || chosen.set_tid.len() > MAX_SET_TID
+            || chosen.set_tid.last() != Some(&id)
+        {
+            return None;
+        }
+        if chosen.guest_entries {
+            let original_entries = read_guest_set_tid(memory, tid, &original_args).ok()?;
+            if original_entries != chosen.set_tid[..depth] {
+                return None;
+            }
+        } else if original_args[SET_TID_OFFSET..SET_TID_SIZE_OFFSET + 8] != [0; 16]
+            || !(depth == 0
+                || (depth == 1 && flags & libc::CLONE_NEWPID as u64 != 0 && chosen.set_tid[0] == 1))
+        {
+            return None;
+        }
+        Some(Self {
+            id,
+            maximum,
+            args: original_args,
+            size: chosen.size,
+            set_tid: chosen.set_tid.clone(),
+        })
+    }
+
+    fn staged_matches<M: MemoryAccess>(
+        &self,
+        memory: &M,
+        tid: i32,
+        rewritten: &syscalls::Clone3,
+        array: u64,
+    ) -> bool {
+        if rewritten.size() != self.size {
+            return false;
+        }
+        let Some(address) = rewritten.args() else {
+            return false;
+        };
+        let mut observed = [0; CLONE_ARGS_SIZE_VER2];
+        let expected = ChosenIdCall::with_set_tid(self.args, array, self.set_tid.len());
+        memory
+            .read_exact_with_user_access(address.cast::<u8>().into(), &mut observed)
+            .is_ok()
+            && observed == expected
+            && read_guest_set_tid(memory, tid, &observed).as_ref() == Ok(&self.set_tid)
+    }
 }
 
 /// How a clone-family call is issued, as [`Detcore::plan_clone_id`] decides.
@@ -559,6 +673,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         return Ok(ClonePlan::Chosen(ChosenId {
                             set_tid: tids,
                             id: None,
+                            fresh_allocation: false,
                             restart: None,
                             args,
                             size,
@@ -607,10 +722,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // every clone). Nothing else in the call depends on it.
         let args = without_untraced(args);
         let call = RestartedCloneId::call(sysno, &args, size);
-        let id = match restarted {
-            Some(restarted) if restarted.call == call => restarted.id,
+        let (id, fresh_allocation) = match restarted {
+            Some(restarted) if restarted.call == call => (restarted.id, false),
             _ => match crate::tool_global::next_guest_id(guest).await {
-                Some(id) => id,
+                Some(id) => (id, true),
                 // Exhaustion does not wrap to a nonpositive or reused ID.
                 // Keep the existing host-ID fallback or strict refusal.
                 None => {
@@ -631,6 +746,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(ClonePlan::Chosen(ChosenId {
             set_tid,
             id: Some(id),
+            fresh_allocation,
             restart: Some(call),
             args,
             size,
@@ -865,9 +981,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the guest.
     ///
     /// The added ID can introduce `EEXIST` when held, `EPERM` without the
-    /// capability to choose it, or `EINVAL` when out of range. Reading pid_max
-    /// is only a preflight check: it can fail or race a later limit change.
-    /// For those ambiguous errors, and when the scratch memory cannot be
+    /// capability to choose it, or `EINVAL` when out of range. EINVAL may be
+    /// attributed to the original call only with [`AddedIdEvidence`], under
+    /// its explicit stable-pid_max assumption. Missing evidence keeps the
+    /// error ambiguous. For ambiguous errors, and when scratch memory cannot be
     /// written, a run that needs every ID chosen ends, before any task gets a
     /// host ID; any other run issues the guest's own call, whose task, if it
     /// creates one, has a host ID ([`Self::gave_host_id`]). A restart keeps
@@ -886,18 +1003,38 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ..
             }
         );
+        let maximum_before = pid_max();
+        let mut attribution = self
+            .cfg
+            .sequentialize_threads
+            .then(|| {
+                AddedIdEvidence::capture(
+                    &guest.memory(),
+                    guest.tid().as_raw(),
+                    &call,
+                    &chosen,
+                    maximum_before,
+                )
+            })
+            .flatten();
+        if let Some(evidence) = &attribution
+            && crate::tool_global::thread_id_refused(guest, DetTid::from_raw(evidence.id)).await
+        {
+            attribution = None;
+        }
         let ChosenId {
             set_tid,
             id,
+            fresh_allocation: _,
             restart,
             args,
             size,
             untraced,
             guest_entries,
         } = chosen;
-        // Reject a known bad added ID before rewriting. A successful sample
-        // does not rule out a later EINVAL from alloc_pid.
-        if let Some(cause) = id.and_then(|id| chosen_id_range_refusal(id, pid_max())) {
+        // Reject a known bad added ID before rewriting. The sample alone
+        // does not establish attribution of a later EINVAL.
+        if let Some(cause) = id.and_then(|id| chosen_id_range_refusal(id, maximum_before)) {
             if refuse_host_ids {
                 refuse_host_id(
                     guest,
@@ -928,8 +1065,30 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let rewritten = syscalls::Clone3::new()
                     .with_args(AddrMut::from_raw(args.as_raw()))
                     .with_size(size);
+                if attribution.as_ref().is_some_and(|evidence| {
+                    !evidence.staged_matches(
+                        &guest.memory(),
+                        guest.tid().as_raw(),
+                        &rewritten,
+                        array.as_raw() as u64,
+                    )
+                }) {
+                    attribution = None;
+                }
                 let result = guest.inject(rewritten).await;
                 drop(scratch);
+                // No child exists after EINVAL. Recheck the same allocated
+                // value, not a PID obtained from the failed syscall result.
+                // Matching samples do not exclude pid_max ABA; the admitted
+                // environment must keep that sysctl stable during the attempt.
+                if result == Err(Errno::EINVAL)
+                    && let Some(evidence) = &attribution
+                    && pid_max() == Some(evidence.maximum)
+                    && !crate::tool_global::thread_id_refused(guest, DetTid::from_raw(evidence.id))
+                        .await
+                {
+                    return Err(Errno::EINVAL);
+                }
                 match result {
                     Ok(child) => {
                         debug!(
@@ -983,7 +1142,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ),
                         Some(SetTidFailure::PossiblyOutOfRange) => format!(
                             "the rewrite with ID {} in Hermit's PID namespace failed with EINVAL; \
-                             the added ID may no longer be within the kernel's PID range",
+                             the added ID lacks complete unchanged-input, stable-pid-range and \
+                             registration evidence for attributing that error to the guest",
                             id.unwrap()
                         ),
                     },
@@ -1131,8 +1291,9 @@ enum SetTidFailure {
 }
 
 /// Failures the added set_tid entry may cause (kernel/pid.c, alloc_pid).
-/// EINVAL is ambiguous even after the preflight range check. When fallback
-/// is permitted, only the original call can establish its own result.
+/// EINVAL remains ambiguous without the complete conditional AddedIdEvidence.
+/// When that evidence is absent and fallback is permitted, only the original
+/// call can establish its own result.
 fn set_tid_failure(errno: Errno) -> Option<SetTidFailure> {
     match errno {
         Errno::EEXIST => Some(SetTidFailure::Taken),

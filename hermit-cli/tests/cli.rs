@@ -10690,8 +10690,8 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
 
 /// An error Linux gives the guest's own clone stays its answer instead of
 /// ending the run: under an explicit base, a clone with `CLONE_SIGHAND` but
-/// not `CLONE_VM` gets `EINVAL` from the rewritten `clone3` as from its own
-/// call; a guest `clone3` whose own `set_tid` points at nothing gets
+/// not `CLONE_VM` gets its native `EINVAL` through the original call, before
+/// adding an ID; a guest `clone3` whose own `set_tid` points at nothing gets
 /// `EFAULT`, and one with `set_tid` but no size `EINVAL`, from the kernel;
 /// and, in both kinds of run, a `CLONE_NEWPID` call with a one-entry
 /// `set_tid` and an unknown flag gets `EINVAL` from the rewrite that adds
