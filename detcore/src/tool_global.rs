@@ -7600,10 +7600,12 @@ pub enum SignalScope {
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
 /// fails until it does). That test digests the two enums' bodies and
-/// `Resources`: a change to another payload type defined elsewhere
+/// `Resources`, the StoreExclusive payload's types, the scheduled event
+/// `TraceSchedEvent` carries and its reply with the replayed slice end it
+/// holds: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 24;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 25;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
