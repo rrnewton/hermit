@@ -14888,10 +14888,10 @@ impl Scheduler {
     /// signal; or the exit grant of its PID namespace's init,
     /// `namespace_zap_victims`). A doomed thread leaves the scheduler at a
     /// host-timed moment, so whether it still has a `next_turns` entry must
-    /// not decide this. The marks err toward too much (a process-group SIGKILL
-    /// that fails keeps its members marked; a failed exec keeps its threads
-    /// marked), so a marked process that survives is not stopped by the bound,
-    /// the same way in every run.
+    /// not decide this. Process-group SIGKILL marks are conservative: a failed
+    /// group kill keeps its members marked, so a marked process that survives
+    /// is not stopped by the bound, the same way in every run. A failed exec
+    /// clears its in-flight mark before the old image resumes.
     fn a_thread_can_still_be_granted(&self) -> bool {
         self.next_turns.keys().any(|tid| {
             !self.committed_exits.contains(tid)

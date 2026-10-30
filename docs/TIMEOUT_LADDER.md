@@ -341,8 +341,9 @@ remaining process (a granted exit, a SIGKILL, an exec in flight, a delivered
 fatal signal, or the exit of its PID namespace's init), stops nothing: the
 guest ended on its own, and its own status stands. The marks err toward too
 much, so a process that a committed decision marked doomed but that survives (a
-process-group SIGKILL that failed, or a failed exec) is not stopped by the
-bound either, the same way in every run. After a SIGKILL whose victim Detcore
+process-group SIGKILL that failed) is not stopped by the bound either, the
+same way in every run. A failed exec clears its in-flight mark before the
+old image resumes. After a SIGKILL whose victim Detcore
 could not name, that victim counts until the host reports it gone, so a stop
 decided after one is recorded as a determinism loss. The check reads the clock
 and never moves, rounds or resets it, and it does not change how threads are

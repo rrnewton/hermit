@@ -1102,8 +1102,10 @@ pub struct Config {
     /// virtual time `--summary` reports as elapsed (`virttime_elapsed` in `--summary-json`); it is
     /// checked each time the scheduler commits it at the start of a turn, before the turn's thread
     /// runs, and the check never moves it. A guest that has already exited, or whose remaining
-    /// processes a committed exit, kill, exec or fatal signal has marked doomed, is not stopped by
-    /// it, even if such a process then survives. Unlike `--timeout`, a
+    /// processes a committed exit, kill, in-flight exec or fatal signal has marked doomed, is not
+    /// stopped by it. A failed exec clears its in-flight mark before the old image resumes.
+    /// Process-group SIGKILL marks are conservative: if a marked process survives a failed group
+    /// kill, the bound does not stop it. Unlike `--timeout`, a
     /// wall-clock bound in seconds that fires wherever the guest has got to when the host's clock
     /// runs out (`class=run-timeout`), for a guest whose input all comes from inside the
     /// container this bound fires at the same point of the same schedule on every host and in
