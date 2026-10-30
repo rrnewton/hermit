@@ -681,6 +681,7 @@ fn analyze_ends_at_a_refused_trial() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    // EXIT-CLASS: hermit. Hermit refused the trial (HERMIT_POLICY_REFUSAL_EXIT).
     assert_eq!(output.status.code(), Some(122), "{label}\n{combined}");
     assert!(
         combined.contains("HERMIT_POLICY_REFUSAL")
@@ -713,6 +714,7 @@ fn analyze_ends_with_a_refused_target_run() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    // EXIT-CLASS: hermit. Hermit refused the trial (HERMIT_POLICY_REFUSAL_EXIT).
     assert_eq!(output.status.code(), Some(122), "{label}\n{combined}");
     assert!(
         combined.contains("HERMIT_POLICY_REFUSAL"),
