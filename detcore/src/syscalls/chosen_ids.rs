@@ -93,8 +93,9 @@ pub(crate) enum ChosenIdCall {
     },
     /// Issue the call as the guest made it: every kernel that can choose IDs
     /// (5.5 and later, for `set_tid`) refuses it before it creates a task, by
-    /// the ABI (`CLONE_PIDFD` beside `CLONE_DETACHED`, a `clone3` struct
-    /// shorter than its first version), so no ID is needed, and `clone3`
+    /// the ABI (`CLONE_PIDFD` beside `CLONE_DETACHED`, incompatible legacy
+    /// thread/signal-sharing flags, a `clone3` struct shorter than its first
+    /// version), so no ID is needed, and `clone3`
     /// could refuse it with another error.
     Unchanged,
     /// The original legacy call fails validation before conversion. Return
@@ -259,6 +260,17 @@ impl LegacyClone {
         // calls bypass this conversion and retain native results.
         if self.flags & shares_parent != 0 && self.exit_signal > 64 {
             return ChosenIdCall::Invalid(Errno::EINVAL);
+        }
+        // These legacy-clone combinations cannot create a child. Let the
+        // original kernel call preserve its error precedence instead of
+        // confusing its EINVAL with the added set_tid entry. Linux v6.17
+        // copy_process rejects both before alloc_pid:
+        // https://github.com/torvalds/linux/blob/v6.17/kernel/fork.c#L1945
+        let thread = self.flags & libc::CLONE_THREAD as u64 != 0;
+        let sighand = self.flags & libc::CLONE_SIGHAND as u64 != 0;
+        let vm = self.flags & libc::CLONE_VM as u64 != 0;
+        if (thread && !sighand) || (sighand && !vm) {
+            return ChosenIdCall::Unchanged;
         }
         let detached = libc::CLONE_DETACHED as u64;
         let pidfd = libc::CLONE_PIDFD as u64;
@@ -1760,6 +1772,65 @@ mod tests {
             clone3_form(Sysno::clone, &clone_args(thread | 0x80, 0, 0, 0, 0), None),
             ChosenIdCall::Invalid(Errno::EINVAL)
         );
+
+        // Known no-child combinations go to the original kernel even if
+        // their stack cannot be converted. UNTRACED still takes the
+        // existing traced-original path, retaining all other registers.
+        for untraced in [0, libc::CLONE_UNTRACED] {
+            for invalid in [
+                libc::CLONE_THREAD,
+                libc::CLONE_THREAD | libc::CLONE_VM,
+                libc::CLONE_SIGHAND,
+                libc::CLONE_THREAD | libc::CLONE_SIGHAND,
+            ] {
+                let args = clone_args(
+                    (invalid | untraced) as u64 | libc::SIGCHLD as u64,
+                    1,
+                    0x1234,
+                    0x2345,
+                    0x3456,
+                );
+                assert_eq!(
+                    clone3_form(Sysno::clone, &args, None),
+                    ChosenIdCall::Unchanged
+                );
+                let mut expected = args;
+                expected.arg0 &= !(libc::CLONE_UNTRACED as usize);
+                assert_eq!(traced_legacy_clone(args), expected);
+            }
+            for valid in [
+                0,
+                libc::CLONE_VM,
+                libc::CLONE_SIGHAND | libc::CLONE_VM,
+                libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM,
+            ] {
+                let flags = (valid | untraced) as u64;
+                let (converted, _) = fields(&clone3_form(
+                    Sysno::clone,
+                    &clone_args(flags, 0, 0, 0, 0),
+                    None,
+                ));
+                assert_eq!(converted[0], flags);
+            }
+        }
+        // Original-signal validation still precedes this no-child route.
+        assert_eq!(
+            clone3_form(
+                Sysno::clone,
+                &clone_args(libc::CLONE_THREAD as u64 | 65, 1, 0, 0, 0),
+                None
+            ),
+            ChosenIdCall::Invalid(Errno::EINVAL)
+        );
+        // The legacy-only proof does not alter clone3 size or set_tid handling.
+        let mut guest_args = [0; CLONE_ARGS_SIZE_VER2];
+        guest_args[..8].copy_from_slice(&(libc::CLONE_SIGHAND as u64).to_ne_bytes());
+        let (converted, _) = fields(&clone3_form(
+            Sysno::clone3,
+            &clone_args(0, 0, 0, 0, 0),
+            Some(&guest_args),
+        ));
+        assert_eq!(converted[0], libc::CLONE_SIGHAND as u64);
     }
 
     /// clone's last two arguments are the child TID address and the TLS on
