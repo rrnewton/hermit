@@ -615,8 +615,8 @@ pub struct Resources {
     #[serde(default)]
     pub(crate) read_fd: Option<(detcore_model::fd::FilesId, i32)>,
     /// Set on a polling request whose attempts fail or succeed only through
-    /// guest actions: a retry on a container-internal descriptor (a pipe, a
-    /// socketpair end, or a FIFO polled as a pipe), or a FIFO open waiting for
+    /// guest actions: a retry on a guest-held socketpair end, a pipe or FIFO
+    /// classified as internal, or a FIFO open waiting for
     /// a guest peer. Such a poller cannot make progress on its own, which is
     /// what `Scheduler::nothing_else_can_run` asks
     /// (<https://github.com/rrnewton/hermit/issues/2203>). `false` for a poll

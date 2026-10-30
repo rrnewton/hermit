@@ -19337,6 +19337,27 @@ fn task_state_of_stat(stat: &[u8]) -> Option<char> {
         .map(|byte| *byte as char)
 }
 
+/// Exercise an actual producer's request after it has entered the poll queue,
+/// before and after another thread publishes descriptor-export revocation.
+#[cfg(test)]
+pub(crate) fn assert_poll_export_revocation_for_test(request: Resources, guest_only_before: bool) {
+    let config = Config::default();
+    let mut sched = Scheduler::new(&config);
+    let opener = DetTid::from_raw(3);
+    test::register_known_thread_for(&mut sched, opener);
+    let poller = request.tid;
+    test::queued_poller_for(&mut sched, poller);
+    sched.next_turns.get_mut(&poller).unwrap().req = Ivar::full(Ok(request));
+    assert_eq!(sched.nothing_else_can_run(opener), guest_only_before);
+
+    let mut export = Resources::new(DetTid::from_raw(7));
+    export.passes_descriptors_out = true;
+    let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+    sched.request_put(&Ivar::new(), export, &global_time);
+    assert!(sched.guest_held_marks_revoked);
+    assert!(!sched.nothing_else_can_run(opener));
+}
+
 #[cfg(test)]
 mod test {
     use reverie::syscalls::Sysno;

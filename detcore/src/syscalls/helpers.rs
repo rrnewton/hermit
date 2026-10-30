@@ -486,11 +486,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
-            // Only guests write or read the other end of an internal fd, or of
-            // a guest-held one (`DetFd::is_guest_held`).
-            rsrc.relies_on_guest_held_marks =
-                !internal_fd && syscall_targets_guest_held_fd(guest, wrapped);
-            rsrc.polls_guest_state_only = internal_fd || rsrc.relies_on_guest_held_marks;
+            (rsrc.polls_guest_state_only, rsrc.relies_on_guest_held_marks) =
+                single_fd_poll_readiness(guest, wrapped, internal_fd);
             // A pipe read: a recorded private `SIGCHLD` ends it as on Linux.
             rsrc.private_sigchld_decides = reads_a_pipe(guest, wrapped);
             // A read waits for data, a write for room (`--pipe-wake-latency`).
@@ -1386,27 +1383,25 @@ fn ioaction_for_fd_status(fd: i32, virt: bool, phys: bool, flags_forbid_waiting:
 
 /// Does this single-fd syscall operate on a container-INTERNAL file descriptor?
 ///
-/// This recognizes pipes, whose two endpoints are always both owned by guest
-/// processes inside the deterministic container, and `socketpair(2)` endpoints, which
-/// have that same property for the same reason. Internal fds are made physically
+/// This is an execution-routing classification, not proof that only guests can
+/// change readiness. It recognizes pipes and `socketpair(2)` endpoints. Internal
+/// fds are made physically
 /// nonblocking (see `handle_pipe2` and `handle_socketpair`) so a potentially-blocking
 /// op on them can use the deterministic `InternalIOPolling` nonblockize-and-retry
 /// strategy instead of `BlockingExternalIO`. Treating an internal fd as external
 /// blocking IO deadlocks the sequentialized scheduler in record/replay, because a
 /// reader and its paired writer are not independent.
 ///
-/// A socketpair is the one socket case where internality is known at creation time:
-/// the kernel creates BOTH ends, so no peer outside the container can ever hold one.
+/// Socketpair origin is known at creation time, and remains useful for routing
+/// even after an endpoint is exported or a datagram endpoint changes its peer.
 /// Under record and replay a connected socket whose peer is a guest, which
 /// `Detcore::classify_socket_peer` finds from the peer's credentials after
 /// `connect`, `accept` or an `SCM_RIGHTS` receive, is internal too. Every other
 /// socket, including every loopback IP socket, conservatively remains external.
 ///
-/// The residual assumption, stated because it is an assumption and not a proof: a
-/// guest could pass a socketpair endpoint out of the container over `SCM_RIGHTS` to a
-/// process on the host. A pipe fd can escape by exactly the same route and this code
-/// has always accepted that for pipes, so recognizing socketpairs widens no exposure
-/// class -- but neither claim is airtight.
+/// Readiness needs a separate decision: a socketpair endpoint can leave the guest
+/// through `SCM_RIGHTS`, and a bound, disconnected datagram endpoint can receive
+/// from an outside sender. See `single_fd_poll_readiness`.
 ///
 /// A descriptor a guest RECEIVES over `SCM_RIGHTS` is recorded
 /// (`Detcore::record_received_descriptors`) or discovered. One that names an open
@@ -1469,6 +1464,31 @@ fn syscall_targets_guest_held_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
             .with_detfd(fd, |detfd| detfd.is_guest_held())
             .unwrap_or(false)
     })
+}
+
+/// The generic single-fd poll's guest-only claim and whether it rests on
+/// revocable guest-held marks. Socketpair origin selects live internal routing,
+/// but only its current guest-held mark can establish guest-only readiness.
+/// Mark-dependent requests remain subject to the scheduler's export revocation,
+/// including requests that were already published when the export was reported.
+/// Other internal descriptors retain their existing readiness classification.
+/// In particular, this does not repair guest-only claims for pipes exported
+/// through SCM_RIGHTS or received from outside the guest.
+fn single_fd_poll_readiness<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    call: Syscall,
+    internal_fd: bool,
+) -> (bool, bool) {
+    let socketpair = get_fd(call).is_some_and(|fd| {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.is_socketpair_endpoint())
+            .unwrap_or(false)
+    });
+    let relies_on_guest_held_marks =
+        (!internal_fd || socketpair) && syscall_targets_guest_held_fd(guest, call);
+    let polls_guest_state_only = (internal_fd && !socketpair) || relies_on_guest_held_marks;
+    (polls_guest_state_only, relies_on_guest_held_marks)
 }
 
 /// The most entries a `poll` or `ppoll` may have for
@@ -7284,6 +7304,124 @@ mod kernel_signal_wait_failures {
             &mut guest,
             syscalls::Readv::new().with_fd(socket.as_raw_fd()).into()
         ));
+    }
+
+    #[test]
+    fn a_socketpair_poll_uses_revocable_provenance_without_changing_internal_routing() {
+        use std::os::fd::AsRawFd;
+
+        use nix::sys::socket::AddressFamily;
+        use nix::sys::socket::SockFlag;
+        use nix::sys::socket::SockType;
+        use nix::sys::socket::socketpair;
+
+        let (mut guest, _) = WaitGuest::live(guest_mask());
+        let pairs = [SockType::Datagram, SockType::Stream, SockType::SeqPacket].map(|kind| {
+            let (socket, peer) =
+                socketpair(AddressFamily::Unix, kind, None, SockFlag::empty()).unwrap();
+            (kind, socket, peer)
+        });
+        for (kind, socket, _peer) in &pairs {
+            let fd = socket.as_raw_fd();
+            guest
+                .thread
+                .add_fd(fd, nix::fcntl::OFlag::O_RDWR, FdType::Socket, None)
+                .unwrap();
+            let alias = guest
+                .thread
+                .with_detfd(fd, |d| {
+                    d.set_socketpair_endpoint();
+                    d.clone()
+                })
+                .unwrap();
+            // Datagram pairs are deliberately not guest-held at creation:
+            // binding and AF_UNSPEC disconnect can admit outside senders.
+            // Connected stream/seqpacket pairs have the stronger mark.
+            let connection = *kind != SockType::Datagram;
+            if connection {
+                alias.set_guest_held();
+            }
+            let calls = [
+                syscalls::Read::new().with_fd(fd).into(),
+                syscalls::Readv::new().with_fd(fd).into(),
+                syscalls::Recvfrom::new().with_fd(fd).into(),
+                syscalls::Recvmsg::new().with_sockfd(fd).into(),
+            ];
+            for call in calls {
+                let internal = syscall_targets_internal_fd(&mut guest, call);
+                assert!(internal, "{kind:?}: live record/replay routing is retained");
+                let readiness = single_fd_poll_readiness(&mut guest, call, internal);
+                assert_eq!(
+                    readiness,
+                    (connection, connection),
+                    "{kind:?}: readiness needs revocable provenance"
+                );
+                let mut request = Resources::new(DetTid::from_raw(5));
+                request.insert(ResourceID::InternalIOPolling, Permission::W);
+                request.poll_attempt = 1;
+                (
+                    request.polls_guest_state_only,
+                    request.relies_on_guest_held_marks,
+                ) = readiness;
+                crate::scheduler::assert_poll_export_revocation_for_test(request, connection);
+            }
+            // Cached record/replay peer credentials are another routing fact,
+            // and must not override a socketpair's readiness provenance either.
+            alias.set_guest_peer();
+            for call in calls {
+                let internal = syscall_targets_internal_fd(&mut guest, call);
+                assert_eq!(
+                    single_fd_poll_readiness(&mut guest, call, internal),
+                    (connection, connection),
+                    "cached guest-peer routing is not socketpair readiness proof"
+                );
+            }
+            alias.clear_guest_held();
+            for call in calls {
+                let internal = syscall_targets_internal_fd(&mut guest, call);
+                assert!(internal, "revocation must not change live routing");
+                assert_eq!(
+                    single_fd_poll_readiness(&mut guest, call, internal),
+                    (false, false),
+                    "withdrawing a mark through an alias withdraws readiness"
+                );
+            }
+        }
+
+        // The socketpair repair does not reclassify other internal descriptors.
+        let (pipe, _writer) = nix::unistd::pipe().unwrap();
+        guest
+            .thread
+            .add_fd(
+                pipe.as_raw_fd(),
+                nix::fcntl::OFlag::O_RDONLY,
+                FdType::Pipe,
+                None,
+            )
+            .unwrap();
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        guest
+            .thread
+            .add_fd(
+                socket.as_raw_fd(),
+                nix::fcntl::OFlag::O_RDWR,
+                FdType::Socket,
+                None,
+            )
+            .unwrap();
+        guest
+            .thread
+            .with_detfd(socket.as_raw_fd(), |d| d.set_guest_peer())
+            .unwrap();
+        for fd in [pipe.as_raw_fd(), socket.as_raw_fd()] {
+            let call = syscalls::Read::new().with_fd(fd).into();
+            let internal = syscall_targets_internal_fd(&mut guest, call);
+            assert!(internal);
+            assert_eq!(
+                single_fd_poll_readiness(&mut guest, call, internal),
+                (true, false)
+            );
+        }
     }
 
     /// Answer this thread's `/proc` reads from `kernel` until the result drops.

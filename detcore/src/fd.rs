@@ -657,9 +657,10 @@ struct OpenFileDescription {
     /// trace mode is active.
     #[serde(default)]
     network_socket: NetworkSocketKind,
-    /// True when this socket is one end of a `socketpair(2)`, whose two
-    /// endpoints are therefore both container-internal. See
-    /// `syscall_targets_internal_fd`.
+    /// True when this socket originated in `socketpair(2)`, selecting live
+    /// internal routing. This does not prove guest-only readiness: an endpoint
+    /// may be exported, or a datagram endpoint rebound. See
+    /// `syscall_targets_internal_fd` and `is_guest_held`.
     #[serde(default)]
     socketpair_endpoint: bool,
     /// True when record/replay found that this socket's peer is a guest of
@@ -2337,8 +2338,8 @@ impl DetFd {
         })
     }
 
-    /// Whether this open file is one end of a `socketpair(2)`, and therefore
-    /// container-internal.
+    /// Whether this open file originated in `socketpair(2)`, for live internal
+    /// routing. Guest-only readiness instead requires `is_guest_held`.
     pub(crate) fn is_socketpair_endpoint(&self) -> bool {
         self.with_description(|d| d.socketpair_endpoint)
     }
@@ -2350,9 +2351,9 @@ impl DetFd {
         self.with_description(|d| d.guest_peer = true);
     }
 
-    /// Whether only guests of this container hold the other end of this
-    /// socket: a `socketpair(2)` endpoint, or a socket whose peer record/replay
-    /// found to be a guest. Detcore keeps such a socket physically nonblocking
+    /// Whether this socket uses internal execution routing: a `socketpair(2)`
+    /// endpoint, or a socket whose peer record/replay found to be a guest.
+    /// Detcore keeps such a socket physically nonblocking
     /// and polls a blocking call on it in the caller's turn, as for a pipe
     /// (`syscall_targets_internal_fd`).
     pub(crate) fn is_internal_socket(&self) -> bool {
