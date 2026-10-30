@@ -3151,7 +3151,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
-    ("test.detcore_unit", 3034),
+    // And a_binder_call_blocks_when_it_waits_for_another_process: 3035.
+    ("test.detcore_unit", 3035),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4484,7 +4485,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
-    ("test.cli", 744),
+    // And a_blocking_binder_read_does_not_hold_the_guests_turn, which skips
+    // the same way: 745.
+    ("test.cli", 745),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5056,7 +5059,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
-    ("test.cli_on_host", 663),
+    // And the same blocking binder read test: 664.
+    ("test.cli_on_host", 664),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5559,7 +5563,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
     // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
-    ("test.detcore_unit_on_host", 3034),
+    // And the same blocking-classification unit: 3035.
+    ("test.detcore_unit_on_host", 3035),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
