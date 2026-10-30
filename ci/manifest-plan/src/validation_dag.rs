@@ -103,8 +103,16 @@ const PINNED_WORKSPACE_PREPARE_DESCRIPTION: &str = "The preparation half of the 
 const PINNED_WORKSPACE_PREPARE_EST_SECONDS: f64 = 60.0;
 const PINNED_WORKSPACE_PREPARE_WALL_SECONDS: i64 = 600;
 const PINNED_WORKSPACE_PREPARE_CPU_SECONDS: i64 = 2100;
-const PINNED_WORKSPACE_PREPARE_RSS_BASELINE_BYTES: i64 = 4 * 1024 * 1024 * 1024;
-const PINNED_WORKSPACE_PREPARE_HARD_MEM_MAX_BYTES: i64 = 8 * 1024 * 1024 * 1024;
+// 2026-10-30 rush-fix measurement: uncapped
+// `prepare full` at 32 jobs in the pinned root peaked at
+// 16,466,087,936 bytes (15.3 GiB) of cgroup memory.peak, against
+// the old 8 GiB hard cap (4 oom_kill events in 75 s). The growth
+// is validate-profile compile parallelism over a larger workspace,
+// not a leak: the same selection's test execution peaks far below.
+// Baseline takes the measured peak rounded up; hard cap adds
+// roughly 30% headroom for colder caches.
+const PINNED_WORKSPACE_PREPARE_RSS_BASELINE_BYTES: i64 = 16 * 1024 * 1024 * 1024;
+const PINNED_WORKSPACE_PREPARE_HARD_MEM_MAX_BYTES: i64 = 20 * 1024 * 1024 * 1024;
 
 /// The group of every tool self-test node: `selftest.<name>`.
 pub const TOOL_SELF_TEST_GROUP: &str = "selftest";

@@ -74168,8 +74168,8 @@
       "hint": {
         "resources": {},
         "est_duration_s": 60.0,
-        "rss_baseline_bytes": 4294967296,
-        "hard_mem_max_bytes": 8589934592,
+        "rss_baseline_bytes": 17179869184,
+        "hard_mem_max_bytes": 21474836480,
         "classification": "cpu-bound",
         "preferred_inner_jobs": 32,
         "measured_effective_cores": null,
