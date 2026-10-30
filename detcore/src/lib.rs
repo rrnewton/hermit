@@ -543,6 +543,26 @@ fn choose_rcb_timer(
     (max_rcbs_remaining, true)
 }
 
+/// What a schedule replay's recorded callback checkpoints decided at one
+/// check-in site (`Detcore::replay_callback_checkpoint`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayCheckpoint {
+    /// No checkpoint decides here; the slice's own end does.
+    Undecided,
+    /// The next checkpoint ended the slice here.
+    Ended,
+    /// The next checkpoint ends the slice later, at a later site of the
+    /// running callback.
+    EndsLater,
+}
+
+impl ReplayCheckpoint {
+    /// Whether the checkpoints, not the slice's own end, decide here.
+    fn decides(self) -> bool {
+        self != Self::Undecided
+    }
+}
+
 /// The actual callback check-in at which a slice ends, carried into
 /// `end_timeslice_with_checkpoint` so that priority-history replay of a
 /// callback-annotated record (`Config::annotated_priority_replay`) decides
@@ -1519,8 +1539,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .end_of_timeslice
                     .filter(|deadline| *deadline > max_timeslice_end)
                     .unwrap_or(fallback_deadline);
-                thread_state.end_of_timeslice = Some(replay_deadline);
-                thread_state.max_timeslice_end = Some(replay_deadline);
+                thread_state.install_schedule_deadline(replay_deadline, true);
                 thread_state.last_rcb_timer = None;
                 thread_state.last_rcb_timer_is_max = false;
                 thread_state.stats.reset_timeslice();
@@ -2559,6 +2578,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self
             .replay_callback_checkpoint(guest, boundary, token, site)
             .await
+            .decides()
         {
             return;
         }
@@ -2611,35 +2631,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         thread.callback_history.origin(thread, token, site)
     }
 
+    /// Under a schedule replay, let the recorded callback checkpoints decide
+    /// whether the slice ends at `site`, and say how they did
+    /// (`ReplayCheckpoint`): the next checkpoint ended the slice here, or it
+    /// ends it later, at a later site of the running callback
+    /// (`callback_history::State::ends_later_in_callback`). When it ends it
+    /// later, the caller must not end the slice here either: a timer
+    /// preemption the record ended in its post-hook, within one RCB of the PMU
+    /// maximum, already reaches its replayed branch count in the pre-hook, and
+    /// ending it at both would give the replay a scheduler turn, and a turn's
+    /// charge of virtual time, that the record does not have.
     async fn replay_callback_checkpoint<G: Guest<Self>>(
         &self,
         guest: &mut G,
         boundary: CheckIn,
         token: &mut Option<preemptions::callback_history::Token>,
         site: preemptions::callback_history::Site,
-    ) -> bool {
+    ) -> ReplayCheckpoint {
         if self.cfg.replay_schedule_from.is_none()
             || self.cfg.strict_schedule_boundaries
             || guest.thread_state().own_signal_turn_hold.is_some()
         {
-            return false;
+            return ReplayCheckpoint::Undecided;
         }
         let thread = guest.thread_state();
         if let Some(token) = token {
             token.note_cut(thread.callback_history.progress(), site);
         }
         let Some(actual) = thread.callback_history.origin(thread, token, site) else {
-            return false;
+            return ReplayCheckpoint::Undecided;
         };
         let Some(origin) = self
-            .take_callback_checkpoint(guest, actual, token.as_ref())
+            .take_callback_checkpoint(guest, actual.clone(), token.as_ref())
             .await
         else {
-            return false;
+            let history = &guest.thread_state().callback_history;
+            return if history.ends_later_in_callback(&actual) {
+                ReplayCheckpoint::EndsLater
+            } else {
+                ReplayCheckpoint::Undecided
+            };
         };
         self.end_timeslice_with_checkpoint(guest, false, Some(origin), boundary, None)
             .await;
-        true
+        ReplayCheckpoint::Ended
     }
 
     /// Priority-history replay of a callback-annotated record
@@ -3175,7 +3210,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         check_in: CheckIn,
         checkin: Option<PriorityCheckin<'_>>,
     ) {
-        let chaos = guest.config().chaos;
+        let chaos = guest.config().chaos_draws_schedule();
         loop {
             let thread_state = guest.thread_state();
             let dettid = thread_state.dettid;
@@ -3217,8 +3252,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if replay_checkpoint && !expiry_due {
                     // The event cursor may just have installed a future deadline,
                     // including through a TraceReplay resume. This administrative
-                    // pass does not draw or reset a slice. Later real grants may
-                    // update that authority normally; do not snapshot it here.
+                    // pass does not draw a slice end or close the slice; it only
+                    // restarts the backstop, as the recorded run's new slice
+                    // had it. Later real grants may update that authority
+                    // normally; do not snapshot it here.
+                    thread.restart_replay_backstop(&self.cfg);
                     (None, None)
                 } else if let Some(mut observed) = thread.slice_boundary.take() {
                     let result =
@@ -5076,6 +5114,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     lone_slice_end: None,
                     replaying_lone_slice_end: None,
                     lone_replay_unsound: false,
+                    replay_backstop: None,
 
                     record_or_replay,
                     preemption_points: None,

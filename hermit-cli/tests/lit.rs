@@ -380,8 +380,8 @@ fn fixtures(root: &Path) -> Vec<PathBuf> {
 fn every_lit_fixture_is_within_the_supported_subset() {
     let root = lit_root();
     let fixtures = fixtures(&root);
-    // 27 main.{rs,c,go} files, 47 .lit, 6 .test and 2 scheduler scripts.
-    assert_eq!(fixtures.len(), 82, "{fixtures:#?}");
+    // 28 main.{rs,c,go} files, 47 .lit, 6 .test and 2 scheduler scripts.
+    assert_eq!(fixtures.len(), 83, "{fixtures:#?}");
     let placeholder = Path::new("/placeholder");
     let substitutions = [
         ("hermit", placeholder),
@@ -551,6 +551,7 @@ lit_cases! {
     lit_rt_sigprocmask_hermit_run => "rt_sigprocmask/hermit-run.lit",
     lit_timerfd_virtual_time_main => "timerfd_virtual_time/main.c",
     lit_timerfd_virtual_time_hermit_run_strict => "timerfd_virtual_time/hermit-run-strict.lit",
+    lit_chaos_schedule_replay_main => "chaos_schedule_replay/main.rs",
     lit_child_should_inherit_fds_hermit_run => "child_should_inherit_fds/hermit-run.lit",
     lit_child_should_inherit_fds_main => "child_should_inherit_fds/main.rs",
     lit_close_on_exec_hermit_run => "close_on_exec/hermit-run.lit",

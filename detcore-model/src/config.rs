@@ -732,7 +732,11 @@ pub struct Config {
     /// nondeterminism points it uses `--fuzz-seed` to (a) deliver a
     /// process-directed signal to a randomly chosen thread in the group (signal
     /// timing races) and (b) randomize the requeue position of a force-unblocked
-    /// thread (lock-ordering / wakeup races). Only takes effect with `--chaos`;
+    /// thread (lock-ordering / wakeup races). With `--chaos`, outside a replay,
+    /// it also (c) starts a new thread other than a vfork child at the first or
+    /// last priority instead of a random one (fork and exec races); a vfork
+    /// child keeps its random priority. It is meant for `--chaos` runs,
+    /// but (a) and (b) apply whenever it is set, with or without `--chaos`;
     /// like the rest of chaos mode it remains reproducible under a fixed seed.
     #[clap(long)]
     pub chaos_target_races: bool,
@@ -1850,6 +1854,37 @@ impl Config {
     /// setting `--max-timeslice=disabled`.
     pub fn use_rcb_time(&self) -> bool {
         self.max_timeslice.is_some() && !self.no_rcb_time
+    }
+
+    /// Whether chaos mode makes this run's scheduling decisions: `--chaos`,
+    /// unless the run replays a recorded schedule (`--replay-schedule-from`).
+    ///
+    /// Chaos draws a thread's timeslice ends and its new priority at each of
+    /// them, and lets a `sched_yield` loop open a yield epoch. A schedule
+    /// replay takes those decisions from its record instead: it ends a slice
+    /// where the record does and runs the thread the record ran. A chaos draw
+    /// there would end a slice the record does not have, and the extra
+    /// scheduler turn moves the virtual clock the guest reads, so a replay
+    /// with `--chaos` makes exactly the decisions a replay without it makes.
+    /// That holds past the end of the schedule too: the rest of the run is
+    /// scheduled as a run without `--chaos`, as a replay without it is.
+    ///
+    /// What chaos does to virtual time itself (`--chaos-per-thread-slowdown`)
+    /// is not a scheduling decision and stays on. A replay computes those
+    /// factors from its own scheduler seed and slowdown options, so it
+    /// reproduces the recorded run's virtual time only when it is given the
+    /// same ones.
+    ///
+    /// Nor does this predicate cover what `--fuzz-seed` draws: targeted chaos
+    /// (`--chaos-target-races`: the thread a process-directed signal goes to,
+    /// and whether a force-unblocked thread is requeued at the front) and
+    /// `--fuzz-futexes`. The scheduler reads those flags, not `--chaos`, so
+    /// adding `--chaos` to a schedule replay changes none of their draws. The
+    /// record does not carry them; a replay draws them again from its own
+    /// `--fuzz-seed`, so it reproduces them only when it is given the
+    /// recorded run's.
+    pub fn chaos_draws_schedule(&self) -> bool {
+        self.chaos && self.replay_schedule_from.is_none()
     }
 
     /// Whether a `FUTEX_WAKE` that woke `woken` waiters makes the waker yield

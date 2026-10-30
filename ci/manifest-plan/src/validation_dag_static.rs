@@ -3148,7 +3148,28 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4897 adds two detcore units: 2979 + 2 = 2981, re-measured at this integration head.
     // The 4843 overshoot fix adds eighteen detcore units: 2981 + 18 = 2999, re-measured at this integration head.
     // The socketpair readiness increment adds one detcore unit: 2999 + 1 = 3000, re-measured at this integration head.
-    ("test.detcore_unit", 3000),
+    // And tool_local::timeslice_tests::chaos_schedule_replay_draws_no_slice_end
+    // (a schedule replay under --chaos draws no chaos decision): 3001, listed.
+    // And tool_local::timeslice_tests::a_kept_replay_slice_restarts_only_the_backstop
+    // and preemptions::callback_history::tests::a_later_site_of_the_running_callback_ends_the_slice_later
+    // (a replayed slice end a callback checkpoint marks is one turn): 2814, listed.
+    // And tool_global::tests::legacy_callback_checkpoint_at_the_pmu_epsilon_ends_an_expired_deadline_once
+    // and tool_global::tests::legacy_chaos_replay_ends_an_expired_deadline_as_without_chaos
+    // (the same two fixes through the hooks): 3005, listed.
+    // And tool_local::timeslice_tests::a_schedule_deadline_on_the_backstop_keeps_its_place
+    // (a schedule deadline that falls on the backstop is still the schedule's): 3006, listed.
+    // And preemptions::callback_history::tests::a_timer_stop_before_the_recorded_callback_leaves_the_slice_to_it
+    // and tool_global::tests::a_timer_stop_before_a_recorded_syscall_slice_end_leaves_it_to_the_call
+    // (a timer stop at a recorded system call's slice end leaves it to the call): 3008, listed.
+    // And four units pinning each replayed slice end the schedule installs
+    // and the kept slice's backstop restart (callback_history_tests'
+    // a_replayed_event_deadline_is_the_schedules_and_no_backstop,
+    // a_replayed_slice_end_past_the_maximum_is_the_schedules_and_no_backstop,
+    // a_replayed_checkpoint_that_keeps_the_slice_restarts_its_backstop, and
+    // exec_identity_tests'
+    // an_exec_continuation_resumes_the_schedules_slice_end_not_a_backstop):
+    // 2937, listed.
+    ("test.detcore_unit", 3010),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3495,7 +3516,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at 360e99b2e24: a81e8a3fbfd (PR 4862) added two lit tests
     // without moving this pin; the shard executed 292, all passing, in
     // the full validate at that head.
-    ("test.hermit_integration_2", 292),
+    // And lit's chaos_schedule_replay fixture (a --chaos recording replayed
+    // with --die-on-desync): 293, listed.
+    ("test.hermit_integration_2", 293),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -4474,7 +4497,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the third is new and never listed here) = 739, re-measured at this integration head.
     // The 4843 overshoot fix adds one cli case: 739 + 1 = 740, re-measured at this integration head.
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
-    ("test.cli", 742),
+    // And a_schedule_replay_under_chaos_follows_its_recording: 743, listed.
+    // And a_schedule_replay_ends_each_recorded_slice_once: 744, listed.
+    // Each of the two schedule-replay tests split into one test per seed
+    // (seeds 1, 2 and 3), so each fits the 57-second wall bound: 656 + 4 = 748.
+    ("test.cli", 748),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5042,7 +5069,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4853 transplant relocation: 660 - 2 = 658.
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
-    ("test.cli_on_host", 661),
+    // And a_schedule_replay_under_chaos_follows_its_recording: 662, listed.
+    // And a_schedule_replay_ends_each_recorded_slice_once: 663, listed.
+    // And the same per-seed split of the two schedule-replay tests:
+    // 575 + 4 = 667.
+    ("test.cli_on_host", 667),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5537,7 +5568,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4897 units: 2979 + 2 = 2981.
     // The same eighteen 4843 overshoot fix units: 2981 + 18 = 2999.
     // The same socketpair readiness unit: 2999 + 1 = 3000.
-    ("test.detcore_unit_on_host", 3000),
+    // And the same chaos schedule-replay unit: 3001, listed.
+    // And the same two callback-checkpoint replay units: 2814, listed.
+    // And the same two hook-level replay units: 3005, listed.
+    // And the same backstop-coincidence unit: 3006, listed.
+    // And the same two timer-stop-before-a-call units: 3008, listed.
+    // And the same four replayed-slice-end units: 2937, listed.
+    ("test.detcore_unit_on_host", 3010),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5657,7 +5694,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list --profile ci` (the local shards' 61 + 290 + 349).
     // Recount at 360e99b2e24: shard 2 grew to 292 (see its pin), so the
     // whole-node twin executes 61 + 292 + 349 = 702.
-    ("test.hermit_integration_on_host", 702),
+    // And the same chaos_schedule_replay lit fixture: 703, listed.
+    ("test.hermit_integration_on_host", 703),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
