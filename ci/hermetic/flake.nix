@@ -239,6 +239,13 @@
             # procps' uptime spells; coreutils' uptime (merged into /bin
             # above) has no -p. Point /bin/uptime at procps, as on the host.
             ln -sfnT "${pkgs.procps}/bin/uptime" bin/uptime
+            # The compat corpus's clang must not become the build's compiler:
+            # merged into /bin, the clang wrapper's cc/c++ win over gcc's, and
+            # the SaBRe build (cc + CMake) then compiles with Clang and refuses
+            # its own flags under -Werror. Keep /bin/cc and /bin/c++ on gcc, as
+            # before the corpus moved in; clang stays available as clang.
+            ln -sfnT "${pkgs.gcc}/bin/cc" bin/cc
+            ln -sfnT "${pkgs.gcc}/bin/c++" bin/c++
             ${commandFixtureLinks}
             for path in ${pkgs.lib.escapeShellArgs requiredGuestPaths}; do
               command="''${path##*/}"
