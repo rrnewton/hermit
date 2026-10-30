@@ -710,9 +710,8 @@ impl AdoptedInputs {
         // Provenance is the authenticated sealed object, not a new stat of
         // `meta.path`, whose contents may since have been replaced.
         let mut file = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
-        let identity = detcore_model::host_input::HostFileIdentity::from_stat(
-            &nix::sys::stat::fstat(file.as_raw_fd())?,
-        );
+        let identity =
+            detcore_model::host_input::HostFileIdentity::from_stat(&nix::sys::stat::fstat(&file)?);
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         ensure!(
@@ -1289,7 +1288,7 @@ mod tests {
         let (bytes, origin) = inputs.read_role("ld-so-cache", &path).unwrap().unwrap();
         assert_eq!(bytes, b"sealed cache");
         let physical = detcore_model::host_input::HostFileIdentity::from_stat(
-            &nix::sys::stat::fstat(inputs.objects[0].1.as_raw_fd()).unwrap(),
+            &nix::sys::stat::fstat(&inputs.objects[0].1).unwrap(),
         );
         assert_eq!(
             origin, physical,

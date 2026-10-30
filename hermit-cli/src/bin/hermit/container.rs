@@ -1305,10 +1305,10 @@ impl LdSoCacheSnapshot {
         mut file: File,
         read: impl FnOnce(&mut File, &mut Vec<u8>) -> Result<(), Error>,
     ) -> Result<Self, Error> {
-        let before = nix::sys::stat::fstat(file.as_raw_fd())?;
+        let before = nix::sys::stat::fstat(&file)?;
         let mut bytes = Vec::new();
         read(&mut file, &mut bytes)?;
-        let after = nix::sys::stat::fstat(file.as_raw_fd())?;
+        let after = nix::sys::stat::fstat(&file)?;
         let origin = HostFileIdentity::from_stat(&before);
         anyhow::ensure!(
             origin == HostFileIdentity::from_stat(&after)
@@ -1408,7 +1408,7 @@ pub(super) fn identity_hardening_mounts_on(
     let ld_so_cache = frozen_ld_so_cache(Some(&snapshot))?;
     let ld_so_cache_origin = match (&ld_so_cache, snapshot.0.as_ref()) {
         (Some(cache), Some(captured)) if captured.origin.is_some() => Some(HostInputSnapshot {
-            physical: HostFileIdentity::from_stat(&nix::sys::stat::fstat(cache.as_raw_fd())?),
+            physical: HostFileIdentity::from_stat(&nix::sys::stat::fstat(cache)?),
             origin: captured.origin.unwrap(),
             content: detcore::Digest::new(&captured.bytes).to_string(),
         }),
@@ -6672,8 +6672,7 @@ mod tests {
         let path = directory.path().join("ld.so.cache");
         fs::write(&path, b"captured cache").unwrap();
         let source = File::open(&path).unwrap();
-        let origin =
-            HostFileIdentity::from_stat(&nix::sys::stat::fstat(source.as_raw_fd()).unwrap());
+        let origin = HostFileIdentity::from_stat(&nix::sys::stat::fstat(&source).unwrap());
         let snapshot = LdSoCacheSnapshot::of_path(&path).unwrap();
         let replacement = directory.path().join("new");
         fs::write(&replacement, b"different host cache").unwrap();
