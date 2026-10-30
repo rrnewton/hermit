@@ -1580,19 +1580,36 @@ impl AnalyzeOpts {
         }
     }
 
-    /// Does a finished trial meet the criteria? A trial that ended on a
-    /// deadlock under Hermit's model has no guest status to judge (its 121 is
-    /// Hermit's), and the deadlock may be a gap in Hermit's model rather than
-    /// the guest's behaviour, so it is counted neither on nor off target: the
-    /// trial fails with the deadlock's own outcome.
-    pub fn trial_matches(&self, out: &Output, guest_deadlock: bool) -> anyhow::Result<bool> {
-        if guest_deadlock {
-            return Err(Error::new(crate::container::GuestDeadlock).context(
+    /// Does a finished trial meet the criteria? A trial that ended with a
+    /// scheduler terminal outcome has no guest status to judge (its 121 or 124
+    /// is Hermit's), so it is counted neither on nor off target: the trial
+    /// fails with the outcome's own class line and status. A deadlock under
+    /// Hermit's model may be a gap in Hermit's model rather than the guest's
+    /// behaviour; a virtual timeout is a bound Hermit imposed on a guest that
+    /// had not finished, and a model gap (a missed wake turned into a
+    /// spin-poll) can be what ran the clock past it.
+    pub fn trial_matches(
+        &self,
+        out: &Output,
+        terminal_outcome: Option<detcore::TerminalOutcome>,
+    ) -> anyhow::Result<bool> {
+        match terminal_outcome {
+            Some(outcome @ detcore::TerminalOutcome::GuestDeadlock) => Err(Error::new(
+                crate::container::SchedulerOutcome(outcome),
+            )
+            .context(
                 "an analyze trial ended on a deadlock under Hermit's model, which is \
-                 neither on nor off target",
-            ));
+                     neither on nor off target",
+            )),
+            Some(outcome @ detcore::TerminalOutcome::VirtualTimeout { .. }) => Err(Error::new(
+                crate::container::SchedulerOutcome(outcome),
+            )
+            .context(
+                "an analyze trial was stopped by --virtual-timeout, which is neither on \
+                     nor off target",
+            )),
+            None => Ok(self.output_matches(out)),
         }
-        Ok(self.output_matches(out))
     }
 
     /// Does the run meet the criteria we are looking for (e.g. a particular error message).
@@ -2336,16 +2353,53 @@ mod tests {
             argv.extend(target);
             argv.extend(["--", "/bin/true"]);
             let options = AnalyzeOpts::try_parse_from(argv).unwrap();
-            let error = options.trial_matches(&output, true).unwrap_err();
+            let error = options
+                .trial_matches(&output, Some(detcore::TerminalOutcome::GuestDeadlock))
+                .unwrap_err();
             assert!(
-                error
-                    .downcast_ref::<crate::container::GuestDeadlock>()
-                    .is_some(),
+                matches!(
+                    error.downcast_ref::<crate::container::SchedulerOutcome>(),
+                    Some(crate::container::SchedulerOutcome(
+                        detcore::TerminalOutcome::GuestDeadlock
+                    ))
+                ),
                 "{target:?}: {error:#}"
             );
             assert!(
-                options.trial_matches(&output, false).unwrap(),
+                options.trial_matches(&output, None).unwrap(),
                 "{target:?}: a guest's own 121 is judged as usual"
+            );
+        }
+    }
+
+    /// A trial that `--virtual-timeout` stopped is neither on nor off target
+    /// either, under the default nonzero target or any other: it fails with
+    /// the bound's outcome, while the same output from a guest that exited 124
+    /// itself is judged as usual.
+    #[test]
+    fn a_virtual_timeout_trial_is_neither_on_nor_off_target() {
+        let outcome = detcore::TerminalOutcome::VirtualTimeout { bound_ns: 9 };
+        let output = Output {
+            status: ExitStatus::Exited(outcome.exit_status()),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        for target in [None, Some("--target-exit-code=any")] {
+            let mut argv = vec!["analyze", "--analyze-seed=7"];
+            argv.extend(target);
+            argv.extend(["--", "/bin/true"]);
+            let options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let error = options.trial_matches(&output, Some(outcome)).unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<crate::container::SchedulerOutcome>(),
+                    Some(crate::container::SchedulerOutcome(o)) if *o == outcome
+                ),
+                "{target:?}: {error:#}"
+            );
+            assert!(
+                options.trial_matches(&output, None).unwrap(),
+                "{target:?}: a guest's own 124 is judged as usual"
             );
         }
     }

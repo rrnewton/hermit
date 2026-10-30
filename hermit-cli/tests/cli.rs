@@ -298,6 +298,7 @@ static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static UNTRACED_CLONE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CONDVAR_JOIN_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static VIRTUAL_TIMEOUT_LOOP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_PERMITS_PER_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GROUP_EXIT_SIGNAL_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3442,6 +3443,32 @@ fn condvar_join_deadlock_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "condvar-join-deadlock guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn virtual_timeout_loop_guest() -> &'static Path {
+    VIRTUAL_TIMEOUT_LOOP_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("virtual-timeout-loop");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the virtual-timeout-loop guest directory");
+        let guest = build_root.join("virtual_timeout_loop");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/virtual_timeout_loop.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the virtual-timeout-loop guest");
+        assert!(
+            output.status.success(),
+            "virtual-timeout-loop guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -42554,6 +42581,85 @@ fn analyze_refuses_a_model_deadlock_before_accepting_a_target() {
     );
 }
 
+/// Analyze must retain a real captured run's virtual-timeout outcome through
+/// RunData instead of accepting its synthetic nonzero status as a guest target.
+/// The sleeping guest actually runs and its output and bound survive, but no
+/// later trial or localization report may follow this unfinished run.
+#[test]
+fn analyze_refuses_a_virtual_timeout_before_accepting_a_target() {
+    let _guard = hermit_run_guard();
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let bound = format!("--virtual-timeout={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    let class =
+        format!("HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let workspaces = directory.path().join("workspaces");
+    let report = directory.path().join("report.json");
+    let output = hermit(&[
+        "analyze",
+        "--analyze-seed=7",
+        "--run1-seed=1",
+        "--tmp-dir",
+        workspaces.to_str().unwrap(),
+        "--report-file",
+        report.to_str().unwrap(),
+        "--",
+        "--strict",
+        "--base-env=minimal",
+        "--chaos",
+        "--epoch=2026-01-01T00:00:00Z",
+        bound.as_str(),
+        "--",
+        guest.as_str(),
+    ]);
+    let log = stderr(&output);
+    assert_eq!(output.status.code(), Some(124), "{log}");
+    assert!(log.lines().any(|line| line == class), "{log}");
+    assert!(log.contains("neither on nor off target"), "{log}");
+    assert!(!log.contains("First run matched target criteria"), "{log}");
+    assert!(!log.contains("class=run-timeout"), "{log}");
+    assert!(!log.contains("HERMIT_INTERNAL_FAILURE"), "{log}");
+    assert!(
+        !report.exists(),
+        "an unfinished trial cannot produce {report:?}: {log}"
+    );
+
+    let workspaces: Vec<_> = fs::read_dir(&workspaces)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(workspaces.len(), 1, "{workspaces:?}: {log}");
+    let workspace = &workspaces[0];
+    assert_eq!(
+        fs::read_to_string(workspace.join("run1_target.stdout")).unwrap(),
+        VIRTUAL_TIMEOUT_SLEEP_STDOUT,
+        "{log}"
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.join("run1_target.summary")).unwrap()).unwrap();
+    let bound_ns: u64 = VIRTUAL_TIMEOUT_SLEEP_BOUND.parse().unwrap();
+    assert_eq!(summary["virtual_timeout_ns"], bound_ns, "{summary}: {log}");
+    assert!(
+        summary["virttime_elapsed"].as_u64().unwrap() > bound_ns,
+        "{summary}: {log}"
+    );
+    assert!(summary.get("guest_deadlock").is_none(), "{summary}: {log}");
+    let launched: Vec<_> = fs::read_dir(workspace)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "repro")
+        })
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        launched,
+        ["run1_target.repro"],
+        "no trial may follow the virtual timeout: {log}"
+    );
+}
+
 /// With an explicit `--verify-allow=failure`, two runs of a guest that
 /// deadlocks reach the same deadlock under Hermit's model, so `--verify
 /// --verify-strict` compares them and establishes bitwise parity: the
@@ -42765,6 +42871,433 @@ fn a_recorded_guest_deadlock_replays_to_the_same_outcome() {
         verify_log.contains(":: Success: replay matched recording."),
         "{verify_log}"
     );
+}
+
+/// The `--virtual-timeout` the virtual-timeout tests give the sleeping
+/// `tests/c/virtual_timeout_loop.c`, in virtual nanoseconds: three and a half
+/// of its one-second sleeps.
+const VIRTUAL_TIMEOUT_SLEEP_BOUND: &str = "3500000000";
+
+/// What the sleeping `tests/c/virtual_timeout_loop.c` prints before
+/// [`VIRTUAL_TIMEOUT_SLEEP_BOUND`] stops it.
+const VIRTUAL_TIMEOUT_SLEEP_STDOUT: &str = "tick 0\ntick 1\ntick 2\ntick 3\n";
+
+/// A guest that never ends stops at `--virtual-timeout`: exit 124 and
+/// `HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=N` after the
+/// scheduler's report and the summary, never `--timeout`'s
+/// `class=run-timeout` or an internal failure. A guest that sleeps keeps the
+/// ticks it printed before the bound, and its summary records the bound and
+/// an elapsed virtual time past it, the quantity the bound measures. A guest
+/// that spins without a system call is stopped by the same bound, through its
+/// preemption turns. A guest that deadlocks under a bound it does not reach
+/// still ends with the guest-deadlock outcome (ptrace, `--strict`).
+#[test]
+fn a_virtual_timeout_stops_a_guest_that_never_ends() {
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let bound = format!("--virtual-timeout={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    let class =
+        format!("HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let summary_path = directory.path().join("summary.json");
+    let summary_json = format!("--summary-json={}", summary_path.display());
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--summary",
+            summary_json.as_str(),
+            bound.as_str(),
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(status.and_then(|status| status.code()), Some(124), "{log}");
+    assert_eq!(stdout, VIRTUAL_TIMEOUT_SLEEP_STDOUT, "{log}");
+    let line_of = |wanted: &dyn Fn(&str) -> bool, what: &str| {
+        log.lines()
+            .position(wanted)
+            .unwrap_or_else(|| panic!("no {what} line:\n{log}"))
+    };
+    let report = line_of(
+        &|line| line.starts_with("Virtual timeout: at scheduler turn "),
+        "report",
+    );
+    let summary = line_of(
+        &|line| {
+            line == format!(
+                "The run's virtual clock passed {bound}: no scheduler turn was granted after it."
+            )
+        },
+        "summary",
+    );
+    let class_line = line_of(&|line| line == class, "class");
+    assert!(
+        report < summary && summary < class_line,
+        "the report, then the summary, then the class line:\n{log}"
+    );
+    assert!(!log.contains("class=run-timeout"), "{log}");
+    assert!(!log.contains("HERMIT_INTERNAL_FAILURE"), "{log}");
+    assert!(!log.contains("backend failure"), "{log}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(&summary_path).unwrap()).unwrap();
+    let bound_ns: u64 = VIRTUAL_TIMEOUT_SLEEP_BOUND.parse().unwrap();
+    assert_eq!(
+        summary["virtual_timeout_ns"],
+        serde_json::json!(bound_ns),
+        "{summary}"
+    );
+    assert!(
+        summary["virttime_elapsed"].as_u64().unwrap() > bound_ns,
+        "the bound measures the summary's elapsed virtual time: {summary}"
+    );
+
+    let spin = run_pmu_spinner_retrying_skid(
+        "a_virtual_timeout_stops_a_guest_that_never_ends",
+        &[
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--virtual-timeout=200000000",
+            "--",
+            guest.as_str(),
+            "spin",
+        ],
+        Duration::from_secs(120),
+        |stdout| assert_eq!(stdout, "spinning\n"),
+    );
+    assert_eq!(
+        spin.status.and_then(|status| status.code()),
+        Some(124),
+        "{}",
+        spin.stderr
+    );
+    assert_eq!(spin.stdout, "spinning\n", "{}", spin.stderr);
+    assert!(
+        spin.stderr
+            .lines()
+            .any(|line| line == "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=200000000"),
+        "{}",
+        spin.stderr
+    );
+
+    let deadlock = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--virtual-timeout=1000000000000",
+            "--",
+            deadlock.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.lines()
+            .any(|line| line == detcore_model::HERMIT_MODEL_DEADLOCK_LINE)
+            && !log.contains("class=virtual-timeout"),
+        "{log}"
+    );
+}
+
+/// A bound the guest never reaches changes nothing, for a guest that ends on
+/// its own either way: one that sleeps three times and exits 0, and one that
+/// sleeps three times beside a thread parked in pause() and then dies of
+/// SIGTERM, whose delivery records the doom of its process because the bound
+/// is set. Each runs to its own end with `--virtual-timeout` set past it,
+/// with the same stdout, the same elapsed virtual time and an INFO stream
+/// that `log-diff --canonical-info` matches against the run without the
+/// bound. Nor does a bound that only the commit after the exiting guest's
+/// last exit grant passes: no thread is left that a turn could be granted to,
+/// so its own status stands (ptrace, `--strict`). The SIGTERM is delivered to
+/// the thread that raised it, in a turn charged nothing, so that run has no
+/// commit after the delivery to test; the scheduler unit tests cover a doomed
+/// process.
+#[test]
+fn a_virtual_timeout_the_guest_never_reaches_changes_nothing() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let bound: u64 = VIRTUAL_TIMEOUT_SLEEP_BOUND.parse().unwrap();
+    // The scheduler charges a turn this much (`--scheduler-turn-cost`'s
+    // default). A guest that exits 0 ends in an exit grant, after which the
+    // run's last commit is at least this far past any commit at which its
+    // thread could run.
+    const SCHEDULER_TURN_CHARGE: u64 = 500_000;
+    for (mode, ending, after_the_end) in [
+        (&["3"][..], "exit 0", Some(SCHEDULER_TURN_CHARGE / 2)),
+        (&["term", "3"][..], "SIGTERM", None),
+    ] {
+        let run = |name: &str, bound: Option<u64>| {
+            let name = format!("{}-{name}", mode.join("-"));
+            let log = directory.path().join(format!("{name}.log"));
+            let summary = directory.path().join(format!("{name}.json"));
+            let log_file = format!("--log-file={}", log.display());
+            let summary_json = format!("--summary-json={}", summary.display());
+            let bound = bound.map(|bound| format!("--virtual-timeout={bound}"));
+            let mut args = vec![
+                "--log=info",
+                log_file.as_str(),
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                summary_json.as_str(),
+            ];
+            args.extend(bound.as_deref());
+            args.push("--");
+            args.push(guest.as_str());
+            args.extend(mode);
+            let run_directory = directory.path().join(&name);
+            fs::create_dir(&run_directory).unwrap();
+            let (status, stderr) = run_with_deadline(
+                hermit_command(&args),
+                &run_directory,
+                Duration::from_secs(120),
+                false,
+            );
+            let stdout = fs::read_to_string(run_directory.join("deadline-run.stdout")).unwrap();
+            let status = status.unwrap_or_else(|| panic!("{name}: no status: {stderr}"));
+            match ending {
+                "exit 0" => assert_eq!(status.code(), Some(0), "{name}: {stderr}"),
+                _ => assert_eq!(status.signal(), Some(libc::SIGTERM), "{name}: {stderr}"),
+            }
+            assert_eq!(stdout, "tick 0\ntick 1\ntick 2\n", "{name}: {stderr}");
+            assert!(!stderr.contains("HERMIT_RUN_TIMEOUT"), "{name}: {stderr}");
+            let summary: serde_json::Value =
+                serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+            assert!(
+                summary.get("virtual_timeout_ns").is_none(),
+                "{name}: {summary}"
+            );
+            (log, summary["virttime_elapsed"].as_u64().unwrap())
+        };
+        let (unbounded_log, elapsed) = run("unbounded", None);
+        assert!(
+            elapsed < bound,
+            "{ending}: the three ticks end before the bound: {elapsed}"
+        );
+        let (bounded_log, bounded_elapsed) = run("bounded", Some(bound));
+        assert_eq!(bounded_elapsed, elapsed, "{ending}");
+        let comparison = directory.path().join(format!("{}.json", mode.join("-")));
+        let diff = hermit(&[
+            "log-diff",
+            "--canonical-info",
+            "--json",
+            comparison.to_str().unwrap(),
+            unbounded_log.to_str().unwrap(),
+            bounded_log.to_str().unwrap(),
+        ]);
+        assert!(
+            diff.status.success(),
+            "{ending}: {}{}",
+            stdout(&diff),
+            stderr(&diff)
+        );
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&comparison).unwrap()).unwrap();
+        assert_eq!(verdict["verdict"], "matched", "{ending}: {verdict:#}");
+        assert!(
+            verdict["selected_messages"]["left"].as_u64().unwrap() > 0,
+            "{ending}: {verdict:#}"
+        );
+        if let Some(after_the_end) = after_the_end {
+            run("after-the-end", Some(elapsed - after_the_end));
+        }
+    }
+}
+
+/// With an explicit `--verify-allow` of `failure` or `both`, two runs of a
+/// guest that never ends stop at the same turn of `--virtual-timeout`, so
+/// `--verify --verify-strict` compares them and establishes bitwise parity,
+/// and the verification ends with the bound's outcome: the stdout both runs
+/// agreed on once, the class line and exit 124 (ptrace, `--strict`). The
+/// default `success` refuses run 1 instead
+/// (`a_virtual_timeout_is_not_verified_under_the_default_verify_allow`).
+#[test]
+fn a_virtual_timeout_verifies_as_the_same_stop_in_both_runs() {
+    let _guard = hermit_run_guard();
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let bound = format!("--virtual-timeout={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    for allow in [Some("--verify-allow=failure"), Some("--verify-allow=both")] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report_path = directory.path().join("verify.json");
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            bound.as_str(),
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_path.to_str().unwrap(),
+        ];
+        args.extend(allow);
+        args.extend(["--", guest.as_str()]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(240),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(124),
+            "{allow:?}: {log}"
+        );
+        assert_eq!(stdout, VIRTUAL_TIMEOUT_SLEEP_STDOUT, "{allow:?}: {log}");
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{allow:?}: {log}"
+        );
+        let class = format!(
+            "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={VIRTUAL_TIMEOUT_SLEEP_BOUND}\n\
+             Error: The run's virtual clock passed {bound} (virtual nanoseconds since the run \
+             began)"
+        );
+        assert!(log.contains(&class), "{allow:?}: {log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(report["verdict"], serde_json::json!("matched"), "{report}");
+        assert_eq!(report["verified"], serde_json::json!(true), "{report}");
+        assert_eq!(
+            report["bitwise_parity"],
+            serde_json::json!(true),
+            "{report}"
+        );
+        assert_eq!(
+            report["guest_exit_code"],
+            serde_json::json!(124),
+            "{report}"
+        );
+    }
+}
+
+/// A virtual timeout is a bound Hermit imposed on a guest that had not
+/// finished, not a guest result, so under the default
+/// `--verify-allow=success` run 1 is refused as a deadlock under Hermit's
+/// model is: no second run, `verified: false` (`no_result`,
+/// `first_run_rejected`), and the run still reports the stdout written
+/// before the bound and ends with the bound's class line and exit 124.
+/// Before, a run 1 the bound stopped skipped the `--verify-allow` check and
+/// the report said `verified: true` (ptrace, `--strict`).
+#[test]
+fn a_virtual_timeout_is_not_verified_under_the_default_verify_allow() {
+    let _guard = hermit_run_guard();
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let bound = format!("--virtual-timeout={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report_path = directory.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            bound.as_str(),
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_path.to_str().unwrap(),
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(240),
+        false,
+    );
+    assert_eq!(status.and_then(|status| status.code()), Some(124), "{log}");
+    assert!(
+        log.contains(&format!("Stdout:\n{VIRTUAL_TIMEOUT_SLEEP_STDOUT}")),
+        "{log}"
+    );
+    assert!(
+        log.contains("First run errored during --verify, not continuing to a second."),
+        "{log}"
+    );
+    assert!(!log.contains("Determinism verified"), "{log}");
+    let class =
+        format!("HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    assert!(log.lines().any(|line| line == class), "{log}");
+    assert!(!log.contains("HERMIT_INTERNAL_FAILURE"), "{log}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+    assert_eq!(report["verified"], serde_json::json!(false), "{report}");
+    assert_eq!(
+        report["verdict"],
+        serde_json::json!("no_result"),
+        "{report}"
+    );
+    assert_eq!(
+        report["no_result_reason"]["kind"],
+        serde_json::json!("first_run_rejected"),
+        "{report}"
+    );
+}
+
+/// On KVM, whose scheduler cannot hand the stop to the run, the scheduler
+/// exits the container child 124 and leaves the bound in the note the child
+/// shares with Hermit, so the run still reports `class=virtual-timeout` with
+/// the output written before the bound, never `--timeout`'s
+/// `class=run-timeout` or an internal failure.
+#[test]
+fn run_kvm_virtual_timeout_is_reported_from_the_childs_note() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let guest = virtual_timeout_loop_guest().to_str().unwrap().to_owned();
+    let bound = format!("--virtual-timeout={VIRTUAL_TIMEOUT_SLEEP_BOUND}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--backend",
+            "kvm",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            bound.as_str(),
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(status.and_then(|status| status.code()), Some(124), "{log}");
+    assert_eq!(stdout, VIRTUAL_TIMEOUT_SLEEP_STDOUT, "{log}");
+    assert!(
+        log.lines().any(|line| line
+            == format!(
+                "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={VIRTUAL_TIMEOUT_SLEEP_BOUND}"
+            )),
+        "{log}"
+    );
+    assert!(!log.contains("class=run-timeout"), "{log}");
+    assert!(!log.contains("HERMIT_INTERNAL_FAILURE"), "{log}");
 }
 
 /// A parent waiting for a child that cannot exit (its only thread paused

@@ -391,7 +391,7 @@ impl ReplayOpts {
         let _guard = global.init_tracing();
 
         // A recording of a deadlocked guest replays to the same deadlock,
-        // which returns `hermit::GuestDeadlocked`: the deadlock under
+        // which returns `hermit::SchedulerEndedRun`: the deadlock under
         // Hermit's model the recording ended on.
         if autopilot {
             hermit.replay(id)

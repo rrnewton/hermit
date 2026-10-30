@@ -71,12 +71,12 @@ use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
-use super::container::GuestDeadlock;
 use super::container::HostLayout;
 use super::container::IdentityGuard;
 use super::container::LogCapExceeded;
 use super::container::PlannedMount;
 use super::container::PolicyRefusal;
+use super::container::SchedulerOutcome;
 use super::container::apply_affinity;
 use super::container::container_proc_mount;
 use super::container::identity_hardening_mounts_on;
@@ -949,12 +949,13 @@ pub(super) struct VerificationRunOutput {
     pub(super) output: Output,
     pub(super) skid_overshoots: u64,
     pub(super) latches: RunLatches,
-    /// The run ended in a deadlock under Hermit's model (not a guest result,
-    /// and a native hang only if Hermit models every wake the program relies
-    /// on) and the backend unwound it: `output` is what the guest wrote before
-    /// the deadlock, and its status is `HERMIT_GUEST_DEADLOCK_EXIT`, not one the
-    /// guest exited with.
-    pub(super) guest_deadlock: bool,
+    /// The run ended with a scheduler terminal outcome and the backend unwound
+    /// the guest: a deadlock under Hermit's model (not a guest result, and a
+    /// native hang only if Hermit models every wake the program relies on) or
+    /// a virtual timeout (a bound Hermit imposed). `output` is what the guest
+    /// wrote before it, and its status is the outcome's, not one the guest
+    /// exited with.
+    pub(super) terminal_outcome: Option<detcore::TerminalOutcome>,
     #[cfg(feature = "dbt")]
     pub(super) dbt: Option<super::backends::DbtRunCompletion>,
 }
@@ -5972,6 +5973,171 @@ fn scheduler_turn_cost_parses_round_trips_and_is_refused_for_dbt() {
     );
 }
 
+/// `--virtual-timeout` takes virtual nanoseconds (not zero, not a unit), is
+/// rendered into the reproduce command and round-trips; its help says what it
+/// bounds and how it differs from `--timeout`. A launch without Detcore's
+/// sequentializing scheduler, which is where the bound is checked, is refused
+/// with a message that names the cause and the way out.
+#[test]
+fn virtual_timeout_parses_round_trips_and_is_refused_without_the_scheduler() {
+    use clap::CommandFactory;
+
+    let mut opts = RunOpts::parse_from(["fakehermit", "--virtual-timeout=3500000000", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        opts.det_opts.det_config.virtual_timeout,
+        std::num::NonZeroU64::new(3_500_000_000)
+    );
+    let rendered = format!("{opts}");
+    assert!(
+        rendered.contains(" --virtual-timeout=3500000000"),
+        "{rendered}"
+    );
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    assert_eq!(
+        RunOpts::parse_from(reparsed_args)
+            .det_opts
+            .det_config
+            .virtual_timeout,
+        std::num::NonZeroU64::new(3_500_000_000)
+    );
+    for value in ["0", "2s", "-1"] {
+        let flag = format!("--virtual-timeout={value}");
+        assert!(
+            RunOpts::try_parse_from(["fakehermit", flag.as_str(), "fakeprog"]).is_err(),
+            "{flag}"
+        );
+    }
+
+    let help = RunOpts::command().render_long_help().to_string();
+    let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    for expected in [
+        "--virtual-timeout <virtual-nanoseconds>",
+        "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=N",
+        "the same virtual time `--summary` reports as elapsed (`virttime_elapsed`",
+        "Unlike `--timeout`, a wall-clock bound",
+        "(`class=run-timeout`)",
+        "fires at the same point of the same schedule on every host and in every run",
+    ] {
+        assert!(
+            help.contains(expected),
+            "{expected:?} missing from:\n{help}"
+        );
+    }
+
+    for (argv, cause) in [
+        (
+            vec!["hermit", "run", "--no-sequentialize-threads"],
+            "--no-sequentialize-threads",
+        ),
+        (vec!["hermit", "run", "--strace-only"], "--strace-only"),
+        (
+            vec!["hermit", "run", "--namespace-only"],
+            "--namespace-only",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--no-virtualize-time",
+                "--no-virtualize-metadata",
+            ],
+            "with --no-virtualize-time the run's summary reports no elapsed virtual time",
+        ),
+    ] {
+        let mut argv = argv;
+        argv.extend(["--virtual-timeout=1000", "fakeprog"]);
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("--virtual-timeout=1000 bounds the virtual time")
+                && error.contains(cause)
+                && error.contains("bound wall-clock time with --timeout instead"),
+            "{argv:?}: {error}"
+        );
+    }
+    // Fail-closed: only the backends a run of the bound was measured on,
+    // and DBT for its own reason.
+    for (backend, cause) in [
+        (
+            "dbt",
+            "dbt drives Detcore's scheduler in Hermit's own process",
+        ),
+        ("liteinst", "measured only on the ptrace and kvm backends"),
+        (
+            "in-guest-trap",
+            "measured only on the ptrace and kvm backends",
+        ),
+        ("sabre", "measured only on the ptrace and kvm backends"),
+    ] {
+        let flag = format!("--backend={backend}");
+        let argv = [
+            "hermit",
+            flag.as_str(),
+            "run",
+            "--max-timeslice=disabled",
+            "--virtual-timeout=1000",
+            "fakeprog",
+        ];
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!(
+                "--virtual-timeout=1000 is not supported on the `{backend}` backend: "
+            )) && error.contains(cause)
+                && error.contains("Run it with --backend=ptrace or --backend=kvm"),
+            "{argv:?}: {error}"
+        );
+    }
+    // A comparison needs the ptrace runtime, which finishes a stopped run;
+    // KVM's scheduler exits the container child instead. The refusal names
+    // the flag that was given.
+    for verify in [
+        &["--verify"][..],
+        &["--verify-run", "/tmp/never-created"][..],
+    ] {
+        let mut argv = vec!["hermit", "--backend=kvm", "run"];
+        argv.extend_from_slice(verify);
+        argv.extend(["--virtual-timeout=1000", "fakeprog"]);
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err()
+            .to_string();
+        let flag = verify[0];
+        assert!(
+            error.starts_with(&format!(
+                "--virtual-timeout=1000 with {flag} is supported only on the ptrace backend"
+            )) && error.ends_with(&format!("Run it with --backend=ptrace, or drop {flag}")),
+            "{argv:?}: {error}"
+        );
+    }
+    for argv in [
+        &[
+            "hermit",
+            "run",
+            "--verify",
+            "--virtual-timeout=1000",
+            "fakeprog",
+        ][..],
+        &[
+            "hermit",
+            "--backend=kvm",
+            "run",
+            "--virtual-timeout=1000",
+            "fakeprog",
+        ][..],
+    ] {
+        run_opts_for(argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_or_else(|error| panic!("{argv:?}: {error}"));
+    }
+}
+
 #[cfg(test)]
 fn liteinst_in_guest_refusal(options: &[&str]) -> Result<(), anyhow::Error> {
     in_guest_refusal("--backend=liteinst", options)
@@ -10065,6 +10231,74 @@ impl RunOpts {
                 );
             }
         }
+        // `--virtual-timeout` is checked where Detcore's scheduler commits
+        // virtual time; a launch without that scheduler could never stop on
+        // it, so it is refused rather than accepted and ignored.
+        if let Some(bound) = config.virtual_timeout {
+            let without = if self.namespace_only {
+                Some("--namespace-only (--lite) runs the guest natively, without it")
+            } else if self.strace_only {
+                Some("--strace-only turns sequentialization off")
+            } else if !config.sequentialize_threads {
+                Some("it cannot be combined with --no-sequentialize-threads")
+            } else if !config.virtualize_time {
+                Some(
+                    "with --no-virtualize-time the run's summary reports no elapsed virtual time, \
+                     which is what the bound measures",
+                )
+            } else {
+                None
+            };
+            if let Some(without) = without {
+                anyhow::bail!(
+                    "--virtual-timeout={bound} bounds the virtual time Detcore's scheduler commits \
+                     to sequentialized threads; {without}. Drop that option, or bound wall-clock \
+                     time with --timeout instead"
+                );
+            }
+            // Fail-closed, as `--timeout` is: a backend is accepted once a
+            // run of the bound on it has been measured, not because it shares
+            // the scheduler.
+            let unqualified = match backend {
+                Backend::Ptrace | Backend::E9patch | Backend::Kvm => None,
+                Backend::Dbt => Some(
+                    "dbt drives Detcore's scheduler in Hermit's own process, where the exit the \
+                     bound ends a run with would end Hermit itself, without its class line",
+                ),
+                Backend::Liteinst | Backend::InGuestTrap | Backend::Sabre => Some(
+                    "the bound has been measured only on the ptrace and kvm backends, and is \
+                     refused elsewhere until a run on that backend qualifies it",
+                ),
+            };
+            if let Some(unqualified) = unqualified {
+                anyhow::bail!(
+                    "--virtual-timeout={bound} is not supported on the `{}` backend: \
+                     {unqualified}. Run it with --backend=ptrace or --backend=kvm, or bound \
+                     wall-clock time with --timeout instead",
+                    backend.as_str()
+                );
+            }
+            // Only the ptrace runtime unwinds a guest the bound stopped and
+            // finishes its run with output and log; KVM's scheduler exits the
+            // container child, which leaves a comparison without a verdict.
+            let verify_flag = if self.verify {
+                Some("--verify")
+            } else {
+                self.verify_run.as_ref().map(|_| "--verify-run")
+            };
+            if let Some(flag) = verify_flag
+                && !matches!(backend, Backend::Ptrace | Backend::E9patch)
+            {
+                anyhow::bail!(
+                    "--virtual-timeout={bound} with {flag} is supported only on the ptrace \
+                     backend (and e9patch preprocessing, which runs on it), which finishes a run \
+                     the bound stopped with its output and log; backend `{}` ends that run from \
+                     its scheduler, so the comparison could reach no verdict. Run it with \
+                     --backend=ptrace, or drop {flag}",
+                    backend.as_str()
+                );
+            }
+        }
         if config.scheduler_turn_cost.is_some() && backend == Backend::Dbt {
             anyhow::bail!(
                 "the dbt backend cannot apply --scheduler-turn-cost: its runtime reads a frozen \
@@ -11370,14 +11604,15 @@ impl RunOpts {
     }
 
     /// Run the guest once. With `capture_output` the guest's output is
-    /// returned, and the flag says whether the run ended on a deadlock under
-    /// Hermit's model, whose status `HERMIT_GUEST_DEADLOCK_EXIT` is then not
-    /// the guest's own; without it a deadlock is returned as its error.
+    /// returned with the scheduler terminal outcome the run ended with, if any
+    /// (a deadlock under Hermit's model, a virtual timeout), whose status is
+    /// then not the guest's own; without it such an outcome is returned as its
+    /// error.
     pub fn run(
         &self,
         global: &GlobalOpts,
         capture_output: bool,
-    ) -> Result<(ExitStatus, Option<Output>, bool), Error> {
+    ) -> Result<(ExitStatus, Option<Output>, Option<detcore::TerminalOutcome>), Error> {
         self.refuse_unready_exec_stop()?;
         let mut options = self.clone();
         options.det_opts.det_config.annotated_priority_replay =
@@ -11582,6 +11817,12 @@ impl RunOpts {
             .transpose()?;
         #[cfg(not(feature = "native-exec"))]
         let native_plan: Option<()> = None;
+        // Inherited at the clone: where the child's scheduler leaves a virtual
+        // timeout it exits 124 with instead of reporting it
+        // (`classify_container_result`).
+        if self.det_opts.det_config.virtual_timeout.is_some() {
+            super::terminal_outcome_note::arm()?;
+        }
         super::owned_container::run(
             &mut container,
             (tmpfs, identity, guards, native_plan, gdbserver_port),
@@ -11867,30 +12108,37 @@ impl RunOpts {
                 mut output,
                 skid_overshoots,
                 latches,
-                guest_deadlock,
+                terminal_outcome,
                 #[cfg(feature = "dbt")]
                     dbt: _,
             } = completed;
             latches.refuse_comparison("run")?;
             let forwarded_syscalls =
                 self.take_forwarded_detlogs(&log_path, &mut output.stderr, socket)?;
-            Ok((output, skid_overshoots, forwarded_syscalls, guest_deadlock))
+            Ok((
+                output,
+                skid_overshoots,
+                forwarded_syscalls,
+                terminal_outcome,
+            ))
         });
         let (outcome, result) = match completed {
-            Ok((output, skid_overshoots, forwarded_syscalls, guest_deadlock)) => {
+            Ok((output, skid_overshoots, forwarded_syscalls, terminal_outcome)) => {
                 writer.write(verify_run::STDOUT, &output.stdout)?;
                 writer.write(verify_run::STDERR, &output.stderr)?;
+                let (guest_deadlock, virtual_timeout_ns) =
+                    detcore::TerminalOutcome::to_fields(terminal_outcome);
                 (
                     verify_run::VerifyRunOutcome::Completed {
                         status: verify_run::recorded_status(output.status),
                         skid_overshoots,
                         forwarded_syscalls: forwarded_syscalls.map(|count| count as u64),
                         guest_deadlock,
+                        virtual_timeout_ns,
                     },
-                    if guest_deadlock {
-                        Err(Error::new(GuestDeadlock))
-                    } else {
-                        Ok(output.status)
+                    match terminal_outcome {
+                        Some(ended) => Err(Error::new(SchedulerOutcome(ended))),
+                        None => Ok(output.status),
                     },
                 )
             }
@@ -12128,7 +12376,7 @@ impl RunOpts {
             output: out1,
             skid_overshoots: skid_overshoots_run1,
             latches: latches1,
-            guest_deadlock: guest_deadlock1,
+            terminal_outcome: terminal_outcome1,
             #[cfg(feature = "dbt")]
                 dbt: dbt1,
         } = match run_verification_execution(
@@ -12221,8 +12469,9 @@ impl RunOpts {
             echo_first_run_log(&log1_path)?;
         }
 
-        // A deadlock under Hermit's model passes `--verify-allow` like any
-        // other non-success status (`rejected_first_run`).
+        // A terminal outcome (a deadlock under Hermit's model, a virtual
+        // timeout) passes `--verify-allow` like any other non-success status
+        // (`rejected_first_run`): neither is a guest result.
         if let Some(error) = reject_first_run(
             self.verify_json.as_deref(),
             self.verify_allow,
@@ -12233,7 +12482,7 @@ impl RunOpts {
                 .and_then(read_verify_summary)
                 .as_ref(),
         ) {
-            let error = rejected_first_run(error, guest_deadlock1);
+            let error = rejected_first_run(error, terminal_outcome1);
             // Queued here; `main` writes it after everything else.
             drop(signal_reports);
             if self.keep_logs {
@@ -12320,7 +12569,7 @@ impl RunOpts {
             output: out2,
             skid_overshoots: skid_overshoots_run2,
             latches: latches2,
-            guest_deadlock: guest_deadlock2,
+            terminal_outcome: terminal_outcome2,
             #[cfg(feature = "dbt")]
                 dbt: dbt2,
         } = match run_verification_execution(
@@ -12511,12 +12760,16 @@ impl RunOpts {
             eprintln!(":: Backend: {backend_banner}");
         }
         emit_compared_guest_output(true, &out1, &out2)?;
-        // Both runs deadlocked at the same point under Hermit's model, which
-        // `main` reports by its class line and status. Only an explicit
-        // `--verify-allow` of failure or both reaches here with a deadlock, and
-        // then `verified` says the deadlock repeats, not that it is native.
-        if guest_deadlock1 && guest_deadlock2 {
-            return Err(Error::new(GuestDeadlock));
+        // Both runs ended with the same terminal outcome at the same point,
+        // which `main` reports by its class line and status. Only an explicit
+        // `--verify-allow` of failure or both reaches here with one, and then
+        // `verified` says the outcome repeats: for a deadlock, not that it is
+        // native; for a virtual timeout, that both runs stopped at the same
+        // turn.
+        if let Some(outcome) = terminal_outcome1
+            && terminal_outcome1 == terminal_outcome2
+        {
+            return Err(Error::new(SchedulerOutcome(outcome)));
         }
         Ok(status)
     }
@@ -12964,13 +13217,15 @@ impl RunOpts {
             )
         })
         .map(
-            |((output, skid_overshoots, latches, guest_deadlock), _guards)| VerificationRunOutput {
-                output,
-                skid_overshoots,
-                latches,
-                guest_deadlock,
-                #[cfg(feature = "dbt")]
-                dbt: None,
+            |((output, skid_overshoots, latches, terminal_outcome), _guards)| {
+                VerificationRunOutput {
+                    output,
+                    skid_overshoots,
+                    latches,
+                    terminal_outcome,
+                    #[cfg(feature = "dbt")]
+                    dbt: None,
+                }
             },
         )
     }
@@ -14078,7 +14333,7 @@ impl RunOpts {
         capture_output: bool,
         identity_sources: Option<&IdentityGuard>,
         image: &super::mapped_first_admission::RetainedImage,
-    ) -> Result<(ExitStatus, Option<Output>, bool), Error> {
+    ) -> Result<(ExitStatus, Option<Output>, Option<detcore::TerminalOutcome>), Error> {
         anyhow::ensure!(
             !capture_output,
             "exec-stop direct-run path requires external bounded stdout capture"
@@ -14135,7 +14390,7 @@ impl RunOpts {
             detcore::detlog::determinism_loss().is_none(),
             "actual mapped DETLOG reports determinism loss"
         );
-        Ok((status, None, false))
+        Ok((status, None, None))
     }
 
     fn run_in_container(
@@ -14143,7 +14398,7 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
         identity_sources: Option<&IdentityGuard>,
-    ) -> Result<(ExitStatus, Option<Output>, bool), Error> {
+    ) -> Result<(ExitStatus, Option<Output>, Option<detcore::TerminalOutcome>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
         hermit::proc_mount::warn_if_readonly_proc();
 
@@ -14159,13 +14414,14 @@ impl RunOpts {
 
         let timeout = self.run_timeout();
         let summary_json = self.summary_json.clone();
-        // A guest deadlock the backend unwound is a finished run that returns
-        // `hermit::GuestDeadlocked`. A plain run reports it by its class line;
-        // a caller that captures the output (analyze) keeps the output, whose
-        // status is `HERMIT_GUEST_DEADLOCK_EXIT`, with the flag that says the
-        // guest did not exit with it.
+        // A terminal outcome the backend unwound (a deadlock under Hermit's
+        // model, a virtual timeout) is a finished run that returns
+        // `hermit::SchedulerEndedRun`. A plain run reports it by its class
+        // line; a caller that captures the output (analyze) keeps the output,
+        // whose status is the outcome's, with the outcome that says the guest
+        // did not exit with it.
         let result = if capture_output {
-            hermit::GuestDeadlocked::output_of(hermit::run_with_output_backend_timeout(
+            hermit::SchedulerEndedRun::output_of(hermit::run_with_output_backend_timeout(
                 command,
                 config,
                 self.summary,
@@ -14173,7 +14429,7 @@ impl RunOpts {
                 backend,
                 timeout,
             ))
-            .map(|(out, deadlocked)| (out.status, Some(out), deadlocked))
+            .map(|(out, outcome)| (out.status, Some(out), outcome))
         } else {
             hermit::run_with_backend_timeout(
                 command,
@@ -14183,7 +14439,7 @@ impl RunOpts {
                 backend,
                 timeout,
             )
-            .map(|status| (status, None, false))
+            .map(|status| (status, None, None))
         };
         self.relabel_e9patch_dispatch_stats(&summary_json)?;
         result
@@ -14221,7 +14477,7 @@ impl RunOpts {
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped: Option<
             &MappedVerificationRun,
         >,
-    ) -> Result<(Output, u64, RunLatches, bool), Error> {
+    ) -> Result<(Output, u64, RunLatches, Option<detcore::TerminalOutcome>), Error> {
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
         if let Some(mapped) = mapped {
             anyhow::ensure!(
@@ -14244,7 +14500,7 @@ impl RunOpts {
                 },
             );
             return finish_mapped_verification_log(result, log).map(
-                |(output, skid_overshoots, latches)| (output, skid_overshoots, latches, false),
+                |(output, skid_overshoots, latches)| (output, skid_overshoots, latches, None),
             );
         }
         let mut forwarded_detlogs = forwarded_detlogs.open_in_container()?;
@@ -14293,7 +14549,7 @@ impl RunOpts {
                 determinism_loss: detcore::detlog::determinism_loss(),
                 log_sink_failure: log.failure(),
             };
-            return Ok((output, 0, latches, false));
+            return Ok((output, 0, latches, None));
         }
         #[cfg(not(feature = "native-exec"))]
         let _ = native;
@@ -14313,12 +14569,16 @@ impl RunOpts {
             // Records sent after the guest's last request, then close the socket.
             detcore::detlog::clear_forwarded_source();
         }
-        // A deadlocked run carries its output in `hermit::GuestDeadlocked`;
-        // one that also overshot its skid stays that refusal.
-        let (output, skid_overshoots, guest_deadlock) =
-            match hermit::GuestDeadlocked::split(result)? {
-                Ok((output, skid_overshoots)) => (output, skid_overshoots, false),
-                Err(deadlock) => (deadlock.into_output()?, 0, true),
+        // A run that ended with a terminal outcome carries its output in
+        // `hermit::SchedulerEndedRun`; one that also overshot its skid stays that
+        // refusal.
+        let (output, skid_overshoots, terminal_outcome) =
+            match hermit::SchedulerEndedRun::split(result)? {
+                Ok((output, skid_overshoots)) => (output, skid_overshoots, None),
+                Err(ended) => {
+                    let outcome = ended.outcome;
+                    (ended.into_output()?, 0, Some(outcome))
+                }
             };
         self.relabel_e9patch_dispatch_stats(&self.summary_json)?;
         // A flush error counts too.
@@ -14327,7 +14587,7 @@ impl RunOpts {
             determinism_loss: detcore::detlog::determinism_loss(),
             log_sink_failure: log.failure(),
         };
-        Ok((output, skid_overshoots, latches, guest_deadlock))
+        Ok((output, skid_overshoots, latches, terminal_outcome))
     }
 }
 
@@ -14381,16 +14641,22 @@ fn finish_mapped_verification_log(
 /// `run --verify`, which then does not start a second run, and `hermit
 /// log-diff --verify-json`, which then does not compare.
 /// The error `run --verify` and `log-diff` end with when [`reject_first_run`]
-/// refused run 1. A deadlock under Hermit's model is not a guest result, so it
+/// refused run 1. A scheduler terminal outcome is not a guest result, so it
 /// gets no exemption from `--verify-allow`: the default `success` refuses it
-/// as it refuses a guest that failed, and the report is not `verified`. It
-/// still ends with its own class line and status rather than a CLI error. A
-/// skid overshoot keeps its refusal.
-pub(super) fn rejected_first_run(error: Error, guest_deadlock: bool) -> Error {
-    if guest_deadlock && error.downcast_ref::<SkidOvershootError>().is_none() {
-        error.context(GuestDeadlock)
-    } else {
-        error
+/// as it refuses a guest that failed, and the report is not `verified`. That
+/// holds for a deadlock under Hermit's model and, by the same rule, for a
+/// virtual timeout, a bound Hermit imposed on a guest that had not finished.
+/// It still ends with the outcome's own class line and status rather than a
+/// CLI error. A skid overshoot keeps its refusal.
+pub(super) fn rejected_first_run(
+    error: Error,
+    terminal_outcome: Option<detcore::TerminalOutcome>,
+) -> Error {
+    match terminal_outcome {
+        Some(outcome) if error.downcast_ref::<SkidOvershootError>().is_none() => {
+            error.context(SchedulerOutcome(outcome))
+        }
+        _ => error,
     }
 }
 

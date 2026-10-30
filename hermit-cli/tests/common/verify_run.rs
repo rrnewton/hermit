@@ -716,6 +716,36 @@ fn paired_verify_runs_refuse_a_deadlocked_run_one_like_run_verify() {
     );
 }
 
+/// A run the `--virtual-timeout` bound stopped is not a guest result either,
+/// so `log-diff --verify-json` refuses it as run 1 under the default
+/// `--verify-allow=success`, as `run --verify` does: the same `no_result`
+/// report (`first_run_rejected`, `verified: false`), exit code and stdout
+/// (ptrace, `--strict`).
+#[test]
+fn paired_verify_runs_refuse_a_virtual_timeout_run_one_like_run_verify() {
+    let _guard = hermit_run_guard();
+    let guest = super::virtual_timeout_loop_guest().to_str().unwrap();
+    let bound = format!("--virtual-timeout={}", super::VIRTUAL_TIMEOUT_SLEEP_BOUND);
+    let rejected = assert_paired_matches_run_verify(
+        "virtual timeout",
+        &[],
+        &[
+            "--strict",
+            "--base-env=minimal",
+            "--verify-strict",
+            bound.as_str(),
+        ],
+        "success",
+        &[guest],
+    );
+    assert_eq!(rejected["verdict"], "no_result", "{rejected}");
+    assert_eq!(rejected["verified"], false, "{rejected}");
+    assert_eq!(
+        rejected["no_result_reason"]["kind"], "first_run_rejected",
+        "{rejected}"
+    );
+}
+
 /// `hermit record start --verify-run`, then the same with
 /// `--verify-replay-of` the first, then `log-diff --verify-json`, against
 /// `record start --verify --verify-json`: the same report, exit code and

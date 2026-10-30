@@ -5324,36 +5324,52 @@ impl std::fmt::Display for LogCapExceeded {
 
 impl std::error::Error for LogCapExceeded {}
 
-/// The container child exited [`detcore_model::HERMIT_GUEST_DEADLOCK_EXIT`]:
+/// The run ended with a scheduler terminal outcome
+/// ([`detcore::TerminalOutcome`]), reported across the container boundary:
 /// Detcore's scheduler found every remaining guest thread blocked with no
-/// wake it models, printed its "Deadlock detected" report, and ended the run.
+/// wake it models (its "Deadlock detected" report), or the run's virtual clock
+/// passed `--virtual-timeout` (its "Virtual timeout" report), and ended the
+/// run. The child either finished the run and reported the outcome through
+/// its result channel, or exited the outcome's status.
 ///
-/// ⚠️ A DEADLOCK UNDER HERMIT'S MODEL, NOT A GUEST RESULT, and not a
-/// [`ContainerChildExit`] either. That type means "the child died with a status
-/// it did not pick"; this status was picked. It says no wake Hermit models can
-/// reach a remaining thread, which is a native hang only when the model is
-/// complete for the program; past modeling gaps produced exactly this report
-/// (see [`detcore_model::HERMIT_GUEST_DEADLOCK_EXIT`]).
+/// ⚠️ NEITHER IS A GUEST RESULT, and neither is a [`ContainerChildExit`]. That
+/// type means "the child died with a status it did not pick"; this status was
+/// picked. A deadlock is a deadlock under Hermit's model: it says no wake
+/// Hermit models can reach a remaining thread, which is a native hang only when
+/// the model is complete for the program; past modeling gaps produced exactly
+/// this report (see [`detcore_model::HERMIT_GUEST_DEADLOCK_EXIT`]). A virtual
+/// timeout is a bound Hermit imposed for the caller, as `--timeout`'s is, in
+/// virtual time: the guest did not finish, so it has no result.
 ///
-/// A unit struct for the reason [`PolicyRefusal`] is one: the status is
-/// `HERMIT_GUEST_DEADLOCK_EXIT` by construction, and the report itself is
-/// already on stderr, written by the child before it exited.
+/// Carries only the outcome, as [`PolicyRefusal`] carries nothing: the report
+/// itself is already on stderr, written by the child before it ended.
 #[derive(Debug)]
-pub struct GuestDeadlock;
+pub struct SchedulerOutcome(pub detcore::TerminalOutcome);
 
-impl std::fmt::Display for GuestDeadlock {
+impl std::fmt::Display for SchedulerOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Deadlock under Hermit's model: no remaining thread can be woken by anything \
-             Hermit models; the deadlock report is above. This is not a guest result. It is \
-             a native hang only if Hermit models every wake the program relies on: if the \
-             program does not hang natively, report it as a hermit bug."
-        )
+        match self.0 {
+            detcore::TerminalOutcome::GuestDeadlock => write!(
+                f,
+                "Deadlock under Hermit's model: no remaining thread can be woken by anything \
+                 Hermit models; the deadlock report is above. This is not a guest result. It is \
+                 a native hang only if Hermit models every wake the program relies on: if the \
+                 program does not hang natively, report it as a hermit bug."
+            ),
+            detcore::TerminalOutcome::VirtualTimeout { bound_ns } => write!(
+                f,
+                "The run's virtual clock passed --virtual-timeout={bound_ns} (virtual \
+                 nanoseconds since the run began), so hermit stopped the guest there, at the same \
+                 point of the same schedule on every host and in every run; the report above \
+                 names the turn. This is the bound working: not a guest result and not a hermit \
+                 failure. Raise --virtual-timeout to let the guest run longer, or use --timeout \
+                 to bound wall-clock time instead."
+            ),
+        }
     }
 }
 
-impl std::error::Error for GuestDeadlock {}
+impl std::error::Error for SchedulerOutcome {}
 
 /// Carries the signal, unlike [`PolicyRefusal`], because there is more than one
 /// and the number is the whole content of the report.
@@ -5401,6 +5417,18 @@ impl std::fmt::Display for ContainerChildPanic {
 
 impl std::error::Error for ContainerChildPanic {}
 
+/// What a container child that exited [`HERMIT_DEADLINE_EXIT`] stopped for,
+/// given the outcome its scheduler noted before exiting, if any: a virtual
+/// timeout with its note, otherwise `--timeout`'s deadline.
+fn deadline_exit(note: Option<detcore::TerminalOutcome>) -> Error {
+    match note {
+        Some(outcome @ detcore::TerminalOutcome::VirtualTimeout { .. }) => {
+            Error::new(SchedulerOutcome(outcome))
+        }
+        _ => Error::new(RunTimeoutMarker),
+    }
+}
+
 /// Preserve the primary class from a settled container result. The owned CLI
 /// adapter also calls this for its strict error-only failed-child channel.
 pub fn classify_container_result<T>(
@@ -5443,10 +5471,11 @@ pub fn classify_container_result<T>(
                 // operator sees the bound; only the machine-readable class is
                 // reconstructed here.
                 FailureKind::RunTimeout => error.context(RunTimeoutMarker),
-                // The same deadlock under Hermit's model as the
-                // `HERMIT_GUEST_DEADLOCK_EXIT` status arm below, reported once the child had unwound the
-                // guest and finished the run; the report is above either way.
-                FailureKind::GuestDeadlock => Error::new(GuestDeadlock),
+                // The same terminal outcome (a deadlock under Hermit's model or
+                // a virtual timeout) as the status arms below, reported once the
+                // child had unwound the guest and finished the run; the report
+                // is above either way.
+                FailureKind::TerminalOutcome(outcome) => Error::new(SchedulerOutcome(outcome)),
                 // The marker goes UNDER the child's message, as it was in the
                 // child: the first `Error:` line keeps naming the failure.
                 FailureKind::BackendRunFailure => {
@@ -5473,8 +5502,15 @@ pub fn classify_container_result<T>(
         // exit 125, `class=container-child-exit`, i.e. "hermit broke" for a
         // bound working as designed. Measured before this arm existed: the
         // `run --timeout` fallback exited the init 124 and the run reported 125.
+        //
+        // ⚠️ A VIRTUAL TIMEOUT EXITS THE SAME STATUS. A backend that cannot
+        // unwind the guest exits the child 124 from its scheduler when the run's
+        // virtual clock passes `--virtual-timeout`, and its exit hook leaves the
+        // bound in the note (`terminal_outcome_note`) the child shares with
+        // this process. The note, not the status, tells the two apart; without
+        // one the deadline is `--timeout`'s, as it always was.
         Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_DEADLINE_EXIT) => {
-            Err(Error::new(RunTimeoutMarker))
+            Err(deadline_exit(super::terminal_outcome_note::take()))
         }
         // The --max-log-bytes cap, chosen by `CappedWriter` in the init. Same
         // reason as the deadline arm: without it a working bound reports 125.
@@ -5490,7 +5526,9 @@ pub fn classify_container_result<T>(
         Err(RunError::ExitStatus(status))
             if status.code() == Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT) =>
         {
-            Err(Error::new(GuestDeadlock))
+            Err(Error::new(SchedulerOutcome(
+                detcore::TerminalOutcome::GuestDeadlock,
+            )))
         }
         // A signal death, before the catch-all for the same reason the refusal arm
         // is: falling through would report a signal-terminated run as an
@@ -6373,7 +6411,10 @@ mod tests {
             ExitStatus::Exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
         )))
         .expect_err("a deadlocked guest is not a success");
-        assert!(deadlock.downcast_ref::<GuestDeadlock>().is_some());
+        assert!(matches!(
+            deadlock.downcast_ref::<SchedulerOutcome>(),
+            Some(SchedulerOutcome(detcore::TerminalOutcome::GuestDeadlock))
+        ));
         assert!(
             deadlock.downcast_ref::<ContainerChildExit>().is_none(),
             "a guest deadlock must not also read as an unaccounted container exit"
@@ -6384,7 +6425,29 @@ mod tests {
             classify_container_result::<()>(Err(RunError::ExitStatus(ExitStatus::Exited(1))))
                 .expect_err("a Hermit stall is not a success");
         assert!(stall.downcast_ref::<ContainerChildExit>().is_some());
-        assert!(stall.downcast_ref::<GuestDeadlock>().is_none());
+        assert!(stall.downcast_ref::<SchedulerOutcome>().is_none());
+    }
+
+    /// A child that exited the deadline status is `--timeout`'s deadline
+    /// (`class=run-timeout`) unless its scheduler noted a virtual timeout
+    /// before exiting, which is then that terminal outcome with its bound; a
+    /// note of any other outcome does not turn the deadline into it. Drop
+    /// the note from `deadline_exit` and the first assertion fails; read the
+    /// status alone and the second does.
+    #[test]
+    fn a_deadline_exit_is_a_virtual_timeout_only_with_its_note() {
+        let outcome = detcore::TerminalOutcome::VirtualTimeout { bound_ns: 42 };
+        let noted = deadline_exit(Some(outcome));
+        assert!(matches!(
+            noted.downcast_ref::<SchedulerOutcome>(),
+            Some(SchedulerOutcome(o)) if *o == outcome
+        ));
+        assert!(noted.downcast_ref::<RunTimeoutMarker>().is_none());
+        for note in [None, Some(detcore::TerminalOutcome::GuestDeadlock)] {
+            let deadline = deadline_exit(note);
+            assert!(deadline.downcast_ref::<RunTimeoutMarker>().is_some());
+            assert!(deadline.downcast_ref::<SchedulerOutcome>().is_none());
+        }
     }
 
     #[test]

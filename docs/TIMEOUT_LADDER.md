@@ -7,7 +7,7 @@ them.
 
 **If a run was killed rather than failing, this is the page for it.** The same
 number means different things at different rungs, so two rungs carrying "15" are
-not agreeing with each other. Five rungs exit **124**, which is why the exit code
+not agreeing with each other. Six rungs exit **124**, which is why the exit code
 cannot say which one fired and the stderr class line is the discriminator
 instead. And a bound at an inner rung that is not strictly smaller than its outer
 rung can never fire: it is dead configuration that reads as protection, and it
@@ -31,6 +31,7 @@ agreeing with each other.
 | Rung | Bounds | Value comes from | How it stops the run | Reports |
 | --- | --- | --- | --- | --- |
 | `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace and liteinst only** | the caller's argument | ptrace publishes termination and polls the retained original operation; unresolved cleanup retains its owner and guards. LiteInst keeps its existing timeout/unwind path. | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
+| `hermit run --virtual-timeout N` | **one hermit invocation's virtual time**: Detcore's global virtual time since the run began, the `virttime_elapsed` of its summary, in virtual nanoseconds, checked as each scheduler turn commits it | the caller's argument | the scheduler grants no further turn; ptrace unwinds the guest as for `--timeout` and finishes the run; other backends exit 124 from the scheduler (see below) | exit 124, `HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=N` |
 | hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/bin/hermit/run_timeout.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
 | container finalize budget | **the teardown after a run has published its result**: the container child's own exit, and reaping what is left in its namespace | `FINALIZE_BUDGET` in `hermit-cli/src/bin/hermit/owned_container.rs`: 20s, a margin of 13x over the largest measured teardown (1.52s on a saturated 316-CPU host; the Buck-parallel tail that exceeded the old 2s was not measured); `HERMIT_FINALIZE_BUDGET_MS` overrides it | the parent cancels the child (SIGKILL) and waits up to the same budget again, so a child that never exits costs up to **2 x budget** (40s) | exit 125, "container child published its result but did not exit within the ... finalize budget" |
@@ -244,12 +245,12 @@ evidence, not processes.
 
 ## Which rung fired: read the class line, not `$?`
 
-⚠️ **THE EXIT CODE CANNOT ANSWER THIS AND MUST NOT BE ASKED.** Five different
-rungs exit **124** — hermit's own bound, hermit's fallback, `hermit record`'s
-bound, the manifest cell's `timeout(1)`, and `safehermit`'s wall deadline. GNU
-`timeout` uses 124 for the same event. A consumer that branches on `$?` alone is
-guessing which mechanism stopped the run, and will attribute a slow guest to the
-wrong layer.
+⚠️ **THE EXIT CODE CANNOT ANSWER THIS AND MUST NOT BE ASKED.** Six different
+rungs exit **124** — hermit's own bound, its virtual bound, hermit's fallback,
+`hermit record`'s bound, the manifest cell's `timeout(1)`, and `safehermit`'s
+wall deadline. GNU `timeout` uses 124 for the same event. A consumer that
+branches on `$?` alone is guessing which mechanism stopped the run, and will
+attribute a slow guest to the wrong layer.
 
 **The contract is the class line on stderr.** Each rung emits a distinct,
 greppable marker, and that marker — not the status — is what a caller keys on:
@@ -257,6 +258,7 @@ greppable marker, and that marker — not the status — is what a caller keys o
 | Marker | Meaning | What to change |
 | --- | --- | --- |
 | `HERMIT_RUN_TIMEOUT class=run-timeout` | hermit's own bound expired and hermit unwound the container. The line also carries the bound in seconds. | the guest is genuinely slow, or the bound is too tight |
+| `HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=N` | the run's virtual clock passed `--virtual-timeout` (see below). For a guest whose input all comes from inside the container, the stop is at the same turn of the same schedule on every host and in every run. | the guest really runs that long in virtual time, or the bound is too tight |
 | `HERMIT_RUN_TIMEOUT_FALLBACK` | the bound expired and **the unwind itself did not finish** within the grace. This is a hermit defect, not a slow guest. | investigate the wedged teardown |
 | `HERMIT_INTERNAL_FAILURE class=cli-error` with "did not exit within the ... finalize budget" | the run had published its result, but the container child did not exit within the finalize budget and hermit cancelled it; the published result was discarded | a teardown stall: raise `HERMIT_FINALIZE_BUDGET_MS` on an overloaded host, or investigate the child's teardown |
 | `safehermit: bound.wall=APPLIED` … then a kill | the outermost cgroup deadline reaped the tree | the run escaped every inner bound |
@@ -304,10 +306,10 @@ other outcome of Hermit's own, and an `analyze` trial that ends on it fails
 with it rather than counting as on or off target. A
 teardown that records a failure of its own (a capture drain or cleanup error)
 is Hermit's failure instead, `HERMIT_INTERNAL_FAILURE`, because the kept output
-may then be incomplete. Library callers receive `hermit::GuestDeadlocked`,
-carrying the output when the run captured it. Reverie still logs each tracee
-the unwind kills (`guest terminated by signal ... SIGKILL`), as it does for
-`--timeout`.
+may then be incomplete. Library callers receive `hermit::SchedulerEndedRun`,
+carrying the outcome and the output when the run captured it. Reverie still
+logs each tracee the unwind kills (`guest terminated by signal ... SIGKILL`),
+as it does for `--timeout`.
 
 Only ptrace unwinds the guest, and only ptrace is measured. On the other
 backends the scheduler still exits with 121 from the process it runs in. From
@@ -321,6 +323,86 @@ The scheduler's own `HERMIT_DEADLOCK: ...` verdicts are not this. They say
 Hermit cannot go on (a broken invariant, or a death the backend never
 reported), and stay `HERMIT_INTERNAL_FAILURE class=container-child-exit`,
 exit 125.
+
+## A virtual timeout bounds virtual time, not the host's
+
+`hermit run --virtual-timeout=N` bounds the run in **virtual** nanoseconds:
+Detcore's global virtual time since the run began, the same quantity
+`--summary` reports as elapsed (`virttime_elapsed` in `--summary-json`). The
+scheduler reads it each time it commits the global clock at the start of a
+turn, before the turn's thread runs, and the first commit more than `N` past
+the run's start ends the run, provided some thread could still be granted a
+turn: it prints `Virtual timeout: at scheduler turn T, the run's virtual clock
+is E ns past its start, beyond --virtual-timeout=N; no further turn is
+granted.`, and the run exits 124 with
+`HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=N`. A commit past `N` after
+the guest's last thread has exited, or after committed decisions doomed every
+remaining process (a granted exit, a SIGKILL, an exec in flight, a delivered
+fatal signal, or the exit of its PID namespace's init), stops nothing: the
+guest ended on its own, and its own status stands. The marks err toward too
+much, so a process that a committed decision marked doomed but that survives (a
+process-group SIGKILL that failed, or a failed exec) is not stopped by the
+bound either, the same way in every run. After a SIGKILL whose victim Detcore
+could not name, that victim counts until the host reports it gone, so a stop
+decided after one is recorded as a determinism loss. The check reads the clock
+and never moves, rounds or resets it, and it does not change how threads are
+scheduled before the stop.
+
+`--timeout` fires wherever the guest has got to when the host's clock runs out,
+so where it stops depends on how fast the host is. For a guest whose input all
+comes from inside the container, the virtual bound stops the same schedule at
+the same turn on every host and in every run, so the output written before it,
+`--summary` (which says the bound fired) and `--verify` are reproducible: under
+an explicit `--verify-allow=failure` or `both`, two runs that stop at the same
+turn verify equal at bitwise parity. A thread that
+polls something outside the container (retries a nonblocking call on a pipe or
+socket a host process feeds) advances virtual time with each retry, and how
+many retries it takes depends on the host, so such a run can stop at another
+turn; `--verify --verify-strict` reports that as a divergence, because the
+committed time in every compared COMMIT record moves with it.
+
+It is still not a wall-clock bound, and the wall-clock invariant below does
+not order it against the rungs above it: a large virtual bound can take any
+amount of host time to reach, and while every thread is blocked in a call
+outside the container virtual time does not pass at all, so the wall-clock
+rungs stay in place.
+
+⚠️ **A VIRTUAL TIMEOUT IS NOT A GUEST RESULT EITHER.** The bound is Hermit's,
+imposed for the caller, and the guest had not finished when it fired; a gap in
+Hermit's model (a missed wake that turns into a spin-poll, as with the
+deadlocks above) can also be what ran the clock past it. So Hermit treats it
+the way it treats a deadlock under Hermit's model. `--verify` applies
+`--verify-allow` to it: the default `success` refuses run 1 (`no_result`,
+`first_run_rejected`, `verified: false`, still ending with the class line and
+124), and only an explicit `failure` or `both` compares the runs, in which case
+`verified` says both runs stopped at the same turn. `--verify-run` pairs
+compared by `log-diff --verify-json` follow the same rule. `hermit-verify
+chaos-stress` stops on it as on any other outcome of Hermit's own instead of
+counting it as the guest failing under that schedule, and an `analyze` trial
+that it stops fails with it rather than counting as on or off target. These
+three choices follow the deadlock's by consistency; a guest that exits 124 by
+itself, with no class line, is still judged by its status.
+
+On ptrace the scheduler hands the stop to the run's owner, which tears the
+parked guest down and finishes the run as it does for a deadlock under Hermit's
+model (above).
+KVM's scheduler exits the container child 124 directly. That status is also
+`--timeout`'s fallback's, so a run with the bound maps a note the child shares
+with its parent (a `MAP_SHARED` cell mapped before the clone, and cleared
+before every launch), the scheduler writes the bound there just before it
+exits, and the parent reports `class=virtual-timeout` only when the note says
+so. Such a run has no summary, and two of them cannot be compared, so
+`--verify` (or `--verify-run`) with the bound is refused on KVM.
+
+The option needs Detcore's sequentializing scheduler and virtual time: it is
+refused with `--no-sequentialize-threads`, `--namespace-only`, `--strace-only`
+or `--no-virtualize-time`. Like `--timeout`, it is qualified per backend and
+fail-closed: accepted on ptrace (and e9patch preprocessing, which runs on it)
+and KVM, where it was measured; refused on LiteInst, in-guest-trap and SaBRe
+until a run there qualifies it; and refused on DBT, which drives Detcore's
+scheduler in Hermit's own process, so the exit that ends a stopped run would
+end Hermit itself without its class line. `hermit record` takes no virtual
+bound.
 
 ## `--timeout` is qualified per backend, and refuses elsewhere
 

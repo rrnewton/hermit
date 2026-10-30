@@ -114,6 +114,98 @@ const _: () = assert!(
     "a deadlock must not read as success, as the scheduler's old exit 1, or as a refusal"
 );
 
+/// Exit status for a run whose virtual clock passed `--virtual-timeout`: 124,
+/// the status every deadline in Hermit already uses (`hermit::HERMIT_DEADLINE_EXIT`,
+/// which pins itself to this value). The stderr class line, not the status,
+/// tells it from `--timeout`'s.
+const VIRTUAL_TIMEOUT_EXIT: i32 = 124;
+
+/// How Detcore's scheduler ended a run itself, with a status and a stderr class
+/// line of its own: NEITHER KIND IS A GUEST RESULT. A deadlock is a verdict of
+/// Hermit's model (see [`HERMIT_GUEST_DEADLOCK_EXIT`]) and a virtual timeout is
+/// a bound Hermit imposed, so `--verify` (under the default
+/// `--verify-allow=success`), chaos-stress and `analyze` do not take either as
+/// the guest's outcome. Neither is a Hermit failure (125) either.
+///
+/// The scheduler hands it to the run's owner when the backend can unwind the
+/// parked guest (ptrace), and otherwise exits the process with
+/// [`TerminalOutcome::exit_status`]. Both kinds stop a run at a committed
+/// scheduler turn, so both stop it at the same point of the same schedule in
+/// every run.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub enum TerminalOutcome {
+    /// Every remaining guest thread is blocked with no wake Hermit models: a
+    /// deadlock under Hermit's model, not a guest result
+    /// ([`HERMIT_GUEST_DEADLOCK_EXIT`], [`HERMIT_MODEL_DEADLOCK_LINE`]).
+    GuestDeadlock,
+    /// The run's virtual clock passed `--virtual-timeout`: at a committed
+    /// scheduler turn, Detcore's global virtual time was more than `bound_ns`
+    /// virtual nanoseconds past the run's start (the time a run summary
+    /// reports as `virttime_elapsed`). Exits 124, as a deadline does. A bound
+    /// Hermit imposed, not a guest result.
+    VirtualTimeout {
+        /// The configured bound, in virtual nanoseconds.
+        bound_ns: u64,
+    },
+}
+
+impl TerminalOutcome {
+    /// The status a run with this outcome ends with.
+    pub const fn exit_status(self) -> i32 {
+        match self {
+            Self::GuestDeadlock => HERMIT_GUEST_DEADLOCK_EXIT,
+            Self::VirtualTimeout { .. } => VIRTUAL_TIMEOUT_EXIT,
+        }
+    }
+
+    /// The machine-readable stderr line Hermit ends such a run with, which
+    /// tells it from a guest that exited the same status of its own accord
+    /// and, for a virtual timeout, from `--timeout`'s `class=run-timeout`.
+    pub fn class_line(self) -> String {
+        match self {
+            Self::GuestDeadlock => HERMIT_MODEL_DEADLOCK_LINE.to_owned(),
+            Self::VirtualTimeout { bound_ns } => {
+                format!("HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={bound_ns}")
+            }
+        }
+    }
+
+    /// The `(guest_deadlock, virtual_timeout_ns)` pair a run summary and a
+    /// verification record store an outcome as: a deadlock keeps the
+    /// `guest_deadlock` flag it has always been stored as.
+    pub fn to_fields(outcome: Option<Self>) -> (bool, Option<u64>) {
+        match outcome {
+            None => (false, None),
+            Some(Self::GuestDeadlock) => (true, None),
+            Some(Self::VirtualTimeout { bound_ns }) => (false, Some(bound_ns)),
+        }
+    }
+
+    /// The outcome [`TerminalOutcome::to_fields`] stored.
+    pub fn from_fields(guest_deadlock: bool, virtual_timeout_ns: Option<u64>) -> Option<Self> {
+        match (guest_deadlock, virtual_timeout_ns) {
+            (true, _) => Some(Self::GuestDeadlock),
+            (false, Some(bound_ns)) => Some(Self::VirtualTimeout { bound_ns }),
+            (false, None) => None,
+        }
+    }
+}
+
+const _: () = assert!(
+    signal_from_exit_status(VIRTUAL_TIMEOUT_EXIT).is_none()
+        && VIRTUAL_TIMEOUT_EXIT != HERMIT_GUEST_DEADLOCK_EXIT
+        && VIRTUAL_TIMEOUT_EXIT != HERMIT_POLICY_REFUSAL_EXIT,
+    "a virtual timeout must not read as a signal death, a deadlock or a refusal"
+);
+
 /// The shell's base for "killed by signal N": a process killed by signal `N` is
 /// conventionally reported as `128 + N`.
 pub const SIGNAL_EXIT_BASE: i32 = 128;
@@ -252,3 +344,40 @@ pub mod liteinst_native_exec_runtime;
 
 #[cfg(feature = "native-exec")]
 pub mod liteinst_native_exec_sources;
+
+#[cfg(test)]
+mod terminal_outcome_tests {
+    use super::*;
+
+    /// Each terminal outcome has its own status and class line. A guest
+    /// deadlock keeps exactly the ones it had (121, [`HERMIT_MODEL_DEADLOCK_LINE`]); a
+    /// virtual timeout exits 124 like every deadline but names its own class
+    /// and bound, so `--timeout`'s `class=run-timeout` is never confused with
+    /// it. Both survive the summary and record fields they are stored as.
+    #[test]
+    fn terminal_outcomes_carry_their_status_and_class_line() {
+        let deadlock = TerminalOutcome::GuestDeadlock;
+        assert_eq!(deadlock.exit_status(), 121);
+        assert_eq!(
+            deadlock.class_line(),
+            "HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model"
+        );
+        let timeout = TerminalOutcome::VirtualTimeout {
+            bound_ns: 3_500_000_000,
+        };
+        assert_eq!(timeout.exit_status(), 124);
+        assert_eq!(
+            timeout.class_line(),
+            "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=3500000000"
+        );
+        assert_ne!(timeout.class_line(), "HERMIT_RUN_TIMEOUT class=run-timeout");
+        for outcome in [None, Some(deadlock), Some(timeout)] {
+            let (guest_deadlock, virtual_timeout_ns) = TerminalOutcome::to_fields(outcome);
+            assert_eq!(
+                TerminalOutcome::from_fields(guest_deadlock, virtual_timeout_ns),
+                outcome
+            );
+        }
+        assert_eq!(TerminalOutcome::to_fields(Some(deadlock)), (true, None));
+    }
+}
