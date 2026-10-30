@@ -3680,9 +3680,6 @@ mod tests {
         }
     }
 
-    /// A listener bound before its path was unlinked and bound again takes
-    /// connections Detcore no longer tracks: its accepts pair with nothing,
-    /// and the later listener's connections stay its own.
     /// A connection is guest-held only when both of its ends are sockets a
     /// guest made and never passed out (`both_ends_guest_made`), and only
     /// where the connect or accept completed in its turn: a connecting socket
@@ -3744,6 +3741,9 @@ mod tests {
         );
     }
 
+    /// A listener bound before its path was unlinked and bound again takes
+    /// connections Detcore no longer tracks: its accepts pair with nothing,
+    /// and the later listener's connections stay its own.
     #[test]
     fn a_listener_whose_name_was_bound_again_pairs_nothing() {
         use crate::fd::DetFd;
