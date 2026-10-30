@@ -7770,7 +7770,8 @@ pub enum SignalScope {
 /// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 26;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 27;
+/// PR #4728's `SchedEvent::stopless` and `ReplayedSliceEnd` append revision 27 above 26.
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
