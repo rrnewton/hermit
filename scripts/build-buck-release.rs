@@ -6155,6 +6155,11 @@ mod tests {
 
     fn write_complete_install(root: &Path, reverie_sha: &str) {
         fs::create_dir_all(root.join("rsrcs")).unwrap();
+        fs::create_dir_all(root.join("licenses")).unwrap();
+        for relative in ["LICENSE", "licenses/LICENSE"] {
+            fs::write(root.join(relative), b"fixture license\n").unwrap();
+        }
+        write_executable(&root.join("hermit"), b"#!/bin/sh\nexit 0\n");
         for (relative, executable) in CORE_REQUIRED_RESOURCES {
             let path = root.join(relative);
             if let Some(parent) = path.parent() {
@@ -6171,11 +6176,11 @@ mod tests {
             format!("{reverie_sha}\n"),
         )
         .unwrap();
-        fs::write(root.join("rsrcs/unprobed-resource"), b"generation-one\n").unwrap();
+        fs::write(root.join("README.txt"), b"generation-one\n").unwrap();
         checked_output(
             Command::new("python3")
                 .arg(source_root().join("ci/test_packaged_detcore.py"))
-                .arg("--write-fixture")
+                .arg("--write-core-fixture")
                 .arg(root)
                 .arg(reverie_sha),
             "write synthetic packaging receipt reader fixture",
@@ -6313,7 +6318,7 @@ mod tests {
 
     fn write_retained_candidate_fixture(root: &Path) -> BuildInfo {
         let version = build_info_json();
-        let help = "ptrace dbt liteinst sabre kvm e9patch\n";
+        let help = "ptrace liteinst in-guest-trap kvm\n";
         let host = host_capabilities_json("arch prctl = ok");
         for (name, contents) in [
             ("cargo-version.json", version.as_str()),
@@ -7300,7 +7305,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         fs::write(
-            install.join("rsrcs/unprobed-resource"),
+            install.join("README.txt"),
             b"mutated-during-copy\n",
         )
         .unwrap();
@@ -7458,7 +7463,7 @@ mod tests {
         let original_help = fs::read(&help_path).unwrap();
         fs::write(
             &help_path,
-            b"ptrace dbt liteinst sabre kvm e9patch changed\n",
+            b"ptrace liteinst in-guest-trap kvm changed\n",
         )
         .unwrap();
         assert!(
@@ -7599,7 +7604,7 @@ mod tests {
 
         // A caller install that changes between the two publications is still
         // refused as mixed input rather than published.
-        fs::write(caller.join("rsrcs/unprobed-resource"), b"generation-two\n").unwrap();
+        fs::write(caller.join("README.txt"), b"generation-two\n").unwrap();
         let changed_evidence = root.join("changed-evidence");
         fs::create_dir_all(&changed_evidence).unwrap();
         let changed = publish_buck_shadow_bundle(
