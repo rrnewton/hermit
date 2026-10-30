@@ -18734,7 +18734,7 @@ fn manifest_command_is_prebuilt(tag: &str, command: &str) -> Result<bool, String
 }
 
 fn manifest_step_policy(step: &Step) -> Result<(Selection, bool), String> {
-    let (selection, prebuilt) = manifest_command_policy(&step.tag(), &step.cmd)?;
+    let (mut selection, prebuilt) = manifest_command_policy(&step.tag(), &step.cmd)?;
     if let Some(manifest) = &step.manifest {
         if selection.lane.as_deref() != Some(&manifest.lane)
             || selection.category.as_deref() != Some(&manifest.category)
@@ -18758,6 +18758,14 @@ fn manifest_step_policy(step: &Step) -> Result<(Selection, bool), String> {
             step.tag()
         ));
     }
+    // The unchanged command invokes test-harness with its default core owner.
+    // Match its strict source-owner policy after validating the complete argv;
+    // a focused external run type must refuse, not lose comparator cells.
+    let owners = hermit_manifest_plan::execution_owners::ExecutionOwners::from_slice(
+        include_bytes!("../ci/execution-owners.json"),
+    )?;
+    selection.execution_backends =
+        Some(owners.backends_for_selection("core", &selection.labels)?);
     Ok((selection, prebuilt))
 }
 
@@ -19135,10 +19143,39 @@ mod nextest_timeout_tests {
             .find(|step| step.tag() == "quick.e2e_verify")
             .expect("the committed quick manifest node is present");
         let manifests = ManifestSet::load(&root).unwrap();
+        let owners = hermit_manifest_plan::execution_owners::ExecutionOwners::load(&root).unwrap();
+        owners.validate_manifest_backends(&manifests).unwrap();
+        // Core accounting must not erase an external owner's source cells.
+        // Keep the complete default population and every run-type identity in
+        // a disjoint backend-owner union, separately from executable core scope.
+        for all_run_types in [false, true] {
+            let baseline = Selection {
+                population: Some(Population::Required),
+                all_run_types,
+                ..Default::default()
+            };
+            let all = manifests.select(&baseline).unwrap();
+            if !all_run_types {
+                assert_eq!(all.len(), 2600, "the original all-owner population is retained");
+            }
+            let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
+            assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
+            let mut union = BTreeSet::new();
+            for owner in owners.names() {
+                let mut selection = baseline.clone();
+                selection.execution_backends = Some(owners.backends(owner).unwrap());
+                for cell in manifests.select(&selection).unwrap() {
+                    assert_eq!(owners.owner(cell.id.backend.as_deref()).unwrap(), owner);
+                    assert!(union.insert(cell.id), "a cell has two execution owners");
+                }
+            }
+            assert_eq!(union, expected, "an owned cell disappeared or changed identity");
+        }
         assert_eq!(
             manifests
                 .select(&Selection {
                     population: Some(Population::Required),
+                    execution_backends: Some(owners.backends("core").unwrap()),
                     ..Default::default()
                 })
                 .unwrap()

@@ -39,7 +39,7 @@
     "selftest.pressure_test",
     "selftest.validate_rs",
     "selftest.manifest_cli",
-    "selftest.dbt_budget"
+    "selftest.core_build"
   ],
   "build_debug_nodes": [
     "e2e.audit_compile_c_programs",
