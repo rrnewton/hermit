@@ -186,6 +186,26 @@ pub(crate) fn error_queue_read_never_waits(family: i32, socket_type: i32, protoc
     }
 }
 
+/// The transport of a socket whose local port Linux picks itself when the
+/// socket has none (see `crate::syscalls::implicit_bind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PortTransport {
+    /// TCP.
+    Tcp,
+    /// UDP.
+    Udp,
+}
+
+/// A TCP or UDP socket `socket(2)` created that Detcore has not seen bound
+/// to a port (see `crate::syscalls::implicit_bind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UnboundSocket {
+    /// TCP or UDP.
+    pub(crate) transport: PortTransport,
+    /// The family it was created with, `AF_INET` or `AF_INET6`.
+    pub(crate) family: u16,
+}
+
 /// Read provenance authenticated at the container's initial image: a terminal
 /// checked with TCGETS, the launcher's actually created controller input pipe,
 /// or a readable pipe end the initial image holds on fds 0-2
@@ -1180,6 +1200,11 @@ struct OpenFileDescription {
     /// ([`DetFd::is_last_reference`]). Not printed.
     #[serde(skip)]
     in_flight: usize,
+    /// A TCP or UDP socket `socket(2)` created, until Detcore sees it bound
+    /// to a port; `None` for every other description. See
+    /// `crate::syscalls::implicit_bind`. Not printed.
+    #[serde(default)]
+    unbound_socket: Option<UnboundSocket>,
 }
 /// Written out, not derived, so that `channel` is printed only when it is set:
 /// a run without `--pipe-wake-latency` logs every description exactly as
@@ -1510,6 +1535,7 @@ impl DetFd {
                 may_hold_ofd_lock: false,
                 rights: SocketRights::default(),
                 in_flight: 0,
+                unbound_socket: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             }))),
@@ -2577,6 +2603,17 @@ impl DetFd {
     /// The socket's family and type as the network trace classified it.
     pub(crate) fn network_socket(&self) -> NetworkSocketKind {
         self.with_description(|d| d.network_socket)
+    }
+
+    /// Record that this open file is a TCP or UDP socket with no local port
+    /// yet, or (`None`) that it has one or is no such socket.
+    pub(crate) fn set_unbound_socket(&self, socket: Option<UnboundSocket>) {
+        self.with_description(|d| d.unbound_socket = socket);
+    }
+
+    /// This socket, while Detcore has not seen it bound to a port.
+    pub(crate) fn unbound_socket(&self) -> Option<UnboundSocket> {
+        self.with_description(|d| d.unbound_socket)
     }
 
     /// Mark this open file as one end of a `socketpair(2)`. Like
