@@ -8888,9 +8888,7 @@ fn add_framework_retries(
     record: &mut serde_json::Value,
     retries: Option<Result<hermit_manifest_plan::ledger::FrameworkRetriesV1, String>>,
 ) {
-    match retries.map(|retries| {
-        retries.and_then(|retries| serde_json::to_value(retries).map_err(|error| error.to_string()))
-    }) {
+    match retries {
         None => {}
         Some(Ok(retries)) => {
             if let Ok(rollup) = serde_json::to_value(
@@ -8898,7 +8896,10 @@ fn add_framework_retries(
             ) {
                 record["retry_rollup_v1"] = rollup;
             }
-            record["framework_retries_v1"] = retries;
+            match serde_json::to_value(retries) {
+                Ok(value) => record["framework_retries_v1"] = value,
+                Err(error) => record["framework_retries_error"] = error.to_string().into(),
+            }
         }
         Some(Err(error)) => {
             record["retry_rollup_error"] = error.clone().into();

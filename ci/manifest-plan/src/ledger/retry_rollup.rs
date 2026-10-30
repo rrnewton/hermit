@@ -32,7 +32,9 @@ pub struct RetryRecordV1 {
 #[serde(deny_unknown_fields)]
 pub struct RetryRollupV1 {
     pub schema: u32,
-    /// The one bound, from `MAX_ATTEMPTS_PER_CELL`.
+    /// The one e2e bound, from `MAX_ATTEMPTS_PER_CELL`. (The nextest skid
+    /// helper's separate bound of 5 attempts predates this schema and is
+    /// recorded per record, not by this field.)
     pub max_attempts_per_test: u64,
     pub total_retries: u64,
     pub retried_tests: u64,
@@ -71,8 +73,25 @@ impl RetryRollupV1 {
                 backend: Some(cell.cell.backend.clone()),
                 attempts: cell.attempts,
                 retries: cell.attempts.saturating_sub(1),
-                attempt_outcomes: vec![cell.first_outcome.clone()],
-                attempt_classes: vec![cell.first_failure_class.clone()],
+                // The census retains first and final outcomes; with the
+                // harness bound of 2 attempts that is the whole history.
+                attempt_outcomes: if cell.attempts > 1 {
+                    vec![cell.first_outcome.clone(), cell.final_outcome.clone()]
+                } else {
+                    vec![cell.first_outcome.clone()]
+                },
+                attempt_classes: if cell.attempts > 1 {
+                    vec![
+                        cell.first_failure_class.clone(),
+                        if cell.final_outcome == "PASS" {
+                            None
+                        } else {
+                            cell.first_failure_class.clone()
+                        },
+                    ]
+                } else {
+                    vec![cell.first_failure_class.clone()]
+                },
                 final_outcome: cell.final_outcome.clone(),
                 flaky_pass: cell.final_outcome == "PASS",
             })
