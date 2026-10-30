@@ -1221,7 +1221,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // And detcore-model host_input::tests::stdio_kinds_name_each_changed_descriptor: 1930.
     // And host_input::tests::terminal_devices_follow_the_kernels_driver_list: 1931.
-    ("test.regular_crates", 1931),
+    // And host_input::tests::a_guest_descriptor_is_classified_without_reaching_a_fuse_filesystem: 1932.
+    ("test.regular_crates", 1932),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -6167,7 +6168,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // And the same detcore-model stdio unit: 1916.
     // And the same terminal-device unit: 1917.
-    ("test.regular_crates_on_host", 1917),
+    // And the same guest-descriptor classifier unit: 1918.
+    ("test.regular_crates_on_host", 1918),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
