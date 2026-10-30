@@ -106,6 +106,30 @@ impl RetryRollupV1 {
     }
 }
 
+/// The landing signal for a validate run (Step 4): red on any product
+/// failure or an incomplete run; otherwise green-clean when no retry ran,
+/// green-flaky (still landing-eligible) with the top flaky tests named.
+pub fn landing_signal(
+    product_failures: usize,
+    validation_complete: bool,
+    rollup: &RetryRollupV1,
+) -> (&'static str, Vec<String>) {
+    if product_failures > 0 || !validation_complete {
+        return ("red", Vec::new());
+    }
+    if rollup.total_retries == 0 {
+        return ("green-clean", Vec::new());
+    }
+    let mut flaky: Vec<&RetryRecordV1> = rollup.tests.iter().filter(|t| t.flaky_pass).collect();
+    flaky.sort_by(|a, b| b.retries.cmp(&a.retries).then_with(|| a.test.cmp(&b.test)));
+    let top = flaky
+        .iter()
+        .take(10)
+        .map(|t| format!("{} ({} retries)", t.test, t.retries))
+        .collect();
+    ("green-flaky", top)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +165,27 @@ mod tests {
             serde_json::from_value::<RetryRollupV1>(value).unwrap(),
             rollup
         );
+    }
+
+    #[test]
+    fn landing_signal_distinguishes_clean_flaky_and_red() {
+        let clean = RetryRollupV1::from_records(vec![]);
+        assert_eq!(landing_signal(0, true, &clean), ("green-clean", vec![]));
+        assert_eq!(landing_signal(1, true, &clean).0, "red");
+        assert_eq!(landing_signal(0, false, &clean).0, "red");
+        let flaky = RetryRollupV1::from_records(vec![RetryRecordV1 {
+            test: "fixture/x".into(),
+            mode: "verify".into(),
+            backend: None,
+            attempts: 2,
+            retries: 1,
+            attempt_outcomes: vec!["FAIL".into(), "PASS".into()],
+            attempt_classes: vec![None, None],
+            final_outcome: "PASS".into(),
+            flaky_pass: true,
+        }]);
+        let (signal, top) = landing_signal(0, true, &flaky);
+        assert_eq!(signal, "green-flaky");
+        assert_eq!(top, ["fixture/x (1 retries)"]);
     }
 }
