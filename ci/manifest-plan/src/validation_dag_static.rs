@@ -1223,7 +1223,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model host_input::tests::stdio_kinds_name_each_changed_descriptor: 1933.
     // And host_input::tests::terminal_devices_follow_the_kernels_driver_list: 1934.
     // And host_input::tests::a_guest_descriptor_is_classified_without_reaching_a_fuse_filesystem: 1935.
-    ("test.regular_crates", 1935),
+    // And host_input::tests::a_guest_descriptor_is_statted_only_on_a_local_kernel_filesystem: 1932.
+    // And host_input::tests::the_root_is_known_by_its_mapped_image: 1936.
+    ("test.regular_crates", 1936),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5073,8 +5075,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.cli_on_host", 667),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
-    // Kept equal to the second test.regular_crates_on_host entry below: 1921.
-    ("test.regular_crates_on_host", 1921),
+    // Kept equal to the second test.regular_crates_on_host entry below: 1922.
+    ("test.regular_crates_on_host", 1922),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6207,7 +6209,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same detcore-model stdio unit: 1919.
     // And the same terminal-device unit: 1920.
     // And the same guest-descriptor classifier unit: 1921.
-    ("test.regular_crates_on_host", 1921),
+    // And the same mapped-image unit: 1922.
+    ("test.regular_crates_on_host", 1922),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
