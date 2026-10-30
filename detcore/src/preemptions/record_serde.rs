@@ -447,4 +447,28 @@ mod tests {
             }
         }
     }
+
+    /// `format_version` (#4845) goes through `RawRecord` like main's fields:
+    /// a record that states it as a top-level field, as every record did
+    /// before the incomplete-record envelope, reads it, writes it back in
+    /// place, and keeps it inside the envelope when the record is marked.
+    #[test]
+    fn a_record_format_round_trips_through_the_legacy_fields_and_the_envelope() {
+        let old = r#"{"per_thread":{},"global":[],"format_version":2}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(record.format_version(), 2);
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let mut marked = record.clone();
+        marked.replay_departed_at = Some(7);
+        let written = serde_json::to_string(&marked).unwrap();
+        assert_eq!(
+            written,
+            format!(
+                r#"{{"incomplete_preemption_record":{{"version":1,"replay_departed_at":7,"record":{old}}}}}"#
+            )
+        );
+        let read: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(read.format_version(), 2);
+        assert_eq!(read, marked);
+    }
 }
