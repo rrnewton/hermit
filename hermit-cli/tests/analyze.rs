@@ -1219,7 +1219,7 @@ fn analyze_stops_a_run_whose_init_has_not_armed() {
 fn analyze_starts_from_a_recorded_target_run() {
     let label = "analyze --prefix-search --run1-preemptions analyze_race_then plain";
     let guest = &workloads().race_then;
-    let seed = race_then_target_seed("plain", &[]);
+    let seed = race_then_target_seed_matching("plain", &[]);
     // Recorded outside /tmp: the run's guest has a private one, and the
     // record is written from inside the container.
     let workspace =
