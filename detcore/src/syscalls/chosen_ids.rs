@@ -588,7 +588,7 @@ fn reserved_clone_image(
         return Err(InputUnavailable::new("clone-set-tid-image-too-large"));
     }
     let mut array = [0; MAX_SET_TID * std::mem::size_of::<libc::pid_t>()];
-    for (entry, bytes) in entries.iter().zip(array.chunks_exact_mut(4)) {
+    for (entry, bytes) in entries.iter().zip(array.as_chunks_mut::<4>().0.iter_mut()) {
         bytes.copy_from_slice(&entry.to_ne_bytes());
     }
     let array_address = layout.base;

@@ -233,7 +233,7 @@ impl NativeSyscallFacts for Fixture {
             mount_id: Ok(1),
             proc_path: Ok(b"socket:[7]".to_vec()),
             path_context: Err(reverie::reserved_input::InputNativeError {
-                operation: "scripted non-path socket".into(),
+                operation: "scripted non-path socket",
                 errno: None,
             }),
         })
@@ -846,7 +846,7 @@ impl Fixture {
 
     async fn run_background_write_helper(&mut self) -> Result<i64, Error> {
         let tool = <Detcore as Tool>::new(Pid::from_raw(self.native_tid), &self.config);
-        let bytes = [b'x'];
+        let bytes = *b"x";
         // FD 2 remains an ordinary description even when a distinct FD carries
         // process-memory authority. Thus the shared-table refusal below must
         // come from C/W_seen, not a scripted direct proc-memory write.

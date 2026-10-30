@@ -792,14 +792,14 @@ mod tests {
                 .with_guest_ids(chosen())
                 .with_format(Some(3));
             writer.insert_schedevent(SchedEvent::branches(DetTid::from_raw(5000), 2));
-            writer.insert_time_skip(skip.clone());
+            writer.insert_time_skip(skip);
             assert!(writer.inner.reserved_input().is_missing());
             writer.observe_reserved_input_setup(&good).unwrap();
             let recorded =
                 Recording::decode(writer.serialized_string().unwrap().as_bytes()).unwrap();
             assert_eq!(recorded.reserved_input(), &native.metadata());
             assert_eq!(recorded.format_version(), Some(3));
-            assert_eq!(recorded.time_skips(), Some([skip.clone()].as_slice()));
+            assert_eq!(recorded.time_skips(), Some([skip].as_slice()));
             recorded
                 .validate_replay_inputs("writer observer", chosen())
                 .unwrap();
@@ -815,7 +815,7 @@ mod tests {
             let partial = Recording::decode(writer.into_string().as_bytes()).unwrap();
             assert!(partial.reserved_input().is_missing());
             assert_eq!(partial.format_version(), Some(3));
-            assert_eq!(partial.time_skips(), Some([skip.clone()].as_slice()));
+            assert_eq!(partial.time_skips(), Some([skip].as_slice()));
             assert!(
                 partial
                     .validate_replay_inputs("unqualified earlier image", chosen())

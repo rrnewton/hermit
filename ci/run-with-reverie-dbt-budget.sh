@@ -3145,7 +3145,11 @@ fi
 # build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
 # This pin changes no tool selection or native recipe; limits retained.
 # This is budget carry, not a native cache HIT or a fresh timing sample.
-expected_pin=3872090227e6cd77d4a2ae7bf4994569680e25c9
+# F1 CARRY TO 0d71f7272e88746651dd28e83728a78b8acafed2: native recipe input objects equal 3872090227e6cd77d4a2ae7bf4994569680e25c9.
+# build.rs 3f2abba1b74a3287c6ecbef7d1b8a7f118eb3938; vendor 4e4afaa7cb1af0170c89a55f2004821426e88aba.
+# This pin changes no tool selection or native recipe; limits retained.
+# This is budget carry, not a native cache HIT or a fresh timing sample.
+expected_pin=0d71f7272e88746651dd28e83728a78b8acafed2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
