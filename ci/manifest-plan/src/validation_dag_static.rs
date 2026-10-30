@@ -1258,7 +1258,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's
     // only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end
     // (--chaos-instruction-offset): 1974.
-    ("test.regular_crates", 1974),
+    // And chaos_instruction_offset_never_enters_the_legacy_form: 1975.
+    ("test.regular_crates", 1975),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5263,8 +5264,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusions are present exactly once: 1971 - 14 = 1957, by nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
-    // And the cases added since, as this twin's entry further down counts: 1960.
-    ("test.regular_crates_on_host", 1960),
+    // And the cases added since, as this twin's entry further down counts: 1961.
+    ("test.regular_crates_on_host", 1961),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6462,7 +6463,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
     // And the same --chaos-instruction-offset detcore-model unit: 1960.
-    ("test.regular_crates_on_host", 1960),
+    // And the same legacy-form unit: 1961.
+    ("test.regular_crates_on_host", 1961),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
