@@ -1270,7 +1270,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 1952 + 1 = 1953.
     // And host_input::tests::a_guest_descriptor_is_classified_without_reaching_a_fuse_filesystem: 1935.
     // Rebased onto main fcd62385f: 1953 + 1 = 1954.
-    ("test.regular_crates", 1954),
+    // And host_input::tests::a_guest_descriptor_is_statted_only_on_a_local_kernel_filesystem: 1932.
+    // And host_input::tests::the_root_is_known_by_its_mapped_image: 1936.
+    // Rebased onto main fcd62385f: 1954 + 1 = 1955.
+    ("test.regular_crates", 1955),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5318,6 +5321,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 715 + 1 = 716.
     // Rebased onto main 2baafbdf5: 717 + 1 = 718.
     // Kept equal to the second test.regular_crates_on_host entry below: 1921.
+    // Kept equal to the second test.regular_crates_on_host entry below: 1922.
     ("test.cli_on_host", 718),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
@@ -5332,7 +5336,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 1937 + 1 = 1938.
     // Rebased onto main fcd62385f: 1938 + 1 = 1939.
     // Rebased onto main fcd62385f: 1939 + 1 = 1940.
-    ("test.regular_crates_on_host", 1940),
+    // Rebased onto main fcd62385f: 1940 + 1 = 1941.
+    ("test.regular_crates_on_host", 1941),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6561,7 +6566,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 1938 + 1 = 1939.
     // And the same guest-descriptor classifier unit: 1921.
     // Rebased onto main fcd62385f: 1939 + 1 = 1940.
-    ("test.regular_crates_on_host", 1940),
+    // And the same mapped-image unit: 1922.
+    // Rebased onto main fcd62385f: 1940 + 1 = 1941.
+    ("test.regular_crates_on_host", 1941),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
