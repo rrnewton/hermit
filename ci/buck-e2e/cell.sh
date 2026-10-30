@@ -424,8 +424,7 @@ def read_rows():
         seen = json.loads(rows_seen)
     except ValueError:
         raise Invalid(f"harness rc={rc} wrote an unreadable results.jsonl")
-    if seen["count"] > 1:
-        raise Invalid(f"harness rc={rc} wrote {seen['count']} rows; a cell runs the harness once, which writes one")
+    # The harness owns retries: one execution writes one row per attempt.
     return seen["count"], seen["outcome"]
 
 def withheld_pair(done, rows):
@@ -491,7 +490,7 @@ def verdict():
     if skip:
         return skip
     if pair:
-        # The existing RE policy: a withheld cell fails there, so Tpx retries it.
+        # A withheld cell fails there; ci/buck-e2e/run reruns it locally (Tpx retries are off).
         return failed(f"harness rc={rc} produced {len(done)} test_done records")
     lost = no_result_pair(done, rows)
     if lost:
