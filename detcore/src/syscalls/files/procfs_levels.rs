@@ -817,10 +817,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // the sysfs directories that list them
         // (`crate::procfs::absent_cpu_entry_prefix`), as the guest named it
         // before any `chroot`: the listings leave it out, so a lookup finds
-        // nothing either. Not under record and replay, where the listings keep
-        // every entry (`Detcore::drop_absent_entries`).
+        // nothing either. With native metadata or under record and replay,
+        // the listings keep every entry (`Detcore::drop_absent_entries`).
         let substituted = substituted.or_else(|| {
-            if root.is_some() || self.cfg.recordreplay_modes {
+            if !self.cfg.virtualize_metadata || root.is_some() || self.cfg.recordreplay_modes {
                 return None;
             }
             let prefix =

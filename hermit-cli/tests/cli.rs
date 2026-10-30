@@ -40949,6 +40949,42 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
         "compatibility mode must preserve the kernel's rseq result"
     );
 
+    // Native metadata keeps the host's CPU population in both directory
+    // listings and lookups. Compare the same guest with Linux, including a
+    // CPU that the default one-CPU model omits when it exists on this host.
+    for name in ["cpu0", "cpu1"] {
+        let native = Command::new(&guest)
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .args(["bound", "/sys/devices/system/cpu", name])
+            .output()
+            .expect("failed to run the native CPU directory control");
+        assert_success(&native, &["native", guest.as_str(), "bound", name]);
+        if name == "cpu0" {
+            assert_eq!(stdout(&native), "bound listing cpu0: 1\nbound openat: ok\n");
+        }
+        let args = [
+            "run",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--no-virtualize-metadata",
+            "--",
+            guest.as_str(),
+            "bound",
+            "/sys/devices/system/cpu",
+            name,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            stdout(&native),
+            "native metadata must preserve Linux's listing and lookup for {name}: {}",
+            stderr(&output)
+        );
+    }
+
     // These names belong to an ordinary directory bound over sysfs. Both
     // lookup and getdents must retain them, regardless of their spelling.
     let bound = directory.path().join("bound");
