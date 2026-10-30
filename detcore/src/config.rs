@@ -140,6 +140,8 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4738, renumbered to 16 at
         // integration; digests measured at this head).
         (16, "182b80da8855a429", "846052997d97693f"),
+        // Adds `Resources.polls_a_named_fifo` (#4692).
+        (17, "182b80da8855a429", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
