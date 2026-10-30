@@ -135,6 +135,18 @@ pub struct PreemptionRecord {
     /// is nonzero. Zero, and absent, for a run that counted none, for other
     /// architectures, and for records written before the field existed.
     store_exclusive_failures: HostObservedCount,
+    /// The record's format ([`PREEMPTION_RECORD_FORMAT`]): `None` for format 1.
+    format_version: Option<u32>,
+    /// Every jump of global time to a deadline that the scheduler made because
+    /// nothing else could run (`TimeSkip`), in order; absent when there was
+    /// none. A record of format 2 or later lists all its jumps, so a replay of
+    /// it makes exactly those jumps, each where the recording made it
+    /// (`TimeSkip::event`), and computes none of its own. A record of format 1
+    /// (written before jumps were recorded) replays as before: it makes no
+    /// idle-poller jump, and a FIFO open's fast-forward recomputes its jump.
+    /// Analyze and bisect carry a source record's jumps into the trial
+    /// schedules they splice from it (`with_time_skips`).
+    time_skips: Option<Vec<TimeSkip>>,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -162,6 +174,87 @@ impl std::hash::Hash for HostObservedCount {
     fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
+/// The newest preemption-record format this Hermit writes and reads
+/// (`PreemptionRecord::format_version`), one counter for every format change:
+/// a record of format N has every property of the formats before it.
+///
+/// - Format 1 has no version field: every record written before the field
+///   existed.
+/// - Format 2 ([`TIME_SKIPS_FORMAT`]) lists every jump of global time its run
+///   made (`time_skips`, absent when there was none).
+/// - Format 3 ([`SWITCH_IN_CHARGE_FORMAT`]) was written by a run that charged
+///   every stretch of guest code a turn, so its replay charges a replayed
+///   switch-in under which guest code runs.
+///
+/// A record of a newer format is refused (`PreemptionRecord::validate_format`).
+pub const PREEMPTION_RECORD_FORMAT: u32 = SWITCH_IN_CHARGE_FORMAT;
+
+/// The format from which a record lists all its jumps of global time.
+pub const TIME_SKIPS_FORMAT: u32 = 2;
+
+/// The format from which a schedule replay charges a scheduler turn for every
+/// replayed switch to a thread that then runs guest code
+/// (`Scheduler::bump_global_time`), as the run that wrote the record charged
+/// the yield turn the switch stands for. A run charges every such stretch when
+/// it follows no record, or follows one of this format. A replay of an older
+/// record charges as before: its writer cannot say whether its own run
+/// followed a schedule, and so left those stretches uncharged.
+///
+/// This restores the switch-in charge when guest events retire. A bare
+/// `TraceReplay` turn does not become `previous_turn_tid`: main's ordinary
+/// turn rule continues to decide subsequent signal charges. This format alone
+/// does not claim equality of every record/replay clock observation.
+pub const SWITCH_IN_CHARGE_FORMAT: u32 = 3;
+
+/// A record whose format, or jumps of global time, this Hermit refuses to
+/// replay (`PreemptionRecord::validate_format`): a policy refusal, not a
+/// malformed file.
+#[derive(Debug)]
+pub struct RecordFormatRefusal(pub String);
+
+impl std::fmt::Display for RecordFormatRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RecordFormatRefusal {}
+
+/// Whether `PreemptionRecord::time_skips` has nothing to write.
+fn lists_no_time_skips(skips: &Option<Vec<TimeSkip>>) -> bool {
+    skips.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// Why the scheduler moved global time ahead to a deadline.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Hash, Serialize, Deserialize)]
+pub enum TimeSkipReason {
+    /// A FIFO open waits for a peer while every other thread is an idle
+    /// guest-state poller or parked.
+    FifoOpenAlone,
+    /// A guest-state poller retried without progress while every other thread
+    /// is an idle guest-state poller or parked.
+    IdleGuestPollers,
+}
+
+/// One jump of global time. A replay of the record makes it where the
+/// recording did, as replay drives context switches, and checks it: its target
+/// must still lie ahead, and no finite deadline the replay knows, then or
+/// later, may come before it, or the replay reports a desync
+/// (`Scheduler::make_recorded_time_skip`).
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Hash, Serialize, Deserialize)]
+pub struct TimeSkip {
+    /// Where in the recorded stream the jump falls: the number of stored
+    /// records before it (global events in the original format, and every
+    /// record, boundaries included, in the boundary protocol). Taken where the
+    /// jump is made, at the start of a scheduler pass, when every thread is
+    /// parked, so no event can race it.
+    pub event: u64,
+    /// The exact deadline global time moved to.
+    pub target: LogicalTime,
+    /// Why nothing else could run.
+    pub reason: TimeSkipReason,
+}
+
 impl std::fmt::Display for PreemptionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = serde_json::to_string(&self).unwrap();
@@ -187,6 +280,8 @@ impl PreemptionRecord {
             expired_wait_runs_charged_once: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
+            format_version: None,
+            time_skips: None,
         }
     }
 
@@ -251,6 +346,8 @@ impl PreemptionRecord {
             host_inputs,
             store_exclusive_failures: _,
             replay_departed_at,
+            format_version,
+            time_skips,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -303,6 +400,23 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             // A prefix of an inexact record is inexact too.
             replay_departed_at: *replay_departed_at,
+            format_version: *format_version,
+            // The jumps the prefix reaches, in stream order, as analyze and
+            // bisect carry them (`hermit-cli`'s `time_skip_carry`): one at its
+            // end still waits there for a FIFO open's poll, and one beyond it
+            // was never reached.
+            time_skips: time_skips
+                .as_ref()
+                .map(|skips| {
+                    skips
+                        .iter()
+                        .take_while(|skip| {
+                            usize::try_from(skip.event).is_ok_and(|event| event <= len)
+                        })
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .filter(|skips| !skips.is_empty()),
         }
     }
 
@@ -317,6 +431,73 @@ impl PreemptionRecord {
         record.validate().is_ok().then_some(record)
     }
 
+    /// Attach the metadata of two interpolation inputs to `events`.
+    ///
+    /// The caller first reconciles the existing guest-ID, signal-copy and
+    /// other option policies. An exact source schedule keeps that source's
+    /// complete record, including callback checkpoints and time jumps. Both
+    /// formats must agree: a single output cannot follow two charging rules.
+    ///
+    /// A genuinely mixed order has no established mapping for either source's
+    /// jumps or checkpoints, so refuse those inputs. For jump/checkpoint-free
+    /// inputs, every remaining metadata field must agree. Keep those fields,
+    /// but clear the per-thread priority histories, as an event-order edit
+    /// follows its global stream rather than either original priority history.
+    /// Host-observed failure counts must agree too; retain their warning,
+    /// without claiming that an unrun edit has measured that many failures.
+    pub fn interpolate_events(
+        &self,
+        other: &Self,
+        events: Vec<SchedEvent>,
+    ) -> Result<Self, String> {
+        self.validate()?;
+        other.validate()?;
+        if self.format_version != other.format_version {
+            return Err(format!(
+                "cannot interpolate record formats {:?} and {:?}: their replay rules differ",
+                self.format_version, other.format_version
+            ));
+        }
+        if events == self.global {
+            return Ok(self.clone());
+        }
+        if events == other.global {
+            return Ok(other.clone());
+        }
+        if !lists_no_time_skips(&self.time_skips) || !lists_no_time_skips(&other.time_skips) {
+            return Err(
+                "cannot interpolate a mixed schedule with recorded time jumps: no source's complete event order matches the result"
+                    .to_owned(),
+            );
+        }
+        if !self.callback_checkpoints.is_empty() || !other.callback_checkpoints.is_empty() {
+            return Err(
+                "cannot interpolate a mixed schedule with callback checkpoints: no mapping to the edited event order is established"
+                    .to_owned(),
+            );
+        }
+        let metadata = |source: &Self| {
+            let mut record = source.clone();
+            record.global.clear();
+            record.per_thread.clear();
+            record
+        };
+        let mut record = metadata(self);
+        // HostObservedCount deliberately compares equal for ordinary replay
+        // comparisons, so interpolation must check its stored value explicitly.
+        if record != metadata(other)
+            || self.store_exclusive_failures() != other.store_exclusive_failures()
+        {
+            return Err(
+                "cannot interpolate a mixed schedule with incompatible recording metadata (epoch, charging policy, RNG, timeslice or host inputs)"
+                    .to_owned(),
+            );
+        }
+        record.global = events;
+        record.validate()?;
+        Ok(record)
+    }
+
     /// The `--max-timeslice` the run that produced this record drew under
     /// `--chaos-timeslice-draw=run`, if it drew one.
     pub fn chaos_timeslice(&self) -> Option<u64> {
@@ -327,6 +508,51 @@ impl PreemptionRecord {
     pub fn with_chaos_timeslice(mut self, timeslice: Option<u64>) -> Self {
         self.chaos_timeslice = timeslice;
         self
+    }
+
+    /// The same record, listing `skips` as its jumps of global time, in format
+    /// 2 at least when there are any. Analyze and bisect carry a source
+    /// record's jumps into a trial schedule spliced from its prefix.
+    pub fn with_time_skips(mut self, skips: Vec<TimeSkip>) -> Self {
+        self.time_skips = (!skips.is_empty()).then_some(skips);
+        if self.time_skips.is_some() && !self.lists_its_time_skips() {
+            self.format_version = Some(TIME_SKIPS_FORMAT);
+        }
+        self
+    }
+
+    /// The same record in the newest format ([`PREEMPTION_RECORD_FORMAT`]),
+    /// which a record from a run of this Hermit has.
+    pub fn with_current_format(self) -> Self {
+        self.with_format(Some(PREEMPTION_RECORD_FORMAT))
+    }
+
+    /// The same record in `format` (`None` for format 1). Analyze and bisect
+    /// write a trial schedule in the oldest format among the recordings they
+    /// read (`hermit-cli`'s `time_skip_carry`).
+    pub fn with_format(mut self, format: Option<u32>) -> Self {
+        self.format_version = format;
+        self
+    }
+
+    /// The record's format: `None` for format 1.
+    pub fn format_version(&self) -> Option<u32> {
+        self.format_version
+    }
+
+    /// Whether a schedule replay of this record charges a replayed switch-in
+    /// under which guest code runs (format 3 or later,
+    /// [`SWITCH_IN_CHARGE_FORMAT`]).
+    pub fn charges_replayed_switch_ins(&self) -> bool {
+        self.format_version
+            .is_some_and(|format| format >= SWITCH_IN_CHARGE_FORMAT)
+    }
+
+    /// Whether the record lists every jump of global time its run made
+    /// (format 2 or later), so that a replay makes exactly those.
+    pub fn lists_its_time_skips(&self) -> bool {
+        self.format_version
+            .is_some_and(|format| format >= TIME_SKIPS_FORMAT)
     }
 
     /// The same record, stating the `--pipe-wake-latency` of the trials it
@@ -508,6 +734,8 @@ impl PreemptionRecord {
             host_inputs: self.host_inputs.clone(),
             // A count of this run's host, not part of the preemptions.
             store_exclusive_failures: HostObservedCount::default(),
+            format_version: None,
+            time_skips: None,
         }
     }
 
@@ -576,7 +804,15 @@ impl PreemptionRecord {
             expired_wait_runs_charged_once: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
+            format_version: None,
+            time_skips: None,
         }
+    }
+
+    /// The jumps of global time the recorder saw (`time_skips`), or `None`
+    /// when the record does not say.
+    pub fn time_skips(&self) -> Option<&[TimeSkip]> {
+        self.time_skips.as_deref()
     }
 
     pub(crate) fn callback_checkpoints(
@@ -619,7 +855,64 @@ impl PreemptionRecord {
     /// Perform internal invariant checks on the PreemptionRecord and return an error if
     /// it is not well formed.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_contents()?;
+        self.validate_format()
+    }
+
+    /// Check everything [`Self::validate`] does but the format
+    /// ([`Self::validate_format`]), whose failure is a refusal rather than a
+    /// malformed record, and which readers check separately for that reason.
+    pub fn validate_contents(&self) -> Result<(), String> {
         self.validate_callback_checkpoints()?;
+        self.validate_histories()
+    }
+
+    /// Check the record's format and its jumps of global time: a format this
+    /// Hermit reads, with the list that format requires, in stream order, to
+    /// later and finite deadlines. A failure is a refusal of the record, not a
+    /// malformed file (`RecordFormatRefusal`).
+    pub fn validate_format(&self) -> Result<(), String> {
+        if let Some(skip) = self
+            .time_skips
+            .iter()
+            .flatten()
+            .find(|skip| skip.target.is_indefinite())
+        {
+            return Err(format!(
+                "time skip {skip:?} moves to the indefinite deadline, which nothing reaches"
+            ));
+        }
+        let skips = match &self.time_skips {
+            Some(skips) if skips.is_empty() => {
+                return Err("an empty list of time skips is written as no list".to_string());
+            }
+            skips => skips.as_deref().unwrap_or_default(),
+        };
+        let known = self
+            .format_version
+            .is_none_or(|format| (TIME_SKIPS_FORMAT..=PREEMPTION_RECORD_FORMAT).contains(&format));
+        if !known || (!skips.is_empty() && !self.lists_its_time_skips()) {
+            return Err(format!(
+                "record format {:?} with {} time skips: this Hermit reads formats 1 to \
+                 {PREEMPTION_RECORD_FORMAT}, and time skips need format {TIME_SKIPS_FORMAT} or later",
+                self.format_version,
+                skips.len()
+            ));
+        }
+        if let Some(pair) = skips
+            .windows(2)
+            .find(|pair| pair[1].event < pair[0].event || pair[1].target <= pair[0].target)
+        {
+            return Err(format!(
+                "time skips must come in stream order and move to later deadlines: {:?} then {:?}",
+                pair[0], pair[1]
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check every thread's priority history.
+    fn validate_histories(&self) -> Result<(), String> {
         for (tid, history) in &self.per_thread {
             if !is_ordinary_priority(history.final_prio) {
                 return Err(format!(
@@ -1727,6 +2020,40 @@ mod tests {
         }
     }
 
+    /// A schedule prefix keeps the record's format and the jumps of global
+    /// time its events reach, as analyze and bisect carry them: up to and
+    /// including one at the prefix's end, none beyond it.
+    #[test]
+    fn a_schedule_prefix_keeps_the_jumps_its_events_reach() {
+        let tid = DetTid::from_raw(3);
+        let jump = |event: u64| TimeSkip {
+            event,
+            target: LogicalTime::from_nanos(1_000 * (event + 1)),
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+            SchedEvent::branches(tid, 30),
+        ])
+        .with_current_format()
+        .with_time_skips(vec![jump(1), jump(2), jump(3)]);
+        for (len, kept) in [
+            (0, vec![]),
+            (1, vec![jump(1)]),
+            (2, vec![jump(1), jump(2)]),
+            (9, vec![jump(1), jump(2), jump(3)]),
+        ] {
+            let prefix = record.schedule_prefix(len);
+            assert!(prefix.lists_its_time_skips(), "prefix of {len} events");
+            assert_eq!(
+                prefix.time_skips().unwrap_or_default(),
+                kept.as_slice(),
+                "prefix of {len} events"
+            );
+        }
+    }
+
     /// A replay of a schedule's first events keeps the callback checkpoints
     /// of the slices those events end, for the threads they run, and no later
     /// ones: the slice end at the prefix's own end belongs to the event after
@@ -1792,6 +2119,26 @@ mod tests {
             .callback_checkpoints
             .insert(late, late_points.clone());
         record.validate().unwrap();
+
+        // An exact interpolation keeps the histories/checkpoints themselves,
+        // not a reconstructed record that happens to have the same events.
+        let exact = record
+            .interpolate_events(&record, record.global.clone())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&exact).unwrap(),
+            serde_json::to_value(&record).unwrap()
+        );
+        let mut other = record.clone();
+        other.global.push(SchedEvent::branches(late, 1));
+        let mut mixed = record.global.clone();
+        mixed.push(SchedEvent::branches(main, 1));
+        assert!(
+            record
+                .interpolate_events(&other, mixed)
+                .unwrap_err()
+                .contains("callback checkpoints")
+        );
 
         let kept = |len: usize| {
             let prefix = record.schedule_prefix(len);
@@ -2006,6 +2353,36 @@ impl PreemptionWriter {
             dest: path,
             flushed: false,
         }
+    }
+
+    /// Write the record in `format` (`None` for format 1): the newest
+    /// ([`PREEMPTION_RECORD_FORMAT`]) for a run that follows no record, or the
+    /// format of the record a replay follows, whose rules it ran by.
+    pub fn with_format(mut self, format: Option<u32>) -> Self {
+        self.inner.format_version = format;
+        self
+    }
+
+    /// Record a jump of global time (`PreemptionRecord::time_skips`), which
+    /// puts the record in format 2 at least ([`TIME_SKIPS_FORMAT`]).
+    pub fn insert_time_skip(&mut self, skip: TimeSkip) {
+        if !self.inner.lists_its_time_skips() {
+            self.inner.format_version = Some(TIME_SKIPS_FORMAT);
+        }
+        self.inner
+            .time_skips
+            .get_or_insert_with(Vec::new)
+            .push(skip);
+    }
+
+    /// The position the next stored record takes in the recorded stream:
+    /// where a jump made now falls (`TimeSkip::event`).
+    pub fn stream_position(&self) -> u64 {
+        let position = match &self.boundary_records {
+            Some(records) => records.len(),
+            None => self.inner.global.len(),
+        };
+        position as u64
     }
 
     /// Select the explicit boundary protocol before recording any global

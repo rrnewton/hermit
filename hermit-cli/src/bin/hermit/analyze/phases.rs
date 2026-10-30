@@ -983,6 +983,8 @@ impl AnalyzeOpts {
             let path = newrun.sched_path_out().to_path_buf();
             let record = PreemptionReader::try_new(&path)?.into_inner();
             RunData::require_complete_record(&record, &path)?;
+            // Only a completed trial contributes its realized schedule and jumps.
+            self.time_skip_sources.lock().unwrap().remember(&record);
             Ok(CompletedScheduleTrial {
                 target_met: newrun.is_a_match(),
                 schedule: record.into_global(),

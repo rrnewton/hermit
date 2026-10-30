@@ -266,14 +266,23 @@ impl InterpolateOpts {
                     .collect::<Vec<_>>(),
             )
         };
-        let next_sched = PreemptionRecord::from_sched_events(requested_schedule)
-            .retain_replay_departure(first_record.replay_departed_at())
-            .retain_replay_departure(second_record.replay_departed_at())
-            .with_guest_ids(guest_ids)
-            .with_pipe_wake_latency(latency)
-            .with_signal_state_copy(copy)
-            .with_expired_wait_runs_charged_once(charged_once);
-        Ok(next_sched)
+        // Preserve main's first-input guest-ID refusal policy and its
+        // existing option reconciliation before comparing the other metadata,
+        // retaining each input's replay departure (4860) through the merge.
+        let first_departed = first_record.replay_departed_at();
+        let second_departed = second_record.replay_departed_at();
+        let reconciled = |record: PreemptionRecord| {
+            record
+                .retain_replay_departure(first_departed)
+                .retain_replay_departure(second_departed)
+                .with_guest_ids(guest_ids)
+                .with_pipe_wake_latency(latency)
+                .with_signal_state_copy(copy)
+                .with_expired_wait_runs_charged_once(charged_once)
+        };
+        reconciled(first_record)
+            .interpolate_events(&reconciled(second_record), requested_schedule)
+            .map_err(anyhow::Error::msg)
     }
 
     /// Numbering must agree just as it must for replay. The refusal policy
@@ -450,6 +459,147 @@ fn print_boundaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn interpolation_input(events: Vec<SchedEvent>) -> PreemptionRecord {
+        // Nondefault current-main metadata must survive together with the new
+        // format/jump fields. Deserialize the public record representation,
+        // as the command does, rather than constructing private fields.
+        let mut value =
+            serde_json::to_value(PreemptionRecord::from_sched_events(events).with_current_format())
+                .unwrap();
+        value["epoch"] = serde_json::json!("2026-01-01T00:00:00Z");
+        value["cap_preemption_charge"] = serde_json::json!(true);
+        value["chaos_timeslice"] = serde_json::json!(123_456);
+        value["rng_seed"] = serde_json::json!(987);
+        value["store_exclusive_failures"] = serde_json::json!(7);
+        value["host_inputs"] = serde_json::json!({"digest": "source-inputs", "files": []});
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn interpolate_records(
+        first: &PreemptionRecord,
+        second: &PreemptionRecord,
+        interpolate: u8,
+    ) -> anyhow::Result<PreemptionRecord> {
+        let directory = tempfile::tempdir().unwrap();
+        let file_a = directory.path().join("a.events");
+        let file_b = directory.path().join("b.events");
+        first.write_to_disk(&file_a).unwrap();
+        second.write_to_disk(&file_b).unwrap();
+        InterpolateOpts {
+            interpolate,
+            file_a,
+            file_b,
+        }
+        .interpolated_record()
+    }
+
+    #[test]
+    fn interpolation_preserves_source_metadata_and_refuses_unmapped_time_history() {
+        use detcore::preemptions::TimeSkip;
+        use detcore::preemptions::TimeSkipReason;
+        use detcore_model::pid::GuestIds;
+        use detcore_model::time::LogicalTime;
+        let events: Vec<_> = [3, 4, 5]
+            .map(|tid| SchedEvent::branches(DetTid::from_raw(tid), 1))
+            .into();
+        let first = interpolation_input(events.clone()).with_time_skips(vec![TimeSkip {
+            event: 1,
+            target: LogicalTime::from_nanos(1_000),
+            reason: TimeSkipReason::FifoOpenAlone,
+        }]);
+        // A=A through the command's actual read/interpolate path preserves
+        // every serialized field, including host-observed counts (whose Eq
+        // implementation intentionally ignores their value).
+        for percentage in [0, 50, 100] {
+            let result = interpolate_records(&first, &first, percentage).unwrap();
+            assert_eq!(
+                serde_json::to_value(&result).unwrap(),
+                serde_json::to_value(first.clone().with_guest_ids(GuestIds::Namespace)).unwrap()
+            );
+            assert!(result.charges_replayed_switch_ins());
+            assert_eq!(result.time_skips(), first.time_skips());
+        }
+        let mut reverse = events.clone();
+        reverse.reverse();
+        let second = interpolation_input(reverse).with_time_skips(vec![TimeSkip {
+            event: 2,
+            target: LogicalTime::from_nanos(2_000),
+            reason: TimeSkipReason::IdleGuestPollers,
+        }]);
+        let mut endpoint_schedules = Vec::new();
+        for percentage in [0, 100] {
+            let result = interpolate_records(&first, &second, percentage).unwrap();
+            let source = if result.schedevents() == first.schedevents() {
+                &first
+            } else {
+                assert_eq!(result.schedevents(), second.schedevents());
+                &second
+            };
+            assert_eq!(
+                serde_json::to_value(&result).unwrap(),
+                serde_json::to_value(source.clone().with_guest_ids(GuestIds::Namespace)).unwrap()
+            );
+            endpoint_schedules.push(result.into_global());
+        }
+        assert_ne!(endpoint_schedules[0], endpoint_schedules[1]);
+        let error = interpolate_records(&first, &second, 50).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mixed schedule with recorded time jumps"),
+            "{error}"
+        );
+
+        let other_format = first.clone().with_format(Some(2));
+        let error = interpolate_records(&first, &other_format, 50).unwrap_err();
+        assert!(error.to_string().contains("record formats"), "{error}");
+    }
+
+    #[test]
+    fn mixed_interpolation_keeps_compatible_metadata_and_rejects_raw_count_mismatches() {
+        let events: Vec<_> = [3, 4, 5]
+            .map(|tid| SchedEvent::branches(DetTid::from_raw(tid), 1))
+            .into();
+        let first = interpolation_input(events.clone());
+        let mut reverse = events;
+        reverse.reverse();
+        let second = interpolation_input(reverse);
+        for format in [None, Some(2), Some(3)] {
+            let first = first.clone().with_format(format);
+            let second = second.clone().with_format(format);
+            let result = interpolate_records(&first, &second, 50).unwrap();
+            assert_ne!(result.schedevents(), first.schedevents());
+            assert_ne!(result.schedevents(), second.schedevents());
+            let mut expected = serde_json::to_value(&first).unwrap();
+            expected["global"] = serde_json::to_value(result.schedevents()).unwrap();
+            expected["guest_ids"] =
+                serde_json::to_value(detcore_model::pid::GuestIds::Namespace).unwrap();
+            assert_eq!(serde_json::to_value(&result).unwrap(), expected);
+            for (field, changed) in [
+                ("store_exclusive_failures", serde_json::json!(8)),
+                ("epoch", serde_json::json!("2026-01-02T00:00:00Z")),
+                ("rng_seed", serde_json::json!(988)),
+                ("chaos_timeslice", serde_json::json!(123_457)),
+                ("cap_preemption_charge", serde_json::json!(false)),
+                (
+                    "host_inputs",
+                    serde_json::json!({"digest": "other-inputs", "files": []}),
+                ),
+            ] {
+                let mut value = serde_json::to_value(&second).unwrap();
+                value[field] = changed;
+                let incompatible = serde_json::from_value(value).unwrap();
+                let error = interpolate_records(&first, &incompatible, 50).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("incompatible recording metadata"),
+                    "{field}: {error}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn identity_interpolation_preserves_chosen_guest_ids() {

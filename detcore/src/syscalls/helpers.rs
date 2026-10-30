@@ -361,6 +361,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrcs.blocked_signal_mask = blocked_signal_mask;
             rsrcs.blocked_signal_mask_unknown = blocked_signal_mask_unknown;
             rsrcs.replay_served_from_log = replay_served_from_log;
+            // A send leaving the turn reports a possible pass-out with this
+            // request (`Detcore::passes_descriptors_out_outside_the_turn`).
+            Detcore::<T>::passes_descriptors_out_outside_the_turn(guest, call);
             resource_request(guest, rsrcs).await;
         }
         after_grant(guest);
@@ -3056,9 +3059,26 @@ where
         // The call's memory as it began, for this attempt and for the reads
         // of it below, and what another thread wrote over it meanwhile, which
         // goes back once the attempt is made.
-        let displaced = entry_import
+        let mut displaced = entry_import
             .as_ref()
             .map(|entry| entry.reinstate(&mut guest.memory()));
+        // Classify the input the kernel will actually import: sendmsg keeps
+        // its entry-time header/control, while sendmmsg reads each attempt.
+        // The FD table may have changed during either call's retry wait.
+        if Detcore::<T>::passes_descriptors_out_now(guest, call.into()) {
+            // Never yield with captured bytes installed over a sibling's
+            // writes. Restore those writes before reporting the export,
+            // then capture the current displaced view after the new grant.
+            if let Err(error) = put_back_entry_import(guest, &entry_import, displaced.take(), false)
+            {
+                break Err(error);
+            }
+            let dettid = guest.thread_state().dettid;
+            let _ = resource_request(guest, Resources::new(dettid)).await;
+            displaced = entry_import
+                .as_ref()
+                .map(|entry| entry.reinstate(&mut guest.memory()));
+        }
         // A receive whose descriptors Detcore names reads its geometry again
         // right before each attempt: a sibling may have changed it while an
         // earlier attempt waited (`ThreadState::receive_geometry`).
@@ -3187,9 +3207,12 @@ where
                 record_retry_event(guest, call).await;
             }
         } else {
-            let res = call
-                .normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0)
-                .map_err(|e| e.into());
+            let normalized =
+                call.normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0);
+            if normalized != syscall_result {
+                guest.thread_state_mut().nonblocking_result_normalized = true;
+            }
+            let res = normalized.map_err(|e| e.into());
             if res.is_ok() {
                 completed_observation = attempt_observation;
             }
@@ -4393,9 +4416,12 @@ where
             }
         };
         if !call.syscall_would_have_blocked(syscall_result) {
-            let res = call
-                .normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0)
-                .map_err(|e| e.into());
+            let normalized =
+                call.normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0);
+            if normalized != syscall_result {
+                guest.thread_state_mut().nonblocking_result_normalized = true;
+            }
+            let res = normalized.map_err(|e| e.into());
             tracing::trace!(
                 "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",
                 rsrc.poll_attempt,

@@ -143,6 +143,7 @@ impl BisectOpts {
             // the run arguments' --timeout alone.
             trial_timeout: crate::analyze::TrialTimeout::Off,
             endpoints: Default::default(),
+            time_skip_sources: Default::default(),
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
@@ -171,6 +172,13 @@ impl BisectOpts {
             ("--good", &self.good),
             ("--bad", &self.bad),
         ])?;
+        // A trial spliced from either schedule's prefix makes the jumps of
+        // global time that prefix contains (`crate::time_skip_carry`).
+        {
+            let mut sources = analyzer.time_skip_sources.lock().unwrap();
+            sources.remember(&good);
+            sources.remember(&bad);
+        }
         let mut good = good.into_global();
         let mut bad = bad.into_global();
         // Analyze's trial outputs omit optional event timestamps. Put these
