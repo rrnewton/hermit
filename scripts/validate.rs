@@ -445,9 +445,17 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             ));
         }
     }
-    for (tag, profile) in [
-        ("build.workspace_in_pinned_root", "full"),
-        ("build.workspace_on_host", "hosted-portable"),
+    for (tag, profile, expected_feature_argument) in [
+        (
+            "build.workspace_in_pinned_root",
+            "full",
+            "--features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/liteinst &&",
+        ),
+        (
+            "build.workspace_on_host",
+            "hosted-portable",
+            "--features hermit-run/kvm-native-test-support,hermit-run/liteinst &&",
+        ),
     ] {
         let Some(producer) = cfg.steps.iter().find(|step| step.tag() == tag) else {
             if tag == "build.workspace_on_host" {
@@ -478,7 +486,7 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
                 .map_err(|error| format!("release-artifact bracket: {tag}: {error}"))?;
         if !source.ends_with(&unified)
             || !unified.contains("--profile validate --workspace --all-targets")
-            || !unified.contains("hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/liteinst")
+            || !unified.contains(expected_feature_argument)
             || source.contains("--bin hermit")
             || !source.contains("./ci/run-with-core-build.sh cargo build --locked --profile validate --workspace")
             || source.contains("third-party-backends")
@@ -8285,6 +8293,12 @@ mod ordinary_artifact_pointer_tests {
         std::fs::write(&binary, format!("#!/bin/sh\n# {marker}\nexit 0\n")).unwrap();
         exec_safe_fs::set_executable(&binary, 0o700).unwrap();
         let install = root.join("fixture-install");
+        std::fs::create_dir_all(install.join("licenses")).unwrap();
+        for name in ["LICENSE", "README.txt", "licenses/LICENSE"] {
+            std::fs::write(install.join(name), format!("{marker} {name}\n")).unwrap();
+        }
+        exec_safe_fs::copy(&binary, install.join("hermit")).unwrap();
+        exec_safe_fs::set_executable(install.join("hermit"), 0o700).unwrap();
         for name in ["libdetcore_liteinst.so", "libreverie_liteinst.so"] {
             let path = install.join("rsrcs").join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -32307,7 +32321,7 @@ mod fused_privileged_build_tests {
             "#!/bin/sh\nexit 0\n",
         );
         write_executable(
-            &root.path().join("ci/run-with-reverie-dbt-budget.sh"),
+            &root.path().join("ci/run-with-core-build.sh"),
             "#!/bin/sh\nexec \"$@\"\n",
         );
         write_executable(
