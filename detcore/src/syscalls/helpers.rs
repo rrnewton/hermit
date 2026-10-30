@@ -619,7 +619,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let guest_held = syscall_targets_guest_held_fd(guest, call.into());
         let mut resources = pipe_writev_resources(guest.thread_state().dettid, call, guest_held);
         resources.polls_a_named_fifo = is_named_fifo(guest, call.fd());
-        resources.polls_guest_state_only |= resources.polls_a_named_fifo;
+        resources.polls_guest_state_only = self.cfg.recordreplay_modes
+            || resources.polls_guest_state_only
+            || resources.polls_a_named_fifo;
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
             .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
@@ -974,8 +976,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.private_sigchld_decides = true;
         resources.polls_a_named_fifo = is_named_fifo(guest, call.fd());
         resources.relies_on_guest_held_marks = syscall_targets_guest_held_fd(guest, call.into());
-        resources.polls_guest_state_only =
-            resources.relies_on_guest_held_marks || resources.polls_a_named_fifo;
+        resources.polls_guest_state_only = self.cfg.recordreplay_modes
+            || resources.relies_on_guest_held_marks
+            || resources.polls_a_named_fifo;
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
             .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
@@ -1640,6 +1643,9 @@ fn pollfd_descriptors(bytes: &[u8]) -> Vec<i32> {
 pub(crate) struct GuestHeldPollProof {
     call: Syscall,
     targets: Option<GuestHeldPollTargets>,
+    /// Whether the call claimed a proof at capture: a claimed proof, once
+    /// lost, stays lost for this call.
+    claimed: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -1667,7 +1673,11 @@ impl GuestHeldPollProof {
         if resources.relies_on_guest_held_marks && targets.is_none() {
             Self::clear(resources);
         }
-        Self { call, targets }
+        Self {
+            claimed: resources.relies_on_guest_held_marks,
+            call,
+            targets,
+        }
     }
 
     pub(crate) fn revalidate<T, G>(&mut self, guest: &mut G, resources: &mut Resources)
@@ -1677,6 +1687,11 @@ impl GuestHeldPollProof {
     {
         if self.targets.is_some() && Self::read_targets(guest, self.call) != self.targets {
             self.targets = None;
+            Self::clear(resources);
+        } else if self.targets.is_none() && self.claimed {
+            // A proof once lost (or never captured for a call that claimed
+            // one) cannot be reacquired by a later refresh of the same
+            // call's classification: restored operands do not restore it.
             Self::clear(resources);
         }
     }
@@ -3211,6 +3226,9 @@ where
         // scheduler's progress/freshness checks prevent the older queued
         // request from justifying an idle jump before this new probe.
         refresh_guest_poll_state(guest, call.into(), &mut rsrc);
+        // The refresh above recomputes the classification from the current
+        // table; a guest-held proof this call already lost stays lost.
+        guest_held.revalidate(guest, &mut rsrc);
         let resumed = match call.into() {
             Syscall::Read(read) if maybe_timeout.is_none() && maybe_stackguard.is_none() => {
                 crate::tool_global::polled_read_request(guest, read, rsrc.clone()).await
@@ -3340,17 +3358,9 @@ where
             .await;
         }
         // A sibling may have replaced the destination descriptor while this
-        // attempt waited for its turn. Recheck the channel immediately before
-        // each send, independently of the mutable control data.
-        match call.into() {
-            Syscall::Sendmsg(send) => {
-                Detcore::<T>::note_descriptors_passed_out(guest, send.fd(), None, false);
-            }
-            Syscall::Sendmmsg(send) => {
-                Detcore::<T>::note_descriptors_passed_out(guest, send.sockfd(), None, false);
-            }
-            _ => {}
-        }
+        // attempt waited for its turn. The per-attempt check above
+        // (`passes_descriptors_out_now`) rechecks the channel immediately
+        // before each send, independently of the mutable control data.
         // Read actual metadata after reinstatement and all earlier awaits.
         // Observation adds no reads or allocation when buffer logging is off.
         let attempt_observation =
@@ -7988,7 +7998,7 @@ pub(crate) mod kernel_signal_wait_failures {
                         script.publications.push(*mask);
                         return (None, GlobalResponse::SetSavedGuestSigmask(()));
                     }
-                    GlobalRequest::TraceSchedEvent(_, _, _) => {
+                    GlobalRequest::TraceSchedEvent(..) => {
                         let mut script = script.lock().unwrap();
                         assert!(script.observe_retry_masks);
                         let blocked = self.kernel.lock().unwrap().blocked;

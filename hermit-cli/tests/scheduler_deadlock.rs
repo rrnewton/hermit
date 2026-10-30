@@ -38,6 +38,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use detcore_model::HERMIT_GUEST_DEADLOCK_EXIT;
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -1190,7 +1191,7 @@ fn a_poll_with_no_possible_progress_reports_a_deadlock() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
-            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            Some(HERMIT_GUEST_DEADLOCK_EXIT),
             "run {run} must end with the scheduler deadlock status\nstderr:\n{stderr}"
         );
         assert_eq!(

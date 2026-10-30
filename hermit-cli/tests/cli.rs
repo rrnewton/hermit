@@ -915,6 +915,13 @@ fn binder_fd_passing_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "binder-fd-passing guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 fn pipe_reader_replay_guest() -> &'static Path {
     PIPE_READER_REPLAY_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))

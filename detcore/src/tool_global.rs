@@ -9579,6 +9579,7 @@ where
     // can suspend before the request reaches the scheduler, and cancellation
     // must leave it available to the consuming exit hook.
     r.passes_descriptors_out |= guest.thread_state().passed_descriptors_out_unreported;
+    let carried_export = r.passes_descriptors_out;
     // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;
@@ -9607,6 +9608,13 @@ where
         r.guest_signal_mask = publish_request_guest_mask(guest, &r);
         let resp =
             send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
+        if carried_export {
+            // The scheduler has been told: consume the local fact now that
+            // publication completed (a future dropped before this point
+            // retains it for the exit hook), and do not report it again.
+            guest.thread_state_mut().passed_descriptors_out_unreported = false;
+            guest.thread_state_mut().passed_descriptors_out_reported = true;
+        }
         match resp.1 {
             GlobalResponse::RequestResources(x) => {
                 use reverie::reserved_input::InputGrantKind;
@@ -17923,6 +17931,7 @@ mod tests {
                         syscall_count: 0,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        passed_descriptors_out: false,
                         killed_by_group_signal: false,
                     }),
                 ),
@@ -22975,8 +22984,13 @@ mod robust_exit_clock_tests {
                 assert!(sched.next_turns.contains_key(&reader));
                 assert_eq!(sched.turn, 0, "exit publication must not take a turn");
                 let rpcs = rpc_observations.lock().unwrap();
-                assert_eq!(rpcs.len(), 1, "reuse the existing exit notification");
-                assert_eq!(rpcs[0].kind, "deregister");
+                // The export rides the deregistration itself: that is the
+                // one exit notification for it (the SIGKILL robust-list take
+                // is the chain's separate, pre-existing exit RPC).
+                let deregisters: Vec<_> =
+                    rpcs.iter().filter(|rpc| rpc.kind == "deregister").collect();
+                assert_eq!(deregisters.len(), 1, "reuse the existing exit notification");
+                assert!(deregisters[0].accepted);
                 assert!(rpcs[0].accepted);
             }
             assert_reader_after_sender_exit(&state, reader, exported).await;

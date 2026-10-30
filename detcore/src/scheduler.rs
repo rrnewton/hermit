@@ -21867,7 +21867,7 @@ mod test {
         grant_guest_poll(&mut sched, sibling, 0);
         sched.logically_kill_thread(&sibling, &DetPid::from_raw(5), MmId::initial(sibling));
         assert!(!sched.next_turns.contains_key(&sibling));
-        assert!(sched.retired_at > sched.last_attempt_at[&reader]);
+        assert!(sched.retired_at > sched.last_commit_at[&reader]);
         assert!(!sched.only_idle_guest_pollers_remain());
         grant_guest_poll(&mut sched, reader, 1);
         queue_guest_poll(&mut sched, reader, 2);

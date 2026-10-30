@@ -567,7 +567,7 @@ fn blocked_and_ignored_handlers_still_report_the_idle_reader_deadlock() {
         let output = run(&program, mode, true, directory.path());
         assert_eq!(
             output.status.code(),
-            Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
             "{mode}: {output:?}"
         );
         assert_eq!(output.stdout, b"READY\n", "{mode}: {output:?}");
@@ -631,7 +631,7 @@ fn blocked_and_ignored_handlers_still_report_idle_poll_deadlocks() {
         let output = run(&program, mode, true, directory.path());
         assert_eq!(
             output.status.code(),
-            Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
             "{mode}: {output:?}"
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -683,7 +683,7 @@ fn one_shot_handler_byte_is_progress_and_its_return_without_a_byte_is_deadlock()
     let hermit = run_observed(&program, mode, true, directory.path());
     assert_eq!(
         hermit.output.status.code(),
-        Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
+        Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
         "{hermit:?}"
     );
     assert_eq!(hermit.output.stdout, native.output.stdout, "{hermit:?}");

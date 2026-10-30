@@ -50,6 +50,7 @@ async fn a_retired_siblings_late_request_stays_unanswered() {
                 thread,
                 requests: Mutex::new(Vec::new()),
                 retired: std::sync::atomic::AtomicBool::new(false),
+                hold_private_memory_publication: false,
             }
         };
         let mut receiving = guest_of(receiver);
@@ -132,6 +133,7 @@ async fn a_retired_siblings_late_request_stays_unanswered() {
                         syscall_count: 0,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        passed_descriptors_out: false,
                         killed_by_group_signal: true,
                     }),
                 ),

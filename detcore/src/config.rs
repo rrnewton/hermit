@@ -148,7 +148,7 @@ mod tests {
         // Adds `Resources.polls_a_named_fifo`
         // (https://github.com/rrnewton/hermit/pull/4692, allocated revision 18
         // at integration; digests measured at this head).
-        (18, "5e3c31a8fe54f2a1", "f013e36743d8d9e6"),
+        (18, "c413f205051a27d4", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
