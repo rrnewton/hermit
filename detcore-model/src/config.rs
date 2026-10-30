@@ -416,23 +416,6 @@ pub struct Config {
     #[clap(skip)]
     pub launch_image: Option<LaunchImage>,
 
-    /// The kinds of file behind the guest's standard descriptors as its
-    /// launch gives them ([`crate::host_input::StdioKinds`]): this process's
-    /// own where the guest inherits them, and the stdin and pipes an
-    /// output-capturing launch (`--verify`, analyze and bisect trials, and
-    /// the SaBRe and LiteInst launches) gives it instead. A run that records
-    /// its host inputs keeps them in its set, and a replay names each that
-    /// differs from its recording's. `None` where the launch does not say
-    /// (KVM, whose runtime serves the guest's stdio itself, and DBT), and
-    /// then no kinds are recorded.
-    ///
-    /// The host sets it, not a flag, when it launches the guest. Like
-    /// `launch_image` it has no legacy key, so DBT's legacy form never
-    /// carries it.
-    #[serde(default)]
-    #[clap(skip)]
-    pub launch_stdio: Option<crate::host_input::StdioKinds>,
-
     /// The seccomp state the guest inherits from the thread that starts it
     /// ([`InheritedSeccomp`]). The caller that starts the guest states it, as
     /// only the caller knows the filters its launch installs, such as those of
@@ -3031,7 +3014,7 @@ impl Default for Config {
 /// `BackendCapabilities::host_timed_signals_are_physical` holds, false for
 /// DBT, and [`Config::in_guest_detlog_forward_policy`] and
 /// [`Config::in_guest_site_patching_off`], which is unset for DBT, and
-/// [`Config::launch_image`] and [`Config::launch_stdio`], which came after it. So is [`Config::target_timeslice_syscalls_only`],
+/// [`Config::launch_image`], which came after it. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
 /// option has no effect. So are [`Config::futex_wake_yields`],
 /// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`] and
@@ -3561,8 +3544,7 @@ mod legacy_backend_json {
     /// `launch_image` came after the legacy form froze: it is never written
     /// and reads as unset. DBT's runtime takes it from the coordinator's
     /// configuration instead, which declares DynamoRIO's library as the
-    /// launcher. `launch_stdio` came after it too: DBT's runtime records no
-    /// host inputs, so it is never written and reads as unset.
+    /// launcher.
     /// `inherited_seccomp` came after the legacy form froze too. It is never
     /// written and reads as unknown.
     /// `cpu_profile` and `cpu_profile_host` came after it as well. DBT refuses
@@ -3618,7 +3600,7 @@ mod legacy_backend_json {
     // reads as absent, its serde default.
     /// `replay_continue_fairly` came after it too; only the scheduler reads
     /// it, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 46] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 45] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3628,7 +3610,6 @@ mod legacy_backend_json {
         "in_guest_reserved_signals",
         "in_guest_refuses_host_timed_producers",
         "launch_image",
-        "launch_stdio",
         "target_timeslice_syscalls_only",
         "futex_wake_yields",
         "pipe_wake_latency",
@@ -3760,7 +3741,7 @@ mod legacy_backend_json {
     /// [`Config::in_guest_reserved_signals`],
     /// [`Config::in_guest_refuses_host_timed_producers`],
     /// [`Config::in_guest_signal_delivery`], [`Config::launch_image`],
-    /// [`Config::launch_stdio`], [`Config::target_timeslice_syscalls_only`],
+    /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
     /// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`],
     /// [`Config::virtual_timeout`], [`Config::inherited_seccomp`] or [`Config::replay_edited_preemptions`] takes
@@ -3825,7 +3806,6 @@ mod legacy_backend_json {
                 Some(
                     "in_guest_detlog_forward_policy"
                     | "launch_image"
-                    | "launch_stdio"
                     | "detlog_anon"
                     | "scheduler_turn_cost"
                     | "virtual_timeout"
@@ -4129,7 +4109,6 @@ mod legacy_backend_json {
                 | "in_guest_reserved_signals"
                 | "in_guest_refuses_host_timed_producers"
                 | "launch_image"
-                | "launch_stdio"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
@@ -5009,7 +4988,7 @@ mod tests {
     /// `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
     /// `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
     /// `in_guest_signal_delivery`,
-    /// `launch_image`, `launch_stdio`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
+    /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
     /// `scheduler_turn_cost`, `cap_preemption_charge`,
     /// `inherited_seccomp`, `replay_edited_preemptions` or `detlog_anon`,
@@ -5036,7 +5015,6 @@ mod tests {
                 | "in_guest_reserved_signals"
                 | "in_guest_refuses_host_timed_producers"
                 | "launch_image"
-                | "launch_stdio"
                 | "target_timeslice_syscalls_only"
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
@@ -5086,7 +5064,7 @@ mod tests {
         // `guest_may_inherit_a_terminal`,
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
-        // `launch_image`, `launch_stdio`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
+        // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `expired_wait_charge`, `replaying`, `scheduler_turn_cost`,
         // `cap_preemption_charge`, `virtual_timeout`, `inherited_seccomp`, `cpu_profile`,
         // `cpu_profile_host`, `cpu_profile_source`,
@@ -5108,9 +5086,9 @@ mod tests {
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes`, `replay_continue_fairly` and
         // `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-five fewer, so thirty-one keys fewer than fields.
+        // forty-four fewer, so thirty keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 31);
+        assert_eq!(fields.len(), keys.len() + 30);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

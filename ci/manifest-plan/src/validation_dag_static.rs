@@ -1221,7 +1221,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // The retry stack adds three: 1929 + 3 = 1932, re-measured 2026-10-31.
     // And detcore-model host_input::tests::stdio_kinds_name_each_changed_descriptor: 1933.
-    ("test.regular_crates", 1933),
+    // And host_input::tests::terminal_devices_follow_the_kernels_driver_list: 1934.
+    ("test.regular_crates", 1934),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4491,7 +4492,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The retry stack adds one cli case: 744 + 1 = 745.
     // And a_schedule_replay_names_a_stdio_kind_changed_since_the_recording: 746.
     // And a_verify_run_records_the_stdio_kinds_its_guest_was_given: 747.
-    ("test.cli", 747),
+    // And a_library_run_records_the_stdio_kinds_of_its_commands_descriptors: 748.
+    ("test.cli", 748),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5066,11 +5068,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same retry-stack cli case: 663 + 1 = 664.
     // And the same stdio-kind replay test: 665.
     // And the same captured-run stdio-kind test: 666.
-    ("test.cli_on_host", 666),
+    // And the same library-run stdio-kind test: 667.
+    ("test.cli_on_host", 667),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
-    // Kept equal to the second test.regular_crates_on_host entry below: 1919.
-    ("test.regular_crates_on_host", 1919),
+    // Kept equal to the second test.regular_crates_on_host entry below: 1920.
+    ("test.regular_crates_on_host", 1920),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6201,7 +6204,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // The retry stack: the same three added cases: 1932 - 14 = 1918.
     // And the same detcore-model stdio unit: 1919.
-    ("test.regular_crates_on_host", 1919),
+    // And the same terminal-device unit: 1920.
+    ("test.regular_crates_on_host", 1920),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
