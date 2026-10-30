@@ -600,6 +600,20 @@ mod tests {
         .with_current_format()
         .with_time_skips(vec![])
         .with_reserved_input(ReservedInputMetadata(Some(serde_json::Value::Null)));
+        // The inherited format stores no jumps as None, even in format 3.
+        // Check the inputs so this test cannot mistake normalization for a
+        // metadata loss introduced by interpolation.
+        for source in [&first, &second] {
+            assert_eq!(source.time_skips(), None);
+            assert_eq!(source.format_version(), Some(3));
+            source.validate().unwrap();
+            assert!(
+                serde_json::to_value(source)
+                    .unwrap()
+                    .get("time_skips")
+                    .is_none()
+            );
+        }
         let mixed = first
             .interpolate_events(
                 &second,
@@ -608,13 +622,31 @@ mod tests {
             .unwrap();
         assert_eq!(mixed.reserved_input(), first.reserved_input());
         assert_eq!(mixed.format_version(), Some(3));
-        assert_eq!(mixed.time_skips(), Some([].as_slice()));
+        assert_eq!(mixed.time_skips(), None);
+        assert!(
+            serde_json::to_value(&mixed)
+                .unwrap()
+                .get("time_skips")
+                .is_none()
+        );
         assert_eq!(
             first
                 .interpolate_events(&second, second.global.clone())
                 .unwrap(),
             second
         );
+        // An explicitly stored empty list is invalid under the inherited
+        // format contract, including when the requested events are an endpoint.
+        let mut invalid = first.clone();
+        invalid.time_skips = Some(vec![]);
+        for (left, right) in [(&invalid, &second), (&second, &invalid)] {
+            for events in [left.global.clone(), right.global.clone()] {
+                assert_eq!(
+                    left.interpolate_events(right, events).unwrap_err(),
+                    "an empty list of time skips is written as no list"
+                );
+            }
+        }
     }
 
     #[test]

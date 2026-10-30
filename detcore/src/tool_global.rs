@@ -9853,6 +9853,9 @@ mod reserved_input_registration_tests {
             .backend_bind_tool_identity(native.task, 5000, 5000)
             .unwrap();
         global.on_reserved_input_task(bound).unwrap();
+        // Production initial-state admission seeds this native table before preinit
+        // or a child can run. This identity fixture models that bookkeeping only.
+        crate::reserved_input::register_initial_history(&control, native.task).unwrap();
         let logical = DetTid::from_raw(5000);
         {
             let mut scheduler = global.sched.lock().unwrap();
