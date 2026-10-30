@@ -4975,7 +4975,7 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
         "{error}"
     );
     for backend in ["--backend=dbt", "--backend=kvm"] {
-        let mut unavailable = run_opts_for(&["hermit", "run", backend, "--chaos", run, "prog"]);
+        let mut unavailable = run_opts_for(&["hermit", backend, "run", "--chaos", run, "prog"]);
         let error = format!(
             "{:#}",
             unavailable
