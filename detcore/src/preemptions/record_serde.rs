@@ -456,4 +456,48 @@ mod tests {
             }
         }
     }
+
+    /// The record format is a record field main's serde must list: a record in
+    /// the plain form written before this serde, with the field, reads back
+    /// into it, and a plain record and a marked envelope written now keep it.
+    #[test]
+    fn the_record_format_round_trips_through_the_record_serde() {
+        let old: PreemptionRecord =
+            serde_json::from_str(r#"{"per_thread":{},"global":[],"format_version":2}"#).unwrap();
+        assert_eq!(old.format_version, Some(2));
+        let mut marked = old.clone();
+        marked.replay_departed_at = Some(3);
+        for record in [old, marked] {
+            let text = serde_json::to_string(&record).unwrap();
+            let back: PreemptionRecord = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.format_version, Some(2), "{text}");
+            assert_eq!(back, record, "{text}");
+            assert_eq!(back.replay_departed_at, record.replay_departed_at, "{text}");
+        }
+    }
+
+    /// The poll skips are a record field main's serde must list: a record in
+    /// the plain form written before this serde, with the field, reads back
+    /// into it, and a plain record and a marked envelope written now keep it.
+    #[test]
+    fn the_poll_skips_round_trip_through_the_record_serde() {
+        let old: PreemptionRecord = serde_json::from_str(
+            r#"{"per_thread":{},"global":[],"format_version":2,"poll_skips":[{"after":1,"thread":5}]}"#,
+        )
+        .unwrap();
+        let skips = vec![PollSkip {
+            after: 1,
+            thread: DetTid::from_raw(5),
+        }];
+        assert_eq!(old.poll_skips, skips);
+        let mut marked = old.clone();
+        marked.replay_departed_at = Some(3);
+        for record in [old, marked] {
+            let text = serde_json::to_string(&record).unwrap();
+            let back: PreemptionRecord = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.poll_skips, skips, "{text}");
+            assert_eq!(back, record, "{text}");
+            assert_eq!(back.replay_departed_at, record.replay_departed_at, "{text}");
+        }
+    }
 }
