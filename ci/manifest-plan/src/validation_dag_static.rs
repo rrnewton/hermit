@@ -5104,7 +5104,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three package K slice P1 KVM tests: 91 + 3 = 94, listed.
     // And the same two group-exit signal-wait KVM tests: 94 + 2 = 96, listed.
     // And the same five working-directory KVM tests: 96 + 5 = 101, listed.
-    ("privileged-only-test.cli_kvm_on_host", 102),
+    // And run_kvm_virtual_timeout_is_reported_from_the_childs_note: 102 + 1 = 103,
+    // re-measured at the bc60c6a3 fix-forward head (validate run 1436).
+    ("privileged-only-test.cli_kvm_on_host", 103),
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
