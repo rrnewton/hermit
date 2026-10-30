@@ -1098,6 +1098,28 @@ pub struct Config {
     #[clap(long, value_enum, value_name = "each|once")]
     pub expired_wait_charge: Option<ExpiredWaitCharge>,
 
+    /// When a queued plain sleep (a request for `SleepUntil` alone, not yet due) becomes a timed
+    /// waiter: `first-pass`, at the first quiescent scheduler pass that finds it queued, whatever
+    /// the priorities, as a Linux hrtimer is armed when the sleep starts; or `when-chosen`, only
+    /// when its thread is chosen before its deadline, so a sleeper behind threads of better
+    /// priority wakes later. Unset, `when-chosen` under `--chaos` or a `--sched-heuristic` that
+    /// does not select by priority, where those late wakes are what real sleep-ordered races
+    /// depend on, and on a backend whose sleepers' signal mask and dispositions the scheduler
+    /// does not read (DBT, SaBRe and LiteInst without the in-guest delivery gate, KVM), and
+    /// `first-pass` otherwise. On such a backend a sleep parked at the first pass would be ended
+    /// by any signal the scheduler sends it, including one Linux ignores or the sleeper blocks,
+    /// so `first-pass` there, asked for or taken from a record, is refused by name before the
+    /// guest starts. A replay of a schedule or of preemptions that
+    /// leaves this unset takes the value its record stores (a record that stores none, written
+    /// before the option existed or by a `when-chosen` run, registered sleeps when chosen), and an
+    /// explicit value that disagrees with the record is refused. `hermit analyze` and `hermit
+    /// bisect` run every trial under the value of the recording they start from, or
+    /// `when-chosen` when analyze records its own chaos target. Under `hermit record` and
+    /// `hermit replay` a sleep is registered when chosen, as before, whatever the value.
+    #[serde(default)]
+    #[clap(long, value_enum, value_name = "first-pass|when-chosen")]
+    pub sleep_registration: Option<SleepRegistration>,
+
     /// Write a work/span report of the run's schedule to this path as JSON when the run ends
     /// normally: work (the sum of every thread's guest CPU time, in virtual nanoseconds), a
     /// lower span over the scheduler's certain happens-before edges (program order, spawn, a
@@ -1643,6 +1665,17 @@ impl Config {
         self.sequentialize_threads && self.backend.kernel_signal_targets_are_predictable
     }
 
+    /// Whether the scheduler reads a sleeper's signal mask and dispositions
+    /// (`Scheduler::signal_sleep`): where it models the kernel's signal targets
+    /// (`models_signal_targets`), or under the in-guest delivery gate. Elsewhere
+    /// (DBT, SaBRe and LiteInst without the gate, KVM) a sleep parked as a
+    /// timed waiter is woken by any signal the scheduler sends it, including a
+    /// default-ignored `SIGCHLD` or a signal the sleeper blocks, which Linux
+    /// never lets end a sleep.
+    pub fn reads_sleeper_signal_state(&self) -> bool {
+        self.models_signal_targets() || self.in_guest_signal_delivery
+    }
+
     /// Whether `signal` is one of [`Config::in_guest_reserved_signals`]. Never
     /// signal 0 (an existence check sends nothing), nor a number outside 1 to
     /// 64, which Linux refuses with EINVAL before any target is named. Always
@@ -1945,6 +1978,33 @@ impl Config {
             }
     }
 
+    /// Whether a queued plain sleep is registered as a timed waiter at the first quiescent pass
+    /// that finds it queued (`--sleep-registration`): the explicit value, or by default outside
+    /// race search (`--chaos`, or a `--sched-heuristic` that does not select by priority) where
+    /// the scheduler reads a sleeper's signal state (`reads_sleeper_signal_state`). Never under
+    /// `hermit record` and `hermit replay`, whose schedule must not change. A replay that leaves
+    /// the option unset takes its record's value instead (`Scheduler::new`).
+    ///
+    /// A registered sleep is parked, and a signal the scheduler sends a parked sleep wakes it
+    /// whatever the signal is unless the scheduler can read the sleeper's mask and dispositions
+    /// (`Scheduler::signal_sleep`). Without them (DBT, SaBRe and LiteInst without the in-guest
+    /// gate, KVM), a default-ignored `SIGCHLD` or a blocked timer signal would end every plain
+    /// sleep with `EINTR`, where Linux never wakes it. So the default registers when chosen on
+    /// those backends, as before (<https://github.com/rrnewton/hermit/pull/4682>); an explicit
+    /// `first-pass` there, or one taken from a record, is refused before the guest starts, and
+    /// the scheduler does not register there whatever this says, so a record states what it did.
+    pub fn queued_sleeps_registered_at_first_pass(&self) -> bool {
+        !self.recordreplay_modes
+            && match self.sleep_registration {
+                Some(registration) => registration == SleepRegistration::FirstPass,
+                None => {
+                    !self.chaos
+                        && self.sched_heuristic.is_priority_ordered()
+                        && self.reads_sleeper_signal_state()
+                }
+            }
+    }
+
     /// Should we convert sockets to SOCK_NONBLOCK?
     pub fn use_nonblocking_sockets(&self) -> bool {
         self.sequentialize_threads && !self.debug_externalize_sockets
@@ -2181,6 +2241,9 @@ impl fmt::Display for Config {
         }
         if let Some(charge) = self.expired_wait_charge {
             write!(f, " --expired-wait-charge={}", charge.as_str())?;
+        }
+        if let Some(registration) = self.sleep_registration {
+            write!(f, " --sleep-registration={}", registration.as_str())?;
         }
         if let Some(report) = &self.work_span_report {
             write!(f, " --work-span-report={}", report.display())?;
@@ -2437,6 +2500,46 @@ impl ExpiredWaitCharge {
         match self {
             Self::Each => "each",
             Self::Once => "once",
+        }
+    }
+}
+
+/// When a queued plain sleep becomes a timed waiter (`--sleep-registration`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum SleepRegistration {
+    /// At the first quiescent scheduler pass that finds the sleep queued.
+    FirstPass,
+    /// Only when the sleeper's thread is chosen before its deadline.
+    WhenChosen,
+}
+
+impl SleepRegistration {
+    /// The rule a run follows when it registers queued sleeps at the first
+    /// pass (`first-pass`) or not (`when-chosen`).
+    pub fn from_registered_at_first_pass(first_pass: bool) -> Self {
+        if first_pass {
+            Self::FirstPass
+        } else {
+            Self::WhenChosen
+        }
+    }
+
+    /// The option's value as `--sleep-registration` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstPass => "first-pass",
+            Self::WhenChosen => "when-chosen",
         }
     }
 }
@@ -3557,7 +3660,9 @@ mod legacy_backend_json {
     /// `access_trace_max_bytes` came after it too; the scheduler writes the
     /// trace, and `hermit run` refuses it on DBT, so they are never written
     /// and read as unset, 0, unset and unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 44] = [
+    /// `sleep_registration` too: the scheduler registers sleeps, not the
+    /// runtime, so it is never written and reads as unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 45] = [
         // `chaos_timeslice_range` came after it too: the scheduler draws the
         // slices, not the runtime, so it is never written and reads as unset.
         // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
@@ -3581,6 +3686,7 @@ mod legacy_backend_json {
         "futex_wake_yields",
         "pipe_wake_latency",
         "expired_wait_charge",
+        "sleep_registration",
         "replaying",
         "scheduler_turn_cost",
         "cap_preemption_charge",
@@ -3776,6 +3882,7 @@ mod legacy_backend_json {
                     | "virtual_timeout"
                     | "pipe_wake_latency"
                     | "expired_wait_charge"
+                    | "sleep_registration"
                     | "container_mount_table"
                     | "mountinfo_mount_namespace"
                     | "directory_placeholder"
@@ -4078,6 +4185,7 @@ mod legacy_backend_json {
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
                 | "expired_wait_charge"
+                | "sleep_registration"
                 | "replaying"
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
@@ -4983,6 +5091,7 @@ mod tests {
                 | "futex_wake_yields"
                 | "pipe_wake_latency"
                 | "expired_wait_charge"
+                | "sleep_registration"
                 | "replaying"
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
@@ -5028,8 +5137,9 @@ mod tests {
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
-        // `pipe_wake_latency`, `expired_wait_charge`, `replaying`, `scheduler_turn_cost`,
-        // `cap_preemption_charge`, `virtual_timeout`, `inherited_seccomp`, `cpu_profile`,
+        // `pipe_wake_latency`, `expired_wait_charge`, `sleep_registration`, `replaying`,
+        // `scheduler_turn_cost`, `cap_preemption_charge`, `virtual_timeout`,
+        // `inherited_seccomp`, `cpu_profile`,
         // `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
@@ -5049,9 +5159,9 @@ mod tests {
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes` and
         // `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-three fewer, so twenty-nine keys fewer than fields.
+        // forty-four fewer, so thirty keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 29);
+        assert_eq!(fields.len(), keys.len() + 30);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -7196,6 +7306,110 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// `--sleep-registration` is unset by default, parses both values, is
+    /// printed by `Display` (reproducer commands are built from it) only when
+    /// set, round-trips through serde, and never enters the legacy form.
+    #[test]
+    fn the_sleep_registration_is_printed_when_set_and_never_enters_the_legacy_form() {
+        assert_eq!(Config::default().sleep_registration, None);
+        assert!(
+            !Config::default()
+                .to_string()
+                .contains("--sleep-registration")
+        );
+        for (value, registration) in [
+            ("first-pass", SleepRegistration::FirstPass),
+            ("when-chosen", SleepRegistration::WhenChosen),
+        ] {
+            let set = Config::try_parse_from(["detcore", &format!("--sleep-registration={value}")])
+                .unwrap();
+            assert_eq!(set.sleep_registration, Some(registration));
+            assert!(
+                set.to_string()
+                    .contains(&format!(" --sleep-registration={value}")),
+                "{set}"
+            );
+            let reparsed: Config =
+                serde_json::from_str(&serde_json::to_string(&set).unwrap()).unwrap();
+            assert_eq!(reparsed.sleep_registration, Some(registration));
+            let legacy = to_legacy_backend_json(&set).unwrap();
+            assert!(!legacy.contains("sleep_registration"), "{legacy}");
+            assert_eq!(
+                from_legacy_backend_json(&legacy)
+                    .unwrap()
+                    .sleep_registration,
+                None
+            );
+        }
+    }
+
+    /// By default a queued sleep registers at the first pass only where the scheduler reads a
+    /// sleeper's signal state: a backend whose kernel signal targets it predicts (ptrace), or any
+    /// backend under the in-guest delivery gate. DBT, SaBRe, LiteInst and KVM register when
+    /// chosen by default. An explicit value decides here; a `first-pass` the backend cannot honour
+    /// is refused at launch. Race search and `hermit record`/`replay` keep their rule.
+    #[test]
+    fn first_pass_sleep_registration_is_the_default_only_where_signal_state_is_read() {
+        let config = |backend: BackendCapabilities,
+                      gate: bool,
+                      sleep_registration: Option<SleepRegistration>| Config {
+            backend,
+            in_guest_signal_delivery: gate,
+            sleep_registration,
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        for (name, backend) in [
+            ("PTRACE", BackendCapabilities::PTRACE),
+            ("E9PATCH", BackendCapabilities::E9PATCH),
+        ] {
+            let default = config(backend, false, None);
+            assert!(default.reads_sleeper_signal_state(), "{name}");
+            assert!(default.queued_sleeps_registered_at_first_pass(), "{name}");
+        }
+        for (name, backend) in [
+            ("DBT", BackendCapabilities::DBT),
+            ("SABRE", BackendCapabilities::SABRE),
+            ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
+            ("KVM", BackendCapabilities::KVM),
+        ] {
+            let default = config(backend, false, None);
+            assert!(!default.reads_sleeper_signal_state(), "{name}");
+            assert!(!default.queued_sleeps_registered_at_first_pass(), "{name}");
+            let gated = config(backend, true, None);
+            assert!(gated.reads_sleeper_signal_state(), "{name} under the gate");
+            assert!(
+                gated.queued_sleeps_registered_at_first_pass(),
+                "{name} under the gate"
+            );
+            assert!(
+                config(backend, false, Some(SleepRegistration::FirstPass))
+                    .queued_sleeps_registered_at_first_pass(),
+                "{name}, asked for"
+            );
+        }
+        let unserialized = Config {
+            sequentialize_threads: false,
+            ..config(BackendCapabilities::PTRACE, false, None)
+        };
+        assert!(!unserialized.reads_sleeper_signal_state());
+        assert!(!unserialized.queued_sleeps_registered_at_first_pass());
+        let chaos = Config {
+            chaos: true,
+            ..config(BackendCapabilities::PTRACE, false, None)
+        };
+        assert!(!chaos.queued_sleeps_registered_at_first_pass());
+        let recorded = Config {
+            recordreplay_modes: true,
+            ..config(
+                BackendCapabilities::PTRACE,
+                false,
+                Some(SleepRegistration::FirstPass),
+            )
+        };
+        assert!(!recorded.queued_sleeps_registered_at_first_pass());
     }
 
     #[test]

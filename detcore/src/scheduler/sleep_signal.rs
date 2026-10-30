@@ -101,6 +101,53 @@ pub(super) enum SleeperStateUnreadable {
 }
 
 impl Scheduler {
+    /// The deadline of the `nanosleep` `dettid`'s filed request is, on any
+    /// backend: unlike `signal_sleep`, it needs none of the guest's signal
+    /// state, only the request.
+    pub(super) fn filed_nanosleep_deadline(&self, dettid: DetTid) -> Option<LogicalTime> {
+        let resources = self.next_turns.get(&dettid)?.req.try_read()?.ok()?;
+        match resources.resources.iter().next() {
+            Some((ResourceID::SleepUntil(deadline), _))
+                if resources.resources.len() == 1 && resources.fyi.as_str() == NANOSLEEP_FYI =>
+            {
+                Some(*deadline)
+            }
+            _ => None,
+        }
+    }
+
+    /// When the signal being sent now was sent: a timed signal's own due time
+    /// while it is dispatched (`dispatch_timed_signal`), else the commit
+    /// point's `committed_time`.
+    pub(super) fn signal_sent_at(&self) -> LogicalTime {
+        self.signal_sent_at.unwrap_or(self.committed_time)
+    }
+
+    /// When the timed signal being sent was due, if `dettid`'s filed request
+    /// is a `nanosleep` it is about to wake: the instant the sleep is
+    /// interrupted. Read before the wake replaces the request. A send at a
+    /// commit point gives `None`, which leaves the remaining time to the
+    /// sleep's own reading.
+    pub(super) fn timed_sleep_interruption(&self, dettid: DetTid) -> Option<LogicalTime> {
+        self.signal_sent_at
+            .filter(|_| self.filed_nanosleep_deadline(dettid).is_some())
+    }
+
+    /// Note, once `dettid`'s sleep is woken, when it was interrupted
+    /// (`timed_sleep_interruption`, `BlockedPool::sleep_interruptions`). The
+    /// wake has already cleared any earlier note (`remove_blocking_entries`).
+    pub(super) fn note_sleep_interruption(&mut self, dettid: DetTid, due: Option<LogicalTime>) {
+        if let Some(due) = due {
+            self.blocked.sleep_interruptions.insert(dettid, due);
+        }
+    }
+
+    /// When the timed signal that last woke `dettid`'s `nanosleep` was due, if
+    /// one did, taken so a later sleep cannot read it.
+    pub(crate) fn take_sleep_interruption(&mut self, dettid: DetTid) -> Option<LogicalTime> {
+        self.blocked.sleep_interruptions.remove(&dettid)
+    }
+
     /// The sleep `dettid`'s filed request is, if it is one a cross-task signal
     /// can end on this backend.
     pub(super) fn signal_sleep(&self, dettid: DetTid) -> Option<SignalSleep> {

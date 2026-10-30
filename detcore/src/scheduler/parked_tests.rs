@@ -45,6 +45,8 @@ struct Backend {
     child_publications: Mutex<Vec<ChildExitCompletion>>,
     fail_child_publication: std::sync::atomic::AtomicBool,
     fail_publication: std::sync::atomic::AtomicBool,
+    /// Every alarm and timer publication reports its signal already pending.
+    coalesce: std::sync::atomic::AtomicBool,
     fail_recipients: Mutex<Option<SignalProcessId>>,
     fail_reservation: std::sync::atomic::AtomicBool,
     failure_processes: Mutex<Vec<SignalProcessId>>,
@@ -70,7 +72,7 @@ impl ProcessSignalControl for Backend {
         let receipt = ProcessSignalPublication {
             process,
             pending_generation: 0,
-            coalesced: false,
+            coalesced: self.coalesce.load(std::sync::atomic::Ordering::Relaxed),
             disposition: reverie::ProcessAlarmSignalDisposition::Caught,
         };
         if self
@@ -97,7 +99,7 @@ impl ProcessSignalControl for Backend {
         ProcessSignalPublicationResult::Committed(ProcessSignalPublication {
             process,
             pending_generation: 0,
-            coalesced: false,
+            coalesced: self.coalesce.load(std::sync::atomic::Ordering::Relaxed),
             disposition: reverie::ProcessAlarmSignalDisposition::Caught,
         })
     }
@@ -800,6 +802,7 @@ fn an_empty_boundary_round_trip_beside_sibling_permits_changes_only_the_nonce_an
                         site,
                         selection_nonce: 1,
                     },
+                    dequeue: None,
                 },
                 ack: ack.clone(),
             },
@@ -912,6 +915,7 @@ fn a_parked_wait_leaves_nothing_for_an_empty_boundary_to_clean() {
                     site,
                     selection_nonce: 1,
                 },
+                dequeue: None,
             },
             ack: ack.clone(),
         },
@@ -1431,6 +1435,7 @@ fn a_sibling_boundary_is_authorized_beside_an_observed_parked_wait() {
                     site,
                     selection_nonce: 1,
                 },
+                dequeue: None,
             },
             ack: ack.clone(),
         },
@@ -1649,6 +1654,7 @@ fn a_group_exit_retires_permit_holding_siblings_whose_receipts_settle_them() {
                             site,
                             selection_nonce: 1,
                         },
+                        dequeue: None,
                     },
                     ack: ack.clone(),
                 },
@@ -4484,6 +4490,7 @@ fn child_wait_caught_selection_wins_later_exit_and_keeps_return_gate() {
                     site,
                     selection_nonce: 1,
                 },
+                dequeue: None,
             },
             ack: ack.clone(),
         },
@@ -4792,6 +4799,15 @@ fn child_wait_cross_signal_rejects_conflicting_ownership_before_rewrite() {
 }
 
 /// A scheduler for `backend` with sequentialized threads set as given.
+/// KVM's capabilities with a synthetic report of the guest's signal state
+/// (production KVM reports none), under which the scheduler registers queued
+/// sleeps at the first pass (`Config::reads_sleeper_signal_state`).
+fn kvm_reading_signal_state() -> BackendCapabilities {
+    let mut backend = BackendCapabilities::KVM;
+    backend.kernel_signal_targets_are_predictable = true;
+    backend
+}
+
 fn scheduler_for(backend: BackendCapabilities, sequentialize_threads: bool) -> Scheduler {
     Scheduler::new(&Config {
         sequentialize_threads,
@@ -4964,6 +4980,150 @@ fn backends_without_signal_control_never_enter_the_controlled_loop() {
         assert_eq!(s.turn, 1, "{name}");
         assert_eq!(s.controlled_turn_entries, u64::from(controlled), "{name}");
     }
+}
+
+/// The controlled turn loop registers a queued plain sleep as a timed waiter
+/// before its first pop, as the ordinary loop's step 2 does: a sleep queued
+/// ahead of a runnable thread leaves the run queue and is a timed waiter at
+/// its deadline after one turn, which the runnable thread takes.
+#[test]
+fn the_controlled_loop_registers_a_queued_sleep() {
+    use futures::FutureExt;
+
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass registration
+    // applies in the controlled loop (`Config::reads_sleeper_signal_state`).
+    let mut s = scheduler_for(kvm_reading_signal_state(), true);
+    s.install_signal_control(
+        Some(BackendSignalControl {
+            process: Arc::new(Backend::default()),
+        }),
+        true,
+    )
+    .expect("KVM takes the control");
+    assert!(s.signal_control_installed());
+    let (sleeper, _, _) = add(&mut s, 100, 100);
+    let (runner, _, _) = add(&mut s, 100, 101);
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    // Well past the turn's charge, so the sleep is not yet due.
+    let deadline = global.lock().unwrap().as_nanos() + LogicalTime::from_nanos(1_000_000_000);
+    let mut sleep = Resources::new(sleeper);
+    sleep.insert(ResourceID::SleepUntil(deadline), Permission::W);
+    s.next_turns[&sleeper].req.put(Ok(sleep));
+    s.runqueue_push_back(sleeper);
+    s.next_turns[&runner].req.put(Ok(Resources::new(runner)));
+    s.runqueue_push_back(runner);
+    let scheduler = Arc::new(Mutex::new(s));
+    let result = do_a_turn_blocking(scheduler.clone(), global, &Ok(Resources::new(runner)))
+        .now_or_never()
+        .expect("a quiescent request must not block the turn")
+        .expect("the runnable thread must commit");
+    assert_eq!(result.tid, runner);
+    let s = scheduler.lock().unwrap();
+    assert_eq!(s.controlled_turn_entries, 1);
+    assert_eq!(
+        s.blocked.timed_waiters.thread_deadline(sleeper),
+        Some(deadline)
+    );
+    assert!(!s.run_queue.contains_tid(sleeper));
+}
+
+/// The controlled loop's refresh registers a sleep filed after its first
+/// maintenance step, before the refresh can pop a timed event: here a thread
+/// the drain admitted with no request yet holds the loop until it files a
+/// sleep, which the refresh makes a timed waiter while the runnable thread
+/// takes the turn. On KVM first-pass registration is asked for: the scheduler
+/// reads no sleeper's signal state there, so it is not the default
+/// (https://github.com/rrnewton/hermit/pull/4682).
+#[test]
+fn the_controlled_loop_refresh_registers_a_sleep_filed_during_maintenance() {
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass registration
+    // applies in the controlled loop (`Config::reads_sleeper_signal_state`).
+    let mut s = scheduler_for(kvm_reading_signal_state(), true);
+    s.install_signal_control(
+        Some(BackendSignalControl {
+            process: Arc::new(Backend::default()),
+        }),
+        true,
+    )
+    .expect("KVM takes the control");
+    let (runner, _, _) = add(&mut s, 100, 100);
+    let (late, _, _) = add(&mut s, 100, 101);
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let deadline = global.lock().unwrap().as_nanos() + LogicalTime::from_nanos(1_000_000_000);
+    s.next_turns[&runner].req.put(Ok(Resources::new(runner)));
+    s.runqueue_push_back(runner);
+    // Admitted by the first maintenance step's drain, its request still to come.
+    s.admit_to_run_queue(late, AdmitIntent::Fixed(AdmitSide::Back));
+    let scheduler = Arc::new(Mutex::new(s));
+    let last_turn = Ok(Resources::new(runner));
+    let mut turn = Box::pin(do_a_turn_blocking(scheduler.clone(), global, &last_turn));
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        turn.as_mut().poll(&mut cx).is_pending(),
+        "the loop waits for the admitted thread's request"
+    );
+    let mut sleep = Resources::new(late);
+    sleep.insert(ResourceID::SleepUntil(deadline), Permission::W);
+    scheduler.lock().unwrap().next_turns[&late]
+        .req
+        .put(Ok(sleep));
+    let Poll::Ready(result) = turn.as_mut().poll(&mut cx) else {
+        panic!("a quiescent request must not block the turn");
+    };
+    let result = result.expect("the runnable thread must commit");
+    assert_eq!(result.tid, runner);
+    let s = scheduler.lock().unwrap();
+    assert_eq!(
+        s.blocked.timed_waiters.thread_deadline(late),
+        Some(deadline)
+    );
+    assert!(!s.run_queue.contains_tid(late));
+}
+
+/// The controlled loop's first maintenance step registers a sleep its drain
+/// admits (a new thread whose first call is a sleep), before step 3 can
+/// choose by priority, as the ordinary loop's step 2 does
+/// (https://github.com/rrnewton/hermit/pull/4682).
+#[test]
+fn the_controlled_loop_registers_a_sleep_its_drain_admits() {
+    use futures::FutureExt;
+
+    // Synthetic: model a backend that reports the guest's signal state
+    // (production KVM does not set this field), so first-pass registration
+    // applies in the controlled loop (`Config::reads_sleeper_signal_state`).
+    let mut s = scheduler_for(kvm_reading_signal_state(), true);
+    s.install_signal_control(
+        Some(BackendSignalControl {
+            process: Arc::new(Backend::default()),
+        }),
+        true,
+    )
+    .expect("KVM takes the control");
+    let (runner, _, _) = add(&mut s, 100, 100);
+    let (newborn, _, _) = add(&mut s, 100, 101);
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let deadline = global.lock().unwrap().as_nanos() + LogicalTime::from_nanos(1_000_000_000);
+    s.next_turns[&runner].req.put(Ok(Resources::new(runner)));
+    s.runqueue_push_back(runner);
+    let mut sleep = Resources::new(newborn);
+    sleep.insert(ResourceID::SleepUntil(deadline), Permission::W);
+    s.next_turns[&newborn].req.put(Ok(sleep));
+    s.admit_to_run_queue(newborn, AdmitIntent::Fixed(AdmitSide::Back));
+    let scheduler = Arc::new(Mutex::new(s));
+    let result = do_a_turn_blocking(scheduler.clone(), global, &Ok(Resources::new(runner)))
+        .now_or_never()
+        .expect("a quiescent request must not block the turn")
+        .expect("the runnable thread must commit");
+    assert_eq!(result.tid, runner);
+    let s = scheduler.lock().unwrap();
+    assert_eq!(
+        s.blocked.timed_waiters.thread_deadline(newborn),
+        Some(deadline)
+    );
+    assert!(!s.run_queue.contains_tid(newborn));
 }
 
 /// Where a real timer goes is decided by the installed control alone. Without
@@ -6211,4 +6371,220 @@ fn the_vfork_barrier_valve_is_thirty_seconds() {
         Scheduler::VFORK_BARRIER_VALVE,
         Scheduler::SIGNALED_BACKGROUND_VALVE
     );
+}
+/// The KVM controlled alarm path: a timer's published signal that an observed
+/// `nanosleep`'s own observation removes and catches interrupts the sleep at
+/// the timer's due time, however late the observation's finish. The finish
+/// notes that due time, taken once, so the sleep reports its remaining time
+/// from it: deadline N = 100, due D = 10, with committed time already past N
+/// at the finish, the remaining time is N - D = 90. An outcome that does not
+/// interrupt the sleep with exactly that removal leaves no note: no eligible
+/// signal (the removal was ignored), a caught signal the selection removed
+/// another way, a removal some other thread made, and a fatal one. A
+/// process-directed POSIX timer's publication is noted the same way
+/// (https://github.com/rrnewton/hermit/issues/4931).
+#[test]
+fn a_caught_timer_interruption_of_an_observed_nanosleep_notes_the_timers_due_time() {
+    for case in [
+        "caught",
+        "caught POSIX timer",
+        "no eligible signal",
+        "caught another removal",
+        "removed by another thread",
+        "fatal",
+    ] {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        let (other, _, _) = add(&mut s, 100, 101);
+        let response = sleep(&mut s, tid, mm, site, 100);
+        s.committed_time = at(10);
+        let (process, event) = if case == "caught POSIX timer" {
+            s.dispatch_timed_signal(
+                at(10),
+                timed_waiters::SignalTimerId::Posix(DetPid::from_raw(100), 3),
+                timed_waiters::SignalTarget::Process(tid),
+                timed_waiters::TimerSignal::Send(Signal::SIGUSR1),
+                true,
+                at(10),
+            );
+            b.timer_publications.lock().unwrap()[0]
+        } else {
+            s.replace_real_timer(tid, tid, at(0), at(10), at(0), Signal::SIGALRM)
+                .unwrap();
+            s.step2b_process_timed(&committed_clock(&s));
+            b.publications.lock().unwrap()[0]
+        };
+        assert!(!s.backend_failed(), "{case}");
+        b.recipients.lock().unwrap().push(SignalRecipient {
+            task: task(100, 100),
+        });
+        s.select_parked_alarm().unwrap();
+        let observed = selected(&response);
+        // Other work carries committed time past the sleep's deadline before
+        // the observation finishes.
+        s.committed_time = at(150);
+        let remover = if case == "removed by another thread" {
+            other
+        } else {
+            tid
+        };
+        let removal = reverie::SignalDequeue {
+            process,
+            sequence: 1,
+            consumer: reverie::SignalConsumer::ReturnToUser,
+            domain: reverie::PendingDomain::Process,
+            event,
+        };
+        s.apply_signal_dequeue(DetPid::from_raw(100), remover, removal, at(150))
+            .unwrap();
+        let selection = reverie::PreparedSignalToken {
+            site,
+            selection_nonce: 1,
+        };
+        let finish = match case {
+            "no eligible signal" => ObservationFinish::ResumeSameWait,
+            "caught another removal" => ObservationFinish::InterruptForCaught {
+                selection,
+                dequeue: Some(reverie::DequeueId {
+                    process,
+                    sequence: 2,
+                }),
+            },
+            "fatal" => ObservationFinish::Terminate { selection },
+            _ => ObservationFinish::InterruptForCaught {
+                selection,
+                dequeue: Some(removal.id()),
+            },
+        };
+        let ack = Ivar::new();
+        s.post_control(
+            tid,
+            mm,
+            ControlIntent::Finish {
+                wait: observed.continuation,
+                lease: observed.lease,
+                site,
+                finish,
+                ack: ack.clone(),
+            },
+        )
+        .unwrap();
+        s.drain_control_intents();
+        assert!(matches!(ack.try_read(), Some(Ok(_))), "{case}");
+        assert!(s.parked.observed_timer_dequeues.is_empty(), "{case}");
+        if case.starts_with("caught") && case != "caught another removal" {
+            let due = s.take_sleep_interruption(tid);
+            assert_eq!(due, Some(at(10)), "{case}");
+            assert_eq!(
+                at(100).as_nanos() - due.unwrap().as_nanos(),
+                90,
+                "the remaining time"
+            );
+            assert_eq!(s.take_sleep_interruption(tid), None, "taken once");
+        } else {
+            assert_eq!(s.take_sleep_interruption(tid), None, "{case}");
+        }
+    }
+}
+
+/// Dispatches process 100's POSIX timer 3 expiration due at `due`, aimed at
+/// the process, through the control.
+fn dispatch_posix_expiry(s: &mut Scheduler, tid: DetTid, due: u64) {
+    s.dispatch_timed_signal(
+        at(due),
+        timed_waiters::SignalTimerId::Posix(DetPid::from_raw(100), 3),
+        timed_waiters::SignalTarget::Process(tid),
+        timed_waiters::TimerSignal::Send(Signal::SIGUSR1),
+        true,
+        at(due),
+    );
+}
+
+/// A coalesced timer publication installs nothing: Linux keeps the first
+/// pending event. A recurring process-directed POSIX timer published at 10 and
+/// again, coalesced, at 20 before the signal is dequeued keeps the due time
+/// 10, and a caught interruption of an observed `nanosleep` by that event
+/// reports its remaining time from 10
+/// (https://github.com/rrnewton/hermit/issues/4931).
+#[test]
+fn a_coalesced_timer_publication_keeps_the_pending_events_first_due_time() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    let response = sleep(&mut s, tid, mm, site, 100);
+    s.committed_time = at(20);
+    dispatch_posix_expiry(&mut s, tid, 10);
+    b.coalesce.store(true, std::sync::atomic::Ordering::Relaxed);
+    dispatch_posix_expiry(&mut s, tid, 20);
+    let rows: Vec<_> = s.parked.timer_publications.iter().map(|p| p.due).collect();
+    assert_eq!(rows, vec![at(10)]);
+    let (process, event) = b.timer_publications.lock().unwrap()[0];
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    s.select_parked_alarm().unwrap();
+    let observed = selected(&response);
+    let removal = reverie::SignalDequeue {
+        process,
+        sequence: 1,
+        consumer: reverie::SignalConsumer::ReturnToUser,
+        domain: reverie::PendingDomain::Process,
+        event,
+    };
+    s.apply_signal_dequeue(DetPid::from_raw(100), tid, removal, at(150))
+        .unwrap();
+    let ack = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Finish {
+            wait: observed.continuation,
+            lease: observed.lease,
+            site,
+            finish: ObservationFinish::InterruptForCaught {
+                selection: reverie::PreparedSignalToken {
+                    site,
+                    selection_nonce: 1,
+                },
+                dequeue: Some(removal.id()),
+            },
+            ack: ack.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)));
+    assert_eq!(s.take_sleep_interruption(tid), Some(at(10)));
+}
+
+/// A coalesced publication whose pending signal no tracked timer publication
+/// installed (here an `ITIMER_REAL` expiry whose `SIGALRM` was already pending
+/// from elsewhere) creates no entry, so no timer due time is ever attributed
+/// to that signal.
+#[test]
+fn a_coalesced_publication_with_no_tracked_timer_records_nothing() {
+    let (mut s, b) = fixture();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    b.coalesce.store(true, std::sync::atomic::Ordering::Relaxed);
+    s.replace_real_timer(tid, tid, at(0), at(10), at(0), Signal::SIGALRM)
+        .unwrap();
+    s.committed_time = at(10);
+    s.step2b_process_timed(&committed_clock(&s));
+    assert!(!s.backend_failed());
+    assert_eq!(b.publications.lock().unwrap().len(), 1);
+    assert!(s.parked.timer_publications.is_empty());
+    dispatch_posix_expiry(&mut s, tid, 10);
+    assert_eq!(b.timer_publications.lock().unwrap().len(), 1);
+    assert!(s.parked.timer_publications.is_empty());
+}
+
+/// A publication that installed its event replaces an identical entry, which
+/// can only be stale: no identical event was pending.
+#[test]
+fn a_fresh_timer_publication_replaces_a_stale_identical_entry() {
+    let (mut s, _) = fixture();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    dispatch_posix_expiry(&mut s, tid, 10);
+    dispatch_posix_expiry(&mut s, tid, 20);
+    let rows: Vec<_> = s.parked.timer_publications.iter().map(|p| p.due).collect();
+    assert_eq!(rows, vec![at(20)]);
 }

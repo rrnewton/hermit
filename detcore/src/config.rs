@@ -128,6 +128,10 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4738, renumbered to 16 at
         // integration; digests measured at this head).
         (16, "182b80da8855a429", "846052997d97693f"),
+        // Adds `GlobalRequest::TakeSleepInterruption` and its response, and
+        // `ObservationFinish::InterruptForCaught`'s `dequeue`, which the
+        // digest does not cover (https://github.com/rrnewton/hermit/issues/4931).
+        (17, "3d2650f0374048cd", "846052997d97693f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

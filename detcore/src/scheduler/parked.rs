@@ -16,6 +16,7 @@ use reverie::ChildExitCompletion;
 use reverie::ChildExitPublicationResult;
 use reverie::ExitStatus;
 use reverie::ParkedObservationLease;
+use reverie::PendingDomain;
 use reverie::PreparedSignalToken;
 use reverie::ProcessSignalPublicationResult;
 use reverie::SignalDeliveryPermit;
@@ -187,8 +188,18 @@ pub enum ResourceReply {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ObservationFinish {
     ResumeSameWait,
-    InterruptForCaught { selection: PreparedSignalToken },
-    Terminate { selection: PreparedSignalToken },
+    /// The observation selected a caught signal: the syscall is interrupted.
+    /// `dequeue` is the removal that selection made, as the observation's
+    /// `Caught` step names it, so the scheduler can tell whether the signal
+    /// that interrupts the wait is a timer's publication
+    /// (`ParkedRequests::observed_timer_dequeues`).
+    InterruptForCaught {
+        selection: PreparedSignalToken,
+        dequeue: Option<reverie::DequeueId>,
+    },
+    Terminate {
+        selection: PreparedSignalToken,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FinishAck {
@@ -276,6 +287,78 @@ pub(super) struct ParkedRequests {
     pub running: Option<DetTid>,
     pub failures: Vec<reverie::SignalProcessId>,
     pub failure_wakes: Vec<futures::channel::oneshot::Sender<()>>,
+    /// Timer expirations published through the control and not yet dequeued,
+    /// with the time each was due: the instant Linux sends the signal
+    /// (`publish_real_expiry`, `publish_posix_timer_expiry`, through
+    /// `note_timer_publication`). A coalesced publication, whose standard
+    /// signal was already pending, keeps the pending event's entry and its
+    /// first due time, and adds none.
+    pub(super) timer_publications: Vec<TimerPublication>,
+    /// For a thread observing a parked wait, the removal of a timer's
+    /// published signal that its observation made, with the timer's due time
+    /// (`Scheduler::apply_signal_dequeue`). The observation's finish takes it:
+    /// a caught interruption of a `nanosleep` by exactly that removal notes the
+    /// due time for the sleep's remaining time
+    /// (https://github.com/rrnewton/hermit/issues/4931).
+    pub(super) observed_timer_dequeues: BTreeMap<DetTid, ObservedTimerDequeue>,
+}
+
+/// A timer expiration published through the control and not yet dequeued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TimerPublication {
+    pub pid: DetPid,
+    pub process: SignalProcessId,
+    pub event: SignalEvent,
+    pub due: LogicalTime,
+}
+
+/// The removal of a timer's published signal by an observing thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ObservedTimerDequeue {
+    pub wait: ContinuationId,
+    pub lease: ParkedObservationLease,
+    pub dequeue: reverie::DequeueId,
+    pub due: LogicalTime,
+}
+
+impl ParkedRequests {
+    /// Records a timer publication due at `due`, from the backend's receipt.
+    ///
+    /// A publication that installed its event (`coalesced` false) is recorded
+    /// with its due time, replacing an identical event's entry, which can only
+    /// be stale since no identical event was pending. A coalesced one
+    /// installed nothing: the kernel keeps the first pending event, so an
+    /// identical entry keeps its first due time, and with none tracked (the
+    /// pending signal is not a timer's this ledger saw) no entry is made.
+    /// A publication that did not commit records nothing.
+    fn note_timer_publication(
+        &mut self,
+        pid: DetPid,
+        process: SignalProcessId,
+        event: SignalEvent,
+        due: LogicalTime,
+        outcome: &ProcessSignalPublicationResult,
+    ) {
+        let ProcessSignalPublicationResult::Committed(receipt) = outcome else {
+            return;
+        };
+        if receipt.coalesced {
+            return;
+        }
+        self.timer_publications
+            .retain(|p| !(p.pid == pid && p.process == process && p.event == event));
+        self.timer_publications.push(TimerPublication {
+            pid,
+            process,
+            event,
+            due,
+        });
+    }
+
+    /// Drops a retired process's undequeued publications.
+    pub(super) fn forget_timer_publications(&mut self, pid: DetPid) {
+        self.timer_publications.retain(|p| p.pid != pid);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,6 +638,7 @@ impl Scheduler {
     pub(crate) fn apply_signal_dequeue(
         &mut self,
         pid: DetPid,
+        tid: DetTid,
         dequeue: reverie::SignalDequeue,
         now: LogicalTime,
     ) -> Result<super::real_timer::DequeueAck, TimerFailure> {
@@ -562,6 +646,30 @@ impl Scheduler {
             self.real_timers.fail(pid, TimerFailure::Unsupported);
         }
         let (ack, next) = self.real_timers.dequeue(pid, dequeue, now)?;
+        // The removal of a timer's published signal from the process queue.
+        // Made by a thread observing a parked wait, it may be the signal that
+        // interrupts that wait; the observation's finish decides
+        // (`finish_observation`).
+        if dequeue.domain == PendingDomain::Process
+            && let Some(index) = self.parked.timer_publications.iter().position(|p| {
+                p.pid == pid && p.process == dequeue.process && p.event == dequeue.event
+            })
+        {
+            let publication = self.parked.timer_publications.remove(index);
+            if let Some(NextTurnOwner::Observation { wait, lease }) =
+                self.next_turns.get(&tid).map(|turn| turn.protocol.owner)
+            {
+                self.parked.observed_timer_dequeues.insert(
+                    tid,
+                    ObservedTimerDequeue {
+                        wait,
+                        lease,
+                        dequeue: dequeue.id(),
+                        due: publication.due,
+                    },
+                );
+            }
+        }
         if let Some(deadline) = next {
             self.blocked
                 .timed_waiters
@@ -646,7 +754,25 @@ impl Scheduler {
     }
 
     /// Both timed pop sites dispatch before any host-capable signal operation.
+    /// While it runs, `signal_sent_at` is the event's own time: a pass pops
+    /// one due event, so committed time may already be past later deadlines,
+    /// and a sleep the signal reaches is judged by when the signal was due
+    /// (`wake_signaled_guest_as`).
     pub(super) fn dispatch_timed_signal(
+        &mut self,
+        deadline: LogicalTime,
+        id: SignalTimerId,
+        target: timed_waiters::SignalTarget,
+        signal: timed_waiters::TimerSignal,
+        normal_due: bool,
+        observed_now: LogicalTime,
+    ) {
+        let previous = self.signal_sent_at.replace(deadline);
+        self.dispatch_timed_signal_at(deadline, id, target, signal, normal_due, observed_now);
+        self.signal_sent_at = previous;
+    }
+
+    fn dispatch_timed_signal_at(
         &mut self,
         deadline: LogicalTime,
         id: SignalTimerId,
@@ -1031,6 +1157,8 @@ impl Scheduler {
         ) {
             self.parked.failures.push(process);
         }
+        self.parked
+            .note_timer_publication(pid, process, event, deadline, &outcome);
         self.real_timers.publication(expiry, outcome)?;
         Ok(())
     }
@@ -1069,7 +1197,12 @@ impl Scheduler {
         siginfo[16..20].copy_from_slice(&timer.to_ne_bytes());
         let event = SignalEvent::new(signo, siginfo, SignalTarget::Process { pid: process.tgid })
             .map_err(|_| ProtocolFailure::Identity)?;
-        match control.process.publish_timer_expiry(process, event) {
+        let outcome = control.process.publish_timer_expiry(process, event);
+        // Due at the expiration being dispatched (`signal_sent_at`).
+        let due = self.signal_sent_at();
+        self.parked
+            .note_timer_publication(pid, process, event, due, &outcome);
+        match outcome {
             ProcessSignalPublicationResult::Committed(_) => Ok(()),
             ProcessSignalPublicationResult::FailedAfterCommit { .. } => {
                 self.parked.failures.push(process);
@@ -1504,6 +1637,9 @@ impl Scheduler {
             .requests
             .remove(&wait)
             .ok_or(ProtocolFailure::Identity)?;
+        // Taken whatever the outcome: only a caught interruption by exactly
+        // this removal uses it.
+        let observed = self.parked.observed_timer_dequeues.remove(&wait.dettid);
         let result = (|| {
             if !matches!(owned.phase, ContinuationPhase::Observing(expected) if expected == lease)
                 || owned.origin.control.site() != Some(site)
@@ -1538,9 +1674,28 @@ impl Scheduler {
                     self.resume_ticket(&mut owned, site)
                         .map(FinishAck::AwaitResume)
                 }
-                ObservationFinish::InterruptForCaught { selection } => {
+                ObservationFinish::InterruptForCaught { selection, dequeue } => {
                     if selection.site != site {
                         return Err(ProtocolFailure::Identity);
+                    }
+                    // A `nanosleep` interrupted by the caught signal its own
+                    // observation removed, a timer's publication: Linux ends
+                    // the sleep at the timer's due time, so the sleep's
+                    // remaining time is taken from there, however late the
+                    // finish (https://github.com/rrnewton/hermit/issues/4931).
+                    if let ControlCapability::ParkedWait {
+                        policy: ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline },
+                        ..
+                    } = owned.origin.control
+                        && let Some(observed) = observed
+                        && observed.wait == wait
+                        && observed.lease == lease
+                        && dequeue == Some(observed.dequeue)
+                        && observed.due < absolute_deadline
+                    {
+                        self.blocked
+                            .sleep_interruptions
+                            .insert(wait.dettid, observed.due);
                     }
                     let turn = self
                         .next_turns

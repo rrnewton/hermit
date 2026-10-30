@@ -65,6 +65,8 @@ struct RawRecord {
     expired_wait_runs_charged_once: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_inputs: Option<HostInputSet>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    queued_sleeps_registered_at_first_pass: bool,
     #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
 }
@@ -361,6 +363,100 @@ mod tests {
                 serde_json::from_str::<PreemptionRecord>(&rewritten).unwrap(),
                 record
             );
+        }
+    }
+
+    /// The rule that registered queued sleeps (`--sleep-registration`) is a
+    /// run setting, kept by the raw record under its old attributes: a record
+    /// written before the field existed reads as `when-chosen` and writes back
+    /// byte for byte, a `first-pass` record writes the field and reads it
+    /// back, and an incomplete record keeps it inside its envelope's payload.
+    /// So a reader of the marked record, of its settings, of a copy, or of a
+    /// file holding it never takes the `when-chosen` default for a
+    /// `first-pass` run, which would replay its timed wakes in other passes.
+    #[test]
+    fn the_sleep_registration_rule_survives_the_raw_record_and_the_envelope() {
+        let old = r#"{"per_thread":{},"global":[]}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        assert!(!record.queued_sleeps_registered_at_first_pass());
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let written =
+            serde_json::to_string(&record.with_queued_sleeps_registered_at_first_pass(true))
+                .unwrap();
+        assert_eq!(
+            written,
+            r#"{"per_thread":{},"global":[],"queued_sleeps_registered_at_first_pass":true}"#
+        );
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert!(back.queued_sleeps_registered_at_first_pass());
+
+        let directory = tempfile::tempdir().unwrap();
+        for first_pass in [false, true] {
+            let mut writer =
+                PreemptionWriter::new(None).with_queued_sleeps_registered_at_first_pass(first_pass);
+            writer.mark_replay_departed(7);
+            let text = writer.into_string();
+            let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let payload = &envelope[ENVELOPE]["record"];
+            assert_eq!(
+                payload.get("queued_sleeps_registered_at_first_pass"),
+                first_pass.then_some(&serde_json::Value::Bool(true)),
+                "{text}"
+            );
+            let marked: PreemptionRecord = serde_json::from_str(&text).unwrap();
+            assert_eq!(marked.replay_departed_at(), Some(7));
+            assert_eq!(marked.queued_sleeps_registered_at_first_pass(), first_pass);
+            assert_eq!(
+                serde_json::from_str::<PreemptionRecord>(&serde_json::to_string(&marked).unwrap())
+                    .unwrap(),
+                marked
+            );
+            assert_eq!(
+                settings_value(&marked).unwrap()["queued_sleeps_registered_at_first_pass"]
+                    .as_bool()
+                    .unwrap_or(false),
+                first_pass
+            );
+            for copy in [
+                marked.clone_preemptions_only(),
+                marked.schedule_prefix(0),
+                marked.normalize(),
+                marked.with_schedule(vec![]).unwrap(),
+            ] {
+                assert_eq!(copy.queued_sleeps_registered_at_first_pass(), first_pass);
+            }
+            for boundaries in [false, true] {
+                let recording = if boundaries {
+                    Recording::Boundaries(
+                        BoundaryRecording::new(
+                            marked.clone(),
+                            detcore_model::schedule::boundary::Schedule::new(vec![]).unwrap(),
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    Recording::Legacy(marked.clone())
+                };
+                let path = directory
+                    .path()
+                    .join(format!("{boundaries}-{first_pass}.json"));
+                recording.write(&path).unwrap();
+                assert_eq!(read_recorded_replay_departure(&path).unwrap(), Some(7));
+                assert_eq!(
+                    crate::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(&path)
+                        .unwrap(),
+                    first_pass
+                );
+                let stripped =
+                    crate::preemptions::strip_times_from_events_file(&path, None).unwrap();
+                assert_eq!(
+                    crate::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(
+                        &stripped
+                    )
+                    .unwrap(),
+                    first_pass
+                );
+            }
         }
     }
 
