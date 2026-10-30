@@ -78,9 +78,9 @@ jobs:
     # job from changing that host. Return the rebuild to ubuntu-latest once the
     # builder streams the ledger instead of holding it whole in memory.
     runs-on: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && fromJSON('["self-hosted", "gate", "docs-rebuild"]') || 'ubuntu-latest' }}
-    # Room for the 180-minute rebuild step below plus the steps around it
+    # Room for the 420-minute rebuild step below plus the steps around it
     # (about 10 minutes on 2026-09-27, with an 11-minute public-byte check cap).
-    timeout-minutes: 240
+    timeout-minutes: 480
 
     steps:
     # Before any git command: the runner's user has git URL rewrites in its
@@ -342,8 +342,12 @@ jobs:
       # release upload, which each attempt bounds by the archive's size
       # (rebuild-compatibility-site.py, upload_timeout): about 44 minutes for
       # a 471 MB archive. 101 minutes would not hold a slow fetch, the build
-      # and one slow upload.
-      timeout-minutes: 180
+      # and one slow upload. The 10,500 s inner cap below was the proven
+      # killer of run 40974370554 (exit 137 after exactly 10,530 s: the cap
+      # plus its 30 s kill grace, not OOM — the gate runner has no memory
+      # cap), so the inner cap is 21,600 s and this step and job budget
+      # cover it with headroom while the export's peak and wall are cut.
+      timeout-minutes: 420
       env:
         GH_TOKEN: ${{ github.token }}
         CARGO_TARGET_DIR: ${{ runner.temp }}/compatibility-target
@@ -367,7 +371,7 @@ jobs:
         VALIDATION_HISTORY_COMMIT: ${{ steps.website-history.outputs.validation_history_commit }}
       run: |
         set -euo pipefail
-        timeout --signal=TERM --kill-after=30s 10500s \
+        timeout --signal=TERM --kill-after=30s 21600s \
           python3 -B .github/scripts/rebuild-compatibility-site.py rebuild \
           --builder-parent "$GITHUB_WORKSPACE/_website_source" \
           --scratch "${COMPATIBILITY_SCRATCH_PARENT:-$RUNNER_TEMP}/compatibility-nightly-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
