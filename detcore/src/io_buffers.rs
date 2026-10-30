@@ -1946,6 +1946,28 @@ mod event_tests {
     /// guest-held, its message carrying descriptors as `rights` says. Returns
     /// each request's `Resources::passes_descriptors_out`.
     async fn send_rewritten_while_it_waits(batched: bool, rights: Rights) -> Vec<bool> {
+        send_rewritten_while_it_waits_marks(batched, rights)
+            .await
+            .passes_out
+    }
+
+    /// What a send left behind (`send_rewritten_while_it_waits_marks`): each
+    /// request's `Resources::passes_descriptors_out`; whether the pipe end its
+    /// message may name is still guest-held, and whether the socket it sends
+    /// on is guest-held now; and whether the thread holds a pass-out to report
+    /// or has reported one (`ThreadState::passed_descriptors_out_unreported`,
+    /// `ThreadState::passed_descriptors_out_reported`), which makes the
+    /// scheduler revoke every guest-held mark.
+    #[derive(Debug, PartialEq)]
+    struct SendMarks {
+        passes_out: Vec<bool>,
+        pipe_end_guest_held: bool,
+        socket_guest_held: bool,
+        pass_out_noted: bool,
+    }
+
+    /// `send_rewritten_while_it_waits`, with the marks the send left behind.
+    async fn send_rewritten_while_it_waits_marks(batched: bool, rights: Rights) -> SendMarks {
         let (parked_tx, parked_rx) = oneshot::channel();
         let (resume_tx, resume_rx) = oneshot::channel();
         let (tool, mut guest) = event_guest(FdType::Socket, Some((parked_tx, resume_rx)));
@@ -2004,24 +2026,51 @@ mod event_tests {
         .expect("the send did not cross its retry resource wait");
         assert_eq!(result.unwrap(), 1);
         assert_eq!(guest.send_attempts, 2);
-        guest.passes_out.lock().unwrap().clone()
+        SendMarks {
+            passes_out: guest.passes_out.lock().unwrap().clone(),
+            pipe_end_guest_held: guest
+                .thread
+                .with_detfd(MARKED, |detfd| detfd.is_guest_held())
+                .unwrap(),
+            socket_guest_held: guest
+                .thread
+                .with_detfd(FD, |detfd| detfd.is_guest_held())
+                .unwrap(),
+            pass_out_noted: guest.thread.passed_descriptors_out_unreported
+                || guest.thread.passed_descriptors_out_reported,
+        }
     }
 
-    /// A `sendmsg` polled in the caller's turns reads its messages again
-    /// before every attempt (`Detcore::passes_descriptors_out_now`). Rewritten
-    /// by a sibling to pass a guest-held pipe end while it waits, it reports
-    /// the pass-out in a request of its own before the attempt that passes it,
-    /// so the scheduler revokes every guest-held mark first; left alone, it
-    /// files no extra request. A send that passes a descriptor from the start
+    /// A `sendmsg` polled in the caller's turns sends the message header and
+    /// control data it began with, as Linux copies them when the call begins
+    /// (`___sys_sendmsg` copies the header through `copy_msghdr_from_user`,
+    /// and `____sys_sendmsg` the control data, before `__sock_sendmsg` waits
+    /// for room; net/socket.c:2616, :2543 and :2566 at v6.16): Detcore
+    /// reinstates them before every attempt (`EntryImport`). Rewritten by a
+    /// sibling to pass a guest-held pipe end while it waits, it passes nothing
+    /// out, so no mark may be revoked or added: the reading before every
+    /// attempt (`Detcore::passes_descriptors_out_now`) comes after that
+    /// reinstatement and sees the message as it began. Left alone, it files no
+    /// extra request either. A send that passes a descriptor from the start
     /// reports it with its first request, as before, and files no extra
-    /// request either: the thread has reported, so its later attempts check
-    /// no more (`ThreadState::passed_descriptors_out_reported`) (Codex review
-    /// of https://github.com/rrnewton/hermit/pull/4862).
+    /// request: the thread has reported, so its later attempts check no more
+    /// (`ThreadState::passed_descriptors_out_reported`) (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4862).
     #[tokio::test(flavor = "current_thread")]
-    async fn a_sendmsg_rewritten_to_pass_a_descriptor_while_it_waits_revokes_every_mark() {
+    async fn a_sendmsg_rewritten_while_it_waits_sends_the_message_it_began_with() {
         assert_eq!(
-            send_rewritten_while_it_waits(false, Rights::Rewritten).await,
-            [false, false, true]
+            send_rewritten_while_it_waits_marks(false, Rights::Rewritten).await,
+            SendMarks {
+                // The first request and the retry's, neither reporting a
+                // pass-out, and no request of its own for one.
+                passes_out: vec![false, false],
+                // The rewritten descriptor is not passed out: the pipe end
+                // keeps its mark, the socket gains none, and the thread has
+                // no pass-out to report.
+                pipe_end_guest_held: true,
+                socket_guest_held: false,
+                pass_out_noted: false,
+            }
         );
         assert_eq!(
             send_rewritten_while_it_waits(false, Rights::Never).await,
@@ -2033,7 +2082,17 @@ mod event_tests {
         );
     }
 
-    /// The same for a `sendmmsg` of one message.
+    /// The same for a `sendmmsg` of one message, except that a rewrite while
+    /// it waits is sent. Linux copies each message's header and control data
+    /// when it starts sending that message (`__sys_sendmmsg` calls
+    /// `___sys_sendmsg` for each one in turn, net/socket.c:2709 at v6.16), but
+    /// Detcore keeps only a `sendmsg`'s header as it began (`EntryImport`), so
+    /// each attempt of a `sendmmsg` copies the message again. The reading
+    /// before every attempt (`Detcore::passes_descriptors_out_now`) therefore
+    /// sees the rewrite and reports the pass-out in a request of its own
+    /// before the attempt that passes it, so the scheduler revokes every
+    /// guest-held mark first. Keeping a `sendmmsg`'s messages as they began
+    /// is https://github.com/rrnewton/hermit/issues/4955.
     #[tokio::test(flavor = "current_thread")]
     async fn a_sendmmsg_rewritten_to_pass_a_descriptor_while_it_waits_revokes_every_mark() {
         assert_eq!(
