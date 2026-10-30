@@ -4870,6 +4870,15 @@ impl Scheduler {
                 recording
                     .require_strict_mode(cfg.strict_schedule_boundaries)
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
+                // Raw record/replay library callers may supply a schedule
+                // even though the CLI clears it. Its new timing rules cannot
+                // change a binary recording's clock without an epoch change.
+                if cfg.recordreplay_modes && recording.lists_its_time_skips() {
+                    exit_on_scheduler_refusal(&crate::preemptions::RecordFormatRefusal(format!(
+                        "record/replay cannot use schedule timing format {}; use plain schedule replay or a legacy format-1 schedule",
+                        recording.format_version().unwrap(),
+                    )));
+                }
                 recorded_host_inputs = recording.host_inputs().cloned();
                 time_skip_mode = if recording.lists_its_time_skips() {
                     TimeSkipMode::Driven(
@@ -21293,6 +21302,68 @@ mod test {
                 .into_string()
                 .contains("format_version")
         );
+    }
+
+    /// Public record/replay constructors forward raw Config, so their shared
+    /// loader must refuse new schedule timing formats rather than silently
+    /// enable their jumps/charges or discard the explicitly supplied schedule.
+    #[test]
+    fn binary_record_replay_refuses_new_schedule_timing_formats_in_the_real_loader() {
+        const CHILD: &str = "HERMIT_BINARY_RR_SCHEDULE_FORMAT_TEST";
+        const NAME: &str = "scheduler::test::binary_record_replay_refuses_new_schedule_timing_formats_in_the_real_loader";
+        let load = |format, recordreplay_modes, replaying| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("schedule.json");
+            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+                .with_format(format);
+            Recording::Legacy(record).write(&path).unwrap();
+            Scheduler::new(&Config {
+                replay_schedule_from: Some(path),
+                recordreplay_modes,
+                replaying,
+                ..Config::default()
+            })
+        };
+        if let Ok(case) = std::env::var(CHILD) {
+            let (format, replaying) = case.split_once(':').unwrap();
+            load(
+                Some(format.parse::<u32>().unwrap()),
+                true,
+                replaying == "true",
+            );
+            panic!("raw binary record/replay admitted a new schedule timing format");
+        }
+        for replaying in [false, true] {
+            let legacy = load(None, true, replaying);
+            assert_eq!(legacy.time_skip_mode, TimeSkipMode::Legacy);
+            assert!(!legacy.charge_replayed_switch_ins);
+            for format in [2, 3] {
+                let plain = load(Some(format), false, false);
+                assert_eq!(plain.time_skip_mode, TimeSkipMode::Driven(VecDeque::new()));
+                assert_eq!(plain.charge_replayed_switch_ins, format == 3);
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, format!("{format}:{replaying}"))
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                    "format={format}, replay={replaying}: {output:?}"
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains(&format!(
+                        "record/replay cannot use schedule timing format {format}"
+                    )),
+                    "{stderr}"
+                );
+                assert!(
+                    stderr.contains("use plain schedule replay or a legacy format-1 schedule"),
+                    "{stderr}"
+                );
+            }
+        }
     }
 
     /// A record whose jump moves to the indefinite deadline is refused, and a
