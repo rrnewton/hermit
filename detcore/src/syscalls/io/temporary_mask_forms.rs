@@ -1337,6 +1337,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             let in_turn = first;
             if !in_turn {
                 masked.note_request();
+                // Provenance as it is now (`Resources::waits_on_guest_held_only`).
+                rsrc.waits_on_guest_held_only = crate::syscalls::helpers::poll_targets_guest_held(
+                    guest,
+                    call.fds().map(|fds| fds.as_raw()),
+                    call.nfds() as usize,
+                );
                 resource_request(guest, rsrc.clone()).await;
             }
             first = false;

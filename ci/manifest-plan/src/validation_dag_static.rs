@@ -1219,7 +1219,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
-    ("test.regular_crates", 1929),
+    // And detcore-model's thread_exit_ordering_round_trips_and_defaults_to_false
+    // (PR 4892): 1891 + 1 = 1892 on main 2033f299f.
+    // The same unit on main 16a66895f, and on main 32f85d391 (1906): 1907.
+    // The same unit on main dc85ec16a (1929): 1930, listed.
+    ("test.regular_crates", 1930),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1901,7 +1905,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
-    ("test.hermit_unit", 1289),
+    // And only_ptrace_e9patch_and_dbt_state_that_thread_exits_finish_first
+    // (PR 4892): 1169 + 1 = 1170 on main 2033f299f.
+    // The same unit on main 16a66895f, and on main 32f85d391 (1202): 1203.
+    // The same unit on main dc85ec16a (1289): 1290, listed.
+    ("test.hermit_unit", 1290),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3104,9 +3112,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // copy only where the count proves it): 2691, listed.
     // And passthru_opt_intercepts_the_protection_key_calls (the inotify
     // fault path's protection-key record under --passthru-opt): 2692, listed.
+    // The train-1 recount adds https://github.com/rrnewton/hermit/pull/4588's
+    // unit: 2693, listed.
+    // And https://github.com/rrnewton/hermit/pull/4605's runqueue
+    // a_poll_upgrade_lets_the_change_point_bound_count_a_last_band_poller and
+    // scheduler a_chaos_change_point_yields_to_an_upgraded_last_band_poller,
+    // which landed without a pin hunk; the train-2 recount counted them:
+    // 2693 + 2 = 2695, listed.
     // And package K slice P2b deletes procfs_inode's
     // only_kvms_synthetic_procfs_device_is_proved_by_its_stat_fields with the
     // KVM /proc anchor's device check it tested: 2695 - 1 = 2694, listed.
+    // The train-4 recount adds 28: 2722, listed.
+    // The train-5 recount adds 14: 2736, listed.
     // And determinize_stat_reports_one_link_for_directories_only and
     // determinize_stat_nlink_pin_edges (directory st_nlink pinned to 1):
     // 2736 + 2 = 2738, listed.
@@ -3151,7 +3168,69 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
-    ("test.detcore_unit", 3034),
+    // On main 32f85d391 (2877), this change's three units, fd's
+    // a_received_descriptor_is_guest_held_only_through_its_senders_open_file
+    // and a_socket_is_guest_created_only_through_its_own_open_file, io_buffers'
+    // six send and connect units and scm_rights'
+    // a_connection_is_guest_made_only_when_both_of_its_ends_are: 2889.
+    // The same twelve units on main dc85ec16a, which has three of them
+    // (3034): 3043, listed.
+    // And scheduler::test's ten idle-poller deadlock units (a reader beside
+    // a writer nothing can wake, and nine states that still poll on): 2748.
+    // And scheduler::test::a_trace_replay_grant_after_a_failed_attempt_is_no_attempt: 2749.
+    // Measured with this change's eleven units on #4862's rebased head: 2825.
+    // The same eleven units on #4862's head on main 32f85d391 (2889): 2900.
+    // The same eleven units on #4862's head on main dc85ec16a (3043): 3054.
+    // And fd's
+    // a_receipt_shares_the_provenance_of_the_description_its_message_kept:
+    // 3055, listed.
+    // And scheduler::test::a_trace_replay_grant_after_a_failed_attempt_is_no_attempt: 2752.
+    // And the fix-forward of PR 4605 that counts poll-upgrade progress apart
+    // from round-robin turns: runqueue's
+    // a_poll_upgrade_comes_at_the_same_counted_operation_whatever_host_timed_requeues_add
+    // and scheduler's a_host_timed_requeue_does_not_count_toward_a_poll_upgrade,
+    // host_timed_retries_before_a_poll_upgrade_leave_chaos_change_points_alone,
+    // a_timed_wake_goes_to_the_front_of_its_band_beside_a_thread_at_the_chaos_passover_bound
+    // and the_bound_names_a_poller_only_when_no_other_thread_starves_beside_it:
+    // 2752 + 5 = 2757.
+    // And its fix of https://github.com/rrnewton/hermit/pull/4652's timed
+    // trigger: host_timed_requeues_move_neither_poll_upgrade_trigger,
+    // the_retries_a_timed_poll_upgrade_readies_do_not_count_toward_the_interval,
+    // step2_runs_the_timed_poll_upgrade and parked_tests'
+    // the_controlled_loop_runs_the_timed_poll_upgrade_in_maintenance:
+    // 2757 + 4 = 2761.
+    // And the boundaries of which polling retries count:
+    // only_a_retry_that_waits_on_guest_actions_alone_counts_toward_a_poll_upgrade
+    // and helpers'
+    // a_poll_of_a_guest_held_and_a_host_backed_descriptor_is_not_guest_state:
+    // 2761 + 2 = 2763.
+    // And the provenance, merge and doom boundaries: helpers'
+    // a_retry_counts_on_guest_held_provenance_not_on_internal_routing,
+    // resources' merging_a_host_backed_wait_withdraws_the_guest_state_flags
+    // and scheduler's
+    // a_retry_does_not_count_while_a_doomed_process_awaits_its_reap:
+    // 2763 + 3 = 2766.
+    // And the doom judged at filing and the fatal-delivery wiring:
+    // scheduler's
+    // a_retry_filed_while_a_process_was_doomed_does_not_count_after_the_reap,
+    // tool_global's a_fatal_delivery_stops_the_poll_upgrade_count_until_the_reap
+    // and signal_announcement_tests'
+    // a_fatal_delivery_records_its_doom_outside_record_replay:
+    // 2766 + 3 = 2769.
+    // And io_buffers' a_retry_loop_judges_guest_held_provenance_before_every_attempt:
+    // 2770 on main 2033f299f.
+    // The same eighteen units on #4692's rebased head on main 0e7fd4bdc: 2843.
+    // The same eighteen units on #4692's rebased head on main 16a66895f
+    // (2882): 2900.
+    // The same eighteen units on #4692's rebased head on main 32f85d391
+    // (2900): 2918.
+    // The same eighteen units on #4692's rebased head on main dc85ec16a
+    // (3054): 3072.
+    // And scheduler::test::a_fatal_delivery_noted_for_the_count_alone_dooms_no_thread:
+    // 3073.
+    // The same nineteen units on #4692's head with its receipt unit (3055):
+    // 3074, listed.
+    ("test.detcore_unit", 3074),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3549,7 +3628,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-measured at 3bdd41fda38 by the full validate at that tip:
     // 349 executed, all passed (the two added cases are in this shard;
     // the shard pins 61 + 290 + 349 again sum to the on-host 700).
-    ("test.hermit_integration_3", 349),
+    // And scheduler_deadlock's poll-deadlock report: 350.
+    ("test.hermit_integration_3", 350),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4447,6 +4527,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity, the ptrace
     // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
     // tests: 632 + 2 = 634.
+    // The train-2 recount adds three that landed without a pin hunk,
+    // https://github.com/rrnewton/hermit/pull/4605's
+    // a_last_band_poller_sees_a_pipe_write_beside_two_sleepers_under_chaos
+    // among them: 634 + 3 = 637, listed.
+    // The train-3 and train-4 recounts add 1 + 6: 644.
     // And in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors
     // (https://github.com/rrnewton/hermit/issues/4689): 645.
     // And relative_names_are_decided_by_the_guests_working_directory,
@@ -4477,6 +4562,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4725 adds thirteen cli cases: 714 + 13 = 727, re-measured at this integration head.
     // PR 4679: re-measured at this integration head by the cli binary's own
     // list under the node's skip filters, minus ignored cases: 738.
+    // The train-5 recount adds 9: 654, listed. PR 4605's poll-upgrade
+    // progress fix-forward adds none: 654, listed.
     // PR 4738 adds three cli cases: 738 + 3 = 741, re-measured at this integration head.
     // The PR 4853 transplant relocates three timeslice cases to the PMU node: 741 - 2 listed here
     // (the third is new and never listed here) = 739, re-measured at this integration head.
@@ -4484,7 +4571,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
-    ("test.cli", 744),
+    // And a_schedule_replay_of_a_pipe_reader_whose_writers_exited_is_no_deadlock: 655.
+    // The same test on main 32f85d391 (694): 695.
+    // The same test on main dc85ec16a (744): 745, listed.
+    ("test.cli", 745),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5033,6 +5123,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // And the same two ptrace group-exit signal-wait tests, not excluded:
     // 551 + 2 = 553.
+    // And the same three from the train-2 recount, PR 4605's among them, not
+    // excluded: 556.
+    // And the same 1 + 6 from the train-3 and train-4 recounts: 563.
     // And the same in-guest dup2-onto-runtime-descriptors test, not excluded:
     // 564.
     // And the same five ptrace working-directory tests, not excluded: 573 +
@@ -5051,12 +5144,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same thirteen PR 4725 cli cases: 633 + 13 = 646.
     // PR 4679: the same re-measurement as test.cli with the hosted
     // exclusions applied: 657.
+    // And the same 9 from the train-5 recount: 573, listed.
     // The same three PR 4738 cases: 657 + 3 = 660.
     // The same PR 4853 transplant relocation: 660 - 2 = 658.
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
-    ("test.cli_on_host", 663),
+    // And a_schedule_replay_of_a_pipe_reader_whose_writers_exited_is_no_deadlock: 574.
+    // The same test on main 32f85d391 (613): 614.
+    // The same test on main dc85ec16a (663): 664, listed.
+    ("test.cli_on_host", 664),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5529,7 +5626,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 3c.1e B unit: 2682, listed.
     // And the same nine units for a read that faults: 2691, listed.
     // And the same protection-key subscription unit: 2692, listed.
+    // And the same PR 4588 unit from the train-1 recount: 2693.
+    // And the same two PR 4605 units, counted by the train-2 recount: 2695.
     // And the same P2b deletion of the anchor device unit: 2694, listed.
+    // And the same 28 from the train-4 recount: 2722, listed.
+    // And the same 14 from the train-5 recount: 2736, listed.
     // And the same two directory st_nlink units: 2738, listed.
     // And the same three working-directory units: 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
@@ -5559,7 +5660,30 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
     // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
-    ("test.detcore_unit_on_host", 3034),
+    // The same twelve units on main 32f85d391 (2877): 2889.
+    // The same twelve units on main dc85ec16a, which has three of them
+    // (3034): 3043, listed.
+    // And the same ten idle-poller deadlock units: 2748.
+    // And the same TraceReplay-grant unit: 2749.
+    // The same eleven units: 2825.
+    // The same eleven units on main 32f85d391 (2889): 2900.
+    // The same eleven units on main dc85ec16a (3043): 3054.
+    // And the same receipt unit: 3055, listed.
+    // And the same TraceReplay-grant unit: 2752.
+    // And the same five poll-upgrade progress units: 2757.
+    // And the same four units for PR 4652's timed trigger: 2761.
+    // And the same two units for which polling retries count: 2763.
+    // And the same three provenance, merge and doom units: 2766.
+    // And the same three filing-time doom and fatal-delivery units: 2769.
+    // And the same retry-loop provenance unit: 2770 on main 2033f299f.
+    // The same eighteen units on #4692's rebased head on main 0e7fd4bdc: 2843.
+    // The same eighteen units on main 16a66895f (2882): 2900.
+    // The same eighteen units on main 32f85d391 (2900): 2918.
+    // The same eighteen units on main dc85ec16a (3054): 3072.
+    // And the same count-only fatal-delivery unit: 3073.
+    // The same nineteen units on #4692's head with its receipt unit (3055):
+    // 3074, listed.
+    ("test.detcore_unit_on_host", 3074),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5679,7 +5803,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list --profile ci` (the local shards' 61 + 290 + 349).
     // Recount at 360e99b2e24: shard 2 grew to 292 (see its pin), so the
     // whole-node twin executes 61 + 292 + 349 = 702.
-    ("test.hermit_integration_on_host", 702),
+    // And scheduler_deadlock's poll-deadlock report: 703, listed.
+    ("test.hermit_integration_on_host", 703),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -5952,7 +6077,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
-    ("test.hermit_unit_on_host", 1283),
+    // And the same thread-exit ordering unit: 1164 on main 2033f299f.
+    // The same unit on main 16a66895f, and on main 32f85d391 (1196): 1197.
+    // The same unit on main dc85ec16a (1283): 1284, listed.
+    ("test.hermit_unit_on_host", 1284),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6179,7 +6307,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738: the same nine added cases: 1927 - 14 = 1913.
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
-    ("test.regular_crates_on_host", 1915),
+    // And the same detcore-model thread-exit ordering unit: 1878 on main
+    // 2033f299f.
+    // The same unit on main 16a66895f, and on main 32f85d391 (1892): 1893.
+    // The same unit on main dc85ec16a (1915): 1916, listed.
+    ("test.regular_crates_on_host", 1916),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

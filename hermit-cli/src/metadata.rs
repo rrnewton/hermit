@@ -1277,6 +1277,11 @@ fn record_or_replay_config_with_timer_support(
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        // Record and replay count every requeue toward a poll upgrade before
+        // this is read (`Scheduler::upgrade_progress_of`), so it changes no
+        // recorded schedule; false, as for every configuration the host did
+        // not prepare through `prepare_backend_config`.
+        thread_exits_finish_before_the_next_turn: false,
         // Record and replay never replay a priority history.
         annotated_priority_replay: false,
         // The first image's link stays the kernel's in record and replay.

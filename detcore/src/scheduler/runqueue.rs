@@ -47,6 +47,13 @@
 //! and the scheduler also runs one when none has run for a poll-upgrade period
 //! of virtual time, at least 200 ms (`Scheduler::upgrade_pollers_on_time`).
 //!
+//! The operations that count toward an upgrade are counted apart from the
+//! round-robin turns (`RunQueue::upgrade_progress`), and a requeue whose
+//! number depends on host timing does not count ([`UpgradeProgress`]): a
+//! polling retry, or a loopback poll's yield, can be made any number of times
+//! before a descriptor becomes ready. Counting them let two runs of one seed
+//! upgrade at different points.
+//!
 //! An upgraded poller competes as ordinary runnable work, which under chaos
 //! includes the bound on how often a change point may pass it over
 //! (`Scheduler::bound_chaos_starvation`). A poller whose normal priority is
@@ -165,10 +172,27 @@ pub enum PollerRestore {
     NotQueued,
 }
 
-/// After queueing this many new tasks, perform a "poll upgrade," in which
-/// we upgrade all outstanding polling tasks their original priority levels,
+/// After this many queueing operations that count toward it
+/// ([`UpgradeProgress::Counts`]), perform a "poll upgrade," in which we
+/// upgrade all outstanding polling tasks their original priority levels,
 /// temporarily negating backoff behavior.
 pub(crate) const POLLING_UPGRADE_INTERVAL: u64 = 200;
+
+/// Whether a queueing operation counts toward the next poll upgrade
+/// (`RunQueue::upgrade_progress`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeProgress {
+    /// It counts: a push or a restore that the guest's own execution makes,
+    /// as many times in every run of one seed. That includes the retry of a
+    /// poll that only guest actions can satisfy.
+    Counts,
+    /// It does not: the requeue of a thread after a turn, or a skipped turn,
+    /// whose number depends on host timing (`Scheduler::upgrade_progress_of`):
+    /// the retry of a poll whose outcome a host can change, which repeats
+    /// until a descriptor is ready, or a loopback poll's yield. It still
+    /// takes a round-robin turn.
+    HostTimed,
+}
 
 #[derive(Debug, Copy, Clone)]
 struct QueueValue {
@@ -225,8 +249,8 @@ impl QueueValue {
     }
 
     /// Whether this entry is a polling thread whose backoff has reached the
-    /// last band ([`RunQueue::push_poller`]): only then does it stop holding a
-    /// yield epoch open.
+    /// last band ([`RunQueue::push_poller_with`]): only then does it stop
+    /// holding a yield epoch open.
     fn is_fully_backed_off_poller(&self, priority: Priority) -> bool {
         self.poll_upgrade.is_some() && priority >= LAST_PRIORITY
     }
@@ -262,9 +286,19 @@ pub struct RunQueue {
 
     /// How many poll upgrades have run, from the queueing-operation interval
     /// or [`Self::upgrade_pollers`], so the scheduler can tell how long ago
-    /// the last one was.
+    /// the last one was (`Scheduler::upgrade_pollers_on_time`). Advanced once
+    /// per upgrade, in `do_poll_upgrade`, whichever trigger ran it. It moves
+    /// only with `upgrade_progress` and with the scheduler's timed upgrades,
+    /// never with a host-timed requeue
+    /// (<https://github.com/rrnewton/hermit/pull/4652>, Codex review).
     poll_upgrades: u64,
 
+    /// The queueing operations so far that count toward a poll upgrade
+    /// ([`UpgradeProgress::Counts`]); every `POLLING_UPGRADE_INTERVAL`th runs
+    /// one. Kept apart from the round-robin turns above, which every push
+    /// takes, so that a requeue whose number depends on host timing moves no
+    /// upgrade (<https://github.com/rrnewton/hermit/pull/4605>, Codex review).
+    upgrade_progress: u64,
     /// Used to lock the queue from other changes while we are tentatively popping from it, and also
     /// cache the result.
     tentative_selection: Option<DetTid>,
@@ -337,6 +371,7 @@ impl RunQueue {
             last_back_turn: 0,
             last_front_turn: 0,
             poll_upgrades: 0,
+            upgrade_progress: 0,
             sched_strategy: ss,
             tentative_selection: None,
             tentative_selection_is_exact: false,
@@ -433,22 +468,46 @@ impl RunQueue {
     ///
     /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
     pub fn push_back(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
+        self.push_back_with(tid, priority, UpgradeProgress::Counts)
+    }
+
+    /// [`Self::push_back`], counting toward the next poll upgrade only if
+    /// `progress` says so.
+    pub fn push_back_with(
+        &mut self,
+        tid: DetTid,
+        priority: Priority,
+        progress: UpgradeProgress,
+    ) -> PrioritizedOrder {
         assert!(self.tentative_selection.is_none());
         self.push_safety_check(tid);
         if !is_ordinary_priority(priority) {
             panic!("This is not an acceptable priority value: {}", priority);
         }
-        self.push_back_inner(tid, priority, None)
+        self.push_back_inner(tid, priority, None, progress)
+    }
+
+    /// [`Self::push_yielded_with`], counting toward the next poll upgrade.
+    #[cfg(test)]
+    pub fn push_yielded(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
+        self.push_yielded_with(tid, priority, UpgradeProgress::Counts)
     }
 
     /// Requeue an explicitly yielding thread at its persistent priority while
     /// excluding it from the next selection. The exclusion, rather than the
-    /// queue key, makes this a one-turn operation under every heuristic.
-    pub fn push_yielded(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
+    /// queue key, makes this a one-turn operation under every heuristic. It
+    /// counts toward the next poll upgrade only if `progress` says so: a
+    /// loopback poll's yield does not (`Scheduler::upgrade_progress_of`).
+    pub fn push_yielded_with(
+        &mut self,
+        tid: DetTid,
+        priority: Priority,
+        progress: UpgradeProgress,
+    ) -> PrioritizedOrder {
         assert!(self.yielded_skip.is_none());
         self.yielded_skip = Some(tid);
         self.queued_by_yield.insert(tid);
-        self.push_back(tid, priority)
+        self.push_back_with(tid, priority, progress)
     }
 
     /// Requeue a thread that called `sched_yield` under chaos at its own
@@ -458,10 +517,10 @@ impl RunQueue {
     /// beginning one if none is open. A yield made with no one else to run
     /// does not count, so a thread that spins alone has no streak when another
     /// becomes runnable. Its turn must have been committed with
-    /// [`Self::commit_tentative_pop_yield`]. Unlike [`Self::push_yielded`], the
-    /// epoch lasts until a thread that did not yield has a turn, however many
-    /// yielders take turns in between, and it changes neither the thread's
-    /// band nor its queue key.
+    /// [`Self::commit_tentative_pop_yield`]. Unlike
+    /// [`Self::push_yielded_with`], the epoch lasts until a thread that did
+    /// not yield has a turn, however many yielders take turns in between, and
+    /// it changes neither the thread's band nor its queue key.
     pub fn push_yielded_into_epoch(&mut self, tid: DetTid, priority: Priority) -> PrioritizedOrder {
         // Any other queued thread counts, an epoch member included: a thread
         // left outside an epoch of yielders must be able to join it, or it
@@ -480,17 +539,32 @@ impl RunQueue {
         self.push_back(tid, priority)
     }
 
-    /// Push a polling thread. The priority level is an exponential backoff from
-    /// the given `normal_priority` value. The pushed thread will also
-    /// participatein "poll upgrades" in which periodically polling threads are
-    /// re-boosted to their original `normal_priority` values.
-    ///
-    /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
+    /// [`Self::push_poller_with`], counting toward the next poll upgrade.
+    #[cfg(test)]
     pub fn push_poller(
         &mut self,
         tid: DetTid,
         normal_priority: Priority,
         poll_attempt: u32,
+    ) -> PrioritizedOrder {
+        self.push_poller_with(tid, normal_priority, poll_attempt, UpgradeProgress::Counts)
+    }
+
+    /// Push a polling thread. The priority level is an exponential backoff from
+    /// the given `normal_priority` value. The pushed thread will also
+    /// participatein "poll upgrades" in which periodically polling threads are
+    /// re-boosted to their original `normal_priority` values. The push counts
+    /// toward the next poll upgrade only if `progress` says so: the
+    /// scheduler's requeue of a skipped retry does not, outside record/replay
+    /// (`Scheduler::upgrade_progress_of`).
+    ///
+    /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
+    pub fn push_poller_with(
+        &mut self,
+        tid: DetTid,
+        normal_priority: Priority,
+        poll_attempt: u32,
+        progress: UpgradeProgress,
     ) -> PrioritizedOrder {
         assert!(self.tentative_selection.is_none());
         self.push_safety_check(tid);
@@ -501,7 +575,7 @@ impl RunQueue {
             .unwrap_or(Priority::MAX)
             .min(LAST_PRIORITY);
         // Upgrade back to original priority:
-        self.push_back_inner(tid, priority, Some(normal_priority))
+        self.push_back_inner(tid, priority, Some(normal_priority), progress)
     }
 
     fn push_back_inner(
@@ -509,11 +583,12 @@ impl RunQueue {
         tid: DetTid,
         priority: Priority,
         poll_upgrade: Option<Priority>,
+        progress: UpgradeProgress,
     ) -> PrioritizedOrder {
         self.last_back_turn += 1;
         let turn = self.last_back_turn;
         let prio = PrioritizedOrder { priority, turn };
-        self.push_inner(tid, prio, poll_upgrade)
+        self.push_inner(tid, prio, poll_upgrade, progress)
     }
 
     /// Push a thread to the front of the specified priority. `push_back` should
@@ -549,7 +624,7 @@ impl RunQueue {
         self.last_front_turn -= 1;
         let turn = self.last_front_turn;
         let prio = PrioritizedOrder { priority, turn };
-        self.push_inner(tid, prio, poll_upgrade)
+        self.push_inner(tid, prio, poll_upgrade, UpgradeProgress::Counts)
     }
 
     fn push_inner(
@@ -557,6 +632,7 @@ impl RunQueue {
         tid: DetTid,
         prio: PrioritizedOrder,
         poll_upgrade: Option<Priority>,
+        progress: UpgradeProgress,
     ) -> PrioritizedOrder {
         let qval = QueueValue {
             tid,
@@ -566,7 +642,7 @@ impl RunQueue {
         };
         let old = self.queue.insert(prio, qval);
         assert!(old.is_none()); // last_*_turn should be monotonic
-        self.check_poll_upgrade();
+        self.check_poll_upgrade(progress);
         prio
     }
 
@@ -592,9 +668,9 @@ impl RunQueue {
 
     /// Whether `tid` is queued as a thread that will run its turn, not as a
     /// polling thread retrying a call that is not ready: one pushed by
-    /// [`RunQueue::push_poller`] (which records a polling upgrade) or restored
-    /// as a poller and not run since. Its priority band does not decide it: a
-    /// runnable thread can sit in the last band, as under
+    /// [`RunQueue::push_poller_with`] (which records a polling upgrade) or
+    /// restored as a poller and not run since. Its priority band does not
+    /// decide it: a runnable thread can sit in the last band, as under
     /// `--chaos-target-races`. Read-only.
     pub fn contains_non_polling_tid(&self, tid: DetTid) -> bool {
         self.queue
@@ -902,15 +978,24 @@ impl RunQueue {
         self.tentative_selection_is_exact = false;
     }
 
-    /// Return how many things have been queued.
-    fn turn_counter(&self) -> u64 {
-        debug_assert!(self.last_back_turn >= 0);
-        debug_assert!(self.last_front_turn <= 0);
-        self.last_back_turn as u64 + self.last_front_turn.unsigned_abs()
+    /// The queueing operations that have counted toward a poll upgrade
+    /// (`RunQueue::upgrade_progress`).
+    #[cfg(test)]
+    pub fn upgrade_progress(&self) -> u64 {
+        self.upgrade_progress
     }
 
-    fn check_poll_upgrade(&mut self) {
-        if self.turn_counter().is_multiple_of(POLLING_UPGRADE_INTERVAL) {
+    /// Count one queueing operation toward the next poll upgrade, unless it is
+    /// host-timed, and run the upgrade at every `POLLING_UPGRADE_INTERVAL`th.
+    fn check_poll_upgrade(&mut self, progress: UpgradeProgress) {
+        if progress == UpgradeProgress::HostTimed {
+            return;
+        }
+        self.upgrade_progress += 1;
+        if self
+            .upgrade_progress
+            .is_multiple_of(POLLING_UPGRADE_INTERVAL)
+        {
             self.do_poll_upgrade();
         }
     }
@@ -921,7 +1006,8 @@ impl RunQueue {
         self.sched_strategy.is_priority_ordered()
     }
 
-    /// Run a poll upgrade now, as the `POLLING_UPGRADE_INTERVAL`th push would.
+    /// Run a poll upgrade now, as the `POLLING_UPGRADE_INTERVAL`th counted
+    /// queueing operation would.
     #[cfg(test)]
     pub fn poll_upgrade_now(&mut self) {
         self.do_poll_upgrade();
@@ -944,7 +1030,9 @@ impl RunQueue {
     /// later, such as a spinner requeued at its next preemption. Keeping its
     /// older round-robin turn instead let it overtake a thread that became
     /// runnable before its deadline. The move is a queueing operation: it
-    /// takes a new back turn and counts toward the poll-upgrade interval.
+    /// takes a new back turn and counts toward the poll-upgrade interval: it
+    /// answers a deadline the guest set or a channel another thread readied,
+    /// not a retry.
     ///
     /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
     pub fn restore_poller_priority(&mut self, tid: DetTid) -> PollerRestore {
@@ -966,7 +1054,7 @@ impl RunQueue {
             turn: self.last_back_turn,
         };
         assert!(self.queue.insert(restored, value).is_none());
-        self.check_poll_upgrade();
+        self.check_poll_upgrade(UpgradeProgress::Counts);
         PollerRestore::Restored
     }
 
@@ -978,7 +1066,11 @@ impl RunQueue {
     /// Run a poll upgrade now, outside the queueing-operation interval, and
     /// answer which backed-off pollers it restored to their normal priority.
     /// The scheduler calls this when virtual time, not queueing operations,
-    /// says an upgrade is due.
+    /// says an upgrade is due. It is not a queueing operation: it neither
+    /// counts toward nor restarts `upgrade_progress`, so the next interval
+    /// upgrade comes where it would have without it. It advances the upgrade
+    /// count once, in `do_poll_upgrade`, and sets the same marks as an
+    /// interval upgrade (`QueueValue::upgraded_in_place`).
     ///
     /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
     pub fn upgrade_pollers(&mut self) -> Vec<DetTid> {
@@ -987,7 +1079,8 @@ impl RunQueue {
     }
 
     /// Upgrade polled tasks to their specified normal priority, and answer
-    /// which it restored.
+    /// which it restored. The one place an upgrade is counted
+    /// (`poll_upgrades`), for both triggers.
     #[cold]
     fn do_poll_upgrade(&mut self) -> Vec<DetTid> {
         self.poll_upgrades += 1;
@@ -1066,7 +1159,7 @@ mod tests {
         queue.push_poller(poller, DEFAULT_PRIORITY, 3);
         queue.push_poller(other, DEFAULT_PRIORITY, 3);
         queue.push_back(spinner, DEFAULT_PRIORITY);
-        let pushes = queue.turn_counter();
+        let pushes = queue.upgrade_progress();
         // Backed off, the poller loses to the spinner.
         assert_eq!(queue.tentative_pop_next(), Some(spinner));
         queue.undo_tentative_pop();
@@ -1075,7 +1168,11 @@ mod tests {
             queue.restore_poller_priority(poller),
             PollerRestore::Restored
         );
-        assert_eq!(queue.turn_counter(), pushes + 1, "a restore is one push");
+        assert_eq!(
+            queue.upgrade_progress(),
+            pushes + 1,
+            "a restore counts as one push"
+        );
         assert_eq!(queue.queued_priority(poller), Some(DEFAULT_PRIORITY));
         assert_eq!(queue.tentative_pop_next(), Some(spinner), "queued first");
         assert_eq!(queue.commit_tentative_pop(), spinner);
@@ -1262,6 +1359,13 @@ mod tests {
         assert!(!queue.can_be_passed_over(other));
         queue.do_poll_upgrade();
         assert!(queue.can_be_passed_over(poller), "the upgrade reached it");
+        // `suspend` and `restore` (the parked alarm observation) keep the
+        // entry, and the mark with it (Claude review of
+        // https://github.com/rrnewton/hermit/pull/4605, finding 3).
+        let entry = queue.suspend(poller, LAST_PRIORITY).expect("queued");
+        assert!(!queue.contains_tid(poller));
+        queue.restore(entry, LAST_PRIORITY);
+        assert!(queue.can_be_passed_over(poller), "restored with its mark");
         assert!(queue.can_be_passed_over(other), "moved, as on main");
         assert!(!queue.contains_non_polling_tid(poller));
         assert_eq!(queue.queued_priority(poller), Some(LAST_PRIORITY));
@@ -1287,6 +1391,69 @@ mod tests {
         assert!(queue.only_pollers());
         assert!(!queue.contains_tid(DetTid::from_raw(9)));
         assert!(!queue.can_be_passed_over(DetTid::from_raw(9)));
+    }
+
+    /// A poll upgrade runs at the `POLLING_UPGRADE_INTERVAL`th queueing
+    /// operation that counts toward it, and a host-timed requeue (a polling
+    /// retry, skipped or run, or a loopback poll's yield) does not count,
+    /// however many come. At 199 counted operations nothing is upgraded or
+    /// marked, whatever host-timed requeues are added, and the 200th upgrades
+    /// and marks as it does without them; each requeue still takes its
+    /// round-robin turn. Before, every push counted, so a retry count that
+    /// depends on host timing moved the upgrade, and with it the mark the
+    /// chaos change-point bound reads (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4605).
+    #[test]
+    fn a_poll_upgrade_comes_at_the_same_counted_operation_whatever_host_timed_requeues_add() {
+        let poller = DetTid::from_raw(1);
+        let backed_off = DetTid::from_raw(2);
+        let worker = DetTid::from_raw(3);
+        let retrier = DetTid::from_raw(4);
+        let interval = POLLING_UPGRADE_INTERVAL;
+        for host_timed in [0, 1, 2, 7, 3 * interval] {
+            let mut queue = RunQueue::default();
+            queue.push_poller(poller, LAST_PRIORITY, 5);
+            queue.push_poller(backed_off, DEFAULT_PRIORITY, 3);
+            queue.push_back(worker, DEFAULT_PRIORITY);
+            while queue.upgrade_progress() < interval - 1 {
+                assert!(queue.remove_tid(worker));
+                queue.push_back(worker, DEFAULT_PRIORITY);
+            }
+            let turns = queue.last_back_turn;
+            for retry in 0..host_timed {
+                queue.remove_tid(retrier);
+                let progress = UpgradeProgress::HostTimed;
+                match retry % 3 {
+                    0 => queue.push_poller_with(retrier, DEFAULT_PRIORITY, 2, progress),
+                    1 => queue.push_back_with(retrier, DEFAULT_PRIORITY, progress),
+                    _ => queue.push_yielded_with(retrier, DEFAULT_PRIORITY, progress),
+                };
+            }
+            let context = format!("{host_timed} host-timed requeues");
+            assert_eq!(queue.upgrade_progress(), interval - 1, "{context}");
+            assert_eq!(
+                queue.last_back_turn,
+                turns + host_timed as RoundRobinTurn,
+                "{context}: each takes a turn"
+            );
+            assert!(!queue.can_be_passed_over(poller), "{context}: no mark");
+            assert_eq!(
+                queue.queued_priority(backed_off),
+                Some(8 * DEFAULT_PRIORITY),
+                "{context}: no upgrade"
+            );
+
+            assert!(queue.remove_tid(worker));
+            queue.push_back(worker, DEFAULT_PRIORITY);
+            assert_eq!(queue.upgrade_progress(), interval, "{context}");
+            assert!(queue.can_be_passed_over(poller), "{context}: marked");
+            assert!(!queue.contains_non_polling_tid(poller), "{context}");
+            assert_eq!(
+                queue.queued_priority(backed_off),
+                Some(DEFAULT_PRIORITY),
+                "{context}: upgraded"
+            );
+        }
     }
 
     /// A chaos `sched_yield` requeue marks its thread as a yielder, as the

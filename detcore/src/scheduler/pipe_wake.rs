@@ -39,6 +39,18 @@ impl Scheduler {
         self.fatal_signal_doomed.insert(process);
     }
 
+    /// Record that `process` received a signal whose default action ends it,
+    /// in the turn that delivered it, until its reap (`consume_child_wait`):
+    /// at every committed delivery (`commit_fatal_delivery`), and where the
+    /// delivery is not committed (`GlobalRequest::NoteFatalDelivery`). Only
+    /// the poll upgrade's count reads it
+    /// (`Scheduler::a_committed_doom_is_outstanding`). It dooms no thread:
+    /// where the delivery is not committed, a gdbserver client may still
+    /// cancel the signal, and the process lives on.
+    pub(crate) fn note_fatal_signal_delivery(&mut self, process: DetPid) {
+        self.fatal_signals_unreaped.insert(process);
+    }
+
     /// Whether a committed fatal signal doomed `process`, read through
     /// [`Scheduler::thread_is_doomed`].
     fn fatal_signal_doomed(&self, process: DetPid) -> bool {
@@ -48,8 +60,10 @@ impl Scheduler {
     /// Whether `tid`'s process is doomed by a decision some committed turn
     /// made: a granted exit, a committed SIGKILL, an exec teardown in flight,
     /// or a delivered fatal signal. Such a thread may leave the scheduler at a
-    /// host-timed moment, so neither the scan below nor `--virtual-timeout`
-    /// (`a_thread_can_still_be_granted`) may depend on whether it already has.
+    /// host-timed moment, so neither the hand-off scan below, the idle-poller
+    /// deadlock check (`Scheduler::only_idle_guest_pollers_remain`) nor
+    /// `--virtual-timeout` (`a_thread_can_still_be_granted`) may depend on
+    /// whether it already has. A thread of no known process counts as doomed.
     pub(super) fn thread_is_doomed(&self, tid: DetTid) -> bool {
         let Some(process) = self.thread_tree.thread_to_leader.get(&tid).copied() else {
             return true;
