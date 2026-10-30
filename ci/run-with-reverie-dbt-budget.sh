@@ -3069,7 +3069,7 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO 382028d6f55c408c817e89860a99ecc35975d783 (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
+# CARRY TO c0d9a755d5f300048781e27898f29dbabf22b01a (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
 # Interval: reverie train (1111, 1116, 1136, 1147, 1148, 1152, 1155,
 # 1160, 1161, 1162, 1178, 1179). The reverie-dbt tree is unchanged;
 # reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
@@ -3083,7 +3083,7 @@ fi
 # (353ffffb). The reverie-dbt tree changed and the committed
 # inventory is 1043. The existing SDK budget carries, not runtime
 # equivalence.
-# CARRY TO 382028d6f55c408c817e89860a99ecc35975d783 (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
+# CARRY TO c0d9a755d5f300048781e27898f29dbabf22b01a (2026-10-29): from 77ac9de280d5e6ac7505c55be5ff1a37e7996f95.
 # Interval: reverie train (1111, 1116, 1136, 1147, 1148, 1152, 1155,
 # 1160, 1161, 1162, 1178, 1179). The reverie-dbt tree is unchanged;
 # reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
@@ -3101,7 +3101,7 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=382028d6f55c408c817e89860a99ecc35975d783
+expected_pin=c0d9a755d5f300048781e27898f29dbabf22b01a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
