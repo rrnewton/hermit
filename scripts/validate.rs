@@ -8892,13 +8892,22 @@ fn add_framework_retries(
         retries.and_then(|retries| serde_json::to_value(retries).map_err(|error| error.to_string()))
     }) {
         None => {}
-        Some(Ok(retries)) => record["framework_retries_v1"] = retries,
+        Some(Ok(retries)) => {
+            if let Ok(rollup) = serde_json::to_value(
+                hermit_manifest_plan::ledger::RetryRollupV1::from_framework_retries(&retries),
+            ) {
+                record["retry_rollup_v1"] = rollup;
+            }
+            record["framework_retries_v1"] = retries;
+        }
         Some(Err(error)) => {
+            record["retry_rollup_error"] = error.clone().into();
             eprintln!("validate: framework retry summary unavailable: {error}");
             record["framework_retries_error"] = error.into();
         }
     }
 }
+
 #[cfg(test)]
 mod concurrent_validate_path_tests {
     use std::io::Write;
