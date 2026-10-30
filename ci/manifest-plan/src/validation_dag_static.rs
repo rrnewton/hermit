@@ -1266,7 +1266,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Composed on measured main ffe313b1: 1944 + 2 = 1946 (Train 5 delta +2).
     // And detcore-model host_input::tests::stdio_kinds_name_each_changed_descriptor: 1933.
     // Rebased onto main fcd62385f: 1951 + 1 = 1952.
-    ("test.regular_crates", 1952),
+    // And host_input::tests::terminal_devices_follow_the_kernels_driver_list: 1934.
+    // Rebased onto main fcd62385f: 1952 + 1 = 1953.
+    ("test.regular_crates", 1953),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4641,7 +4643,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_verify_run_records_the_stdio_kinds_its_guest_was_given: 747.
     // Rebased onto main fcd62385f: 795 + 1 = 796.
     // Rebased onto main 2baafbdf5: 797 + 1 = 798.
-    ("test.cli", 798),
+    // And a_library_run_records_the_stdio_kinds_of_its_commands_descriptors: 748.
+    // Rebased onto main fcd62385f: 796 + 1 = 797.
+    // Rebased onto main 2baafbdf5: 798 + 1 = 799.
+    ("test.cli", 799),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5306,7 +5311,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main 2baafbdf5: 715 + 1 = 716.
     // Rebased onto main fcd62385f: 714 + 1 = 715.
     // Rebased onto main 2baafbdf5: 716 + 1 = 717.
-    ("test.cli_on_host", 717),
+    // And the same library-run stdio-kind test: 667.
+    // Kept equal to the second test.regular_crates_on_host entry below: 1920.
+    // Rebased onto main fcd62385f: 715 + 1 = 716.
+    // Rebased onto main 2baafbdf5: 717 + 1 = 718.
+    ("test.cli_on_host", 718),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5318,7 +5327,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
     // Rebased onto main fcd62385f: 1937 + 1 = 1938.
-    ("test.regular_crates_on_host", 1938),
+    // Rebased onto main fcd62385f: 1938 + 1 = 1939.
+    ("test.regular_crates_on_host", 1939),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6543,7 +6553,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
     // And the same detcore-model stdio unit: 1919.
     // Rebased onto main fcd62385f: 1937 + 1 = 1938.
-    ("test.regular_crates_on_host", 1938),
+    // And the same terminal-device unit: 1920.
+    // Rebased onto main fcd62385f: 1938 + 1 = 1939.
+    ("test.regular_crates_on_host", 1939),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
