@@ -1337,6 +1337,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let in_turn = first;
             if !in_turn {
                 masked.note_request();
+                crate::syscalls::helpers::refresh_guest_poll_state(guest, probe.into(), &mut rsrc);
                 resource_request(guest, rsrc.clone()).await;
             }
             first = false;

@@ -1026,6 +1026,112 @@ fn ppoll(memory: &FormMemory, pollfd: usize) -> reverie::syscalls::Ppoll {
         .with_sigsetsize(8)
 }
 
+/// Each real poll handler refreshes the modeled description after a sibling
+/// replaces the same numeric descriptor during its parked retry. The first
+/// stale queued request is deliberately retained; scheduler freshness must
+/// prevent it from authorizing a jump until the new probe has run.
+#[tokio::test]
+async fn poll_retries_refresh_guest_held_authority_after_a_parked_fd_replacement() {
+    for family in [
+        "poll",
+        "ppoll",
+        "masked-ppoll",
+        "gated-masked-ppoll",
+        "read",
+    ] {
+        for replace in [false, true] {
+            let _seam = script(proc_state(0, 0, 0));
+            let memory = FormMemory::new(None, 0);
+            LocalMemory::new()
+                .write_value(
+                    AddrMut::<[i32; 2]>::from_raw(memory.at(FormMemory::SET)).unwrap(),
+                    &[8, 1],
+                )
+                .unwrap();
+            let mut guest = turn_guest(family == "gated-masked-ppoll" || family == "read", Some(0));
+            if family == "masked-ppoll" {
+                guest.config.backend = reverie::BackendCapabilities::PTRACE;
+            }
+            guest.clock_step = 0;
+            let original = crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 800);
+            let replacement = crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 801);
+            add_pipe(&mut guest, 8, original);
+            guest
+                .thread
+                .with_detfd(8, |fd| fd.set_guest_held())
+                .unwrap();
+            if replace {
+                let fd = crate::fd::DetFd::new(
+                    8,
+                    nix::fcntl::OFlag::O_RDONLY,
+                    crate::fd::FdType::Socket,
+                    replacement,
+                );
+                fd.set_physically_nonblocking();
+                *guest.replace_poll_fd.lock().unwrap() = Some((8, fd));
+            }
+            guest.probe_results = VecDeque::from([Ok(0), Ok(0), Ok(1)]);
+            guest.read_results = VecDeque::from([Err(Errno::EAGAIN), Err(Errno::EAGAIN), Ok(1)]);
+            let tool = super::tool(&guest);
+            let result = match family {
+                "poll" => {
+                    tool.handle_poll(
+                        &mut guest,
+                        reverie::syscalls::Poll::new()
+                            .with_fds(AddrMut::from_raw(memory.at(FormMemory::SET)))
+                            .with_nfds(1)
+                            .with_timeout(-1),
+                    )
+                    .await
+                }
+                "read" => {
+                    tool.execute_nonblockable_fd_syscall(
+                        &mut guest,
+                        reverie::syscalls::Read::new()
+                            .with_fd(8)
+                            .with_buf(AddrMut::from_raw(memory.at(FormMemory::SET)))
+                            .with_len(1),
+                    )
+                    .await
+                }
+                _ => {
+                    let call = ppoll(&memory, FormMemory::SET).with_timeout(None);
+                    let call = if family == "ppoll" {
+                        call.with_sigmask(None)
+                    } else {
+                        call
+                    };
+                    tool.handle_ppoll(&mut guest, call).await
+                }
+            };
+            assert_eq!(result.unwrap(), 1, "{family}, replace={replace}");
+            let expected = if replace { replacement } else { original };
+            assert_eq!(
+                guest.polled_open_files,
+                [Some(original), Some(expected), Some(expected)],
+                "{family}, replace={replace}: the actual injected attempts use the replaced slot"
+            );
+            let requests: Vec<_> = guest
+                .requests()
+                .into_iter()
+                .filter(|r| r.resources.contains_key(&ResourceID::InternalIOPolling))
+                .collect();
+            assert!(requests.len() >= 2, "{family}: two parked retry boundaries");
+            assert!(requests[0].polls_guest_state_only && requests[0].relies_on_guest_held_marks);
+            let last = requests.last().unwrap();
+            assert_eq!(
+                last.polls_guest_state_only, !replace,
+                "{family}: refreshed readiness authority"
+            );
+            assert_eq!(
+                last.relies_on_guest_held_marks, !replace,
+                "{family}: refreshed provenance"
+            );
+            assert!(guest.replace_poll_fd.lock().unwrap().is_none());
+        }
+    }
+}
+
 /// The 3c.1d `ppoll` gate (D50 reader (5); F17's `ppoll` order), with the
 /// base rows in-guest already matches Linux in. Own mask: SIGTERM (and
 /// SIGURG); temporary mask: empty.

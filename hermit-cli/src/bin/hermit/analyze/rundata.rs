@@ -1260,15 +1260,15 @@ impl AnalyzeOpts {
     /// ([`Self::stamp_trial_record`]). The record carries the jumps of global
     /// time of the recorded schedule whose event prefix its events repeat
     /// furthest (`crate::time_skip_carry`), so its replay jumps where that
-    /// recording did, and is in the oldest format among the recordings read,
-    /// whose rules its events follow. A record that would not validate is
-    /// refused before anything is written.
+    /// recording did. All sources must share one timing format; mixing
+    /// formats cannot preserve their different switch-in charging rules.
+    /// An incompatible format or invalid record is refused before writing.
     pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
         let (skips, format) = {
             let sources = self.time_skip_sources.lock().unwrap();
             (
                 sources.carried(record.schedevents()),
-                sources.trial_format(),
+                sources.trial_format()?,
             )
         };
         let record = self.stamp_trial_record(record.with_format(format).with_time_skips(skips));
@@ -1526,6 +1526,76 @@ mod tests {
             "{}",
             recording.to_repro()
         );
+    }
+
+    /// The actual writer preserves one format's jumps/charging and refuses
+    /// mixed formats before touching its destination, even for an exact prefix.
+    #[test]
+    fn trial_record_writing_preserves_one_timing_format_and_refuses_mixed_sources() {
+        use detcore::preemptions::TimeSkip;
+        use detcore::preemptions::TimeSkipReason;
+        use detcore::types::DetTid;
+        use detcore::types::LogicalTime;
+
+        let events = vec![SchedEvent::branches(DetTid::from_raw(3), 1)];
+        let record = |format| {
+            let record = PreemptionRecord::from_sched_events(events.clone()).with_format(format);
+            if format.is_some() {
+                record.with_time_skips(vec![TimeSkip {
+                    event: 1,
+                    target: LogicalTime::from_nanos(1000),
+                    reason: TimeSkipReason::IdleGuestPollers,
+                }])
+            } else {
+                record
+            }
+        };
+        let options = || {
+            let args =
+                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("trial.json");
+        for format in [None, Some(2), Some(3)] {
+            let options = options();
+            let source = record(format);
+            options.time_skip_sources.lock().unwrap().remember(&source);
+            options
+                .write_trial_schedule(events.clone(), &output)
+                .unwrap();
+            let written = PreemptionReader::try_new(&output).unwrap().into_inner();
+            assert_eq!(written.format_version(), format);
+            assert_eq!(written.time_skips(), source.time_skips());
+            assert_eq!(written.charges_replayed_switch_ins(), format == Some(3));
+        }
+        for other in [None, Some(2)] {
+            for formats in [[Some(3), other], [other, Some(3)]] {
+                let options = options();
+                for format in formats {
+                    options
+                        .time_skip_sources
+                        .lock()
+                        .unwrap()
+                        .remember(&record(format));
+                }
+                std::fs::write(&output, b"existing output must survive refusal").unwrap();
+                let error = options
+                    .write_trial_schedule(events.clone(), &output)
+                    .unwrap_err();
+                let message = error.to_string();
+                assert!(message.contains("different timing formats"), "{message}");
+                assert!(message.contains("record both inputs"), "{message}");
+                assert_eq!(
+                    std::fs::read(&output).unwrap(),
+                    b"existing output must survive refusal"
+                );
+            }
+        }
     }
 
     /// Analyze and bisect run every trial under the timeslice a recording says

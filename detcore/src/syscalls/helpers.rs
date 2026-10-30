@@ -489,8 +489,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
-            (rsrc.polls_guest_state_only, rsrc.relies_on_guest_held_marks) =
-                single_fd_poll_readiness(guest, wrapped, internal_fd);
+            // Routing through internal polling does not prove closed guest
+            // membership: even a pipe may have been passed to a host.
+            refresh_guest_poll_state(guest, wrapped, &mut rsrc);
             // A pipe read: a recorded private `SIGCHLD` ends it as on Linux.
             rsrc.private_sigchld_decides = reads_a_pipe(guest, wrapped);
             // A read waits for data, a write for room (`--pipe-wake-latency`).
@@ -681,6 +682,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             Err(error) => break Err(error),
                         }
                     }
+                    refresh_guest_poll_state(guest, call.into(), &mut resources);
                     let status = resource_request(guest, resources.clone()).await;
                     let turn = if checks_at_turn {
                         // A named signal counts if the guest's own mask leaves
@@ -933,7 +935,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A pipe write: a recorded private `SIGCHLD` ends it as on Linux
         // (`Resources::private_sigchld_decides`).
         resources.private_sigchld_decides = true;
-        resources.polls_guest_state_only = true;
+        refresh_guest_poll_state(guest, call.into(), &mut resources);
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
             .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
@@ -980,6 +982,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the bytes written so far are returned, or the restart errno if
             // there are none.
             let status = if resources.poll_attempt > 0 {
+                refresh_guest_poll_state(guest, call.into(), &mut resources);
                 Some(resource_request(guest, resources.clone()).await)
             } else {
                 None
@@ -1530,6 +1533,34 @@ pub(crate) fn poll_targets_guest_held<G: Guest<Detcore<T>>, T: RecordOrReplay>(
         })
 }
 
+/// Refresh only descriptor-based idle-poll authority, independently of the
+/// syscall's record/replay routing. Pipes and socketpairs also rely on the
+/// guest-held mark: SCM export revokes that authority for queued requests.
+/// Non-FD primitives retain the proof supplied by their own handlers.
+pub(crate) fn refresh_guest_poll_state<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    call: Syscall,
+    resources: &mut Resources,
+) {
+    let held = match call {
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Poll(call) => poll_targets_guest_held(
+            guest,
+            call.fds().map(|fds| fds.as_raw()),
+            call.nfds() as usize,
+        ),
+        Syscall::Ppoll(call) => poll_targets_guest_held(
+            guest,
+            call.fds().map(|fds| fds.as_raw()),
+            call.nfds() as usize,
+        ),
+        _ if get_fd(call).is_some() => syscall_targets_guest_held_fd(guest, call),
+        _ => return,
+    };
+    resources.relies_on_guest_held_marks = held;
+    resources.polls_guest_state_only = held;
+}
+
 /// The descriptors Linux polls in a `pollfd` array's bytes: each entry's
 /// `fd` when it is not negative.
 fn pollfd_descriptors(bytes: &[u8]) -> Vec<i32> {
@@ -1914,7 +1945,8 @@ fn pipe_writev_resources(dettid: DetTid, call: reverie::syscalls::Writev) -> Res
     // disposition itself after a `Signaled` wake, so the scheduler's drain
     // must not filter by the kernel mask (`execute_blocking_pipe_writev`).
     resources.decides_signal_interruption_itself = true;
-    resources.polls_guest_state_only = true;
+    // The caller fills descriptor provenance immediately before requesting
+    // a turn; constructing a pipe request alone proves no closed membership.
     resources
 }
 
@@ -2985,6 +3017,11 @@ where
     let mut published = PublishedWaitMask::default();
 
     let result: Result<i64, Error> = loop {
+        // A sibling can replace a descriptor while the previous request
+        // waits. Classify the next attempt against the current table. The
+        // scheduler's progress/freshness checks prevent the older queued
+        // request from justifying an idle jump before this new probe.
+        refresh_guest_poll_state(guest, call.into(), &mut rsrc);
         let resumed = match call.into() {
             Syscall::Read(read) if maybe_timeout.is_none() && maybe_stackguard.is_none() => {
                 crate::tool_global::polled_read_request(guest, read, rsrc.clone()).await

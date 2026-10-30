@@ -454,7 +454,7 @@ impl PreemptionRecord {
         other.validate()?;
         if self.format_version != other.format_version {
             return Err(format!(
-                "cannot interpolate record formats {:?} and {:?}: their replay rules differ",
+                "cannot interpolate record formats {:?} and {:?}: their replay rules differ; record both inputs with the same Hermit version and timing format",
                 self.format_version, other.format_version
             ));
         }
@@ -466,13 +466,13 @@ impl PreemptionRecord {
         }
         if !lists_no_time_skips(&self.time_skips) || !lists_no_time_skips(&other.time_skips) {
             return Err(
-                "cannot interpolate a mixed schedule with recorded time jumps: no source's complete event order matches the result"
+                "cannot interpolate a mixed schedule with recorded time jumps: no source's complete event order matches the result; replay an unchanged endpoint instead"
                     .to_owned(),
             );
         }
         if !self.callback_checkpoints.is_empty() || !other.callback_checkpoints.is_empty() {
             return Err(
-                "cannot interpolate a mixed schedule with callback checkpoints: no mapping to the edited event order is established"
+                "cannot interpolate a mixed schedule with callback checkpoints: no mapping to the edited event order is established; replay an unchanged endpoint instead"
                     .to_owned(),
             );
         }
@@ -489,7 +489,7 @@ impl PreemptionRecord {
             || self.store_exclusive_failures() != other.store_exclusive_failures()
         {
             return Err(
-                "cannot interpolate a mixed schedule with incompatible recording metadata (epoch, charging policy, RNG, timeslice or host inputs)"
+                "cannot interpolate a mixed schedule with incompatible recording metadata (epoch, charging policy, RNG, timeslice or host inputs); record inputs with matching metadata or replay an unchanged endpoint"
                     .to_owned(),
             );
         }
@@ -528,8 +528,8 @@ impl PreemptionRecord {
     }
 
     /// The same record in `format` (`None` for format 1). Analyze and bisect
-    /// write a trial schedule in the oldest format among the recordings they
-    /// read (`hermit-cli`'s `time_skip_carry`).
+    /// require one shared timing format across the recordings they read
+    /// (`hermit-cli`'s `time_skip_carry`).
     pub fn with_format(mut self, format: Option<u32>) -> Self {
         self.format_version = format;
         self

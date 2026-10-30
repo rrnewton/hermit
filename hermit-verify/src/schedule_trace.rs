@@ -61,7 +61,7 @@ impl DiffOpts {
         let second_schedule = legacy_schedule(&self.file_b, "schedule diff/interpolation")?;
         println!("first schedule length: {}", first_schedule.len());
         println!("second schedule length: {}", second_schedule.len());
-        let bubbles = iterable_bubble_sort(&first_schedule, &second_schedule);
+        let bubbles = iterable_bubble_sort(first_schedule, second_schedule);
         eprintln!(
             ":: {}",
             format!(

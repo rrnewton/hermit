@@ -166,7 +166,7 @@ impl BisectOpts {
         analyzer.adopt_recorded_epoch(&[("--good", &self.good), ("--bad", &self.bad)])?;
         // Every replay charges expired timed waits as the failing schedule did.
         analyzer.adopt_expired_wait_charge(Some(&self.bad))?;
-        // Every replay registers queued sleeps as the failing schedule did.
+        // Keep the timeslice drawn by the recordings.
         analyzer.adopt_recorded_timeslice(&[("--good", &self.good), ("--bad", &self.bad)])?;
         analyzer.refuse_recordings_under_another_pipe_wake_latency(&[
             ("--good", &self.good),
@@ -178,6 +178,9 @@ impl BisectOpts {
             let mut sources = analyzer.time_skip_sources.lock().unwrap();
             sources.remember(&good);
             sources.remember(&bad);
+            // Refuse before the first trial, rather than silently downgrading
+            // a format-3 prefix's charging rule to a legacy/format-2 rule.
+            sources.trial_format()?;
         }
         let mut good = good.into_global();
         let mut bad = bad.into_global();
@@ -271,6 +274,39 @@ mod tests {
         assert_eq!(fs::read(good_path).unwrap(), good_bytes);
         assert_eq!(fs::read(bad_path).unwrap(), bad_bytes);
         result
+    }
+
+    /// Admission reaches the real source-format check before any trial.
+    #[test]
+    fn bisect_refuses_mixed_timing_formats_before_starting_a_trial() {
+        let first = vec![SchedEvent::branches(DetTid::from_raw(3), 1)];
+        let second = vec![SchedEvent::branches(DetTid::from_raw(5), 1)];
+        let record = |events, format| {
+            let mut value = search_record(events);
+            if let Some(format) = format {
+                value["format_version"] = serde_json::json!(format);
+            }
+            value
+        };
+        for format in [None, Some(2), Some(3)] {
+            prepare_search_records(
+                &record(first.clone(), format),
+                &record(second.clone(), format),
+            )
+            .unwrap();
+        }
+        for other in [None, Some(2)] {
+            for formats in [[Some(3), other], [other, Some(3)]] {
+                let error = prepare_search_records(
+                    &record(first.clone(), formats[0]),
+                    &record(second.clone(), formats[1]),
+                )
+                .unwrap_err();
+                let message = format!("{error:#}");
+                assert!(message.contains("different timing formats"), "{message}");
+                assert!(message.contains("record both inputs"), "{message}");
+            }
+        }
     }
 
     #[test]

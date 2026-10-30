@@ -2927,6 +2927,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut published = PublishedWaitMask::default();
         publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
         let result = loop {
+            crate::syscalls::helpers::refresh_guest_poll_state(guest, probe.into(), &mut rsrc);
             resource_request(guest, rsrc.clone()).await;
             // Virtual timerfds first (`crate::syscalls::timerfd`), in the
             // staged cells' scratch while they hold the stack.

@@ -19,6 +19,7 @@
 //! up to where they part: one recording's history, never a mix of several,
 //! which could disagree.
 
+use std::collections::BTreeSet;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -34,9 +35,9 @@ use detcore::types::SchedEvent;
 #[derive(Debug, Default)]
 pub struct TimeSkipSources {
     sources: Vec<Source>,
-    /// The oldest format among the recordings remembered (`None` for format
-    /// 1), once one is (`trial_format`).
-    oldest_format: Option<Option<u32>>,
+    /// Every timing format read (`None` means legacy format 1). A trial
+    /// cannot combine formats with different jump/switch-in charging rules.
+    formats: BTreeSet<Option<u32>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -98,12 +99,7 @@ impl TimeSkipSources {
     /// Remember `record`. One that made no jump counts as much as one that
     /// did: a trial that repeats it furthest makes no jump either.
     pub fn remember(&mut self, record: &PreemptionRecord) {
-        // `None` (format 1) orders before every numbered format.
-        let format = record.format_version();
-        self.oldest_format = Some(
-            self.oldest_format
-                .map_or(format, |oldest| oldest.min(format)),
-        );
+        self.formats.insert(record.format_version());
         let source = Source {
             prefix_hashes: prefix_hashes(record.schedevents()),
             skips: record.time_skips().unwrap_or_default().to_vec(),
@@ -113,12 +109,25 @@ impl TimeSkipSources {
         }
     }
 
-    /// The format a trial schedule spliced from the remembered recordings is
-    /// written in: the oldest of theirs, since its events follow those
-    /// recordings' rules, or the newest format when none was read.
-    pub fn trial_format(&self) -> Option<u32> {
-        self.oldest_format
-            .unwrap_or(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT))
+    /// The single timing format all sources share, or the current format
+    /// before any source is read. There is no proved conversion between
+    /// legacy, format 2 and format 3 charging rules, even when a selected
+    /// prefix comes from just one of the sources.
+    pub fn trial_format(&self) -> anyhow::Result<Option<u32>> {
+        anyhow::ensure!(
+            self.formats.len() <= 1,
+            "cannot combine recordings with different timing formats {:?}; \
+             record both inputs with the same Hermit version and timing format",
+            self.formats
+                .iter()
+                .map(|format| format.unwrap_or(1))
+                .collect::<Vec<_>>()
+        );
+        Ok(self
+            .formats
+            .first()
+            .copied()
+            .unwrap_or(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)))
     }
 
     /// The jumps a replay of `events` must make: those of the remembered
@@ -276,26 +285,27 @@ mod tests {
             &PreemptionRecord::from_sched_events(jumped.clone())
                 .with_time_skips(vec![skip(1, 2_000)]),
         );
-        sources.remember(&PreemptionRecord::from_sched_events(plain.clone()));
+        sources.remember(&PreemptionRecord::from_sched_events(plain.clone()).with_format(Some(2)));
         assert!(sources.carried(&plain).is_empty());
         assert_eq!(sources.carried(&jumped), vec![skip(1, 2_000)]);
     }
 
-    /// A trial is written in the oldest format among the recordings read, the
-    /// newest when there are none (Claude review, round 3).
+    /// Timing formats cannot be converted merely by choosing the oldest.
+    /// The actual writer/admission controls also check this refusal.
     #[test]
-    fn a_trial_takes_the_oldest_format_read() {
+    fn a_trial_refuses_mixed_timing_formats() {
         let mut sources = TimeSkipSources::default();
         assert_eq!(
-            sources.trial_format(),
+            sources.trial_format().unwrap(),
             Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)
         );
         sources.remember(&PreemptionRecord::from_sched_events(events(&[3])).with_current_format());
         assert_eq!(
-            sources.trial_format(),
+            sources.trial_format().unwrap(),
             Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)
         );
         sources.remember(&PreemptionRecord::from_sched_events(events(&[5])));
-        assert_eq!(sources.trial_format(), None);
+        let error = sources.trial_format().unwrap_err();
+        assert!(error.to_string().contains("different timing formats"));
     }
 }

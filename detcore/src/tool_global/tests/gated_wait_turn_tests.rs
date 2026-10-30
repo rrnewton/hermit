@@ -222,6 +222,10 @@ struct TurnGuest {
     /// Every RPC, in order.
     rpcs: Mutex<Vec<GlobalRequest>>,
     answers: Mutex<Answers>,
+    /// A sibling's replacement of one FD slot while retry 1 is parked.
+    replace_poll_fd: Mutex<Option<(i32, crate::fd::DetFd)>>,
+    /// Open-file identity observed by actual read/poll probe injections.
+    polled_open_files: Vec<Option<crate::types::OpenFileId>>,
     /// What a `FutexAction::WaitRequest` is answered with.
     futex_answer: Option<SchedValue>,
     /// `sa_flags` an injected `rt_sigaction` query reports.
@@ -341,7 +345,22 @@ impl GlobalRPC<GlobalState> for TurnGuest {
     ) -> <GlobalState as GlobalTool>::Response {
         self.rpcs.lock().unwrap().push(message.2.clone());
         let response = match message.2 {
-            GlobalRequest::RequestResources(..) => {
+            GlobalRequest::RequestResources(ref request, _) => {
+                if request.poll_attempt == 1
+                    && request
+                        .resources
+                        .contains_key(&ResourceID::InternalIOPolling)
+                    && let Some((fd, replacement)) = self.replace_poll_fd.lock().unwrap().take()
+                {
+                    let old = self
+                        .thread
+                        .file_metadata
+                        .lock()
+                        .unwrap()
+                        .file_handles
+                        .insert(fd, replacement);
+                    assert!(old.is_some(), "the scripted dup2 replaces an existing slot");
+                }
                 *self.clock.lock().unwrap() += self.clock_step_on_request;
                 GlobalResponse::RequestResources(
                     self.answers
@@ -483,7 +502,14 @@ impl Guest<Detcore> for TurnGuest {
         self.injected.push(call.number());
         let (number, args) = call.into_parts();
         match Syscall::from_raw(number, args) {
-            Syscall::Read(_) => self.read_results.pop_front().unwrap_or(Err(Errno::EAGAIN)),
+            Syscall::Read(call) => {
+                self.polled_open_files.push(
+                    self.thread
+                        .with_detfd(call.fd(), |fd| fd.open_file_id())
+                        .ok(),
+                );
+                self.read_results.pop_front().unwrap_or(Err(Errno::EAGAIN))
+            }
             Syscall::Write(_) | Syscall::Writev(_) => {
                 self.write_results.pop_front().unwrap_or(Err(Errno::EAGAIN))
             }
@@ -616,6 +642,12 @@ impl Guest<Detcore> for TurnGuest {
                 self.probe_results.pop_front().unwrap_or(Ok(0))
             }
             Syscall::Ppoll(probe) => {
+                if let Some(fds) = probe.fds() {
+                    let fd = LocalMemory::new().read_value::<_, i32>(fds.cast()).ok();
+                    self.polled_open_files.push(
+                        fd.and_then(|fd| self.thread.with_detfd(fd, |fd| fd.open_file_id()).ok()),
+                    );
+                }
                 self.probe_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.probe_masks
@@ -637,6 +669,12 @@ impl Guest<Detcore> for TurnGuest {
             // ppoll probe is: the scripted result, and `revents` written for a
             // count, which an unreadable array fails with EFAULT.
             Syscall::Poll(probe) => {
+                if let Some(fds) = probe.fds() {
+                    let fd = LocalMemory::new().read_value::<_, i32>(fds.cast()).ok();
+                    self.polled_open_files.push(
+                        fd.and_then(|fd| self.thread.with_detfd(fd, |fd| fd.open_file_id()).ok()),
+                    );
+                }
                 self.probe_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.probe_masks.push(None);
@@ -726,6 +764,8 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         own_mask,
         rpcs: Mutex::new(Vec::new()),
         answers: Mutex::new(VecDeque::new()),
+        replace_poll_fd: Mutex::new(None),
+        polled_open_files: Vec::new(),
         futex_answer: Some(SchedValue::Value(0)),
         action_flags: 0,
         action_mask: 0,
@@ -1430,6 +1470,124 @@ fn add_pipe(guest: &mut TurnGuest, fd: i32, id: crate::types::OpenFileId) {
         .unwrap()
         .file_handles
         .insert(fd, pipe);
+}
+
+/// Internal-FD routing is independent of the guest-held proof. Actual
+/// scalar read/write and pipe-writev requests reach scheduler admission, where
+/// an export must revoke their idle authority without changing that routing.
+#[tokio::test]
+async fn internal_pipe_poll_authority_depends_on_revocable_guest_held_provenance() {
+    for socketpair in [false, true] {
+        for held in [false, true] {
+            for operation in ["read", "write", "writev"] {
+                let _seam = script(proc_state(0, 0, 0));
+                let mut guest = turn_guest(true, Some(0));
+                let id = crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 700);
+                let fd = crate::fd::DetFd::new(
+                    8,
+                    nix::fcntl::OFlag::O_RDWR,
+                    if socketpair {
+                        crate::fd::FdType::Socket
+                    } else {
+                        crate::fd::FdType::Pipe
+                    },
+                    id,
+                );
+                fd.set_physically_nonblocking();
+                if socketpair {
+                    fd.set_socketpair_endpoint();
+                }
+                if held {
+                    fd.set_guest_held();
+                }
+                guest
+                    .thread
+                    .file_metadata
+                    .lock()
+                    .unwrap()
+                    .file_handles
+                    .insert(8, fd);
+                let tool = tool(&guest);
+                let buffer = Box::leak(Box::new([0u8; 8])).as_mut_ptr() as usize;
+                guest.write_results = VecDeque::from([Err(Errno::EAGAIN), Ok(1)]);
+                guest.read_results = VecDeque::from([Err(Errno::EAGAIN), Ok(1)]);
+                let result = match operation {
+                    "read" => {
+                        tool.execute_nonblockable_fd_syscall(
+                            &mut guest,
+                            reverie::syscalls::Read::new()
+                                .with_fd(8)
+                                .with_buf(AddrMut::from_raw(buffer))
+                                .with_len(1),
+                        )
+                        .await
+                    }
+                    "write" => {
+                        let call = reverie::syscalls::Write::new()
+                            .with_fd(8)
+                            .with_buf(Addr::from_raw(buffer))
+                            .with_len(1);
+                        if socketpair {
+                            tool.execute_nonblockable_fd_syscall(&mut guest, call).await
+                        } else {
+                            tool.execute_blocking_pipe_write(&mut guest, call, id).await
+                        }
+                    }
+                    "writev" => {
+                        let iovec = Box::leak(Box::new([buffer, 1usize])).as_mut_ptr() as usize;
+                        let call = reverie::syscalls::Writev::new()
+                            .with_fd(8)
+                            .with_iov(Addr::from_raw(iovec))
+                            .with_len(1);
+                        if socketpair {
+                            tool.execute_nonblockable_fd_syscall(&mut guest, call).await
+                        } else {
+                            tool.execute_blocking_pipe_writev(&mut guest, call, id)
+                                .await
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    result.unwrap(),
+                    1,
+                    "held={held}, socketpair={socketpair}, {operation}"
+                );
+                let requests: Vec<_> = guest
+                    .requests()
+                    .into_iter()
+                    .filter(|r| r.resources.contains_key(&ResourceID::InternalIOPolling))
+                    .collect();
+                assert!(!requests.is_empty());
+                for request in &requests {
+                    assert_eq!(request.polls_guest_state_only, held);
+                    assert_eq!(
+                        request.relies_on_guest_held_marks, held,
+                        "an exported internal FD must lose the same authority as any guest-held FD"
+                    );
+                }
+                let request = requests.last().unwrap().clone();
+                assert!(
+                    request.poll_attempt > 0,
+                    "a real failed attempt preceded this request"
+                );
+                let config = Config::default();
+                let mut scheduler = crate::scheduler::Scheduler::new(&config);
+                let time = std::sync::Arc::new(Mutex::new(crate::types::GlobalTime::new(&config)));
+                let admitted = crate::ivar::Ivar::new();
+                scheduler.request_put(&admitted, request, &time);
+                let request = admitted.try_read().unwrap().unwrap();
+                assert_eq!(scheduler.idle_guest_poll_for_test(&request), held);
+                let mut export = Resources::new(PEER);
+                export.passes_descriptors_out = true;
+                scheduler.request_put(&crate::ivar::Ivar::new(), export, &time);
+                assert!(
+                    !scheduler.idle_guest_poll_for_test(&request),
+                    "scheduler admission revokes the actual {operation} request after export"
+                );
+            }
+        }
+    }
 }
 
 /// D50 reader 1's waiting side, a parked pipe write, scalar and vectored:

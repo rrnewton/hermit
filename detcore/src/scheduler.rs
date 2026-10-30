@@ -17088,6 +17088,13 @@ impl Scheduler {
             && Self::waits_after_a_failed_attempt(rs)
     }
 
+    /// Observe the production idle decision for a request captured by a real
+    /// syscall-handler test, including scheduler-wide export revocation.
+    #[cfg(test)]
+    pub(crate) fn idle_guest_poll_for_test(&self, rs: &Resources) -> bool {
+        self.is_idle_guest_poll(rs)
+    }
+
     /// Whether no guest thread other than `dtid` can make progress unless a
     /// host acts or a timer fires, judged from scheduler state alone at
     /// `dtid`'s commit (<https://github.com/rrnewton/hermit/issues/2203>).
@@ -20517,6 +20524,51 @@ mod test {
         sched.progress_epoch += 1;
         sched.last_progress = sched.progress_epoch;
         assert!(!sched.nothing_else_can_run(opener));
+    }
+
+    /// A sibling's ordinary turn (including dup2/close) makes a queued
+    /// descriptor classification stale. It cannot authorize a jump before
+    /// the poller probes again and publishes its refreshed classification.
+    #[test]
+    fn a_descriptor_replacement_turn_requires_a_fresh_poll_before_an_idle_jump() {
+        let mut sched = Scheduler::new(&Config::default());
+        let sibling = DetTid::from_raw(3);
+        let poller = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sibling);
+        queued_poller(&mut sched, poller, true);
+        let old_commit = sched.last_commit_at[&poller];
+        assert!(sched.nothing_else_can_run(sibling));
+        sched.next_turns[&sibling]
+            .req
+            .put(Ok(Resources::new(sibling)));
+        let _ = turn_answer(&mut sched, sibling);
+        assert!(sched.last_progress > old_commit);
+        assert!(
+            !sched.nothing_else_can_run(sibling),
+            "the queued stale request is not idle"
+        );
+        assert_eq!(sched.alone_until(poller, Some(old_commit)), None);
+        let _ = turn_answer(&mut sched, poller);
+        assert!(
+            sched.pending_time_skip.is_none(),
+            "the first post-replacement probe gets no jump"
+        );
+
+        register_known_thread(&mut sched, poller);
+        let mut refreshed = Resources::new(poller);
+        refreshed.insert(ResourceID::InternalIOPolling, Permission::W);
+        refreshed.poll_attempt = 2;
+        sched.next_turns[&poller].req.put(Ok(refreshed.clone()));
+        assert!(
+            !sched.nothing_else_can_run(sibling),
+            "an external replacement never becomes idle"
+        );
+        // A genuine guest-held replacement remains eligible after its fresh
+        // failed probe; the fix does not disable the positive case.
+        refreshed.polls_guest_state_only = true;
+        refreshed.relies_on_guest_held_marks = true;
+        sched.next_turns.get_mut(&poller).unwrap().req = Ivar::full(Ok(refreshed));
+        assert!(sched.nothing_else_can_run(sibling));
     }
 
     /// A partial pipe write's retry follows an attempt that moved bytes: the
