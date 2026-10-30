@@ -126,7 +126,7 @@ check_guest_paths() {
         return 2
     }
     while IFS= read -r path || [[ -n $path ]]; do
-        if [[ ! $path =~ ^/usr/bin/[A-Za-z0-9_-]+$ || -v seen[$path] ]]; then
+        if [[ ! $path =~ ^/usr/(bin|sbin)/[][A-Za-z0-9_.+-]+$ || -v seen[$path] ]]; then
             echo "assert-build-dependencies: invalid or duplicate guest path: $path" >&2
             return 2
         fi
@@ -260,6 +260,7 @@ self_test() {
     manifest=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/guest-paths.txt
     mkdir -p "$guest_root/usr/bin"
     while IFS= read -r path; do
+        mkdir -p "$guest_root$(dirname -- "$path")"
         ln -s "$stub" "$guest_root$path"
     done < "$manifest"
     check_guest_paths "$guest_root"
