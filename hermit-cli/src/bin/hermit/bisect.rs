@@ -195,6 +195,12 @@ fn read_schedule(path: &Path, label: &str) -> anyhow::Result<PreemptionRecord> {
         .validate()
         .map_err(anyhow::Error::msg)
         .with_context(|| format!("--{label} schedule {} failed validation", path.display()))?;
+    record.require_faithful_replay().map_err(|error| {
+        anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            "--{label} schedule {} cannot supply bisection evidence: {error:#}",
+            path.display()
+        ))
+    })?;
     if !record.contains_schedevents() {
         bail!(
             "--{label} schedule {} contains no global schedule events",
@@ -883,5 +889,37 @@ mod tests {
         )
         .unwrap();
         assert!(schedule.contains_schedevents());
+    }
+}
+
+#[cfg(test)]
+mod replay_departure_tests {
+    use super::*;
+
+    #[test]
+    fn bisection_refuses_a_marked_schedule_before_event_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schedule.json");
+        for marker in [None, Some(7)] {
+            let record = PreemptionRecord::from_sched_events(vec![SchedEvent::branches(
+                detcore::types::DetTid::from_raw(3),
+                1,
+            )])
+            .retain_replay_departure(marker);
+            record.write_to_disk(&path).unwrap();
+            let result = read_schedule(&path, "good");
+            if marker.is_some() {
+                let error = result.expect_err("bisection must not drop departure provenance");
+                assert!(
+                    error
+                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .is_some(),
+                    "{error:#}"
+                );
+                assert!(format!("{error:#}").contains("HERMIT_INCOMPLETE_REPLAY_RECORD"));
+            } else {
+                assert_eq!(result.unwrap(), record);
+            }
+        }
     }
 }

@@ -535,6 +535,30 @@ those slices and go on with the first recorded slice still ahead, at its
 priority (at a thread's start, the record's first priority holds until that
 slice ends). `hermit analyze` adds it to the records it edits.
 
+Explicit `--replay-edited-preemptions` is exploration-only. It cannot be
+combined with `--verify`, `--verify-strict`, or `--verify-run`, even when the
+input record has no departure marker: an edited replay can omit a change point
+while running, so matching output alone cannot certify faithful replay. Ordinary
+unmarked faithful replay and verification remain supported. Analyze's separate
+selfcheck requires both its input and recorded result to have no known omission.
+
+A record with `replay_departed_at` is known to omit a replay change point.
+Faithful history replay, global-schedule replay, boundary replay, and analysis
+refuse it with `HERMIT_INCOMPLETE_REPLAY_RECORD` before using it as execution
+evidence. Explicit edited history exploration may read it, with a warning, and
+any new recording retains the omission fact. Copying, stripping timestamps,
+normalizing, or interpolating a record cannot remove that fact. A retained count
+refers to a source observation; it need not index a transformed output.
+
+Newly written marked JSON uses the mandatory
+`incomplete_preemption_record` version-1 envelope, which old readers reject.
+The new reader also recognizes historical flat marked JSON and refuses its
+faithful use, but cannot protect those already-written flat files from old
+binaries. Unmarked legacy bytes and their admission policy remain unchanged;
+a missing marker does not prove historical completeness. Marked records cannot
+be serialized through an unversioned non-human format. No appended-data
+detection or generic legacy binary roundtrip guarantee is implied.
+
 A replay reproduces the recording only if the guest reads the same host
 files. The recorded schedule therefore keeps the set of host files the run
 read (`host_inputs`: each path with its host identity and, for a regular file

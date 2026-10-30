@@ -93,6 +93,7 @@ impl AnalyzeOpts {
 
         let tids: Vec<DetTid> = pr.all_threads();
         let init_schedule: PreemptionRecord = pr.load_all();
+        super::rundata::RunData::require_complete_record(&init_schedule, preempts_path)?;
         let mut round: u64 = 0;
 
         // All the preemption points we don't know about yet.  Are they critical?
@@ -377,6 +378,52 @@ mod tests {
                 trials, failing_trial,
                 "minimization ran more trials after trial {failing_trial} failed"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod replay_departure_tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn minimizing_a_marked_record_never_projects_it_into_unmarked_trials() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.json");
+        let history = (1..=8)
+            .map(|i| (LogicalTime::from_nanos(i * 1000), FIRST_PRIORITY + i))
+            .collect();
+        let record = PreemptionRecord::from_vecs(&BTreeMap::from([(DetTid::from_raw(3), history)]));
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap();
+        for marker in [None, Some(7)] {
+            record
+                .clone()
+                .retain_replay_departure(marker)
+                .write_to_disk(&path)
+                .unwrap();
+            let mut calls = 0;
+            let result = options.minimize_with(&path, |_, _| {
+                calls += 1;
+                Ok(true)
+            });
+            if marker.is_some() {
+                let error = result
+                    .expect_err("marked history must not be reconstructed without its marker");
+                assert!(
+                    error
+                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .is_some(),
+                    "{error:#}"
+                );
+                assert_eq!(calls, 0);
+            } else {
+                result.unwrap();
+                assert_eq!(calls, 3);
+            }
         }
     }
 }

@@ -3233,6 +3233,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             };
 
+            // A preemption replay's change point at or before the thread's
+            // last one means the thread left its record (a slice closed with
+            // no time in it). Filed, it was never granted and the replay
+            // stalled until `--timeout`. Report it and run on without the
+            // record's remaining ends for this thread: the run ends in the
+            // skid-overshoot refusal instead.
+            if !replay_checkpoint && maybe_prio.is_some() {
+                let thread = guest.thread_state_mut();
+                if let Err(last) = thread.file_replay_change_point(&self.cfg, end_time) {
+                    tool_local::report_stale_replay_filing(
+                        self.cfg.panic_on_rcb_overshoot,
+                        dettid,
+                        thread.stats.timeslice_count,
+                        end_time,
+                        last,
+                    );
+                    thread.abandon_replayed_slices(&self.cfg);
+                    break;
+                }
+            }
+
             // Depending on chaos mode, a received timer event is either a preemption or a changepoint
             let mut req = if replay_checkpoint {
                 // The selected scheduler operation reads its current replay
@@ -5038,6 +5059,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
+                    last_replay_change_point: None,
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(PR-1151)
                     chaos_epoch: tool_local::chaos_epoch_sentinel(),

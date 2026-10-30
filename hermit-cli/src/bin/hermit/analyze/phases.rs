@@ -466,9 +466,11 @@ impl AnalyzeOpts {
                 path.display()
             )
         })?;
+        let record = record.into_inner();
+        RunData::require_complete_record(&record, &path)?;
         Ok(CompletedScheduleTrial {
             target_met,
-            schedule: record.into_inner().into_global(),
+            schedule: record.into_global(),
         })
     }
 
@@ -821,6 +823,7 @@ impl AnalyzeOpts {
         global: &GlobalOpts,
         min_run: &mut RunData,
     ) -> Result<(), Error> {
+        min_run.require_complete_output()?;
         let min_log_path = &min_run.log_path().unwrap().to_path_buf();
         let min_preempts_path = min_run.preempts_path_out().to_path_buf();
 
@@ -977,11 +980,12 @@ impl AnalyzeOpts {
             newrun
                 .launch()
                 .map_err(|error| incomplete_trial(error, &newrun.root_path()))?;
+            let path = newrun.sched_path_out().to_path_buf();
+            let record = PreemptionReader::try_new(&path)?.into_inner();
+            RunData::require_complete_record(&record, &path)?;
             Ok(CompletedScheduleTrial {
                 target_met: newrun.is_a_match(),
-                schedule: PreemptionReader::try_new(newrun.sched_path_out())?
-                    .into_inner()
-                    .into_global(),
+                schedule: record.into_global(),
             })
         })
     }
@@ -1389,8 +1393,8 @@ impl AnalyzeOpts {
 
         let baseline_sched_name = baseline_endpoint_run.sched_out_file_name();
         let target_sched_name = target_endpoint_run.sched_out_file_name();
-        let target = target_endpoint_run.sched_out();
-        let baseline = baseline_endpoint_run.sched_out();
+        let target = target_endpoint_run.sched_out()?;
+        let baseline = baseline_endpoint_run.sched_out()?;
 
         eprintln!(
             ":: {} (event lengths {} / {}): {} {}",
@@ -1462,6 +1466,7 @@ impl AnalyzeOpts {
     ///
     /// Argument: the last on-target run that was preemption based.
     fn save_final_target_sched_events(&mut self, mut last_run: RunData) -> anyhow::Result<RunData> {
+        last_run.require_complete_output()?;
         let pr = last_run.preempts_out();
         if pr.contains_schedevents() {
             let path = last_run.preempts_path_out();
@@ -3010,6 +3015,70 @@ mod tests {
                 analyze.tmp_dir.is_none(),
                 "{options:?}: a workspace was created before the refusal"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod replay_departure_tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn marked_target_evidence_cannot_pass_selfcheck_or_become_an_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(directory.path().to_path_buf());
+        for marker in [None, Some(7)] {
+            let record = PreemptionRecord::from_sched_events(vec![SchedEvent::branches(
+                detcore::types::DetTid::from_raw(3),
+                1,
+            )])
+            .retain_replay_departure(marker);
+            let path = directory.path().join("target.json");
+            record.write_to_disk(&path).unwrap();
+            let runopts = crate::run::RunOpts::try_parse_from(["run", "/bin/true"]).unwrap();
+            let make_run = || {
+                RunData::from_minimize_output(
+                    &options,
+                    "target".into(),
+                    runopts.clone(),
+                    record.clone(),
+                    path.clone(),
+                    directory.path().join("target.log"),
+                )
+            };
+            // A marked input must stop even before the optional selfcheck
+            // launches; the ordinary no-selfcheck endpoint remains accepted.
+            let mut run = make_run();
+            let mut check = options.clone();
+            check.selfcheck = marker.is_some();
+            let checked = check.phase3_strict_preempt_replay_check(
+                &GlobalOpts::try_parse_from(["hermit"]).unwrap(),
+                &mut run,
+            );
+            let projected = run.sched_out().cloned();
+            let promoted = options.clone().save_final_target_sched_events(make_run());
+            if marker.is_some() {
+                for error in [
+                    checked.unwrap_err(),
+                    projected.unwrap_err(),
+                    promoted.err().expect("marked target was promoted"),
+                ] {
+                    assert!(
+                        error
+                            .downcast_ref::<crate::container::PolicyRefusal>()
+                            .is_some(),
+                        "{error:#}"
+                    );
+                    assert!(format!("{error:#}").contains("HERMIT_INCOMPLETE_REPLAY_RECORD"));
+                }
+            } else {
+                checked.unwrap();
+                assert_eq!(projected.unwrap(), record.schedevents().clone());
+                promoted.unwrap();
+            }
         }
     }
 }

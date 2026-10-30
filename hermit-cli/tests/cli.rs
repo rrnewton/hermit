@@ -20186,8 +20186,13 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
             .stdin(Stdio::null()),
     );
     let replay_stderr = stderr(&replayed);
+    // The replay never finds a thread past a recorded slice end.
     assert!(
         !replay_stderr.contains("Cannot set end of timeslice"),
+        "{replay_stderr}"
+    );
+    assert!(
+        !replay_stderr.contains("HERMIT_SKID_OVERSHOOT preemption replay"),
         "{replay_stderr}"
     );
     assert_success(&replayed, &replay_args);
@@ -55625,6 +55630,114 @@ fn preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do() {
             assert!(
                 stderr(&recorded).contains("Success: replay matched recording."),
                 "{mode}: replay must match the recording: {recorded:?}"
+            );
+        }
+    }
+}
+
+/// Known omissions are refused before a guest or verification artifact exists.
+/// The small monotonic history is an actual recording; no PMU overshoot is
+/// required to distinguish admission from the original warning-only behavior.
+#[test]
+fn run_refuses_incomplete_replay_before_guest_execution() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let ordinary = directory.path().join("ordinary.preempts");
+    let marked = directory.path().join("marked.preempts");
+    let rerecorded = directory.path().join("exploration.preempts");
+    let run = |extra: &[String]| {
+        let mut args = vec![
+            "run".to_owned(),
+            "--base-env=minimal".into(),
+            "--epoch=2026-01-01T00:00:00Z".into(),
+            "--max-timeslice=disabled".into(),
+            "--timeout=10".into(),
+        ];
+        args.extend_from_slice(extra);
+        args.extend([
+            "--".into(),
+            "/bin/echo".into(),
+            "HERMIT_4843_GUEST_RAN".into(),
+        ]);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        hermit_test::hermit_output(
+            "incomplete replay admission",
+            hermit_command(&argv).stdin(Stdio::null()),
+        )
+    };
+    let recorded = run(&[format!("--record-preemptions-to={}", ordinary.display())]);
+    assert_eq!(recorded.status.code(), Some(0), "{}", stderr(&recorded));
+    assert_eq!(stdout(&recorded), "HERMIT_4843_GUEST_RAN\n");
+    let record = detcore::preemptions::PreemptionReader::try_new(&ordinary)
+        .unwrap()
+        .into_inner();
+    record.validate().unwrap();
+    assert!(record.contains_schedevents());
+    assert_eq!(record.replay_departed_at(), None);
+    record
+        .clone()
+        .retain_replay_departure(Some(0))
+        .write_to_disk(&marked)
+        .unwrap();
+    let marked_record = detcore::preemptions::PreemptionReader::try_new(&marked)
+        .unwrap()
+        .into_inner();
+    assert_eq!(marked_record.schedevents(), record.schedevents());
+    assert_eq!(marked_record.extract_all(), record.extract_all());
+    assert_eq!(marked_record.replay_departed_at(), Some(0));
+
+    let history = format!("--replay-preemptions-from={}", ordinary.display());
+    for flags in [vec![history.clone()], vec![history, "--verify".into()]] {
+        let replayed = run(&flags);
+        assert_eq!(replayed.status.code(), Some(0), "{}", stderr(&replayed));
+        assert_eq!(stdout(&replayed), "HERMIT_4843_GUEST_RAN\n");
+    }
+    let edited = run(&[
+        format!("--replay-preemptions-from={}", marked.display()),
+        "--replay-edited-preemptions".into(),
+        format!("--record-preemptions-to={}", rerecorded.display()),
+    ]);
+    assert_eq!(edited.status.code(), Some(0), "{}", stderr(&edited));
+    assert_eq!(stdout(&edited), "HERMIT_4843_GUEST_RAN\n");
+    assert!(stderr(&edited).contains("explicit edited history exploration"));
+    assert_eq!(
+        detcore::preemptions::read_recorded_replay_departure(&rerecorded).unwrap(),
+        Some(0)
+    );
+
+    for flag in ["--replay-preemptions-from", "--replay-schedule-from"] {
+        let refused = run(&[format!("{flag}={}", marked.display())]);
+        assert_eq!(refused.status.code(), Some(122), "{}", stderr(&refused));
+        assert!(
+            refused.stdout.is_empty(),
+            "guest ran despite incomplete-record refusal"
+        );
+        assert!(stderr(&refused).contains("HERMIT_INCOMPLETE_REPLAY_RECORD"));
+        assert!(stderr(&refused).contains("replay_departed_at=0"));
+    }
+    for (index, path) in [&ordinary, &marked].into_iter().enumerate() {
+        let capture = directory.path().join(format!("verification-{index}"));
+        for verification in [
+            vec!["--verify".into()],
+            vec!["--verify".into(), "--verify-strict".into()],
+            vec![format!("--verify-run={}", capture.display())],
+        ] {
+            let mut flags = vec![
+                format!("--replay-preemptions-from={}", path.display()),
+                "--replay-edited-preemptions".into(),
+            ];
+            flags.extend(verification);
+            let refused = run(&flags);
+            assert_eq!(refused.status.code(), Some(122), "{}", stderr(&refused));
+            assert!(
+                refused.stdout.is_empty(),
+                "guest ran despite exploration-only refusal"
+            );
+            assert!(stderr(&refused).contains("exploration-only"));
+            assert!(stderr(&refused).contains("verification"));
+            assert!(
+                !capture.exists(),
+                "refused exploration created a verification artifact"
             );
         }
     }

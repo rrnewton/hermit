@@ -10,6 +10,7 @@
 
 pub mod boundary_recording;
 pub mod callback_history;
+mod record_serde;
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -36,7 +37,7 @@ use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 
 /// A record of all the preemptions and other scheduling events that occur during execution.
-#[derive(PartialEq, Default, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Default, Debug, Eq, Clone, Hash)]
 pub struct PreemptionRecord {
     // TODO(T106838933): switch the keys from DetTid to Pedigree.
     /// A sorted list of end-of-timeslice preemption times for each thread.
@@ -49,7 +50,6 @@ pub struct PreemptionRecord {
     /// here. A replay started from any other epoch would see every recorded
     /// timeslice end shifted by the difference. `None` for records written
     /// before the epoch was stored, and for records synthesized in memory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     epoch: Option<DateTime<Utc>>,
     /// The `--pipe-wake-latency` of the run that produced this record
     /// (<https://github.com/rrnewton/hermit/issues/4380>). A hand-off moves
@@ -57,7 +57,6 @@ pub struct PreemptionRecord {
     /// reproduce the run, and is refused. `None` when the option was off,
     /// which writes the record exactly as before the field existed, and for
     /// records written before it. `Some(0)` is distinct from `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pipe_wake_latency: Option<u64>,
     /// Whether Detcore's signal-state copy was on in the run that produced
     /// this record (`Config::signal_state_copy`, A5 step 2d). With it on,
@@ -66,14 +65,12 @@ pub struct PreemptionRecord {
     /// lists, so a replay under the other setting is refused. `None` for
     /// records written before the field existed, and for records synthesized
     /// in memory, which are replayed under either setting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     signal_state_copy: Option<bool>,
     /// Whether the run that produced this record charged preemptions at most
     /// the time their slice ran (`--cap-preemption-charge`). Turn charges
     /// move timers and timeouts, so a replay under the other setting cannot
     /// reproduce the run, and is refused. Off writes the record exactly as
     /// before the field existed.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     cap_preemption_charge: bool,
     /// The `--max-timeslice` the run that produced this record drew under
     /// `--chaos-timeslice-draw=run` (`Config::chaos_timeslice`), in virtual
@@ -81,7 +78,6 @@ pub struct PreemptionRecord {
     /// it unless the replay gives another `--max-timeslice`, which is
     /// refused). `None`, which writes nothing, for a run that drew none and
     /// for records written before the field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     chaos_timeslice: Option<u64>,
     /// How the run that produced this record numbered its guest's process
     /// and thread IDs (`Config::guest_ids`), when no PID namespace of its own
@@ -89,11 +85,22 @@ pub struct PreemptionRecord {
     /// replay under another numbering is refused. `None` for a run its PID
     /// namespace numbered, which writes the record exactly as before the
     /// field existed, and for records written before it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     guest_ids: Option<detcore_model::pid::GuestIds>,
+    /// Set in a record written by a preemption replay that left a change point
+    /// (and its slowdown-epoch transitions) out of it because it would not
+    /// have come after the thread's last one: the global event count where it
+    /// first did. A record's rows must increase (`Self::validate`), so such a
+    /// change point cannot be written, and the record no longer holds the
+    /// priority the thread had at that instant: it is not an exact record of
+    /// the run, and faithful replay refuses it. That happens to a replay that left the
+    /// record it replays, and to a replay of an edited record
+    /// (`--replay-edited-preemptions`), which keeps a slice that ends at once.
+    /// Absence preserves legacy admission; it does not prove historical
+    /// completeness. Newly marked JSON uses a mandatory envelope that old
+    /// readers reject, and marked non-human serialization is refused.
+    replay_departed_at: Option<u64>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
     /// The `--rng-seed` of the run that produced this record.
     ///
@@ -102,7 +109,6 @@ pub struct PreemptionRecord {
     /// a replay at another `--seed` would otherwise hand the guest other values.
     /// `None` for records written before the field existed, and for records
     /// synthesized in memory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     rng_seed: Option<u64>,
     /// Whether the run that produced this record charged a run of
     /// consecutive expired timed waits one scheduler turn
@@ -114,7 +120,6 @@ pub struct PreemptionRecord {
     /// that leaves `--expired-wait-charge` unset charges as its record says,
     /// so that a chaos recording replayed without `--chaos` (or a plain one
     /// replayed with it) keeps its recorded virtual times.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     expired_wait_runs_charged_once: bool,
     /// The host files the recorded run's guest opened
     /// (`detcore_model::host_input::HostInputSet`), so that a replay can
@@ -122,7 +127,6 @@ pub struct PreemptionRecord {
     /// Information only: a replay never refuses or alters its schedule for
     /// it. `None` for records written before the field existed, and for
     /// records synthesized in memory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     host_inputs: Option<HostInputSet>,
     /// The store-exclusives that failed in the run that produced this record
     /// (aarch64, `STREX_FAIL_SPEC`). Each retried a load/store exclusive loop
@@ -130,7 +134,6 @@ pub struct PreemptionRecord {
     /// replay of this record may diverge; a replay warns at its start when it
     /// is nonzero. Zero, and absent, for a run that counted none, for other
     /// architectures, and for records written before the field existed.
-    #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
 }
 
@@ -178,6 +181,7 @@ impl PreemptionRecord {
             cap_preemption_charge: false,
             chaos_timeslice: None,
             guest_ids: None,
+            replay_departed_at: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -246,6 +250,7 @@ impl PreemptionRecord {
             expired_wait_runs_charged_once,
             host_inputs,
             store_exclusive_failures: _,
+            replay_departed_at,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -296,6 +301,8 @@ impl PreemptionRecord {
             host_inputs: host_inputs.clone(),
             // A count of this run's host, not part of the preemptions.
             store_exclusive_failures: HostObservedCount::default(),
+            // A prefix of an inexact record is inexact too.
+            replay_departed_at: *replay_departed_at,
         }
     }
 
@@ -356,6 +363,38 @@ impl PreemptionRecord {
     /// (zero where none were counted).
     pub fn store_exclusive_failures(&self) -> u64 {
         self.store_exclusive_failures.0
+    }
+
+    /// A retained source event count where a replay omitted a change point.
+    /// After transformations it need not index this record's global events.
+    pub fn replay_departed_at(&self) -> Option<u64> {
+        self.replay_departed_at
+    }
+
+    /// Refuse a known omission before replay or analysis can certify it.
+    /// Unmarked legacy records retain their existing admission policy; their
+    /// absence of this field is not proof of historical completeness.
+    pub fn require_faithful_replay(&self) -> anyhow::Result<()> {
+        if let Some(event) = self.replay_departed_at {
+            anyhow::bail!(
+                "HERMIT_INCOMPLETE_REPLAY_RECORD: replay_departed_at={event}: this record omits \
+                 a replay change point and cannot certify faithful replay. Re-record a complete \
+                 execution; --replay-edited-preemptions permits only non-verifying history exploration."
+            );
+        }
+        Ok(())
+    }
+
+    /// Retain an omission observed in a source record, never clearing one.
+    /// When sources differ, the smaller count is only a retained source
+    /// observation: it is neither a common causal order nor an event index
+    /// in a transformed output. Admission depends only on its presence.
+    pub fn retain_replay_departure(mut self, source: Option<u64>) -> Self {
+        self.replay_departed_at = match (self.replay_departed_at, source) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self
     }
 
     /// The same record, stating whether the copy was on in the trials it
@@ -461,6 +500,8 @@ impl PreemptionRecord {
             cap_preemption_charge: self.cap_preemption_charge,
             chaos_timeslice: self.chaos_timeslice,
             guest_ids: self.guest_ids,
+            // A record derived from an inexact one is inexact too.
+            replay_departed_at: self.replay_departed_at,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
@@ -529,6 +570,7 @@ impl PreemptionRecord {
             cap_preemption_charge: false,
             chaos_timeslice: None,
             guest_ids: None,
+            replay_departed_at: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -999,6 +1041,68 @@ mod tests {
 
     use super::*;
     use crate::types::RcbTimeMultiplier;
+
+    /// A record written by a replay that left a change point out of it says
+    /// so, with the global event count where it first did; records derived
+    /// from it keep the mark; a record with nothing left out has none.
+    #[test]
+    fn marked_record_serialization_requires_an_envelope() {
+        let ordinary = PreemptionWriter::new(None).into_string();
+        assert_eq!(ordinary, "{\"per_thread\":{},\"global\":[]}");
+        let mut writer = PreemptionWriter::new(None);
+        writer.mark_replay_departed(7);
+        let text = writer.into_string();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            value.get("per_thread").is_none(),
+            "old readers must not accept {text}"
+        );
+        assert!(
+            value.get("global").is_none(),
+            "old readers must not accept {text}"
+        );
+        assert_eq!(value["incomplete_preemption_record"]["version"], 1);
+        assert_eq!(
+            value["incomplete_preemption_record"]["replay_departed_at"],
+            7
+        );
+        let back: PreemptionRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.replay_departed_at(), Some(7));
+    }
+
+    #[test]
+    fn marked_records_refuse_binary_serialization_before_writing() {
+        let mut writer = PreemptionWriter::new(None);
+        writer.mark_replay_departed(7);
+        let record: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        let mut bytes = Vec::new();
+        let result =
+            bincode::serde::encode_into_std_write(&record, &mut bytes, bincode::config::legacy());
+        assert!(
+            result.is_err(),
+            "a marked record has no unversioned binary encoding"
+        );
+        assert!(bytes.is_empty(), "refuse before writing a partial record");
+    }
+
+    #[test]
+    fn a_departed_replays_record_says_it_is_not_exact() {
+        let mut writer = PreemptionWriter::new(None);
+        writer.mark_replay_departed(7);
+        writer.mark_replay_departed(9);
+        let written = writer.into_string();
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.replay_departed_at(), Some(7), "the first departure");
+        assert_eq!(back.clone_preemptions_only().replay_departed_at(), Some(7));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, &written).unwrap();
+        assert_eq!(read_recorded_replay_departure(&path), Ok(Some(7)));
+        let exact = PreemptionWriter::new(None).into_string();
+        assert!(!exact.contains("replay_departed_at"), "{exact}");
+        std::fs::write(&path, &exact).unwrap();
+        assert_eq!(read_recorded_replay_departure(&path), Ok(None));
+    }
 
     /// `--pipe-wake-latency` rides in a preemption record as the epoch does:
     /// omitted when off, kept through JSON and through every record a run or
@@ -2067,6 +2171,43 @@ impl PreemptionWriter {
         history.final_prio = next_prio;
     }
 
+    /// Mark this record as written by a preemption replay that left a change
+    /// point out of it, first at global event count `event`
+    /// ([`PreemptionRecord::replay_departed_at`]). Warns once, naming the
+    /// file, so nobody replays it as an exact record.
+    pub fn mark_replay_departed(&mut self, event: u64) {
+        if self.inner.replay_departed_at.is_some() {
+            return;
+        }
+        self.inner.replay_departed_at = Some(event);
+        if let Some(dest) = &self.dest {
+            tracing::warn!(
+                "the preemption record {} retains an omitted replay change point observed at source \
+                 event {}; replay_departed_at preserves that provenance and faithful replay refuses it",
+                dest.display(),
+                event
+            );
+        }
+    }
+
+    /// The time of the last change point recorded for `tid`, if any. A new one
+    /// must be strictly later ([`Self::insert_reprioritization`]).
+    pub fn last_reprioritization_time(&self, tid: DetTid) -> Option<LogicalTime> {
+        self.inner
+            .per_thread
+            .get(&tid)
+            .and_then(|history| history.prio_changes.last())
+            .map(|(time, _)| *time)
+    }
+
+    /// How many change points are recorded for `tid`.
+    pub(crate) fn reprioritization_count(&self, tid: DetTid) -> usize {
+        self.inner
+            .per_thread
+            .get(&tid)
+            .map_or(0, |history| history.prio_changes.len())
+    }
+
     /// Attach only an observed callback expiry to the row the original helper just wrote.
     pub(crate) fn insert_callback_checkpoint(
         &mut self,
@@ -2213,6 +2354,17 @@ impl Drop for PreemptionWriter {
             panic!("Error while dropping PreemptionWriter: {}", e);
         }
     }
+}
+
+/// Read only whether a preemption record was written by a replay that left a
+/// change point out of it ([`PreemptionRecord::replay_departed_at`]).
+pub fn read_recorded_replay_departure(path: &Path) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct DepartureOnly {
+        #[serde(default)]
+        replay_departed_at: Option<u64>,
+    }
+    Ok(boundary_recording::read_settings::<DepartureOnly>(path)?.replay_departed_at)
 }
 
 /// A reader for a stream of preemption events.

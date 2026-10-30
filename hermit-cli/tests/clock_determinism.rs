@@ -451,6 +451,10 @@ fn replay_refuses_an_explicit_epoch_that_contradicts_the_recording() {
         );
         assert!(!stderr.contains("Cannot set end of timeslice"), "{stderr}");
         assert!(
+            !stderr.contains("HERMIT_SKID_OVERSHOOT preemption replay"),
+            "{stderr}"
+        );
+        assert!(
             refused.stdout.is_empty(),
             "the guest ran despite the refusal: {}",
             String::from_utf8_lossy(&refused.stdout)

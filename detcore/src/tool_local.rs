@@ -5070,6 +5070,13 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub replay_rcb_end: Option<u64>,
 
+    /// In a preemption replay, the logical time of the last priority change
+    /// point this thread filed (`ThreadState::file_replay_change_point`).
+    // Native-exec admission rejects live replay state; supported snapshots
+    // retain their existing positional layout.
+    #[serde(skip)]
+    pub last_replay_change_point: Option<LogicalTime>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     /// Deterministic chaos epoch this thread was in at its last `next_timeslice`.
@@ -5411,6 +5418,7 @@ impl<T> ThreadState<T> {
             || self.slice_boundary.is_some()
             || !self.interrupt_at.is_empty()
             || self.replay_rcb_end.is_some()
+            || self.last_replay_change_point.is_some()
             || self.last_rcb_timer.is_some()
             || self.last_rcb_timer_is_max
             || self.max_timeslice_end.is_some()
@@ -5876,6 +5884,7 @@ impl<T> ThreadState<T> {
             scheduler_grants: 0,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
+            last_replay_change_point: None,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1151)
             chaos_epoch: chaos_epoch_sentinel(),
@@ -7203,6 +7212,54 @@ impl<T> ThreadState<T> {
     /// thread now: the configured clock multiplier times its chaos slowdown.
     pub(crate) fn clock_multiplier(&self, cfg: &Config) -> f64 {
         cfg.clock_multiplier.unwrap_or(1.0) * self.rcb_time_multiplier().as_f64()
+    }
+
+    /// Files a priority change point at `time` in a preemption replay, or
+    /// returns the thread's last one when `time` is not after it.
+    ///
+    /// A replay that reproduces its record files each thread's change points
+    /// at the record's times, which are strictly increasing (the loaded
+    /// record is validated), so it never gets the error. A change point at or
+    /// before the last one is a thread that left the record: a slice closed
+    /// with no time in it, as when the slice before ran onto the next
+    /// recorded end's branch count while that end's time was still ahead and
+    /// the thread's time did not move (the adjacent zero-RCB slices of
+    /// `end_timeslice_with_checkpoint`). Filed, such a change point was never
+    /// granted, and the replay stalled until `--timeout`. Outside a
+    /// preemption replay nothing is checked or kept, and nor is it for an
+    /// edited record (`--replay-edited-preemptions`), which keeps a slice
+    /// whose RCB target is the thread's count and ends it at once
+    /// (`next_edited_slice`): its change points need not advance.
+    pub(crate) fn file_replay_change_point(
+        &mut self,
+        cfg: &Config,
+        time: LogicalTime,
+    ) -> Result<(), LogicalTime> {
+        if cfg.replay_preemptions_from.is_none() || cfg.replay_edited_preemptions {
+            return Ok(());
+        }
+        if let Some(last) = self.last_replay_change_point.filter(|last| time <= *last) {
+            return Err(last);
+        }
+        self.last_replay_change_point = Some(time);
+        Ok(())
+    }
+
+    /// Runs the rest of a preemption replay's thread as its final slice: no
+    /// recorded end governs it any more, and only the run's own PMU maximum
+    /// (if any) bounds its slices, as when the record runs out. For a thread
+    /// that left its record ([`Self::file_replay_change_point`]), whose
+    /// remaining recorded ends no longer describe it.
+    pub(crate) fn abandon_replayed_slices(&mut self, cfg: &Config) {
+        self.stats.last_recorded_slice = Some(self.stats.timeslice_count);
+        self.end_of_timeslice = Some(LogicalTime::MAX);
+        self.replay_rcb_end = None;
+        let now = self.thread_logical_time.as_nanos();
+        self.max_timeslice_end = cfg
+            .max_timeslice
+            .map(|max_timeslice| now + Duration::from_nanos(u64::from(max_timeslice)));
+        self.last_rcb_timer = None;
+        self.last_rcb_timer_is_max = false;
     }
 
     /// Whether this thread has consumed its current logical timeslice.
@@ -8995,6 +9052,264 @@ mod timeslice_tests {
         replay_from_500ns(&config, history);
     }
 
+    // Exercise the same production selector with larger counts and both
+    // settings of the optional skid diagnostic. A faithful replay must stop
+    // at its first already-passed RCB end, even when later ends remain ahead.
+    fn assert_faithful_rcb_ends_stop(panic_on_rcb_overshoot: bool) {
+        for counts in [
+            vec![40, 80],
+            vec![40, 45, 80],
+            vec![40, 51, 80],
+            vec![40, 45],
+        ] {
+            let config = Config {
+                target_timeslice: nz(10_000),
+                max_timeslice: nz(100_000),
+                panic_on_rcb_overshoot,
+                ..Default::default()
+            };
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let now = state.thread_logical_time.as_nanos();
+            let history = ThreadHistory::new()
+                .with_prio_changes(
+                    (0..counts.len())
+                        .map(|i| {
+                            (
+                                now + Duration::from_nanos(100 * (i as u64 + 1)),
+                                DEFAULT_PRIORITY,
+                            )
+                        })
+                        .collect(),
+                )
+                .with_preemption_rcbs(counts.clone());
+            state.preemption_points = Some(history.into_iter());
+            state.committed_clock_value = 51;
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.next_timeslice(&config)
+            }))
+            .expect_err("faithful replay must not pass a recorded RCB end");
+            let message = panic.downcast_ref::<String>().unwrap();
+            assert!(
+                message.contains("Cannot set RCB end of timeslice to 40"),
+                "{counts:?}: {message}"
+            );
+            assert!(
+                message.contains("count is already 51. An edited record"),
+                "{counts:?}: {message}"
+            );
+            assert!(
+                message.contains("needs --replay-edited-preemptions"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_faithful_replay_past_larger_rcb_ends_stops_by_default() {
+        assert_faithful_rcb_ends_stop(false);
+    }
+
+    #[test]
+    fn a_faithful_replay_past_larger_rcb_ends_stops_with_skid_panic_enabled() {
+        assert_faithful_rcb_ends_stop(true);
+    }
+
+    /// Edited histories retain the semantics of
+    /// https://github.com/rrnewton/hermit/pull/4672: an equal-count slice
+    /// ends at once, a future time-only slice is kept, and filed change
+    /// points need not advance. The optional diagnostic must not panic.
+    #[test]
+    fn an_edited_record_reports_no_departure() {
+        let config = Config {
+            panic_on_rcb_overshoot: true,
+            replay_preemptions_from: Some(std::path::PathBuf::from("history.json")),
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        let history = |end: u64, rcbs: u64| {
+            ThreadHistory::new()
+                .with_prio_changes(vec![
+                    (at(end), DEFAULT_PRIORITY + 7),
+                    (at(5000), DEFAULT_PRIORITY),
+                ])
+                .with_preemption_rcbs(vec![rcbs, 500])
+        };
+        let (mut state, prio, now) = replay_from_500ns(&config, history(100, 10));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(
+            (state.end_of_timeslice, state.replay_rcb_end),
+            (Some(at(100)), Some(10))
+        );
+        assert!(state.timeslice_expired());
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+        assert_eq!(state.file_replay_change_point(&config, at(100)), Ok(()));
+        let (state, prio, _) = replay_from_500ns(&config, history(800, 4));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(
+            (state.end_of_timeslice, state.replay_rcb_end),
+            (Some(at(800)), None)
+        );
+        // Main also keeps this equal-count slice in faithful mode. Unlike
+        // edited exploration, filing the same change point twice is refused.
+        let faithful = Config {
+            replay_edited_preemptions: false,
+            ..config
+        };
+        let (mut state, _, now) = replay_from_500ns(&faithful, history(100, 10));
+        assert_eq!(state.replay_rcb_end, Some(10));
+        assert_eq!(state.file_replay_change_point(&faithful, now), Ok(()));
+        assert_eq!(state.file_replay_change_point(&faithful, now), Err(now));
+    }
+
+    /// Main admits an equal-RCB end even when its timestamp is behind.
+    /// Preserve that instant slice in this Android-shaped history, but refuse
+    /// filing it twice at the preceding slice's unchanged logical instant.
+    #[test]
+    fn a_replay_keeps_an_equal_rcb_end_and_refuses_repeated_filing() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            replay_preemptions_from: Some("history.json".into()),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(31754), &config, ());
+        state.thread_logical_time.add_rcbs(863_958);
+        state.committed_clock_value = 863_958;
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (
+                    LogicalTime::from_nanos(now.as_nanos() - 1_802_680),
+                    DEFAULT_PRIORITY + 1,
+                ),
+                (
+                    LogicalTime::from_nanos(now.as_nanos() - 1_802_670),
+                    DEFAULT_PRIORITY + 2,
+                ),
+                (now + Duration::from_nanos(10_780), DEFAULT_PRIORITY + 3),
+            ])
+            .with_preemption_rcbs(vec![863_958, 863_959, 864_037]);
+        state.preemption_points = Some(history.into_iter());
+
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+        let prio = state.next_timeslice(&config);
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 1));
+        assert_eq!(state.replay_rcb_end, Some(863_958));
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(LogicalTime::from_nanos(now.as_nanos() - 1_802_680))
+        );
+        assert!(state.timeslice_expired());
+        assert_eq!(state.file_replay_change_point(&config, now), Err(now));
+        state.abandon_replayed_slices(&config);
+        assert!(!state.timeslice_expired());
+        assert_eq!(state.end_of_timeslice, Some(LogicalTime::MAX));
+    }
+
+    /// An end exactly at the thread's count whose time is not behind it is
+    /// the slice's end, now, as before (the record's adjacent zero-RCB
+    /// slices, `replay_preserves_adjacent_zero_rcb_slices`).
+    #[test]
+    fn a_replay_follows_an_end_at_its_count_whose_time_is_ahead() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![(
+                now + Duration::from_nanos(25_000),
+                DEFAULT_PRIORITY + 1,
+            )])
+            .with_preemption_rcbs(vec![0]);
+        state.preemption_points = Some(history.into_iter());
+
+        assert_eq!(state.next_timeslice(&config), Some(DEFAULT_PRIORITY + 1));
+        assert_eq!(state.replay_rcb_end, Some(0));
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(25_000))
+        );
+
+        // At the thread's time exactly, too.
+        let mut state = ThreadState::new(DetPid::from_raw(6), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![(now, DEFAULT_PRIORITY + 1)])
+            .with_preemption_rcbs(vec![0]);
+        state.preemption_points = Some(history.into_iter());
+        assert_eq!(state.next_timeslice(&config), Some(DEFAULT_PRIORITY + 1));
+        assert_eq!(state.replay_rcb_end, Some(0));
+        assert_eq!(state.end_of_timeslice, Some(now));
+    }
+
+    /// The shape of a stalled Android emulator replay (`--chaos
+    /// --preemption-timeout=1000`): a slice ended at the branch count of the
+    /// next recorded end, whose time was still ahead, so that end was
+    /// followed and its slice was over at once (adjacent zero-RCB slices);
+    /// but the thread's time had not moved, so the second change point would
+    /// have been filed at the instant of the first. It is caught before it
+    /// is filed, and the thread runs on as its final slice, not already over.
+    #[test]
+    fn a_replay_change_point_at_the_last_ones_instant_is_caught_before_filing() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            replay_preemptions_from: Some(std::path::PathBuf::from("history.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(31744), &config, ());
+        let start = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (start + Duration::from_nanos(70), DEFAULT_PRIORITY + 1),
+                (start + Duration::from_nanos(80), DEFAULT_PRIORITY + 2),
+                (start + Duration::from_nanos(500), DEFAULT_PRIORITY + 3),
+            ])
+            .with_preemption_rcbs(vec![4, 4, 40]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(4);
+        state.committed_clock_value = 4;
+        assert!(state.timeslice_expired());
+        let now = state.thread_logical_time.as_nanos();
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+
+        // The end at the same count, 10 ns later, is followed (its time is
+        // ahead), and its slice is over at once; the thread's time is still
+        // `now`.
+        state.next_timeslice(&config);
+        assert_eq!(state.replay_rcb_end, Some(4));
+        assert!(state.timeslice_expired());
+        assert_eq!(state.file_replay_change_point(&config, now), Err(now));
+
+        state.abandon_replayed_slices(&config);
+        assert!(!state.timeslice_expired());
+        assert_eq!(state.replay_rcb_end, None);
+        assert_eq!(state.end_of_timeslice, Some(LogicalTime::MAX));
+        assert_eq!(
+            state.max_timeslice_end,
+            Some(now + Duration::from_nanos(100_000))
+        );
+
+        // A later change point files as usual; outside a preemption replay
+        // nothing is checked.
+        let later = now + Duration::from_nanos(1);
+        assert_eq!(state.file_replay_change_point(&config, later), Ok(()));
+        let recording = Config {
+            replay_preemptions_from: None,
+            ..config
+        };
+        assert_eq!(state.file_replay_change_point(&recording, later), Ok(()));
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -10205,4 +10520,46 @@ mod native_main_state_tests {
             .unwrap();
         assert_eq!(again.shared_open_files_for_exec().unwrap(), Some(empty));
     }
+}
+/// The hint every report of a preemption replay that left its record ends
+/// with: a faithful replay never leaves it, but a record edited after it was
+/// recorded (preemptions knocked out, as `hermit analyze` does) does by
+/// design, and is replayed with `--replay-edited-preemptions`, which skips the
+/// slices that already ended instead (`next_edited_slice`) and reports none
+/// of these.
+pub(crate) const EDITED_RECORD_HINT: &str = "An edited record, not the recording of this run's \
+     schedule, needs --replay-edited-preemptions.";
+
+/// Reports a preemption replay's thread about to file a change point at
+/// `time`, not after its last one at `last`
+/// ([`ThreadState::file_replay_change_point`]): a skid overshoot, counted
+/// where every overshoot is (`reverie::record_skid_overshoot`) so the run
+/// ends in the skid-overshoot policy refusal, and named with
+/// `reverie::SKID_OVERSHOOT_MARKER`. Panics instead under
+/// `--panic-on-rcb-overshoot`.
+#[cold]
+pub(crate) fn report_stale_replay_filing(
+    panic_on_rcb_overshoot: bool,
+    dettid: DetTid,
+    slice: u64,
+    time: LogicalTime,
+    last: LogicalTime,
+) {
+    let message = format!(
+        "{} preemption replay: thread {} would end slice T{} with a change point at {}, not \
+         after its last change point at {}: the slice closed with no time in it, which the \
+         replayed record never does. The thread files no change point here and runs on as \
+         its final slice; the rest of this run does not replay the record exactly. {}",
+        reverie::SKID_OVERSHOOT_MARKER,
+        dettid,
+        slice,
+        time,
+        last,
+        EDITED_RECORD_HINT,
+    );
+    if panic_on_rcb_overshoot {
+        panic!("{message}");
+    }
+    reverie::record_skid_overshoot();
+    tracing::error!("{message}");
 }

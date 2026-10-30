@@ -1792,12 +1792,24 @@ impl GlobalState {
                 // Keep ordinary file/JSON errors in their original panic class.
                 let history = HistoryReader::read(path).unwrap();
                 history
-                    .require_legacy_mode()
+                    .require_replay_mode(cfg.replay_edited_preemptions)
                     .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
                 // A recording whose run retried store-exclusives may not
                 // replay; say so before the replay starts.
                 #[cfg(target_arch = "aarch64")]
                 crate::store_exclusive::warn_at_replay_start(history.store_exclusive_failures());
+                // Inherit provenance from the very history consumed below,
+                // before any guest event or new recording can be emitted.
+                if let Some(event) = history.replay_departed_at() {
+                    tracing::warn!(
+                        "HERMIT_INCOMPLETE_REPLAY_RECORD: explicit edited history exploration of {} \
+                         retains replay_departed_at={}; it does not certify faithful replay",
+                        path.display(), event,
+                    );
+                    if let Some(writer) = &mut sched.lock().unwrap().preemption_writer {
+                        writer.mark_replay_departed(event);
+                    }
+                }
                 // The scheduler takes the same record's callback checkpoints,
                 // and checks them against the launch decision, before its
                 // loop runs or any thread starts.
@@ -22783,6 +22795,49 @@ mod robust_exit_clock_tests {
                 assert!(!sched.next_turns.contains_key(&owner.dettid));
                 assert!(!sched.note_deregistration_accounted(owner.dettid));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod replay_departure_tests {
+    use super::*;
+    use crate::preemptions::PreemptionRecord;
+    use crate::preemptions::PreemptionWriter;
+
+    #[test]
+    fn edited_history_rerecording_inherits_the_consumed_history_departure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.json");
+        for marker in [None, Some(0), Some(71)] {
+            let mut writer = PreemptionWriter::new(None);
+            if let Some(event) = marker {
+                writer.mark_replay_departed(event);
+            }
+            std::fs::write(&path, writer.into_string()).unwrap();
+            let history = HistoryReader::read(&path).unwrap();
+            history.require_replay_mode(true).unwrap();
+            assert_eq!(
+                history.require_replay_mode(false).is_err(),
+                marker.is_some()
+            );
+            let config = Config {
+                replay_preemptions_from: Some(path.clone()),
+                replay_edited_preemptions: true,
+                record_preemptions: true,
+                ..Config::default()
+            };
+            let global = GlobalState::for_tests(&config);
+            let text = global
+                .sched
+                .lock()
+                .unwrap()
+                .preemption_writer
+                .take()
+                .unwrap()
+                .into_string();
+            let written: PreemptionRecord = serde_json::from_str(&text).unwrap();
+            assert_eq!(written.replay_departed_at(), marker);
         }
     }
 }

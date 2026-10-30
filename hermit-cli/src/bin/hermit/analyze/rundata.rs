@@ -26,7 +26,6 @@ use clap::parser::ValueSource;
 use colored::Colorize;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
-use detcore::preemptions::strip_times_from_events_file;
 use detcore::types::SchedEvent;
 use detcore_model::config::ExpiredWaitCharge;
 use hermit::process::Bind;
@@ -146,9 +145,27 @@ impl RunData {
             .to_string()
     }
 
-    pub fn sched_out(&mut self) -> &Vec<SchedEvent> {
-        let pr = self.preempts_out();
-        pr.schedevents()
+    pub fn sched_out(&mut self) -> anyhow::Result<&Vec<SchedEvent>> {
+        self.require_complete_output()?;
+        Ok(self.preempts_out().schedevents())
+    }
+
+    /// Known omissions cannot become an analysis endpoint or selfcheck proof.
+    pub fn require_complete_output(&mut self) -> anyhow::Result<()> {
+        let path = self.sched_path_out().to_path_buf();
+        Self::require_complete_record(self.preempts_out(), &path)
+    }
+
+    pub(super) fn require_complete_record(
+        record: &PreemptionRecord,
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        record.require_faithful_replay().map_err(|error| {
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "analysis cannot use {} as completed schedule evidence: {error:#}",
+                path.display()
+            ))
+        })
     }
 
     /// Only set after launch.
@@ -366,8 +383,16 @@ impl RunData {
 
     /// Any post-processing that needs to be applied to a recorded file of SchedEvents
     pub fn post_process_events_file(sched_path: &Path, dest: &Path) -> anyhow::Result<()> {
-        let _ = strip_times_from_events_file(sched_path, Some(dest.to_owned()))?;
-        Ok(())
+        let mut recording = detcore::preemptions::boundary_recording::Recording::read(sched_path)?;
+        recording.require_faithful_replay().map_err(|error| {
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "analysis trial at {} omitted a replay change point: {error:#}; \
+                 the raw diagnostic record is retained and cannot certify an outcome",
+                sched_path.display()
+            ))
+        })?;
+        recording.strip_times();
+        recording.write(dest)
     }
 
     fn log_level(aopts: &AnalyzeOpts) -> LevelFilter {
@@ -1267,6 +1292,14 @@ impl AnalyzeOpts {
                 .into_iter()
                 .filter_map(|(option, path)| Some((option, path?))),
         ) {
+            detcore::preemptions::boundary_recording::Recording::read(path)?
+                .require_faithful_replay()
+                .map_err(|error| {
+                    anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                        "{option} {} cannot supply analysis evidence: {error:#}",
+                        path.display()
+                    ))
+                })?;
             let recorded = detcore::preemptions::read_recorded_pipe_wake_latency(path)
                 .map_err(anyhow::Error::msg)?;
             if let Some(refusal) = detcore::preemptions::pipe_wake_latency_mismatch(
@@ -3081,5 +3114,56 @@ mod tests {
             Some(Duration::from_secs(100))
         );
         assert_eq!(later.runopts.run_timeout(), Some(Duration::from_secs(200)));
+    }
+}
+
+#[cfg(test)]
+mod replay_departure_tests {
+    use clap::Parser;
+
+    use super::*;
+    use crate::container::PolicyRefusal;
+
+    #[test]
+    fn analysis_refuses_marked_inputs_and_outputs_before_discarding_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("raw.preempts");
+        let output = directory.path().join("stripped.preempts");
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let mut event = SchedEvent::branches(detcore::types::DetTid::from_raw(3), 2);
+        event.end_time = Some(detcore::types::LogicalTime::from_nanos(12));
+        for marker in [None, Some(0)] {
+            let record = PreemptionRecord::from_sched_events(vec![event.clone()])
+                .retain_replay_departure(marker);
+            record.write_to_disk(&input).unwrap();
+            let raw = std::fs::read(&input).unwrap();
+            std::fs::write(&output, b"existing destination").unwrap();
+            let admitted = options.refuse_recordings_under_another_pipe_wake_latency(&[(
+                "--run1-preemptions",
+                &input,
+            )]);
+            let processed = RunData::post_process_events_file(&input, &output);
+            if marker.is_some() {
+                for result in [admitted, processed] {
+                    let error = result.expect_err("known omissions cannot supply trial evidence");
+                    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+                    assert!(format!("{error:#}").contains("HERMIT_INCOMPLETE_REPLAY_RECORD"));
+                }
+                assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+            } else {
+                admitted.unwrap();
+                processed.unwrap();
+                let actual = PreemptionReader::try_new(&output).unwrap().into_inner();
+                let mut expected_event = event.clone();
+                expected_event.end_time = None;
+                let expected = PreemptionRecord::from_sched_events(vec![expected_event]);
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(
+                std::fs::read(&input).unwrap(),
+                raw,
+                "retain raw diagnostics"
+            );
+        }
     }
 }

@@ -249,10 +249,14 @@ impl InterpolateOpts {
         let latency = Self::common_pipe_wake_latency(&self.file_a, &self.file_b)?;
         let copy = Self::common_signal_state_copy(&self.file_a, &self.file_b)?;
         let charged_once = Self::common_expired_wait_charge(&self.file_a, &self.file_b)?;
-        let first_schedule = legacy_schedule(&self.file_a, "schedule diff/interpolation")?;
-        let second_schedule = legacy_schedule(&self.file_b, "schedule diff/interpolation")?;
+        let first_record =
+            Recording::read(&self.file_a)?.into_legacy("schedule diff/interpolation")?;
+        let second_record =
+            Recording::read(&self.file_b)?.into_legacy("schedule diff/interpolation")?;
+        let first_schedule = first_record.schedevents();
+        let second_schedule = second_record.schedevents();
         let (_swap_dist, _edit_dist, requested_schedule) = {
-            let mut bubbles = iterable_bubble_sort(&first_schedule, &second_schedule);
+            let mut bubbles = iterable_bubble_sort(first_schedule, second_schedule);
             (
                 bubbles.swap_distance(),
                 bubbles.edit_distance(),
@@ -263,6 +267,8 @@ impl InterpolateOpts {
             )
         };
         let next_sched = PreemptionRecord::from_sched_events(requested_schedule)
+            .retain_replay_departure(first_record.replay_departed_at())
+            .retain_replay_departure(second_record.replay_departed_at())
             .with_guest_ids(guest_ids)
             .with_pipe_wake_latency(latency)
             .with_signal_state_copy(copy)
@@ -742,6 +748,57 @@ mod tests {
                     .contains("different --pipe-wake-latency values"),
                 "{error}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod replay_departure_tests {
+    use super::*;
+
+    #[test]
+    fn interpolation_retains_departure_from_either_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = directory.path().join("a.json");
+        let b = directory.path().join("b.json");
+        let events = vec![detcore::types::SchedEvent::branches(
+            detcore::types::DetTid::from_raw(3),
+            1,
+        )];
+        for left in [None, Some(0), Some(7)] {
+            for right in [None, Some(3), Some(9)] {
+                PreemptionRecord::from_sched_events(events.clone())
+                    .retain_replay_departure(left)
+                    .write_to_disk(&a)
+                    .unwrap();
+                PreemptionRecord::from_sched_events(events.clone())
+                    .retain_replay_departure(right)
+                    .write_to_disk(&b)
+                    .unwrap();
+                for interpolate in [0, 50, 100] {
+                    let record = InterpolateOpts {
+                        interpolate,
+                        file_a: a.clone(),
+                        file_b: b.clone(),
+                    }
+                    .interpolated_record()
+                    .unwrap();
+                    let expected = match (left, right) {
+                        (Some(x), Some(y)) => Some(x.min(y)),
+                        (x, y) => x.or(y),
+                    };
+                    assert_eq!(record.replay_departed_at(), expected);
+                    assert_eq!(record.schedevents(), &events);
+                    assert_eq!(
+                        record.require_faithful_replay().is_err(),
+                        expected.is_some()
+                    );
+                    assert_eq!(
+                        serde_json::from_str::<PreemptionRecord>(&record.to_string()).unwrap(),
+                        record
+                    );
+                }
+            }
         }
     }
 }

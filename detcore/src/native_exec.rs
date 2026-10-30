@@ -637,6 +637,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn native_exec_rejects_a_replay_change_point_before_snapshot() {
+        let (tool, mut thread, binding) = fixture();
+        assert_eq!(thread.last_replay_change_point, None);
+        let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
+        thread.last_replay_change_point = Some(LogicalTime::from_nanos(1));
+        assert_eq!(
+            validate_old_native_exec_cut(&tool, &thread, &binding).unwrap_err(),
+            NativeExecCutError::LiveCapability("RCB/replay/chaos state")
+        );
+        thread.last_replay_change_point = None;
+        prepare(&mut thread, &binding);
+        capture_prepared_native_exec(&tool, &thread, &binding, &receipt).unwrap();
+        thread.last_replay_change_point = Some(LogicalTime::from_nanos(1));
+        assert_eq!(
+            capture_prepared_native_exec(&tool, &thread, &binding, &receipt).unwrap_err(),
+            NativeExecCutError::LiveCapability("RCB/replay/chaos state")
+        );
+    }
+
+    #[test]
     fn native_exec_final_exact_comparison_keeps_state_and_refuses_every_byte_change() {
         let (tool, mut thread, binding) = fixture();
         let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();

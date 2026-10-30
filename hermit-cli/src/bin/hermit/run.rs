@@ -4770,6 +4770,107 @@ fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
 }
 
 #[test]
+fn marked_replay_records_are_refused_before_the_container() {
+    use detcore::preemptions::PreemptionRecord;
+    use detcore::preemptions::PreemptionWriter;
+    use detcore::preemptions::boundary_recording::BoundaryRecording;
+    use detcore::preemptions::boundary_recording::Recording;
+    use detcore_model::schedule::boundary::Schedule;
+
+    let dir = tempfile::tempdir().unwrap();
+    for marked in [false, true] {
+        for (flag, boundaries) in [
+            ("--replay-preemptions-from", false),
+            ("--replay-schedule-from", false),
+            ("--replay-schedule-from", true),
+        ] {
+            let mut writer = PreemptionWriter::new(None);
+            if marked {
+                writer.mark_replay_departed(7);
+            }
+            let record: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+            record.validate().unwrap();
+            let recording = if boundaries {
+                Recording::Boundaries(
+                    BoundaryRecording::new(record, Schedule::new(vec![]).unwrap()).unwrap(),
+                )
+            } else {
+                Recording::Legacy(record)
+            };
+            let path = dir
+                .path()
+                .join(format!("{flag}-{boundaries}-{marked}.json"));
+            recording.write(&path).unwrap();
+            let argument = format!("{flag}={}", path.display());
+            let mut args = vec!["fakehermit", argument.as_str()];
+            if boundaries {
+                args.push("--strict-schedule-boundaries");
+            }
+            args.push("fakeprog");
+            let options = RunOpts::parse_from(args);
+            let result = options.refuse_an_invalid_replayed_record();
+            if marked {
+                let error = result.expect_err("an incomplete record cannot be a faithful replay");
+                assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+                let text = format!("{error:#}");
+                assert!(text.contains("HERMIT_INCOMPLETE_REPLAY_RECORD"), "{text}");
+                assert!(text.contains("7"), "{text}");
+                assert!(text.contains(&path.display().to_string()), "{text}");
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn edited_history_cannot_certify_faithful_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("edited.json");
+    let input = format!("--replay-preemptions-from={}", path.display());
+    let capture = format!("--verify-run={}", dir.path().join("verification").display());
+    for marked in [false, true] {
+        let mut writer = detcore::preemptions::PreemptionWriter::new(None);
+        if marked {
+            writer.mark_replay_departed(7);
+        }
+        std::fs::write(&path, writer.into_string()).unwrap();
+        let options = RunOpts::parse_from([
+            "fakehermit",
+            input.as_str(),
+            "--replay-edited-preemptions",
+            "fakeprog",
+        ]);
+        options.refuse_an_invalid_replayed_record().unwrap();
+        for verification in [
+            vec!["--verify"],
+            vec!["--verify", "--verify-strict"],
+            vec![capture.as_str()],
+        ] {
+            let mut args = vec!["fakehermit", input.as_str(), "--replay-edited-preemptions"];
+            args.extend(verification.iter().copied());
+            args.push("fakeprog");
+            let options = RunOpts::parse_from(args);
+            let error = options
+                .refuse_an_invalid_replayed_record()
+                .expect_err("edited exploration cannot certify faithful replay");
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            let text = format!("{error:#}");
+            assert!(text.contains("--replay-edited-preemptions"), "{text}");
+            assert!(text.contains("verification"), "{text}");
+            if !marked {
+                let mut args = vec!["fakehermit", input.as_str()];
+                args.extend(verification.iter().copied());
+                args.push("fakeprog");
+                RunOpts::parse_from(args)
+                    .refuse_an_invalid_replayed_record()
+                    .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn replay_takes_the_recorded_rng_seed_and_refuses_another() {
     let directory = tempfile::tempdir().unwrap();
     let record = directory.path().join("schedule.preempts");
@@ -8740,13 +8841,33 @@ impl RunOpts {
             return Ok(());
         }
         let config = &self.det_opts.det_config;
+        if config.replay_edited_preemptions
+            && (self.verify
+                || self.verify_verbose
+                || self.verify_strict
+                || self.verify_run.is_some())
+        {
+            return Err(Error::new(PolicyRefusal).context(
+                "--replay-edited-preemptions is exploration-only and cannot be combined with \
+                 verification (--verify, --verify-strict, or --verify-run). Replay an unedited, \
+                 complete recording without this option to verify it; omit verification to explore.",
+            ));
+        }
         let replayed = [
             ("--replay-preemptions-from", &config.replay_preemptions_from),
             ("--replay-schedule-from", &config.replay_schedule_from),
         ];
         for (flag, path) in replayed {
             let Some(path) = path else { continue };
-            if let Err(error) = detcore::preemptions::boundary_recording::Recording::read(path) {
+            let admitted = detcore::preemptions::boundary_recording::Recording::read(path)
+                .and_then(|record| {
+                    if flag == "--replay-preemptions-from" && config.replay_edited_preemptions {
+                        record.require_strict_mode(false)
+                    } else {
+                        record.require_faithful_replay()
+                    }
+                });
+            if let Err(error) = admitted {
                 return Err(Error::new(PolicyRefusal).context(format!(
                     "{flag}={}: Hermit cannot replay this record: {error:#}. Pass a complete \
                      record Hermit wrote (re-record it), or correct the named entry.",
@@ -12170,6 +12291,8 @@ impl RunOpts {
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>, Option<detcore::TerminalOutcome>), Error> {
         self.refuse_unready_exec_stop()?;
+        // Analyze and other in-process callers bypass the outer CLI entry.
+        self.refuse_an_invalid_replayed_record()?;
         let mut options = self.clone();
         options.det_opts.det_config.annotated_priority_replay =
             options.annotated_priority_replay_admission()?;

@@ -54,6 +54,8 @@ struct FormatProbe {
     // A present null must not look like an absent protocol marker.
     #[serde(default, deserialize_with = "marker_present")]
     slice_boundary_recording: bool,
+    #[serde(default, deserialize_with = "marker_present")]
+    incomplete_preemption_record: bool,
 }
 
 fn marker_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
@@ -69,9 +71,9 @@ impl FormatProbe {
 pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
-    let boundary = FormatProbe::is_boundary_recording(&bytes)
+    let format: FormatProbe = serde_json::from_slice(&bytes)
         .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    if !boundary {
+    if !format.slice_boundary_recording && !format.incomplete_preemption_record {
         // Each old metadata reader still deserializes only its own field,
         // from the original bytes, preserving its legacy acceptance contract.
         return serde_json::from_slice(&bytes)
@@ -79,8 +81,10 @@ pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Resu
     }
     let recording = Recording::decode(&bytes)
         .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    serde_json::from_value(serde_json::to_value(recording.metadata()).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))
+    serde_json::from_value(
+        super::record_serde::settings_value(recording.metadata()).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))
 }
 
 impl BoundaryRecording {
@@ -138,6 +142,16 @@ pub enum Recording {
 }
 
 impl Recording {
+    /// Refuse a known omitted change point in either stored format.
+    pub fn require_faithful_replay(&self) -> anyhow::Result<()> {
+        self.metadata().require_faithful_replay()
+    }
+
+    /// A retained source observation of an omitted replay change point.
+    pub fn replay_departed_at(&self) -> Option<u64> {
+        self.metadata().replay_departed_at()
+    }
+
     /// Require an explicit matching execution policy. The strict verifier must
     /// not silently fall back to an incomplete legacy stream, and ordinary
     /// recovery must not silently acquire strict EOF/desync semantics.
@@ -263,6 +277,19 @@ impl HistoryReader {
     /// silently project a new-format recording into legacy priorities/RCBs.
     pub(crate) fn require_legacy_mode(&self) -> anyhow::Result<()> {
         self.0.require_strict_mode(false)
+    }
+
+    /// Only explicit edited history exploration may consume known omissions.
+    pub(crate) fn require_replay_mode(&self, edited: bool) -> anyhow::Result<()> {
+        self.require_legacy_mode()?;
+        if !edited {
+            self.0.require_faithful_replay()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replay_departed_at(&self) -> Option<u64> {
+        self.0.replay_departed_at()
     }
 
     pub(crate) fn thread_initial_priority(
