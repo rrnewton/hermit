@@ -211,6 +211,7 @@ pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use scheduler::set_terminal_deadlock_hook;
 pub use scheduler::set_virtual_timeout_exit_hook;
+pub use syscalls::chosen_ids::holder_of as chosen_id_holder;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 pub use tool_global::SyscallObservationGap;
