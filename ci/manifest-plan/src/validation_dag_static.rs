@@ -3140,7 +3140,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4862 adds three detcore units: 2955 + 3 = 2958, re-measured at this integration head.
     // The loader-cache provenance fix adds one detcore unit: 2958 + 1 = 2959, re-measured at this integration head.
     // PR 4738 adds twenty detcore units: 2959 + 20 = 2979, re-measured at this integration head.
-    ("test.detcore_unit", 2979),
+    // PR 4897 adds two detcore units: 2979 + 2 = 2981, re-measured at this integration head.
+    ("test.detcore_unit", 2981),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5513,7 +5514,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three PR 4862 units: 2955 + 3 = 2958.
     // The same loader-cache provenance unit: 2958 + 1 = 2959.
     // The same twenty PR 4738 units: 2959 + 20 = 2979.
-    ("test.detcore_unit_on_host", 2979),
+    // The same two PR 4897 units: 2979 + 2 = 2981.
+    ("test.detcore_unit_on_host", 2981),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
