@@ -1223,7 +1223,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And host_input::tests::terminal_devices_follow_the_kernels_driver_list: 1931.
     // And host_input::tests::a_guest_descriptor_is_statted_only_on_a_local_kernel_filesystem: 1932.
     // And host_input::tests::the_root_is_known_by_its_mapped_image: 1933.
-    ("test.regular_crates", 1933),
+    // And host_input::tests::an_unknown_stdio_kind_is_never_compared: 1934.
+    // And config::tests::launch_namespace_mounts_never_enters_the_legacy_form: 1935.
+    ("test.regular_crates", 1935),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4481,7 +4483,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_schedule_replay_names_a_stdio_kind_changed_since_the_recording: 743.
     // And a_verify_run_records_the_stdio_kinds_its_guest_was_given: 744.
     // And a_library_run_records_the_stdio_kinds_of_its_commands_descriptors: 745.
-    ("test.cli", 745),
+    // And a_containerized_run_records_the_stdio_kinds_it_inherits: 746.
+    ("test.cli", 746),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5052,7 +5055,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same stdio-kind replay test: 662.
     // And the same captured-run stdio-kind test: 663.
     // And the same library-run stdio-kind test: 664.
-    ("test.cli_on_host", 664),
+    // And the same containerized-run stdio-kind test: 665.
+    ("test.cli_on_host", 665),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6171,7 +6175,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same terminal-device unit: 1917.
     // And the same guest-descriptor classifier unit: 1918.
     // And the same mapped-image unit: 1919.
-    ("test.regular_crates_on_host", 1919),
+    // And the same never-compared unit: 1920.
+    // And the same launch-namespace config unit: 1921.
+    ("test.regular_crates_on_host", 1921),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
