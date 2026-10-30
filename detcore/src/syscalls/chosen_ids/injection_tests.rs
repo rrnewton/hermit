@@ -137,6 +137,11 @@ impl CloneGuest {
     fn enable_fresh_attempt(&mut self) {
         self.config.sequentialize_threads = true;
         self.proof_context = true;
+        self.thread = ThreadState::new(
+            DetPid::from_raw(std::process::id() as i32),
+            &self.config,
+            (),
+        );
         let ids = Box::new([1]);
         self.original_args[0..8]
             .copy_from_slice(&(libc::CLONE_NEWPID as u64 | (1 << 40)).to_ne_bytes());
