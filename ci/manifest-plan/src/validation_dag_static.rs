@@ -1907,7 +1907,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4868): 1292.
     // And run::replay_takes_the_recorded_seeds_and_refuses_a_contradicting_seed
     // (the scheduler seed too, and an explicit --seed checked): 1293, listed.
-    ("test.hermit_unit", 1293),
+    // And analyze::phases::tests::analyze_trials_replay_a_record_under_its_recorded_seeds
+    // and run::run_takes_a_replayed_records_seeds_as_main_does (every launch
+    // takes a replayed record's seeds): 1295.
+    ("test.hermit_unit", 1295),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5946,7 +5949,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4912 unit: 1282 + 1 = 1283.
     // And the same three trial-guest-random-seed units: 1286.
     // And the same recorded-seeds replay test: 1287, listed.
-    ("test.hermit_unit_on_host", 1287),
+    // And the same two replayed-seed tests: 1289.
+    ("test.hermit_unit_on_host", 1289),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

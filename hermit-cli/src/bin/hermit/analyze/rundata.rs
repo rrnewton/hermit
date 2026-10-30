@@ -233,6 +233,15 @@ impl RunData {
         }
     }
 
+    /// Settle the trial's options before anything reads them: the seeds of
+    /// the record it replays ([`RunOpts::adopt_replayed_rng_seed`], which
+    /// `RunOpts::run` repeats without change), then validation. The
+    /// reproducer written after this names the seeds the trial runs under.
+    pub(super) fn prepare_trial_options(&mut self) -> anyhow::Result<()> {
+        self.runopts.adopt_replayed_rng_seed()?;
+        self.runopts.validate_args()
+    }
+
     /// Execute the run. (Including setting up logging and temp dir binding.)
     pub fn launch(&mut self) -> anyhow::Result<()> {
         let root = self.root_path();
@@ -257,7 +266,7 @@ impl RunData {
             self.runopts.det_opts.det_config.record_preemptions_to = Some(temp_path);
         }
 
-        self.runopts.validate_args()?;
+        self.prepare_trial_options()?;
 
         let repro_file = self.root_path().with_extension("repro");
         std::fs::write(repro_file, self.to_repro() + "\n")?;

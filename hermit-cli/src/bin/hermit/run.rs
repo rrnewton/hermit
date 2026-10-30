@@ -1431,6 +1431,12 @@ pub struct RunOpts {
     #[clap(skip = true)]
     seed_explicit: bool,
 
+    /// Runtime-only: the record [`Self::adopt_replayed_rng_seed`] last took
+    /// seeds from and what it changed, so that preparing the same record again
+    /// changes nothing.
+    #[clap(skip)]
+    replay_seeds_prepared: Option<PreparedReplaySeeds>,
+
     /// Runtime-only: the seed `--seed-from` chose, which `--save-config`
     /// writes in its place.
     #[clap(skip)]
@@ -4777,6 +4783,17 @@ fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
     );
 }
 
+/// What [`RunOpts::adopt_replayed_rng_seed`] did for one replayed record.
+#[derive(Debug, Clone)]
+struct PreparedReplaySeeds {
+    /// The replayed record.
+    record: PathBuf,
+    /// The guest random seed and the scheduler seed before any was adopted.
+    before: (Option<u64>, Option<u64>),
+    /// The seeds adopted from the record.
+    adopted: detcore_model::summary::AdoptedSeeds,
+}
+
 /// The seed a schedule replay adopts for `option` from the recorded seed
 /// `recorded` of the record at `path`: `Some` when the run omitted it.
 /// `explicit` is the run's own `option`, `global` its explicit `--seed`. One
@@ -5387,6 +5404,39 @@ fn replay_takes_the_recorded_seeds_and_refuses_a_contradicting_seed() {
         run_opts_for(&["hermit", "run", "--seed=6", replay_arg.as_str(), "fakeprog"]);
     agreeing.adopt_replayed_rng_seed().unwrap();
     assert_eq!(agreeing.det_opts.det_config.replay_adopted_seeds, None);
+}
+
+/// `RunOpts::run`, which in-process callers such as `hermit analyze` launch
+/// through, takes a replayed record's seeds as `main` does: a guest random
+/// seed given explicitly that contradicts the record is refused with `hermit
+/// run`'s refusal before anything is launched.
+#[test]
+fn run_takes_a_replayed_records_seeds_as_main_does() {
+    let directory = tempfile::tempdir().unwrap();
+    let record = directory.path().join("schedule.preempts");
+    fs::write(
+        &record,
+        r#"{"per_thread":{},"global":[],"rng_seed":6,"sched_seed":7}"#,
+    )
+    .unwrap();
+    let replay_arg = format!("--replay-preemptions-from={}", record.display());
+    let args =
+        crate::Args::try_parse_from(["hermit", "run", "--rng-seed=1", &replay_arg, "fakeprog"])
+            .unwrap();
+    let crate::Subcommand::Run(options) = args.command else {
+        unreachable!()
+    };
+    let refusal = options
+        .run(&args.global, true)
+        .expect_err("--rng-seed=1 contradicts the recorded guest random seed");
+    assert!(
+        refusal.downcast_ref::<PolicyRefusal>().is_some(),
+        "{refusal:#}"
+    );
+    assert!(
+        format!("{refusal:#}").contains("--rng-seed=1 differs from the seed 6"),
+        "{refusal:#}"
+    );
 }
 
 /// The environment variable that turned the signal-state copy on while it
@@ -9125,18 +9175,40 @@ impl RunOpts {
     /// scheduler seed is kept: the record decides the schedule wherever it
     /// records a decision. A record written before a seed was stored is
     /// replayed as before for that seed.
-    fn adopt_replayed_rng_seed(&mut self) -> Result<(), Error> {
+    ///
+    /// Every launch of a recorded run goes through this: `main` before it
+    /// reads stdin, and [`Self::run`] for every caller, among them `hermit
+    /// analyze`'s trials, which also call it before their validation and
+    /// reproducer (`RunData::launch`). It is idempotent: preparing the same
+    /// record again changes nothing, and preparing another record first takes
+    /// back what the earlier one adopted, where the options still hold it.
+    pub(crate) fn adopt_replayed_rng_seed(&mut self) -> Result<(), Error> {
         if self.namespace_only {
             return Ok(());
         }
         let config = &self.det_opts.det_config;
-        let Some(path) = config
+        let path = config
             .replay_preemptions_from
             .clone()
-            .or_else(|| config.replay_schedule_from.clone())
-        else {
+            .or_else(|| config.replay_schedule_from.clone());
+        if let Some(prepared) = self.replay_seeds_prepared.take() {
+            if path.as_ref() == Some(&prepared.record) {
+                self.replay_seeds_prepared = Some(prepared);
+                return Ok(());
+            }
+            let config = &mut self.det_opts.det_config;
+            if prepared.adopted.rng.is_some() && config.rng_seed == prepared.adopted.rng {
+                config.rng_seed = prepared.before.0;
+            }
+            if prepared.adopted.sched.is_some() && config.sched_seed == prepared.adopted.sched {
+                config.sched_seed = prepared.before.1;
+            }
+            config.replay_adopted_seeds = None;
+        }
+        let Some(path) = path else {
             return Ok(());
         };
+        let config = &self.det_opts.det_config;
         // --seed-from draws a fresh seed, and a replay takes its seeds from
         // the record: the two contradict each other whatever is drawn.
         if self.seed_from.is_some() {
@@ -9171,6 +9243,7 @@ impl RunOpts {
             &path,
         )?;
         let config = &mut self.det_opts.det_config;
+        let before = (config.rng_seed, config.sched_seed);
         if let Some(seed) = rng {
             config.rng_seed = Some(seed);
         }
@@ -9179,6 +9252,11 @@ impl RunOpts {
         }
         let adopted = detcore_model::summary::AdoptedSeeds { rng, sched };
         config.replay_adopted_seeds = adopted.any().then_some(adopted);
+        self.replay_seeds_prepared = Some(PreparedReplaySeeds {
+            record: path,
+            before,
+            adopted,
+        });
         Ok(())
     }
 
@@ -12463,6 +12541,9 @@ impl RunOpts {
         // Analyze and other in-process callers bypass the outer CLI entry.
         self.refuse_an_invalid_replayed_record()?;
         let mut options = self.clone();
+        // A recorded run is launched with its record's seeds, whoever calls;
+        // for `main`, which took them already, this changes nothing.
+        options.adopt_replayed_rng_seed()?;
         options.det_opts.det_config.annotated_priority_replay =
             options.annotated_priority_replay_admission()?;
         let network_trace = options.open_network_trace()?;
