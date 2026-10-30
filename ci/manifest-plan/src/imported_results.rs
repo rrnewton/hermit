@@ -245,8 +245,15 @@ fn stale_reason(context: &RunContext, cell: &SelectedCell, row: &CellResult) -> 
     let Some(observations) = &row.cpu_observations else {
         return Some("imported row has no CPU observations".into());
     };
+    let bound = observations.binding.outer_attempt;
+    if bound != row.attempt && bound != 1 {
+        return Some(format!(
+            "imported row attempt {} carries CPU observations bound to attempt {bound}",
+            row.attempt
+        ));
+    }
     let mut as_executed = row.clone();
-    as_executed.attempt = observations.binding.outer_attempt;
+    as_executed.attempt = bound;
     if let Err(error) = as_executed.require_cpu_observations() {
         return Some(format!(
             "imported row's CPU observations do not belong to its own execution: {error}"

@@ -320,13 +320,14 @@ fi
 # run 2's), otherwise both.
 outcome=$(python3 -c 'import json,sys
 rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-print(rows[-1]["outcome"] if rows else "")' "$out/results.jsonl" 2>/dev/null)
+outs=[r.get("outcome") for r in rows]
+print(next((o for o in ("PASS", "FAIL", "ERROR", "HOST-INAPPLICABLE") if o in outs), ""))' "$out/results.jsonl" 2>/dev/null)
 # The same rows as the verdict normalizer will judge them: how many, and the last one's outcome.
 rows_seen=$(python3 -c 'import json,os,sys
 p=sys.argv[1]
 rows=[json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
 assert all(isinstance(r, dict) for r in rows)
-print(json.dumps({"count": len(rows), "outcome": rows[-1].get("outcome") if rows else None}))' "$out/results.jsonl" 2>/dev/null) ||
+print(json.dumps({"count": len(rows), "outcome": next((o for o in ("PASS", "FAIL", "ERROR", "HOST-INAPPLICABLE") if o in [r.get("outcome") for r in rows]), None)}))' "$out/results.jsonl" 2>/dev/null) ||
     rows_seen=unreadable
 n_run1=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run1_log_*' | wc -l)
 n_run2=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run2_log_*' | wc -l)

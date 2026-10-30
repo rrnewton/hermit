@@ -750,11 +750,14 @@ def main():
             evidence_complete[(lane, category)].append(
                 {"test": c["test"], "mode": c["mode"], "backend": None if c["backend"] == "native" else c["backend"],
                  "run_id": run_id})
+        attempts_already = sum(len(rows) for rows, _, _ in ran)
         if not ran:
             rerun_locally.append(cell_slug(want[cell]))
-        elif withheld_on_re(cell, *runs[-1]):
+        elif withheld_on_re(cell, *runs[-1]) and attempts_already < 2:
+            # A withheld rerun is only for an attempt the cell has not had;
+            # a cell that already consumed both harness attempts is final.
             retry_locally.append(cell_slug(want[cell]))
-        elif len(ran) == 1 and len(runs) > 1 and ran[0][2] == "re" and failed_attempt(cell, *ran[0]):
+        elif attempts_already < 2 and len(ran) == 1 and len(runs) > 1 and ran[0][2] == "re" and failed_attempt(cell, *ran[0]):
             # Tpx's one retry went to an execution withheld on RE before the
             # cell's only attempt, which failed on RE: that attempt never got
             # the retry an executed run gives it. (A local rerun's attempt has
@@ -771,8 +774,12 @@ def main():
             if not rows:
                 attempt += 1
             # The harness owns retries (owner policy, 2026-10-30): one
-            # execution may write several rows, one per innermost attempt,
-            # and each takes its own attempt number in order.
+            # execution may write several rows, one per innermost attempt.
+            # The producer's own attempt numbers must already be 1..N in
+            # order; renumbering must never launder a disordered file.
+            if [row.get("attempt") for row in rows] != list(range(1, len(rows) + 1)):
+                sys.exit(f"ingest: the execution of {cell} that ended at {end} has producer attempts "
+                         f"{[row.get('attempt') for row in rows]}; expected 1..{len(rows)} in order")
             for row in rows:
                 attempt += 1
                 buckets[(lane, category)].append(dict(row, attempt=attempt))

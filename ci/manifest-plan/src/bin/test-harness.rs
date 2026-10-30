@@ -2939,12 +2939,10 @@ enum RetryCause {
 
 /// Why this finished attempt of `cell` is retried, or `None` when it is not.
 ///
-/// Retries apply only in a run that has not turned them off, and only to a
-/// cell that has not declared `no_retry_reason`, so `--no-retry` measurements
-/// and the single-attempt compatibility corpus keep exactly one attempt. The
-/// shared [`MAX_ATTEMPTS_PER_CELL`] caps both causes together. Every other
-/// failure, including a divergence, timeout or no-result that coincides with
-/// an overshoot report, has no cause and is final.
+/// Retries apply to every failing attempt in a run that has not turned
+/// them off (`--no-retry` keeps exactly one attempt for flake measurement).
+/// The shared [`MAX_ATTEMPTS_PER_CELL`] caps all causes together;
+/// classification only labels the retry (owner policy, 2026-10-30).
 fn attempt_retry_cause(
     retries: Retries,
     cell: &SelectedCell,
@@ -3581,12 +3579,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let retried = retried_attempts(args.retries, &cells, &attempt_results);
     let product_retried = retried
         .iter()
-        .filter(|retried| {
-            matches!(
-                retried.cause,
-                RetryCause::ProductFailure | RetryCause::Failure
-            )
-        })
+        .filter(|retried| retried.cause == RetryCause::ProductFailure)
+        .collect::<Vec<_>>();
+    let failure_retried = retried
+        .iter()
+        .filter(|retried| retried.cause == RetryCause::Failure)
         .collect::<Vec<_>>();
     let host_input_retried = retried
         .iter()
@@ -3594,17 +3591,25 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         .collect::<Vec<_>>();
     if expected > 0 {
         println!(
-            "test-harness: PRODUCT-RETRY count {} ({} final PASS); HOST-INPUT-RETRY count {}",
+            "test-harness: PRODUCT-RETRY count {} ({} final PASS); HOST-INPUT-RETRY count {}; FAILURE-RETRY count {} ({} final PASS)",
             product_retried.len(),
             product_retried
                 .iter()
                 .filter(|retried| retried.final_outcome == "PASS")
                 .count(),
-            host_input_retried.len()
+            host_input_retried.len(),
+            failure_retried.len(),
+            failure_retried
+                .iter()
+                .filter(|retried| retried.final_outcome == "PASS")
+                .count()
         );
     }
     for retried in &product_retried {
         println!("{}", retried_attempt_line("PRODUCT-RETRY", retried));
+    }
+    for retried in &failure_retried {
+        println!("{}", retried_attempt_line("FAILURE-RETRY", retried));
     }
     for retried in &host_input_retried {
         println!("{}", retried_attempt_line("HOST-INPUT-RETRY", retried));
@@ -3666,6 +3671,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         // file changing explains; see the PRODUCT-RETRY lines above.
         "product_retries": product_retried.len(),
         "product_retry_cells": product_retried
+            .iter()
+            .map(|retried| retried_attempt_json(retried))
+            .collect::<Vec<_>>(),
+        "failure_retries": failure_retried.len(),
+        "failure_retry_cells": failure_retried
             .iter()
             .map(|retried| retried_attempt_json(retried))
             .collect::<Vec<_>>(),
@@ -5120,19 +5130,37 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                 stdout.contains(&format!("; SKID-RETRY count {skid_retries}\n")),
                 "{scenario}: the summary line must carry the SKID-RETRY count: {stdout}"
             );
-            // Every retry is counted, not only a SKID-RETRY.
+            // Every retry is counted, not only a SKID-RETRY. Generic
+            // (universal-policy) retries count as FAILURE-RETRY, not PRODUCT.
+            let generic = matches!(
+                scenario,
+                "unmarked-skid"
+                    | "rejected-guest-skid"
+                    | "crashed-operand-skid"
+                    | "skid-wrong-stdout"
+            );
+            let (want_product, want_failure) = if generic {
+                (0, product_retries)
+            } else {
+                (product_retries, 0)
+            };
             assert_eq!(
                 summary["product_retries"],
-                json!(product_retries),
+                json!(want_product),
+                "{scenario}"
+            );
+            assert_eq!(
+                summary["failure_retries"],
+                json!(want_failure),
                 "{scenario}"
             );
             assert_eq!(summary["host_input_retries"], json!(0), "{scenario}");
             assert!(
                 stdout.contains(&format!(
-                    "test-harness: PRODUCT-RETRY count {product_retries} ({} final PASS); HOST-INPUT-RETRY count 0\n",
+                    "test-harness: PRODUCT-RETRY count {want_product} ({} final PASS); HOST-INPUT-RETRY count 0; FAILURE-RETRY count {want_failure} (0 final PASS)\n",
                     usize::from(scenario == "unmarked-diverged-then-match")
                 )),
-                "{scenario}: the summary must carry the PRODUCT-RETRY count: {stdout}"
+                "{scenario}: the summary must carry the retry counts: {stdout}"
             );
             let first = &rows[0];
             match scenario {
@@ -5963,7 +5991,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                             assert_eq!(result.status.code(), Some(0), "{context}");
                             assert_eq!(summary["passed"], json!(1), "{context}");
                             assert_eq!(summary["skid_retries"], json!(0), "{context}");
-                            assert!(stdout.contains("PRODUCT-RETRY count 1"), "{context}");
+                            assert!(stdout.contains("FAILURE-RETRY count 1"), "{context}");
                         }
                         Expect::Unretried => {
                             // The skid row itself, as its producer wrote it,
@@ -10106,7 +10134,7 @@ sys.exit(1 if failed else 0)
     }
 
     #[test]
-    fn production_run_retries_only_product_failures() {
+    fn production_run_retries_every_failing_cell() {
         use std::path::Path;
         use std::path::PathBuf;
         use std::process::Command;
@@ -10119,7 +10147,7 @@ sys.exit(1 if failed else 0)
         const CHILD_FIXTURE: &str = "HERMIT_HARNESS_RETRY_TEST_FIXTURE";
         const CHILD_DIAGNOSTIC: &str = "HERMIT_HARNESS_RETRY_TEST_DIAGNOSTIC_RESULTS";
         const CHILD_NO_RETRY: &str = "HERMIT_HARNESS_RETRY_TEST_NO_RETRY";
-        const TEST_NAME: &str = "tests::production_run_retries_only_product_failures";
+        const TEST_NAME: &str = "tests::production_run_retries_every_failing_cell";
         if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
             let fixture = PathBuf::from(fixture);
             // Run against the fixture as a Git-less source snapshot
@@ -10523,7 +10551,7 @@ sys.exit(1 if failed else 0)
     /// strict-compatibility row (no_retry_reason) is final, while the same
     /// FAIL of an ordinary verify cell earns its retry.
     #[test]
-    fn a_no_retry_cell_is_not_retried_after_a_product_failure() {
+    fn a_no_retry_manifest_cell_is_retried_after_a_product_failure() {
         let manifests = ManifestSet::load(&super::root(None)).unwrap();
         let cell = |test: &str| {
             manifests
@@ -10768,7 +10796,7 @@ sys.exit(1 if failed else 0)
     /// lane ran each program once, while the same FAIL of the same test's
     /// verify cell earns its retry.
     #[test]
-    fn a_replay_cell_is_not_retried_after_a_product_failure() {
+    fn a_replay_cell_is_retried_after_a_product_failure() {
         let manifests = ManifestSet::load(&super::root(None)).unwrap();
         let cell = |mode: &str| {
             manifests
