@@ -171,6 +171,7 @@ impl BisectOpts {
             ("--good", &self.good),
             ("--bad", &self.bad),
         ])?;
+        analyzer.refuse_instruction_offsets(&[("--good", &self.good), ("--bad", &self.bad)])?;
         let mut good = good.into_global();
         let mut bad = bad.into_global();
         // Analyze's trial outputs omit optional event timestamps. Put these

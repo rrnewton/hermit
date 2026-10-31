@@ -2313,6 +2313,16 @@ pub struct Scheduler {
     /// recording priorities. The writer owns the latter through retirement.
     record_logical_replay_priorities: bool,
 
+    /// Where the timer of each thread's ending timeslice was armed, for a
+    /// timeslice armed with `--chaos-instruction-offset`, as the thread
+    /// published it just before the change point that ends that timeslice
+    /// (`publish_instruction_offset`). Taken by that change point, which
+    /// records it in the preemption record beside its row
+    /// (`perform_priority_changepoint`). Kept out of `Resources`, which every
+    /// syscall's futures copy at each level. A thread's entry dies with it
+    /// (`logically_kill_thread`).
+    pub(crate) instruction_offsets: HashMap<DetTid, crate::resources::InstructionOffset>,
+
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
     /// Whether the run replays a preemption record (`--replay-preemptions-from`),
@@ -4937,6 +4947,7 @@ impl Scheduler {
             preemption_writer,
             access_trace,
             record_logical_replay_priorities: Self::records_logical_replay_priorities(cfg),
+            instruction_offsets: HashMap::new(),
             callback_history_active: crate::preemptions::callback_history::recording_enabled(cfg)
                 || cfg.annotated_priority_replay
                 || callback_checkpoints
@@ -6304,6 +6315,7 @@ impl Scheduler {
         }
         self.kernel_run_requests.remove(dtid);
         self.published_masks.remove(dtid);
+        self.instruction_offsets.remove(dtid);
         let retired = self
             .discarded_at_send
             .retire(discarded_at_send::QueueId::Thread(*dtid));
@@ -8021,6 +8033,29 @@ impl Scheduler {
             held: entry.generation,
             taken,
         })
+    }
+
+    /// Note where the timer of `thread`'s ending timeslice was armed
+    /// (`instruction_offsets`), for the change point the thread files next.
+    /// Answered before any clock or scheduler accounting, like a published
+    /// mask, and refused, taking nothing, on the same grounds: a thread the
+    /// scheduler does not know, one logically killed, or a retired exec
+    /// incarnation of its tid (`rpc_incarnation_matches` with the request's
+    /// `mm`). Such a thread files no change point that could record it.
+    pub(crate) fn publish_instruction_offset(
+        &mut self,
+        thread: DetTid,
+        mm: MmId,
+        offset: crate::resources::InstructionOffset,
+    ) -> bool {
+        if !self.next_turns.contains_key(&thread)
+            || self.thread_is_logically_killed(thread)
+            || !self.rpc_incarnation_matches(thread, mm)
+        {
+            return false;
+        }
+        self.instruction_offsets.insert(thread, offset);
+        true
     }
 
     /// Record (`Some`) or withdraw (`None`) `thread`'s mask as Detcore's copy
@@ -16527,6 +16562,14 @@ impl Scheduler {
     ) -> Result<(), SkipTurn> {
         assert!(runqueue::is_ordinary_priority(new_priority));
         self.chaos_turns_in_slice.remove(&dettid);
+        // Taken whether or not this change point is recorded, so that it
+        // never reaches a later one. The thread published it from the same
+        // committed clock this change point carries, at or past the target.
+        let instruction_offset = self.instruction_offsets.remove(&dettid);
+        debug_assert!(
+            instruction_offset.is_none_or(|offset| offset.rcb_target <= guest_rcbs),
+            "[dtid {dettid}] offset {instruction_offset:?} ends before its change point's {guest_rcbs} branches"
+        );
         let new_priority = self.bound_chaos_starvation(dettid, new_priority);
         // Alter the threads priority and requeue.
         let old_priority = self.priorities.insert(dettid, new_priority);
@@ -16593,6 +16636,7 @@ impl Scheduler {
                         guest_rcbs,
                         old_prio,
                         new_priority,
+                        instruction_offset,
                     );
                 }
             }

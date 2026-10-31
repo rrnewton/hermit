@@ -1325,7 +1325,8 @@ impl AnalyzeOpts {
         self.adopt_expired_wait_charge(run1.as_deref())?;
         // Every trial registers queued sleeps as the target did.
         self.adopt_recorded_timeslice(&recordings)?;
-        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
+        self.refuse_instruction_offsets(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every

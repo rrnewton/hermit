@@ -771,6 +771,22 @@ pub struct Config {
     #[clap(long, default_value = "0", value_name = "nanos")]
     pub chaos_epoch_length_ns: u64,
 
+    /// Let a chaos preemption land up to this many instructions past the
+    /// conditional branch its timeslice ends on. `0` (the default) is off.
+    ///
+    /// A chaos timeslice ends after a retired conditional branch, so a race
+    /// window with no conditional branch in it is never split. With this set,
+    /// each timeslice that ends on its timer is delivered `k` single steps
+    /// past that branch instead, `k` drawn uniformly from `0..=N` for each
+    /// timeslice from the seed, so a preemption can land inside straight-line
+    /// code. A preemption record keeps each `k` and its branch count, and its
+    /// replay stops at the same instruction. Each step is one ptrace stop, so
+    /// a preemption costs up to `N` more. Needs `--chaos` and the ptrace
+    /// backend's precise timers on x86_64; at most 256.
+    #[serde(default)]
+    #[clap(long, default_value = "0", value_name = "instructions")]
+    pub chaos_instruction_offset: u64,
+
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
     #[clap(long)]
@@ -1818,10 +1834,13 @@ impl Config {
     /// state at each end), no slice-boundary protocol, no stack traces at
     /// preemptions or events, no turn-numbered triggers (`--stop-after-turn`,
     /// `--stop-after-iter`, `--signal-at`), no happens-before program, no
-    /// manual interrupt points and no syscall-boundary deadline
-    /// (`--target-timeslice`). Never with a gdbserver either: a debugger is
-    /// served at the stops, and between skipped ends it would see Detcore's
-    /// slice bookkeeping lag the guest's program counter.
+    /// manual interrupt points, no syscall-boundary deadline
+    /// (`--target-timeslice`) and no instruction offsets
+    /// ([`Config::slice_ends_need_a_stop`]: an offset is stepped from a real
+    /// stop at its branch target, and processing a skipped end can draw one).
+    /// Never with a gdbserver either: a debugger is served at the stops, and
+    /// between skipped ends it would see Detcore's slice bookkeeping lag the
+    /// guest's program counter.
     pub fn replays_lone_preemptions(&self) -> bool {
         !self.eager_lone_preemptions
             && self.use_preemption_timer()
@@ -1841,6 +1860,7 @@ impl Config {
             && self.signal_at.is_none()
             && self.happens_before.is_none()
             && self.interrupt_at.is_empty()
+            && !self.slice_ends_need_a_stop()
             && !self.gdbserver
     }
 
@@ -1850,6 +1870,18 @@ impl Config {
     /// setting `--max-timeslice=disabled`.
     pub fn use_rcb_time(&self) -> bool {
         self.max_timeslice.is_some() && !self.no_rcb_time
+    }
+
+    /// Whether every chaos timeslice end needs the guest really stopped at
+    /// its PMU branch target: `--chaos-instruction-offset` single-steps from
+    /// that stop to where the timeslice ends. Any optimization that takes a
+    /// slice end without stopping the guest there (for example a lone
+    /// runnable thread's slice end processed at its branch count, which
+    /// [`Config::replays_lone_preemptions`] turns off) must be off while this
+    /// holds, or the offset is lost and a replay of the record no longer
+    /// stops where the recorded run did.
+    pub fn slice_ends_need_a_stop(&self) -> bool {
+        self.chaos && self.chaos_instruction_offset > 0
     }
 
     /// Whether a `FUTEX_WAKE` that woke `woken` waiters makes the waker yield
@@ -2063,6 +2095,13 @@ impl fmt::Display for Config {
             if self.chaos_epoch_length_ns > 0 {
                 write!(f, " --chaos-epoch-length-ns={}", self.chaos_epoch_length_ns)?;
             }
+        }
+        if self.chaos_instruction_offset > 0 {
+            write!(
+                f,
+                " --chaos-instruction-offset={}",
+                self.chaos_instruction_offset
+            )?;
         }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
@@ -3557,7 +3596,10 @@ mod legacy_backend_json {
     /// `access_trace_max_bytes` came after it too; the scheduler writes the
     /// trace, and `hermit run` refuses it on DBT, so they are never written
     /// and read as unset, 0, unset and unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 44] = [
+    /// `chaos_instruction_offset` came after it as well: the ptrace backend's
+    /// precise timer takes its single steps, and `hermit run` refuses it on
+    /// every other backend, so it is never written and reads as 0.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 45] = [
         // `chaos_timeslice_range` came after it too: the scheduler draws the
         // slices, not the runtime, so it is never written and reads as unset.
         // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
@@ -3612,6 +3654,7 @@ mod legacy_backend_json {
         "access_trace_from",
         "access_trace_max_records",
         "access_trace_max_bytes",
+        "chaos_instruction_offset",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3760,9 +3803,9 @@ mod legacy_backend_json {
                     | "eager_lone_preemptions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
-                Some("in_guest_reserved_signals" | "access_trace_from") => {
-                    seed.deserialize(U64Deserializer::new(0)).map(Some)
-                }
+                Some(
+                    "in_guest_reserved_signals" | "access_trace_from" | "chaos_instruction_offset",
+                ) => seed.deserialize(U64Deserializer::new(0)).map(Some),
                 // On, as its serde default is.
                 Some("signal_state_copy") => {
                     seed.deserialize(BoolDeserializer::new(true)).map(Some)
@@ -4108,7 +4151,8 @@ mod legacy_backend_json {
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
-                | "access_trace_max_bytes" => Ok(()),
+                | "access_trace_max_bytes"
+                | "chaos_instruction_offset" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -4279,6 +4323,20 @@ mod tests {
         }
         let point: TimesliceRange = "4321..4321".parse().unwrap();
         assert_eq!(point.log_uniform(0.7), 4321.0);
+    }
+
+    /// `--chaos-instruction-offset` needs a real stop at every chaos slice
+    /// end; nothing else does, and the option is inert without `--chaos`.
+    #[test]
+    fn only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end() {
+        let mut config = Config::default();
+        assert!(!config.slice_ends_need_a_stop());
+        config.chaos_instruction_offset = 8;
+        assert!(!config.slice_ends_need_a_stop());
+        config.chaos = true;
+        assert!(config.slice_ends_need_a_stop());
+        config.chaos_instruction_offset = 0;
+        assert!(!config.slice_ends_need_a_stop());
     }
 
     /// The four capabilities split out of
@@ -5013,7 +5071,8 @@ mod tests {
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
-                | "access_trace_max_bytes" => {}
+                | "access_trace_max_bytes"
+                | "chaos_instruction_offset" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -5047,11 +5106,11 @@ mod tests {
         // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
-        // `access_trace_max_bytes` and
+        // `access_trace_max_bytes`, `chaos_instruction_offset` and
         // `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-three fewer, so twenty-nine keys fewer than fields.
+        // forty-four fewer, so thirty keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 29);
+        assert_eq!(fields.len(), keys.len() + 30);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5324,6 +5383,51 @@ mod tests {
         assert_eq!(
             from_legacy_backend_json(&array).unwrap().guest_ids,
             crate::pid::GuestIds::Namespace
+        );
+    }
+
+    /// `chaos_instruction_offset` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads back as 0 from
+    /// both the object and the array form.
+    #[test]
+    fn chaos_instruction_offset_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            chaos: true,
+            chaos_instruction_offset: 16,
+            ..off.clone()
+        };
+        let chaos = Config {
+            chaos: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&chaos).unwrap());
+        assert!(!json.contains("chaos_instruction_offset"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        assert!(
+            !to_legacy_backend_json(&off)
+                .unwrap()
+                .contains("chaos_instruction_offset")
         );
     }
 
@@ -7095,6 +7199,14 @@ mod tests {
                 },
             ),
             (
+                "--chaos --chaos-instruction-offset=8",
+                Config {
+                    chaos: true,
+                    chaos_instruction_offset: 8,
+                    ..base.clone()
+                },
+            ),
+            (
                 "--gdbserver",
                 Config {
                     gdbserver: true,
@@ -7105,6 +7217,14 @@ mod tests {
         for (option, config) in off {
             assert!(!config.replays_lone_preemptions(), "{option}");
         }
+        // Chaos alone draws no offsets: its slice ends need no stop.
+        assert!(
+            Config {
+                chaos: true,
+                ..base.clone()
+            }
+            .replays_lone_preemptions()
+        );
     }
 
     #[test]
