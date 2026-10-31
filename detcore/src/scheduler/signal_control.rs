@@ -305,13 +305,24 @@ impl Scheduler {
         task: SignalTaskIdentity,
     ) -> Result<Option<SignalDeliveryPermit>, reverie::Error> {
         let Some(control) = self.parked.control.clone() else {
+            tracing::debug!("[permit-probe] authorize: no signal control");
             return Ok(None);
         };
         let tid = DetTid::from_raw(task.tid.as_raw());
         if self.backend_failed() || self.thread_is_logically_killed(tid) {
+            tracing::debug!(
+                "[permit-probe] authorize dtid {tid}: DECLINE backend_failed={} killed={}",
+                self.backend_failed(),
+                self.thread_is_logically_killed(tid)
+            );
             return Ok(None);
         }
         if let Some(permit) = self.parked.permits.get(&tid) {
+            tracing::debug!(
+                "[permit-probe] authorize dtid {tid}: REUSE own permit seq {} site {}",
+                permit.sequence,
+                permit.site.is_some()
+            );
             return if permit.task == task {
                 Ok(Some(*permit))
             } else {
@@ -321,6 +332,10 @@ impl Scheduler {
         // Real serial grant ownership, not arrival at this backend hook, is
         // the authority. Startup is registered before its first grant as well.
         if self.parked.running != Some(tid) {
+            tracing::debug!(
+                "[permit-probe] authorize dtid {tid}: DECLINE not the serial grant (parked.running={:?})",
+                self.parked.running
+            );
             return Ok(None);
         }
         let pid = self
@@ -339,6 +354,17 @@ impl Scheduler {
             .values()
             .any(|p| p.task.process == task.process)
         {
+            let holders: Vec<(DetTid, u64, bool)> = self
+                .parked
+                .permits
+                .iter()
+                .filter(|(_, p)| p.task.process == task.process)
+                .map(|(holder, p)| (*holder, p.sequence, p.site.is_some()))
+                .collect();
+            tracing::debug!(
+                "[permit-probe] authorize dtid {tid}: DECLINE sibling permit(s) (holder dtid, seq, observation-site) {:?}",
+                holders
+            );
             return Ok(None);
         }
         let sequence = self
@@ -354,6 +380,7 @@ impl Scheduler {
         control.process.reserve_delivery(permit)?;
         self.parked.nonce = sequence;
         self.parked.permits.insert(tid, permit);
+        tracing::debug!("[permit-probe] authorize dtid {tid}: GRANT permit seq {sequence}");
         Ok(Some(permit))
     }
 
@@ -1076,6 +1103,11 @@ impl Scheduler {
         // duplicates remain recognizable after timer/task retirement. No turn
         // or membership is created by this consuming notification.
         if let Some(released) = self.parked.permits.remove(&tid) {
+            tracing::debug!(
+                "[permit-probe] consume dtid {tid}: RELEASE permit seq {} outcome {:?}",
+                released.sequence,
+                receipt.outcome
+            );
             self.admit_exits_released_by(tid, released.task.process);
         }
         if exit_fence.is_some() {

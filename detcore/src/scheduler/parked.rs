@@ -1383,6 +1383,11 @@ impl Scheduler {
             .reserve_delivery(permit)
             .map_err(|_| ProtocolFailure::Identity)?;
         self.parked.permits.insert(tid, permit);
+        tracing::debug!(
+            "[permit-probe] observation dtid {tid}: GRANT observation permit seq {} (parked wait {:?})",
+            permit.sequence,
+            origin.control
+        );
         if existing.is_none() {
             self.parked.nonce = continuation.nonce;
         }
