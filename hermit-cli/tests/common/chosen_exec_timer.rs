@@ -73,7 +73,6 @@ fn run(mode: &str, kind: Run) -> Output {
         command.args([
             "--log=info",
             "run",
-            "--strict",
             "--base-env=minimal",
             "--max-timeslice=disabled",
             "--target-timeslice=1000",
@@ -86,7 +85,12 @@ fn run(mode: &str, kind: Run) -> Output {
             "--summary",
         ]);
         if matches!(kind, Run::Chosen) {
+            // Global --strict refuses --no-namespace's host-network policy.
+            // The outer unshare still owns this fixture's network namespace,
+            // and an explicit --pid-base requires Chosen IDs without fallback.
             command.args(["--no-namespace", "--pid-base=5000"]);
+        } else {
+            command.arg("--strict");
         }
         command.arg("--");
     }
@@ -118,6 +122,12 @@ fn check(mode: &str, pending: u8, take_back: usize) {
         let log = stderr(&output);
         assert_eq!(stdout(&output), expected, "{kind:?} {mode}: {log}");
         if !matches!(kind, Run::Native) {
+            // Chosen cannot use global --strict, so reject the same delivery
+            // contradiction that strict mode makes fatal before dropping its copy.
+            assert!(
+                !log.contains("the kernel contradicts the delivery of signal "),
+                "{kind:?} {mode}: {log}"
+            );
             assert_eq!(
                 log.matches(TAKE_BACK).count(),
                 take_back,
