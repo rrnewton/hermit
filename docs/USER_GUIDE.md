@@ -865,6 +865,30 @@ Run `hermit analyze --help` before using this workflow. Search, minimization,
 and schedule replay can perform many guest executions and require a reliably
 reproducible target condition.
 
+Analyze keeps every run's schedules, logs, output and reproducer command in a
+workspace, a `hermit_analyze*` directory it creates in `--tmp-dir`, or else in
+`$TMPDIR` (`/tmp` when TMPDIR is unset); the paths it prints name that
+directory. Analyze removes the workspace when it exits after its report, and
+when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since the
+error can name trial files in it (a trial that did not finish, say). A stop
+signal ends the run in progress and starts no other; analyze then removes the
+workspace and that run's own temporary directories, and dies of the signal, so
+a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
+keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
+too, since the per-run logs it adds are written there. The report file
+(`--report-file`) and the `--tmp-dir` directory itself are never removed.
+
+Analyze cannot clean up after SIGKILL, nor after a stop signal it does not
+handle: a signal it inherits as ignored stays ignored (SIGINT in a shell's
+background job, SIGHUP under `nohup`), and an analyze that is PID 1 of its PID
+namespace, as in `docker run IMAGE hermit analyze ...` without `--init`, keeps
+the default actions, which Linux discards for a namespace's init. Analyze also
+leaves the stop signals to kill it at once, as before, when `/proc` is not its
+own PID namespace's (analyze started by another process inside `unshare -pf`
+without `--mount-proc`) or when it inherited more than 64 children, since it
+could not then find the run to stop. `hermit
+bisect` keeps its workspace and names it when it exits.
+
 A replayed or spliced schedule can leave the guest spinning or waiting indefinitely.
 `--trial-timeout=SECONDS|auto|off` bounds runs after the initial target attempt.
 The default `auto` uses the initial completed run and completed target/baseline
@@ -903,8 +927,14 @@ example timeslices that end at other points, or extra iterations of a polling
 loop), no single swap may separate the outcomes. `--prefix-search` searches
 within the failing schedule instead: each trial replays its first K events and
 then schedules without chaos, and a binary search finds the event at which the
-outcome flips. The report shows the stack of the thread the failing schedule
-runs at that event and of the thread that runs there otherwise:
+outcome flips. The continuation runs at the run's own `--max-timeslice`; a race
+found only at a short timeslice often shows without chaos at that timeslice
+too, and then the search continues at 200 ms instead
+(`--continuation-timeslice`). The report shows the stack of the thread the
+failing schedule runs at that event and of the thread that runs there
+otherwise. When both continuations run the same thread there, the decision is
+how long that thread runs: the report then shows its stack, and the stacks of
+the threads that run after it with and without the event:
 
 ```bash
 hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
