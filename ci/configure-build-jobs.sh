@@ -3161,7 +3161,7 @@ fi
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
 # carries, not runtime equivalence.
-# CARRY TO 00953e938fa0a38f7225f6fbdb167699192f6f32 (2026-10-30): from 641887661b506b4d856489eb06787bc5b4f40a28.
+# CARRY TO f91e4c3795cc1d7419325457024a541f1238a4ee (2026-10-30): from 641887661b506b4d856489eb06787bc5b4f40a28.
 # Interval: Reverie main 64188766..dc415e98 (one commit, dc415e98, which
 # fixes a reverie-dbt evidence test in reverie-dbt/src/evidence.rs), then
 # this slice: LinuxEmu's FIONREAD forwarding on inotify and its
@@ -3171,8 +3171,8 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 00953e938fa0a38f7225f6fbdb167699192f6f32 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 00953e938fa0a38f7225f6fbdb167699192f6f32 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f91e4c3795cc1d7419325457024a541f1238a4ee ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f91e4c3795cc1d7419325457024a541f1238a4ee (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
