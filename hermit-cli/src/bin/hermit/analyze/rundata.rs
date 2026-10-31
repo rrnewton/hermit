@@ -34,6 +34,7 @@ use tracing::metadata::LevelFilter;
 
 use crate::analyze::consts::*;
 use crate::analyze::types::AnalyzeOpts;
+use crate::analyze::types::ContinuationTimeslice;
 use crate::analyze::types::TRIAL_LOG_FACTOR;
 use crate::analyze::types::TRIAL_LOG_FLOOR;
 use crate::analyze::types::TRIAL_TIMEOUT_FACTOR;
@@ -195,19 +196,33 @@ impl RunData {
         self.is_a_match.is_some()
     }
 
-    /// Called after the run has been launched, normalize the output preemptions and swap around so
-    /// that our output file points to the normalized version.
-    pub fn normalize_preempts_out(&mut self) {
-        assert!(self.has_launched());
-        let preempts_path = self.preempts_path_out();
-        let normalized_path = preempts_path.with_extension("normalized");
+    /// For a test that drives a phase with a launch it models: the completed
+    /// observation `launch` makes, whether the run met the target, and the
+    /// schedule it recorded.
+    #[cfg(test)]
+    pub(super) fn complete_for_test(
+        &mut self,
+        met: bool,
+        recorded: &[SchedEvent],
+    ) -> anyhow::Result<()> {
+        self.is_a_match = Some(met);
+        PreemptionRecord::from_sched_events(recorded.to_vec())
+            .write_to_disk(self.sched_path_out())
+            .map_err(anyhow::Error::msg)
+    }
 
+    /// Write a normalized copy of the output preemption record, for reading
+    /// only, beside it, and return its path and contents. The run keeps its
+    /// own record: normalization renumbers priorities across the scheduler's
+    /// fixed ones, so the copy can replay another schedule.
+    pub fn write_normalized_preempts(&mut self) -> (PathBuf, PreemptionRecord) {
+        assert!(self.has_launched());
+        let normalized_path = self.preempts_path_out().with_extension("normalized");
         let normalized = self.preempts_out().normalize();
         normalized
             .write_to_disk(&normalized_path)
             .expect("write of preempts file to succeed");
-        self.in_mem_sched_out = Some(normalized);
-        self.sched_path_out = Some(normalized_path);
+        (normalized_path, normalized)
     }
 
     /// The global options a trial run is launched with. Trials go through
@@ -1162,6 +1177,43 @@ impl AnalyzeOpts {
              the trials under the recorded one, or pass --max-timeslice={timeslice}.",
             explicit.map_or_else(|| "disabled".to_owned(), |maximum| format!("{maximum} ns"))
         ))
+    }
+
+    /// Refuses (exit 122) a `--continuation-timeslice` that would change the
+    /// replayed prefix, before any workspace or trial: one shorter than the
+    /// run's `--max-timeslice`, which also ends the prefix's slices that its
+    /// schedule does not end, or one for a run without PMU timeslices, whose
+    /// clock it would change.
+    pub fn refuse_unsound_continuation_timeslice(&self) -> anyhow::Result<()> {
+        let ContinuationTimeslice::Nanos(nanos) = self.continuation_timeslice else {
+            return Ok(());
+        };
+        let reason = match self.trial_max_timeslice() {
+            None => "the run arguments disable PMU timeslices, and a continuation timeslice \
+                     would turn them on for the replayed prefix too"
+                .to_owned(),
+            Some(run) if nanos < run => format!(
+                "it is shorter than the run's --max-timeslice={run}, and the trials' timeslice \
+                 also ends the replayed prefix's slices that its schedule does not end, so it \
+                 would change the prefix"
+            ),
+            Some(_) => return Ok(()),
+        };
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "--continuation-timeslice={nanos} is refused: {reason}. Omit it (auto), or pass \
+                 a timeslice at least as long as the run's own."
+            )),
+        )
+    }
+
+    /// The trials' `--max-timeslice`, from their run arguments (`None` for
+    /// disabled).
+    pub fn trial_max_timeslice(&self) -> detcore_model::config::MaybeTimeslice {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .max_timeslice
     }
 
     /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
@@ -3151,8 +3203,10 @@ mod tests {
             .refuse_unenforceable_trial_timeout()
             .unwrap();
     }
-    /// The final adapter must compare observed completed predicates, including
-    /// guest nonzero exits, even when neither diagnostic stack is available.
+    /// The stack-trace replay the report takes must give the observed
+    /// completed predicate, including a guest's nonzero exit, even when neither
+    /// diagnostic stack is available: the report compares that outcome with
+    /// the search's, and ends the analysis when they differ.
     #[test]
     fn final_replays_require_the_observed_completed_outcome() {
         use reverie::process::ExitStatus;
@@ -3161,12 +3215,12 @@ mod tests {
         let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         options.tmp_dir = Some(dir.path().to_path_buf());
         for actual in [false, true] {
-            for expected in [false, true] {
-                let result = options.run_and_retrieve_stacks_with(
+            let replay = options
+                .replay_for_stacks(
                     "completed_final",
-                    dir.path().join("candidate.json"),
+                    &dir.path().join("candidate.json"),
+                    &[],
                     1,
-                    expected,
                     |run| {
                         assert!(!run.has_launched());
                         let output = Output {
@@ -3179,21 +3233,15 @@ mod tests {
                         // product API that could manufacture completion.
                         run.is_a_match = Some(options.output_matches(&output));
                         assert_eq!(run.is_a_match(), actual);
+                        // A completed replay records the schedule it ran.
+                        PreemptionRecord::from_sched_events(Vec::new())
+                            .write_to_disk(run.sched_path_out())
+                            .map_err(anyhow::Error::msg)?;
                         Ok(())
                     },
-                );
-                if actual == expected {
-                    let (first, second) = result.expect("a completed matching replay is valid");
-                    assert!(first.is_none() && second.is_none());
-                } else {
-                    let error = result
-                        .expect_err("a contradictory final replay cannot certify a candidate");
-                    assert!(
-                        error.to_string().contains("observed the opposite"),
-                        "{error:#}"
-                    );
-                }
-            }
+                )
+                .expect("a completed replay gives its outcome");
+            assert_eq!(replay.met_target, actual);
         }
     }
 
@@ -3223,6 +3271,105 @@ mod tests {
             Some(Duration::from_secs(100))
         );
         assert_eq!(later.runopts.run_timeout(), Some(Duration::from_secs(200)));
+    }
+
+    /// A `--continuation-timeslice` shorter than the run's `--max-timeslice`,
+    /// or one for a run without PMU timeslices, is refused before any
+    /// workspace or trial, naming what to pass instead; one at least as long
+    /// is accepted.
+    #[test]
+    fn a_continuation_timeslice_that_would_change_the_prefix_is_refused() {
+        let refusal = |argv: &[&str]| {
+            let mut full = vec!["analyze", "--prefix-search"];
+            full.extend(argv);
+            full.push("/bin/true");
+            AnalyzeOpts::try_parse_from(full)
+                .unwrap()
+                .refuse_unsound_continuation_timeslice()
+        };
+        for (argv, reason) in [
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=100000",
+                ][..],
+                "shorter than the run's --max-timeslice=100000",
+            ),
+            (
+                &["--continuation-timeslice=20000000", "--"][..],
+                "shorter than the run's --max-timeslice=200000000",
+            ),
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=disabled",
+                ][..],
+                "disable PMU timeslices",
+            ),
+        ] {
+            let error = refusal(argv).expect_err(reason);
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(reason) && message.contains("Omit it (auto)"),
+                "{argv:?}: {message}"
+            );
+        }
+        refusal(&[
+            "--continuation-timeslice=200000000",
+            "--",
+            "--max-timeslice=1000",
+        ])
+        .unwrap();
+        refusal(&["--"]).unwrap();
+    }
+
+    /// The normalized copy of a run's preemption record is written beside it
+    /// for reading, and the run keeps its own record: the target endpoint
+    /// and --minimize's baseline replay the record that met the target.
+    /// Before, the run switched to the copy, whose renumbered priorities can
+    /// run another schedule, and a minimized record that met the target was
+    /// then "still not matching" it.
+    #[test]
+    fn a_normalized_record_is_written_for_reading_and_not_replayed() {
+        use detcore::preemptions::PreemptionRecord;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let recorded = workspace.path().join("round_014.preempts");
+        let history = vec![
+            (detcore::types::LogicalTime::from_nanos(1_000), 352),
+            (detcore::types::LogicalTime::from_nanos(2_000), 4923),
+        ];
+        let record = PreemptionRecord::from_vecs(&std::collections::BTreeMap::from([(
+            detcore::DetTid::from_raw(7),
+            history,
+        )]));
+        record.write_to_disk(&recorded).unwrap();
+        let mut run = RunData::from_minimize_output(
+            &options,
+            "minimized".to_owned(),
+            RunData::get_raw_runopts(&options),
+            record.clone(),
+            recorded.clone(),
+            workspace.path().join("round_014.log"),
+        );
+        let (normalized_path, normalized) = run.write_normalized_preempts();
+        assert_eq!(
+            normalized_path,
+            workspace.path().join("round_014.normalized")
+        );
+        assert!(normalized_path.exists());
+        assert_ne!(normalized, record, "normalizing renumbers the priorities");
+        assert_eq!(run.preempts_path_out(), recorded.as_path());
+        assert_eq!(run.preempts_out(), &record);
     }
 }
 
