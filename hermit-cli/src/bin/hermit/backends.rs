@@ -1474,6 +1474,9 @@ fn dbt_verify_run(
         materialize_dbt_evidence_log(&evidence, log_file, &log_path)
             .map_err(|error| error.context(hermit::BackendRunFailure))?;
         dbt_run_latches(&evidence).refuse_comparison("run")?;
+        // Carry the host-input records into the paired directory, as the
+        // other backends' --verify-run does, before capture consumes the sink.
+        let host_inputs = fs::read(stats.directory().join("host-inputs.jsonl")).ok();
         let records = stats.capture();
         let snapshot = require_dbt_stats(&records)
             .map_err(|error| error.context(hermit::BackendRunFailure))?;
@@ -1484,13 +1487,16 @@ fn dbt_verify_run(
                 snapshot.stdin_reads()
             )));
         }
-        Ok((dbt_verification_output(raw), evidence, records))
+        Ok((dbt_verification_output(raw), evidence, records, host_inputs))
     });
     let (outcome, dbt, result) = match completed {
-        Ok((output, evidence, records)) => {
+        Ok((output, evidence, records, host_inputs)) => {
             writer.write(verify_run::STDOUT, &output.stdout)?;
             writer.write(verify_run::STDERR, &output.stderr)?;
             writer.write(verify_run::DBT_STATS, records.records()?)?;
+            if let Some(host_inputs) = &host_inputs {
+                writer.write(verify_run::HOST_INPUTS, host_inputs)?;
+            }
             (
                 verify_run::VerifyRunOutcome::Completed {
                     status: verify_run::recorded_status(output.status),

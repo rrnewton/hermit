@@ -10367,7 +10367,15 @@ impl RunOpts {
                 ) {
                     return Err(Error::msg(super::backends::DBT_LOG_FILE_REFUSAL));
                 }
-                let invocation = self.dbt_invocation()?;
+                // A --verify-run execution is one half of a verification:
+                // it must do (and record) exactly what run --verify's runs
+                // do, host-input recording included, or the paired reports
+                // disagree in counted branches and evidence.
+                let mut invocation_options = self.clone();
+                if self.verify_run.is_some() {
+                    invocation_options.record_host_inputs = true;
+                }
+                let invocation = invocation_options.dbt_invocation()?;
                 if let Some(directory) = &self.verify_run {
                     return invocation.verify_run(
                         directory,
