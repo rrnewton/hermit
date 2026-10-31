@@ -33,11 +33,15 @@ use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
 use crate::analyze::consts::*;
+use crate::analyze::stop;
 use crate::analyze::types::AnalyzeOpts;
+use crate::analyze::types::ContinuationTimeslice;
 use crate::analyze::types::TRIAL_LOG_FACTOR;
 use crate::analyze::types::TRIAL_LOG_FLOOR;
+use crate::analyze::types::TRIAL_LOG_LEAST;
 use crate::analyze::types::TRIAL_TIMEOUT_FACTOR;
 use crate::analyze::types::TRIAL_TIMEOUT_FLOOR;
+use crate::analyze::types::TrialLog;
 use crate::analyze::types::TrialTimeout;
 use crate::container::RunTimeoutMarker;
 use crate::global_opts::GlobalOpts;
@@ -56,10 +60,16 @@ pub struct RunData {
     sched_path_in: Option<PathBuf>,
     sched_path_out: Option<PathBuf>,
 
-    /// How much logging to enable in the guest.
+    /// The level the run logs at ([`AnalyzeOpts::trial_log_level`]).
     log_level: LevelFilter,
     /// Where to write the guest log too (otherwise stderr).
     log_path: Option<PathBuf>,
+    /// Whether `--selfcheck` may compare this run's log with another's: the
+    /// target run, a `--search` run that may become it, a `--minimize` run
+    /// that may be the last to match, and the target's replay. Under
+    /// `--selfcheck` such a run logs at debug or above, into its file
+    /// ([`RunData::logging`]).
+    log_compared: bool,
 
     /// The input preemptions, if it has been read to memory.
     in_mem_preempts_in: Option<PreemptionRecord>,
@@ -195,19 +205,33 @@ impl RunData {
         self.is_a_match.is_some()
     }
 
-    /// Called after the run has been launched, normalize the output preemptions and swap around so
-    /// that our output file points to the normalized version.
-    pub fn normalize_preempts_out(&mut self) {
-        assert!(self.has_launched());
-        let preempts_path = self.preempts_path_out();
-        let normalized_path = preempts_path.with_extension("normalized");
+    /// For a test that drives a phase with a launch it models: the completed
+    /// observation `launch` makes, whether the run met the target, and the
+    /// schedule it recorded.
+    #[cfg(test)]
+    pub(super) fn complete_for_test(
+        &mut self,
+        met: bool,
+        recorded: &[SchedEvent],
+    ) -> anyhow::Result<()> {
+        self.is_a_match = Some(met);
+        PreemptionRecord::from_sched_events(recorded.to_vec())
+            .write_to_disk(self.sched_path_out())
+            .map_err(anyhow::Error::msg)
+    }
 
+    /// Write a normalized copy of the output preemption record, for reading
+    /// only, beside it, and return its path and contents. The run keeps its
+    /// own record: normalization renumbers priorities across the scheduler's
+    /// fixed ones, so the copy can replay another schedule.
+    pub fn write_normalized_preempts(&mut self) -> (PathBuf, PreemptionRecord) {
+        assert!(self.has_launched());
+        let normalized_path = self.preempts_path_out().with_extension("normalized");
         let normalized = self.preempts_out().normalize();
         normalized
             .write_to_disk(&normalized_path)
             .expect("write of preempts file to succeed");
-        self.in_mem_sched_out = Some(normalized);
-        self.sched_path_out = Some(normalized_path);
+        (normalized_path, normalized)
     }
 
     /// The global options a trial run is launched with. Trials go through
@@ -215,14 +239,10 @@ impl RunData {
     /// from `hermit --backend <BACKEND> analyze` by `get_raw_runopts`); this
     /// copy keeps the trial's global options consistent with it.
     fn trial_global_opts(&self) -> GlobalOpts {
-        let log_path = self.root_path().with_extension(LOG_EXT);
+        let (log, log_file) = self.logging();
         GlobalOpts {
-            log: Some(self.log_level),
-            log_file: if self.analyze_opts.verbose || self.analyze_opts.selfcheck {
-                Some(log_path)
-            } else {
-                None
-            },
+            log: Some(log),
+            log_file,
             backend: self.analyze_opts.backend,
             // A run analyze bounds in time also gets the log bound.
             log_file_limit: self
@@ -230,7 +250,7 @@ impl RunData {
                 .trial_bound(&self.runopts)
                 .and(self.analyze_opts.trial_log_limit()),
             // Every trial charges the invocation's ONE budget, as verify's
-            // per-run logs do. Without --verbose/--selfcheck a trial traces to
+            // per-run logs do. A trial that writes no log file traces to
             // hermit's own stderr -- the public stream the cap exists to bound.
             max_log_bytes: self.analyze_opts.max_log_bytes,
             log_budget: self.analyze_opts.log_budget.clone(),
@@ -240,7 +260,11 @@ impl RunData {
     }
 
     /// Execute the run. (Including setting up logging and temp dir binding.)
+    ///
+    /// Once a stop signal has arrived (`stop`), no run starts, and the run it
+    /// ended reports the stop instead of its own outcome.
     pub fn launch(&mut self) -> anyhow::Result<()> {
+        stop::check()?;
         let root = self.root_path();
         let gopts = self.trial_global_opts();
         // Open it HERE, on the host, for the same reason `main` does: `launch` runs
@@ -270,7 +294,9 @@ impl RunData {
         self.runopts.write_debug_options_dump()?;
 
         let started = Instant::now();
-        let (_, output, terminal_outcome) = self.runopts.run(&gopts, true).map_err(|error| {
+        let ran = self.runopts.run(&gopts, true);
+        stop::check()?;
+        let (_, output, terminal_outcome) = ran.map_err(|error| {
             self.run_error(self.name_the_trial_bound(error), gopts.log_file.as_deref())
         })?;
         let output: Output = output.context("expected captured output")?;
@@ -401,25 +427,29 @@ impl RunData {
         recording.write(dest)
     }
 
-    fn log_level(aopts: &AnalyzeOpts) -> LevelFilter {
-        let mut lvl = if let Some(l) = &aopts.guest_log {
-            *l
+    /// The level this run logs at, and the file it logs into, if any. A run
+    /// logs at the trials' level ([`AnalyzeOpts::trial_log_level`]), into a
+    /// file of its own above warn. A run whose log `--selfcheck` compares
+    /// logs at debug or above, into its file, whatever that level.
+    fn logging(&self) -> (LevelFilter, Option<PathBuf>) {
+        let compared = self.log_compared && self.analyze_opts.selfcheck;
+        let level = if compared {
+            self.log_level.max(LevelFilter::DEBUG)
         } else {
-            LevelFilter::WARN
+            self.log_level
         };
+        let file = (compared || level > LevelFilter::WARN).then(|| {
+            self.log_path
+                .clone()
+                .unwrap_or_else(|| self.root_path().with_extension(LOG_EXT))
+        });
+        (level, file)
+    }
 
-        // Ensure a minum level for these functionalities:
-        if aopts.verbose || aopts.selfcheck && lvl < LevelFilter::DEBUG {
-            if aopts.guest_log.is_some() {
-                eprintln!(
-                    "WARNING: manually set log lvl to {} but need DEBUG for selfcheck/verbose functionality",
-                    lvl
-                );
-            }
-            lvl = LevelFilter::DEBUG;
-        }
-
-        lvl
+    /// Mark a run whose log `--selfcheck` may compare ([`RunData::logging`]).
+    pub fn compared_by_selfcheck(mut self) -> Self {
+        self.log_compared = true;
+        self
     }
 
     /// A run with `runopts`, bounded by the endpoint runs measured so far
@@ -432,7 +462,7 @@ impl RunData {
 
     /// A run with `runopts` that no `--trial-timeout` bounds: the target run.
     fn new_unbounded(aopts: &AnalyzeOpts, runname: String, runopts: RunOpts) -> Self {
-        let log_level: LevelFilter = Self::log_level(aopts);
+        let log_level = aopts.trial_log_level();
         let mut rd = RunData {
             runname,
             analyze_opts: aopts.clone(),
@@ -441,6 +471,7 @@ impl RunData {
             sched_path_in: None,
             sched_path_out: None,
             log_path: None,
+            log_compared: false,
             in_mem_preempts_in: None,
             in_mem_sched_out: None,
             is_a_match: None,
@@ -469,7 +500,7 @@ impl RunData {
     /// The run arguments' own timeout still applies.
     pub fn new_run1_target(aopts: &AnalyzeOpts, runname: String) -> anyhow::Result<Self> {
         let ro = Self::get_run1_runopts(aopts)?;
-        Ok(Self::new_unbounded(aopts, runname, ro))
+        Ok(Self::new_unbounded(aopts, runname, ro).compared_by_selfcheck())
     }
 
     /// Replay with the selected run's seeds and the original replay policy.
@@ -637,7 +668,7 @@ impl RunData {
         preempts_path: PathBuf,
         log_path: PathBuf,
     ) -> Self {
-        let log_level: LevelFilter = Self::log_level(aopts);
+        let log_level = aopts.trial_log_level();
         RunData {
             runname,
             analyze_opts: aopts.clone(),
@@ -646,6 +677,8 @@ impl RunData {
             sched_path_in: None,
             sched_path_out: Some(preempts_path),
             log_path: Some(log_path),
+            // The last matching minimize run, whose log --selfcheck compares.
+            log_compared: true,
             log_level,
             in_mem_sched_out: Some(in_mem_preempts),
             in_mem_preempts_in: None,
@@ -663,7 +696,7 @@ impl RunData {
         runopts: RunOpts,
         sched_path: PathBuf,
     ) -> Self {
-        let log_level: LevelFilter = Self::log_level(aopts);
+        let log_level = aopts.trial_log_level();
         RunData {
             runname,
             analyze_opts: aopts.clone(),
@@ -672,6 +705,7 @@ impl RunData {
             sched_path_in: None,
             sched_path_out: Some(sched_path),
             log_path: None,
+            log_compared: false,
             log_level,
             in_mem_sched_out: None,
             in_mem_preempts_in: None,
@@ -762,19 +796,15 @@ impl RunData {
     }
 
     /// The `hermit ... run ...` command that reproduces this run, without
-    /// the working directory it needs ([`Self::to_repro`]).
+    /// the working directory it needs ([`Self::to_repro`]), with the global
+    /// options that set its logging: none for the default warn level to
+    /// stderr.
     pub fn repro_command(&self) -> String {
-        let logging = if let Some(path) = &self.log_path {
-            format!(" --log=debug --log-file={}", path.display())
-        } else {
-            "".to_string()
+        let logging = match self.logging() {
+            (level, Some(path)) => format!(" --log={level} --log-file={}", path.display()),
+            (level, None) if level != LevelFilter::WARN => format!(" --log={level}"),
+            (_, None) => String::new(),
         };
-        // let logging = if self.analyze_opts.verbose || self.analyze_opts.selfcheck {
-        //     let path = self.log_path().unwrap();
-        //     format!(" --log=debug --log-file={}", path.display())
-        // } else {
-        //     "".to_string()
-        // };
         format!(
             "hermit{}{} run {}",
             logging,
@@ -837,6 +867,31 @@ impl AnalyzeOpts {
                 .saturating_mul(TRIAL_LOG_FACTOR)
                 .max(TRIAL_LOG_FLOOR),
         )
+    }
+
+    /// The level the runs analyze starts log at: `--trial-log`, else
+    /// `--guest-log`, else warn, and never below errors ([`TRIAL_LOG_LEAST`]).
+    /// `--verbose` does not raise it.
+    pub fn trial_log_level(&self) -> LevelFilter {
+        self.trial_log
+            .map(TrialLog::level)
+            .or(self.guest_log)
+            .unwrap_or(LevelFilter::WARN)
+            .max(TRIAL_LOG_LEAST)
+    }
+
+    /// The option that makes every run write its log into a file of its own
+    /// (a level above warn), if one does.
+    pub fn trial_log_files_option(&self) -> Option<&'static str> {
+        if self.trial_log_level() <= LevelFilter::WARN {
+            None
+        } else if self.trial_log.is_some() {
+            Some("--trial-log")
+        } else if self.guest_log_from_env {
+            Some("--guest-log (HERMIT_LOG)")
+        } else {
+            Some("--guest-log")
+        }
     }
 
     /// Record a finished endpoint `run`, and say what bound the runs after it
@@ -1162,6 +1217,43 @@ impl AnalyzeOpts {
              the trials under the recorded one, or pass --max-timeslice={timeslice}.",
             explicit.map_or_else(|| "disabled".to_owned(), |maximum| format!("{maximum} ns"))
         ))
+    }
+
+    /// Refuses (exit 122) a `--continuation-timeslice` that would change the
+    /// replayed prefix, before any workspace or trial: one shorter than the
+    /// run's `--max-timeslice`, which also ends the prefix's slices that its
+    /// schedule does not end, or one for a run without PMU timeslices, whose
+    /// clock it would change.
+    pub fn refuse_unsound_continuation_timeslice(&self) -> anyhow::Result<()> {
+        let ContinuationTimeslice::Nanos(nanos) = self.continuation_timeslice else {
+            return Ok(());
+        };
+        let reason = match self.trial_max_timeslice() {
+            None => "the run arguments disable PMU timeslices, and a continuation timeslice \
+                     would turn them on for the replayed prefix too"
+                .to_owned(),
+            Some(run) if nanos < run => format!(
+                "it is shorter than the run's --max-timeslice={run}, and the trials' timeslice \
+                 also ends the replayed prefix's slices that its schedule does not end, so it \
+                 would change the prefix"
+            ),
+            Some(_) => return Ok(()),
+        };
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "--continuation-timeslice={nanos} is refused: {reason}. Omit it (auto), or pass \
+                 a timeslice at least as long as the run's own."
+            )),
+        )
+    }
+
+    /// The trials' `--max-timeslice`, from their run arguments (`None` for
+    /// disabled).
+    pub fn trial_max_timeslice(&self) -> detcore_model::config::MaybeTimeslice {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .max_timeslice
     }
 
     /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
@@ -2553,7 +2645,7 @@ mod tests {
     /// `GlobalOpts` that `RunOpts::main` takes its backend from, the validated
     /// trial `RunOpts`, and the printed reproducer.
     /// `hermit --max-log-bytes=N analyze` caps its trials with the
-    /// invocation's shared budget. A trial without --verbose/--selfcheck traces
+    /// invocation's shared budget. A trial that writes no log file traces
     /// to hermit's stderr, so an exempt trial would put uncapped output on the
     /// public stream (review of https://github.com/rrnewton/hermit/pull/3686,
     /// round 1).
@@ -2578,6 +2670,220 @@ mod tests {
             charged.shares_counter_with(&invocation),
             "the trial must charge the invocation's counter, not a fresh one"
         );
+    }
+
+    /// Parse `analyze OPTIONS -- /bin/true` with a workspace for its runs.
+    fn options_with_workspace(options: &[&str]) -> (AnalyzeOpts, tempfile::TempDir) {
+        let mut argv = vec!["analyze"];
+        argv.extend_from_slice(options);
+        argv.extend(["--", "/bin/true"]);
+        let mut parsed = AnalyzeOpts::try_parse_from(&argv).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        parsed.tmp_dir = Some(workspace.path().to_path_buf());
+        (parsed, workspace)
+    }
+
+    /// `--verbose` used to run every trial at debug into a log file of its
+    /// own: a gigabyte per trial on a program with ~760k scheduling events,
+    /// and a trial several times slower. It now prints analyze's own detail
+    /// only: a trial logs at the default warn level to stderr, and neither
+    /// its options nor its reproducer carry a debug log.
+    #[test]
+    fn a_verbose_trial_keeps_the_default_log_level() {
+        let (options, workspace) = options_with_workspace(&["-v"]);
+        let run = RunData::new_baseline(&options, "trial".to_owned()).unwrap();
+        let trial = run.trial_global_opts();
+        assert_eq!(trial.log, Some(LevelFilter::WARN));
+        assert_eq!(trial.log_file, None);
+        let repro = run.repro_command();
+        assert!(repro.starts_with("hermit run "), "{repro}");
+        assert!(!repro.contains("--log"), "{repro}");
+        drop(workspace);
+    }
+
+    /// `--trial-log=debug` restores the debug log file: the trial's options
+    /// and its reproducer name the level and the file in the workspace.
+    #[test]
+    fn trial_log_debug_writes_each_trials_debug_log() {
+        let (options, workspace) = options_with_workspace(&["-v", "--trial-log=debug"]);
+        let run = RunData::new_baseline(&options, "trial".to_owned()).unwrap();
+        let trial = run.trial_global_opts();
+        let log = workspace.path().join("trial.log");
+        assert_eq!(trial.log, Some(LevelFilter::DEBUG));
+        assert_eq!(trial.log_file.as_deref(), Some(log.as_path()));
+        let repro = run.repro_command();
+        let expected = format!("hermit --log=debug --log-file={} run ", log.display());
+        assert!(repro.starts_with(&expected), "{repro}");
+    }
+
+    /// Each `--trial-log` level, and `--guest-log`'s, which `--trial-log`
+    /// overrides: a file above warn, stderr at warn and below.
+    #[test]
+    fn trial_log_sets_the_level_and_the_file() {
+        for (flags, level, file, repro) in [
+            (&[][..], LevelFilter::WARN, false, ""),
+            (
+                &["--trial-log=off"][..],
+                LevelFilter::ERROR,
+                false,
+                " --log=error",
+            ),
+            (&["--trial-log=warn"][..], LevelFilter::WARN, false, ""),
+            (
+                &["--trial-log=info"][..],
+                LevelFilter::INFO,
+                true,
+                " --log=info",
+            ),
+            (
+                &["-g", "trace"][..],
+                LevelFilter::TRACE,
+                true,
+                " --log=trace",
+            ),
+            (
+                &["-g", "error"][..],
+                LevelFilter::ERROR,
+                false,
+                " --log=error",
+            ),
+            (
+                &["-g", "debug", "--trial-log=warn"][..],
+                LevelFilter::WARN,
+                false,
+                "",
+            ),
+        ] {
+            let (options, workspace) = options_with_workspace(flags);
+            let run = RunData::new_baseline(&options, "trial".to_owned()).unwrap();
+            let trial = run.trial_global_opts();
+            assert_eq!(trial.log, Some(level), "{flags:?}");
+            let log = workspace.path().join("trial.log");
+            assert_eq!(trial.log_file, file.then(|| log.clone()), "{flags:?}");
+            let expected = if file {
+                format!("hermit{repro} --log-file={} run ", log.display())
+            } else {
+                format!("hermit{repro} run ")
+            };
+            assert!(
+                run.repro_command().starts_with(&expected),
+                "{flags:?}: {}",
+                run.repro_command()
+            );
+        }
+        assert!(
+            AnalyzeOpts::try_parse_from(["analyze", "--trial-log=loud", "--", "/bin/true"])
+                .is_err()
+        );
+    }
+
+    /// `--selfcheck` compares the target run's debug log with its replay's,
+    /// so every run whose log it may compare logs at debug or above into its
+    /// file, whatever `--trial-log` says: the target run, its replay, a
+    /// `--search` run (the one that matches becomes the target), a
+    /// `--minimize` round (the last one to match is the minimized target)
+    /// and the minimized target itself. Each is built as analyze builds it.
+    /// The other trials keep the `--trial-log` level, and without
+    /// `--selfcheck` the compared runs do too.
+    #[test]
+    fn selfcheck_logs_the_runs_it_compares_at_debug() {
+        for (flags, compared_level, other_level, other_file) in [
+            (
+                &["--selfcheck"][..],
+                Some(LevelFilter::DEBUG),
+                LevelFilter::WARN,
+                false,
+            ),
+            (
+                &["--selfcheck", "--trial-log=off"][..],
+                Some(LevelFilter::DEBUG),
+                LevelFilter::ERROR,
+                false,
+            ),
+            (
+                &["--selfcheck", "-g", "trace"][..],
+                Some(LevelFilter::TRACE),
+                LevelFilter::TRACE,
+                true,
+            ),
+            (&[][..], None, LevelFilter::WARN, false),
+        ] {
+            let (options, workspace) = options_with_workspace(flags);
+            let preempts = workspace.path().join("record.preempts");
+            let minimized_log = workspace.path().join("round_007.log");
+            let target = RunData::new_run1_target(&options, "target".to_owned()).unwrap();
+            let replay =
+                RunData::new_run1_replay(&options, "replay".to_owned(), &target.runopts).unwrap();
+            let search = options.search_run(3, 17).unwrap();
+            let round = options.preempts_replay_run("round_001", &preempts).unwrap();
+            let minimized = RunData::from_minimize_output(
+                &options,
+                "minimized".to_owned(),
+                target.runopts.clone(),
+                PreemptionRecord::default(),
+                preempts.clone(),
+                minimized_log.clone(),
+            );
+            for run in [&target, &replay, &search, &round, &minimized] {
+                let trial = run.trial_global_opts();
+                let log = if run.name() == "minimized" {
+                    minimized_log.clone()
+                } else {
+                    workspace.path().join(format!("{}.log", run.name()))
+                };
+                match compared_level {
+                    Some(level) => {
+                        assert_eq!(trial.log, Some(level), "{flags:?} {}", run.name());
+                        assert_eq!(
+                            trial.log_file,
+                            Some(log.clone()),
+                            "{flags:?} {}",
+                            run.name()
+                        );
+                        let logging = format!("hermit --log={level} --log-file={} ", log.display());
+                        assert!(
+                            run.repro_command().starts_with(&logging),
+                            "{flags:?} {}",
+                            run.repro_command()
+                        );
+                    }
+                    None => {
+                        assert_eq!(trial.log, Some(other_level), "{flags:?} {}", run.name());
+                        assert_eq!(trial.log_file, None, "{flags:?} {}", run.name());
+                    }
+                }
+            }
+            let other = RunData::new_baseline(&options, "prefix_round_001".to_owned()).unwrap();
+            let trial = other.trial_global_opts();
+            assert_eq!(trial.log, Some(other_level), "{flags:?}");
+            assert_eq!(
+                trial.log_file.is_some(),
+                other_file,
+                "{flags:?}: {:?}",
+                trial.log_file
+            );
+        }
+    }
+
+    /// A refused trial's warning says its reason is in hermit's log above, or
+    /// in the trial's log file: Detcore logs that reason as an error, so every
+    /// level keeps errors, `--trial-log=off` and `-g off` included.
+    #[test]
+    fn every_trial_log_level_keeps_errors() {
+        for flags in [
+            &["--trial-log=off"][..],
+            &["-g", "off"][..],
+            &["-g", "error"][..],
+        ] {
+            let (options, _workspace) = options_with_workspace(flags);
+            assert_eq!(options.trial_log_level(), LevelFilter::ERROR, "{flags:?}");
+            let run = RunData::new_baseline(&options, "trial".to_owned()).unwrap();
+            assert_eq!(
+                run.trial_global_opts().log,
+                Some(LevelFilter::ERROR),
+                "{flags:?}"
+            );
+        }
     }
 
     #[test]
@@ -3151,8 +3457,10 @@ mod tests {
             .refuse_unenforceable_trial_timeout()
             .unwrap();
     }
-    /// The final adapter must compare observed completed predicates, including
-    /// guest nonzero exits, even when neither diagnostic stack is available.
+    /// The stack-trace replay the report takes must give the observed
+    /// completed predicate, including a guest's nonzero exit, even when neither
+    /// diagnostic stack is available: the report compares that outcome with
+    /// the search's, and ends the analysis when they differ.
     #[test]
     fn final_replays_require_the_observed_completed_outcome() {
         use reverie::process::ExitStatus;
@@ -3161,12 +3469,12 @@ mod tests {
         let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         options.tmp_dir = Some(dir.path().to_path_buf());
         for actual in [false, true] {
-            for expected in [false, true] {
-                let result = options.run_and_retrieve_stacks_with(
+            let replay = options
+                .replay_for_stacks(
                     "completed_final",
-                    dir.path().join("candidate.json"),
+                    &dir.path().join("candidate.json"),
+                    &[],
                     1,
-                    expected,
                     |run| {
                         assert!(!run.has_launched());
                         let output = Output {
@@ -3179,21 +3487,15 @@ mod tests {
                         // product API that could manufacture completion.
                         run.is_a_match = Some(options.output_matches(&output));
                         assert_eq!(run.is_a_match(), actual);
+                        // A completed replay records the schedule it ran.
+                        PreemptionRecord::from_sched_events(Vec::new())
+                            .write_to_disk(run.sched_path_out())
+                            .map_err(anyhow::Error::msg)?;
                         Ok(())
                     },
-                );
-                if actual == expected {
-                    let (first, second) = result.expect("a completed matching replay is valid");
-                    assert!(first.is_none() && second.is_none());
-                } else {
-                    let error = result
-                        .expect_err("a contradictory final replay cannot certify a candidate");
-                    assert!(
-                        error.to_string().contains("observed the opposite"),
-                        "{error:#}"
-                    );
-                }
-            }
+                )
+                .expect("a completed replay gives its outcome");
+            assert_eq!(replay.met_target, actual);
         }
     }
 
@@ -3223,6 +3525,105 @@ mod tests {
             Some(Duration::from_secs(100))
         );
         assert_eq!(later.runopts.run_timeout(), Some(Duration::from_secs(200)));
+    }
+
+    /// A `--continuation-timeslice` shorter than the run's `--max-timeslice`,
+    /// or one for a run without PMU timeslices, is refused before any
+    /// workspace or trial, naming what to pass instead; one at least as long
+    /// is accepted.
+    #[test]
+    fn a_continuation_timeslice_that_would_change_the_prefix_is_refused() {
+        let refusal = |argv: &[&str]| {
+            let mut full = vec!["analyze", "--prefix-search"];
+            full.extend(argv);
+            full.push("/bin/true");
+            AnalyzeOpts::try_parse_from(full)
+                .unwrap()
+                .refuse_unsound_continuation_timeslice()
+        };
+        for (argv, reason) in [
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=100000",
+                ][..],
+                "shorter than the run's --max-timeslice=100000",
+            ),
+            (
+                &["--continuation-timeslice=20000000", "--"][..],
+                "shorter than the run's --max-timeslice=200000000",
+            ),
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=disabled",
+                ][..],
+                "disable PMU timeslices",
+            ),
+        ] {
+            let error = refusal(argv).expect_err(reason);
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(reason) && message.contains("Omit it (auto)"),
+                "{argv:?}: {message}"
+            );
+        }
+        refusal(&[
+            "--continuation-timeslice=200000000",
+            "--",
+            "--max-timeslice=1000",
+        ])
+        .unwrap();
+        refusal(&["--"]).unwrap();
+    }
+
+    /// The normalized copy of a run's preemption record is written beside it
+    /// for reading, and the run keeps its own record: the target endpoint
+    /// and --minimize's baseline replay the record that met the target.
+    /// Before, the run switched to the copy, whose renumbered priorities can
+    /// run another schedule, and a minimized record that met the target was
+    /// then "still not matching" it.
+    #[test]
+    fn a_normalized_record_is_written_for_reading_and_not_replayed() {
+        use detcore::preemptions::PreemptionRecord;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let recorded = workspace.path().join("round_014.preempts");
+        let history = vec![
+            (detcore::types::LogicalTime::from_nanos(1_000), 352),
+            (detcore::types::LogicalTime::from_nanos(2_000), 4923),
+        ];
+        let record = PreemptionRecord::from_vecs(&std::collections::BTreeMap::from([(
+            detcore::DetTid::from_raw(7),
+            history,
+        )]));
+        record.write_to_disk(&recorded).unwrap();
+        let mut run = RunData::from_minimize_output(
+            &options,
+            "minimized".to_owned(),
+            RunData::get_raw_runopts(&options),
+            record.clone(),
+            recorded.clone(),
+            workspace.path().join("round_014.log"),
+        );
+        let (normalized_path, normalized) = run.write_normalized_preempts();
+        assert_eq!(
+            normalized_path,
+            workspace.path().join("round_014.normalized")
+        );
+        assert!(normalized_path.exists());
+        assert_ne!(normalized, record, "normalizing renumbers the priorities");
+        assert_eq!(run.preempts_path_out(), recorded.as_path());
+        assert_eq!(run.preempts_out(), &record);
     }
 }
 

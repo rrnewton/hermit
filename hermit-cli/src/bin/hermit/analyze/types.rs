@@ -60,9 +60,16 @@ pub struct AnalyzeOpts {
     #[clap(long, default_value = "nonzero", value_name = "NUM|nonzero|any")]
     pub target_exit_code: ExitStatusConstraint,
 
-    /// What level of logging to enable for the guest runs.
+    /// The trials' log level, as --trial-log sets it, which wins when both are given. This
+    /// also accepts `error` and `trace`; a level above warn writes each trial's log into its
+    /// own file in the workspace. Errors are kept at `off` too, as with --trial-log=off.
     #[clap(short, long, value_name = "LEVEL", env = "HERMIT_LOG")]
     pub guest_log: Option<LevelFilter>,
+
+    /// Whether `guest_log` came from its environment variable, HERMIT_LOG, which the
+    /// workspace's retention names.
+    #[clap(skip)]
+    pub guest_log_from_env: bool,
 
     /// Insist on perfect determinism before proceeding with the analysis.
     #[clap(long)]
@@ -76,9 +83,17 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub run_needleman: bool,
 
-    /// Given a passing/failing run pair, based on different chaos seeds, first minimize the
-    /// chaos-mode interventions necessary to flip between the two outcomes.  This may accelerate
-    /// the subsequent binary search.
+    /// Before searching, minimize the target run's chaos-mode interventions (its preemptions
+    /// and priority changes) to those it needs to meet the target criteria, by knocking them out
+    /// a batch at a time. This may accelerate the subsequent binary search.
+    ///
+    /// The baseline is then the minimized record with its latest intervention knocked out, and
+    /// knocked out again while the replay still meets the target. When no intervention is left,
+    /// there is no baseline to bisect against and the analysis ends with that error, as it does
+    /// with the run's own error for a knocked-out run that does not finish; `--prefix-search`
+    /// needs no baseline. So `--minimize` finds its own baseline and does not
+    /// take `--run2-seed`, `--run2-preemptions` or `--run2-schedule`. To search between a given
+    /// pair of runs, omit `--minimize`.
     #[clap(
         long,
         conflicts_with = "run2_seed",
@@ -98,7 +113,9 @@ pub struct AnalyzeOpts {
     ///
     /// Unlike the default search, it needs no baseline schedule, so events that only one of
     /// two unrelated runs executed (timeslices that end at other points, iterations of a
-    /// polling loop) cannot stop it. It takes about log2(schedule length) trials.
+    /// polling loop) cannot stop it. It takes about log2(schedule length) trials, two more for
+    /// each continuation (`--continuation-timeslice`) it tries, and two to recheck the
+    /// boundary.
     #[clap(
         long,
         conflicts_with = "minimize",
@@ -108,6 +125,23 @@ pub struct AnalyzeOpts {
         conflicts_with = "run_needleman"
     )]
     pub prefix_search: bool,
+
+    /// The timeslice, in virtual nanoseconds, with which `--prefix-search` trials continue
+    /// without chaos after their replayed prefix: `auto` (the default) or a number.
+    ///
+    /// A race found only at a short timeslice often shows without chaos at that timeslice too:
+    /// the scheduler alone, replaying none of the target schedule, already meets the target,
+    /// and the search has nothing to bisect against. With `auto` the search continues at the
+    /// run's own `--max-timeslice`, and when that cannot serve (the scheduler alone meets the
+    /// target, or replaying the whole schedule misses it) at hermit's default 200 ms. This also
+    /// applies to the prefix search the default search falls back to. The report names the
+    /// timeslice the search used.
+    ///
+    /// The value is the trials' `--max-timeslice`, which also ends the replayed prefix's
+    /// slices that its schedule does not end, so it may not be shorter than the run's own, and
+    /// a run whose arguments disable PMU timeslices takes none.
+    #[clap(long, value_name = "NANOS|auto", default_value = "auto")]
+    pub continuation_timeslice: ContinuationTimeslice,
 
     /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
     /// enabled.
@@ -186,9 +220,30 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub analyze_seed: Option<u64>,
 
-    /// Print quite a bit of extra information so that you can see exactly what is happening.
+    /// Print quite a bit of extra information so that you can see exactly what is happening:
+    /// every run's reproducer command, the guest's output and the search's steps.
+    ///
+    /// Analyze keeps the workspace when it exits, as --keep-tmp does, so that the files the
+    /// reproducers name can be read. It does not raise the trials' log level: --trial-log
+    /// does.
     #[clap(long, short)]
     pub verbose: bool,
+
+    /// How much each run analyze starts logs, and where: `warn` (the default), `off`, `info`
+    /// or `debug`.
+    ///
+    /// At `warn` a run's warnings and errors go to analyze's stderr, as those of `hermit run`
+    /// do, and `off` drops the warnings: errors still go there, since the reason Hermit gives
+    /// when it refuses a trial is one. At `info` or `debug` each run writes its log, at that level,
+    /// into a file of its own in the workspace (`<run>.log`, see --tmp-dir), and analyze keeps
+    /// the workspace when it exits, as --keep-tmp does, so that the logs can be read. A debug
+    /// log can grow to gigabytes per run and make the run several times slower, so a trial a
+    /// bound stops then gets through less of the program. --selfcheck logs the runs whose logs
+    /// it compares (the target run, the --search run that becomes it, the runs of --minimize
+    /// and the target's replay) at debug or above, into their files, whatever this says.
+    /// When this option is not given, --guest-log gives the level, if given.
+    #[clap(long, value_name = "LEVEL", value_enum)]
+    pub trial_log: Option<TrialLog>,
 
     /// The maximum amount of schedule jitter (deviation) to tolerater while performing the bisection search.
     #[clap(long)]
@@ -202,7 +257,10 @@ pub struct AnalyzeOpts {
     /// Directory under which the analysis creates its workspace of temporary artifacts
     /// (schedules, logs, reports of every run), created if missing.
     ///
-    /// By default the workspace is a directory in `/tmp`
+    /// By default the workspace is created in the system's temporary directory: $TMPDIR, or
+    /// /tmp when TMPDIR is unset. Analyze removes the workspace when it exits, unless
+    /// --keep-tmp, --verbose, or --trial-log above warn, or an error ended it; this directory
+    /// itself stays.
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
@@ -220,8 +278,9 @@ pub struct AnalyzeOpts {
     ///
     /// The bound needs a backend on which `hermit run --timeout` is qualified; elsewhere `auto`
     /// gives no bound and an explicit number is refused. Use an outer timeout there.
-    /// While trials are bounded, their `--verbose`/`--selfcheck` log files are capped at
-    /// max(64 MiB, 10 times the largest measured endpoint log), within HERMIT_LOG_MAX_BYTES.
+    /// While trials are bounded, the log files they write under `--trial-log` above warn or
+    /// `--selfcheck` are capped at max(64 MiB, 10 times the largest measured endpoint log),
+    /// within HERMIT_LOG_MAX_BYTES.
     /// HERMIT_LOG_MAX_BYTES=0 lifts both file caps; `off` lifts analyze's file cap.
     #[clap(long, value_name = "SECONDS|auto|off", default_value = "auto")]
     pub trial_timeout: TrialTimeout,
@@ -236,6 +295,26 @@ pub struct AnalyzeOpts {
     /// letting it grow until the kernel kills it.
     #[clap(long, value_name = "SIZE|auto|off", default_value = "auto")]
     pub max_memory: super::MemoryBudget,
+
+    /// Keep the workspace (see --tmp-dir) when analyze exits.
+    ///
+    /// The workspace holds every run's schedules, logs, output and reproducer command, and the
+    /// paths analyze prints name it. By default analyze removes it when it exits after its
+    /// report, and when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since
+    /// the error can name trial files in it. A stop signal ends the run in progress and starts
+    /// no other; analyze then removes the workspace and dies of that signal (a shell reports
+    /// 128 plus its number, 143 for SIGTERM). --verbose, and --trial-log above warn, keep the
+    /// workspace too. The report file (--report-file) is never removed.
+    ///
+    /// Analyze cannot clean up after SIGKILL, nor after a stop signal it does not handle: one it
+    /// inherits as ignored stays ignored, and an analyze that is PID 1 of its PID namespace
+    /// (`docker run IMAGE hermit analyze ...` without --init) leaves the stop signals at their
+    /// default actions, which Linux discards for a namespace's init. Neither does it handle
+    /// them, so that they kill it at once as before, when /proc is not its own PID namespace's
+    /// (analyze started by another process inside `unshare -pf` without --mount-proc) or
+    /// when it inherited more than 64 children.
+    #[clap(long)]
+    pub keep_tmp: bool,
 
     /// Specify that analyze itself should return a non-zero exit code on success.
     /// This is needed under esoteric invocation scenarios.
@@ -291,6 +370,65 @@ pub struct AnalyzeOpts {
     /// (`crate::time_skip_carry`). Shared by every copy of these options.
     #[clap(skip)]
     pub time_skip_sources: crate::time_skip_carry::SharedTimeSkipSources,
+}
+
+/// `--continuation-timeslice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationTimeslice {
+    /// Short first, then coarser where the short one cannot serve.
+    Auto,
+    /// This many virtual nanoseconds.
+    Nanos(NonZeroU64),
+}
+
+impl FromStr for ContinuationTimeslice {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "auto" {
+            return Ok(ContinuationTimeslice::Auto);
+        }
+        match s.parse::<NonZeroU64>() {
+            Ok(nanos) if nanos.get() >= detcore_model::time::NANOS_PER_RCB as u64 => {
+                Ok(ContinuationTimeslice::Nanos(nanos))
+            }
+            _ => Err(format!(
+                "expected `auto` or a timeslice of at least one RCB ({} virtual nanoseconds), \
+                 got {s:?}",
+                detcore_model::time::NANOS_PER_RCB
+            )),
+        }
+    }
+}
+
+/// The least a run analyze starts logs: errors, among them the reason Hermit
+/// gives when it refuses the run at an operation it does not support, which
+/// the refusal's warning points at.
+pub const TRIAL_LOG_LEAST: LevelFilter = LevelFilter::ERROR;
+
+/// `--trial-log`: how much each run analyze starts logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TrialLog {
+    /// Errors only, to analyze's stderr: the reason Hermit refuses a trial is one.
+    Off,
+    /// Warnings and errors, to analyze's stderr.
+    Warn,
+    /// Info and above, into the run's own log file.
+    Info,
+    /// Debug and above, into the run's own log file.
+    Debug,
+}
+
+impl TrialLog {
+    /// The level a run logs at. `off` keeps errors ([`TRIAL_LOG_LEAST`]).
+    pub fn level(self) -> LevelFilter {
+        match self {
+            TrialLog::Off => TRIAL_LOG_LEAST,
+            TrialLog::Warn => LevelFilter::WARN,
+            TrialLog::Info => LevelFilter::INFO,
+            TrialLog::Debug => LevelFilter::DEBUG,
+        }
+    }
 }
 
 /// `--trial-timeout`.
@@ -421,6 +559,16 @@ pub struct Report {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_counter_warning: Option<String>,
+
+    /// `--prefix-search` only, when the deciding event is a timing decision
+    /// (both continuations run the same thread there, for different lengths):
+    /// that thread's stack at the deciding event. The two critical events are
+    /// then the threads that run next in each continuation, and their
+    /// `event_index` is a position in that continuation's recorded schedule
+    /// (the header names both files); where no other thread runs, it is that
+    /// schedule's length and the stack is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deciding_event: Option<ReportCriticalEvent>,
 }
 
 /// Runtime context for a critical event included in the analyze report.

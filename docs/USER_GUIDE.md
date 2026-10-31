@@ -865,6 +865,44 @@ Run `hermit analyze --help` before using this workflow. Search, minimization,
 and schedule replay can perform many guest executions and require a reliably
 reproducible target condition.
 
+Analyze keeps every run's schedules, logs, output and reproducer command in a
+workspace, a `hermit_analyze*` directory it creates in `--tmp-dir`, or else in
+`$TMPDIR` (`/tmp` when TMPDIR is unset); the paths it prints name that
+directory. Analyze removes the workspace when it exits after its report, and
+when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since the
+error can name trial files in it (a trial that did not finish, say). A stop
+signal ends the run in progress and starts no other; analyze then removes the
+workspace and that run's own temporary directories, and dies of the signal, so
+a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
+keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
+too, since the reproducers it prints name its files, and so does
+`--trial-log` above `warn`. The report file (`--report-file`) and the
+`--tmp-dir` directory itself are never removed.
+
+Every run analyze starts logs at the `warn` level to analyze's stderr, as
+`hermit run` does. `--trial-log=info` or `--trial-log=debug` writes each run's
+log at that level into a file of its own in the workspace (`<run>.log`), and
+`--trial-log=off` drops the runs' warnings but keeps their errors, among them
+the reason Hermit gives when it refuses a trial; `--verbose` prints analyze's
+own detail and leaves the runs' level alone. Without `--trial-log`,
+`--guest-log` (or HERMIT_LOG) gives the level. A debug log can grow to
+gigabytes per run and make the run several times slower, so a trial that a
+bound stops gets through less of the program. `--selfcheck` compares the
+target run's log with its replay's, so the runs whose logs it may compare (the
+target run, the `--search` run that becomes it, the `--minimize` runs and the
+replay) log at `debug` or above into their files, whatever `--trial-log` says.
+
+Analyze cannot clean up after SIGKILL, nor after a stop signal it does not
+handle: a signal it inherits as ignored stays ignored (SIGINT in a shell's
+background job, SIGHUP under `nohup`), and an analyze that is PID 1 of its PID
+namespace, as in `docker run IMAGE hermit analyze ...` without `--init`, keeps
+the default actions, which Linux discards for a namespace's init. Analyze also
+leaves the stop signals to kill it at once, as before, when `/proc` is not its
+own PID namespace's (analyze started by another process inside `unshare -pf`
+without `--mount-proc`) or when it inherited more than 64 children, since it
+could not then find the run to stop. `hermit
+bisect` keeps its workspace and names it when it exits.
+
 A replayed or spliced schedule can leave the guest spinning or waiting indefinitely.
 `--trial-timeout=SECONDS|auto|off` bounds runs after the initial target attempt.
 The default `auto` uses the initial completed run and completed target/baseline
@@ -883,9 +921,10 @@ completed runs may already have been printed. This also applies when the
 default non-chaos baseline times out; analyze
 does not replace it with a prefix search. Retry with a larger trial bound if the
 guest can finish. `--trial-timeout=off` removes analyze's time and log bounds,
-while leaving a user-supplied `--timeout` in force. Bounded trials' verbose or
-self-check log files are capped at max(64 MiB, 10 times the largest measured
-endpoint log), within `HERMIT_LOG_MAX_BYTES`; setting that variable to `0`
+while leaving a user-supplied `--timeout` in force. The log files bounded
+trials write under `--trial-log` above warn or `--selfcheck` are capped at
+max(64 MiB, 10 times the largest measured endpoint log), within
+`HERMIT_LOG_MAX_BYTES`; setting that variable to `0`
 lifts both file caps. These host resource limits may stop a trial on a slow
 machine; they never change a stopped trial into a completed outcome.
 
@@ -903,8 +942,14 @@ example timeslices that end at other points, or extra iterations of a polling
 loop), no single swap may separate the outcomes. `--prefix-search` searches
 within the failing schedule instead: each trial replays its first K events and
 then schedules without chaos, and a binary search finds the event at which the
-outcome flips. The report shows the stack of the thread the failing schedule
-runs at that event and of the thread that runs there otherwise:
+outcome flips. The continuation runs at the run's own `--max-timeslice`; a race
+found only at a short timeslice often shows without chaos at that timeslice
+too, and then the search continues at 200 ms instead
+(`--continuation-timeslice`). The report shows the stack of the thread the
+failing schedule runs at that event and of the thread that runs there
+otherwise. When both continuations run the same thread there, the decision is
+how long that thread runs: the report then shows its stack, and the stacks of
+the threads that run after it with and without the event:
 
 ```bash
 hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
