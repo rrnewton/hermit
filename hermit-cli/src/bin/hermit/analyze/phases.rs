@@ -2837,7 +2837,8 @@ mod tests {
     /// trial that replays a record, and the baseline without chaos, draws no
     /// offsets of its own; the search's chaos runs keep the option. Every
     /// schedule analyze writes (each trial's, the final ones) keeps its
-    /// events' offsets, stamped format 4. Recordings with and without offsets
+    /// events' offsets, stamped with the offsets format
+    /// (`INSTRUCTION_OFFSET_FORMAT`). Recordings with and without offsets
     /// combine. Refused before any trial: a record whose rows hold offsets its
     /// schedule trace does not, a record of a newer format, and offsets the
     /// trials cannot stop at (imprecise timers, `--imprecise-search`).
