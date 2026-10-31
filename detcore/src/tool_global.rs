@@ -8019,9 +8019,12 @@ pub enum SignalScope {
 // pair (both landed in batch D2).
 /// https://github.com/rrnewton/hermit/pull/4728's `SchedEvent::stopless`
 /// and `ReplayedSliceEnd` are revision 30, reserved for this change by the
-/// D2 seal; the combined layout on top of 31 appends revision 32, which is
-/// the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 32;
+/// D2 seal; the combined layout on top of 31 appends revision 32.
+/// https://github.com/rrnewton/hermit/pull/4769's `PublishInstructionOffset`
+/// pair, appended after `PostCrash`/`WithPostCrashBound`, is revision 42
+/// (33 to 41 are reserved for changes not on this base), which is the
+/// current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 42;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
