@@ -53,10 +53,12 @@ pub struct AnalyzeOpts {
     #[clap(long, value_name = "REGEX")]
     pub target_stderr: Option<Regex>,
 
-    /// Target: Analyze runs that have the specified exit code.  Accepts "nonzero" for all nonzero
-    /// exit codes.  Accepts "none" or "any" for no filter at all (accepts any exit code).  The
-    /// default is "nonzero" because it's very common to analyze a bug that causes the program to
-    /// crash or error.
+    /// Target: Analyze runs that have the specified exit code, 0 to 255, as a shell reports it:
+    /// the guest's own, or 128 plus the signal number when a signal killed it (134 for SIGABRT,
+    /// which also matches a guest that exits 134).  Accepts "nonzero" for all nonzero exit codes.
+    /// Accepts "none" or "any" for no filter at all (accepts any exit code).  The default is
+    /// "nonzero" because it's very common to analyze a bug that causes the program to crash or
+    /// error.
     #[clap(long, default_value = "nonzero", value_name = "NUM|nonzero|any")]
     pub target_exit_code: ExitStatusConstraint,
 
@@ -76,9 +78,17 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub run_needleman: bool,
 
-    /// Given a passing/failing run pair, based on different chaos seeds, first minimize the
-    /// chaos-mode interventions necessary to flip between the two outcomes.  This may accelerate
-    /// the subsequent binary search.
+    /// Before searching, minimize the target run's chaos-mode interventions (its preemptions
+    /// and priority changes) to those it needs to meet the target criteria, by knocking them out
+    /// a batch at a time. This may accelerate the subsequent binary search.
+    ///
+    /// The baseline is then the minimized record with its latest intervention knocked out, and
+    /// knocked out again while the replay still meets the target. When no intervention is left,
+    /// there is no baseline to bisect against and the analysis ends with that error, as it does
+    /// with the run's own error for a knocked-out run that does not finish; `--prefix-search`
+    /// needs no baseline. So `--minimize` finds its own baseline and does not
+    /// take `--run2-seed`, `--run2-preemptions` or `--run2-schedule`. To search between a given
+    /// pair of runs, omit `--minimize`.
     #[clap(
         long,
         conflicts_with = "run2_seed",
@@ -98,7 +108,9 @@ pub struct AnalyzeOpts {
     ///
     /// Unlike the default search, it needs no baseline schedule, so events that only one of
     /// two unrelated runs executed (timeslices that end at other points, iterations of a
-    /// polling loop) cannot stop it. It takes about log2(schedule length) trials.
+    /// polling loop) cannot stop it. It takes about log2(schedule length) trials, two more for
+    /// each continuation (`--continuation-timeslice`) it tries, and two to recheck the
+    /// boundary.
     #[clap(
         long,
         conflicts_with = "minimize",
@@ -108,6 +120,23 @@ pub struct AnalyzeOpts {
         conflicts_with = "run_needleman"
     )]
     pub prefix_search: bool,
+
+    /// The timeslice, in virtual nanoseconds, with which `--prefix-search` trials continue
+    /// without chaos after their replayed prefix: `auto` (the default) or a number.
+    ///
+    /// A race found only at a short timeslice often shows without chaos at that timeslice too:
+    /// the scheduler alone, replaying none of the target schedule, already meets the target,
+    /// and the search has nothing to bisect against. With `auto` the search continues at the
+    /// run's own `--max-timeslice`, and when that cannot serve (the scheduler alone meets the
+    /// target, or replaying the whole schedule misses it) at hermit's default 200 ms. This also
+    /// applies to the prefix search the default search falls back to. The report names the
+    /// timeslice the search used.
+    ///
+    /// The value is the trials' `--max-timeslice`, which also ends the replayed prefix's
+    /// slices that its schedule does not end, so it may not be shorter than the run's own, and
+    /// a run whose arguments disable PMU timeslices takes none.
+    #[clap(long, value_name = "NANOS|auto", default_value = "auto")]
+    pub continuation_timeslice: ContinuationTimeslice,
 
     /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
     /// enabled.
@@ -293,6 +322,35 @@ pub struct AnalyzeOpts {
     pub time_skip_sources: crate::time_skip_carry::SharedTimeSkipSources,
 }
 
+/// `--continuation-timeslice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationTimeslice {
+    /// Short first, then coarser where the short one cannot serve.
+    Auto,
+    /// This many virtual nanoseconds.
+    Nanos(NonZeroU64),
+}
+
+impl FromStr for ContinuationTimeslice {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "auto" {
+            return Ok(ContinuationTimeslice::Auto);
+        }
+        match s.parse::<NonZeroU64>() {
+            Ok(nanos) if nanos.get() >= detcore_model::time::NANOS_PER_RCB as u64 => {
+                Ok(ContinuationTimeslice::Nanos(nanos))
+            }
+            _ => Err(format!(
+                "expected `auto` or a timeslice of at least one RCB ({} virtual nanoseconds), \
+                 got {s:?}",
+                detcore_model::time::NANOS_PER_RCB
+            )),
+        }
+    }
+}
+
 /// `--trial-timeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrialTimeout {
@@ -364,10 +422,22 @@ pub enum ExitStatusConstraint {
     Any,
 }
 
+/// The exit code a shell reports for a run that ended with `status`: the
+/// guest's own code, or 128 plus the signal number for a signal death. Not
+/// the raw wait status, which shifts an exit code left by eight bits.
+pub fn run_exit_code(status: ExitStatus) -> i32 {
+    match status {
+        ExitStatus::Exited(code) => code,
+        ExitStatus::Signaled(signal, _) => detcore_model::signal_exit_status(signal as i32),
+        ExitStatus::SignaledRaw(signal, _) => detcore_model::signal_exit_status(signal),
+    }
+}
+
 impl ExitStatusConstraint {
-    /// Is the constraint met for a given exit code?
+    /// Is the constraint met for a run that ended with `exit_status`
+    /// ([`run_exit_code`])?
     pub fn is_match(&self, exit_status: ExitStatus) -> bool {
-        let exit_code = exit_status.into_raw();
+        let exit_code = run_exit_code(exit_status);
         match self {
             ExitStatusConstraint::Exact(code) => exit_code == *code,
             ExitStatusConstraint::NonZero => exit_code != 0,
@@ -381,6 +451,12 @@ impl FromStr for ExitStatusConstraint {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Ok(n) = s.parse::<i32>() {
+            if !(0..=255).contains(&n) {
+                return Err(format!(
+                    "Exit code constraint {n} is out of range: an exit code is 0 to 255 (128 plus \
+                     the signal number for a signal death)"
+                ));
+            }
             Ok(ExitStatusConstraint::Exact(n))
         } else {
             match s.to_lowercase().as_str() {
@@ -421,6 +497,16 @@ pub struct Report {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_counter_warning: Option<String>,
+
+    /// `--prefix-search` only, when the deciding event is a timing decision
+    /// (both continuations run the same thread there, for different lengths):
+    /// that thread's stack at the deciding event. The two critical events are
+    /// then the threads that run next in each continuation, and their
+    /// `event_index` is a position in that continuation's recorded schedule
+    /// (the header names both files); where no other thread runs, it is that
+    /// schedule's length and the stack is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deciding_event: Option<ReportCriticalEvent>,
 }
 
 /// Runtime context for a critical event included in the analyze report.

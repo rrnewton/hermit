@@ -46,7 +46,8 @@ pub struct BisectOpts {
     #[clap(long, value_name = "REGEX")]
     target_stderr: Option<Regex>,
 
-    /// Exit status identifying the target failure.
+    /// Exit code identifying the target failure, 0 to 255, as a shell reports it: the guest's own,
+    /// or 128 plus the signal number when a signal killed it.
     #[clap(long, default_value = "nonzero", value_name = "NUM|nonzero|any")]
     target_exit_code: ExitStatusConstraint,
 
@@ -114,6 +115,7 @@ impl BisectOpts {
             run_needleman: self.needleman,
             minimize: false,
             prefix_search: false,
+            continuation_timeslice: crate::analyze::ContinuationTimeslice::Auto,
             imprecise_search: false,
             run1_seed: None,
             run1_preemptions: None,
