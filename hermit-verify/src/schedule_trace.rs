@@ -601,6 +601,72 @@ mod tests {
         }
     }
 
+    /// Each segment's failed store-exclusives, and the flag saying every
+    /// segment was counted, describe the order a run executed. An endpoint
+    /// is that run's own record and keeps them; a mixed order no run
+    /// executed keeps neither, whichever input carried them, while the
+    /// run-wide count keeps its warning. The inputs' flags differ in two of
+    /// the cases because the flag compares equal whatever its value.
+    #[test]
+    fn mixed_interpolation_keeps_no_segment_store_exclusive_counts() {
+        use detcore_model::pid::GuestIds;
+        let events: Vec<_> = [3, 4, 5]
+            .map(|tid| SchedEvent::branches(DetTid::from_raw(tid), 1))
+            .into();
+        let mut reverse = events.clone();
+        reverse.reverse();
+        let counted = |events: Vec<SchedEvent>, segments_counted: bool| {
+            let mut value = serde_json::to_value(interpolation_input(events)).unwrap();
+            for (fails, event) in (1..).zip(value["global"].as_array_mut().unwrap()) {
+                event["strex_fails"] = serde_json::json!(fails);
+            }
+            value["segment_store_exclusives"] = serde_json::json!(segments_counted);
+            serde_json::from_value::<PreemptionRecord>(value).unwrap()
+        };
+        let fails = |record: &PreemptionRecord| {
+            record
+                .schedevents()
+                .iter()
+                .map(|event| event.strex_fails.0)
+                .collect::<Vec<_>>()
+        };
+        for (first_counted, second_counted) in [(true, true), (true, false), (false, true)] {
+            let first = counted(events.clone(), first_counted);
+            let second = counted(reverse.clone(), second_counted);
+            assert_eq!(fails(&first), [1, 2, 3]);
+            assert_eq!(first.segment_store_exclusives(), first_counted);
+            let mut endpoints = Vec::new();
+            for percentage in [0, 100] {
+                let result = interpolate_records(&first, &second, percentage).unwrap();
+                let source = if result.schedevents() == first.schedevents() {
+                    &first
+                } else {
+                    assert_eq!(result.schedevents(), second.schedevents());
+                    &second
+                };
+                endpoints.push(std::ptr::eq(source, &first));
+                assert_eq!(
+                    serde_json::to_value(&result).unwrap(),
+                    serde_json::to_value(source.clone().with_guest_ids(GuestIds::Namespace))
+                        .unwrap(),
+                    "{percentage}%"
+                );
+                assert_eq!(fails(&result), [1, 2, 3]);
+                assert_eq!(
+                    result.segment_store_exclusives(),
+                    source.segment_store_exclusives()
+                );
+            }
+            assert_ne!(endpoints[0], endpoints[1]);
+            let mixed = interpolate_records(&first, &second, 50).unwrap();
+            assert_ne!(mixed.schedevents(), first.schedevents());
+            assert_ne!(mixed.schedevents(), second.schedevents());
+            assert!(!mixed.segment_store_exclusives());
+            assert_eq!(fails(&mixed), [0, 0, 0]);
+            assert_eq!(mixed.store_exclusive_failures(), 7);
+        }
+    }
+
     fn synthetic_chosen_reserved_input() -> serde_json::Value {
         // A recognized descriptor for synthetic editor inputs, not a live
         // setup receipt or a way to qualify an existing recording.

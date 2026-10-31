@@ -493,6 +493,9 @@ impl PreemptionRecord {
     /// follows its global stream rather than either original priority history.
     /// Host-observed failure counts must agree too; retain their warning,
     /// without claiming that an unrun edit has measured that many failures.
+    /// For the same reason the mixed order keeps no segment's failed
+    /// store-exclusives and no flag saying every segment was counted: no run
+    /// executed its segments, as for a split, edited or replaced schedule.
     pub fn interpolate_events(
         &self,
         other: &Self,
@@ -557,15 +560,16 @@ impl PreemptionRecord {
             );
         }
         record.global = events;
+        record.forget_segment_store_exclusives();
         record.validate()?;
         Ok(record)
     }
 
     /// Drop each segment's failed store-exclusives and the flag that says
     /// every segment was counted, for a schedule whose events are no longer
-    /// the ones this run observed: split, edited or replaced. A count copied
-    /// into a derived event, or carried by one from another run, would claim
-    /// an observation nobody made.
+    /// the ones this run observed: split, edited, replaced or interpolated.
+    /// A count copied into a derived event, or carried by one from another
+    /// run, would claim an observation nobody made.
     fn forget_segment_store_exclusives(&mut self) {
         self.segment_store_exclusives = HostObservedFlag::default();
         for event in &mut self.global {
@@ -1849,6 +1853,23 @@ mod tests {
         assert!(holds_no_store_exclusive_counts(&replaced));
         assert!(record.segment_store_exclusives());
         assert_eq!(record.global[0].strex_fails.0, 2);
+    }
+
+    /// An interpolated order that equals neither source's schedule is one no
+    /// run executed, so it keeps neither the sources' counts nor the flag;
+    /// an order equal to a source's is that source's record and keeps both.
+    #[test]
+    fn an_interpolated_schedule_keeps_no_store_exclusive_counts() {
+        let record = counted_record();
+        let mut reordered = record.global.clone();
+        reordered.reverse();
+        let mixed = record.interpolate_events(&record, reordered).unwrap();
+        assert!(holds_no_store_exclusive_counts(&mixed));
+        let exact = record
+            .interpolate_events(&record, record.global.clone())
+            .unwrap();
+        assert!(exact.segment_store_exclusives());
+        assert_eq!(exact.global[0].strex_fails.0, 2);
     }
 
     /// The run's failed store-exclusives ride in a record so that a replay
