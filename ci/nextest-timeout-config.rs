@@ -136,7 +136,19 @@ const RR_THREAD_STRESS_CPU_SECONDS: u64 = 34;
 // coordinator validations, at most 28.3 s wall); the 13 others were stopped
 // by the 22-second cap at 22.00 to 22.02 (22.1 to 29.6 s wall).
 // ceil(1.5 * 22.02) = 34.
-const ESI_POLL_DEADLINE_CPU_SECONDS: u64 = 34;
+// Recalibrated 2026-10-31: under full-validation load the two
+// without-namespace tests now cost more than that sample. The full
+// validations at fd59b85c73 and 4892f76e6a each stopped both of them at the
+// 34-second cap (34.08 to 34.14 s wall) in their third cell, the first two
+// cells completing with their correct RESULT lines at 10.8 to 11.7 s of
+// host wall per 10-second deadline poll; the same tests completed at
+// 17.6 s wall in e7c3643d52's full validation and at 20.4 s in
+// 185c2c1d3c's focused node, so the assertions are unchanged and only the
+// bound moved. A cap stop counts as an observation of at least the cap:
+// ceil(1.5 * 34) = 51. The per-cell cost under full load is about twice
+// the calibration sample's per-cell share; that rise is the poll owners'
+// to explain, and this cap remains a hang guard, not a measurement of it.
+const ESI_POLL_DEADLINE_CPU_SECONDS: u64 = 51;
 const ESI_POLL_DEADLINE_TESTS: [(&str, &str); 4] = [
     (
         "hermit-esi-poll-deadline-resize-namespace-cpu",
@@ -2306,7 +2318,7 @@ mod tests {
                     "hermit-run::external_signal_interrupt",
                     *test,
                     *name,
-                    34,
+                    51,
                 )
             })
             .collect::<Vec<_>>();
@@ -3011,23 +3023,24 @@ mod tests {
                 );
             }
         }
-        // The largest non-owned cap remains36 regardless of the stack rows.
+        // The largest non-owned cap remains 51 regardless of the stack rows
+        // (the recalibrated poll-deadline cap; see ESI_POLL_DEADLINE_CPU_SECONDS).
         let mut reversed = MEASURED_CPU_ALLOWANCES.to_vec();
         reversed.reverse();
         for selected in [MEASURED_CPU_ALLOWANCES.as_slice(), reversed.as_slice()] {
             assert!(
                 scaled_config_with_allowances(
-                    &source.replace("57s", "38s"),
+                    &source.replace("57s", "53s"),
                     1.0,
                     Some((Path::new("/fixture/wrapper"), 1.0)),
                     selected
                 )
                 .unwrap_err()
-                .contains("(36s)")
+                .contains("(51s)")
             );
             assert!(
                 scaled_config_with_allowances(
-                    &source.replace("57s", "39s"),
+                    &source.replace("57s", "54s"),
                     1.0,
                     Some((Path::new("/fixture/wrapper"), 1.0)),
                     selected
