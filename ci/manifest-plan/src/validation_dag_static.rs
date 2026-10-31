@@ -3554,7 +3554,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-measured at 3bdd41fda38 by the full validate at that tip:
     // 349 executed, all passed (the two added cases are in this shard;
     // the shard pins 61 + 290 + 349 again sum to the on-host 700).
-    ("test.hermit_integration_3", 349),
+    // The integrated chain adds twelve cases in this shard's range:
+    // 349 + 12 = 361, re-measured at fd59b85c73 (361 passed).
+    ("test.hermit_integration_3", 361),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -5700,7 +5702,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list --profile ci` (the local shards' 61 + 290 + 349).
     // Recount at 360e99b2e24: shard 2 grew to 292 (see its pin), so the
     // whole-node twin executes 61 + 292 + 349 = 702.
-    ("test.hermit_integration_on_host", 702),
+    // The integrated chain grows shard 3 to 361 (see its pin): 61 + 292 +
+    // 361 = 714.
+    ("test.hermit_integration_on_host", 714),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
