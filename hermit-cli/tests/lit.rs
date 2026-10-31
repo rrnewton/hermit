@@ -380,8 +380,10 @@ fn fixtures(root: &Path) -> Vec<PathBuf> {
 fn every_lit_fixture_is_within_the_supported_subset() {
     let root = lit_root();
     let fixtures = fixtures(&root);
-    // 27 main.{rs,c,go} files, 47 .lit, 6 .test and 2 scheduler scripts.
-    assert_eq!(fixtures.len(), 82, "{fixtures:#?}");
+    // 28 main.{rs,c,go} files, 48 .lit, 6 .test and 2 scheduler scripts.
+    // fifo_jump_replay (main.c + hermit-run.lit) joined with the guest-poll
+    // replay work: 82 + 2 = 84.
+    assert_eq!(fixtures.len(), 84, "{fixtures:#?}");
     let placeholder = Path::new("/placeholder");
     let substitutions = [
         ("hermit", placeholder),
@@ -400,8 +402,9 @@ fn every_lit_fixture_is_within_the_supported_subset() {
             checked += 1;
         }
     }
-    // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts 45.
-    assert_eq!(checked, 45);
+    // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts
+    // 47 (fifo_jump_replay adds two).
+    assert_eq!(checked, 47);
 }
 
 /// The `%me` of FIXTURE: its directory's `main.c`, compiled into DIRECTORY
@@ -567,6 +570,8 @@ lit_cases! {
     lit_fcntl_getfd_setfd_hermit_run_strict => "fcntl_getfd_setfd/hermit-run-strict.lit",
     lit_fcntl_getfd_setfd_hermit_run => "fcntl_getfd_setfd/hermit-run.lit",
     lit_fcntl_getfd_setfd_main => "fcntl_getfd_setfd/main.rs",
+    lit_fifo_jump_replay_hermit_run => "fifo_jump_replay/hermit-run.lit",
+    lit_fifo_jump_replay_main => "fifo_jump_replay/main.c",
     lit_file_race_openwrite_hermit_run_strict => "file_race_openwrite/hermit-run-strict.lit",
     lit_file_race_openwrite_hermit_run => "file_race_openwrite/hermit-run.lit",
     lit_file_race_openwrite_main => "file_race_openwrite/main.rs",
