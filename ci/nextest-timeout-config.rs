@@ -2723,7 +2723,7 @@ mod tests {
             prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
                 .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 31);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 32);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),
