@@ -52099,7 +52099,7 @@ fn a_shells_blocking_fifo_open_verifies_and_shows_its_poll() {
     let log = stderr(&output);
     for line in [
         "the FIFO open polls for a guest peer",
-        "Nothing but a FIFO open's poll can run; skipping global time ahead",
+        "Nothing else can run (FifoOpenAlone); skipping global time ahead",
         "a guest removed the name of the FIFO it made",
     ] {
         assert!(log.contains(line), "{args:?}: no {line:?} in:\n{log}");
