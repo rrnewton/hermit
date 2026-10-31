@@ -89,14 +89,19 @@ mod tests {
     /// Revisions reserved for a change that is not on this base yet, which
     /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 39 are reserved for
     /// pending changes in the coordinator's allocation table (39 for kvm
-    /// 2b-1). At this head 28 is https://github.com/rrnewton/hermit/pull/4789's,
-    /// 29 is https://github.com/rrnewton/hermit/pull/4884's, 30 is
+    /// 2b-1), and 41 to 44 are queued or advisory claims at this rebase
+    /// (41 on queued heads, 42 on drain/4759, 43 for PR 4627, 44 for
+    /// kvm-2b-3 in the allocation table). At this head 28 is
+    /// https://github.com/rrnewton/hermit/pull/4789's, 29 is
+    /// https://github.com/rrnewton/hermit/pull/4884's, 30 is
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
     /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
-    /// layout on top of 31's, and 40, the `CpuClockProcess` pair allocated
-    /// to https://github.com/rrnewton/hermit/pull/4885, is the current
-    /// revision.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
+    /// layout on top of 31's, 40 is the `CpuClockProcess` pair allocated
+    /// to https://github.com/rrnewton/hermit/pull/4885, and 45, this
+    /// change's `TraceSchedEvent`/`WithWatchOrder` revision, is current.
+    /// Remove an entry when its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] =
+        &[33, 34, 35, 36, 37, 38, 39, 41, 42, 43, 44];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -270,6 +275,11 @@ mod tests {
         // (the stopless layout on top of 31), skipping reserved 33 to 39;
         // digests measured at this head).
         (40, "3919013da0508f27", "f013e36743d8d9e6"),
+        // Retypes `GlobalRequest::TraceSchedEvent`; adds
+        // `GlobalResponse::WithWatchOrder` (#4796). Live-computed as 45 at
+        // its rebase onto main's 40, skipping queued/advisory claims
+        // 41-44; digest measured at the sealed head.
+        (45, "972afd3cae07a4c4", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

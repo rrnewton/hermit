@@ -8066,9 +8066,10 @@ pub enum SignalScope {
 /// and `ReplayedSliceEnd` are revision 30, reserved for this change by the
 /// D2 seal; the combined layout on top of 31 appends revision 32.
 /// 40 appends the `CpuClockProcess` pair (drain of PR 4885, allocated
-/// revision 40) after 32, skipping reserved 33 to 39, and is the current
-/// revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 40;
+/// revision 40) after 32, skipping reserved 33 to 39. 45 is #4796's
+/// TraceSchedEvent/WithWatchOrder revision, live-computed at its rebase
+/// onto 40 skipping queued/advisory claims 41-44, and is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 45;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
