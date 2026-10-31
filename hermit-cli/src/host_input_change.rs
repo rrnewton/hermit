@@ -582,6 +582,22 @@ mod tests {
         assert_eq!(open_position("not a Hermit log", 3, 12), None);
     }
 
+    #[test]
+    fn path_fallback_places_the_last_open_of_that_path_and_syscall() {
+        let log = [
+            commit(4),
+            finish(3, 12),
+            commit(5),
+            finished(9, 12, "openat(-100, 0x1 -> \"/etc/a\", O_RDONLY)"),
+        ]
+        .join("\n");
+        // (dtid, syscall) is ambiguous here; the fallback names the last
+        // finished open of the changed path with that syscall number.
+        assert_eq!(open_position_for_path(&log, 12, "/etc/a"), Some(4));
+        assert_eq!(open_position_for_path(&log, 12, "/etc/b"), None);
+        assert_eq!(open_position_for_path(&log, 13, "/etc/a"), None);
+    }
+
     /// Only a structured record of a finished open, read at Hermit's own
     /// prefix and found exactly once, places an open. A thread number and
     /// syscall count that repeat (a non-leader exec takes the leader's number
