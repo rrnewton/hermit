@@ -1941,7 +1941,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // forced-gate rows fail only for want of a locally built liteinst
     // runtime, which the validate builds; they pass there).
     // And container::tests::superblock_options_leave_out_the_owner: 1330.
-    ("test.hermit_unit", 1330),
+    // And run::a_mount_the_private_dev_mqueue_would_cover_is_refused_before_its_target_is_looked_for:
+    // 1331.
+    ("test.hermit_unit", 1331),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6117,7 +6119,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1319 + 4 = 1323 (carried: the hosted lane did not run here; the
     // portable twin executed 1329 in the targeted rerun).
     // And the container's superblock-owner test: 1324.
-    ("test.hermit_unit_on_host", 1324),
+    // And the same private /dev/mqueue refusal-order unit: 1325.
+    ("test.hermit_unit_on_host", 1325),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
