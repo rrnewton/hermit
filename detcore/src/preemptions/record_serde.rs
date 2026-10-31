@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn the_poll_skips_round_trip_through_the_record_serde() {
         let old: PreemptionRecord = serde_json::from_str(
-            r#"{"per_thread":{},"global":[],"format_version":2,"poll_skips":[{"after":1,"thread":5}]}"#,
+            r#"{"per_thread":{},"global":[],"format_version":4,"poll_skips":[{"after":1,"thread":5}]}"#,
         )
         .unwrap();
         let skips = vec![PollSkip {

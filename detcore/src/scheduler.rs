@@ -5181,9 +5181,17 @@ impl Scheduler {
             // format 2 once it makes a jump, a FIFO fast-forward it recomputes
             // or a jump past the record's end (`PreemptionWriter::insert_time_skip`):
             // the jumps must be listed to be replayed, though that record's own
-            // replay then decides a FIFO open by the newer rules.
-            let writer =
-                writer.with_format(replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT)));
+            // replay then decides a FIFO open by the newer rules. A schedule
+            // replay, which takes its record's poll skips, and a slice-boundary
+            // recording record none (`record_or_replay_poll_skip`), so they
+            // state a format below the poll skips' list.
+            let format = replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT));
+            let records_poll_skips = cfg.replay_schedule_from.is_none() && !boundaries;
+            let writer = writer.with_format(if records_poll_skips {
+                format
+            } else {
+                crate::preemptions::format_without_poll_skips(format)
+            });
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -23015,7 +23023,9 @@ mod test {
     /// A run that replays nothing records in the current format, which lists
     /// every jump, also when it made none; a replay of such a record is driven
     /// by its (possibly empty) list, and a replay of a format-1 record keeps the
-    /// older rules (`TimeSkipMode::Legacy`) and records format 1.
+    /// older rules (`TimeSkipMode::Legacy`) and records format 1. A
+    /// slice-boundary recording, and a replay of a record that lists its poll
+    /// skips, record none and state the format below their list.
     #[test]
     fn a_record_states_its_format_and_its_replay_follows_it() {
         let recording = Config {
@@ -23029,6 +23039,26 @@ mod test {
             .into_string();
         let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
         assert!(record.lists_its_time_skips());
+        assert_eq!(
+            record.format_version(),
+            Some(crate::preemptions::POLL_SKIPS_FORMAT)
+        );
+        // A slice-boundary recording records no poll skips.
+        let boundaries = Scheduler::new(&Config {
+            strict_schedule_boundaries: true,
+            sequentialize_threads: true,
+            ..recording.clone()
+        })
+        .preemption_writer
+        .take()
+        .unwrap()
+        .into_string();
+        assert_eq!(
+            Recording::decode(boundaries.as_bytes())
+                .unwrap()
+                .format_version(),
+            Some(crate::preemptions::POLL_SKIPS_FORMAT - 1)
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let replay = |record: crate::preemptions::PreemptionRecord| {
@@ -23053,6 +23083,25 @@ mod test {
                 .unwrap()
                 .into_string()
                 .contains("\"format_version\"")
+        );
+        // A schedule replay takes its record's poll skips and records none,
+        // so a replay of a record that lists them states the format below
+        // their list.
+        let rerecorded: crate::preemptions::PreemptionRecord = serde_json::from_str(
+            &replay(
+                empty
+                    .clone()
+                    .with_format(Some(crate::preemptions::POLL_SKIPS_FORMAT)),
+            )
+            .preemption_writer
+            .take()
+            .unwrap()
+            .into_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            rerecorded.format_version(),
+            Some(crate::preemptions::POLL_SKIPS_FORMAT - 1)
         );
         let mut older = replay(empty);
         assert_eq!(older.time_skip_mode, TimeSkipMode::Legacy);

@@ -175,9 +175,11 @@ pub struct PreemptionRecord {
     /// schedules they splice from it (`with_time_skips`).
     time_skips: Option<Vec<TimeSkip>>,
     /// The turns the scheduler gave polling threads only to skip them, in the
-    /// order it took them (`PollSkip`). Absent in records written before the
-    /// field existed, which replay as before, and dropped, as the callback
-    /// checkpoints are, by any edit of the schedule.
+    /// order it took them (`PollSkip`); absent when there was none. A record
+    /// of format 4 or later ([`POLL_SKIPS_FORMAT`]) lists them all; an older
+    /// record, written before they were recorded, holds none and replays as
+    /// before. Dropped, as the callback checkpoints are, by any edit of the
+    /// schedule.
     poll_skips: Vec<PollSkip>,
 }
 
@@ -217,9 +219,11 @@ impl std::hash::Hash for HostObservedCount {
 /// - Format 3 ([`SWITCH_IN_CHARGE_FORMAT`]) was written by a run that charged
 ///   every stretch of guest code a turn, so its replay charges a replayed
 ///   switch-in under which guest code runs.
+/// - Format 4 ([`POLL_SKIPS_FORMAT`]) lists every turn its run gave a polling
+///   thread only to skip it (`poll_skips`, absent when there was none).
 ///
 /// A record of a newer format is refused (`PreemptionRecord::validate_format`).
-pub const PREEMPTION_RECORD_FORMAT: u32 = SWITCH_IN_CHARGE_FORMAT;
+pub const PREEMPTION_RECORD_FORMAT: u32 = POLL_SKIPS_FORMAT;
 
 /// The format from which a record lists all its jumps of global time.
 pub const TIME_SKIPS_FORMAT: u32 = 2;
@@ -237,6 +241,22 @@ pub const TIME_SKIPS_FORMAT: u32 = 2;
 /// turn rule continues to decide subsequent signal charges. This format alone
 /// does not claim equality of every record/replay clock observation.
 pub const SWITCH_IN_CHARGE_FORMAT: u32 = 3;
+
+/// The format from which a record lists every turn its run gave a polling
+/// thread only to skip it (`PollSkip`), so that a schedule replay takes each
+/// skip where the recording did. A record of an older format holds none and
+/// replays as before. A record that cannot list them all states an older
+/// format ([`format_without_poll_skips`]).
+pub const POLL_SKIPS_FORMAT: u32 = 4;
+
+/// `format` for a record that does not list every poll skip of the run it
+/// describes: at most the format before [`POLL_SKIPS_FORMAT`], whose rules it
+/// still follows. A schedule replay, which records no poll skips, a
+/// slice-boundary recording, a trial, a shorter prefix and an edit of the
+/// schedule write such a record.
+pub fn format_without_poll_skips(format: Option<u32>) -> Option<u32> {
+    format.map(|format| format.min(POLL_SKIPS_FORMAT - 1))
+}
 
 /// A record whose format, or jumps of global time, this Hermit refuses to
 /// replay (`PreemptionRecord::validate_format`): a policy refusal, not a
@@ -437,7 +457,13 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             // A prefix of an inexact record is inexact too.
             replay_departed_at: *replay_departed_at,
-            format_version: *format_version,
+            // A shorter prefix drops the poll skips below, and so states a
+            // format below their list (`format_without_poll_skips`).
+            format_version: if followed {
+                format_without_poll_skips(*format_version)
+            } else {
+                *format_version
+            },
             // The jumps the prefix reaches, in stream order, as analyze and
             // bisect carry them (`hermit-cli`'s `time_skip_carry`): one at its
             // end still waits there for a FIFO open's poll, and one beyond it
@@ -458,7 +484,7 @@ impl PreemptionRecord {
             // checkpoints do. A prefix of the whole schedule keeps them; a
             // shorter one drops them, as an edit of the schedule does
             // (`drop_poll_skips`), so its replay takes no skip it cannot
-            // place. The format, a rule of the recorded run, is copied above.
+            // place.
             poll_skips: if followed {
                 Vec::new()
             } else {
@@ -472,8 +498,13 @@ impl PreemptionRecord {
     /// For a schedule that replayed this record's events and went on past
     /// them: its own recording keeps no checkpoints, since a replay records
     /// none, but the replayed part ended its slices where this record did.
+    /// Other events drop the poll skips, which a replay does not record either
+    /// (`drop_poll_skips`).
     pub fn with_schedule(&self, events: Vec<SchedEvent>) -> Option<PreemptionRecord> {
         let mut record = self.clone();
+        if events != record.global {
+            record.drop_poll_skips();
+        }
         record.global = events;
         record.validate().is_ok().then_some(record)
     }
@@ -483,7 +514,9 @@ impl PreemptionRecord {
     /// The caller first reconciles the existing guest-ID, signal-copy and
     /// other option policies. An exact source schedule keeps that source's
     /// complete record, including callback checkpoints and time jumps. Both
-    /// formats must agree: a single output cannot follow two charging rules.
+    /// formats must agree, but for whether they list poll skips: a single
+    /// output cannot follow two charging rules. A mixed order drops the poll
+    /// skips, as an edit does.
     ///
     /// A genuinely mixed order has no established mapping for either source's
     /// jumps or checkpoints, so refuse those inputs. For jump/checkpoint-free
@@ -501,7 +534,9 @@ impl PreemptionRecord {
         other.validate()?;
         self.validate_combined_reserved_inputs(other)
             .map_err(|refusal| refusal.to_string())?;
-        if self.format_version != other.format_version {
+        if format_without_poll_skips(self.format_version)
+            != format_without_poll_skips(other.format_version)
+        {
             return Err(format!(
                 "cannot interpolate record formats {:?} and {:?}: their replay rules differ; record both inputs with the same Hermit version and timing format",
                 self.format_version, other.format_version
@@ -529,6 +564,7 @@ impl PreemptionRecord {
             let mut record = source.clone();
             record.global.clear();
             record.per_thread.clear();
+            record.drop_poll_skips();
             record
         };
         let mut record = metadata(self);
@@ -583,10 +619,12 @@ impl PreemptionRecord {
         self
     }
 
-    /// The same record in the newest format ([`PREEMPTION_RECORD_FORMAT`]),
-    /// which a record from a run of this Hermit has.
+    /// The same record in the newest format a record states without listing
+    /// a run's poll skips ([`format_without_poll_skips`] of
+    /// [`PREEMPTION_RECORD_FORMAT`]): one built rather than recorded. A run
+    /// that records its poll skips states [`PREEMPTION_RECORD_FORMAT`].
     pub fn with_current_format(self) -> Self {
-        self.with_format(Some(PREEMPTION_RECORD_FORMAT))
+        self.with_format(format_without_poll_skips(Some(PREEMPTION_RECORD_FORMAT)))
     }
 
     /// The same record in `format` (`None` for format 1). Analyze and bisect
@@ -615,6 +653,13 @@ impl PreemptionRecord {
     pub fn lists_its_time_skips(&self) -> bool {
         self.format_version
             .is_some_and(|format| format >= TIME_SKIPS_FORMAT)
+    }
+
+    /// Whether the record lists every turn its run gave a polling thread only
+    /// to skip it (format 4 or later, [`POLL_SKIPS_FORMAT`]).
+    pub fn lists_its_poll_skips(&self) -> bool {
+        self.format_version
+            .is_some_and(|format| format >= POLL_SKIPS_FORMAT)
     }
 
     /// The same record, stating the `--pipe-wake-latency` of the trials it
@@ -897,9 +942,12 @@ impl PreemptionRecord {
     }
 
     /// Forget the poll skips: an edit of the schedule moves the events they
-    /// follow. The record keeps its format, the rules its run followed.
+    /// follow. The record keeps the rules its run followed, but no longer lists
+    /// its poll skips, so it states a format below their list
+    /// (`format_without_poll_skips`).
     fn drop_poll_skips(&mut self) {
         self.poll_skips.clear();
+        self.format_version = format_without_poll_skips(self.format_version);
     }
 
     /// Timestamp stripping preserves the event/progress relation, unlike an editor.
@@ -965,8 +1013,9 @@ impl PreemptionRecord {
 
     /// Check the record's format and its jumps of global time: a format this
     /// Hermit reads, with the list that format requires, in stream order, to
-    /// later and finite deadlines. A failure is a refusal of the record, not a
-    /// malformed file (`RecordFormatRefusal`).
+    /// later and finite deadlines; and poll skips only in a format that lists
+    /// them. A failure is a refusal of the record, not a malformed file
+    /// (`RecordFormatRefusal`).
     pub fn validate_format(&self) -> Result<(), String> {
         if let Some(skip) = self
             .time_skips
@@ -993,6 +1042,14 @@ impl PreemptionRecord {
                  {PREEMPTION_RECORD_FORMAT}, and time skips need format {TIME_SKIPS_FORMAT} or later",
                 self.format_version,
                 skips.len()
+            ));
+        }
+        if !self.poll_skips.is_empty() && !self.lists_its_poll_skips() {
+            return Err(format!(
+                "record format {:?} with {} poll skips: poll skips need format \
+                 {POLL_SKIPS_FORMAT} or later",
+                self.format_version,
+                self.poll_skips.len()
             ));
         }
         if let Some(pair) = skips
@@ -1497,12 +1554,13 @@ mod tests {
         assert_eq!(read_recorded_replay_departure(&path), Ok(None));
     }
 
-    /// Poll skips are recorded after the events before them and stamp the
-    /// record format 2. They round-trip through JSON, and a record without
-    /// them is written as before, with neither field. A record of a newer
-    /// format, or with a skip out of order or past its events, is refused.
-    /// An edit of the schedule drops them, and stripping event times keeps
-    /// them.
+    /// Poll skips are recorded after the events before them and put the
+    /// record in format 4 at least. They round-trip through JSON, and a record
+    /// without them is written as before, with neither field. A record of a
+    /// newer format, of a format before 4 with skips, or with a skip out of
+    /// order or past its events, is refused. An edit of the schedule drops
+    /// them and states the format below their list, and stripping event times
+    /// keeps them.
     #[test]
     fn poll_skips_are_recorded_after_their_events_and_version_the_record() {
         let event = |tid: i32| SchedEvent {
@@ -1528,7 +1586,7 @@ mod tests {
         let json = writer.into_string();
         let record: PreemptionRecord = serde_json::from_str(&json).unwrap();
         record.validate().unwrap();
-        assert_eq!(record.format_version, Some(PREEMPTION_RECORD_FORMAT));
+        assert_eq!(record.format_version, Some(POLL_SKIPS_FORMAT));
         let skip = |after, tid| PollSkip {
             after,
             thread: DetTid::from_raw(tid),
@@ -1544,7 +1602,10 @@ mod tests {
         let mut edited = record.clone();
         edited.schedevents_iter_mut().for_each(drop);
         assert!(edited.poll_skips().is_empty());
-        assert_eq!(edited.format_version, record.format_version);
+        assert_eq!(edited.format_version, Some(POLL_SKIPS_FORMAT - 1));
+        let stripped = record.clone().strip_contents();
+        assert!(stripped.poll_skips().is_empty());
+        assert_eq!(stripped.format_version, Some(POLL_SKIPS_FORMAT - 1));
 
         let mut newer = record.clone();
         newer.format_version = Some(PREEMPTION_RECORD_FORMAT + 1);
@@ -1553,6 +1614,14 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .contains("this Hermit reads formats 1 to"),
+        );
+        let mut older = record.clone();
+        older.format_version = Some(SWITCH_IN_CHARGE_FORMAT);
+        assert!(
+            older
+                .validate_format()
+                .unwrap_err()
+                .contains("poll skips need format 4 or later"),
         );
         let mut out_of_order = record.clone();
         out_of_order.poll_skips.swap(0, 1);
@@ -2237,9 +2306,11 @@ mod tests {
     }
 
     /// The poll skips name points of the recorded run, as the callback
-    /// checkpoints do: a prefix of the whole schedule keeps them, and a
-    /// shorter one drops them, as an edit of the schedule does. Every prefix
-    /// keeps the record's format.
+    /// checkpoints do: a prefix of the whole schedule keeps them and its
+    /// format, and a shorter one drops them, as an edit of the schedule does,
+    /// and states the format below their list. So does a schedule that
+    /// replayed the record and went on past it (`with_schedule`), whose
+    /// replay recorded no poll skips.
     #[test]
     fn a_schedule_prefix_keeps_the_poll_skips_only_for_the_whole_schedule() {
         let tid = DetTid::from_raw(3);
@@ -2267,10 +2338,18 @@ mod tests {
             assert!(prefix.poll_skips().is_empty(), "prefix of {len} events");
             assert_eq!(
                 prefix.format_version,
-                Some(PREEMPTION_RECORD_FORMAT),
+                Some(POLL_SKIPS_FORMAT - 1),
                 "prefix of {len} events"
             );
         }
+        let same = record.with_schedule(record.global.clone()).unwrap();
+        assert_eq!(same.poll_skips(), record.poll_skips());
+        assert_eq!(same.format_version, Some(POLL_SKIPS_FORMAT));
+        let mut continued = record.global.clone();
+        continued.push(SchedEvent::branches(tid, 30));
+        let continued = record.with_schedule(continued).unwrap();
+        assert!(continued.poll_skips().is_empty());
+        assert_eq!(continued.format_version, Some(POLL_SKIPS_FORMAT - 1));
     }
 
     /// A replay of a schedule's first events keeps the callback checkpoints
@@ -2904,8 +2983,9 @@ impl PreemptionWriter {
     }
 
     /// Record that the scheduler gave the polling thread `thread` a turn only
-    /// to skip it, after the events recorded so far (`PollSkip`). A writer of
-    /// the slice-boundary stream records none.
+    /// to skip it, after the events recorded so far (`PollSkip`), which puts
+    /// the record in format 4 at least ([`POLL_SKIPS_FORMAT`]). A writer of the
+    /// slice-boundary stream records none.
     pub(crate) fn insert_poll_skip(&mut self, thread: DetTid) {
         if self.boundary_records.is_some() {
             return;
@@ -2914,7 +2994,9 @@ impl PreemptionWriter {
             after: self.inner.global.len() as u64,
             thread,
         });
-        self.inner.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        if !self.inner.lists_its_poll_skips() {
+            self.inner.format_version = Some(POLL_SKIPS_FORMAT);
+        }
     }
 
     /// Append the observation of an existing slice-end request at its exact

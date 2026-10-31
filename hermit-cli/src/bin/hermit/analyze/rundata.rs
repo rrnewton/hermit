@@ -1262,6 +1262,8 @@ impl AnalyzeOpts {
     /// furthest (`crate::time_skip_carry`), so its replay jumps where that
     /// recording did. All sources must share one timing format; mixing
     /// formats cannot preserve their different switch-in charging rules.
+    /// The trial states the format below the poll skips' list, unless the
+    /// record lists them itself (a prefix of a whole recorded schedule).
     /// An incompatible format or invalid record is refused before writing.
     pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
         let (skips, format, identity) = {
@@ -1286,6 +1288,11 @@ impl AnalyzeOpts {
                 .reserved_input()
                 .require_same_for_chosen(&reserved_input)?;
         }
+        let format = if record.lists_its_poll_skips() {
+            record.format_version()
+        } else {
+            format
+        };
         let record = self.stamp_trial_record(
             record
                 .with_format(format)
@@ -1582,7 +1589,10 @@ mod tests {
         };
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("trial.json");
-        for format in [None, Some(2), Some(3)] {
+        // A trial records no poll skips, so a source that lists them gives
+        // it the format below their list.
+        let listed = Some(detcore::preemptions::POLL_SKIPS_FORMAT);
+        for format in [None, Some(2), Some(3), listed] {
             let options = options();
             let source = record(format);
             options.time_skip_sources.lock().unwrap().remember(&source);
@@ -1590,9 +1600,12 @@ mod tests {
                 .write_trial_schedule(events.clone(), &output)
                 .unwrap();
             let written = PreemptionReader::try_new(&output).unwrap().into_inner();
-            assert_eq!(written.format_version(), format);
+            assert_eq!(
+                written.format_version(),
+                detcore::preemptions::format_without_poll_skips(format)
+            );
             assert_eq!(written.time_skips(), source.time_skips());
-            assert_eq!(written.charges_replayed_switch_ins(), format == Some(3));
+            assert_eq!(written.charges_replayed_switch_ins(), format >= Some(3));
         }
         for other in [None, Some(2)] {
             for formats in [[Some(3), other], [other, Some(3)]] {

@@ -2160,7 +2160,7 @@ mod tests {
         use detcore::preemptions::boundary_recording::Recording;
 
         const RECORDS: [&[u8]; 2] = [
-            br#"{"per_thread":{},"global":[],"format_version":4}"#,
+            br#"{"per_thread":{},"global":[],"format_version":5}"#,
             br#"{"per_thread":{},"global":[],"format_version":3,"time_skips":[]}"#,
         ];
         for contextual in [false, true] {

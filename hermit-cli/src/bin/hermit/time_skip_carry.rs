@@ -103,7 +103,12 @@ impl TimeSkipSources {
     /// Remember `record`. One that made no jump counts as much as one that
     /// did: a trial that repeats it furthest makes no jump either.
     pub fn remember(&mut self, record: &PreemptionRecord) {
-        self.formats.insert(record.format_version());
+        // A trial lists no poll skips of its own, so only the rules a
+        // format implies count, not whether it lists them.
+        self.formats
+            .insert(detcore::preemptions::format_without_poll_skips(
+                record.format_version(),
+            ));
         let source = Source {
             prefix_hashes: prefix_hashes(record.schedevents()),
             skips: record.time_skips().unwrap_or_default().to_vec(),
@@ -116,9 +121,11 @@ impl TimeSkipSources {
     }
 
     /// The single timing format all sources share, or the current format
-    /// before any source is read. There is no proved conversion between
-    /// legacy, format 2 and format 3 charging rules, even when a selected
-    /// prefix comes from just one of the sources.
+    /// before any source is read, below the format that lists poll skips
+    /// (`detcore::preemptions::format_without_poll_skips`): a trial records
+    /// none. There is no proved conversion between legacy, format 2 and
+    /// format 3 charging rules, even when a selected prefix comes from just
+    /// one of the sources.
     pub fn trial_format(&self) -> anyhow::Result<Option<u32>> {
         anyhow::ensure!(
             self.formats.len() <= 1,
@@ -129,11 +136,11 @@ impl TimeSkipSources {
                 .map(|format| format.unwrap_or(1))
                 .collect::<Vec<_>>()
         );
-        Ok(self
-            .formats
-            .first()
-            .copied()
-            .unwrap_or(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)))
+        Ok(self.formats.first().copied().unwrap_or(
+            detcore::preemptions::format_without_poll_skips(Some(
+                detcore::preemptions::PREEMPTION_RECORD_FORMAT,
+            )),
+        ))
     }
 
     /// Admit all Chosen source metadata before a trial or endpoint shortcut.
@@ -340,16 +347,14 @@ mod tests {
     /// The actual writer/admission controls also check this refusal.
     #[test]
     fn a_trial_refuses_mixed_timing_formats() {
+        // A trial lists no poll skips, so it states the format below theirs.
+        let current = detcore::preemptions::format_without_poll_skips(Some(
+            detcore::preemptions::PREEMPTION_RECORD_FORMAT,
+        ));
         let mut sources = TimeSkipSources::default();
-        assert_eq!(
-            sources.trial_format().unwrap(),
-            Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)
-        );
+        assert_eq!(sources.trial_format().unwrap(), current);
         sources.remember(&PreemptionRecord::from_sched_events(events(&[3])).with_current_format());
-        assert_eq!(
-            sources.trial_format().unwrap(),
-            Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)
-        );
+        assert_eq!(sources.trial_format().unwrap(), current);
         sources.remember(&PreemptionRecord::from_sched_events(events(&[5])));
         let error = sources.trial_format().unwrap_err();
         assert!(error.to_string().contains("different timing formats"));

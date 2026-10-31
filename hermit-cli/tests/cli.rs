@@ -20463,12 +20463,14 @@ fn prctl_set_ptracer_answers_as_the_host_kernel_does() {
 /// skip it, and a schedule replay takes those skips where its recording did.
 /// The guest's pipe reader retries as a poller; seeds 1, 5, 6 and 7, recorded
 /// under `--chaos`, each skip it right after a failed attempt and before a
-/// writer runs. Each record must hold its skips, as format 2, and each replay
+/// writer runs. Each record must hold its skips, as format 4, and each replay
 /// must print the recording's line with no desync. This guest replays
 /// faithfully without the skips too: the replay takes such a skip one pass
 /// late, which here moves nothing. The test pins the record and the replay of
 /// skips, whose loss desynced replays of programs where that pass moved the
-/// clock.
+/// clock. A replay records no poll skips, so its own record states the format
+/// below their list, and a replay of that record prints the same line with no
+/// desync.
 #[test]
 fn a_schedule_replay_takes_a_pollers_skipped_turns_where_its_recording_did() {
     let program = pipe_reader_replay_guest()
@@ -20482,6 +20484,9 @@ fn a_schedule_replay_takes_a_pollers_skipped_turns_where_its_recording_did() {
         let record_arg = format!("--record-preemptions-to={}", record.display());
         let replay_arg = format!("--replay-schedule-from={}", record.display());
         let summary_arg = format!("--summary-json={}", summary.display());
+        let rerecord = dir.path().join(format!("seed-{seed}.rerecord.json"));
+        let rerecord_arg = format!("--record-preemptions-to={}", rerecord.display());
+        let rereplay_arg = format!("--replay-schedule-from={}", rerecord.display());
         let run = |extra: &[&str]| {
             let mut args = vec!["run", "--strict", "--epoch=2026-01-01T00:00:00Z"];
             args.extend_from_slice(extra);
@@ -20499,15 +20504,45 @@ fn a_schedule_replay_takes_a_pollers_skipped_turns_where_its_recording_did() {
                 .is_some_and(|skips| !skips.is_empty()),
             "seed {seed}: no poll skip recorded"
         );
-        assert_eq!(record_json["format_version"], 2, "seed {seed}");
         assert_eq!(
-            run(&[replay_arg.as_str(), summary_arg.as_str()]),
+            record_json["format_version"],
+            detcore::preemptions::POLL_SKIPS_FORMAT,
+            "seed {seed}"
+        );
+        assert_eq!(
+            run(&[
+                replay_arg.as_str(),
+                summary_arg.as_str(),
+                rerecord_arg.as_str()
+            ]),
             recorded,
             "seed {seed}"
         );
-        let summary: serde_json::Value =
+        let summary_json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
-        assert_eq!(summary["schedevent_desynced"], 0, "seed {seed}: {summary}");
+        assert_eq!(
+            summary_json["schedevent_desynced"], 0,
+            "seed {seed}: {summary_json}"
+        );
+        let rerecord_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&rerecord).unwrap()).unwrap();
+        assert_eq!(
+            rerecord_json["format_version"],
+            detcore::preemptions::POLL_SKIPS_FORMAT - 1,
+            "seed {seed}"
+        );
+        assert!(rerecord_json.get("poll_skips").is_none(), "seed {seed}");
+        assert_eq!(
+            run(&[rereplay_arg.as_str(), summary_arg.as_str()]),
+            recorded,
+            "seed {seed}: replay of the re-record"
+        );
+        let summary_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(
+            summary_json["schedevent_desynced"], 0,
+            "seed {seed}: replay of the re-record: {summary_json}"
+        );
     }
 }
 
@@ -57057,7 +57092,7 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
         })
     );
     assert_eq!(original["guest_ids"]["Chosen"]["base"], 5000);
-    assert_eq!(original["format_version"], 3);
+    assert_eq!(original["format_version"], 4);
     let event_count = original["global"].as_array().unwrap().len();
     assert!(event_count > 0, "{original}");
     // Raw schedule replay records its own registration priority, rather
@@ -57285,9 +57320,9 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
             serde_json::json!({
                 "per_thread": {}, "global": [],
                 "guest_ids": detcore_model::pid::GuestIds::Namespace,
-                "format_version": 4
+                "format_version": 5
             }),
-            "record format Some(4) with 0 time skips: this Hermit reads formats 1 to 3, and time skips need format 2 or later",
+            "record format Some(5) with 0 time skips: this Hermit reads formats 1 to 4, and time skips need format 2 or later",
         ),
         (
             "empty-time-skips.json",
