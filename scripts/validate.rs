@@ -14546,16 +14546,19 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         hermit_manifest_plan::validation_dag::manifest_selector_flags("compat")
     );
     if bucket.cmd.matches(selector.as_str()).count() != 1
-        || bucket.cmd.contains("run-in-pinned-root.sh")
+        || !bucket.cmd.contains("run-in-pinned-root.sh")
         || bucket
             .env
             .get("HERMIT_E2E_EMPTY_WORKDIR")
             .map(String::as_str)
             != Some("/test")
-        || !bucket.deps.iter().any(|dep| dep == "compatprep.fixtures")
+        || !bucket
+            .deps
+            .iter()
+            .any(|dep| dep == "compatprep.fixtures_in_pinned_root")
     {
         return Err(format!(
-            "strict-compat bucket: e2e.manifest_compat must run `{selector}` once on the host, in the isolated /test working directory, after compatprep.fixtures: env={:?} deps={:?} cmd={}",
+            "strict-compat bucket: e2e.manifest_compat must run `{selector}` once in the pinned root, in the isolated /test working directory, after compatprep.fixtures_in_pinned_root: env={:?} deps={:?} cmd={}",
             bucket.env, bucket.deps, bucket.cmd
         ));
     }
@@ -14567,8 +14570,9 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // The full run's compat rows: the 193 of the portable strict corpus
     // extracted from validate.sh, the 25 of
     // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
-    // the super run type runs (218 - 4).
-    let expected = 214;
+    // the super run type runs (218 - 4), less the logger and pkg-config
+    // rows deselected with the pinned-image move (214 - 2).
+    let expected = 212;
     if rows.len() != expected {
         return Err(format!(
             "strict-compat bucket: compat.yaml has {} CI rows; the full run has {expected}",

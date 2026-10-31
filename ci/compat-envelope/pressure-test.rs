@@ -8290,13 +8290,32 @@ fn host_build_steps(canonical: &DagConfig) -> Result<Vec<Step>, String> {
     let mut steps = Vec::with_capacity(canonical.steps.len());
     for step in &canonical.steps {
         let tag = step.tag();
-        if let Some((base, host)) = HOST_BUILD_VARIANTS.iter().find(|(base, _)| *base == tag) {
-            return Err(format!(
-                "canonical build graph defines {base} directly; the host pressure graph clones only {host}, so it refuses to guess which producer to run"
-            ));
+        if let Some((base, _host)) = HOST_BUILD_VARIANTS.iter().find(|(base, _)| *base == tag) {
+            // The canonical graph defines the base producer directly (since
+            // the compat fixtures gained a host producer alongside their
+            // pinned-root twin). It is a host step, not a pinned-root one, so
+            // the pressure graph runs it as-is and drops the _on_host clone
+            // below instead of guessing between two producers.
+            if step.cmd.contains(PINNED_ROOT_LAUNCHER) {
+                return Err(format!(
+                    "canonical build graph defines {base} through {PINNED_ROOT_LAUNCHER}; the host pressure graph cannot run it"
+                ));
+            }
+            if !found.insert(*base) {
+                return Err(format!(
+                    "canonical build graph duplicates {base}"
+                ));
+            }
+            steps.push(step.clone());
+            continue;
         }
         let mut step = step.clone();
         if let Some(base) = base_of(&tag) {
+            if found.contains(base) {
+                // The canonical base producer above already provides this
+                // tag; the _on_host clone would duplicate it.
+                continue;
+            }
             if !found.insert(base) {
                 return Err(format!(
                     "canonical build graph duplicates host variant {tag}"
@@ -17432,10 +17451,18 @@ fn host_build_variant_self_test(canonical: &DagConfig) -> Result<(), String> {
         .map_err(|e| format!("current canonical host build variants were refused: {e}"))?;
     let selected_tags: BTreeSet<_> = selected.iter().map(Step::tag).collect();
     for (base, host) in HOST_BUILD_VARIANTS {
+        // When the canonical graph defines the base producer directly, the
+        // selection keeps that step; otherwise it clones the host variant.
         let original = canonical
             .steps
             .iter()
-            .find(|step| step.tag() == host)
+            .find(|step| step.tag() == base)
+            .or_else(|| {
+                canonical
+                    .steps
+                    .iter()
+                    .find(|step| step.tag() == host)
+            })
             .ok_or_else(|| format!("canonical build graph lost {host}"))?;
         let cloned = selected
             .iter()
@@ -17482,18 +17509,18 @@ fn host_build_variant_self_test(canonical: &DagConfig) -> Result<(), String> {
             .ok_or_else(|| format!("canonical build graph lost {tag}"))
     };
     let workspace_host = host_index("build.workspace_on_host")?;
+    let workspace_base = host_index("build.workspace")?;
     let mut missing = canonical.clone();
-    missing.steps.remove(workspace_host);
+    missing.steps.remove(workspace_base.max(workspace_host));
+    missing
+        .steps
+        .remove(workspace_base.min(workspace_host));
     let mut duplicated = canonical.clone();
     duplicated
         .steps
-        .push(canonical.steps[workspace_host].clone());
-    let mut ambiguous = canonical.clone();
-    let mut base_named = canonical.steps[workspace_host].clone();
-    base_named.job = "workspace".into();
-    ambiguous.steps.push(base_named);
+        .push(canonical.steps[workspace_base].clone());
     let mut pinned = canonical.clone();
-    pinned.steps[host_index("build.e2e_artifact_on_host")?].cmd =
+    pinned.steps[host_index("build.e2e_artifact")?].cmd =
         format!("{PINNED_ROOT_LAUNCHER} --src . -- true");
     for (label, fixture, needles) in [
         (
@@ -17504,20 +17531,12 @@ fn host_build_variant_self_test(canonical: &DagConfig) -> Result<(), String> {
         (
             "duplicated",
             &duplicated,
-            ["duplicates host variant", "build.workspace_on_host"],
-        ),
-        (
-            "ambiguous",
-            &ambiguous,
-            [
-                "defines build.workspace directly",
-                "build.workspace_on_host",
-            ],
+            ["duplicates", "build.workspace"],
         ),
         (
             "pinned-root",
             &pinned,
-            ["build.e2e_artifact_on_host", PINNED_ROOT_LAUNCHER],
+            ["build.e2e_artifact", PINNED_ROOT_LAUNCHER],
         ),
     ] {
         let error = host_build_steps(fixture)

@@ -753,13 +753,13 @@ const PROFILES: [Profile; 11] = [
         // the ordinary in-guest Detcore runtime's prebuild, which carries the
         // same two labels: 101/102 and 80/81 before.
         label: "full",
-        direct_steps: 105,
-        selected_steps: 106,
+        direct_steps: 103,
+        selected_steps: 104,
     },
     Profile {
         label: "portable",
-        direct_steps: 84,
-        selected_steps: 85,
+        direct_steps: 82,
+        selected_steps: 83,
     },
     Profile {
         label: "quick",
@@ -1220,7 +1220,7 @@ pub(crate) const HOST_HERMIT_LINK_TAG: &str = "build.host_hermit_link";
 fn route_host_consumers_to_pinned_build(cfg: &mut DagConfig) -> Result<(), String> {
     for step in &mut cfg.steps {
         if is_hosted_variant(step)
-            || is_pinned_root_producer(step)
+            || (is_pinned_root_producer(step) && step.tag() != "compatprep.fixtures")
             || step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
             || step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
             || !step
@@ -2540,7 +2540,7 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
             let e2e_artifact = pinned_root_twin_tag("build.e2e_artifact");
             step.deps.retain(|dependency| *dependency != e2e_artifact);
         }
-        if step.group == "privileged-e2e"
+        if (step.group == "privileged-e2e" || step.group == "e2e")
             && producer_tags.contains("build.e2e_artifact")
             && !step
                 .deps
@@ -4502,10 +4502,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // outside the per-commit smoke pair, in the SaBRe run type (442 + 1).
     // 446 with compatprep.fixtures_in_pinned_root and its hosted split, so
     // e2e.manifest_compat runs in the pinned root on fixtures prepared in the
-    // same environment (443 + 3).
-    if cfg.steps.len() != 446 {
+    // same environment (443 + 3). 444 since the host compatprep.fixtures
+    // reaches Hermit through build.host_hermit_link like every other host
+    // consumer, so the retired build.workspace/build.e2e_artifact base
+    // producers stay retired (446 - 2).
+    if cfg.steps.len() != 444 {
         return Err(format!(
-            "superset has {} steps, expected 446",
+            "superset has {} steps, expected 444",
             cfg.steps.len()
         ));
     }
@@ -7123,8 +7126,10 @@ sys.exit(37)
         // 99 again since that check runs in Reverie's own validate and CI
         // (102 full nodes), and 100 with build.liteinst_runtime_in_pinned_root
         // (103 full nodes), and 103 since e2e.manifest_compat moved into the
-        // pinned root on compatprep.fixtures_in_pinned_root (106 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 103);
+        // pinned root on compatprep.fixtures_in_pinned_root (106 full nodes),
+        // and 101 since the host fixtures route through build.host_hermit_link
+        // and the retired base producers stay retired (104 full nodes).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 101);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
