@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3055,
-      "applicable": 2244,
-      "selectable": 1755,
+      "applicable": 2245,
+      "selectable": 1756,
       "population": 2995,
-      "population_candidate_selected": 1755,
+      "population_candidate_selected": 1756,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 765
+      "population_candidate_disabled": 764
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 611,
-        "applicable": 577,
-        "selectable": 570,
+        "applicable": 578,
+        "selectable": 571,
         "population": 599,
-        "population_candidate_selected": 570,
+        "population_candidate_selected": 571,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 26
+        "population_candidate_disabled": 25
       },
       "liteinst": {
         "cells": 611,
@@ -2932,7 +2932,7 @@
     {"test_id":"system-utils/clock-determinism","backend":"sabre","category":"system-utils","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"system-utils/clock-exec-continuity","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/clock-exec-continuity","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"system-utils/clock-exec-continuity","backend":"kvm","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Enable once the KVM post-exec clock path is qualified against the ptrace baseline"},
+    {"test_id":"system-utils/clock-exec-continuity","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/clock-exec-continuity","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The preload runtime does not survive the guest's own re-exec"},
     {"test_id":"system-utils/clock-exec-continuity","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC"},
     {"test_id":"system-utils/date-nanoseconds","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
