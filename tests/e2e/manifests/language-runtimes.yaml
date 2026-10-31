@@ -628,11 +628,11 @@ test:
           kvm: true
           dbt: true
         timeout_seconds:
-          dbt: 64
+          dbt: 102
         cpu_timeout_seconds:
-          dbt: 33
+          dbt: 50
         slow_reason:
-          dbt: Local samples at the flip head on the measurement host recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" (test-harness run, 2026-10-30) measured 19.841 CPU seconds and 21.226 wall seconds in an uncapped passing run, with one run stopped at the default 22 CPU s; the configured bound is ceil(1.5 x 22.0) = 33 and ceil(3x wall) = 64. The cell was also CLEAN on the nightly pressure sweeps of 2026-10-29 and 2026-10-30.
+          dbt: Local samples at the flip head on the measurement host recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" (test-harness run, 2026-10-30) measured 19.841 CPU seconds and 21.226 wall seconds in an uncapped passing run, with one run stopped at the default 22 CPU s; the configured bound is ceil(1.5 x 22.0) = 33 and ceil(3x wall) = 64. The cell was also CLEAN on the nightly pressure sweeps of 2026-10-29 and 2026-10-30. Recalibrated 2026-10-31 at Hermit 4304385b11; solo and contained width-12 samples completed at 18.0 to 23.0 CPU seconds, but the full validations of 6d34a412 and 5d111b3e each stopped both attempts at the 33 CPU-second bound (33.03 to 33.07 used, 33.8 wall), so the bound follows the same censored-stop rule from the new stop; ceil(1.5 x 33.07) = 50 CPU seconds and ceil(3 x 33.85) = 102 wall seconds. CPU seconds under full-validate load run at least 1.7x the solo cost; that inflation is recorded here for the DBT owners rather than hidden.
         backends_enabled:
           - ptrace
           - kvm
@@ -1101,6 +1101,12 @@ test:
           ptrace: true
           kvm: true
           dbt: true
+        timeout_seconds:
+          dbt: 91
+        cpu_timeout_seconds:
+          dbt: 34
+        slow_reason:
+          dbt: Measured 2026-10-31 at Hermit 4304385b11 on the host named in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" (test-harness run); twelve solo and contained width-12 samples completed at 17.8 to 18.5 CPU seconds and 19.4 to 20.9 wall seconds, but the full validations of 6d34a412 and 5d111b3e each stopped both attempts at the ordinary 22 CPU-second cap (22.05 used, 22.5 to 22.6 wall). The configured bound follows the censored-stop rule of the 2026-10-30 flip; ceil(1.5 x 22.05) = 34 CPU seconds and ceil(4 x 22.63) = 91 wall seconds.
         backends_enabled:
           - ptrace
           - kvm

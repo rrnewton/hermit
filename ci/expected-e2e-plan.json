@@ -52903,7 +52903,7 @@
       "backend": "dbt",
       "category": "language-runtimes",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 34,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -52914,7 +52914,7 @@
         "python3"
       ],
       "test": "language-runtimes/python-dict-hash-iteration",
-      "timeout_seconds": 57
+      "timeout_seconds": 91
     },
     {
       "backend": "ptrace",
@@ -52980,7 +52980,7 @@
       "backend": "dbt",
       "category": "language-runtimes",
       "classification": "required",
-      "cpu_timeout_seconds": 33,
+      "cpu_timeout_seconds": 50,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -52991,7 +52991,7 @@
         "python3"
       ],
       "test": "language-runtimes/python-io-subprocess-time",
-      "timeout_seconds": 64
+      "timeout_seconds": 102
     },
     {
       "backend": "ptrace",
