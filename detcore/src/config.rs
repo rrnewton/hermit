@@ -161,6 +161,8 @@ mod tests {
         // revisions 17 to 19, never on main, became this one when main took
         // 17 to 19).
         (20, "3fb2388350b1a2fa", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::ImplicitPort` (#4664).
+        (21, "3f7ca89cbccc93ad", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
