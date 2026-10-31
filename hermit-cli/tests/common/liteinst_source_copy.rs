@@ -159,7 +159,12 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
         // RPC protocol (seven rows added by the native caller-Tool join).
         // Four package-role proof/fixture inputs are also bound.
         // The separately bound qualifier source adds one input.
-        78
+        // Reverie 78e3cadac76b adds five more: the native-syscall modules
+        // (reverie/src/native_syscall.rs, reverie-ptrace/src/task/
+        // native_syscall.rs) and the reserved-input modules
+        // (reverie/src/reserved_input/{mod,registry}.rs,
+        // reverie-ptrace/src/task/reserved_input.rs): 78 + 5 = 83.
+        83
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");
