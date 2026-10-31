@@ -4579,7 +4579,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // replay needs a PMU stop on a branch count to go wrong, joins them: 17,
     // listed.
     // The PR 4853 transplant adds three timeslice cases here: 18 + 3 = 21, re-measured at this integration head.
-    ("privileged-test.pmu_cli_cases", 21),
+    // a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write,
+    // which only a PMU preemption can end, joins them: 21 + 1 = 22,
+    // re-measured at fd59b85c73 (22 passed).
+    ("privileged-test.pmu_cli_cases", 22),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this

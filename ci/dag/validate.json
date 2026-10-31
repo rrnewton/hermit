@@ -32388,7 +32388,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER": "4",
         "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER": "3",
-        "NEXTEST_EXPECTED_EXECUTED": "21",
+        "NEXTEST_EXPECTED_EXECUTED": "22",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
