@@ -3553,9 +3553,12 @@ const MAX_SHEBANG_DEPTH: usize = 4;
 /// actually a `#!`-script (for example `/usr/local/bin/file` -> `#!/bin/bash`,
 /// or `/usr/bin/pkg-config` -> `#!/usr/bin/sh`) must be rewritten to launch its
 /// interpreter, exactly as the kernel's `execve(2)` `binfmt_script` handler
-/// does. On success the returned image is an ELF and `argv` has the interpreter,
-/// its shebang arguments, and the script path prepended in kernel order:
-/// `[interp, shebang_args.., script_path, <original argv[1..]>]`.
+/// does. On success the returned file is the ELF image to load and `argv` has
+/// the interpreter, its shebang arguments, and the script path prepended in
+/// kernel order: `[interp, shebang_args.., script_path, <original argv[1..]>]`.
+/// Each file is opened once and its `#!` line is read from that open file, so
+/// the file returned is the one whose bytes were examined, as the kernel execs
+/// the file it read.
 ///
 /// The interpreter line is parsed with hermit's shared [`Shebang`] so the KVM
 /// backend matches how the ptrace backend and recorder treat `#!`-scripts.
@@ -3563,9 +3566,9 @@ const MAX_SHEBANG_DEPTH: usize = 4;
 fn resolve_kvm_shebang(
     resolved_program: &Path,
     mut argv: Vec<String>,
-) -> Result<(PathBuf, Vec<String>, Vec<u8>), Error> {
+) -> Result<(PathBuf, Vec<String>, fs::File), Error> {
     let mut load_path = resolved_program.to_path_buf();
-    let mut image = fs::read(&load_path)
+    let (mut file, mut image) = read_kvm_image(&load_path)
         .map_err(|error| anyhow!("failed to read KVM guest executable {load_path:?}: {error}"))?;
 
     let mut depth = 0;
@@ -3602,14 +3605,23 @@ fn resolve_kvm_shebang(
         argv = rewritten;
 
         load_path = interpreter;
-        image = fs::read(&load_path).map_err(|error| {
+        (file, image) = read_kvm_image(&load_path).map_err(|error| {
             anyhow!(
                 "failed to read `#!` interpreter {load_path:?} for {resolved_program:?}: {error}"
             )
         })?;
     }
 
-    Ok((load_path, argv, image))
+    Ok((load_path, argv, file))
+}
+
+/// Opens `path` and reads its whole contents from that open file.
+#[cfg(target_arch = "x86_64")]
+fn read_kvm_image(path: &Path) -> io::Result<(fs::File, Vec<u8>)> {
+    let mut file = fs::File::open(path)?;
+    let mut image = Vec::new();
+    io::Read::read_to_end(&mut file, &mut image)?;
+    Ok((file, image))
 }
 
 /// The container replaces this host directory with a private, empty tmpfs, so
@@ -3906,7 +3918,7 @@ async fn run_kvm(
     }
 
     // Rewrite `#!`-scripts to their interpreter before the ELF loader sees them.
-    let (_interpreter_path, argv, image) = resolve_kvm_shebang(&resolved_program, argv)?;
+    let (_interpreter_path, argv, executable) = resolve_kvm_shebang(&resolved_program, argv)?;
     // After shebang resolution the executable is the interpreter (argv[0]).
     let program = argv.first().cloned().unwrap_or(program);
     let envp = command
@@ -3954,21 +3966,26 @@ async fn run_kvm(
     // The ptrace launcher execs the path `find_program` resolved, so that is
     // the filename Linux records in AT_EXECFN and copies to the top of the
     // stack, including for a `#!` script whose argv now starts with the
-    // interpreter.
+    // interpreter. The guest's executable is the file itself, the
+    // interpreter's for a script, as Linux keeps the file it execs: an exec
+    // or stat of `/proc/self/exe` reaches it from the first image, as it does
+    // under ptrace. Installing bytes left the first image with no file, so an
+    // exec of `/proc/self/exe` failed with ENOENT there. The file is read in
+    // full twice: by `resolve_kvm_shebang`, which only looks for a `#!` line,
+    // and again by the loader, which keeps the one copy of the image that
+    // the process holds for the run (LinuxEmu's `executable_image`, which a
+    // self-exec runs again). `run_kvm` keeps no copy of its own; holding one
+    // for the whole run cost 75 MB for node
+    // (https://github.com/rrnewton/reverie/issues/1063).
     backend
-        .install_static_elf_with_exec_context(
-            &image,
+        .install_static_elf_file_with_exec_context(
+            executable,
             resolved_program.as_os_str(),
             &argv,
             &envp,
             &cwd,
         )
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
-    // The loader has copied the image's segments into guest memory, so the
-    // file's bytes are no longer needed. Holding them until the run ends kept
-    // a second copy of the program in host memory for the whole run: 75 MB
-    // for node (https://github.com/rrnewton/reverie/issues/1063).
-    drop(image);
     // The placeholder directory Detcore serves `/proc` and the descriptor
     // directories on (`DetConfig::directory_placeholder`, a container's
     // empty read-only tmpfs at `/proc/fs/nfsd`): the executor reaches it only
@@ -10585,6 +10602,15 @@ mod tests {
     // with `#!`, and a real ELF magic makes the intent obvious.
     const FAKE_ELF: &[u8] = b"\x7fELF\x02\x01\x01\x00 fake elf body";
 
+    /// The whole contents of the open file `resolve_kvm_shebang` returned, read
+    /// from its start.
+    fn image_of(mut file: fs::File) -> Vec<u8> {
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).unwrap();
+        let mut image = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut image).unwrap();
+        image
+    }
+
     fn shebang_tmpdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "hermit-shebang-test-{}-{}",
@@ -10603,10 +10629,10 @@ mod tests {
         fs::write(&prog, FAKE_ELF).unwrap();
 
         let argv = vec!["prog".to_owned(), "-a".to_owned()];
-        let (path, out_argv, image) = resolve_kvm_shebang(&prog, argv).unwrap();
+        let (path, out_argv, file) = resolve_kvm_shebang(&prog, argv).unwrap();
         assert_eq!(path, prog);
         assert_eq!(out_argv, vec!["prog".to_owned(), "-a".to_owned()]);
-        assert_eq!(image, FAKE_ELF);
+        assert_eq!(image_of(file), FAKE_ELF);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -10620,7 +10646,7 @@ mod tests {
         fs::write(&script, format!("#!{} -x\necho hi\n", interp.display())).unwrap();
 
         let argv = vec!["script".to_owned(), "arg1".to_owned()];
-        let (path, out_argv, image) = resolve_kvm_shebang(&script, argv).unwrap();
+        let (path, out_argv, file) = resolve_kvm_shebang(&script, argv).unwrap();
         assert_eq!(path, interp);
         // Kernel order: [interp, optarg, script_path, original args after argv[0]].
         assert_eq!(
@@ -10632,7 +10658,7 @@ mod tests {
                 "arg1".to_owned(),
             ]
         );
-        assert_eq!(image, FAKE_ELF);
+        assert_eq!(image_of(file), FAKE_ELF);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -10647,7 +10673,7 @@ mod tests {
         fs::write(&script, format!("#!{} -e\n", mid.display())).unwrap();
 
         let argv = vec!["script".to_owned(), "arg1".to_owned()];
-        let (path, out_argv, image) = resolve_kvm_shebang(&script, argv).unwrap();
+        let (path, out_argv, file) = resolve_kvm_shebang(&script, argv).unwrap();
         assert_eq!(path, interp);
         // Level 1: [mid, -e, script, arg1]; level 2 prepends [interp, mid].
         assert_eq!(
@@ -10660,7 +10686,7 @@ mod tests {
                 "arg1".to_owned(),
             ]
         );
-        assert_eq!(image, FAKE_ELF);
+        assert_eq!(image_of(file), FAKE_ELF);
         fs::remove_dir_all(&dir).unwrap();
     }
 
