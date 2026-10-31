@@ -3224,7 +3224,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_gone_threads_waiting_edge_does_not_end_at_its_ids_next_task and
     // a_child_gone_before_its_parents_clone_returns_keeps_its_creation_edge:
     // 3363 + 5 = 3368.
-    ("test.detcore_unit", 3368),
+    // And scheduler's
+    // a_nonleader_exec_keeps_the_callers_pending_sends_under_the_leader:
+    // 3368 + 1 = 3369.
+    ("test.detcore_unit", 3369),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5727,7 +5730,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same twenty-seven N3 detcore units: 3321 + 27 = 3348.
     // And the same fifteen sync-edge tests as test.detcore_unit: 3363.
     // And the same five edge-soundness tests: 3368.
-    ("test.detcore_unit_on_host", 3368),
+    // And the same non-leader exec test: 3369.
+    ("test.detcore_unit_on_host", 3369),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
