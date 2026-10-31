@@ -5359,6 +5359,178 @@ fn run_rejects_subcommand_level_backend() {
     assert_success(&output, &args);
 }
 
+/// `hermit analyze` prepares `--rewrite-exclusives` for its trials, as
+/// `hermit run` does. A trial starts through `RunOpts::run`, which skips the
+/// preprocessing `RunOpts::main` applies, so trials ran the original images
+/// while each trial's printed reproducer carried the option. On a host without
+/// FEAT_LSE, where `hermit run --rewrite-exclusives` refuses, the analysis's
+/// first trial must refuse the same way rather than run the program
+/// unrewritten. This proves the trial path runs the preparation; that its
+/// overlays then reach the trial can only be seen where the rewrite succeeds,
+/// on aarch64 with FEAT_LSE, where this file's tests do not build, so that is
+/// measured by hand (see the pull request).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn analyze_trials_prepare_the_exclusive_rewrite_their_reproducer_names() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let tmp_dir = format!("--tmp-dir={}", directory.path().display());
+    let refusal = "which this host does not execute (no HWCAP_ATOMICS)";
+
+    let run = hermit(&["run", "--rewrite-exclusives", "--", "/bin/false"]);
+    assert!(stderr(&run).contains(refusal), "{}", stderr(&run));
+
+    let analyzed = hermit(&[
+        "analyze",
+        &tmp_dir,
+        "--run1-seed=1",
+        "--",
+        "--chaos",
+        "--rewrite-exclusives",
+        "--",
+        "/bin/false",
+    ]);
+    let log = stderr(&analyzed);
+    assert!(!analyzed.status.success(), "{log}");
+    assert!(
+        log.contains(refusal),
+        "the trial did not prepare the rewrite:\n{log}"
+    );
+}
+
+/// `--rewrite-exclusives` under `--no-namespace` rewrites in the guest's
+/// memory (there is no mount namespace for the overlay), so the two flags no
+/// longer conflict; asking for the overlay there, or naming overlay files
+/// for an in-memory rewrite, is refused before anything runs, on any host.
+#[test]
+fn rewrite_exclusives_picks_memory_without_a_namespace_and_refuses_what_cannot_apply() {
+    let _guard = hermit_run_guard();
+    let overlay_refusal = "a --no-namespace guest has no mount namespace to carry them";
+    let also_refusal = "rewriting in memory covers every executable file the guest maps";
+
+    let overlay = hermit(&[
+        "run",
+        "--no-namespace",
+        "--rewrite-exclusives",
+        "--rewrite-exclusives-mode=overlay",
+        "--",
+        "/bin/true",
+    ]);
+    assert!(!overlay.status.success());
+    assert!(
+        stderr(&overlay).contains(overlay_refusal),
+        "{}",
+        stderr(&overlay)
+    );
+
+    let also = hermit(&[
+        "run",
+        "--rewrite-exclusives",
+        "--rewrite-exclusives-mode=memory",
+        "--rewrite-exclusives-also=/bin/true",
+        "--",
+        "/bin/true",
+    ]);
+    assert!(!also.status.success());
+    assert!(stderr(&also).contains(also_refusal), "{}", stderr(&also));
+
+    // Concurrent threads could run the code being written.
+    let concurrent = hermit(&[
+        "run",
+        "--no-namespace",
+        "--no-sequentialize-threads",
+        "--rewrite-exclusives",
+        "--",
+        "/bin/true",
+    ]);
+    assert!(!concurrent.status.success());
+    assert!(
+        stderr(&concurrent).contains("under --no-sequentialize-threads"),
+        "{}",
+        stderr(&concurrent)
+    );
+
+    // The default under --no-namespace is memory: no argument conflict, and
+    // the run gets as far as the host check (refused on a host without
+    // FEAT_LSE, admitted on one with it).
+    let auto = hermit(&[
+        "run",
+        "--no-namespace",
+        "--rewrite-exclusives",
+        "--",
+        "/bin/true",
+    ]);
+    let log = stderr(&auto);
+    assert!(!log.contains("cannot be used with"), "{log}");
+    assert!(!log.contains(overlay_refusal), "{log}");
+    // An x86_64 host has no FEAT_LSE: the admitted mode must reach exactly
+    // that refusal, not fail for some other reason or run unrewritten. An
+    // aarch64 test host has it, and the run must succeed.
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(!auto.status.success());
+        assert!(log.contains("no HWCAP_ATOMICS"), "{log}");
+    }
+    #[cfg(target_arch = "aarch64")]
+    assert!(auto.status.success(), "{log}");
+
+    // A recording says whether its run rewrote in memory, and a replay under
+    // the other setting is refused before launch, either way round.
+    let records = tempfile::tempdir().unwrap();
+    let rewritten = records.path().join("rewritten.json");
+    let plain = records.path().join("plain.json");
+    std::fs::write(
+        &rewritten,
+        r#"{"per_thread":{},"global":[],"rewrite_exclusives_in_memory":true}"#,
+    )
+    .unwrap();
+    std::fs::write(&plain, r#"{"per_thread":{},"global":[]}"#).unwrap();
+    let replay_plain = hermit(&[
+        "run",
+        &format!("--replay-schedule-from={}", rewritten.display()),
+        "--",
+        "/bin/true",
+    ]);
+    assert!(!replay_plain.status.success());
+    assert!(
+        stderr(&replay_plain)
+            .contains("would be replayed with exclusive loops as the files have them"),
+        "{}",
+        stderr(&replay_plain)
+    );
+    let replay_rewritten = hermit(&[
+        "run",
+        "--rewrite-exclusives",
+        "--rewrite-exclusives-mode=memory",
+        &format!("--replay-preemptions-from={}", plain.display()),
+        "--",
+        "/bin/true",
+    ]);
+    assert!(!replay_rewritten.status.success());
+    assert!(
+        stderr(&replay_rewritten)
+            .contains("was recorded with exclusive loops as the files have them"),
+        "{}",
+        stderr(&replay_rewritten)
+    );
+
+    // Detcore does the rewrite, and --namespace-only runs no Detcore.
+    let namespace_only = hermit(&[
+        "run",
+        "--namespace-only",
+        "--rewrite-exclusives",
+        "--rewrite-exclusives-mode=memory",
+        "--",
+        "/bin/true",
+    ]);
+    assert!(!namespace_only.status.success());
+    assert!(
+        stderr(&namespace_only).contains("which --namespace-only does not run"),
+        "{}",
+        stderr(&namespace_only)
+    );
+}
+
 #[test]
 fn analyze_rejects_backend_in_its_run_arguments() {
     // `hermit analyze` builds its trials' `run` options from --run-arg and its
