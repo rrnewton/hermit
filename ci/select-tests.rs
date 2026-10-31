@@ -2082,8 +2082,11 @@ fn coarse_selection_bracket(root: &Path, check: &mut dyn FnMut(&str, bool)) {
         dbt.nodes.contains("build.workspace_on_host"),
     );
     check(
-        "dbt-only skips compat (no DBT cells in the current plan)",
-        !dbt.nodes.contains("e2e.manifest_compat_on_host"),
+        "dbt-only runs compat (DBT cells present in the coarse fixture)",
+        plan.cells
+            .iter()
+            .any(|cell| cell.backend == "dbt" && cell.category == "compat")
+            && dbt.nodes.contains("e2e.manifest_compat_on_host"),
     );
     check(
         "dbt-only runs language_runtimes (has DBT cells)",
