@@ -624,7 +624,6 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
-    "privileged-test.pmu_chaos_cli_cases",
     "privileged-test.pmu_detcore_time_cases",
     "privileged-cpuid.cpu_profile_v3",
     "test.pmu_integration_cases",
@@ -2498,11 +2497,12 @@ fn split_pinned_workspace_twin(twin: Step) -> Result<[Step; 2], String> {
 /// it, so the same cell saw different inputs across runs. When the twin
 /// exists, retire the host copy from the local profiles; the authored
 /// hosted variant (compatprep.fixtures_on_host) is a separate step.
-fn retire_host_fixtures_when_twin_present(cfg: &mut DagConfig, twins: &[Step]) {
+fn retire_host_fixtures_when_twin_present(cfg: &mut DagConfig) {
+    // Called after the twins are pushed into cfg, so the twin is visible
+    // in cfg.steps.
     let twin_present = cfg
         .steps
         .iter()
-        .chain(twins.iter())
         .any(|step| step.tag() == "compatprep.fixtures_in_pinned_root");
     if !twin_present {
         return;
@@ -2696,10 +2696,13 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
                 .retain(|label| label != "portable-strict-compat-only");
         }
     }
-    retire_host_fixtures_when_twin_present(cfg, &twins);
     cfg.steps.push(pinned_root_fetch()?);
     cfg.steps.extend(twins);
     route_host_consumers_to_pinned_build(cfg)?;
+    // Retire after routing: clearing the host fixtures step's labels first
+    // would exempt it from routing, leaving its dependency on the host
+    // build producers in place and keeping those retired producers alive.
+    retire_host_fixtures_when_twin_present(cfg);
     retire_unconsumed_host_producers(cfg);
     Ok(())
 }
@@ -4555,13 +4558,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // same environment (443 + 3). 444 since the host compatprep.fixtures
     // reaches Hermit through build.host_hermit_link like every other host
     // consumer, so the retired build.workspace/build.e2e_artifact base
-    // producers stay retired (446 - 2). 446 again with the host-fixtures
-    // retirement (issue 4997): build.workspace and build.e2e_artifact are
-    // retained as unlabeled host bases beside their pinned twins in the
-    // generated superset (444 + 2).
-    if cfg.steps.len() != 446 {
+    // producers stay retired (446 - 2).
+    if cfg.steps.len() != 444 {
         return Err(format!(
-            "superset has {} steps, expected 446",
+            "superset has {} steps, expected 444",
             cfg.steps.len()
         ));
     }
@@ -6002,12 +6002,15 @@ sys.exit(37)
             steps: vec![fixture_step("fixtures", &["full", "portable"])],
             ..Default::default()
         };
-        retire_host_fixtures_when_twin_present(&mut cfg, &[]);
+        retire_host_fixtures_when_twin_present(&mut cfg);
         assert_eq!(cfg.steps[0].labels, ["full", "portable"]);
 
         // Twin present: the host copy must not stay selected (issue 4997).
-        let twin = fixture_step("fixtures_in_pinned_root", &["full", "portable"]);
-        retire_host_fixtures_when_twin_present(&mut cfg, &[twin]);
+        cfg.steps.push(fixture_step(
+            "fixtures_in_pinned_root",
+            &["full", "portable"],
+        ));
+        retire_host_fixtures_when_twin_present(&mut cfg);
         assert!(cfg.steps[0].labels.is_empty(), "{:?}", cfg.steps[0].labels);
     }
 

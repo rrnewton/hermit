@@ -7326,8 +7326,11 @@ mod e2e_runner_tests {
                 assert!(dropped.contains(cargo_tag), "{tag} replaces nothing");
             }
         }
-        assert_eq!(dropped.len(), 22, "{dropped:?}");
-        assert_eq!(buck_tags.len(), cargo_tags.len() - 22 + 19);
+        // 21 dropped since the host compatprep.fixtures step retired from
+        // full (issue 4997, one writer): the Cargo full plan no longer
+        // carries it for the Buck plan to drop. 22 before.
+        assert_eq!(dropped.len(), 21, "{dropped:?}");
+        assert_eq!(buck_tags.len(), cargo_tags.len() - 21 + 19);
         assert_eq!(buck.profile, "full");
         assert_eq!(buck.selection_mode, "full");
         assert!(buck.suite_complete);
@@ -13139,6 +13142,11 @@ fn privileged_nodes_for_scope(
                 "privileged-test.pmu_ptrace_completion_cases",
                 "privileged-test.pmu_detcore_time_cases",
                 "privileged-test.pmu_cli_cases",
+                // The PMU chaos cases (chaos_buck_* in hermit_modes) are a
+                // ptrace PMU node like the three above; the node was
+                // renamed from pmu_chaos_cli_cases without joining this
+                // list, so selective ptrace runs skipped them.
+                "privileged-test.pmu_buck_chaos_cases",
                 "privileged-pmu.preemption",
                 "privileged-cpuid.cpu_profile_v3",
                 "privileged-cpuid.faulting",
@@ -33861,14 +33869,14 @@ mod shared_consumer_tests {
         let selected_tags: BTreeSet<String> = selected.steps.iter().map(Step::tag).collect();
         for tag in [
             "privileged-test.pmu_cli_cases",
-            "privileged-test.pmu_chaos_cli_cases",
+            "privileged-test.pmu_buck_chaos_cases",
         ] {
             assert!(selected_tags.contains(tag), "missing {tag}");
         }
         let chaos = full
             .steps
             .iter()
-            .find(|step| step.tag() == "privileged-test.pmu_chaos_cli_cases")
+            .find(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases")
             .unwrap();
         for dependency in &chaos.deps {
             assert!(selected_tags.contains(dependency), "missing {dependency}");
@@ -33889,7 +33897,7 @@ mod shared_consumer_tests {
         assert!(!portable
             .steps
             .iter()
-            .any(|step| step.tag() == "privileged-test.pmu_chaos_cli_cases"));
+            .any(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases"));
         assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
             .unwrap();
         let isolated = full

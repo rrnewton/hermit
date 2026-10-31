@@ -801,36 +801,6 @@
     },
     {
       "group": "build",
-      "job": "workspace",
-      "desc": "Prepare DBT native resources, then build every workspace target, the backend plugins and the one Hermit binary in the validate profile",
-      "description": "The one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first builds exactly the nextest preparation's guest build, `-p hermetic_infra_hermit_tests --bins`, in the same profile, so that build finds every unit it links already fresh. The workspace build cannot serve it: it resolves 14 shared dependencies with wider features (parking_lot gains send_guard, bytes serde, syn fold), which gives every reverie and hermit-detcore unit a new hash, and building hermit-install alone instead (def08d743) made the guest build compile them inside build.workspace_in_pinned_root, 46 s, so it was reverted. Until 2026-10-18 this first build was `-p detcore-dbt`, a superset of the guest build's units plus reverie-dbt's DynamoRIO build script (25.8 s) and detcore-dbt itself (24.4 s), both rebuilt by the workspace build anyway, which also builds reverie-dbt before hermit-install's build script reads its DynamoRIO cache (the cache publishes by atomic rename, so concurrent builders are safe). In the 32-job timings of 601df499 the first build took 55.9 s and the guest build's own units end at about 47 s; the workspace build's critical chain (163.4 s replayed) does not move when the DynamoRIO build script joins it, since it finishes before detcore-dbt can start. It then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names, and `nextest-binaries.rs prepare` lists every test executable from that one build and records each selection's subset, so no selection recompiles anything or relinks target/validate/hermit. Until 2026-09-30 sixteen per-selection Cargo invocations each re-resolved features and relinked Hermit, about 620 of this node's 830 seconds at d44bbbb79acd.  It cleans reverie-dbt only when ci/clean-stale-reverie-dbt.sh finds a recorded DynamoRIO install that no longer matches its own attestation (a target restored without reverie-dbt-native-cache), and it forces hermit-install to restage target/install_pkg (HERMIT_INSTALL_FORCE_RESTAGE), which a warm target does not carry. Until 2026-10-17 it cleaned reverie-dbt and detcore-sabre on every run for those two reasons, which rebuilt detcore-dbt, hermit and the cdylibs above them even when nothing they compile had changed. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca.",
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/clean-stale-reverie-dbt.sh validate && export HERMIT_INSTALL_FORCE_RESTAGE=\"${DAGRUN_STEP_STARTED_MONOTONIC_NS:-$(date +%s%N)}\" && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate -p hermetic_infra_hermit_tests --bins && HERMIT_CARGO_TIMINGS_DIR=\"${E2E_RESULT_ROOT:+$E2E_RESULT_ROOT/cargo-timings}\" ./ci/run-with-reverie-dbt-budget.sh cargo build --locked --profile validate --workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/third-party-backends && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target",
-      "result_manifests": [],
-      "deps": [
-        "gate.manifest",
-        "setup.nextest"
-      ],
-      "env": {},
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 1200,
-      "cpu_timeout": 7200,
-      "jobs_flag": "",
-      "jobs_env": "CARGO_BUILD_JOBS",
-      "hint": {
-        "resources": {},
-        "est_duration_s": 130.0,
-        "rss_baseline_bytes": 11663998976,
-        "hard_mem_max_bytes": 68719476736,
-        "classification": "cpu-bound",
-        "preferred_inner_jobs": 32,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "build.workspace"
-    },
-    {
-      "group": "build",
       "job": "buck_release_artifact",
       "desc": "Prepare the opt-in Buck release artifact",
       "description": "Cargo mode is the default and this node is an inert, explicit branch. Buck mode runs only on the network-capable host, builds the feature-complete release target through the caller-bound public DotSlash launcher, reconciles the retained Buck event/stdout evidence, checks typed provenance and features, then publishes one content-addressed binary under ignored/. The network-disabled pinned-root producer depends on this node and may only install those exact verified bytes; no Buck failure falls back to Cargo.",
@@ -863,36 +833,6 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "build.buck_release_artifact"
-    },
-    {
-      "group": "build",
-      "job": "e2e_artifact",
-      "desc": "Publish the one Hermit binary at target/ci/hermit and as a verified content-addressed bundle with its backend resources",
-      "description": "This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30.",
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; case \"${HERMIT_VALIDATE_RELEASE_BUILD_MODE:-cargo}\" in cargo) ./ci/nextest-binaries.rs assert full && rm -rf target/install_pkg/rsrcs/hermit-runtime && hermit_payload=target/validate/hermit ;; buck) ./scripts/build-buck-release.rs --validate-dag-install && hermit_payload=target/ci/hermit-strict ;; *) echo \"unknown Hermit release build mode: ${HERMIT_VALIDATE_RELEASE_BUILD_MODE}\" >&2; exit 2 ;; esac && mkdir -p target/ci && install -m 755 \"$hermit_payload\" target/ci/hermit && sabre_source=target/install_pkg/rsrcs/libdetcore_sabre.so && sabre_before=$(sha256sum \"$sabre_source\" | cut -d' ' -f1) && install -m 755 \"$sabre_source\" target/ci/libdetcore_sabre.so && sabre_after=$(sha256sum \"$sabre_source\" | cut -d' ' -f1) && sabre_copy=$(sha256sum target/ci/libdetcore_sabre.so | cut -d' ' -f1) && test \"$sabre_before\" = \"$sabre_after\" && test \"$sabre_before\" = \"$sabre_copy\" && sha256sum target/ci/hermit target/ci/libdetcore_sabre.so target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision && ./ci/publish-hermit-e2e-artifact.sh target/ci/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg",
-      "result_manifests": [],
-      "deps": [
-        "build.buck_release_artifact",
-        "build.workspace"
-      ],
-      "env": {},
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 120,
-      "cpu_timeout": 7200,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 20.0,
-        "rss_baseline_bytes": 536870912,
-        "hard_mem_max_bytes": 2147483648,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "build.e2e_artifact"
     },
     {
       "group": "build",
@@ -52408,7 +52348,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./tests/compat/prepare_real_compat_fixtures.sh $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures",
       "result_manifests": [],
       "deps": [
-        "build.e2e_artifact",
+        "build.host_hermit_link",
         "doc.doctests",
         "doc.rustdoc",
         "lint.clippy",
