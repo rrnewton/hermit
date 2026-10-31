@@ -116,21 +116,34 @@ check_native_libraries() {
 
 check_guest_paths() {
     local root=${1:-}
-    local manifest
-    manifest=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/guest-paths.txt
+    # The manifest is the exact allowlist: every literal path the corpus
+    # names, one per line, reviewed with the image. There is deliberately
+    # no name-pattern gate here — an earlier /usr/bin/[A-Za-z0-9_-] shape
+    # (widened to a basename charset on 2026-10-30) refused legitimate
+    # listed paths (/usr/bin/[, /usr/bin/c++filt, /usr/sbin/ip) while
+    # admitting unlisted ones that happened to match the charset. A listed
+    # line is admitted exactly as written; the only structural rules are
+    # that it is a canonical absolute path (no empty, dot or dot-dot
+    # components, no whitespace) and not a duplicate.
+    local manifest=${2:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/guest-paths.txt}
     local path count=0
     local missing=()
-    local -A seen=()
+    # Duplicate detection compares whole lines literally. An associative
+    # array keyed by the path would mis-key names containing [ or ], which
+    # the exact allowlist deliberately admits (/usr/bin/[).
+    local seen_list=$'\n'
     [[ -f $manifest ]] || {
         echo "assert-build-dependencies: missing guest-path manifest: $manifest" >&2
         return 2
     }
     while IFS= read -r path || [[ -n $path ]]; do
-        if [[ ! $path =~ ^/usr/(bin|sbin)/[][A-Za-z0-9_.+-]+$ || -v seen[$path] ]]; then
+        if [[ $path != /* || $path == *[[:space:]]* || $path == *//* \
+            || $path == */. || $path == */.. || $path == */./* || $path == */../* \
+            || $seen_list == *$'\n'"$path"$'\n'* ]]; then
             echo "assert-build-dependencies: invalid or duplicate guest path: $path" >&2
             return 2
         fi
-        seen[$path]=1
+        seen_list+="$path"$'\n'
         count=$((count + 1))
         if [[ ! -f $root$path || ! -x $root$path ]]; then
             missing+=("$path")
@@ -293,6 +306,31 @@ self_test() {
     done
     check_guest_paths "$guest_root"
     echo "PASS: absolute guest paths reject absent/non-executable/directory/broken-link printf and accept the restored executable"
+
+    # The manifest is the exact allowlist: literal paths with characters
+    # outside any identifier charset are admitted exactly as listed, and
+    # non-canonical or duplicate lines are refused. (The name-pattern gate
+    # this replaces refused /usr/bin/[ and /usr/sbin/ip, both listed.)
+    local exact_root=$fixture/exact-root exact_manifest=$fixture/exact-paths.txt bad
+    mkdir -p "$exact_root/usr/bin" "$exact_root/usr/sbin"
+    printf '%s\n' /usr/bin/[ /usr/bin/c++filt /usr/sbin/ip > "$exact_manifest"
+    ln -s "$stub" "$exact_root/usr/bin/["
+    ln -s "$stub" "$exact_root/usr/bin/c++filt"
+    ln -s "$stub" "$exact_root/usr/sbin/ip"
+    check_guest_paths "$exact_root" "$exact_manifest"
+    for bad in 'usr/bin/[' '/usr/bin/../etc/passwd' '/usr/bin//[' '/usr/bin/['$'\n''/usr/bin/['; do
+        printf '%s\n' "$bad" > "$exact_manifest"
+        set +e
+        output=$(check_guest_paths "$exact_root" "$exact_manifest" 2>&1)
+        rc=$?
+        set -e
+        [[ $rc -eq 2 ]] || {
+            echo "assert-build-dependencies --self-test: non-canonical or duplicate guest path was not refused ($rc): $bad" >&2
+            echo "$output" >&2
+            return 1
+        }
+    done
+    echo "PASS: literal guest paths ([, c++filt, sbin) accepted exactly as listed; relative/dot-dot/empty-component/duplicate lines refused"
 }
 
 case ${1:-} in
