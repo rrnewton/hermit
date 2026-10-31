@@ -4229,6 +4229,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let in_turn = self.completes_in_turn(guest, call);
         self.note_descriptors_passed_out(guest, call.fd(), &headers);
+        self.note_sockets_passed_out(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
         if outside_turn
@@ -4653,6 +4654,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let in_turn = self.completes_in_turn(guest, call);
         self.note_descriptors_passed_out(guest, call.sockfd(), &headers);
+        self.note_sockets_passed_out(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
         if outside_turn
@@ -5195,6 +5197,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         self.classify_received_descriptors(guest, call.fd(), &recorded)
             .await;
+        self.note_short_batch(guest, from, call.vlen() as usize);
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)
             .await?;
