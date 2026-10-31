@@ -56480,7 +56480,9 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
             assert_eq!(replayed.status.code(), Some(2), "{route}: {replayed:?}");
             assert_eq!(
                 stderr(&replayed).lines().next(),
-                Some("error: the argument '--replay-schedule-from <filepath>' cannot be used with '--replay-preemptions-from <filepath>'")
+                Some(
+                    "error: the argument '--replay-schedule-from <filepath>' cannot be used with '--replay-preemptions-from <filepath>'"
+                )
             );
             assert_eq!(stdout(&replayed), "", "invalid flags ran the target");
             assert!(!output_record.exists(), "invalid flags wrote a recording");
@@ -56564,7 +56566,9 @@ fn authentic_legacy_chosen_json_is_refused_before_cli_target_start() {
             assert_eq!(output.status.code(), Some(2), "{route}: {output:?}");
             assert_eq!(
                 diagnostic.lines().next(),
-                Some("error: the argument '--replay-schedule-from <filepath>' cannot be used with '--replay-preemptions-from <filepath>'")
+                Some(
+                    "error: the argument '--replay-schedule-from <filepath>' cannot be used with '--replay-preemptions-from <filepath>'"
+                )
             );
             assert_eq!(stdout(&output), "", "invalid flags ran the target");
             assert!(!diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"));
