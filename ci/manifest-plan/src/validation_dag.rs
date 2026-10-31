@@ -2475,6 +2475,32 @@ fn split_pinned_workspace_twin(twin: Step) -> Result<[Step; 2], String> {
     Ok([compile, prepare])
 }
 
+/// One writer for the shared compat fixtures (issue 4997). The host
+/// compatprep.fixtures and its pinned-root twin both build
+/// $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures, with different
+/// toolchains, and the bucket depends only on the twin. If the host copy
+/// kept its full/portable labels it stayed selected with no consumer and
+/// could rm -rf and rebuild the shared directory while cells were reading
+/// it, so the same cell saw different inputs across runs. When the twin
+/// exists, retire the host copy from the local profiles; the authored
+/// hosted variant (compatprep.fixtures_on_host) is a separate step.
+fn retire_host_fixtures_when_twin_present(cfg: &mut DagConfig, twins: &[Step]) {
+    let twin_present = cfg
+        .steps
+        .iter()
+        .chain(twins.iter())
+        .any(|step| step.tag() == "compatprep.fixtures_in_pinned_root");
+    if !twin_present {
+        return;
+    }
+    for step in &mut cfg.steps {
+        if step.tag() == "compatprep.fixtures" {
+            step.labels
+                .retain(|label| label != "full" && label != "portable");
+        }
+    }
+}
+
 fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     cfg.steps.retain(|step| {
         step.tag() != PINNED_ROOT_FETCH_TAG && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
@@ -2656,6 +2682,7 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
                 .retain(|label| label != "portable-strict-compat-only");
         }
     }
+    retire_host_fixtures_when_twin_present(cfg, &twins);
     cfg.steps.push(pinned_root_fetch()?);
     cfg.steps.extend(twins);
     route_host_consumers_to_pinned_build(cfg)?;
@@ -5917,6 +5944,30 @@ sys.exit(37)
             mode: Some("verify".into()),
             backend: Some("ptrace".into()),
         }
+    }
+
+    fn fixture_step(job: &str, labels: &[&str]) -> Step {
+        let text = format!(
+            r#"{{"description":"","steps":[{{"group":"compatprep","job":"{job}","cmd":"true","labels":{},"timeout":1,"cpu_timeout":1,"hint":{{"rss_baseline_bytes":1,"hard_mem_max_bytes":1}}}}]}}"#,
+            serde_json::to_string(labels).unwrap()
+        );
+        dag_from_json(&text).unwrap().steps.remove(0)
+    }
+
+    #[test]
+    fn host_fixtures_retire_only_when_pinned_twin_present() {
+        // No twin: the host prep is the only writer and keeps its labels.
+        let mut cfg = DagConfig {
+            steps: vec![fixture_step("fixtures", &["full", "portable"])],
+            ..Default::default()
+        };
+        retire_host_fixtures_when_twin_present(&mut cfg, &[]);
+        assert_eq!(cfg.steps[0].labels, ["full", "portable"]);
+
+        // Twin present: the host copy must not stay selected (issue 4997).
+        let twin = fixture_step("fixtures_in_pinned_root", &["full", "portable"]);
+        retire_host_fixtures_when_twin_present(&mut cfg, &[twin]);
+        assert!(cfg.steps[0].labels.is_empty(), "{:?}", cfg.steps[0].labels);
     }
 
     fn owner(result_manifests: Vec<DagManifest>) -> Step {
