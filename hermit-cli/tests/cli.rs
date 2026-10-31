@@ -57004,10 +57004,19 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     assert_eq!(original["format_version"], 3);
     let event_count = original["global"].as_array().unwrap().len();
     assert!(event_count > 0, "{original}");
-    // Raw schedule replay records its own deferred registration priority,
-    // rather than replaying the producer's priority history. Chosen IDs here
-    // are all above the inherited low-ID foreground special case. Keep every
-    // history key and field exact; priority replay still expects the original.
+    // Raw schedule replay records its own registration priority, rather
+    // than replaying the producer's priority history. Under PR 4966's
+    // `records_logical_replay_priorities` gate (schedule-only replay, no
+    // preemptions file, no chaos, heuristic None), the writer records the
+    // logical priority: the default for every thread except a vfork child,
+    // which records one less. This expectation corrects the pre-4966
+    // deferred-dispatch value (9999) for that composition; every other
+    // assertion in this test is unchanged. Chosen IDs here are all above
+    // the inherited low-ID foreground special case. The fixture creates,
+    // in order, main, two pthread threads, a fork child, a vfork child, a
+    // raw clone and a clone3 (see tests/c/chosen_guest_ids.c), so with
+    // --pid-base=5000 the vfork child is 5004. Keep every history key and
+    // field exact; priority replay still expects the original.
     let mut schedule_per_thread = original["per_thread"].clone();
     for (tid, history) in schedule_per_thread.as_object_mut().unwrap() {
         assert!(
@@ -57021,7 +57030,7 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
                 "producer {tid}: {field}"
             );
         }
-        history["final_prio"] = serde_json::json!(9999);
+        history["final_prio"] = serde_json::json!(if tid == "5004" { 999 } else { 1000 });
     }
     let schedule_flag = format!("--replay-schedule-from={}", recording.display());
     let priority_flag = format!("--replay-preemptions-from={}", recording.display());
