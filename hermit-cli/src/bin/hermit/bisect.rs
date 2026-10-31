@@ -114,6 +114,7 @@ impl BisectOpts {
             run_needleman: self.needleman,
             minimize: false,
             prefix_search: false,
+            continuation_timeslice: crate::analyze::ContinuationTimeslice::Auto,
             imprecise_search: false,
             run1_seed: None,
             run1_preemptions: None,
@@ -128,6 +129,9 @@ impl BisectOpts {
             execution_context: self.execution_context,
             tmp_dir: None,
             max_memory: self.max_memory,
+            // Bisect keeps its workspace (`bisect_schedule_pair`), and every
+            // trial's schedules in it, as it has no --keep-tmp to ask.
+            keep_tmp: true,
             success_exit_code: None,
             run_arg: Vec::new(),
             run_args: self.run_args.clone(),
