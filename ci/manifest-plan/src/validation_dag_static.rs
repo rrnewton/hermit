@@ -1916,7 +1916,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And this change's two trial-record units (a schedule past every
     // recording carries no list; a splice past its recording lists no
     // jumps): 1298.
-    ("test.hermit_unit", 1298),
+    // And #4864's revision's
+    // a_trial_charges_only_when_every_recording_read_did,
+    // bisect_refuses_schedules_under_another_switch_in_charge and
+    // analyze_counts_its_own_endpoints_as_charging_switch_ins: 1301.
+    ("test.hermit_unit", 1301),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3259,8 +3263,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And this change's two unit tests: 2758.
     // The same two on main 32f85d391 with #4862 and #4863 (2906): 2908.
     // The same two on main dc85ec16a with #4862 and #4863 (3062): 3064.
-    // The same two on #4892's head 83050eb31 with #4863 (3098): 3100, listed.
-    ("test.detcore_unit", 3100),
+    // The same two on #4892's head 83050eb31 with #4863 (3098): 3100.
+    // And #4864's revision's two units (a charging run's record is refused
+    // by a reader of format 2; the switch-in charge round trips): 3102,
+    // listed.
+    ("test.detcore_unit", 3102),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5729,8 +5736,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same tests: 2758.
     // The same two on main 32f85d391 (2906): 2908.
     // The same two on main dc85ec16a (3062): 3064.
-    // The same two on #4892's head 83050eb31 with #4863 (3098): 3100, listed.
-    ("test.detcore_unit_on_host", 3100),
+    // The same two on #4892's head 83050eb31 with #4863 (3098): 3100.
+    // And the same two units: 3102, listed.
+    ("test.detcore_unit_on_host", 3102),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6134,7 +6142,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six on main dc85ec16a (1283): 1289.
     // The same six on #4892's head 83050eb31 (1284): 1290, listed.
     // And the same two trial-record units: 1292.
-    ("test.hermit_unit_on_host", 1292),
+    // And the same three units: 1295.
+    ("test.hermit_unit_on_host", 1295),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

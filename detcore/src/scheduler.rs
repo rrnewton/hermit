@@ -4882,7 +4882,10 @@ impl Scheduler {
         // The format of the record a replay follows: its run follows that
         // format's rules, and so says so in its own record.
         let mut replayed_format = None;
-        let mut charge_replayed_switch_ins = false;
+        // Whether the record a replay follows says its run charged replayed
+        // switch-ins (`PreemptionRecord::switch_ins_charged`): this run then
+        // charges them too, and says so in its own record.
+        let mut charge_replayed_switch_ins = None;
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
@@ -4917,7 +4920,7 @@ impl Scheduler {
                     TimeSkipMode::Legacy
                 };
                 replayed_format = Some(recording.format_version());
-                charge_replayed_switch_ins = recording.charges_replayed_switch_ins();
+                charge_replayed_switch_ins = Some(recording.charges_replayed_switch_ins());
                 match recording {
                     Recording::Legacy(record) => {
                         callback_checkpoints = record
@@ -5020,8 +5023,13 @@ impl Scheduler {
             // or a jump past the record's end (`PreemptionWriter::insert_time_skip`):
             // the jumps must be listed to be replayed, though that record's own
             // replay then decides a FIFO open by the newer rules.
-            let writer =
-                writer.with_format(replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT)));
+            // A run that follows no record charges every stretch of guest code
+            // a turn, and a replay charges as the record it follows says, in
+            // either case in that record's format; the charge is the field's,
+            // not the format's (`SWITCH_IN_CHARGE_FORMAT`).
+            let writer = writer
+                .with_format(replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT)))
+                .with_switch_ins_charged(charge_replayed_switch_ins.unwrap_or(true));
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -5166,7 +5174,7 @@ impl Scheduler {
             time_skip_mode,
             die_on_time_skip_desync: cfg.die_on_desync,
             time_skip_desyncs: 0,
-            charge_replayed_switch_ins,
+            charge_replayed_switch_ins: charge_replayed_switch_ins.unwrap_or(false),
             switch_in_committed_at: None,
             unconfirmed_time_skip: None,
             jump_request: None,
@@ -17890,8 +17898,8 @@ impl Scheduler {
         // its recording resumed it with the thread's own yield turn. When the
         // thread retires recorded events under that turn, it ran guest code
         // there, as it did under the yield turn the recording charged: under
-        // a format-3 record the replay charges it too, so the guest clock reads
-        // what it read when recorded. A `TraceReplay` turn under which nothing
+        // a record whose run charged (`switch_ins_charged`) the replay charges
+        // it too, so the guest clock reads what it read when recorded. A `TraceReplay` turn under which nothing
         // retired stands for no turn of the recording and stays free
         // (https://github.com/rrnewton/hermit/issues/4805).
         // As before, an empty switch-in counts as its thread's previous turn
@@ -22092,11 +22100,11 @@ mod test {
         );
     }
 
-    /// Under a format-3 record, a replayed switch-in (`TraceReplay` turn) under
-    /// which its thread retired recorded events is charged one scheduler turn,
-    /// as the recording charged the yield turn it stands for. One under which
-    /// nothing retired is free, and every `TraceReplay` turn under an older
-    /// record is free, as before. Either way the turn is not its thread's
+    /// Under a record whose run charged (`switch_ins_charged`), a replayed
+    /// switch-in (`TraceReplay` turn) under which its thread retired recorded
+    /// events is charged one scheduler turn, as the recording charged the
+    /// yield turn it stands for. One under which nothing retired is free, and
+    /// every `TraceReplay` turn under an older record is free, as before. Either way the turn is not its thread's
     /// previous turn: a schedule replay's own switch turns stay out of that
     /// bookkeeping (`previous_turn_tid`).
     #[test]
@@ -22135,19 +22143,22 @@ mod test {
         assert_eq!(charge(false, 3), (start, None));
     }
 
-    /// A format-3 record makes its replay charge replayed switch-ins, and the
-    /// replay writes format 3 again; a format-2 record's replay charges none
-    /// and writes format 2, the rules it ran by.
+    /// A record whose run charged (`switch_ins_charged`) makes its replay
+    /// charge replayed switch-ins, whatever its format, and the replay writes
+    /// the record's format and the charge again; a record whose run did not
+    /// makes its replay charge none. Test adapted: the charge used to follow
+    /// the format (3 charging, 2 not). It now follows the field, so a trial
+    /// written below format 3 (`hermit-cli`'s `time_skip_carry`, a splice in
+    /// format 1) keeps its charge.
     #[test]
-    fn a_replay_charges_switch_ins_by_its_records_format() {
+    fn a_replay_charges_switch_ins_by_its_records_field() {
         let dir = tempfile::tempdir().unwrap();
-        let replay = |format: u32| {
+        let replay = |format: Option<u32>, charged: bool| {
             let path = dir.path().join("record.json");
             let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
-                .with_current_format();
-            let mut value = serde_json::to_value(&record).unwrap();
-            value["format_version"] = serde_json::json!(format);
-            std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+                .with_format(format)
+                .with_switch_ins_charged(charged);
+            record.write_to_disk(&path).unwrap();
             let mut sched = Scheduler::new(&Config {
                 replay_schedule_from: Some(path),
                 record_preemptions: true,
@@ -22156,10 +22167,43 @@ mod test {
             let written: crate::preemptions::PreemptionRecord =
                 serde_json::from_str(&sched.preemption_writer.take().unwrap().into_string())
                     .unwrap();
-            (sched.charge_replayed_switch_ins, written.format_version())
+            (
+                sched.charge_replayed_switch_ins,
+                written.format_version(),
+                written.charges_replayed_switch_ins(),
+            )
         };
-        assert_eq!(replay(3), (true, Some(3)));
-        assert_eq!(replay(2), (false, Some(2)));
+        assert_eq!(replay(Some(3), true), (true, Some(3), true));
+        assert_eq!(replay(Some(2), false), (false, Some(2), false));
+        assert_eq!(replay(None, true), (true, None, true));
+        assert_eq!(replay(None, false), (false, None, false));
+    }
+
+    /// A run that follows no record charges replayed switch-ins and says so in
+    /// a record of format 3 (`SWITCH_IN_CHARGE_FORMAT`), which a Hermit whose
+    /// newest format is 2, one with jump lists but without the charge, refuses
+    /// by its format.
+    #[test]
+    fn a_charging_runs_record_is_refused_by_a_reader_of_format_2() {
+        let mut sched = Scheduler::new(&Config {
+            record_preemptions: true,
+            ..Config::default()
+        });
+        let written: crate::preemptions::PreemptionRecord =
+            serde_json::from_str(&sched.preemption_writer.take().unwrap().into_string()).unwrap();
+        assert!(written.charges_replayed_switch_ins());
+        assert_eq!(
+            written.format_version(),
+            Some(crate::preemptions::SWITCH_IN_CHARGE_FORMAT)
+        );
+        assert!(written.validate_format().is_ok());
+        let refusal = written
+            .validate_format_up_to(crate::preemptions::TIME_SKIPS_FORMAT)
+            .unwrap_err();
+        assert!(
+            refusal.contains("record format Some(3)") && refusal.contains("formats 1 to 2"),
+            "{refusal}"
+        );
     }
 
     fn register_known_thread(sched: &mut Scheduler, tid: DetTid) {

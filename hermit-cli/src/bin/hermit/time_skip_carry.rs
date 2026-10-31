@@ -46,6 +46,10 @@ pub struct TimeSkipSources {
     /// The oldest format among the recordings remembered (`None` for format
     /// 1), once one is (`trial_format`).
     oldest_format: Option<Option<u32>>,
+    /// Whether every recording remembered charged replayed switch-ins
+    /// (`PreemptionRecord::charges_replayed_switch_ins`), once one is
+    /// (`trial_charges`).
+    all_charged: Option<bool>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -120,6 +124,8 @@ impl TimeSkipSources {
             self.oldest_format
                 .map_or(format, |oldest| oldest.min(format)),
         );
+        self.all_charged =
+            Some(self.all_charged.unwrap_or(true) && record.charges_replayed_switch_ins());
         let source = Source {
             prefix_hashes: prefix_hashes(record.schedevents()),
             skips: record.time_skips().unwrap_or_default().to_vec(),
@@ -135,6 +141,22 @@ impl TimeSkipSources {
     pub fn trial_format(&self) -> Option<u32> {
         self.oldest_format
             .unwrap_or(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT))
+    }
+
+    /// Whether a trial schedule built from the remembered recordings charges
+    /// replayed switch-ins (`PreemptionRecord::with_switch_ins_charged`): when
+    /// every one of them did, since its events follow those recordings' rules,
+    /// or, when none was read, as a run that follows no record does. Analyze
+    /// and bisect refuse, before any trial, recordings that charged
+    /// differently
+    /// (`AnalyzeOpts::refuse_recordings_under_another_switch_in_charge`), so
+    /// this is every remembered recording's charge, the one a trial's jumps
+    /// come from included. This
+    /// holds whatever format the trial is written in: a trial written below
+    /// the charge's format (one that goes on past its recordings' events)
+    /// keeps the charge.
+    pub fn trial_charges(&self) -> bool {
+        self.all_charged.unwrap_or(true)
     }
 
     /// The jumps a replay of `events` must make, when a recording lists them
@@ -350,5 +372,21 @@ mod tests {
         );
         sources.remember(&PreemptionRecord::from_sched_events(events(&[5])));
         assert_eq!(sources.trial_format(), None);
+    }
+
+    /// A trial charges replayed switch-ins when every recording read did, and
+    /// when none was read, as a run that follows no record does.
+    #[test]
+    fn a_trial_charges_only_when_every_recording_read_did() {
+        let mut sources = TimeSkipSources::default();
+        assert!(sources.trial_charges());
+        sources.remember(
+            &PreemptionRecord::from_sched_events(events(&[3]))
+                .with_current_format()
+                .with_switch_ins_charged(true),
+        );
+        assert!(sources.trial_charges());
+        sources.remember(&PreemptionRecord::from_sched_events(events(&[5])).with_current_format());
+        assert!(!sources.trial_charges());
     }
 }

@@ -1327,7 +1327,10 @@ impl AnalyzeOpts {
         self.adopt_expired_wait_charge(run1.as_deref())?;
         // Every trial registers queued sleeps as the target did.
         self.adopt_recorded_timeslice(&recordings)?;
-        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
+        // Every trial replays under one switch-in charge.
+        let endpoints = self.switch_in_charge_endpoints()?;
+        self.refuse_recordings_under_another_switch_in_charge(&[], &endpoints)
     }
 
     /// Take the settings `analyze` inherits from the global options: every
@@ -2675,6 +2678,92 @@ mod tests {
                 "{case}: {error:#}"
             );
         }
+    }
+
+    /// Analyze counts each endpoint it records itself (from a seed, a chaos
+    /// run or a preemption record) as charging replayed switch-ins, as such a
+    /// run charges every stretch of guest code, and an endpoint given by
+    /// `--runN-schedule` by its file's own charge; endpoints under different
+    /// charges are refused, naming both (Claude review of #4864's revision:
+    /// `--run2-schedule` with an uncharged record beside run 1 from a seed).
+    /// `prepare` refuses `--runN-schedule` itself as unimplemented first, so
+    /// the count is checked here; endpoints analyze records itself are
+    /// admitted through `prepare`.
+    #[test]
+    fn analyze_counts_its_own_endpoints_as_charging_switch_ins() {
+        let dir = tempfile::tempdir().unwrap();
+        let schedule = |name: &str, charged: bool| {
+            let path = record_with_epoch(dir.path(), name, None);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if charged {
+                value["switch_ins_charged"] = serde_json::Value::from(true);
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let parse = |options: &[&str]| -> AnalyzeOpts {
+            let mut argv = vec!["hermit", "analyze"];
+            argv.extend(options);
+            argv.extend(["--", "/bin/true"]);
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            *options
+        };
+        let uncharged = schedule("uncharged", false);
+        let charged = schedule("charged", true);
+
+        let run2 = format!("--run2-schedule={}", uncharged.display());
+        let analyzer = parse(&["--run1-seed=3", run2.as_str()]);
+        let endpoints = analyzer.switch_in_charge_endpoints().unwrap();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("run 1, which analyze records itself,".to_owned(), true),
+                (format!("--run2-schedule {}", uncharged.display()), false),
+            ]
+        );
+        let error = analyzer
+            .refuse_recordings_under_another_switch_in_charge(&[], &endpoints)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("run 1, which analyze records itself")
+                && message.contains("--run2-schedule")
+                && message.contains("switch_ins_charged"),
+            "{message}"
+        );
+
+        let run2 = format!("--run2-schedule={}", charged.display());
+        let analyzer = parse(&["--run1-seed=3", run2.as_str()]);
+        let endpoints = analyzer.switch_in_charge_endpoints().unwrap();
+        analyzer
+            .refuse_recordings_under_another_switch_in_charge(&[], &endpoints)
+            .unwrap();
+
+        // Both endpoints recorded by analyze, one replaying an uncharged
+        // preemption record: both charge, and `prepare` admits them.
+        let run1 = format!("--run1-preemptions={}", uncharged.display());
+        let mut analyzer = parse(&[run1.as_str()]);
+        assert!(
+            analyzer
+                .switch_in_charge_endpoints()
+                .unwrap()
+                .iter()
+                .all(|(_, charged)| *charged)
+        );
+        let global = crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"])
+            .unwrap()
+            .global;
+        analyzer.prepare(&global).unwrap();
     }
 
     /// Analyze refuses, before any trial, a `--run1-preemptions` record made

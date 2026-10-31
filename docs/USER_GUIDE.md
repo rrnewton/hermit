@@ -872,6 +872,15 @@ and use a supported operation or configuration before retrying. An ordinary
 guest exit 122 remains a completed guest outcome, classified by the target
 criteria; its numeric status alone is not a refusal.
 
+Before any trial, analyze and bisect refuse recordings whose runs charged
+replayed switch-ins differently (a record's `switch_ins_charged`; a record
+without it did not charge them): every trial replays its schedule under one
+charge, so a trial built from one recording's events would replay by the
+other's rule. The refusal names both recordings; re-record them with one
+Hermit. An endpoint analyze records itself, from a seed, a chaos run or a
+preemption record, charges them, and so does every run of this Hermit that
+follows no schedule.
+
 By default analyze bisects between the failing schedule and a passing one from
 another run. When the two runs differ in events only one of them executed (for
 example timeslices that end at other points, or extra iterations of a polling

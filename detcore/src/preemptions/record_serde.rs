@@ -72,6 +72,8 @@ struct RawRecord {
     format_version: Option<u32>,
     #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
     time_skips: Option<Vec<TimeSkip>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    switch_ins_charged: bool,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
@@ -307,6 +309,30 @@ mod tests {
             let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
             assert_eq!(back.time_skips(), Some(&[skip][..]), "{written}");
             assert_eq!(back, record, "{written}");
+        }
+    }
+
+    /// `PreemptionRecord::switch_ins_charged` is written only when on, reads
+    /// back plain or inside the incomplete record's envelope, and is off in a
+    /// record that predates it, whatever that record's format.
+    #[test]
+    fn the_switch_in_charge_is_written_only_when_on_and_round_trips() {
+        let old = r#"{"per_thread":{},"global":[],"format_version":3}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        assert!(!record.charges_replayed_switch_ins());
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let mut charged =
+            PreemptionRecord::from_sched_events(Vec::new()).with_switch_ins_charged(true);
+        for marker in [None, Some(7)] {
+            charged.replay_departed_at = marker;
+            let written = serde_json::to_string(&charged).unwrap();
+            assert!(
+                written.contains(r#""switch_ins_charged":true"#),
+                "{written}"
+            );
+            let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert!(back.charges_replayed_switch_ins(), "{written}");
+            assert_eq!(back, charged, "{written}");
         }
     }
 
