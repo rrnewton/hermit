@@ -1905,7 +1905,23 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
     // H1 host-input evidence adds one hermit-run unit: 1289 + 1 = 1290.
-    ("test.hermit_unit", 1290),
+    // And the prefix search's continuation timeslice: phases::tests::{auto_continuations_only_get_coarser,
+    // the_prefix_search_continues_at_the_first_usable_timeslice} and
+    // rundata::tests::a_continuation_timeslice_that_would_change_the_prefix_is_refused: 1293.
+    // And the report's stacks: phases::tests::{only_the_criteria_a_run_misses_are_reported,
+    // a_replay_leaves_its_schedule_at_the_first_other_event,
+    // each_racing_stack_comes_from_a_replay_that_reached_it,
+    // a_target_replay_with_another_failure_than_the_target_run_is_named,
+    // a_report_without_a_deciding_event_reads,
+    // a_timing_decision_names_the_thread_that_runs_next_in_each_continuation}: 1299.
+    // And phases::tests::slice_ends_are_reported_only_when_the_next_stacks_tell_nothing_apart: 1300.
+    // And --minimize's replay of its own record:
+    // rundata::tests::a_normalized_record_is_written_for_reading_and_not_replayed and
+    // phases::tests::the_baseline_knock_out_removes_a_real_intervention_until_none_is_left: 1305.
+    // And --minimize's baseline search and minimization: phases::tests::the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses and
+    // minimize::tests::a_failed_cut_of_a_threads_last_interventions_is_tested_again: 1307.
+    // And rundata::tests::a_recorded_target_run_replays_a_workspace_copy_within_an_explicit_bound: 1308.
+    ("test.hermit_unit", 1308),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3156,7 +3172,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
     // The inotify fault-boundary repair adds three detcore units: 3034 + 3 = 3037, by nextest list.
-    ("test.detcore_unit", 3242),
+    // And preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities: 3243.
+    ("test.detcore_unit", 3243),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5582,7 +5599,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3242 (2a1a7c67cd) measured the same selection this twin runs; the
     // twin's pin stayed 3037, so the hosted/local count invariant failed
     // on main. 3037 -> 3242 to match that measured recount.
-    ("test.detcore_unit_on_host", 3242),
+    // And the same normalize test: 3243.
+    ("test.detcore_unit_on_host", 3243),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5978,7 +5996,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
     // The same H1 path-fallback unit: 1283 + 1 = 1284.
-    ("test.hermit_unit_on_host", 1284),
+    // And the same three continuation-timeslice tests: 1287.
+    // And the same six report-stack tests: 1293.
+    // And the same slice-end test: 1294.
+    // And the same two minimize tests: 1299.
+    // And the same two --minimize tests: 1301.
+    // And the same run1-preemptions test: 1302.
+    ("test.hermit_unit_on_host", 1302),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

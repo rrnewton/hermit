@@ -871,8 +871,8 @@ The default `auto` uses the initial completed run and completed target/baseline
 endpoints: max(60 seconds, 10 times the slowest measured run), rounded up to
 whole seconds. Analyze prints the bound when it changes. A shorter `--timeout`
 in the run arguments still wins and also bounds the initial run. With
-`--run1-preemptions`, no initial run is measured, so pass an explicit
-`--trial-timeout` to bound trials before a completed replay is measured. On a
+`--run1-preemptions` the initial run is a replay of the record, measured like
+a seed's, which an explicit `--trial-timeout=SECONDS` bounds too. On a
 backend that does not enforce `--timeout`, `auto` gives no bound and an explicit
 number is refused; bound the whole analysis from outside there.
 
@@ -903,8 +903,14 @@ example timeslices that end at other points, or extra iterations of a polling
 loop), no single swap may separate the outcomes. `--prefix-search` searches
 within the failing schedule instead: each trial replays its first K events and
 then schedules without chaos, and a binary search finds the event at which the
-outcome flips. The report shows the stack of the thread the failing schedule
-runs at that event and of the thread that runs there otherwise:
+outcome flips. The continuation runs at the run's own `--max-timeslice`; a race
+found only at a short timeslice often shows without chaos at that timeslice
+too, and then the search continues at 200 ms instead
+(`--continuation-timeslice`). The report shows the stack of the thread the
+failing schedule runs at that event and of the thread that runs there
+otherwise. When both continuations run the same thread there, the decision is
+how long that thread runs: the report then shows its stack, and the stacks of
+the threads that run after it with and without the event:
 
 ```bash
 hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \

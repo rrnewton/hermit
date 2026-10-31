@@ -460,6 +460,14 @@ fn bisect_rejects_a_timed_out_replay() {
 /// same with `spin`; only the behavior after a wins changes. This keeps seed
 /// discovery bounded without waiting for every losing seed to time out.
 fn race_then_target_seed() -> u64 {
+    race_then_target_seed_matching("exit", &[])
+}
+
+/// [`race_then_target_seed`] in mode `stand_in`, under the run arguments
+/// `run_args`. The fixture acts on its mode only after the race, so a
+/// `stand_in` that terminates whichever thread wins finds the seed for any
+/// mode with the same argc and argument length before the race.
+fn race_then_target_seed_matching(stand_in: &str, run_args: &[&str]) -> u64 {
     let guest = &workloads().race_then;
     for seed in 0..40 {
         let mut command = Command::new("timeout");
@@ -467,13 +475,14 @@ fn race_then_target_seed() -> u64 {
             .args(["--signal=KILL", "30s"])
             .arg(hermit_test::hermit_binary())
             .args(["run", "--chaos", "--timeout=2"])
+            .args(run_args)
             .arg(format!("--seed={seed}"));
         if let Some(margin) = std::env::var_os(ANALYZE_SKID_MARGIN_ENV) {
             command.arg(format!("--skid-margin={}", margin.to_string_lossy()));
         }
-        // Match spin's argc and argument length before the race. The mode is
-        // inspected only after the winning thread is known.
-        command.arg("--").arg(guest).arg("exit");
+        // Match the mode's argc and argument length before the race. The mode
+        // is inspected only after the winning thread is known.
+        command.arg("--").arg(guest).arg(stand_in);
         let output = hermit_test::hermit_output("terminating race seed discovery", &mut command);
         match output.status.code() {
             Some(0) => {
@@ -821,5 +830,195 @@ fn analyze_ends_with_a_refused_target_run() {
     assert!(
         diagnostics.contains("unsupported syscall: restart_syscall"),
         "{diagnostics}"
+    );
+}
+
+/// `hermit analyze` of the analyze_race_then fixture in mode `then` (one
+/// that terminates whichever thread wins), with `analyze_opts` and the run
+/// arguments `run_args`, from a chaos seed under which thread b wins: the
+/// output, and the report if analyze wrote one. It runs under the analyze
+/// lock and an outer bound, with the calibrated skid margin, as the spin
+/// tests do.
+fn analyze_race_then_with(
+    then: &str,
+    analyze_opts: &[&str],
+    run_args: &[&str],
+) -> (Output, Option<serde_json::Value>) {
+    let _guard = analyze_lock();
+    let seed = race_then_target_seed_matching(then, run_args);
+    let dir = tempfile::tempdir().unwrap();
+    let report_file = dir.path().join("report.json");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--signal=KILL", "120s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "analyze",
+            "--target-stdout=b-first",
+            "--target-exit-code=0",
+            "--trial-timeout=3",
+        ])
+        .args(analyze_opts)
+        .arg(format!("--run1-seed={seed}"))
+        .arg(format!("--report-file={}", report_file.display()));
+    add_calibrated_skid_margin(&mut command, then);
+    command
+        .args(["--", "--chaos"])
+        .args(run_args)
+        .arg("--")
+        .arg(&workloads().race_then)
+        .arg(then);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let report = fs::read_to_string(&report_file).ok().map(|text| {
+        serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("unreadable report: {error}\n{}", combined_output(&output))
+        })
+    });
+    (output, report)
+}
+
+/// A race found only at a short timeslice: at the run's own 100 us, thread a
+/// is preempted before it claims even without chaos, so the scheduler alone
+/// meets the target and gives the prefix search nothing to bisect against.
+/// The search says so and continues at hermit's default 200 ms, where it
+/// does not. Before, the analysis ended there with exit 125.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_continues_prefixes_at_a_coarser_timeslice() {
+    let label = "analyze --prefix-search analyze_race_then late-a --max-timeslice=100000";
+    let (output, report) =
+        analyze_race_then_with("late-a", &["--prefix-search"], &["--max-timeslice=100000"]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label}: {}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains(
+            "Continuing without chaos at a 100000 ns timeslice, the scheduler alone, replaying \
+             none of the target schedule, meets the target"
+        ),
+        "{label}\n{combined}"
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert!(
+        report["header"]
+            .as_str()
+            .unwrap()
+            .contains("scheduling without chaos at a 200000000 ns timeslice does not meet"),
+        "{label}: {report}"
+    );
+}
+
+/// The same race with `--continuation-timeslice=100000`: there is no other
+/// continuation to try, so analyze fails, saying that the outcome does not
+/// depend on a chaos decision and what to run or pass instead.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_explains_a_target_the_scheduler_meets_alone() {
+    let label = "analyze --prefix-search analyze_race_then late-a --continuation-timeslice=100000";
+    let (output, _) = analyze_race_then_with(
+        "late-a",
+        &["--prefix-search", "--continuation-timeslice=100000"],
+        &["--max-timeslice=100000"],
+    );
+    let combined = combined_output(&output);
+    assert!(!output.status.success(), "{label}\n{combined}");
+    for expected in [
+        "no event of the target schedule decides the outcome: without chaos, the scheduler alone \
+         already meets the target criteria at a 100000 ns timeslice",
+        "prefix_round_001.repro",
+        "pass --continuation-timeslice",
+        "--run2-seed",
+    ] {
+        assert!(
+            combined.contains(expected),
+            "{label}: no {expected:?}\n{combined}"
+        );
+    }
+}
+
+/// `--run1-preemptions` replays the record as the target run, measured for
+/// the trial bound and logged like a seed's run. Before, analyze did not run
+/// it at all, and the next phase unwrapped the log of a run that never ran
+/// (exit 101). The record is read from the host's /tmp, which the guest's
+/// container does not see, so analyze replays a copy in its workspace. A
+/// replay that misses the target ends the analysis with an error that says
+/// why.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_starts_from_a_recorded_target_run() {
+    let label = "analyze --prefix-search --run1-preemptions analyze_race_then plain";
+    let guest = &workloads().race_then;
+    let seed = race_then_target_seed_matching("plain", &[]);
+    // Recorded outside /tmp: the run's guest has a private one, and the
+    // record is written from inside the container.
+    let workspace =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("failed to create a workspace");
+    let recorded = workspace.path().join("target.preempts");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["run", "--chaos"])
+        .arg(format!("--seed={seed}"))
+        .arg(format!("--record-preemptions-to={}", recorded.display()))
+        .arg("--")
+        .arg(guest)
+        .arg("plain");
+    let output = hermit_test::hermit_output(label, &mut command);
+    assert!(
+        output.status.success() && output.stdout == b"b-first\n",
+        "{label}: the recorded run missed the target\n{}",
+        combined_output(&output)
+    );
+    let host_tmp = tempfile::tempdir_in("/tmp").expect("failed to create a directory under /tmp");
+    let record = host_tmp.path().join("target.preempts");
+    fs::copy(&recorded, &record).unwrap();
+
+    let _guard = analyze_lock();
+    let analyze = |target_stdout: &str, report_file: &Path| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args(["analyze", "--prefix-search", "--target-exit-code=0", "-v"])
+            .arg(format!("--target-stdout={target_stdout}"))
+            .arg(format!("--run1-preemptions={}", record.display()))
+            .arg(format!("--report-file={}", report_file.display()))
+            .args(["--", "--chaos"])
+            .arg(format!("--seed={seed}"))
+            .arg("--")
+            .arg(guest)
+            .arg("plain");
+        hermit_test::hermit_output(label, &mut command)
+    };
+    let report_file = workspace.path().join("report.json");
+    let output = analyze("b-first", &report_file);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label}: {}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains("First run matched target criteria")
+            && combined.contains("Runs from here on are bounded at"),
+        "{label}: the record was not run as the target\n{combined}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&report_file).unwrap()).unwrap();
+    assert!(
+        report["critical_event1"]["event_index"].is_u64(),
+        "{label}: {report}"
+    );
+
+    // The record's replay prints b-first, so a-first is a miss.
+    let output = analyze("a-first", &workspace.path().join("miss.json"));
+    let combined = combined_output(&output);
+    assert!(
+        !output.status.success()
+            && output.status.code() != Some(101)
+            && combined.contains("did not meet the target criteria")
+            && combined.contains("--seed included"),
+        "{label}: a missed replay: {}\n{combined}",
+        output.status
     );
 }
