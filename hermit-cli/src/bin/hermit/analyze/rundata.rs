@@ -34,6 +34,7 @@ use tracing::metadata::LevelFilter;
 
 use crate::analyze::consts::*;
 use crate::analyze::types::AnalyzeOpts;
+use crate::analyze::types::ContinuationTimeslice;
 use crate::analyze::types::TRIAL_LOG_FACTOR;
 use crate::analyze::types::TRIAL_LOG_FLOOR;
 use crate::analyze::types::TRIAL_TIMEOUT_FACTOR;
@@ -193,6 +194,21 @@ impl RunData {
 
     pub fn has_launched(&self) -> bool {
         self.is_a_match.is_some()
+    }
+
+    /// For a test that drives a phase with a launch it models: the completed
+    /// observation `launch` makes, whether the run met the target, and the
+    /// schedule it recorded.
+    #[cfg(test)]
+    pub(super) fn complete_for_test(
+        &mut self,
+        met: bool,
+        recorded: &[SchedEvent],
+    ) -> anyhow::Result<()> {
+        self.is_a_match = Some(met);
+        PreemptionRecord::from_sched_events(recorded.to_vec())
+            .write_to_disk(self.sched_path_out())
+            .map_err(anyhow::Error::msg)
     }
 
     /// Called after the run has been launched, normalize the output preemptions and swap around so
@@ -1162,6 +1178,43 @@ impl AnalyzeOpts {
              the trials under the recorded one, or pass --max-timeslice={timeslice}.",
             explicit.map_or_else(|| "disabled".to_owned(), |maximum| format!("{maximum} ns"))
         ))
+    }
+
+    /// Refuses (exit 122) a `--continuation-timeslice` that would change the
+    /// replayed prefix, before any workspace or trial: one shorter than the
+    /// run's `--max-timeslice`, which also ends the prefix's slices that its
+    /// schedule does not end, or one for a run without PMU timeslices, whose
+    /// clock it would change.
+    pub fn refuse_unsound_continuation_timeslice(&self) -> anyhow::Result<()> {
+        let ContinuationTimeslice::Nanos(nanos) = self.continuation_timeslice else {
+            return Ok(());
+        };
+        let reason = match self.trial_max_timeslice() {
+            None => "the run arguments disable PMU timeslices, and a continuation timeslice \
+                     would turn them on for the replayed prefix too"
+                .to_owned(),
+            Some(run) if nanos < run => format!(
+                "it is shorter than the run's --max-timeslice={run}, and the trials' timeslice \
+                 also ends the replayed prefix's slices that its schedule does not end, so it \
+                 would change the prefix"
+            ),
+            Some(_) => return Ok(()),
+        };
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "--continuation-timeslice={nanos} is refused: {reason}. Omit it (auto), or pass \
+                 a timeslice at least as long as the run's own."
+            )),
+        )
+    }
+
+    /// The trials' `--max-timeslice`, from their run arguments (`None` for
+    /// disabled).
+    pub fn trial_max_timeslice(&self) -> detcore_model::config::MaybeTimeslice {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .max_timeslice
     }
 
     /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
@@ -3151,8 +3204,10 @@ mod tests {
             .refuse_unenforceable_trial_timeout()
             .unwrap();
     }
-    /// The final adapter must compare observed completed predicates, including
-    /// guest nonzero exits, even when neither diagnostic stack is available.
+    /// The stack-trace replay the report takes must give the observed
+    /// completed predicate, including a guest's nonzero exit, even when neither
+    /// diagnostic stack is available: the report compares that outcome with
+    /// the search's, and ends the analysis when they differ.
     #[test]
     fn final_replays_require_the_observed_completed_outcome() {
         use reverie::process::ExitStatus;
@@ -3161,12 +3216,12 @@ mod tests {
         let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         options.tmp_dir = Some(dir.path().to_path_buf());
         for actual in [false, true] {
-            for expected in [false, true] {
-                let result = options.run_and_retrieve_stacks_with(
+            let replay = options
+                .replay_for_stacks(
                     "completed_final",
-                    dir.path().join("candidate.json"),
+                    &dir.path().join("candidate.json"),
+                    &[],
                     1,
-                    expected,
                     |run| {
                         assert!(!run.has_launched());
                         let output = Output {
@@ -3179,21 +3234,15 @@ mod tests {
                         // product API that could manufacture completion.
                         run.is_a_match = Some(options.output_matches(&output));
                         assert_eq!(run.is_a_match(), actual);
+                        // A completed replay records the schedule it ran.
+                        PreemptionRecord::from_sched_events(Vec::new())
+                            .write_to_disk(run.sched_path_out())
+                            .map_err(anyhow::Error::msg)?;
                         Ok(())
                     },
-                );
-                if actual == expected {
-                    let (first, second) = result.expect("a completed matching replay is valid");
-                    assert!(first.is_none() && second.is_none());
-                } else {
-                    let error = result
-                        .expect_err("a contradictory final replay cannot certify a candidate");
-                    assert!(
-                        error.to_string().contains("observed the opposite"),
-                        "{error:#}"
-                    );
-                }
-            }
+                )
+                .expect("a completed replay gives its outcome");
+            assert_eq!(replay.met_target, actual);
         }
     }
 
@@ -3223,6 +3272,64 @@ mod tests {
             Some(Duration::from_secs(100))
         );
         assert_eq!(later.runopts.run_timeout(), Some(Duration::from_secs(200)));
+    }
+
+    /// A `--continuation-timeslice` shorter than the run's `--max-timeslice`,
+    /// or one for a run without PMU timeslices, is refused before any
+    /// workspace or trial, naming what to pass instead; one at least as long
+    /// is accepted.
+    #[test]
+    fn a_continuation_timeslice_that_would_change_the_prefix_is_refused() {
+        let refusal = |argv: &[&str]| {
+            let mut full = vec!["analyze", "--prefix-search"];
+            full.extend(argv);
+            full.push("/bin/true");
+            AnalyzeOpts::try_parse_from(full)
+                .unwrap()
+                .refuse_unsound_continuation_timeslice()
+        };
+        for (argv, reason) in [
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=100000",
+                ][..],
+                "shorter than the run's --max-timeslice=100000",
+            ),
+            (
+                &["--continuation-timeslice=20000000", "--"][..],
+                "shorter than the run's --max-timeslice=200000000",
+            ),
+            (
+                &[
+                    "--continuation-timeslice=1000",
+                    "--",
+                    "--max-timeslice=disabled",
+                ][..],
+                "disable PMU timeslices",
+            ),
+        ] {
+            let error = refusal(argv).expect_err(reason);
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(reason) && message.contains("Omit it (auto)"),
+                "{argv:?}: {message}"
+            );
+        }
+        refusal(&[
+            "--continuation-timeslice=200000000",
+            "--",
+            "--max-timeslice=1000",
+        ])
+        .unwrap();
+        refusal(&["--"]).unwrap();
     }
 }
 
