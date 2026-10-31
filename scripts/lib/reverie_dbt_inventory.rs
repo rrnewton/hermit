@@ -14,5 +14,6 @@
 //! `make lint-checks` runs, fails until it is updated.
 
 /// `git ls-files -- reverie-dbt` in the pinned Reverie checkout lists this
-/// many files.
-pub const REVERIE_DBT_FILES: usize = 1044;
+/// many files. Reverie 78e3cadac76b added
+/// reverie-dbt/src/caller_runtime/tests/facility_admission.rs: 1044 + 1.
+pub const REVERIE_DBT_FILES: usize = 1045;
