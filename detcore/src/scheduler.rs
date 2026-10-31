@@ -20733,8 +20733,9 @@ mod test {
         assert!(sched.nothing_else_can_run(opener));
     }
 
-    /// A guest-state poll with a timeout wakes at its deadline, which the
-    /// alone-poller fast-forward does not consider, so it may still run.
+    /// A guest-state poll with a timeout wakes at its deadline: it counts
+    /// as idle, but a jump of global time stops at that deadline, so it
+    /// still runs then.
     #[test]
     fn a_guest_poller_with_a_timeout_may_still_run() {
         let mut sched = Scheduler::new(&Config::default());
@@ -20753,7 +20754,11 @@ mod test {
         sched
             .guest_state_polled_at
             .insert(poller, sched.progress_epoch);
-        assert!(!sched.nothing_else_can_run(opener));
+        assert!(sched.nothing_else_can_run(opener));
+        assert_eq!(
+            sched.alone_until(opener, Some(u64::MAX)),
+            Some(Some(LogicalTime::from_nanos(1_000_000)))
+        );
     }
 
     /// A guest-state poller with a timeout, queued and idle like

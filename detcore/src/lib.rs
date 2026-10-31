@@ -5705,878 +5705,892 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .map(|operation| operation.binding()),
         )?;
         let guest = &mut native_guest;
-        let result = async {
-        // Linux's restart of an interrupted wait is the thread's very next syscall,
-        // so the record a wait kept for it lives only until then
-        // (`handle_restart_syscall`).
-        let restart_block = guest.thread_state_mut().restart_block.take();
-        // A working directory read for the previous syscall may be stale by
-        // now (`ThreadState::syscall_cwd`).
-        guest.thread_state_mut().syscall_cwd = None;
+        let result = Box::pin(async {
+            // Linux's restart of an interrupted wait is the thread's very next syscall,
+            // so the record a wait kept for it lives only until then
+            // (`handle_restart_syscall`).
+            let restart_block = guest.thread_state_mut().restart_block.take();
+            // A working directory read for the previous syscall may be stale by
+            // now (`ThreadState::syscall_cwd`).
+            guest.thread_state_mut().syscall_cwd = None;
 
-        let dettid = guest.thread_state().dettid;
-
-        if guest.thread_state().guest_past_first_execve() {
-            detlog!(
-                event = crate::detlog::DetLogEvent::Syscall;
-                "[syscall][detcore, dtid {}] inbound syscall: {} = ?",
-                dettid,
-                call.display(&guest.memory())
-            );
-        }
-
-        // The hot syscall path only reads a few Copy flags from the config, so copy
-        // just those out instead of cloning the entire Config on every intercepted
-        // syscall (previously flagged inline as an unnecessary copy). guest.config()
-        // borrows guest immutably; bind the flags in a tight scope so the borrow ends
-        // before the later thread_state_mut()/&mut guest borrows below.
-        let (sequentialize_threads, virtualize_time, panic_on_unsupported_syscalls) = {
-            let config = guest.config();
-            (
-                config.sequentialize_threads,
-                config.virtualize_time,
-                config.panic_on_unsupported_syscalls,
-            )
-        };
-
-        if sequentialize_threads && self.cfg.observes_schedevents() {
-            let access = self.access_trace_entry(guest, &call);
-            trace_schedevent_with_access(
-                guest,
-                with_guest_time(
-                    guest,
-                    SchedEvent::syscall(dettid, call.number(), SyscallPhase::Prehook),
-                ),
-                true,
-                access,
-            )
-            .await;
-            // Its descriptors as the call reaches them: after this thread's
-            // turn at its prehook event.
-            self.begin_traced_call(guest, &call);
-        }
-
-        let syscall_cost_ns = syscall_time::cost_ns(call.number());
-        // The backend-runtime bootstrap window. A backend-resident runtime (the
-        // LiteInst preload constructor) issues hundreds to thousands of syscalls
-        // on one thread (315 for a small C program, 6,970 for emacs; see
-        // `syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`) between its validated
-        // begin trap and the trap that ends its bootstrap: the ready report, or
-        // the report that preparation failed.
-        // Reverie reports that window only for the bootstrapping thread; every
-        // other thread and every forked process sees no window.
-        //
-        // What is withheld: the per-syscall cost below, for the bootstrapping
-        // thread only, for each syscall it makes inside the window that does not
-        // observe virtual time, up to
-        // `syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS` per window. That
-        // includes syscalls made by guest code the runtime calls into, such as
-        // an interposed malloc or open64. Charging the runtime's own syscalls
-        // would make guest-visible virtual time (uptime, CLOCK_MONOTONIC, CPU
-        // time) depend on which backend ran the program. Every withheld syscall
-        // is still counted and fully handled below, so Detcore keeps tracking
-        // the fds, mappings and inodes it creates.
-        //
-        // What is always charged, inside the window too: syscalls that observe
-        // virtual time (`syscall_time::observes_virtual_time`), so two clock
-        // reads on the bootstrapping thread differ by at least one syscall cost
-        // exactly as outside the window; and every syscall past the cap, so a
-        // loop inside the window, or a runtime that never reports ready, again
-        // advances the clock at each syscall.
-        //
-        // When it matters: with a syscall-driven clock (no PMU, or
-        // --max-timeslice=disabled, which Hermit selects when perf counters are
-        // unavailable, or --no-rcb-time) these charges are the thread's only
-        // per-syscall progress, and with sequentialized threads the 500x no-RCB
-        // multiplier makes each one large. With RCB time on a PMU host, retired
-        // branches still advance the thread's clock inside the window and only
-        // the syscall costs are withheld.
-        //
-        // The decision depends only on the window the backend reports (opened
-        // and closed by trap instructions the runtime executes), the syscall
-        // number and the count of earlier uncharged syscalls in the same
-        // window: all functions of the guest's own execution. Record/replay and
-        // both --verify runs therefore make the same decisions. The clock is
-        // never reset: the first syscall after the window continues from the
-        // value the window left. See https://github.com/rrnewton/hermit/issues/3338
-        // and https://github.com/rrnewton/hermit/pull/3430#issuecomment-5928691696.
-        //
-        // The scheduler turns such a syscall needs are withheld the same way.
-        // Handling an uncharged syscall can still commit scheduler turns (for
-        // example the file resources of a read of /proc/self/maps), and each
-        // committed turn normally advances global time by the per-turn
-        // scheduler cost. While the syscall is being handled the thread is
-        // marked `in_uncharged_bootstrap_syscall`, `tool_global::resource_request`
-        // copies that mark into the request, and the scheduler does not
-        // advance global time for a marked turn unless it is an IO-polling
-        // retry, whose time enforces timeouts. Without this, a LiteInst run of
-        // the clock-trajectory fixture reached its first clock read 11.5 ms of
-        // virtual time later than with it, and each exec added 12.0 ms more
-        // (measured locally), which was enough for its sysinfo uptime to
-        // differ from the ptrace backend's on the hosted runner
-        // (https://github.com/rrnewton/hermit/issues/3517). A charged syscall
-        // (one that observes virtual time, or any past the cap) is not marked,
-        // so its turns advance the clock as everywhere else.
-        let in_backend_runtime_bootstrap = guest.is_backend_runtime_bootstrap();
-        let new_count = {
-            // which results from not being able to borrow guest twice.
-            let thread_state = guest.thread_state_mut();
-            thread_state.stats.count_syscall(call.number());
-
-            // Every intercepted syscall advances logical time, including configurations that do
-            // not serialize threads. This keeps virtual clocks productive during syscall loops.
-            // The one exception is the bootstrap window described above: on the bootstrapping
-            // thread, up to MAX_UNCHARGED_BOOTSTRAP_SYSCALLS syscalls per window that do not
-            // observe virtual time are left uncharged.
-            let charged =
-                thread_state.charge_syscall_time(in_backend_runtime_bootstrap, call.number());
-            if charged {
-                thread_state
-                    .thread_logical_time
-                    .add_syscall_with_cost(syscall_cost_ns);
-            }
-            thread_state.in_uncharged_bootstrap_syscall = !charged;
-            // This only folds the thread's new user and system time into the process total.
-            // An uncharged syscall added none, so it needs no guard.
-            thread_state.account_process_cpu_time();
-            thread_state.stats.syscall_count
-        };
-        // The backend's injection count at entry: the histogram's outcome
-        // compares it with the count at the result (`syscall_histogram`).
-        let injected_at_entry = guest.injected_syscalls();
-
-        // Happens-before enforcement checkpoint. When the run carries a
-        // happens-before program and an anchor at exactly
-        // `Position::SyscallCount(new_count)` names this thread (by dettid, or by
-        // a spawn ordinal only the scheduler can resolve), this syscall checks in
-        // with the scheduler at its prehook, carrying this thread's running
-        // syscall count.
-        // The scheduler fires any anchor at that count on this thread and parks
-        // the thread (out of the run queue) when that anchor is the AFTER
-        // endpoint of a Hard edge whose BEFORE endpoint has not fired yet. For
-        // any other (thread, count) the scheduler would find no anchor and do
-        // nothing, so the request is skipped: one scheduler round trip per anchor
-        // the thread reaches rather than per syscall
-        // (https://github.com/rrnewton/hermit/issues/3877), and threads the spec
-        // does not name keep their schedule.
-        // This is the gate that makes an authored partial order reproduce a known
-        // race deterministically (see detcore-model `happens_before`). It
-        // requires sequentialized threads (enforced by the CLI) so the scheduler
-        // owns ordering.
-        //
-        // A syscall-occurrence anchor ("the thread's Nth writev to fd 9") is
-        // counted here, in this thread's own counters, once per syscall entry;
-        // the thread checks in only when a call is some such anchor's nth
-        // occurrence, naming the anchors it reached.
-        let hb_checkpoint = if guest.config().happens_before.is_some() {
             let dettid = guest.thread_state().dettid;
-            let mut counters = std::mem::take(&mut guest.thread_state_mut().stats.hb_occurrences);
-            let program = guest
-                .config()
-                .happens_before
-                .as_ref()
-                .expect("checked above");
-            // A posthook anchor this entry reaches checks in when the call
-            // completes, below, not here
-            // (https://github.com/rrnewton/hermit/issues/3929).
-            let mut reached = if program.has_syscall_occurrence_anchors() {
-                let (sysno, args) = call.into_parts();
-                program.count_syscall_occurrences(
-                    &mut counters,
+
+            if guest.thread_state().guest_past_first_execve() {
+                detlog!(
+                    event = crate::detlog::DetLogEvent::Syscall;
+                    "[syscall][detcore, dtid {}] inbound syscall: {} = ?",
                     dettid,
-                    sysno,
-                    [args.arg0, args.arg1],
-                    new_count,
+                    call.display(&guest.memory())
+                );
+            }
+
+            // The hot syscall path only reads a few Copy flags from the config, so copy
+            // just those out instead of cloning the entire Config on every intercepted
+            // syscall (previously flagged inline as an unnecessary copy). guest.config()
+            // borrows guest immutably; bind the flags in a tight scope so the borrow ends
+            // before the later thread_state_mut()/&mut guest borrows below.
+            let (sequentialize_threads, virtualize_time, panic_on_unsupported_syscalls) = {
+                let config = guest.config();
+                (
+                    config.sequentialize_threads,
+                    config.virtualize_time,
+                    config.panic_on_unsupported_syscalls,
                 )
-            } else {
-                Vec::new()
             };
-            let posthook: Vec<String> = reached
-                .extract_if(.., |name| {
-                    program
-                        .anchors
-                        .get(name)
-                        .is_some_and(|a| a.fires_at_posthook())
-                })
-                .collect();
-            let checkpoint = if !reached.is_empty() {
-                Some(ResourceID::HappensBeforeSyscallCheckpoint {
-                    count: new_count,
-                    anchors: reached,
-                })
-            } else if program.may_have_syscall_count_anchor_at(dettid, new_count) {
-                Some(ResourceID::HappensBeforeCheckpoint(new_count))
+
+            if sequentialize_threads && self.cfg.observes_schedevents() {
+                let access = self.access_trace_entry(guest, &call);
+                trace_schedevent_with_access(
+                    guest,
+                    with_guest_time(
+                        guest,
+                        SchedEvent::syscall(dettid, call.number(), SyscallPhase::Prehook),
+                    ),
+                    true,
+                    access,
+                )
+                .await;
+                // Its descriptors as the call reaches them: after this thread's
+                // turn at its prehook event.
+                self.begin_traced_call(guest, &call);
+            }
+
+            let syscall_cost_ns = syscall_time::cost_ns(call.number());
+            // The backend-runtime bootstrap window. A backend-resident runtime (the
+            // LiteInst preload constructor) issues hundreds to thousands of syscalls
+            // on one thread (315 for a small C program, 6,970 for emacs; see
+            // `syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`) between its validated
+            // begin trap and the trap that ends its bootstrap: the ready report, or
+            // the report that preparation failed.
+            // Reverie reports that window only for the bootstrapping thread; every
+            // other thread and every forked process sees no window.
+            //
+            // What is withheld: the per-syscall cost below, for the bootstrapping
+            // thread only, for each syscall it makes inside the window that does not
+            // observe virtual time, up to
+            // `syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS` per window. That
+            // includes syscalls made by guest code the runtime calls into, such as
+            // an interposed malloc or open64. Charging the runtime's own syscalls
+            // would make guest-visible virtual time (uptime, CLOCK_MONOTONIC, CPU
+            // time) depend on which backend ran the program. Every withheld syscall
+            // is still counted and fully handled below, so Detcore keeps tracking
+            // the fds, mappings and inodes it creates.
+            //
+            // What is always charged, inside the window too: syscalls that observe
+            // virtual time (`syscall_time::observes_virtual_time`), so two clock
+            // reads on the bootstrapping thread differ by at least one syscall cost
+            // exactly as outside the window; and every syscall past the cap, so a
+            // loop inside the window, or a runtime that never reports ready, again
+            // advances the clock at each syscall.
+            //
+            // When it matters: with a syscall-driven clock (no PMU, or
+            // --max-timeslice=disabled, which Hermit selects when perf counters are
+            // unavailable, or --no-rcb-time) these charges are the thread's only
+            // per-syscall progress, and with sequentialized threads the 500x no-RCB
+            // multiplier makes each one large. With RCB time on a PMU host, retired
+            // branches still advance the thread's clock inside the window and only
+            // the syscall costs are withheld.
+            //
+            // The decision depends only on the window the backend reports (opened
+            // and closed by trap instructions the runtime executes), the syscall
+            // number and the count of earlier uncharged syscalls in the same
+            // window: all functions of the guest's own execution. Record/replay and
+            // both --verify runs therefore make the same decisions. The clock is
+            // never reset: the first syscall after the window continues from the
+            // value the window left. See https://github.com/rrnewton/hermit/issues/3338
+            // and https://github.com/rrnewton/hermit/pull/3430#issuecomment-5928691696.
+            //
+            // The scheduler turns such a syscall needs are withheld the same way.
+            // Handling an uncharged syscall can still commit scheduler turns (for
+            // example the file resources of a read of /proc/self/maps), and each
+            // committed turn normally advances global time by the per-turn
+            // scheduler cost. While the syscall is being handled the thread is
+            // marked `in_uncharged_bootstrap_syscall`, `tool_global::resource_request`
+            // copies that mark into the request, and the scheduler does not
+            // advance global time for a marked turn unless it is an IO-polling
+            // retry, whose time enforces timeouts. Without this, a LiteInst run of
+            // the clock-trajectory fixture reached its first clock read 11.5 ms of
+            // virtual time later than with it, and each exec added 12.0 ms more
+            // (measured locally), which was enough for its sysinfo uptime to
+            // differ from the ptrace backend's on the hosted runner
+            // (https://github.com/rrnewton/hermit/issues/3517). A charged syscall
+            // (one that observes virtual time, or any past the cap) is not marked,
+            // so its turns advance the clock as everywhere else.
+            let in_backend_runtime_bootstrap = guest.is_backend_runtime_bootstrap();
+            let new_count = {
+                // which results from not being able to borrow guest twice.
+                let thread_state = guest.thread_state_mut();
+                thread_state.stats.count_syscall(call.number());
+
+                // Every intercepted syscall advances logical time, including configurations that do
+                // not serialize threads. This keeps virtual clocks productive during syscall loops.
+                // The one exception is the bootstrap window described above: on the bootstrapping
+                // thread, up to MAX_UNCHARGED_BOOTSTRAP_SYSCALLS syscalls per window that do not
+                // observe virtual time are left uncharged.
+                let charged =
+                    thread_state.charge_syscall_time(in_backend_runtime_bootstrap, call.number());
+                if charged {
+                    thread_state
+                        .thread_logical_time
+                        .add_syscall_with_cost(syscall_cost_ns);
+                }
+                thread_state.in_uncharged_bootstrap_syscall = !charged;
+                // This only folds the thread's new user and system time into the process total.
+                // An uncharged syscall added none, so it needs no guard.
+                thread_state.account_process_cpu_time();
+                thread_state.stats.syscall_count
+            };
+            // The backend's injection count at entry: the histogram's outcome
+            // compares it with the count at the result (`syscall_histogram`).
+            let injected_at_entry = guest.injected_syscalls();
+
+            // Happens-before enforcement checkpoint. When the run carries a
+            // happens-before program and an anchor at exactly
+            // `Position::SyscallCount(new_count)` names this thread (by dettid, or by
+            // a spawn ordinal only the scheduler can resolve), this syscall checks in
+            // with the scheduler at its prehook, carrying this thread's running
+            // syscall count.
+            // The scheduler fires any anchor at that count on this thread and parks
+            // the thread (out of the run queue) when that anchor is the AFTER
+            // endpoint of a Hard edge whose BEFORE endpoint has not fired yet. For
+            // any other (thread, count) the scheduler would find no anchor and do
+            // nothing, so the request is skipped: one scheduler round trip per anchor
+            // the thread reaches rather than per syscall
+            // (https://github.com/rrnewton/hermit/issues/3877), and threads the spec
+            // does not name keep their schedule.
+            // This is the gate that makes an authored partial order reproduce a known
+            // race deterministically (see detcore-model `happens_before`). It
+            // requires sequentialized threads (enforced by the CLI) so the scheduler
+            // owns ordering.
+            //
+            // A syscall-occurrence anchor ("the thread's Nth writev to fd 9") is
+            // counted here, in this thread's own counters, once per syscall entry;
+            // the thread checks in only when a call is some such anchor's nth
+            // occurrence, naming the anchors it reached.
+            let hb_checkpoint = if guest.config().happens_before.is_some() {
+                let dettid = guest.thread_state().dettid;
+                let mut counters =
+                    std::mem::take(&mut guest.thread_state_mut().stats.hb_occurrences);
+                let program = guest
+                    .config()
+                    .happens_before
+                    .as_ref()
+                    .expect("checked above");
+                // A posthook anchor this entry reaches checks in when the call
+                // completes, below, not here
+                // (https://github.com/rrnewton/hermit/issues/3929).
+                let mut reached = if program.has_syscall_occurrence_anchors() {
+                    let (sysno, args) = call.into_parts();
+                    program.count_syscall_occurrences(
+                        &mut counters,
+                        dettid,
+                        sysno,
+                        [args.arg0, args.arg1],
+                        new_count,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let posthook: Vec<String> = reached
+                    .extract_if(.., |name| {
+                        program
+                            .anchors
+                            .get(name)
+                            .is_some_and(|a| a.fires_at_posthook())
+                    })
+                    .collect();
+                let checkpoint = if !reached.is_empty() {
+                    Some(ResourceID::HappensBeforeSyscallCheckpoint {
+                        count: new_count,
+                        anchors: reached,
+                    })
+                } else if program.may_have_syscall_count_anchor_at(dettid, new_count) {
+                    Some(ResourceID::HappensBeforeCheckpoint(new_count))
+                } else {
+                    None
+                };
+                guest.thread_state_mut().stats.hb_occurrences = counters;
+                guest.thread_state_mut().stats.hb_pending_posthook = posthook;
+                checkpoint
             } else {
                 None
             };
-            guest.thread_state_mut().stats.hb_occurrences = counters;
-            guest.thread_state_mut().stats.hb_pending_posthook = posthook;
-            checkpoint
-        } else {
-            None
-        };
-        if let Some(checkpoint) = hb_checkpoint {
-            let request = guest.thread_state().mk_request(checkpoint, Permission::R);
-            resource_request(guest, request).await;
-        }
+            if let Some(checkpoint) = hb_checkpoint {
+                let request = guest.thread_state().mk_request(checkpoint, Permission::R);
+                resource_request(guest, request).await;
+            }
 
-        // For `hermit run --verify`: a name the guest itself rebinds is not a
-        // host input change (see `detcore_model::host_input`). Reported before
-        // the call runs, whatever its outcome, so that a change the kernel
-        // commits is never missing from the record, even if the run ends
-        // before this handler returns.
-        if self.cfg.record_host_inputs {
-            self.record_host_namespace_change(guest, &call).await;
-            self.record_untraced_code_change(guest, &call).await;
-        }
+            // For `hermit run --verify`: a name the guest itself rebinds is not a
+            // host input change (see `detcore_model::host_input`). Reported before
+            // the call runs, whatever its outcome, so that a change the kernel
+            // commits is never missing from the record, even if the run ends
+            // before this handler returns.
+            if self.cfg.record_host_inputs {
+                self.record_host_namespace_change(guest, &call).await;
+                self.record_untraced_code_change(guest, &call).await;
+            }
 
-        // The file and descriptor checks below act only on a call that may
-        // name a file or a descriptor; for any other (getpid, futex,
-        // clock_gettime, ...) each answers its trivial value with no effect,
-        // so they are skipped, futures and all. The test reads the syscall
-        // number only (`may_name_file_or_descriptor`); no scheduler request,
-        // logical-time update or turn moves.
-        let may_name_files = crate::syscalls::may_name_file_or_descriptor(call.number());
-        // The inodes whose last name this call removes, stat'ed before it runs
-        // and retired once it succeeds, so that a host reusing one cannot hand
-        // a new file the old file's number
-        // (https://github.com/rrnewton/hermit/issues/3840).
-        let removed_inodes = if may_name_files {
-            self.last_names_removed_by(guest, &call).await
-        } else {
-            Vec::new()
-        };
-        // The guest-made FIFOs whose name this call removes, forgotten once it
-        // succeeds (https://github.com/rrnewton/hermit/issues/2203).
-        let removed_guest_fifos = if may_name_files {
-            self.guest_made_fifos_removed_by(guest, &call).await
-        } else {
-            Vec::new()
-        };
+            // The file and descriptor checks below act only on a call that may
+            // name a file or a descriptor; for any other (getpid, futex,
+            // clock_gettime, ...) each answers its trivial value with no effect,
+            // so they are skipped, futures and all. The test reads the syscall
+            // number only (`may_name_file_or_descriptor`); no scheduler request,
+            // logical-time update or turn moves.
+            let may_name_files = crate::syscalls::may_name_file_or_descriptor(call.number());
+            // The inodes whose last name this call removes, stat'ed before it runs
+            // and retired once it succeeds, so that a host reusing one cannot hand
+            // a new file the old file's number
+            // (https://github.com/rrnewton/hermit/issues/3840).
+            let removed_inodes = if may_name_files {
+                self.last_names_removed_by(guest, &call).await
+            } else {
+                Vec::new()
+            };
+            // The guest-made FIFOs whose name this call removes, forgotten once it
+            // succeeds (https://github.com/rrnewton/hermit/issues/2203).
+            let removed_guest_fifos = if may_name_files {
+                self.guest_made_fifos_removed_by(guest, &call).await
+            } else {
+                Vec::new()
+            };
 
-        // Only an emulated RNG readv supplies authoritative imported geometry.
-        // A generic pre-dispatch snapshot would become stale across pipe waits.
-        let mut rng_readv_output = None;
-        // A vectored call's memory as it began, if its handler keeps it
-        // (`ThreadState::entry_import`): never an earlier call's.
-        guest.thread_state_mut().entry_import = None;
-        // Signal phase 1: a process that handles SIGALRM runs only the calls
-        // its table places (`sigalrm_phase1`).
-        let sigalrm_refusal = if guest.thread_state().sigalrm_handled {
-            self.sigalrm_phase1_gate(guest, call)
-        } else {
-            None
-        };
-        // A `/proc` name outside the run's `--proc` level does not exist. A
-        // procfs file Detcore renders answers, as Linux does, the calls that
-        // would reach the placeholder standing in for it.
-        // A rendered procfs descriptor that reached this table over
-        // SCM_RIGHTS is adopted as the file it is before anything answers a
-        // call through it.
-        let adoption = if sigalrm_refusal.is_none() && may_name_files {
-            self.adopt_received_placeholders(guest, &call).await
-        } else {
-            Ok(())
-        };
-        let rendered_procfs_answer = if let Err(error) = adoption {
-            Some(Err(error))
-        } else if sigalrm_refusal.is_none()
-            && Self::looks_up_below_placeholders(&call)
-            && let Some(refusal) =
-                Box::pin(self.refuse_lookup_below_placeholder(guest, &call)).await
-        {
-            // An exec or an `AF_UNIX` address below a `/proc` directory
-            // Detcore serves on a placeholder (`descriptor_directory`).
-            Some(refusal)
-        } else if sigalrm_refusal.is_none() && !may_name_files {
-            // The `/proc` device is still taken where the level check would
-            // have taken it first.
-            crate::syscalls::take_proc_device();
-            None
-        } else if sigalrm_refusal.is_none()
-            && let Some(answer) = Box::pin(self.answer_placeholder_call(guest, &call)).await
-        {
-            Some(answer)
-        } else if sigalrm_refusal.is_none() {
-            match self
-                .refuse_procfs_name_outside_level(guest, &call)
-                .await
-                .transpose()
+            // Only an emulated RNG readv supplies authoritative imported geometry.
+            // A generic pre-dispatch snapshot would become stale across pipe waits.
+            let mut rng_readv_output = None;
+            // A vectored call's memory as it began, if its handler keeps it
+            // (`ThreadState::entry_import`): never an earlier call's.
+            guest.thread_state_mut().entry_import = None;
+            // Signal phase 1: a process that handles SIGALRM runs only the calls
+            // its table places (`sigalrm_phase1`).
+            let sigalrm_refusal = if guest.thread_state().sigalrm_handled {
+                self.sigalrm_phase1_gate(guest, call)
+            } else {
+                None
+            };
+            // A `/proc` name outside the run's `--proc` level does not exist. A
+            // procfs file Detcore renders answers, as Linux does, the calls that
+            // would reach the placeholder standing in for it.
+            // A rendered procfs descriptor that reached this table over
+            // SCM_RIGHTS is adopted as the file it is before anything answers a
+            // call through it.
+            let adoption = if sigalrm_refusal.is_none() && may_name_files {
+                self.adopt_received_placeholders(guest, &call).await
+            } else {
+                Ok(())
+            };
+            let rendered_procfs_answer = if let Err(error) = adoption {
+                Some(Err(error))
+            } else if sigalrm_refusal.is_none()
+                && Self::looks_up_below_placeholders(&call)
+                && let Some(refusal) =
+                    Box::pin(self.refuse_lookup_below_placeholder(guest, &call)).await
             {
-                Some(refusal) => {
-                    syscall_histogram::mark_refused::<T, _>(guest);
-                    Some(refusal)
-                }
-                None => match self.answer_rendered_procfs_operation(guest, &call).await {
-                    Some(answer) => Some(answer),
-                    None => match self.answer_rendered_procfs_mapping(guest, &call).await {
-                        Some(answer) => Some(answer),
-                        None => self
-                            .answer_rendered_procfs_path_call(guest, &call)
-                            .await
-                            .transpose(),
-                    },
-                },
-            }
-        } else {
-            None
-        };
-        // This handler's future is as large as the largest future it awaits,
-        // and every syscall moves the whole of it once, into the box the Tool
-        // trait returns it in, whichever arm runs. `handle_openat`'s future is
-        // the outlier (about 7.5 KiB, against about 6.2 KiB for the next,
-        // `handle_write`), so the open family runs in its own box, allocated
-        // only when one of those calls is made, which already does far more
-        // work than one allocation. The hot read and write arms stay inline:
-        // boxing them too would cost those calls an allocation each.
-        // Box::pin(f).await polls `f` exactly as `f.await` does: no await
-        // moves and no arm changes behaviour. `syscall_hot_path_tests` bounds
-        // the result.
-        let res = match classify_syscall(call.number()) {
-            _ if sigalrm_refusal.is_some() => {
-                syscall_histogram::mark_refused::<T, _>(guest);
-                Err(sigalrm_refusal.expect("checked").into())
-            }
-            _ if rendered_procfs_answer.is_some() => rendered_procfs_answer.expect("checked"),
-            SyscallClassification::PassThrough if call.number() == Sysno::chroot => {
-                let result = self.passthrough(guest, call).await;
-                if result.is_ok() {
-                    guest
-                        .thread_state()
-                        .changed_root
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    // Another process's view of this one's mount table
-                    // follows its root (`Detcore::rendered_procfs_at`).
-                    crate::tool_global::mark_changed_root(guest).await;
-                }
-                result
-            }
-            // Outbound TCP channels under a network trace mode; never with no mode.
-            _ if self.network_trace_owns(guest, &call) => {
-                self.handle_network_trace_syscall(guest, call).await
-            }
-            // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
-            // future typed representation preserves this explicit policy.
-            SyscallClassification::Determinized if call.number() == Sysno::rseq => {
-                if panic_on_unsupported_syscalls {
-                    Err(Error::Errno(Errno::ENOSYS))
-                } else {
-                    let (_, args) = call.into_parts();
-                    // RSEQ_FLAG_UNREGISTER is the only known non-registering
-                    // operation. Unknown flags are not disjointness evidence.
-                    if args.arg2 != 1 {
-                        crate::reserved_input::expose_local_overlap(
-                            guest,
-                            args.arg0 as u64,
-                            args.arg1 as u64,
-                            "rseq-reserved-reference",
-                        )?;
-                        crate::reserved_input::expose_local(
-                            guest,
-                            "native-rseq-reference-unverified",
-                        )?;
+                // An exec or an `AF_UNIX` address below a `/proc` directory
+                // Detcore serves on a placeholder (`descriptor_directory`).
+                Some(refusal)
+            } else if sigalrm_refusal.is_none() && !may_name_files {
+                // The `/proc` device is still taken where the level check would
+                // have taken it first.
+                crate::syscalls::take_proc_device();
+                None
+            } else if sigalrm_refusal.is_none()
+                && let Some(answer) = Box::pin(self.answer_placeholder_call(guest, &call)).await
+            {
+                Some(answer)
+            } else if sigalrm_refusal.is_none() {
+                match self
+                    .refuse_procfs_name_outside_level(guest, &call)
+                    .await
+                    .transpose()
+                {
+                    Some(refusal) => {
+                        syscall_histogram::mark_refused::<T, _>(guest);
+                        Some(refusal)
                     }
-                    self.passthrough(guest, call).await
+                    None => match self.answer_rendered_procfs_operation(guest, &call).await {
+                        Some(answer) => Some(answer),
+                        None => match self.answer_rendered_procfs_mapping(guest, &call).await {
+                            Some(answer) => Some(answer),
+                            None => self
+                                .answer_rendered_procfs_path_call(guest, &call)
+                                .await
+                                .transpose(),
+                        },
+                    },
                 }
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#663)
-            // The pinned Reverie revision exposes process_madvise only as a raw call.
-            SyscallClassification::Determinized if call.number() == Sysno::process_madvise => {
-                match call {
-                    Syscall::Other(_, args) => Self::handle_process_madvise(args.arg0, args.arg4),
-                    _ => unreachable!("process_madvise unexpectedly gained a typed variant"),
+            } else {
+                None
+            };
+            // This handler's future is as large as the largest future it awaits,
+            // and every syscall moves the whole of it once, into the box the Tool
+            // trait returns it in, whichever arm runs. `handle_openat`'s future is
+            // the outlier (about 7.5 KiB, against about 6.2 KiB for the next,
+            // `handle_write`), so the open family runs in its own box, allocated
+            // only when one of those calls is made, which already does far more
+            // work than one allocation. The hot read and write arms stay inline:
+            // boxing them too would cost those calls an allocation each.
+            // Box::pin(f).await polls `f` exactly as `f.await` does: no await
+            // moves and no arm changes behaviour. `syscall_hot_path_tests` bounds
+            // the result.
+            let res = match classify_syscall(call.number()) {
+                _ if sigalrm_refusal.is_some() => {
+                    syscall_histogram::mark_refused::<T, _>(guest);
+                    Err(sigalrm_refusal.expect("checked").into())
                 }
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-1175): The pinned Reverie revision exposes
-            // pidfd_send_signal/pidfd_getfd only as raw calls, so dispatch on the
-            // Sysno. See the handlers in syscalls/files.rs for the determinism
-            // argument.
-            SyscallClassification::Determinized if call.number() == Sysno::pidfd_send_signal => {
-                match call {
-                    Syscall::Other(_, args) => {
-                        let result = self
-                            .handle_pidfd_send_signal(
+                _ if rendered_procfs_answer.is_some() => rendered_procfs_answer.expect("checked"),
+                SyscallClassification::PassThrough if call.number() == Sysno::chroot => {
+                    let result = self.passthrough(guest, call).await;
+                    if result.is_ok() {
+                        guest
+                            .thread_state()
+                            .changed_root
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        // Another process's view of this one's mount table
+                        // follows its root (`Detcore::rendered_procfs_at`).
+                        crate::tool_global::mark_changed_root(guest).await;
+                    }
+                    result
+                }
+                // Outbound TCP channels under a network trace mode; never with no mode.
+                _ if self.network_trace_owns(guest, &call) => {
+                    self.handle_network_trace_syscall(guest, call).await
+                }
+                // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
+                // future typed representation preserves this explicit policy.
+                SyscallClassification::Determinized if call.number() == Sysno::rseq => {
+                    if panic_on_unsupported_syscalls {
+                        Err(Error::Errno(Errno::ENOSYS))
+                    } else {
+                        let (_, args) = call.into_parts();
+                        // RSEQ_FLAG_UNREGISTER is the only known non-registering
+                        // operation. Unknown flags are not disjointness evidence.
+                        if args.arg2 != 1 {
+                            crate::reserved_input::expose_local_overlap(
+                                guest,
+                                args.arg0 as u64,
+                                args.arg1 as u64,
+                                "rseq-reserved-reference",
+                            )?;
+                            crate::reserved_input::expose_local(
+                                guest,
+                                "native-rseq-reference-unverified",
+                            )?;
+                        }
+                        self.passthrough(guest, call).await
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#663)
+                // The pinned Reverie revision exposes process_madvise only as a raw call.
+                SyscallClassification::Determinized if call.number() == Sysno::process_madvise => {
+                    match call {
+                        Syscall::Other(_, args) => {
+                            Self::handle_process_madvise(args.arg0, args.arg4)
+                        }
+                        _ => unreachable!("process_madvise unexpectedly gained a typed variant"),
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-1175): The pinned Reverie revision exposes
+                // pidfd_send_signal/pidfd_getfd only as raw calls, so dispatch on the
+                // Sysno. See the handlers in syscalls/files.rs for the determinism
+                // argument.
+                SyscallClassification::Determinized
+                    if call.number() == Sysno::pidfd_send_signal =>
+                {
+                    match call {
+                        Syscall::Other(_, args) => {
+                            let result = self
+                                .handle_pidfd_send_signal(
+                                    guest,
+                                    call,
+                                    args.arg0 as RawFd,
+                                    args.arg1 as i32,
+                                    args.arg3 as u32,
+                                )
+                                .await;
+                            if args.arg1 as i32 == libc::SIGALRM && result.is_ok() {
+                                self.note_guest_sigalrm(guest, GuestSigalrmTarget::Unclassified)
+                                    .await;
+                            }
+                            result
+                        }
+                        _ => unreachable!("pidfd_send_signal unexpectedly gained a typed variant"),
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-1175): pidfd_getfd, likewise untyped.
+                SyscallClassification::Determinized if call.number() == Sysno::pidfd_getfd => {
+                    match call {
+                        Syscall::Other(_, args) => {
+                            self.handle_pidfd_getfd(
                                 guest,
                                 call,
                                 args.arg0 as RawFd,
-                                args.arg1 as i32,
-                                args.arg3 as u32,
+                                args.arg1 as RawFd,
+                                args.arg2 as u32,
                             )
-                            .await;
-                        if args.arg1 as i32 == libc::SIGALRM && result.is_ok() {
-                            self.note_guest_sigalrm(guest, GuestSigalrmTarget::Unclassified)
-                                .await;
+                            .await
+                        }
+                        _ => unreachable!("pidfd_getfd unexpectedly gained a typed variant"),
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
+                // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
+                // deterministic by construction and identical to the modern kernel's own
+                // return, so no guest-visible behavior changes versus the legacy
+                // pass-through. These are untyped (Syscall::Other) in the pinned Reverie,
+                // so dispatch on the Sysno before the typed match below.
+                SyscallClassification::Determinized
+                    if is_unimplemented_enosys_syscall(call.number()) =>
+                {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-852): Review the futex2 fallback contract.
+                // Detcore models legacy futex but not the newer vector/sized futex2
+                // ABI. Match a kernel without futex2 so runtimes take their
+                // established legacy-futex fallback without consulting the host.
+                SyscallClassification::Determinized if is_futex2_enosys_syscall(call.number()) => {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-836): Host filesystem and mount
+                // introspection are outside the deterministic model. Return the
+                // portable feature-absence errno so callers use /proc fallbacks.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-859): Extend this boundary to obsolete ustat
+                // host-filesystem capacity counters.
+                SyscallClassification::Determinized
+                    if is_mount_introspection_enosys_syscall(call.number()) =>
+                {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-848): Hide unmodeled shared keyrings and
+                // request-key upcalls behind the portable CONFIG_KEYS-absent errno.
+                // TODO-HUMAN-REVIEW(PR-916): Fail closed whenever the
+                // panic-on-unsupported policy is active; ordinary runs select that
+                // policy by default. The explicit compatibility opt-out keeps the
+                // pre-848 host pass-through so the guest observes a real working
+                // keyring, restoring the enabled rr `keyctl` compatibility test.
+                // Under fail-closed execution the deterministic ENOSYS boundary is
+                // preserved.
+                SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
+                    if panic_on_unsupported_syscalls {
+                        Err(Error::Errno(Errno::ENOSYS))
+                    } else {
+                        self.passthrough(guest, call).await
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-855): Fail-closed runs cannot expose
+                // unmodeled pipe-buffer ownership or vmsplice page pinning, but
+                // preserve host pass-through under the explicit compatibility
+                // opt-out, `hermit run --allow-unsupported-syscalls`. splice and tee
+                // refuse with EINVAL, the errno Linux returns when a descriptor
+                // pair cannot be spliced and the one callers fall back to
+                // read/write on: GNU grep 3.12 drains a pipe into /dev/null with
+                // splice and falls back on EINVAL, but on ENOSYS it reports a read
+                // error and exits 2. vmsplice keeps ENOSYS.
+                SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
+                    if panic_on_unsupported_syscalls {
+                        syscall_histogram::mark_refused::<T, _>(guest);
+                        if call.number() == Sysno::vmsplice {
+                            Err(Error::Errno(Errno::ENOSYS))
+                        } else {
+                            Err(Error::Errno(Errno::EINVAL))
+                        }
+                    } else {
+                        let result = self.passthrough(guest, call).await;
+                        // A forwarded splice from a socket may take a message
+                        // whose descriptors Linux releases unseen, and one into a
+                        // socket sends messages Detcore does not count.
+                        if let Syscall::Splice(splice) = call {
+                            let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
+                                peek: false,
+                                request: crate::syscalls::scm_rights::Request::Spliced(
+                                    splice.len(),
+                                ),
+                                returns_at_once_when_empty: true,
+                                address_out: false,
+                                takes: crate::syscalls::scm_rights::Takes::One,
+                                // Forwarded in the caller's turn; its result
+                                // depends on no guest memory either way.
+                                in_turn: true,
+                                noted_by_recordings: true,
+                            };
+                            self.note_receive_without_control(guest, splice.fd_in(), &result, read);
+                            self.note_spliced_send(guest, splice.fd_out(), &result);
                         }
                         result
                     }
-                    _ => unreachable!("pidfd_send_signal unexpectedly gained a typed variant"),
                 }
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-1175): pidfd_getfd, likewise untyped.
-            SyscallClassification::Determinized if call.number() == Sysno::pidfd_getfd => {
-                match call {
-                    Syscall::Other(_, args) => {
-                        self.handle_pidfd_getfd(
-                            guest,
-                            call,
-                            args.arg0 as RawFd,
-                            args.arg1 as RawFd,
-                            args.arg2 as u32,
-                        )
-                        .await
-                    }
-                    _ => unreachable!("pidfd_getfd unexpectedly gained a typed variant"),
-                }
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#715): Deterministic ENOSYS for syscalls the pinned
-            // x86_64 kernel leaves unimplemented (sys_ni_syscall). A fixed -ENOSYS is
-            // deterministic by construction and identical to the modern kernel's own
-            // return, so no guest-visible behavior changes versus the legacy
-            // pass-through. These are untyped (Syscall::Other) in the pinned Reverie,
-            // so dispatch on the Sysno before the typed match below.
-            SyscallClassification::Determinized
-                if is_unimplemented_enosys_syscall(call.number()) =>
-            {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-852): Review the futex2 fallback contract.
-            // Detcore models legacy futex but not the newer vector/sized futex2
-            // ABI. Match a kernel without futex2 so runtimes take their
-            // established legacy-futex fallback without consulting the host.
-            SyscallClassification::Determinized if is_futex2_enosys_syscall(call.number()) => {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-836): Host filesystem and mount
-            // introspection are outside the deterministic model. Return the
-            // portable feature-absence errno so callers use /proc fallbacks.
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-859): Extend this boundary to obsolete ustat
-            // host-filesystem capacity counters.
-            SyscallClassification::Determinized
-                if is_mount_introspection_enosys_syscall(call.number()) =>
-            {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-848): Hide unmodeled shared keyrings and
-            // request-key upcalls behind the portable CONFIG_KEYS-absent errno.
-            // TODO-HUMAN-REVIEW(PR-916): Fail closed whenever the
-            // panic-on-unsupported policy is active; ordinary runs select that
-            // policy by default. The explicit compatibility opt-out keeps the
-            // pre-848 host pass-through so the guest observes a real working
-            // keyring, restoring the enabled rr `keyctl` compatibility test.
-            // Under fail-closed execution the deterministic ENOSYS boundary is
-            // preserved.
-            SyscallClassification::Determinized if is_kernel_keyring_syscall(call.number()) => {
-                if panic_on_unsupported_syscalls {
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-860): Host LSM attributes are outside
+                // Detcore's model. Present a stable feature-absence boundary
+                // instead of forwarding probes.
+                SyscallClassification::Determinized
+                    if is_host_security_identity_probe_syscall(call.number()) =>
+                {
                     Err(Error::Errno(Errno::ENOSYS))
-                } else {
-                    self.passthrough(guest, call).await
                 }
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-855): Fail-closed runs cannot expose
-            // unmodeled pipe-buffer ownership or vmsplice page pinning, but
-            // preserve host pass-through under the explicit compatibility
-            // opt-out, `hermit run --allow-unsupported-syscalls`. splice and tee
-            // refuse with EINVAL, the errno Linux returns when a descriptor
-            // pair cannot be spliced and the one callers fall back to
-            // read/write on: GNU grep 3.12 drains a pipe into /dev/null with
-            // splice and falls back on EINVAL, but on ENOSYS it reports a read
-            // error and exits 2. vmsplice keeps ENOSYS.
-            SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
-                if panic_on_unsupported_syscalls {
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
+                // system-administration syscalls (module load/unload, kexec, reboot,
+                // swap, raw I/O ports, root-mount pivot, host/domain name, tty
+                // hangup, disk quotas). The deterministic guest does not hold the
+                // capabilities these require against the host kernel, so a fixed
+                // -EPERM matches the unprivileged errno, never perturbs global host
+                // state, and is identical across --verify and record/replay. These
+                // are untyped (Syscall::Other) in the pinned Reverie, so dispatch on
+                // the Sysno before the typed match below.
+                SyscallClassification::Determinized
+                    if is_privileged_admin_refused_syscall(call.number()) =>
+                {
                     syscall_histogram::mark_refused::<T, _>(guest);
-                    if call.number() == Sysno::vmsplice {
-                        Err(Error::Errno(Errno::ENOSYS))
-                    } else {
-                        Err(Error::Errno(Errno::EINVAL))
+                    Err(Error::Errno(Errno::EPERM))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-844): Enforce a deterministic boundary
+                // around host-global process accounting and cross-process memory.
+                SyscallClassification::Determinized
+                    if is_process_isolation_refused_syscall(call.number()) =>
+                {
+                    syscall_histogram::mark_refused::<T, _>(guest);
+                    Err(Error::Errno(Errno::EPERM))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-876): Guest performance events
+                // expose host PMU availability, policy, and asynchronous counter
+                // state that Detcore does not model. A fixed ENOSYS preserves the
+                // portable feature-probe fallback without creating an untracked fd.
+                SyscallClassification::Determinized
+                    if is_perf_event_enosys_syscall(call.number()) =>
+                {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-853): Refuse nested tracing, host-object
+                // comparison at the deterministic boundary.
+                SyscallClassification::Determinized
+                    if is_privileged_observation_refused_syscall(call.number()) =>
+                {
+                    syscall_histogram::mark_refused::<T, _>(guest);
+                    Err(Error::Errno(Errno::EPERM))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#720): set_mempolicy_home_node is untyped in the
+                // pinned Reverie revision. Hermit exposes a single virtual NUMA node,
+                // so setting a memory range's home node has no observable effect: a
+                // deterministic no-op.
+                SyscallClassification::Determinized
+                    if call.number() == Sysno::set_mempolicy_home_node =>
+                {
+                    Ok(0)
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount
+                // and namespace administration syscalls (mount/umount2/mount_setattr/
+                // move_mount/open_tree/fsopen/fsmount/fsconfig/fspick, unshare, setns,
+                // open_by_handle_at, fanotify_init/fanotify_mark, settimeofday). A
+                // deterministic container pins the guest's namespaces, mount
+                // hierarchy, and virtual clock for the whole run, so these are
+                // refused with a fixed -EPERM: the unprivileged errno for the
+                // capability-gated operations and a deliberate deterministic refusal
+                // otherwise. Never forwarded to the host; identical across --verify
+                // and record/replay. Untyped (Syscall::Other) in the pinned Reverie,
+                // so dispatch on the Sysno before the typed match below.
+                SyscallClassification::Determinized
+                    if is_mount_ns_admin_refused_syscall(call.number()) =>
+                {
+                    syscall_histogram::mark_refused::<T, _>(guest);
+                    Err(Error::Errno(Errno::EPERM))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
+                // asynchronous and message-passing I/O and IPC interfaces Detcore
+                // does not model: Linux native AIO (io_setup/io_destroy/io_submit/
+                // io_cancel/io_getevents/io_pgetevents), POSIX message queues
+                // (mq_*), and System V message queues (msg*). AIO completion is
+                // kernel-driven and lives outside logical time; the message-queue
+                // families operate on global, key/name-addressed kernel objects
+                // shared with the whole host. A fixed -ENOSYS is the errno a kernel
+                // built without AIO/CONFIG_POSIX_MQUEUE/CONFIG_SYSVIPC returns, is
+                // never forwarded to the host, and is identical across --verify and
+                // record/replay (mirrors the io_uring refusal). Untyped
+                // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
+                // before the typed match below.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-859): Include System V semaphore and shared-
+                // memory objects in the existing CONFIG_SYSVIPC refusal boundary.
+                SyscallClassification::Determinized
+                    if is_unsupported_async_ipc_syscall(call.number()) =>
+                {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-882): Legacy nonlinear page
+                // remapping has host-dependent kernel support and VMA behavior that
+                // Detcore does not model. Preserve the documented mmap fallback.
+                SyscallClassification::Determinized
+                    if is_remap_file_pages_enosys_syscall(call.number()) =>
+                {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#787): BATCH 38. openat2 is untyped (Syscall::Other)
+                // in the pinned Reverie revision. It is a superset of openat whose
+                // callers must fall back to openat when it returns ENOSYS (kernels
+                // before 5.6 lack openat2), so a fixed -ENOSYS routes them onto the
+                // already-determinized openat path with no host dependency and behavior
+                // identical across --verify and record/replay.
+                SyscallClassification::Determinized if call.number() == Sysno::openat2 => {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#787): BATCH 38. The credential-setting family
+                // (setuid/setgid and their re-/res-/fs- variants, and setgroups) is
+                // untyped (Syscall::Other) in the pinned Reverie. Detcore presents a
+                // fixed virtual-root identity (getuid/geteuid/getgid/getegid are
+                // virtualized to 0) and never tracks a credential change, so these
+                // succeed as deterministic no-ops returning 0 -- the value a real root
+                // process gets for a permitted credential change (and the previous
+                // fs-id, virtual 0, for setfsuid/setfsgid). That lets privilege-
+                // dropping programs proceed instead of fail-closing and is identical
+                // across --verify and record/replay.
+                SyscallClassification::Determinized
+                    if is_credential_identity_noop_syscall(call.number()) =>
+                {
+                    Ok(0)
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#1851): The file-ownership mutation family
+                // (chown/fchown/fchownat/lchown) completes the fixed virtual-root
+                // identity that the credential query (#1549) and credential set
+                // (#787) families already implement. A real root process's chown
+                // succeeds for any uid, so 0 is the value the virtual identity must
+                // observe; forwarding instead returned the errno of whatever host
+                // identity the backend happened to run under (EPERM with no user
+                // namespace, EINVAL for an unmapped uid inside a one-uid map, and
+                // backend-dependent for in-process backends).
+                //
+                // The emulation covers the IDENTITY half only. Root privilege
+                // waives the ownership permission check; it does not waive pathname,
+                // descriptor, or flag errors, so handle_ownership_change_noop
+                // translates the target arguments into a side-effect-free metadata
+                // lookup and returns 0 only if that validation succeeds. ENOENT,
+                // EBADF, EFAULT, ENOTDIR and the fchownat flag EINVAL therefore
+                // still reach the guest; the host-identity-dependent EPERM/EINVAL
+                // cannot be produced at all. No setattr is attempted, so host
+                // ownership, mode bits, and timestamps are never modified, and
+                // Detcore does not model per-file ownership, so the success is not
+                // observable through a later stat -- see
+                // is_ownership_change_noop_syscall and handle_ownership_change_noop
+                // for the full boundary, and
+                // hermit-cli/tests/chown_virtual_root_identity.rs for the bracket
+                // that fails if this arm's RESULT regresses.
+                SyscallClassification::Determinized
+                    if is_ownership_change_noop_syscall(call.number()) =>
+                {
+                    self.handle_ownership_change_noop(guest, call).await
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS for the Landlock
+                // unprivileged-sandbox syscalls (landlock_create_ruleset,
+                // landlock_add_rule, landlock_restrict_self). Landlock availability
+                // and ABI version depend on the host kernel build
+                // (CONFIG_SECURITY_LANDLOCK) and runtime LSM stacking, so forwarding
+                // them (the legacy pass-through) is host-dependent and, because a
+                // ruleset restricts the whole thread tree, a global-state isolation
+                // hole. A fixed -ENOSYS is the errno a kernel built without Landlock
+                // returns, so the guest sees a consistent "sandbox unavailable"
+                // answer regardless of host; never forwarded to the host and
+                // bitwise-identical across --verify and record/replay. Untyped
+                // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
+                // before the typed match below.
+                SyscallClassification::Determinized
+                    if is_landlock_sandbox_syscall(call.number()) =>
+                {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-847): Refuse unmodeled host-kernel probes
+                // with a fixed ENOSYS so guest behavior does not depend on BPF/LSM
+                // configuration or mutable page-cache state.
+                SyscallClassification::Determinized
+                    if is_host_kernel_probe_syscall(call.number()) =>
+                {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table
+                // synchronization. The pinned Reverie exposes close_range as a raw
+                // call, so dispatch by Sysno before the typed match.
+                SyscallClassification::Determinized if call.number() == Sysno::close_range => {
+                    self.handle_close_range(guest, call).await
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-839): Optional modern memory APIs vary with
+                // host kernel configuration, CET support, and pidfd lifecycle.
+                // Present the portable feature-absence result instead.
+                SyscallClassification::Determinized
+                    if is_optional_memory_feature_syscall(call.number()) =>
+                {
+                    Err(Error::Errno(Errno::ENOSYS))
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is untyped (Syscall::Other)
+                // in the pinned Reverie revision. It is epoll_pwait with a
+                // `struct timespec *` timeout; recent glibc routes epoll_wait/
+                // epoll_pwait through it. Handled identically to epoll_pwait
+                // (scheduler yield + record/replay forwarding).
+                SyscallClassification::Determinized if call.number() == Sysno::epoll_pwait2 => {
+                    self.handle_epoll_pwait2(guest, call).await
+                }
+                SyscallClassification::Determinized => match call {
+                    Syscall::Getpid(_) | Syscall::Gettid(_) => {
+                        // Keep the inner Tool's syscall observation/injection and
+                        // all errors, then project a successful own ID from shared
+                        // state. Do not return early past the normal posthooks.
+                        self.passthrough(guest, call)
+                            .await
+                            .map(|result| self.project_own_getter_result(guest, call, result))
                     }
-                } else {
-                    let result = self.passthrough(guest, call).await;
-                    // A forwarded splice from a socket may take a message
-                    // whose descriptors Linux releases unseen, and one into a
-                    // socket sends messages Detcore does not count.
-                    if let Syscall::Splice(splice) = call {
+                    Syscall::Write(w) => {
+                        let send = self.send_without_control(
+                            guest,
+                            w.fd(),
+                            |guest| self.completes_in_turn(guest, w),
+                            false,
+                            false,
+                        );
+                        let result = self.handle_write(guest, w).await;
+                        self.note_send_without_control(guest, send, &result);
+                        result
+                    }
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#547)
+                    // The vectored handlers keep the call's entry import
+                    // across their retries, so they are boxed like the open
+                    // family (`hot_path_futures_stay_small`).
+                    Syscall::Writev(w) => {
+                        let send = self.send_without_control(
+                            guest,
+                            w.fd(),
+                            |guest| self.completes_in_turn(guest, w),
+                            false,
+                            false,
+                        );
+                        let result = Box::pin(self.handle_writev(guest, w)).await;
+                        self.note_send_without_control(guest, send, &result);
+                        result
+                    }
+                    Syscall::Openat(o) => Box::pin(self.handle_openat(guest, o)).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Open(o) => Box::pin(self.handle_openat(guest, o.into())).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Creat(o) => Box::pin(self.handle_openat(guest, o.into())).await,
+                    Syscall::Close(s) => self.handle_close(guest, s).await,
+                    Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                        self.handle_sock_diag_read(guest, s).await
+                    }
+                    Syscall::Read(s) => {
+                        let in_turn = self.receives_in_turn(guest, s.fd(), s);
+                        let result = self.handle_read(guest, s).await;
                         let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
                             peek: false,
-                            request: crate::syscalls::scm_rights::Request::Spliced(splice.len()),
-                            returns_at_once_when_empty: true,
-                            address_out: false,
-                            takes: crate::syscalls::scm_rights::Takes::One,
-                            // Forwarded in the caller's turn; its result
-                            // depends on no guest memory either way.
-                            in_turn: true,
-                            noted_by_recordings: true,
-                        };
-                        self.note_receive_without_control(guest, splice.fd_in(), &result, read);
-                        self.note_spliced_send(guest, splice.fd_out(), &result);
-                    }
-                    result
-                }
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-860): Host LSM attributes are outside
-            // Detcore's model. Present a stable feature-absence boundary
-            // instead of forwarding probes.
-            SyscallClassification::Determinized
-                if is_host_security_identity_probe_syscall(call.number()) =>
-            {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#722): Deterministic EPERM for privileged
-            // system-administration syscalls (module load/unload, kexec, reboot,
-            // swap, raw I/O ports, root-mount pivot, host/domain name, tty
-            // hangup, disk quotas). The deterministic guest does not hold the
-            // capabilities these require against the host kernel, so a fixed
-            // -EPERM matches the unprivileged errno, never perturbs global host
-            // state, and is identical across --verify and record/replay. These
-            // are untyped (Syscall::Other) in the pinned Reverie, so dispatch on
-            // the Sysno before the typed match below.
-            SyscallClassification::Determinized
-                if is_privileged_admin_refused_syscall(call.number()) =>
-            {
-                syscall_histogram::mark_refused::<T, _>(guest);
-                Err(Error::Errno(Errno::EPERM))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-844): Enforce a deterministic boundary
-            // around host-global process accounting and cross-process memory.
-            SyscallClassification::Determinized
-                if is_process_isolation_refused_syscall(call.number()) =>
-            {
-                syscall_histogram::mark_refused::<T, _>(guest);
-                Err(Error::Errno(Errno::EPERM))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-876): Guest performance events
-            // expose host PMU availability, policy, and asynchronous counter
-            // state that Detcore does not model. A fixed ENOSYS preserves the
-            // portable feature-probe fallback without creating an untracked fd.
-            SyscallClassification::Determinized if is_perf_event_enosys_syscall(call.number()) => {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-853): Refuse nested tracing, host-object
-            // comparison at the deterministic boundary.
-            SyscallClassification::Determinized
-                if is_privileged_observation_refused_syscall(call.number()) =>
-            {
-                syscall_histogram::mark_refused::<T, _>(guest);
-                Err(Error::Errno(Errno::EPERM))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#720): set_mempolicy_home_node is untyped in the
-            // pinned Reverie revision. Hermit exposes a single virtual NUMA node,
-            // so setting a memory range's home node has no observable effect: a
-            // deterministic no-op.
-            SyscallClassification::Determinized
-                if call.number() == Sysno::set_mempolicy_home_node =>
-            {
-                Ok(0)
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount
-            // and namespace administration syscalls (mount/umount2/mount_setattr/
-            // move_mount/open_tree/fsopen/fsmount/fsconfig/fspick, unshare, setns,
-            // open_by_handle_at, fanotify_init/fanotify_mark, settimeofday). A
-            // deterministic container pins the guest's namespaces, mount
-            // hierarchy, and virtual clock for the whole run, so these are
-            // refused with a fixed -EPERM: the unprivileged errno for the
-            // capability-gated operations and a deliberate deterministic refusal
-            // otherwise. Never forwarded to the host; identical across --verify
-            // and record/replay. Untyped (Syscall::Other) in the pinned Reverie,
-            // so dispatch on the Sysno before the typed match below.
-            SyscallClassification::Determinized
-                if is_mount_ns_admin_refused_syscall(call.number()) =>
-            {
-                syscall_histogram::mark_refused::<T, _>(guest);
-                Err(Error::Errno(Errno::EPERM))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#731): Deterministic ENOSYS for the
-            // asynchronous and message-passing I/O and IPC interfaces Detcore
-            // does not model: Linux native AIO (io_setup/io_destroy/io_submit/
-            // io_cancel/io_getevents/io_pgetevents), POSIX message queues
-            // (mq_*), and System V message queues (msg*). AIO completion is
-            // kernel-driven and lives outside logical time; the message-queue
-            // families operate on global, key/name-addressed kernel objects
-            // shared with the whole host. A fixed -ENOSYS is the errno a kernel
-            // built without AIO/CONFIG_POSIX_MQUEUE/CONFIG_SYSVIPC returns, is
-            // never forwarded to the host, and is identical across --verify and
-            // record/replay (mirrors the io_uring refusal). Untyped
-            // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
-            // before the typed match below.
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-859): Include System V semaphore and shared-
-            // memory objects in the existing CONFIG_SYSVIPC refusal boundary.
-            SyscallClassification::Determinized
-                if is_unsupported_async_ipc_syscall(call.number()) =>
-            {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-882): Legacy nonlinear page
-            // remapping has host-dependent kernel support and VMA behavior that
-            // Detcore does not model. Preserve the documented mmap fallback.
-            SyscallClassification::Determinized
-                if is_remap_file_pages_enosys_syscall(call.number()) =>
-            {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#787): BATCH 38. openat2 is untyped (Syscall::Other)
-            // in the pinned Reverie revision. It is a superset of openat whose
-            // callers must fall back to openat when it returns ENOSYS (kernels
-            // before 5.6 lack openat2), so a fixed -ENOSYS routes them onto the
-            // already-determinized openat path with no host dependency and behavior
-            // identical across --verify and record/replay.
-            SyscallClassification::Determinized if call.number() == Sysno::openat2 => {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#787): BATCH 38. The credential-setting family
-            // (setuid/setgid and their re-/res-/fs- variants, and setgroups) is
-            // untyped (Syscall::Other) in the pinned Reverie. Detcore presents a
-            // fixed virtual-root identity (getuid/geteuid/getgid/getegid are
-            // virtualized to 0) and never tracks a credential change, so these
-            // succeed as deterministic no-ops returning 0 -- the value a real root
-            // process gets for a permitted credential change (and the previous
-            // fs-id, virtual 0, for setfsuid/setfsgid). That lets privilege-
-            // dropping programs proceed instead of fail-closing and is identical
-            // across --verify and record/replay.
-            SyscallClassification::Determinized
-                if is_credential_identity_noop_syscall(call.number()) =>
-            {
-                Ok(0)
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#1851): The file-ownership mutation family
-            // (chown/fchown/fchownat/lchown) completes the fixed virtual-root
-            // identity that the credential query (#1549) and credential set
-            // (#787) families already implement. A real root process's chown
-            // succeeds for any uid, so 0 is the value the virtual identity must
-            // observe; forwarding instead returned the errno of whatever host
-            // identity the backend happened to run under (EPERM with no user
-            // namespace, EINVAL for an unmapped uid inside a one-uid map, and
-            // backend-dependent for in-process backends).
-            //
-            // The emulation covers the IDENTITY half only. Root privilege
-            // waives the ownership permission check; it does not waive pathname,
-            // descriptor, or flag errors, so handle_ownership_change_noop
-            // translates the target arguments into a side-effect-free metadata
-            // lookup and returns 0 only if that validation succeeds. ENOENT,
-            // EBADF, EFAULT, ENOTDIR and the fchownat flag EINVAL therefore
-            // still reach the guest; the host-identity-dependent EPERM/EINVAL
-            // cannot be produced at all. No setattr is attempted, so host
-            // ownership, mode bits, and timestamps are never modified, and
-            // Detcore does not model per-file ownership, so the success is not
-            // observable through a later stat -- see
-            // is_ownership_change_noop_syscall and handle_ownership_change_noop
-            // for the full boundary, and
-            // hermit-cli/tests/chown_virtual_root_identity.rs for the bracket
-            // that fails if this arm's RESULT regresses.
-            SyscallClassification::Determinized
-                if is_ownership_change_noop_syscall(call.number()) =>
-            {
-                self.handle_ownership_change_noop(guest, call).await
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS for the Landlock
-            // unprivileged-sandbox syscalls (landlock_create_ruleset,
-            // landlock_add_rule, landlock_restrict_self). Landlock availability
-            // and ABI version depend on the host kernel build
-            // (CONFIG_SECURITY_LANDLOCK) and runtime LSM stacking, so forwarding
-            // them (the legacy pass-through) is host-dependent and, because a
-            // ruleset restricts the whole thread tree, a global-state isolation
-            // hole. A fixed -ENOSYS is the errno a kernel built without Landlock
-            // returns, so the guest sees a consistent "sandbox unavailable"
-            // answer regardless of host; never forwarded to the host and
-            // bitwise-identical across --verify and record/replay. Untyped
-            // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno
-            // before the typed match below.
-            SyscallClassification::Determinized if is_landlock_sandbox_syscall(call.number()) => {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-847): Refuse unmodeled host-kernel probes
-            // with a fixed ENOSYS so guest behavior does not depend on BPF/LSM
-            // configuration or mutable page-cache state.
-            SyscallClassification::Determinized if is_host_kernel_probe_syscall(call.number()) => {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-838): Review close_range descriptor-table
-            // synchronization. The pinned Reverie exposes close_range as a raw
-            // call, so dispatch by Sysno before the typed match.
-            SyscallClassification::Determinized if call.number() == Sysno::close_range => {
-                self.handle_close_range(guest, call).await
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-839): Optional modern memory APIs vary with
-            // host kernel configuration, CET support, and pidfd lifecycle.
-            // Present the portable feature-absence result instead.
-            SyscallClassification::Determinized
-                if is_optional_memory_feature_syscall(call.number()) =>
-            {
-                Err(Error::Errno(Errno::ENOSYS))
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#773): epoll_pwait2 is untyped (Syscall::Other)
-            // in the pinned Reverie revision. It is epoll_pwait with a
-            // `struct timespec *` timeout; recent glibc routes epoll_wait/
-            // epoll_pwait through it. Handled identically to epoll_pwait
-            // (scheduler yield + record/replay forwarding).
-            SyscallClassification::Determinized if call.number() == Sysno::epoll_pwait2 => {
-                self.handle_epoll_pwait2(guest, call).await
-            }
-            SyscallClassification::Determinized => match call {
-                Syscall::Getpid(_) | Syscall::Gettid(_) => {
-                    // Keep the inner Tool's syscall observation/injection and
-                    // all errors, then project a successful own ID from shared
-                    // state. Do not return early past the normal posthooks.
-                    self.passthrough(guest, call)
-                        .await
-                        .map(|result| self.project_own_getter_result(guest, call, result))
-                }
-                Syscall::Write(w) => {
-                    let send = self.send_without_control(
-                        guest,
-                        w.fd(),
-                        |guest| self.completes_in_turn(guest, w),
-                        false,
-                        false,
-                    );
-                    let result = self.handle_write(guest, w).await;
-                    self.note_send_without_control(guest, send, &result);
-                    result
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#547)
-                // The vectored handlers keep the call's entry import
-                // across their retries, so they are boxed like the open
-                // family (`hot_path_futures_stay_small`).
-                Syscall::Writev(w) => {
-                    let send = self.send_without_control(
-                        guest,
-                        w.fd(),
-                        |guest| self.completes_in_turn(guest, w),
-                        false,
-                        false,
-                    );
-                    let result = Box::pin(self.handle_writev(guest, w)).await;
-                    self.note_send_without_control(guest, send, &result);
-                    result
-                }
-                Syscall::Openat(o) => Box::pin(self.handle_openat(guest, o)).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Open(o) => Box::pin(self.handle_openat(guest, o.into())).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Creat(o) => Box::pin(self.handle_openat(guest, o.into())).await,
-                Syscall::Close(s) => self.handle_close(guest, s).await,
-                Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
-                    self.handle_sock_diag_read(guest, s).await
-                }
-                Syscall::Read(s) => {
-                    let in_turn = self.receives_in_turn(guest, s.fd(), s);
-                    let result = self.handle_read(guest, s).await;
-                    let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
-                        peek: false,
-                        request: crate::syscalls::scm_rights::Request::Bytes(
-                            s.buf().map_or(0, |buf| buf.as_raw()),
-                            s.len(),
-                        ),
-                        returns_at_once_when_empty: true,
-                        address_out: false,
-                        takes: crate::syscalls::scm_rights::Takes::Counted,
-                        in_turn,
-                        noted_by_recordings: true,
-                    };
-                    self.note_receive_without_control(guest, s.fd(), &result, read);
-                    result
-                }
-                Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
-                Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
-                Syscall::Sendfile(s) => self.handle_sendfile(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-887): Present a stable pre-4.5-kernel
-                // boundary so callers use determinized read/write copying.
-                Syscall::CopyFileRange(_) => Err(Error::Errno(Errno::ENOSYS)),
-                // TODO-HUMAN-REVIEW(#794): vectored scatter/gather I/O, mirroring
-                // read/pread64/pwrite64/writev.
-                Syscall::Readv(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
-                    self.handle_sock_diag_readv(guest, s).await
-                }
-                Syscall::Readv(s) => {
-                    let in_turn = self.receives_in_turn(guest, s.fd(), s);
-                    let result = self
-                        .handle_readv_with_output(guest, s, &mut rng_readv_output)
-                        .await;
-                    let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
-                        peek: false,
-                        request: crate::syscalls::scm_rights::Request::Iovecs(
-                            s.iov().map_or(0, |iov| iov.as_raw()),
-                            s.len(),
-                        ),
-                        returns_at_once_when_empty: true,
-                        address_out: false,
-                        takes: crate::syscalls::scm_rights::Takes::Counted,
-                        in_turn,
-                        noted_by_recordings: true,
-                    };
-                    self.note_receive_without_control(guest, s.fd(), &result, read);
-                    result
-                }
-                Syscall::Preadv(s) => {
-                    self.handle_preadv_with_output(guest, s, &mut rng_readv_output)
-                        .await
-                }
-                Syscall::Preadv2(s) => {
-                    let current = crate::syscalls::vectored_offset(s.pos_l(), s.pos_h()) == -1;
-                    let in_turn = current && self.receives_in_turn(guest, s.fd(), s);
-                    let result = self
-                        .handle_preadv2_with_output(guest, s, &mut rng_readv_output)
-                        .await;
-                    // At the current offset it reads a socket as `readv` does.
-                    if current {
-                        let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
-                            peek: false,
-                            request: crate::syscalls::scm_rights::Request::Iovecs(
-                                s.iov().map_or(0, |iov| iov.as_raw()),
-                                s.iov_len() as usize,
+                            request: crate::syscalls::scm_rights::Request::Bytes(
+                                s.buf().map_or(0, |buf| buf.as_raw()),
+                                s.len(),
                             ),
                             returns_at_once_when_empty: true,
                             address_out: false,
                             takes: crate::syscalls::scm_rights::Takes::Counted,
                             in_turn,
-                            // Recordings made before saw `preadv2` take
-                            // nothing from a socket's queue.
-                            noted_by_recordings: false,
+                            noted_by_recordings: true,
                         };
                         self.note_receive_without_control(guest, s.fd(), &result, read);
+                        result
                     }
-                    result
-                }
-                Syscall::Pwritev(s) => Box::pin(self.handle_pwritev(guest, s)).await,
-                Syscall::Pwritev2(s) => {
-                    // At the current offset it writes a socket as `writev`
-                    // does.
-                    let send = (crate::syscalls::vectored_offset(s.pos_l(), s.pos_h()) == -1)
-                        .then(|| {
-                            self.send_without_control(
-                                guest,
-                                s.fd(),
-                                |guest| {
-                                    matches!(
+                    Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
+                    Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-838): Review regular-file sendfile mediation.
+                    Syscall::Sendfile(s) => self.handle_sendfile(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-887): Present a stable pre-4.5-kernel
+                    // boundary so callers use determinized read/write copying.
+                    Syscall::CopyFileRange(_) => Err(Error::Errno(Errno::ENOSYS)),
+                    // TODO-HUMAN-REVIEW(#794): vectored scatter/gather I/O, mirroring
+                    // read/pread64/pwrite64/writev.
+                    Syscall::Readv(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                        self.handle_sock_diag_readv(guest, s).await
+                    }
+                    Syscall::Readv(s) => {
+                        let in_turn = self.receives_in_turn(guest, s.fd(), s);
+                        let result = self
+                            .handle_readv_with_output(guest, s, &mut rng_readv_output)
+                            .await;
+                        let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
+                            peek: false,
+                            request: crate::syscalls::scm_rights::Request::Iovecs(
+                                s.iov().map_or(0, |iov| iov.as_raw()),
+                                s.len(),
+                            ),
+                            returns_at_once_when_empty: true,
+                            address_out: false,
+                            takes: crate::syscalls::scm_rights::Takes::Counted,
+                            in_turn,
+                            noted_by_recordings: true,
+                        };
+                        self.note_receive_without_control(guest, s.fd(), &result, read);
+                        result
+                    }
+                    Syscall::Preadv(s) => {
+                        self.handle_preadv_with_output(guest, s, &mut rng_readv_output)
+                            .await
+                    }
+                    Syscall::Preadv2(s) => {
+                        let current = crate::syscalls::vectored_offset(s.pos_l(), s.pos_h()) == -1;
+                        let in_turn = current && self.receives_in_turn(guest, s.fd(), s);
+                        let result = self
+                            .handle_preadv2_with_output(guest, s, &mut rng_readv_output)
+                            .await;
+                        // At the current offset it reads a socket as `readv` does.
+                        if current {
+                            let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
+                                peek: false,
+                                request: crate::syscalls::scm_rights::Request::Iovecs(
+                                    s.iov().map_or(0, |iov| iov.as_raw()),
+                                    s.iov_len() as usize,
+                                ),
+                                returns_at_once_when_empty: true,
+                                address_out: false,
+                                takes: crate::syscalls::scm_rights::Takes::Counted,
+                                in_turn,
+                                // Recordings made before saw `preadv2` take
+                                // nothing from a socket's queue.
+                                noted_by_recordings: false,
+                            };
+                            self.note_receive_without_control(guest, s.fd(), &result, read);
+                        }
+                        result
+                    }
+                    Syscall::Pwritev(s) => Box::pin(self.handle_pwritev(guest, s)).await,
+                    Syscall::Pwritev2(s) => {
+                        // At the current offset it writes a socket as `writev`
+                        // does.
+                        let send =
+                            (crate::syscalls::vectored_offset(s.pos_l(), s.pos_h()) == -1)
+                                .then(|| {
+                                    self.send_without_control(
+                                        guest,
+                                        s.fd(),
+                                        |guest| {
+                                            matches!(
                                         crate::syscalls::helpers::ioaction_based_on_fd(
                                             guest,
                                             s.fd()
@@ -6584,881 +6598,893 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                                         Ok(crate::syscalls::helpers::IOAction::NonblockizeRetry
                                             | crate::syscalls::helpers::IOAction::PassThru)
                                     )
-                                },
-                                false,
-                                false,
-                            )
-                        })
-                        .flatten();
-                    let result = Box::pin(self.handle_pwritev2(guest, s)).await;
-                    self.note_send_without_control(guest, send, &result);
-                    result
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#683)
-                Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
-                // This syscall is advisory; fixed success preserves its API contract.
-                Syscall::Fadvise64(_) => Ok(0),
-                Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
-                Syscall::Madvise(s) => self.handle_madvise(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#775)
-                Syscall::Mincore(s) => self.handle_mincore(guest, s).await,
-                Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
-                Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Lstat(s) => self.handle_stat_family(guest, s.into()).await,
-                Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
-                #[cfg(target_arch = "aarch64")]
-                Syscall::Fstatat(s) => self.handle_stat_family(guest, s.into()).await,
-                Syscall::Statx(s) => self.handle_statx(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#877)
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
-                Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-912)
-                Syscall::Ioctl(s)
-                    if syscalls::socket_timestamp_ioctl::is_socket_timestamp_ioctl(s) =>
-                {
-                    self.handle_socket_timestamp_ioctl(guest, s).await
-                }
-                Syscall::Ioctl(s) => self.handle_ioctl(guest, s).await,
-                Syscall::Futex(s) => self.handle_futex(guest, s).await,
-
-                Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
-                Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
-
-                // Forward vfork as vfork (rather than rewriting to fork) so the
-                // kernel enforces the CLONE_VFORK parent-blocking contract while the
-                // child registers itself and runs to exec/exit.
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
-                Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
-                Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
-
-                Syscall::Setpgid(s) => self.handle_setpgid(guest, s).await,
-                Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Getpgrp(_) => self.handle_group_or_session_getter(guest, call).await,
-                Syscall::Getpgid(_) | Syscall::Getsid(_) => {
-                    self.handle_group_or_session_getter(guest, call).await
-                }
-                // Without virtual time the guest reads the host clock. Each of these
-                // must have a record/replay handler: a recording captures the value
-                // the guest observed, and replay returns it without reading the host.
-                Syscall::Gettimeofday(s) => {
-                    if virtualize_time {
-                        self.handle_gettimeofday(guest, s).await
-                    } else {
-                        self.passthrough(guest, call).await
+                                        },
+                                        false,
+                                        false,
+                                    )
+                                })
+                                .flatten();
+                        let result = Box::pin(self.handle_pwritev2(guest, s)).await;
+                        self.note_send_without_control(guest, send, &result);
+                        result
                     }
-                }
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Time(s) => {
-                    if virtualize_time {
-                        self.handle_time(guest, s).await
-                    } else {
-                        self.passthrough(guest, call).await
-                    }
-                }
-                Syscall::ClockGettime(s) => {
-                    if virtualize_time {
-                        self.handle_clock_gettime(guest, s).await
-                    } else {
-                        self.passthrough(guest, call).await
-                    }
-                }
-                Syscall::ClockGetres(s) => {
-                    if virtualize_time {
-                        self.handle_clock_getres(guest, s).await
-                    } else {
-                        self.passthrough(guest, call).await
-                    }
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::ClockSettime(_) => Err(Error::Errno(Errno::EPERM)),
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-892)
-                Syscall::Getitimer(s) => self.handle_getitimer(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-857): Virtual NTP query and fixed mutation refusal.
-                Syscall::Adjtimex(s) => {
-                    if virtualize_time {
-                        self.handle_adjtimex(guest, s).await
-                    } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
-                        .await
-                    }
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-857): Clock-id form of virtual NTP query.
-                Syscall::ClockAdjtime(s) => {
-                    if virtualize_time {
-                        self.handle_clock_adjtime(guest, s).await
-                    } else {
-                        self.handle_unsupported_syscall(
-                            guest,
-                            call,
-                            dettid,
-                            panic_on_unsupported_syscalls,
-                        )
-                        .await
-                    }
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-857): Empty virtual kernel ring buffer.
-                Syscall::Syslog(s) => self.handle_syslog(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Seccomp(s) => self.handle_seccomp(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Prctl(s) => self.handle_prctl(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getpriority(s) => self.handle_getpriority(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Setpriority(s) => self.handle_setpriority(guest, s).await,
-                Syscall::Uname(s) => self.handle_uname(guest, s).await,
-                Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
-                Syscall::Exit(s) => self.handle_exit(guest, s).await,
-
-                Syscall::Dup(w) => self.handle_dup(guest, w).await.map_err(Into::into),
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Dup2(w) => self.handle_dup2(guest, w).await,
-                Syscall::Dup3(w) => self.handle_dup3(guest, w).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await,
-                Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await,
-                Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Utime(s) => self.handle_utime(guest, s).await.map_err(Into::into),
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Utimes(s) => self.handle_utimes(guest, s).await.map_err(Into::into),
-                // NB: lutimes is a libc function not a syscall
-                Syscall::Utimensat(s) => self.handle_utimensat(guest, s).await.map_err(Into::into),
-                // NB: futimes/futimens are libc functions not a syscall,
-                // futimesat is obsolete, return -ENOSYS for simplicity.
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Futimesat(_s) => Err(Error::Errno(Errno::ENOSYS)),
-                // io_uring completion and memory-sharing semantics are not deterministic.
-                Syscall::IoUringSetup(_)
-                | Syscall::IoUringEnter(_)
-                | Syscall::IoUringRegister(_) => Err(Error::Errno(Errno::ENOSYS)),
-                Syscall::Socket(s) => self.handle_socket(guest, s).await,
-                Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await,
-                Syscall::Connect(s) => self.handle_connect(guest, s).await,
-                Syscall::Bind(s) => self.handle_bind(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Setsockopt(s) => {
-                    let result = self.handle_setsockopt(guest, s).await;
-                    // Credentials passing names the socket at its next send.
-                    if result.is_ok()
-                        && s.level() == libc::SOL_SOCKET
-                        && matches!(s.optname(), libc::SO_PASSCRED | libc::SO_PASSPIDFD)
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#683)
+                    Syscall::Pwrite64(s) => self.handle_pwrite64(guest, s).await,
+                    // This syscall is advisory; fixed success preserves its API contract.
+                    Syscall::Fadvise64(_) => Ok(0),
+                    Syscall::Mmap(s) => self.handle_mmap(guest, s).await,
+                    Syscall::Madvise(s) => self.handle_madvise(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#775)
+                    Syscall::Mincore(s) => self.handle_mincore(guest, s).await,
+                    Syscall::Munmap(s) => self.handle_munmap(guest, s).await,
+                    Syscall::Mremap(s) => self.handle_mremap(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Stat(s) => self.handle_stat_family(guest, s.into()).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Lstat(s) => self.handle_stat_family(guest, s.into()).await,
+                    Syscall::Fstat(s) => self.handle_stat_family(guest, s.into()).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Newfstatat(s) => self.handle_stat_family(guest, s.into()).await,
+                    #[cfg(target_arch = "aarch64")]
+                    Syscall::Fstatat(s) => self.handle_stat_family(guest, s.into()).await,
+                    Syscall::Statx(s) => self.handle_statx(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#877)
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Readlink(s) => self.handle_readlink(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    Syscall::Readlinkat(s) => self.handle_readlinkat(guest, s).await,
+                    Syscall::Fcntl(s) => self.handle_fcntl(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-912)
+                    Syscall::Ioctl(s)
+                        if syscalls::socket_timestamp_ioctl::is_socket_timestamp_ioctl(s) =>
                     {
-                        self.note_unix_socket_reachable(guest, s.fd());
+                        self.handle_socket_timestamp_ioctl(guest, s).await
                     }
-                    result
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Listen(s) => self.handle_listen(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getsockname(s) => self.handle_getsockname(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getpeername(s) => self.handle_getpeername(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getsockopt(s) => self.handle_getsockopt(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#818): shutdown is the lone remaining
-                // socket-family syscall; half-closes a tracked socket and
-                // forwards via record_or_replay (KVM ratchet round 12).
-                Syscall::Shutdown(s) => self.handle_shutdown(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
-                Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
-                Syscall::Signalfd4(s) => self.handle_signalfd4(guest, s).await,
-                Syscall::TimerfdCreate(s) => self.handle_timerfd_create(guest, s).await,
-                Syscall::TimerfdSettime(s) => self.handle_timerfd_settime(guest, s).await,
-                Syscall::TimerfdGettime(s) => self.handle_timerfd_gettime(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::InotifyInit(s) => {
-                    self.handle_inotify_init1(guest, InotifyInit1::from(s))
-                        .await
-                }
-                Syscall::InotifyInit1(s) => self.handle_inotify_init1(guest, s).await,
-                Syscall::InotifyAddWatch(s) => self.handle_inotify_add_watch(guest, s).await,
-                Syscall::InotifyRmWatch(s) => self.handle_inotify_rm_watch(guest, s).await,
-                Syscall::MemfdCreate(s) => self.handle_memfd_create(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-862): Record/replay and register pidfds.
-                Syscall::PidfdOpen(s) => self.handle_pidfd_open(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-899): Host object handles and mount IDs
-                // are outside Detcore's filesystem identity model.
-                Syscall::NameToHandleAt(_) => Err(Error::Errno(Errno::EOPNOTSUPP)),
-                Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await,
-                Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,
-                Syscall::Accept4(s) => self.handle_accept4(guest, s).await,
+                    Syscall::Ioctl(s) => self.handle_ioctl(guest, s).await,
+                    Syscall::Futex(s) => self.handle_futex(guest, s).await,
 
-                Syscall::Nanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
-                Syscall::ClockNanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
-                Syscall::SchedYield(s) => self.handle_sched_yield(guest, s).await,
+                    Syscall::Clone(s) => self.handle_clone_family(guest, s.into()).await,
+                    Syscall::Clone3(s) => self.handle_clone_family(guest, s.into()).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Fork(s) => self.handle_clone_family(guest, s.into()).await,
 
-                // NB: getdents is not recommended, (g)libc should call getdents64 only
-                // see: sysdeps/unix/sysv/linux/getdents.c.
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Getdents(s) => self.handle_getdents(guest, s).await,
-                Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
+                    // Forward vfork as vfork (rather than rewriting to fork) so the
+                    // kernel enforces the CLONE_VFORK parent-blocking contract while the
+                    // child registers itself and runs to exec/exit.
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Vfork(s) => self.handle_clone_family(guest, s.into()).await,
+                    Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
+                    Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
 
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Poll(s) => self.handle_poll(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
-                Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Select(s) => self.handle_select(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::EpollCreate(s) => {
-                    self.handle_epoll_create1(guest, EpollCreate1::from(s))
-                        .await
-                }
-                Syscall::EpollCreate1(s) => self.handle_epoll_create1(guest, s).await,
-                Syscall::EpollCtl(s) => self.handle_epoll_ctl(guest, s).await,
-                Syscall::EpollPwait(s) => self.handle_epoll_pwait(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::EpollWait(s) => self.handle_epoll_wait(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::EpollWaitOld(s) => panic!(
-                    "Not handling deprecated syscall: {}",
-                    s.display(&guest.memory())
-                ),
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#549)
-                // The obsolete x86_64 entry point is absent from modern Linux kernels.
-                #[cfg(target_arch = "x86_64")]
-                Syscall::EpollCtlOld(_) => Err(Error::Errno(Errno::ENOSYS)),
-
-                Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
-                Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,
-
-                // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling
-                // policy. Hermit exposes a single virtual NUMA node and replaces
-                // the Linux scheduler with Detcore, so these are inoperative and
-                // are virtualized to fixed, host-independent results (see the
-                // determinism argument in syscall_classification.rs). Setters and
-                // count-returning calls are no-ops; getters emulate a default
-                // single-node / SCHED_OTHER answer.
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#720)
-                Syscall::Mbind(_) => Ok(0),
-                Syscall::SetMempolicy(_) => Ok(0),
-                Syscall::GetMempolicy(s) => self.handle_get_mempolicy(guest, s).await,
-                Syscall::MigratePages(_) => Ok(0),
-                Syscall::MovePages(s) => self.handle_move_pages(guest, s).await,
-                Syscall::SchedSetscheduler(_) => Ok(0),
-                Syscall::SchedSetparam(_) => Ok(0),
-                // Report the fixed default policy SCHED_OTHER (0).
-                Syscall::SchedGetscheduler(_) => Ok(0),
-                Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
-                Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
-
-                // ===== BATCH 51: fail-closed utility syscalls, re-enabling chrt,
-                // ionice, and flock under --strict. Detcore replaces the Linux
-                // scheduler, exposes a single virtual CPU, and serializes guest
-                // threads, so a thread's Linux scheduling attributes (sched_getattr)
-                // and I/O priority (ioprio_set) are inert: those two have no
-                // deterministic effect and are emulated to fixed, host-independent
-                // results (see syscall_classification.rs).
-                //
-                // flock is NOT in that inert group and is not emulated. This comment
-                // used to claim it "is never contended inside the serialized
-                // container"; that was measured false -- two open file descriptions
-                // in ONE process both held the same LOCK_EX under the old no-op,
-                // where native Linux excluded the second -- and the no-op was
-                // removed. Serializing THREADS does not make a whole-file lock
-                // uncontended, because flock conflicts are between OPEN FILE
-                // DESCRIPTIONS. flock is now forwarded to the kernel, like fcntl's
-                // POSIX record locks; handle_flock carries the determinism argument
-                // and the one case Detcore refuses (a contended BLOCKING request,
-                // which it cannot park a thread on deterministically).
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#791)
-                Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-841): Review virtual sched_setattr no-op policy.
-                Syscall::SchedSetattr(s) => self.handle_sched_setattr(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#791)
-                Syscall::IoprioSet(s) => self.handle_ioprio_set(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-881): Review virtual ioprio_get defaults.
-                Syscall::IoprioGet(s) => self.handle_ioprio_get(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#2373)
-                Syscall::Flock(s) => self.handle_flock(guest, s).await,
-
-                // TODO-HUMAN-REVIEW(PR-1064): recvfrom/read/readv/recvmmsg reach
-                // a NETLINK_SOCK_DIAG dump exactly as recvmsg does. Until they
-                // were routed through the same sanitizer, four of the five
-                // usable receive syscalls returned raw host socket inode
-                // numbers, which made the determinization optional from the
-                // guest's point of view: `socket.recv()` alone was enough to
-                // skip it. Non-socket-diag descriptors take the same path as
-                // before; the predicate is checked inside.
-                Syscall::Recvfrom(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
-                    self.handle_sock_diag_recvfrom(guest, s).await
-                }
-                Syscall::Recvfrom(s) => {
-                    let in_turn = self.receives_in_turn(guest, s.fd(), s);
-                    let result = self.handle_socket_receive(guest, s, s.fd(), true).await;
-                    let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
-                        peek: s.flags() & libc::MSG_PEEK != 0,
-                        request: crate::syscalls::scm_rights::Request::Bytes(
-                            s.buf().map_or(0, |buf| buf.as_raw()),
-                            s.len(),
-                        ),
-                        returns_at_once_when_empty: false,
-                        address_out: s.addr().is_some(),
-                        takes: crate::syscalls::scm_rights::Takes::Counted,
-                        in_turn,
-                        noted_by_recordings: true,
-                    };
-                    self.note_receive_without_control(guest, s.fd(), &result, read);
-                    result
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-901)
-                Syscall::Recvmsg(s) => Box::pin(self.handle_recvmsg(guest, s)).await,
-                Syscall::Sendto(s) => {
-                    let send = self.send_without_control(
-                        guest,
-                        s.fd(),
-                        |guest| self.completes_in_turn(guest, s),
-                        s.addr().is_some() && s.addr_len() != 0,
-                        s.flags() & libc::MSG_OOB as u32 != 0,
-                    );
-                    let result = self.handle_sendrecv(guest, s).await;
-                    self.note_send_without_control(guest, send, &result);
-                    result
-                }
-                Syscall::Sendmsg(s) => Box::pin(self.handle_sendmsg(guest, s)).await,
-                Syscall::Sendmmsg(s) => Box::pin(self.handle_sendmmsg(guest, s)).await,
-
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#788): recvmmsg is the multi-message form of
-                // recvmsg and shares its NonblockableSyscall impl. The fd is made
-                // temporarily nonblocking, the kernel fills the mmsghdr array
-                // atomically, and the Detcore scheduler owns any blocking, so the
-                // timeout argument (deliberately ignored, see helpers.rs) does not
-                // introduce nondeterminism.
-                // TODO-HUMAN-REVIEW(PR-901): Review batched ancillary timestamp rewriting.
-                Syscall::Recvmmsg(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
-                    self.handle_sock_diag_recvmmsg(guest, s).await
-                }
-                Syscall::Recvmmsg(s) => Box::pin(self.handle_recvmmsg(guest, s)).await,
-                Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
-                Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Kill(s) => {
-                    let result = self.handle_kill(guest, s).await;
-                    let result = self
-                        .report_backend_signal_refusal(guest, Sysno::kill, result)
-                        .await;
-                    if s.sig() == libc::SIGALRM && result.is_ok() {
-                        let target = if guest.thread_state().nested_pid_namespace {
-                            Some(GuestSigalrmTarget::Unclassified)
+                    Syscall::Setpgid(s) => self.handle_setpgid(guest, s).await,
+                    Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Getpgrp(_) => self.handle_group_or_session_getter(guest, call).await,
+                    Syscall::Getpgid(_) | Syscall::Getsid(_) => {
+                        self.handle_group_or_session_getter(guest, call).await
+                    }
+                    // Without virtual time the guest reads the host clock. Each of these
+                    // must have a record/replay handler: a recording captures the value
+                    // the guest observed, and replay returns it without reading the host.
+                    Syscall::Gettimeofday(s) => {
+                        if virtualize_time {
+                            self.handle_gettimeofday(guest, s).await
                         } else {
-                            match s.pid() {
-                                pid if pid > 0 => {
-                                    Some(GuestSigalrmTarget::Process(DetPid::from_raw(pid)))
-                                }
-                                0 => Some(GuestSigalrmTarget::Group(None)),
-                                -1 => Some(GuestSigalrmTarget::All),
-                                libc::pid_t::MIN => None,
-                                pid => {
-                                    Some(GuestSigalrmTarget::Group(Some(DetPid::from_raw(-pid))))
-                                }
-                            }
-                        };
-                        if let Some(target) = target {
-                            self.note_guest_sigalrm(guest, target).await;
+                            self.passthrough(guest, call).await
                         }
                     }
-                    result
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Tgkill(s) => {
-                    let result = self.handle_tgkill(guest, s).await;
-                    self.report_backend_signal_refusal(guest, Sysno::tgkill, result)
-                        .await
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#812)
-                Syscall::Tkill(s) => {
-                    let result = self.handle_tkill(guest, s).await;
-                    self.report_backend_signal_refusal(guest, Sysno::tkill, result)
-                        .await
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#812)
-                Syscall::RtSigqueueinfo(s) => {
-                    let result = self.handle_rt_sigqueueinfo(guest, s).await;
-                    let result = self
-                        .report_backend_signal_refusal(guest, Sysno::rt_sigqueueinfo, result)
-                        .await;
-                    if s.sig() == libc::SIGALRM && result.is_ok() {
-                        let target = if guest.thread_state().nested_pid_namespace {
-                            GuestSigalrmTarget::Unclassified
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Time(s) => {
+                        if virtualize_time {
+                            self.handle_time(guest, s).await
                         } else {
-                            GuestSigalrmTarget::Process(DetPid::from_raw(s.tgid()))
+                            self.passthrough(guest, call).await
+                        }
+                    }
+                    Syscall::ClockGettime(s) => {
+                        if virtualize_time {
+                            self.handle_clock_gettime(guest, s).await
+                        } else {
+                            self.passthrough(guest, call).await
+                        }
+                    }
+                    Syscall::ClockGetres(s) => {
+                        if virtualize_time {
+                            self.handle_clock_getres(guest, s).await
+                        } else {
+                            self.passthrough(guest, call).await
+                        }
+                    }
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::ClockSettime(_) => Err(Error::Errno(Errno::EPERM)),
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-892)
+                    Syscall::Getitimer(s) => self.handle_getitimer(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Setitimer(s) => self.handle_setitimer(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-857): Virtual NTP query and fixed mutation refusal.
+                    Syscall::Adjtimex(s) => {
+                        if virtualize_time {
+                            self.handle_adjtimex(guest, s).await
+                        } else {
+                            self.handle_unsupported_syscall(
+                                guest,
+                                call,
+                                dettid,
+                                panic_on_unsupported_syscalls,
+                            )
+                            .await
+                        }
+                    }
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-857): Clock-id form of virtual NTP query.
+                    Syscall::ClockAdjtime(s) => {
+                        if virtualize_time {
+                            self.handle_clock_adjtime(guest, s).await
+                        } else {
+                            self.handle_unsupported_syscall(
+                                guest,
+                                call,
+                                dettid,
+                                panic_on_unsupported_syscalls,
+                            )
+                            .await
+                        }
+                    }
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-857): Empty virtual kernel ring buffer.
+                    Syscall::Syslog(s) => self.handle_syslog(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::ArchPrctl(s) => self.handle_arch_prctl(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    Syscall::Seccomp(s) => self.handle_seccomp(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Prctl(s) => self.handle_prctl(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Getpriority(s) => self.handle_getpriority(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Setpriority(s) => self.handle_setpriority(guest, s).await,
+                    Syscall::Uname(s) => self.handle_uname(guest, s).await,
+                    Syscall::ExitGroup(s) => self.handle_exit_group(guest, s).await,
+                    Syscall::Exit(s) => self.handle_exit(guest, s).await,
+
+                    Syscall::Dup(w) => self.handle_dup(guest, w).await.map_err(Into::into),
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Dup2(w) => self.handle_dup2(guest, w).await,
+                    Syscall::Dup3(w) => self.handle_dup3(guest, w).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await,
+                    Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await,
+                    Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Utime(s) => self.handle_utime(guest, s).await.map_err(Into::into),
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Utimes(s) => self.handle_utimes(guest, s).await.map_err(Into::into),
+                    // NB: lutimes is a libc function not a syscall
+                    Syscall::Utimensat(s) => {
+                        self.handle_utimensat(guest, s).await.map_err(Into::into)
+                    }
+                    // NB: futimes/futimens are libc functions not a syscall,
+                    // futimesat is obsolete, return -ENOSYS for simplicity.
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Futimesat(_s) => Err(Error::Errno(Errno::ENOSYS)),
+                    // io_uring completion and memory-sharing semantics are not deterministic.
+                    Syscall::IoUringSetup(_)
+                    | Syscall::IoUringEnter(_)
+                    | Syscall::IoUringRegister(_) => Err(Error::Errno(Errno::ENOSYS)),
+                    Syscall::Socket(s) => self.handle_socket(guest, s).await,
+                    Syscall::Socketpair(s) => self.handle_socketpair(guest, s).await,
+                    Syscall::Connect(s) => self.handle_connect(guest, s).await,
+                    Syscall::Bind(s) => self.handle_bind(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Setsockopt(s) => {
+                        let result = self.handle_setsockopt(guest, s).await;
+                        // Credentials passing names the socket at its next send.
+                        if result.is_ok()
+                            && s.level() == libc::SOL_SOCKET
+                            && matches!(s.optname(), libc::SO_PASSCRED | libc::SO_PASSPIDFD)
+                        {
+                            self.note_unix_socket_reachable(guest, s.fd());
+                        }
+                        result
+                    }
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Listen(s) => self.handle_listen(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Getsockname(s) => self.handle_getsockname(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Getpeername(s) => self.handle_getpeername(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Getsockopt(s) => self.handle_getsockopt(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#818): shutdown is the lone remaining
+                    // socket-family syscall; half-closes a tracked socket and
+                    // forwards via record_or_replay (KVM ratchet round 12).
+                    Syscall::Shutdown(s) => self.handle_shutdown(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Eventfd(s) => self.handle_eventfd2(guest, s.into()).await,
+                    Syscall::Eventfd2(s) => self.handle_eventfd2(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Signalfd(s) => self.handle_signalfd4(guest, s.into()).await,
+                    Syscall::Signalfd4(s) => self.handle_signalfd4(guest, s).await,
+                    Syscall::TimerfdCreate(s) => self.handle_timerfd_create(guest, s).await,
+                    Syscall::TimerfdSettime(s) => self.handle_timerfd_settime(guest, s).await,
+                    Syscall::TimerfdGettime(s) => self.handle_timerfd_gettime(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::InotifyInit(s) => {
+                        self.handle_inotify_init1(guest, InotifyInit1::from(s))
+                            .await
+                    }
+                    Syscall::InotifyInit1(s) => self.handle_inotify_init1(guest, s).await,
+                    Syscall::InotifyAddWatch(s) => self.handle_inotify_add_watch(guest, s).await,
+                    Syscall::InotifyRmWatch(s) => self.handle_inotify_rm_watch(guest, s).await,
+                    Syscall::MemfdCreate(s) => self.handle_memfd_create(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-862): Record/replay and register pidfds.
+                    Syscall::PidfdOpen(s) => self.handle_pidfd_open(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-899): Host object handles and mount IDs
+                    // are outside Detcore's filesystem identity model.
+                    Syscall::NameToHandleAt(_) => Err(Error::Errno(Errno::EOPNOTSUPP)),
+                    Syscall::Userfaultfd(s) => self.handle_userfaultfd(guest, s).await,
+                    Syscall::Accept(s) => self.handle_accept4(guest, s.into()).await,
+                    Syscall::Accept4(s) => self.handle_accept4(guest, s).await,
+
+                    Syscall::Nanosleep(s) => self.handle_nanosleep_family(guest, s.into()).await,
+                    Syscall::ClockNanosleep(s) => {
+                        self.handle_nanosleep_family(guest, s.into()).await
+                    }
+                    Syscall::SchedYield(s) => self.handle_sched_yield(guest, s).await,
+
+                    // NB: getdents is not recommended, (g)libc should call getdents64 only
+                    // see: sysdeps/unix/sysv/linux/getdents.c.
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Getdents(s) => self.handle_getdents(guest, s).await,
+                    Syscall::Getdents64(s) => self.handle_getdents64(guest, s).await,
+
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Poll(s) => self.handle_poll(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
+                    Syscall::Pselect6(s) => self.handle_pselect6(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#800): select is the timeval sibling of pselect6.
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Select(s) => self.handle_select(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    Syscall::Ppoll(s) => self.handle_ppoll(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::EpollCreate(s) => {
+                        self.handle_epoll_create1(guest, EpollCreate1::from(s))
+                            .await
+                    }
+                    Syscall::EpollCreate1(s) => self.handle_epoll_create1(guest, s).await,
+                    Syscall::EpollCtl(s) => self.handle_epoll_ctl(guest, s).await,
+                    Syscall::EpollPwait(s) => self.handle_epoll_pwait(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::EpollWait(s) => self.handle_epoll_wait(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::EpollWaitOld(s) => panic!(
+                        "Not handling deprecated syscall: {}",
+                        s.display(&guest.memory())
+                    ),
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#549)
+                    // The obsolete x86_64 entry point is absent from modern Linux kernels.
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::EpollCtlOld(_) => Err(Error::Errno(Errno::ENOSYS)),
+
+                    Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
+                    Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,
+
+                    // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling
+                    // policy. Hermit exposes a single virtual NUMA node and replaces
+                    // the Linux scheduler with Detcore, so these are inoperative and
+                    // are virtualized to fixed, host-independent results (see the
+                    // determinism argument in syscall_classification.rs). Setters and
+                    // count-returning calls are no-ops; getters emulate a default
+                    // single-node / SCHED_OTHER answer.
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#720)
+                    Syscall::Mbind(_) => Ok(0),
+                    Syscall::SetMempolicy(_) => Ok(0),
+                    Syscall::GetMempolicy(s) => self.handle_get_mempolicy(guest, s).await,
+                    Syscall::MigratePages(_) => Ok(0),
+                    Syscall::MovePages(s) => self.handle_move_pages(guest, s).await,
+                    Syscall::SchedSetscheduler(_) => Ok(0),
+                    Syscall::SchedSetparam(_) => Ok(0),
+                    // Report the fixed default policy SCHED_OTHER (0).
+                    Syscall::SchedGetscheduler(_) => Ok(0),
+                    Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
+                    Syscall::SchedRrGetInterval(s) => {
+                        self.handle_sched_rr_get_interval(guest, s).await
+                    }
+
+                    // ===== BATCH 51: fail-closed utility syscalls, re-enabling chrt,
+                    // ionice, and flock under --strict. Detcore replaces the Linux
+                    // scheduler, exposes a single virtual CPU, and serializes guest
+                    // threads, so a thread's Linux scheduling attributes (sched_getattr)
+                    // and I/O priority (ioprio_set) are inert: those two have no
+                    // deterministic effect and are emulated to fixed, host-independent
+                    // results (see syscall_classification.rs).
+                    //
+                    // flock is NOT in that inert group and is not emulated. This comment
+                    // used to claim it "is never contended inside the serialized
+                    // container"; that was measured false -- two open file descriptions
+                    // in ONE process both held the same LOCK_EX under the old no-op,
+                    // where native Linux excluded the second -- and the no-op was
+                    // removed. Serializing THREADS does not make a whole-file lock
+                    // uncontended, because flock conflicts are between OPEN FILE
+                    // DESCRIPTIONS. flock is now forwarded to the kernel, like fcntl's
+                    // POSIX record locks; handle_flock carries the determinism argument
+                    // and the one case Detcore refuses (a contended BLOCKING request,
+                    // which it cannot park a thread on deterministically).
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#791)
+                    Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-841): Review virtual sched_setattr no-op policy.
+                    Syscall::SchedSetattr(s) => self.handle_sched_setattr(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#791)
+                    Syscall::IoprioSet(s) => self.handle_ioprio_set(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-881): Review virtual ioprio_get defaults.
+                    Syscall::IoprioGet(s) => self.handle_ioprio_get(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#2373)
+                    Syscall::Flock(s) => self.handle_flock(guest, s).await,
+
+                    // TODO-HUMAN-REVIEW(PR-1064): recvfrom/read/readv/recvmmsg reach
+                    // a NETLINK_SOCK_DIAG dump exactly as recvmsg does. Until they
+                    // were routed through the same sanitizer, four of the five
+                    // usable receive syscalls returned raw host socket inode
+                    // numbers, which made the determinization optional from the
+                    // guest's point of view: `socket.recv()` alone was enough to
+                    // skip it. Non-socket-diag descriptors take the same path as
+                    // before; the predicate is checked inside.
+                    Syscall::Recvfrom(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                        self.handle_sock_diag_recvfrom(guest, s).await
+                    }
+                    Syscall::Recvfrom(s) => {
+                        let in_turn = self.receives_in_turn(guest, s.fd(), s);
+                        let result = self.handle_socket_receive(guest, s, s.fd(), true).await;
+                        let read = crate::syscalls::scm_rights::ReceiveWithoutControl {
+                            peek: s.flags() & libc::MSG_PEEK != 0,
+                            request: crate::syscalls::scm_rights::Request::Bytes(
+                                s.buf().map_or(0, |buf| buf.as_raw()),
+                                s.len(),
+                            ),
+                            returns_at_once_when_empty: false,
+                            address_out: s.addr().is_some(),
+                            takes: crate::syscalls::scm_rights::Takes::Counted,
+                            in_turn,
+                            noted_by_recordings: true,
                         };
-                        self.note_guest_sigalrm(guest, target).await;
+                        self.note_receive_without_control(guest, s.fd(), &result, read);
+                        result
                     }
-                    result
-                }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#812)
-                Syscall::RtTgsigqueueinfo(s) => {
-                    let result = self.handle_rt_tgsigqueueinfo(guest, s).await;
-                    self.report_backend_signal_refusal(guest, Sysno::rt_tgsigqueueinfo, result)
-                        .await
-                }
-
-                Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
-                Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
-
-                Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
-
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#1549): Credential-query
-                // family emulated to the fixed virtual-root identity (0). See
-                // syscall_classification.rs for the determinism rationale.
-                // getuid/geteuid/getgid/getegid return the constant directly;
-                // getresuid/getresgid write the constant to each provided result
-                // pointer. Never forwarded to the host, so the answer no longer
-                // depends on whether the backend runs the guest in a
-                // CLONE_NEWUSER namespace.
-                Syscall::Getuid(_)
-                | Syscall::Geteuid(_)
-                | Syscall::Getgid(_)
-                | Syscall::Getegid(_) => Ok(0),
-                Syscall::Getresuid(s) => self.handle_getresuid(guest, s).await,
-                Syscall::Getresgid(s) => self.handle_getresgid(guest, s).await,
-                Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
-                Syscall::RtSigaction(s) => {
-                    let result = self.handle_rt_sigaction(guest, s).await;
-                    // Rule 5, decided from the installed disposition: an
-                    // old-action fault after the install still installed it
-                    // (https://github.com/rrnewton/hermit/issues/4139).
-                    if s.signum() == libc::SIGALRM
-                        && s.action().is_some()
-                        && guest.config().sequentialize_threads
-                    {
-                        crate::tool_global::note_sigalrm_event(
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(PR-901)
+                    Syscall::Recvmsg(s) => Box::pin(self.handle_recvmsg(guest, s)).await,
+                    Syscall::Sendto(s) => {
+                        let send = self.send_without_control(
                             guest,
-                            crate::tool_global::GlobalRequest::NoteSigalrmDisposition,
+                            s.fd(),
+                            |guest| self.completes_in_turn(guest, s),
+                            s.addr().is_some() && s.addr_len() != 0,
+                            s.flags() & libc::MSG_OOB as u32 != 0,
+                        );
+                        let result = self.handle_sendrecv(guest, s).await;
+                        self.note_send_without_control(guest, send, &result);
+                        result
+                    }
+                    Syscall::Sendmsg(s) => Box::pin(self.handle_sendmsg(guest, s)).await,
+                    Syscall::Sendmmsg(s) => Box::pin(self.handle_sendmmsg(guest, s)).await,
+
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#788): recvmmsg is the multi-message form of
+                    // recvmsg and shares its NonblockableSyscall impl. The fd is made
+                    // temporarily nonblocking, the kernel fills the mmsghdr array
+                    // atomically, and the Detcore scheduler owns any blocking, so the
+                    // timeout argument (deliberately ignored, see helpers.rs) does not
+                    // introduce nondeterminism.
+                    // TODO-HUMAN-REVIEW(PR-901): Review batched ancillary timestamp rewriting.
+                    Syscall::Recvmmsg(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                        self.handle_sock_diag_recvmmsg(guest, s).await
+                    }
+                    Syscall::Recvmmsg(s) => Box::pin(self.handle_recvmmsg(guest, s)).await,
+                    Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
+                    Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::RtSigpending(s) => self.handle_rt_sigpending(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Kill(s) => {
+                        let result = self.handle_kill(guest, s).await;
+                        let result = self
+                            .report_backend_signal_refusal(guest, Sysno::kill, result)
+                            .await;
+                        if s.sig() == libc::SIGALRM && result.is_ok() {
+                            let target = if guest.thread_state().nested_pid_namespace {
+                                Some(GuestSigalrmTarget::Unclassified)
+                            } else {
+                                match s.pid() {
+                                    pid if pid > 0 => {
+                                        Some(GuestSigalrmTarget::Process(DetPid::from_raw(pid)))
+                                    }
+                                    0 => Some(GuestSigalrmTarget::Group(None)),
+                                    -1 => Some(GuestSigalrmTarget::All),
+                                    libc::pid_t::MIN => None,
+                                    pid => Some(GuestSigalrmTarget::Group(Some(DetPid::from_raw(
+                                        -pid,
+                                    )))),
+                                }
+                            };
+                            if let Some(target) = target {
+                                self.note_guest_sigalrm(guest, target).await;
+                            }
+                        }
+                        result
+                    }
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Tgkill(s) => {
+                        let result = self.handle_tgkill(guest, s).await;
+                        self.report_backend_signal_refusal(guest, Sysno::tgkill, result)
+                            .await
+                    }
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#812)
+                    Syscall::Tkill(s) => {
+                        let result = self.handle_tkill(guest, s).await;
+                        self.report_backend_signal_refusal(guest, Sysno::tkill, result)
+                            .await
+                    }
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#812)
+                    Syscall::RtSigqueueinfo(s) => {
+                        let result = self.handle_rt_sigqueueinfo(guest, s).await;
+                        let result = self
+                            .report_backend_signal_refusal(guest, Sysno::rt_sigqueueinfo, result)
+                            .await;
+                        if s.sig() == libc::SIGALRM && result.is_ok() {
+                            let target = if guest.thread_state().nested_pid_namespace {
+                                GuestSigalrmTarget::Unclassified
+                            } else {
+                                GuestSigalrmTarget::Process(DetPid::from_raw(s.tgid()))
+                            };
+                            self.note_guest_sigalrm(guest, target).await;
+                        }
+                        result
+                    }
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#812)
+                    Syscall::RtTgsigqueueinfo(s) => {
+                        let result = self.handle_rt_tgsigqueueinfo(guest, s).await;
+                        self.report_backend_signal_refusal(guest, Sysno::rt_tgsigqueueinfo, result)
+                            .await
+                    }
+
+                    Syscall::Execve(s) => self.handle_execveat(guest, s.into()).await,
+                    Syscall::Execveat(s) => self.handle_execveat(guest, s).await,
+
+                    Syscall::Getcpu(s) => self.handle_getcpu(guest, s).await,
+
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#1549): Credential-query
+                    // family emulated to the fixed virtual-root identity (0). See
+                    // syscall_classification.rs for the determinism rationale.
+                    // getuid/geteuid/getgid/getegid return the constant directly;
+                    // getresuid/getresgid write the constant to each provided result
+                    // pointer. Never forwarded to the host, so the answer no longer
+                    // depends on whether the backend runs the guest in a
+                    // CLONE_NEWUSER namespace.
+                    Syscall::Getuid(_)
+                    | Syscall::Geteuid(_)
+                    | Syscall::Getgid(_)
+                    | Syscall::Getegid(_) => Ok(0),
+                    Syscall::Getresuid(s) => self.handle_getresuid(guest, s).await,
+                    Syscall::Getresgid(s) => self.handle_getresgid(guest, s).await,
+                    Syscall::RtSigprocmask(s) => self.handle_rt_sigprocmask(guest, s).await,
+                    Syscall::RtSigaction(s) => {
+                        let result = self.handle_rt_sigaction(guest, s).await;
+                        // Rule 5, decided from the installed disposition: an
+                        // old-action fault after the install still installed it
+                        // (https://github.com/rrnewton/hermit/issues/4139).
+                        if s.signum() == libc::SIGALRM
+                            && s.action().is_some()
+                            && guest.config().sequentialize_threads
+                        {
+                            crate::tool_global::note_sigalrm_event(
+                                guest,
+                                crate::tool_global::GlobalRequest::NoteSigalrmDisposition,
+                            )
+                            .await;
+                        }
+                        result
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Pause(s) => self.handle_pause(guest, s).await,
+
+                    Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
+                    Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    Syscall::Times(s) => self.handle_times(guest, s).await,
+                    Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Getrlimit(s) => self.handle_getrlimit(guest, s).await,
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    // TODO-HUMAN-REVIEW(#663)
+                    Syscall::Setrlimit(s) => self.handle_setrlimit(guest, s).await,
+
+                    // POSIX per-process timers use the virtual clock and scheduler
+                    // for deterministic arming and supported signal delivery.
+                    Syscall::TimerCreate(s) => self.handle_timer_create(guest, s).await,
+                    Syscall::TimerSettime(s) => self.handle_timer_settime(guest, s).await,
+                    Syscall::TimerGettime(s) => self.handle_timer_gettime(guest, s).await,
+                    Syscall::TimerGetoverrun(s) => self.handle_timer_getoverrun(guest, s).await,
+                    Syscall::TimerDelete(s) => self.handle_timer_delete(guest, s).await,
+
+                    // Serialized threads share a total memory order, so process-wide
+                    // memory barriers are trivially satisfied and can be no-ops.
+                    Syscall::Membarrier(s) => self.handle_membarrier(guest, s).await,
+
+                    // Filesystem statistics: passthrough is record/replay-aware so the
+                    // (otherwise host-dependent) result is captured and reproduced.
+                    // statfs/fstatfs run the real syscall, then canonicalize the
+                    // host-varying fields (free blocks/inodes, fsid) so the result is
+                    // deterministic under --verify (a bare passthrough diverged, e.g.
+                    // for tar).
+                    Syscall::Statfs(s) => self.handle_statfs(guest, s).await,
+                    Syscall::Fstatfs(s) => self.handle_fstatfs(guest, s).await,
+
+                    unexpected => {
+                        self.handle_unsupported_syscall(
+                            guest,
+                            unexpected,
+                            dettid,
+                            panic_on_unsupported_syscalls,
                         )
-                        .await;
+                        .await
+                    }
+                },
+                // Where the run declares a launcher, the kernel's program break
+                // is the launcher's: Detcore answers brk from its model of the
+                // guest's (`Detcore::handle_brk`).
+                SyscallClassification::PassThrough
+                    if call.number() == Sysno::brk && self.declares_launcher() =>
+                {
+                    self.handle_brk(guest, call).await
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-2985): Review scheduler tracking of set_tid_address.
+                // Linux and the backend own the pass-through call. Detcore also
+                // mirrors its successful registration into the scheduler because
+                // the scheduler supplies the logical CHILD_CLEARTID wake.
+                SyscallClassification::PassThrough if call.number() == Sysno::set_tid_address => {
+                    match call {
+                        Syscall::SetTidAddress(s) => self.handle_set_tid_address(guest, s).await,
+                        _ => unreachable!("set_tid_address unexpectedly lost its typed variant"),
+                    }
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-2223): Review observing
+                // the robust-list registration without changing its pass-through
+                // classification. This is still a pass-through — Linux owns the
+                // registration and supplies its result — but Detcore remembers the
+                // head address so thread exit can replay `exit_robust_list()`
+                // against its own futex waiter pool.
+                SyscallClassification::PassThrough if call.number() == Sysno::set_robust_list => {
+                    match call {
+                        Syscall::SetRobustList(s) => self.handle_set_robust_list(guest, s).await,
+                        _ => self.passthrough(guest, call).await,
+                    }
+                }
+                // faccessat2 and fchmodat2 are untyped in the pinned Reverie revision; the
+                // reviewed classification table routes them, and every other reviewed
+                // PassThrough syscall, through the blanket arm below.
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
+                // A pass-through whose restored mask may deliver a pending real-time
+                // timer expiration (https://github.com/rrnewton/hermit/issues/4089).
+                SyscallClassification::PassThrough if call.number() == Sysno::rt_sigreturn => {
+                    crate::syscalls::signal_shadow::record_rt_sigreturn(guest).await;
+                    self.observe_sigreturn_mask(guest).await;
+                    self.passthrough(guest, call).await
+                }
+                // An address space that allocates or applies a protection key may
+                // hold pages its guest cannot write although Hermit's copies can
+                // (`MemoryMetadata::protection_keys`). A key exists only once
+                // pkey_alloc returns one: a failed allocation (EINVAL, ENOSPC, or
+                // a backend without protection keys answering ENOSYS) allocates
+                // nothing, so it is not recorded.
+                SyscallClassification::PassThrough if call.number() == Sysno::pkey_alloc => {
+                    let result = self.passthrough(guest, call).await;
+                    if matches!(result, Ok(key) if key >= 0) {
+                        guest.thread_state().note_protection_keys();
                     }
                     result
                 }
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Alarm(s) => self.handle_alarm(guest, s).await,
-                #[cfg(target_arch = "x86_64")]
-                Syscall::Pause(s) => self.handle_pause(guest, s).await,
-
-                Syscall::Getrusage(s) => self.handle_getrusage(guest, s).await,
-                Syscall::Sysinfo(s) => self.handle_sysinfo(guest, s).await,
+                // pkey_mprotect is recorded after it returns, unless it cannot
+                // have applied a key: key -1 (plain mprotect), ENOSYS (the backend
+                // ran nothing), no length, or a failure Linux returns before it
+                // changes any mapping. Every other outcome is recorded, failures
+                // included ([`pkey_mprotect_may_apply_a_key`]); a record is never
+                // cleared. Recording after the call is the same as before it for
+                // the reads that consult the record: they renumber only with
+                // sequentialized threads, so no other guest thread reads between
+                // the call and the record.
+                SyscallClassification::PassThrough if call.number() == Sysno::pkey_mprotect => {
+                    let args = call.into_parts().1;
+                    let result = self.passthrough(guest, call).await;
+                    if pkey_mprotect_may_apply_a_key(
+                        args.arg0, args.arg1, args.arg2, args.arg3, &result,
+                    ) {
+                        guest.thread_state().note_protection_keys();
+                    }
+                    result
+                }
+                SyscallClassification::PassThrough => self.passthrough(guest, call).await,
+                // The kernel's restart of a wait Detcore emulates, or ran in the
+                // kernel as the guest made it, resumes it; any other
+                // `restart_syscall` keeps the unsupported-syscall policy below.
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                Syscall::Times(s) => self.handle_times(guest, s).await,
-                Syscall::Prlimit64(s) => self.handle_prlimit64(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Getrlimit(s) => self.handle_getrlimit(guest, s).await,
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#663)
-                Syscall::Setrlimit(s) => self.handle_setrlimit(guest, s).await,
-
-                // POSIX per-process timers use the virtual clock and scheduler
-                // for deterministic arming and supported signal delivery.
-                Syscall::TimerCreate(s) => self.handle_timer_create(guest, s).await,
-                Syscall::TimerSettime(s) => self.handle_timer_settime(guest, s).await,
-                Syscall::TimerGettime(s) => self.handle_timer_gettime(guest, s).await,
-                Syscall::TimerGetoverrun(s) => self.handle_timer_getoverrun(guest, s).await,
-                Syscall::TimerDelete(s) => self.handle_timer_delete(guest, s).await,
-
-                // Serialized threads share a total memory order, so process-wide
-                // memory barriers are trivially satisfied and can be no-ops.
-                Syscall::Membarrier(s) => self.handle_membarrier(guest, s).await,
-
-                // Filesystem statistics: passthrough is record/replay-aware so the
-                // (otherwise host-dependent) result is captured and reproduced.
-                // statfs/fstatfs run the real syscall, then canonicalize the
-                // host-varying fields (free blocks/inodes, fsid) so the result is
-                // deterministic under --verify (a bare passthrough diverged, e.g.
-                // for tar).
-                Syscall::Statfs(s) => self.handle_statfs(guest, s).await,
-                Syscall::Fstatfs(s) => self.handle_fstatfs(guest, s).await,
-
-                unexpected => {
-                    self.handle_unsupported_syscall(
+                SyscallClassification::Unsupported if call.number() == Sysno::restart_syscall => {
+                    self.handle_restart_syscall(
                         guest,
-                        unexpected,
+                        call,
+                        restart_block,
                         dettid,
                         panic_on_unsupported_syscalls,
                     )
                     .await
                 }
-            },
-            // Where the run declares a launcher, the kernel's program break
-            // is the launcher's: Detcore answers brk from its model of the
-            // guest's (`Detcore::handle_brk`).
-            SyscallClassification::PassThrough
-                if call.number() == Sysno::brk && self.declares_launcher() =>
-            {
-                self.handle_brk(guest, call).await
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-2985): Review scheduler tracking of set_tid_address.
-            // Linux and the backend own the pass-through call. Detcore also
-            // mirrors its successful registration into the scheduler because
-            // the scheduler supplies the logical CHILD_CLEARTID wake.
-            SyscallClassification::PassThrough if call.number() == Sysno::set_tid_address => {
-                match call {
-                    Syscall::SetTidAddress(s) => self.handle_set_tid_address(guest, s).await,
-                    _ => unreachable!("set_tid_address unexpectedly lost its typed variant"),
-                }
-            }
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-2223): Review observing
-            // the robust-list registration without changing its pass-through
-            // classification. This is still a pass-through — Linux owns the
-            // registration and supplies its result — but Detcore remembers the
-            // head address so thread exit can replay `exit_robust_list()`
-            // against its own futex waiter pool.
-            SyscallClassification::PassThrough if call.number() == Sysno::set_robust_list => {
-                match call {
-                    Syscall::SetRobustList(s) => self.handle_set_robust_list(guest, s).await,
-                    _ => self.passthrough(guest, call).await,
-                }
-            }
-            // faccessat2 and fchmodat2 are untyped in the pinned Reverie revision; the
-            // reviewed classification table routes them, and every other reviewed
-            // PassThrough syscall, through the blanket arm below.
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
-            // A pass-through whose restored mask may deliver a pending real-time
-            // timer expiration (https://github.com/rrnewton/hermit/issues/4089).
-            SyscallClassification::PassThrough if call.number() == Sysno::rt_sigreturn => {
-                crate::syscalls::signal_shadow::record_rt_sigreturn(guest).await;
-                self.observe_sigreturn_mask(guest).await;
-                self.passthrough(guest, call).await
-            }
-            // An address space that allocates or applies a protection key may
-            // hold pages its guest cannot write although Hermit's copies can
-            // (`MemoryMetadata::protection_keys`). A key exists only once
-            // pkey_alloc returns one: a failed allocation (EINVAL, ENOSPC, or
-            // a backend without protection keys answering ENOSYS) allocates
-            // nothing, so it is not recorded.
-            SyscallClassification::PassThrough if call.number() == Sysno::pkey_alloc => {
-                let result = self.passthrough(guest, call).await;
-                if matches!(result, Ok(key) if key >= 0) {
-                    guest.thread_state().note_protection_keys();
-                }
-                result
-            }
-            // pkey_mprotect is recorded after it returns, unless it cannot
-            // have applied a key: key -1 (plain mprotect), ENOSYS (the backend
-            // ran nothing), no length, or a failure Linux returns before it
-            // changes any mapping. Every other outcome is recorded, failures
-            // included ([`pkey_mprotect_may_apply_a_key`]); a record is never
-            // cleared. Recording after the call is the same as before it for
-            // the reads that consult the record: they renumber only with
-            // sequentialized threads, so no other guest thread reads between
-            // the call and the record.
-            SyscallClassification::PassThrough if call.number() == Sysno::pkey_mprotect => {
-                let args = call.into_parts().1;
-                let result = self.passthrough(guest, call).await;
-                if pkey_mprotect_may_apply_a_key(
-                    args.arg0, args.arg1, args.arg2, args.arg3, &result,
-                ) {
-                    guest.thread_state().note_protection_keys();
-                }
-                result
-            }
-            SyscallClassification::PassThrough => self.passthrough(guest, call).await,
-            // The kernel's restart of a wait Detcore emulates, or ran in the
-            // kernel as the guest made it, resumes it; any other
-            // `restart_syscall` keeps the unsupported-syscall policy below.
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            SyscallClassification::Unsupported if call.number() == Sysno::restart_syscall => {
-                self.handle_restart_syscall(
-                    guest,
-                    call,
-                    restart_block,
-                    dettid,
-                    panic_on_unsupported_syscalls,
-                )
-                .await
-            }
-            SyscallClassification::Unsupported => {
-                self.handle_unsupported_syscall(guest, call, dettid, panic_on_unsupported_syscalls)
+                SyscallClassification::Unsupported => {
+                    self.handle_unsupported_syscall(
+                        guest,
+                        call,
+                        dettid,
+                        panic_on_unsupported_syscalls,
+                    )
                     .await
-            }
-        };
-        // A Tool error/cancellation deliberately retains an unresolved import.
-        // The restart checkpoint (A5 step 3c.1c, design D40, placed by IR-2):
-        // under the in-guest delivery gate, a wait a signal ended gets the
-        // result the guest sees here, before anything below observes `res`.
-        // With the gate off it changes nothing.
-        let (res, interrupted) = self.wait_end_checkpoint(guest, &call, res).await;
-
-        // A call Detcore injected that the backend left to the Tool
-        // (`UnsupportedOperation::ToolDecided`), such as the getpgrp a clone3
-        // race passes through (https://github.com/rrnewton/hermit/issues/4531),
-        // ends the run as an internal failure before its ENOSYS can reach the
-        // guest, when it is the event's last injection. The check reads only
-        // the handler's latest refusal, and only if no consumer took it
-        // first; it is not a general guard (see
-        // `fail_on_tool_decided_injection`).
-        crate::syscalls::helpers::fail_on_tool_decided_injection::<T, _>(guest, call.number());
-        syscall_histogram::finish::<T, _>(guest, call.number(), &res, injected_at_entry);
-
-        // A copy may already have changed guest memory before reporting a
-        // terminal backend error. Do not perform even the syscall-result
-        // display's memory reads, or later observers/posthooks/timer effects.
-        // Random-device reads have completed their release RPC before returning;
-        // getrandom acquired no file resource. Physical cleanup belongs to the
-        // backend failure owner, not to this observer fence.
-        if res.as_ref().is_err_and(crate::random::is_copy_failure) {
-            return res;
-        }
-
-        // A `write`, `writev` or `sendto` through a datagram socket whose
-        // connected peer has gone purged the socket's receive queue
-        // (`Detcore::note_send_refused`; `sendmsg` and `sendmmsg` note it
-        // themselves).
-        if crate::syscalls::scm_rights::found_its_peer_gone(&res) {
-            self.note_send_refused(guest, &call);
-        }
-        // What the call made Linux release from `SCM_RIGHTS` queues (the
-        // close of a receiving socket's last descriptor, a receive, a purge)
-        // is released now, in the call's turn, before any observer, posthook
-        // or turn hand-off (`Detcore::settle_released_rights`).
-        if guest.thread_state().holds_released_rights() {
-            Box::pin(self.settle_released_rights(guest)).await;
-        }
-
-        if res.is_ok() && !removed_inodes.is_empty() {
-            self.retire_removed_inodes(guest, removed_inodes).await;
-        }
-        if res.is_ok() {
-            for fifo in removed_guest_fifos {
-                crate::fifo_peer::forget_guest_made(fifo);
-            }
-            self.note_guest_made_fifo(guest, &call).await;
-        }
-        // A read or write that moved bytes through a pipe or FIFO readies the
-        // threads polling its other direction (`--pipe-wake-latency`).
-        if let Ok(moved) = res
-            && moved > 0
-            && let Some((fd, wants)) = crate::pipe_wake::progress_of(&call)
-        {
-            self.note_fd_readied(guest, fd, wants).await;
-        }
-        if crate::fifo_peer::any_orphaned_page() {
-            // Boxed: a rare cleanup, kept out of every syscall's future
-            // (`hot_path_futures_stay_small`).
-            Box::pin(Self::unmap_orphaned_staging_pages(guest)).await;
-        }
-
-        // With asynchronous exit completion, a descriptor that would make this
-        // guest serve another guest's exit ends the run before anything
-        // observes the result (crate::exit_dependencies).
-        // It reads a received message's descriptors from the call's header,
-        // so it reads it as the kernel's view holds it (`EntryImport`).
-        // Boxed: it keeps the view across an await, which would otherwise
-        // grow every syscall's future (`hot_path_futures_stay_small`).
-        if let Ok(ret) = res
-            && let Err(error) =
-                Box::pin(self.refuse_exit_dependencies_in_view(guest, &call, ret)).await
-        {
-            return Box::pin(self.complete_after_posthook(
-                guest,
-                new_count,
-                Err(error),
-                interrupted,
-            ))
-            .await;
-        }
-        // A new executable file mapping's exclusive pairs (store-exclusive
-        // retry loops). Boxed, so this rare path does not grow every
-        // syscall's future.
-        #[cfg(target_arch = "aarch64")]
-        if let Ok(ret) = res
-            && let Some(range) = store_exclusive::range_to_scan(guest, &call, ret)
-        {
-            Box::pin(store_exclusive::report_new_mapping(guest, range)).await;
-        }
-
-        // The guest resumes with this result in its return register (A5 step
-        // 3.2). An error that is not an errno names no register value.
-        let finished = match &res {
-            Ok(value) => Some(*value),
-            Err(Error::Errno(errno)) => Some(-(errno.into_raw() as i64)),
-            Err(_) => None,
-        };
-        if let Some(result) = finished {
-            guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::Return {
-                syscall: call.number() as i64,
-                result,
-            });
-        }
-        detlog!(
-            event = crate::detlog::DetLogEvent::SyscallResult {
-                finished_syscall_number: new_count,
+                }
             };
-            "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",
-            dettid,
-            new_count,
-            display_syscall_finished(&call, &guest.memory(), &res),
-            res
-        );
+            // A Tool error/cancellation deliberately retains an unresolved import.
+            // The restart checkpoint (A5 step 3c.1c, design D40, placed by IR-2):
+            // under the in-guest delivery gate, a wait a signal ended gets the
+            // result the guest sees here, before anything below observes `res`.
+            // With the gate off it changes nothing.
+            let (res, interrupted) = self.wait_end_checkpoint(guest, &call, res).await;
 
-        // Same guest-logical-control point that already anchors the stack/heap hashes: the
-        // syscall is complete and its result written back, so the guest logically has control.
-        // Reading registers is itself backend work, so keep the disabled path inert.  In
-        // particular, a run that does not request register evidence must not be perturbed by
-        // collecting data that will immediately be discarded.
-        if self.cfg.detlog_regs {
-            let control_point_regs = guest.regs().await;
-            let regs_seq = guest.thread_state().stats.syscall_count;
-            self.detlog_registers(guest, &control_point_regs, regs_seq);
-        }
+            // A call Detcore injected that the backend left to the Tool
+            // (`UnsupportedOperation::ToolDecided`), such as the getpgrp a clone3
+            // race passes through (https://github.com/rrnewton/hermit/issues/4531),
+            // ends the run as an internal failure before its ENOSYS can reach the
+            // guest, when it is the event's last injection. The check reads only
+            // the handler's latest refusal, and only if no consumer took it
+            // first; it is not a general guard (see
+            // `fail_on_tool_decided_injection`).
+            crate::syscalls::helpers::fail_on_tool_decided_injection::<T, _>(guest, call.number());
+            syscall_histogram::finish::<T, _>(guest, call.number(), &res, injected_at_entry);
 
-        // brk is PassThrough, so nothing else records where the guest's heap is.
-        // Both brk(NULL) and brk(addr) return the break in effect afterwards.
-        if let Syscall::Brk(_) = &call
-            && let Ok(brk) = res
-            && brk > 0
-        {
-            guest
-                .thread_state()
-                .memory_metadata
-                .lock()
-                .expect("memory metadata mutex poisoned")
-                .observe_brk(brk as u64);
-        }
-
-        if let Err(error) = self.detlog_memory_maps(guest) {
-            return Box::pin(self.complete_after_posthook(
-                guest,
-                new_count,
-                Err(error),
-                interrupted,
-            ))
-            .await;
-        }
-        // Same control point again, for the bytes this syscall moved through a guest buffer.
-        // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
-        // arguments, so it does not matter whether the buffer lives on the stack, in the brk
-        // heap, in BSS or in an anonymous mmap -- the last two of which neither mapping hash
-        // can see. Only successful calls moved anything.
-        // Incoming readv/recvmsg observation uses complete geometry captured
-        // for the successful attempt, when available, but hashes the actual
-        // returned guest bytes without reinstating metadata over the payload.
-        // Outbound observation retains its entry-metadata overlay: the call
-        // may have sent those reinstated bytes. Exit-dependency readers keep
-        // their separate existing overlay contract.
-        if let Ok(ret) = &res
-            && self.cfg.detlog_io_buffers
-        {
-            // Boxed: the entry view it holds would otherwise grow every
-            // syscall's future (`hot_path_futures_stay_small`).
-            if let Some(done) = Box::pin(self.detlog_io_buffers_in_entry_view(
-                guest,
-                &call,
-                *ret,
-                dettid,
-                rng_readv_output.as_deref(),
-                new_count,
-                interrupted,
-            ))
-            .await
-            {
-                return done;
+            // A copy may already have changed guest memory before reporting a
+            // terminal backend error. Do not perform even the syscall-result
+            // display's memory reads, or later observers/posthooks/timer effects.
+            // Random-device reads have completed their release RPC before returning;
+            // getrandom acquired no file resource. Physical cleanup belongs to the
+            // backend failure owner, not to this observer fence.
+            if res.as_ref().is_err_and(crate::random::is_copy_failure) {
+                return res;
             }
-        }
 
-        if sequentialize_threads && self.cfg.observes_schedevents() {
-            let access =
-                self.access_trace_exit(guest, &call, finished, rng_readv_output.as_deref());
-            trace_schedevent_with_access(
-                guest,
-                with_guest_time(
+            // A `write`, `writev` or `sendto` through a datagram socket whose
+            // connected peer has gone purged the socket's receive queue
+            // (`Detcore::note_send_refused`; `sendmsg` and `sendmmsg` note it
+            // themselves).
+            if crate::syscalls::scm_rights::found_its_peer_gone(&res) {
+                self.note_send_refused(guest, &call);
+            }
+            // What the call made Linux release from `SCM_RIGHTS` queues (the
+            // close of a receiving socket's last descriptor, a receive, a purge)
+            // is released now, in the call's turn, before any observer, posthook
+            // or turn hand-off (`Detcore::settle_released_rights`).
+            if guest.thread_state().holds_released_rights() {
+                Box::pin(self.settle_released_rights(guest)).await;
+            }
+
+            if res.is_ok() && !removed_inodes.is_empty() {
+                self.retire_removed_inodes(guest, removed_inodes).await;
+            }
+            if res.is_ok() {
+                for fifo in removed_guest_fifos {
+                    crate::fifo_peer::forget_guest_made(fifo);
+                }
+                self.note_guest_made_fifo(guest, &call).await;
+            }
+            // A read or write that moved bytes through a pipe or FIFO readies the
+            // threads polling its other direction (`--pipe-wake-latency`).
+            if let Ok(moved) = res
+                && moved > 0
+                && let Some((fd, wants)) = crate::pipe_wake::progress_of(&call)
+            {
+                self.note_fd_readied(guest, fd, wants).await;
+            }
+            if crate::fifo_peer::any_orphaned_page() {
+                // Boxed: a rare cleanup, kept out of every syscall's future
+                // (`hot_path_futures_stay_small`).
+                Box::pin(Self::unmap_orphaned_staging_pages(guest)).await;
+            }
+
+            // With asynchronous exit completion, a descriptor that would make this
+            // guest serve another guest's exit ends the run before anything
+            // observes the result (crate::exit_dependencies).
+            // It reads a received message's descriptors from the call's header,
+            // so it reads it as the kernel's view holds it (`EntryImport`).
+            // Boxed: it keeps the view across an await, which would otherwise
+            // grow every syscall's future (`hot_path_futures_stay_small`).
+            if let Ok(ret) = res
+                && let Err(error) =
+                    Box::pin(self.refuse_exit_dependencies_in_view(guest, &call, ret)).await
+            {
+                return Box::pin(self.complete_after_posthook(
                     guest,
-                    SchedEvent::syscall(dettid, call.number(), SyscallPhase::Posthook),
-                ),
-                true,
-                access,
-            )
-            .await;
-        }
+                    new_count,
+                    Err(error),
+                    interrupted,
+                ))
+                .await;
+            }
+            // A new executable file mapping's exclusive pairs (store-exclusive
+            // retry loops). Boxed, so this rare path does not grow every
+            // syscall's future.
+            #[cfg(target_arch = "aarch64")]
+            if let Ok(ret) = res
+                && let Some(range) = store_exclusive::range_to_scan(guest, &call, ret)
+            {
+                Box::pin(store_exclusive::report_new_mapping(guest, range)).await;
+            }
 
-        // Posthook happens-before anchors this call reached fire now that its
-        // result is decided and before the guest resumes
-        // (https://github.com/rrnewton/hermit/issues/3929).
-        self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
-            .await;
+            // The guest resumes with this result in its return register (A5 step
+            // 3.2). An error that is not an errno names no register value.
+            let finished = match &res {
+                Ok(value) => Some(*value),
+                Err(Error::Errno(errno)) => Some(-(errno.into_raw() as i64)),
+                Err(_) => None,
+            };
+            if let Some(result) = finished {
+                guest.thread_state_mut().delivery_interruption =
+                    Some(reverie::Interruption::Return {
+                        syscall: call.number() as i64,
+                        result,
+                    });
+            }
+            detlog!(
+                event = crate::detlog::DetLogEvent::SyscallResult {
+                    finished_syscall_number: new_count,
+                };
+                "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",
+                dettid,
+                new_count,
+                display_syscall_finished(&call, &guest.memory(), &res),
+                res
+            );
 
-        // The syscall is finished; a turn the post-hook takes (a timeslice
-        // end) is the thread's own and advances global time as usual.
-        guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
-        self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
-            .await;
+            // Same guest-logical-control point that already anchors the stack/heap hashes: the
+            // syscall is complete and its result written back, so the guest logically has control.
+            // Reading registers is itself backend work, so keep the disabled path inert.  In
+            // particular, a run that does not request register evidence must not be perturbed by
+            // collecting data that will immediately be discarded.
+            if self.cfg.detlog_regs {
+                let control_point_regs = guest.regs().await;
+                let regs_seq = guest.thread_state().stats.syscall_count;
+                self.detlog_registers(guest, &control_point_regs, regs_seq);
+            }
+
+            // brk is PassThrough, so nothing else records where the guest's heap is.
+            // Both brk(NULL) and brk(addr) return the break in effect afterwards.
+            if let Syscall::Brk(_) = &call
+                && let Ok(brk) = res
+                && brk > 0
+            {
+                guest
+                    .thread_state()
+                    .memory_metadata
+                    .lock()
+                    .expect("memory metadata mutex poisoned")
+                    .observe_brk(brk as u64);
+            }
+
+            if let Err(error) = self.detlog_memory_maps(guest) {
+                return Box::pin(self.complete_after_posthook(
+                    guest,
+                    new_count,
+                    Err(error),
+                    interrupted,
+                ))
+                .await;
+            }
+            // Same control point again, for the bytes this syscall moved through a guest buffer.
+            // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
+            // arguments, so it does not matter whether the buffer lives on the stack, in the brk
+            // heap, in BSS or in an anonymous mmap -- the last two of which neither mapping hash
+            // can see. Only successful calls moved anything.
+            // Incoming readv/recvmsg observation uses complete geometry captured
+            // for the successful attempt, when available, but hashes the actual
+            // returned guest bytes without reinstating metadata over the payload.
+            // Outbound observation retains its entry-metadata overlay: the call
+            // may have sent those reinstated bytes. Exit-dependency readers keep
+            // their separate existing overlay contract.
+            if let Ok(ret) = &res
+                && self.cfg.detlog_io_buffers
+            {
+                // Boxed: the entry view it holds would otherwise grow every
+                // syscall's future (`hot_path_futures_stay_small`).
+                if let Some(done) = Box::pin(self.detlog_io_buffers_in_entry_view(
+                    guest,
+                    &call,
+                    *ret,
+                    dettid,
+                    rng_readv_output.as_deref(),
+                    new_count,
+                    interrupted,
+                ))
+                .await
+                {
+                    return done;
+                }
+            }
+
+            if sequentialize_threads && self.cfg.observes_schedevents() {
+                let access =
+                    self.access_trace_exit(guest, &call, finished, rng_readv_output.as_deref());
+                trace_schedevent_with_access(
+                    guest,
+                    with_guest_time(
+                        guest,
+                        SchedEvent::syscall(dettid, call.number(), SyscallPhase::Posthook),
+                    ),
+                    true,
+                    access,
+                )
+                .await;
+            }
+
+            // Posthook happens-before anchors this call reached fire now that its
+            // result is decided and before the guest resumes
+            // (https://github.com/rrnewton/hermit/issues/3929).
+            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
+                .await;
+
+            // The syscall is finished; a turn the post-hook takes (a timeslice
+            // end) is the thread's own and advances global time as usual.
+            guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
+            self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
+                .await;
 
             // Signal phase 1, step I4: a due SIGALRM entry is delivered here.
             self.complete_syscall(guest, res).await
-        }
+        })
         .await;
         // Every return in the body above has finished decoder/copyout and its
         // existing posthook. No later physical call may use this operation.

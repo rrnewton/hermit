@@ -4541,8 +4541,8 @@ mod tests {
         left.pair_sockets(&right, false);
         let pipe_end = open(5, FdType::Pipe, 2);
         pipe_end.set_guest_held();
-        assert!(left
-            .queue_rights_to_peer(
+        assert!(
+            left.queue_rights_to_peer(
                 vec![SentDescriptor {
                     file: (1, 50),
                     open_file: Some(pipe_end.in_flight_open_file(true)),
@@ -4550,7 +4550,8 @@ mod tests {
                 }],
                 0,
             )
-            .is_ok());
+            .is_ok()
+        );
         let sent = right
             .take_queued_rights(&[(1, 50)], false, false, false, None)
             .expect("the send queued it")

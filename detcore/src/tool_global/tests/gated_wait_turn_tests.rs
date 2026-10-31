@@ -399,6 +399,9 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             GlobalRequest::TouchFile(_) => GlobalResponse::TouchFile(()),
             // Signal phase 1's ledger: no entry is due, nothing is refused.
             GlobalRequest::Sigalrm(_) => GlobalResponse::Sigalrm(false),
+            GlobalRequest::PendingRealTimeExpirations(_) => {
+                GlobalResponse::PendingRealTimeExpirations(0)
+            }
             GlobalRequest::GlobalTimeLowerBound => {
                 let mut clock = self.clock.lock().unwrap();
                 let now = *clock;
