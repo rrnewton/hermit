@@ -56420,8 +56420,9 @@ fn namespace_only_keeps_ignoring_schedule_inputs() {
 
 /// This declaration must come from the real target-image setup callback. The
 /// fixture exercises threads, fork, vfork and clone3; replay must retain the
-/// producer's complete events and timing metadata through either loader and
-/// when both actual inputs are supplied. Synthetic JSON is not the producer.
+/// producer's complete events and timing metadata through either loader.
+/// Supplying both CLI replay options is a parse error before target startup.
+/// Synthetic JSON is not the producer.
 #[test]
 fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -56438,8 +56439,8 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
         &[],
     );
     assert_success(&recorded, &["qualified producer"]);
-    let original: serde_json::Value =
-        serde_json::from_slice(&fs::read(&recording).unwrap()).unwrap();
+    let recording_bytes = fs::read(&recording).unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&recording_bytes).unwrap();
     assert_eq!(
         original["reserved_input"],
         serde_json::json!({
@@ -56473,6 +56474,20 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
             args.push(&priority_flag);
         }
         let replayed = no_namespace_in_own_pid_namespace(&args, &[]);
+        if route == "both" {
+            // Config's inherited CLI grammar rejects this combination before
+            // either replay loader or the target is entered.
+            assert_eq!(replayed.status.code(), Some(2), "{route}: {replayed:?}");
+            assert_eq!(
+                stderr(&replayed).lines().next(),
+                Some("error: the argument '--replay-schedule-from <filepath>' cannot be used with '--replay-preemptions-from <filepath>'")
+            );
+            assert_eq!(stdout(&replayed), "", "invalid flags ran the target");
+            assert!(!output_record.exists(), "invalid flags wrote a recording");
+            assert!(!summary.exists(), "invalid flags wrote a summary");
+            assert_eq!(fs::read(&recording).unwrap(), recording_bytes);
+            continue;
+        }
         assert_success(&replayed, &args);
         assert_eq!(
             stdout(&replayed),
@@ -56542,24 +56557,36 @@ fn authentic_legacy_chosen_json_is_refused_before_cli_target_start() {
             marker.to_str().unwrap(),
         ]);
         let output = hermit(&args);
-        assert_eq!(
-            output.status.code(),
-            Some(HERMIT_POLICY_REFUSAL_EXIT),
-            "{route}: {output:?}"
-        );
         let diagnostic = stderr(&output);
-        assert!(
-            diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"),
-            "{route}: {diagnostic}"
-        );
-        assert!(
-            diagnostic.contains("missing reserved_input provenance"),
-            "{route}: {diagnostic}"
-        );
-        assert!(
-            diagnostic.contains("guest has not started"),
-            "{route}: {diagnostic}"
-        );
+        if route == "both" {
+            // This invalid CLI combination is refused by Clap before provenance
+            // admission; it is not a third executable replay route.
+            assert_eq!(output.status.code(), Some(2), "{route}: {output:?}");
+            assert_eq!(
+                diagnostic.lines().next(),
+                Some("error: the argument '--replay-schedule-from <filepath>' cannot be used with '--replay-preemptions-from <filepath>'")
+            );
+            assert_eq!(stdout(&output), "", "invalid flags ran the target");
+            assert!(!diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"));
+        } else {
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{route}: {output:?}"
+            );
+            assert!(
+                diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"),
+                "{route}: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("missing reserved_input provenance"),
+                "{route}: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("guest has not started"),
+                "{route}: {diagnostic}"
+            );
+        }
         assert!(
             !diagnostic.to_ascii_lowercase().contains("desync"),
             "{route}: {diagnostic}"
