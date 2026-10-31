@@ -2084,6 +2084,26 @@ mod tests {
         }
     }
 
+    /// The timeslice a `--chaos-timeslice-draw=run` run drew is a setting of
+    /// the whole run, as the other run settings are: a prefix of the
+    /// schedule keeps it, whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_drawn_timeslice() {
+        let tid = DetTid::from_raw(3);
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_chaos_timeslice(Some(4321));
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).chaos_timeslice,
+                Some(4321),
+                "prefix of {len} events"
+            );
+        }
+    }
+
     /// A replay of a schedule's first events keeps the callback checkpoints
     /// of the slices those events end, for the threads they run, and no later
     /// ones: the slice end at the prefix's own end belongs to the event after
