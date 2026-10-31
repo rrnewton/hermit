@@ -80,26 +80,64 @@ mod decode {
     /// this many instructions before it.
     pub(crate) const PAIR_WINDOW: u64 = 16;
 
-    /// Counts the exclusive pairs in a stream of instruction words.
-    #[derive(Clone, Debug, Default)]
-    pub(crate) struct PairCounter {
-        index: u64,
-        last_load: Option<u64>,
-        pairs: u64,
+    /// `MRS <Xt>, <system register>` with the system register fixed and only
+    /// `Rt` (bits 4:0) free.
+    const MRS_MASK: u32 = !0x1F;
+    /// The virtual counter, read from EL0: `MRS Xt, CNTVCT_EL0` and its
+    /// self-synchronized form `CNTVCTSS_EL0`. Linux lets every task read it
+    /// directly (or, on CPUs with a counter erratum, traps and emulates the
+    /// read in the kernel), so the guest gets the host's count with no stop
+    /// Hermit sees and nothing Detcore can virtualize. It is this
+    /// architecture's `RDTSC`, without `PR_SET_TSC` to trap it.
+    ///
+    /// Not counted: `CNTPCT_EL0`, `CNTPCTSS_EL0` and the timer registers
+    /// (`CNTV_TVAL_EL0` and the like), whose EL0 access Linux disables, so a
+    /// read faults with `SIGILL`, which is visible and deterministic; and
+    /// `CNTFRQ_EL0`, a constant frequency rather than a time.
+    const COUNTER_READS: [u32; 2] = [0xD53B_E040, 0xD53B_E0C0];
+
+    /// Whether `insn` reads the virtual counter from EL0.
+    pub(crate) fn is_counter_read(insn: u32) -> bool {
+        COUNTER_READS.contains(&(insn & MRS_MASK))
     }
 
-    impl PairCounter {
+    /// What one pass over a code range finds: the exclusive pairs, whose
+    /// retries make a branch count depend on host interrupts, and the EL0
+    /// counter reads, which bypass virtual time outright.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct CodeScan {
+        /// The file offset of the first word.
+        base: u64,
+        index: u64,
+        last_load: Option<u64>,
+        /// The file offset of each pair's load-exclusive.
+        pair_loads: Vec<u64>,
+        /// The file offset of each counter read.
+        reads: Vec<u64>,
+    }
+
+    impl CodeScan {
+        /// A scan of words that start at file offset `base`.
+        pub(crate) fn at(base: u64) -> Self {
+            CodeScan {
+                base,
+                ..CodeScan::default()
+            }
+        }
+
         /// Take the next instruction word.
         pub(crate) fn push(&mut self, insn: u32) {
             match classify(insn) {
                 Some(Exclusive::Load) => self.last_load = Some(self.index),
-                Some(Exclusive::Store)
-                    if self
+                Some(Exclusive::Store) => {
+                    if let Some(load) = self
                         .last_load
-                        .is_some_and(|load| self.index - load <= PAIR_WINDOW) =>
-                {
-                    self.pairs += 1
+                        .filter(|load| self.index - load <= PAIR_WINDOW)
+                    {
+                        self.pair_loads.push(self.base + 4 * load);
+                    }
                 }
+                _ if is_counter_read(insn) => self.reads.push(self.base + 4 * self.index),
                 _ => {}
             }
             self.index += 1;
@@ -115,8 +153,23 @@ mod decode {
         }
 
         /// The pairs counted so far.
+        #[cfg(test)]
         pub(crate) fn pairs(&self) -> u64 {
-            self.pairs
+            self.pair_loads.len() as u64
+        }
+
+        /// The EL0 counter reads counted so far.
+        #[cfg(test)]
+        pub(crate) fn counter_reads(&self) -> u64 {
+            self.reads.len() as u64
+        }
+
+        /// What the scan found, by file offset.
+        pub(crate) fn into_loops(self) -> super::model::FileLoops {
+            super::model::FileLoops {
+                pair_loads: self.pair_loads,
+                counter_reads: self.reads,
+            }
         }
     }
 
@@ -157,12 +210,18 @@ mod decode {
             .collect()
     }
 
+    /// One pass over `words`.
+    #[cfg(test)]
+    pub(crate) fn scan_words(words: impl IntoIterator<Item = u32>) -> CodeScan {
+        let mut scan = CodeScan::default();
+        words.into_iter().for_each(|word| scan.push(word));
+        scan
+    }
+
     /// The exclusive pairs in `words`.
     #[cfg(test)]
     pub(crate) fn count_pairs(words: impl IntoIterator<Item = u32>) -> u64 {
-        let mut counter = PairCounter::default();
-        words.into_iter().for_each(|word| counter.push(word));
-        counter.pairs()
+        scan_words(words).pairs()
     }
 }
 
@@ -175,7 +234,9 @@ mod decode {
 )]
 mod model {
     use std::collections::BTreeMap;
+    use std::collections::VecDeque;
     use std::path::Path;
+    use std::sync::Arc;
 
     /// An Arm CPU PMU, as `/sys/bus/event_source/devices/<name>` describes
     /// it.
@@ -257,52 +318,777 @@ mod model {
         Some((value, running >= enabled))
     }
 
-    /// One address space's pairs of one file, by mapped file range (offset,
-    /// length).
-    type RangePairs = BTreeMap<(u64, u64), u64>;
-
-    /// The exclusive pairs a run's scans found, by guest path, address space
-    /// and mapped file range.
-    #[derive(Debug, Default)]
-    pub(crate) struct PairTally {
-        pairs: BTreeMap<String, BTreeMap<(String, u64), RangePairs>>,
+    /// What a scan of one mapping found.
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        Default,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize
+    )]
+    pub struct Found {
+        /// Exclusive pairs: a branch count that depends on host interrupts.
+        pub pairs: u64,
+        /// EL0 generic-timer counter reads: time the guest sees that virtual
+        /// time does not control.
+        pub counter_reads: u64,
     }
 
-    impl PairTally {
-        /// Take one scan of address space `space`: each mapping's guest path,
-        /// file offset, length and pairs. A mapping replaces the ranges of
-        /// the same file it overlaps, so a mapping split and rejoined by
-        /// mprotect counts once.
-        pub(crate) fn note(&mut self, space: &(String, u64), mappings: &[(String, u64, u64, u64)]) {
-            for (path, offset, len, pairs) in mappings {
-                let ranges = self
-                    .pairs
-                    .entry(path.clone())
-                    .or_default()
-                    .entry(space.clone())
-                    .or_default();
-                let end = offset.saturating_add(*len);
-                ranges.retain(|&(from, length), _| {
-                    end <= from || from.saturating_add(length) <= *offset
-                });
-                ranges.insert((*offset, *len), *pairs);
+    /// What a scan of one mapping found, with the mapping. It crosses to the
+    /// global tool in a `Report`, which is reachable from the crate's public
+    /// RPC types, so it serializes and is nominally `pub`.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ScannedMapping {
+        /// The guest path of the mapped file.
+        pub path: String,
+        /// Where the mapping starts in the guest's address space: the tally
+        /// keeps one outcome per mapping, so two executable aliases of the
+        /// same file bytes are each counted.
+        #[serde(default)]
+        pub address: u64,
+        /// The mapped range of that file.
+        pub offset: u64,
+        pub len: u64,
+        pub found: Found,
+        /// What the in-memory rewrite did to it, in a run that asks for one.
+        #[serde(default)]
+        pub rewrite: Rewrite,
+    }
+
+    /// What rewriting one mapping's exclusive loops in the guest's memory
+    /// did (`--rewrite-exclusives` without a mount namespace). Every pair the
+    /// scan found ends up in exactly one of the three counts.
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        Default,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize
+    )]
+    pub struct Rewrite {
+        /// Loops the mapping now holds as single LSE atomics: written by this
+        /// scan, or already written (an earlier scan of the same pages, or
+        /// pages inherited across `fork`).
+        pub rewritten: u64,
+        /// Loops left as the file has them: the rewriter refuses them, the
+        /// mapping is shared or writable, the bytes in memory differ from the
+        /// file's, or the sequence runs past the end of the mapping.
+        pub left: u64,
+        /// Loops the rewrite was asked for and could not write: the guest's
+        /// memory or the file could not be read or written. They still retry.
+        pub failed: u64,
+    }
+
+    impl Rewrite {
+        /// Add another range's counts.
+        fn add(self, other: Rewrite) -> Rewrite {
+            Rewrite {
+                rewritten: self.rewritten + other.rewritten,
+                left: self.left + other.left,
+                failed: self.failed + other.failed,
             }
         }
 
-        /// The pairs of each guest path: the sum over the ranges one address
-        /// space mapped, and the largest such sum over address spaces, so
-        /// that a library many processes map counts once.
-        pub(crate) fn per_path(&self) -> BTreeMap<String, u64> {
-            self.pairs
+        /// Whether every count is zero.
+        pub(crate) fn is_empty(&self) -> bool {
+            *self == Rewrite::default()
+        }
+    }
+
+    /// Where a patch of a file falls in one mapping of it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Placement {
+        /// Wholly inside the mapping, starting at this guest address.
+        At(u64),
+        /// Starts inside the mapping and runs past its end. Rewriting part of a
+        /// sequence would leave a loop that is neither the old one nor the new
+        /// one, so it is left whole.
+        CrossesEnd,
+        /// Not in the mapping.
+        Outside,
+    }
+
+    /// Where the file bytes `[offset, offset + len)` fall in a mapping of the
+    /// file range `[map_offset, map_offset + map_len)` that starts at guest
+    /// address `map_start`.
+    pub(crate) fn place(
+        offset: u64,
+        len: u64,
+        map_start: u64,
+        map_offset: u64,
+        map_len: u64,
+    ) -> Placement {
+        let map_end = map_offset.saturating_add(map_len);
+        if offset < map_offset || offset >= map_end {
+            Placement::Outside
+        } else if offset.saturating_add(len) > map_end {
+            Placement::CrossesEnd
+        } else {
+            Placement::At(map_start + (offset - map_offset))
+        }
+    }
+
+    /// An address range, `[start, end)`.
+    pub(crate) type Range = (u64, u64);
+
+    /// The `[start, start + len)` a call that takes whole pages acts on: Linux
+    /// rounds the length up to the page size.
+    pub(crate) fn page_span(start: u64, len: u64, page: u64) -> Range {
+        let len = len.max(1).div_ceil(page).saturating_mul(page);
+        (start, start.saturating_add(len))
+    }
+
+    /// What made a scan happen, which decides where the in-memory rewrite may
+    /// write a sequence whose bytes are still the file's.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Trigger {
+        /// The exec stop: every mapping is new and no instruction has run.
+        Exec,
+        /// An `mmap` made the range: whatever was there before is gone.
+        Mapped,
+        /// An `mprotect` made the range executable: a part that already was
+        /// may have run, and only the rest is new.
+        Protected,
+        /// An `madvise` dropped the range's private pages, so a rewritten
+        /// sequence there reads the file's bytes again: those, and only
+        /// those, are put back.
+        Dropped,
+        /// A `munmap`, an `mremap`, or an `mprotect` that took execute
+        /// permission away changed where executable text is: the tally
+        /// follows, and nothing is new.
+        Changed,
+    }
+
+    /// Whether any part of `[start, end)` was executable among an address
+    /// space's file-backed `ranges` (start, end, executable) at the last
+    /// scan. Unknown ranges count as executable.
+    pub(crate) fn was_executable(ranges: Option<&[(u64, u64, bool)]>, (start, end): Range) -> bool {
+        ranges.is_none_or(|ranges| {
+            ranges
+                .iter()
+                .any(|&(from, to, executable)| executable && from < end && start < to)
+        })
+    }
+
+    /// Whether no instruction of the sequence at `[start, end)` can have run
+    /// when the scan that `trigger` made over `range` finds it: only at the
+    /// exec stop, and inside the range a successful `mmap` just made (decided
+    /// per sequence, since the kernel may merge a new mapping with an older
+    /// neighbour into one maps entry). Text made executable by `mprotect` may
+    /// have been executable before, through any number of permission changes
+    /// and moves this module does not follow, so it is never new; nor is text
+    /// whose pages an `madvise` dropped. Those scans only recount.
+    pub(crate) fn sequence_is_new(
+        trigger: Trigger,
+        range: Option<Range>,
+        (start, end): Range,
+    ) -> bool {
+        match trigger {
+            Trigger::Exec => true,
+            Trigger::Mapped => range.is_some_and(|(from, to)| from <= start && end <= to),
+            Trigger::Protected | Trigger::Dropped | Trigger::Changed => false,
+        }
+    }
+
+    /// Whether `[address, address + len)` touches more than one page. Such a
+    /// sequence is left: a page drop could put back the file's bytes in one
+    /// page and keep the replacement in the other, and the guest would run a
+    /// mixture of the two.
+    pub(crate) fn crosses_page(address: u64, len: u64, page: u64) -> bool {
+        len > 0 && address / page != (address + len - 1) / page
+    }
+
+    /// File ranges (start, end) in order with overlapping ones merged, so
+    /// that bytes two section headers both claim are scanned, and counted,
+    /// once. Ranges that only touch stay apart: a pair cannot span two
+    /// sections.
+    pub(crate) fn merge_overlaps(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start < last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+    }
+
+    /// One [`ByteCache`] entry: the bytes, what was made from them, and what
+    /// it is charged.
+    struct Cached<V> {
+        bytes: Box<[u8]>,
+        value: V,
+        charge: usize,
+    }
+
+    /// A [`ByteCache`] key: the length and a hash of three sampled pages.
+    type CacheKey = (usize, u64);
+
+    /// An upper bound on one B-tree node's allocation, for the
+    /// [`ByteCache`] key map and a plan's report maps. A node holds up to 11
+    /// keys, 11 values and (inside the tree) 12 child pointers: for a 16-byte
+    /// key and a 24-byte value that is under 560 bytes. A B-tree never has
+    /// more nodes than entries (no node is empty), so this bounds each entry's
+    /// share however sparsely the nodes are filled.
+    const MAP_NODE_BOUND: usize = 1024;
+
+    /// What one [`ByteCache`] entry's own allocation costs beyond its bytes
+    /// and its value's heap: the entry with its two reference counts.
+    pub(crate) const fn cached_entry_overhead<V>() -> usize {
+        2 * std::mem::size_of::<usize>() + std::mem::size_of::<Cached<V>>()
+    }
+
+    /// An upper bound on what a [`ByteCache`] of at most `max_entries`
+    /// retains besides its entries, whatever was inserted, evicted or
+    /// cleared: the age queue, whose capacity never exceeds twice the most
+    /// entries it held (it grows by doubling, and entries are evicted before
+    /// one is added), at most one key-map node per entry, and each key's
+    /// candidate list, allocated for the most candidates.
+    pub(crate) const fn spine_bound<V>(max_entries: usize) -> usize {
+        let slots = if max_entries < 2 {
+            4
+        } else {
+            max_entries.saturating_mul(2)
+        };
+        spine_of::<V>(slots, max_entries)
+    }
+
+    /// The spine of a [`ByteCache`] whose age queue has room for `slots`
+    /// and whose key map has `keys` keys: the queue's slots, a node per key
+    /// (a bound: there are never more nodes than keys) and each key's
+    /// candidate list. Saturating, so an absurd size cannot wrap.
+    const fn spine_of<V>(slots: usize, keys: usize) -> usize {
+        use std::mem::size_of;
+        let per_key = MAP_NODE_BOUND
+            .saturating_add(MAX_CANDIDATES_PER_KEY.saturating_mul(size_of::<Arc<Cached<V>>>()));
+        slots
+            .saturating_mul(size_of::<(CacheKey, Arc<Cached<V>>)>())
+            .saturating_add(keys.saturating_mul(per_key))
+    }
+
+    /// The most entries [`ByteCache`] compares bytes with for one key.
+    pub(crate) const MAX_CANDIDATES_PER_KEY: usize = 4;
+
+    /// The heap a cached plan holds, from the capacities of everything it
+    /// allocated, as [`ByteCache`] charges it.
+    pub(crate) fn plan_charge(plan: &Option<crate::aarch64_lse::elf::FilePlan>) -> usize {
+        use std::mem::size_of;
+
+        use crate::aarch64_lse::elf::FilePatch;
+        // The plan in its shared allocation, with the reference counts.
+        let mut charge =
+            2 * size_of::<usize>() + size_of::<Option<crate::aarch64_lse::elf::FilePlan>>();
+        let Some(plan) = plan else {
+            return charge;
+        };
+        let add = |charge: &mut usize, more: usize| *charge = charge.saturating_add(more);
+        add(
+            &mut charge,
+            plan.patches
+                .capacity()
+                .saturating_mul(size_of::<FilePatch>()),
+        );
+        for patch in &plan.patches {
+            add(&mut charge, patch.original.capacity());
+            add(&mut charge, patch.rewritten.capacity());
+        }
+        let report = &plan.report;
+        add(
+            &mut charge,
+            report
+                .refused_examples
+                .capacity()
+                .saturating_mul(size_of::<(u64, String)>()),
+        );
+        for (_, why) in &report.refused_examples {
+            add(&mut charge, why.capacity());
+        }
+        add(
+            &mut charge,
+            report
+                .skipped_segments
+                .capacity()
+                .saturating_mul(size_of::<String>()),
+        );
+        for why in &report.skipped_segments {
+            add(&mut charge, why.capacity());
+        }
+        add(
+            &mut charge,
+            (report.patched.len() + report.refused.len()).saturating_mul(MAP_NODE_BOUND),
+        );
+        charge
+    }
+
+    /// Values made from byte strings, found by those bytes: an entry is used
+    /// only for bytes equal to its own, so a value that is a pure function of
+    /// its bytes comes back exactly as making it again would. The key (the
+    /// length and a hash of three sampled 4 KiB pages) only picks the
+    /// candidates, at most [`MAX_CANDIDATES_PER_KEY`] of them. Everything it
+    /// retains (the entries with their bytes and their values' heap, and the
+    /// spine bounded by [`spine_bound`]) stays within the `max_retained` it
+    /// is made with, and the entries within `max_entries`: the oldest go
+    /// before a new one is added.
+    pub(crate) struct ByteCache<V> {
+        by_key: BTreeMap<CacheKey, Vec<Arc<Cached<V>>>>,
+        order: VecDeque<(CacheKey, Arc<Cached<V>>)>,
+        held: usize,
+        peak: usize,
+        max_charge: usize,
+        max_entries: usize,
+    }
+
+    impl<V: Clone> ByteCache<V> {
+        pub(crate) const fn new(max_retained: usize, max_entries: usize) -> Self {
+            ByteCache {
+                by_key: BTreeMap::new(),
+                order: VecDeque::new(),
+                held: 0,
+                peak: 0,
+                // The entries get what the spine cannot take.
+                max_charge: max_retained.saturating_sub(spine_bound::<V>(max_entries)),
+                max_entries,
+            }
+        }
+
+        fn key(bytes: &[u8]) -> CacheKey {
+            let mut hasher = std::hash::DefaultHasher::new();
+            let sample = 4096.min(bytes.len());
+            let middle = (bytes.len() - sample) / 2;
+            for part in [
+                &bytes[..sample],
+                &bytes[middle..middle + sample],
+                &bytes[bytes.len() - sample..],
+            ] {
+                std::hash::Hasher::write(&mut hasher, part);
+            }
+            (bytes.len(), std::hash::Hasher::finish(&hasher))
+        }
+
+        /// The value made from bytes equal to `bytes`, if held.
+        pub(crate) fn get(&self, bytes: &[u8]) -> Option<V> {
+            self.by_key
+                .get(&Self::key(bytes))?
+                .iter()
+                .find(|cached| *cached.bytes == *bytes)
+                .map(|cached| cached.value.clone())
+        }
+
+        /// Hold `value`, made from `bytes`, charged the bytes, `value_charge`
+        /// (its own heap) and the entry's bookkeeping, after the oldest
+        /// entries make room. Not held when its key already has
+        /// [`MAX_CANDIDATES_PER_KEY`] candidates, or when it alone is over
+        /// the bound.
+        pub(crate) fn insert(&mut self, bytes: Vec<u8>, value: V, value_charge: usize) {
+            let key = Self::key(&bytes);
+            let charge = bytes
+                .len()
+                .saturating_add(value_charge)
+                .saturating_add(cached_entry_overhead::<V>());
+            if charge > self.max_charge
+                || self.max_entries == 0
+                || self
+                    .by_key
+                    .get(&key)
+                    .is_some_and(|candidates| candidates.len() >= MAX_CANDIDATES_PER_KEY)
+            {
+                return;
+            }
+            while self.held.saturating_add(charge) > self.max_charge
+                || self.order.len() >= self.max_entries
+            {
+                let Some((key, oldest)) = self.order.pop_front() else {
+                    break;
+                };
+                self.held -= oldest.charge;
+                if let Some(candidates) = self.by_key.get_mut(&key) {
+                    candidates.retain(|candidate| !Arc::ptr_eq(candidate, &oldest));
+                    if candidates.is_empty() {
+                        self.by_key.remove(&key);
+                    }
+                }
+            }
+            let cached = Arc::new(Cached {
+                bytes: bytes.into_boxed_slice(),
+                value,
+                charge,
+            });
+            self.held += charge;
+            self.by_key
+                .entry(key)
+                .or_insert_with(|| Vec::with_capacity(MAX_CANDIDATES_PER_KEY))
+                .push(cached.clone());
+            self.order.push_back((key, cached));
+            self.peak = self.peak.max(self.retained());
+        }
+
+        /// What the cache retains now, by the bounds it is charged with: its
+        /// entries and its spine as allocated (the queue's capacity and a
+        /// node and a candidate list per key). Never more than the
+        /// `max_retained` it was made with.
+        pub(crate) fn retained(&self) -> usize {
+            self.held
+                .saturating_add(spine_of::<V>(self.order.capacity(), self.by_key.len()))
+        }
+
+        /// The most it has retained at once ([`ByteCache::retained`]), its
+        /// spine included, since it was made or cleared.
+        pub(crate) fn peak(&self) -> usize {
+            self.peak
+        }
+
+        /// Drop every entry, the spine's allocations and the peak.
+        pub(crate) fn clear(&mut self) {
+            self.by_key = BTreeMap::new();
+            self.order = VecDeque::new();
+            self.held = 0;
+            self.peak = 0;
+        }
+
+        /// What the entries are charged now, and how many there are.
+        #[cfg(test)]
+        pub(crate) fn held(&self) -> (usize, usize) {
+            (self.held, self.order.len())
+        }
+
+        /// What the entries may be charged: `max_retained` less the spine.
+        #[cfg(test)]
+        pub(crate) fn max_charge(&self) -> usize {
+            self.max_charge
+        }
+    }
+
+    /// What a file's executable bytes hold, by file offset: the load of each
+    /// exclusive pair and each EL0 counter read. A property of the file, not
+    /// of how a process maps it, so one scan serves every mapping of it.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct FileLoops {
+        /// The file offset of each pair's load-exclusive.
+        pub(crate) pair_loads: Vec<u64>,
+        /// The file offset of each counter read.
+        pub(crate) counter_reads: Vec<u64>,
+    }
+
+    impl FileLoops {
+        /// What a mapping of the file range `[start, end)` holds: each pair
+        /// belongs to the mapping that holds its load-exclusive, so a loop
+        /// split across two mappings is counted once, whatever is mapped
+        /// after it, and whether or not the rewriter would take it.
+        pub(crate) fn found_in(&self, start: u64, end: u64) -> Found {
+            let inside = |offsets: &[u64]| {
+                offsets
+                    .iter()
+                    .filter(|offset| start <= **offset && **offset < end)
+                    .count() as u64
+            };
+            Found {
+                pairs: inside(&self.pair_loads),
+                counter_reads: inside(&self.counter_reads),
+            }
+        }
+    }
+
+    /// The loops of one mapping left as the file has them: the pairs its
+    /// scan attributed to it (each pair belongs to the mapping holding its
+    /// load, even when its store is in the next), less those rewritten or
+    /// not written.
+    pub(crate) fn left_in_mapping(pairs: u64, rewritten: u64, failed: u64) -> u64 {
+        pairs.saturating_sub(rewritten + failed)
+    }
+
+    /// How far a file opened for a mapping is proven to be the mapped object.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Opened {
+        /// Through `/proc/<tid>/map_files`: the mapped object itself.
+        Exact,
+        /// By name, with the mapping's inode and device.
+        SameInodeAndDevice,
+        /// By name, with the mapping's inode, on a filesystem whose maps
+        /// device is not the one `stat` reports (btrfs, overlayfs): an inode
+        /// number there is not an identity across subvolumes or layers.
+        SameInodeOnly,
+    }
+
+    impl Opened {
+        /// What an open proves, or `None` when it found another file.
+        pub(crate) fn of(
+            exact: bool,
+            same_inode: bool,
+            same_device: bool,
+            device_unreliable: bool,
+        ) -> Option<Self> {
+            match () {
+                _ if !same_inode => None,
+                _ if exact => Some(Opened::Exact),
+                _ if device_unreliable => Some(Opened::SameInodeOnly),
+                _ if same_device => Some(Opened::SameInodeAndDevice),
+                _ => None,
+            }
+        }
+
+        /// Whether a plan from this file may decide what is written into the
+        /// mapping. Counting accepts any of them; writing needs the mapped
+        /// object proven, since the plan's refusals (branch targets,
+        /// relocations) depend on the whole file.
+        pub(crate) fn may_plan_writes(self) -> bool {
+            self != Opened::SameInodeOnly
+        }
+    }
+
+    /// What the in-memory rewrite does with one sequence, from what the
+    /// guest's memory holds there.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Step {
+        /// Write the replacement.
+        Write,
+        /// The replacement is there already.
+        Done,
+        /// Leave it: not the file's bytes, or code that may be running.
+        Leave,
+    }
+
+    /// The step for a sequence whose memory holds `current`: written only
+    /// where it still holds the file's bytes and no instruction of it can
+    /// have run (`new`).
+    pub(crate) fn step(current: &[u8], original: &[u8], rewritten: &[u8], new: bool) -> Step {
+        if current == rewritten {
+            Step::Done
+        } else if current == original && new {
+            Step::Write
+        } else {
+            Step::Leave
+        }
+    }
+
+    /// The guest memory the in-memory rewrite reads and writes, as a trait so
+    /// that the write protocol can be tested with injected failures.
+    pub(crate) trait GuestCode {
+        /// Read exactly `buf.len()` bytes at `address`.
+        fn read(&self, address: u64, buf: &mut [u8]) -> std::io::Result<()>;
+        /// Write all of `bytes` at `address`. An error may come after a
+        /// prefix was written, as `/proc/<pid>/mem` writes page by page.
+        fn write(&self, address: u64, bytes: &[u8]) -> std::io::Result<()>;
+    }
+
+    /// How writing one sequence ended.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum Written {
+        /// Memory holds the replacement, read back.
+        Rewritten,
+        /// Memory holds the original, as before: counted as not written.
+        Failed(String),
+        /// Memory holds neither, and the original could not be put back:
+        /// the guest must not run.
+        Broken(String),
+    }
+
+    /// Write `rewritten` over `original` at `address`, whole or not at all.
+    ///
+    /// The original bytes are written first: that makes Linux copy every
+    /// page the sequence touches for this process, without changing what any
+    /// of them holds, so a failure there (even after a prefix) leaves the
+    /// loop as it was. Then the replacement is written and read back; on any
+    /// error or other bytes, the original is written back and read back. The
+    /// result says what memory holds, never what was intended.
+    pub(crate) fn write_sequence(
+        code: &impl GuestCode,
+        address: u64,
+        original: &[u8],
+        rewritten: &[u8],
+    ) -> Written {
+        if let Err(error) = code.write(address, original) {
+            return Written::Failed(format!("copying the pages failed: {error}"));
+        }
+        let holds = |expected: &[u8]| {
+            let mut now = vec![0u8; expected.len()];
+            code.read(address, &mut now).is_ok() && now == expected
+        };
+        let problem = match code.write(address, rewritten) {
+            Ok(()) if holds(rewritten) => return Written::Rewritten,
+            Ok(()) => "the replacement did not read back".to_owned(),
+            Err(error) => format!("writing the replacement failed: {error}"),
+        };
+        // Read back whatever the restore reports: a write that fails part
+        // way may still have put every byte back.
+        let restore = code.write(address, original).err();
+        if holds(original) {
+            Written::Failed(problem)
+        } else if holds(rewritten) {
+            Written::Rewritten
+        } else {
+            Written::Broken(match restore {
+                Some(error) => format!("{problem}, and writing the original back failed: {error}"),
+                None => format!("{problem}, and the original did not read back"),
+            })
+        }
+    }
+
+    /// An executable file mapping a scan saw: the file's guest path and the
+    /// mapping's guest address range.
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        serde::Serialize,
+        serde::Deserialize
+    )]
+    pub struct LiveMapping {
+        pub path: String,
+        pub address: u64,
+        pub len: u64,
+    }
+
+    /// One address space's counts for one file, by mapping: its guest
+    /// address range (start, length).
+    type RangeCounts = BTreeMap<(u64, u64), (Found, Rewrite)>;
+
+    /// What a run's scans found, by guest path, address space and mapped
+    /// file range.
+    #[derive(Debug, Default)]
+    pub(crate) struct PairTally {
+        found: BTreeMap<String, BTreeMap<(String, u64), RangeCounts>>,
+    }
+
+    impl PairTally {
+        /// Take one scan of address space `space`: `live` is every
+        /// executable file mapping it saw (`None` when its maps could not be
+        /// read), and `mappings` the outcomes of those it scanned. A mapping
+        /// replaces what it overlaps in that address space, and an
+        /// executable alias of the same file bytes elsewhere counts as its
+        /// own, so the tally holds each address space's executable mappings
+        /// as of its last scan.
+        pub(crate) fn note(
+            &mut self,
+            space: &(String, u64),
+            mappings: &[ScannedMapping],
+            live: Option<&[LiveMapping]>,
+        ) {
+            // The executable file mappings the scan saw, by guest address
+            // range: an earlier outcome for anything else in this address
+            // space (unmapped, moved, split, no longer executable) is gone.
+            if let Some(live) = live {
+                for (path, spaces) in self.found.iter_mut() {
+                    if let Some(ranges) = spaces.get_mut(space) {
+                        ranges.retain(|&(address, len), _| {
+                            live.iter().any(|seen| {
+                                seen.path == *path && seen.address == address && seen.len == len
+                            })
+                        });
+                    }
+                }
+            }
+            for mapping in mappings {
+                let ranges = self
+                    .found
+                    .entry(mapping.path.clone())
+                    .or_default()
+                    .entry(space.clone())
+                    .or_default();
+                // A mapping replaces what it overlaps in the address space (a
+                // range split and rejoined by mprotect, or remapped), and
+                // nothing else: an alias of the same file bytes elsewhere is
+                // another mapping, with its own outcome.
+                let end = mapping.address.saturating_add(mapping.len);
+                ranges.retain(|&(from, length), _| {
+                    end <= from || from.saturating_add(length) <= mapping.address
+                });
+                ranges.insert(
+                    (mapping.address, mapping.len),
+                    (mapping.found, mapping.rewrite),
+                );
+            }
+        }
+
+        /// The exclusive pairs of each guest path that has any.
+        pub(crate) fn pairs_per_path(&self) -> BTreeMap<String, u64> {
+            self.per_path(|(found, _)| found.pairs)
+        }
+
+        /// The EL0 counter reads of each guest path that has any.
+        pub(crate) fn counter_reads_per_path(&self) -> BTreeMap<String, u64> {
+            self.per_path(|(found, _)| found.counter_reads)
+        }
+
+        /// The in-memory rewrite of each guest path it touched: the sums over
+        /// the ranges of one address space, the one that left or could not
+        /// write the most (then the one with the most loops), so that the
+        /// three counts describe one process and the worst exposure is the
+        /// one shown.
+        pub(crate) fn rewrites_per_path(&self) -> BTreeMap<String, Rewrite> {
+            self.found
+                .iter()
+                .map(|(path, spaces)| {
+                    let rewrite = spaces
+                        .values()
+                        .map(|ranges| {
+                            ranges
+                                .values()
+                                .fold(Rewrite::default(), |sum, (_, rewrite)| sum.add(*rewrite))
+                        })
+                        .max_by_key(|r| (r.left + r.failed, r.rewritten + r.left + r.failed))
+                        .unwrap_or_default();
+                    (path.clone(), rewrite)
+                })
+                .filter(|(_, rewrite)| !rewrite.is_empty())
+                .collect()
+        }
+
+        /// The exclusive loops of each guest path that can still retry, in the
+        /// address space where the most can: what an in-memory rewrite left
+        /// or could not write, and every pair where none was attempted. Every
+        /// path with pairs or a rewrite outcome is considered.
+        pub(crate) fn remaining_per_path(&self) -> BTreeMap<String, u64> {
+            self.found
                 .iter()
                 .map(|(path, spaces)| {
                     let most = spaces
                         .values()
-                        .map(|ranges| ranges.values().sum::<u64>())
+                        .map(|ranges| {
+                            let pairs: u64 = ranges.values().map(|(found, _)| found.pairs).sum();
+                            let rewrite = ranges
+                                .values()
+                                .fold(Rewrite::default(), |sum, (_, rewrite)| sum.add(*rewrite));
+                            if rewrite.is_empty() {
+                                pairs
+                            } else {
+                                rewrite.left + rewrite.failed
+                            }
+                        })
                         .max()
                         .unwrap_or(0);
                     (path.clone(), most)
                 })
+                .filter(|(_, count)| *count != 0)
+                .collect()
+        }
+
+        /// One count of each guest path that has a nonzero one: the sum over
+        /// the ranges one address space mapped, and the largest such sum over
+        /// address spaces, so that a library many processes map counts once.
+        /// A path is tallied when its mapping has either kind of finding, so
+        /// the zero of the other kind is left out here.
+        fn per_path(&self, of: impl Fn(&(Found, Rewrite)) -> u64) -> BTreeMap<String, u64> {
+            self.found
+                .iter()
+                .map(|(path, spaces)| {
+                    let most = spaces
+                        .values()
+                        .map(|ranges| ranges.values().map(&of).sum::<u64>())
+                        .max()
+                        .unwrap_or(0);
+                    (path.clone(), most)
+                })
+                .filter(|(_, count)| *count != 0)
                 .collect()
         }
     }
@@ -313,7 +1099,7 @@ pub(crate) use runtime::*;
 
 #[cfg(target_arch = "aarch64")]
 mod runtime {
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::fs::File;
     use std::fs::OpenOptions;
@@ -325,8 +1111,10 @@ mod runtime {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
+    use std::sync::Arc;
     use std::sync::Mutex;
 
+    use detcore_model::summary::ExclusiveRewrite;
     use detcore_model::summary::RunSummary;
     use detcore_model::summary::StoreExclusiveCounts;
     use procfs::process::MMPermissions;
@@ -341,17 +1129,41 @@ mod runtime {
     use tracing::info;
     use tracing::warn;
 
-    use super::decode::PairCounter;
+    use super::decode::CodeScan;
     use super::decode::elf_section_table;
     use super::decode::executable_sections;
+    use super::model::ByteCache;
     use super::model::CpuPmu;
+    use super::model::FileLoops;
+    use super::model::Found;
+    use super::model::GuestCode;
+    use super::model::LiveMapping;
+    use super::model::Opened;
     use super::model::PairTally;
+    use super::model::Placement;
+    use super::model::Range;
+    use super::model::Rewrite;
+    use super::model::ScannedMapping;
+    use super::model::Step;
+    use super::model::Trigger;
+    use super::model::Written;
     use super::model::arm_cpu_pmus;
     use super::model::combine;
     use super::model::covering;
+    use super::model::crosses_page;
+    use super::model::left_in_mapping;
+    use super::model::merge_overlaps;
+    use super::model::page_span;
+    use super::model::place;
+    use super::model::plan_charge;
+    use super::model::sequence_is_new;
+    use super::model::step;
+    use super::model::was_executable;
+    use super::model::write_sequence;
     use crate::Config;
     use crate::Detcore;
     use crate::RecordOrReplay;
+    use crate::aarch64_lse::elf::FilePlan;
     use crate::procmaps::MMapPath;
     use crate::procmaps::MemoryMap;
     use crate::types::MmId;
@@ -360,7 +1172,7 @@ mod runtime {
     /// guest thread is the host task of the same ID and Detcore runs outside
     /// it (ptrace), and not under `hermit record` or `hermit replay`, whose
     /// replayed guest maps placeholders.
-    fn reads_guest_tasks(cfg: &Config) -> bool {
+    pub(crate) fn reads_guest_tasks(cfg: &Config) -> bool {
         cfg.backend.host_task_reads_reach_guest_threads
             && !cfg.backend.tool_shares_guest_descriptor_table
             && !cfg.recordreplay_modes
@@ -407,9 +1219,27 @@ mod runtime {
         Pairs {
             /// The scanned address space (see [`ScannedRanges::space`]).
             space: (String, u64),
-            /// Guest path, file offset, length and pairs of each mapping.
-            mappings: Vec<(String, u64, u64, u64)>,
+            /// What the scan found in each mapping it scanned that has
+            /// anything.
+            mappings: Vec<ScannedMapping>,
+            /// The guest address range of every executable file mapping the
+            /// scan saw; `None` when the maps could not be read.
+            live: Option<Vec<LiveMapping>>,
         },
+    }
+
+    /// Say once per run and file that it reads the virtual counter from EL0.
+    /// Unlike an exclusive pair, which only makes a branch count
+    /// host-dependent, this hands the guest a host time Detcore never sees.
+    fn warn_counter_reads(path: &str, reads: u64) {
+        warn!(
+            "[store-exclusive] {path} reads the generic timer's virtual counter from EL0 ({}). \
+             Those reads make no stop Hermit sees, so Detcore cannot virtualize them: a guest \
+             whose control flow depends on one is not deterministic, and a recorded schedule \
+             may not replay. Reading the counter directly is this architecture's RDTSC, and \
+             Linux has no per-process switch to trap it.",
+            counted(reads, "CNTVCT_EL0 or CNTVCTSS_EL0 read")
+        );
     }
 
     /// A run that executed at least this many store-exclusives warns even
@@ -432,9 +1262,24 @@ mod runtime {
         counts: Option<Result<StoreExclusiveCounts, String>>,
         /// What the end-of-run read found uncounted, to warn about.
         uncounted: Vec<String>,
+        /// The guest paths this run has warned read the counter from EL0.
+        warned_counter_reads: BTreeSet<String>,
+        /// The guest paths this run has warned it could not rewrite.
+        warned_rewrite_failures: BTreeSet<String>,
+        /// Whether this run has said what rewriting in memory means for the
+        /// guest.
+        noted_rewrite: bool,
     }
 
     impl RunTally {
+        /// The tally of a new run. The plan cache starts empty too, so that
+        /// what the run plans and the peak its summary reports are the run's
+        /// own, also when one Hermit process runs several (`analyze` trials).
+        pub(crate) fn new_run() -> Self {
+            PLANS.lock().unwrap().clear();
+            Self::default()
+        }
+
         /// Take one report.
         pub(crate) fn note(&mut self, cfg: &Config, report: &Report) {
             match report {
@@ -443,7 +1288,41 @@ mod runtime {
                         self.counters = Some(Counters::open(*root));
                     }
                 }
-                Report::Pairs { space, mappings } => self.pairs.note(space, mappings),
+                Report::Pairs {
+                    space,
+                    mappings,
+                    live,
+                } => {
+                    for mapping in mappings {
+                        if mapping.found.counter_reads != 0
+                            && self.warned_counter_reads.insert(mapping.path.clone())
+                        {
+                            warn_counter_reads(&mapping.path, mapping.found.counter_reads);
+                        }
+                        if mapping.rewrite.rewritten != 0 && !self.noted_rewrite {
+                            self.noted_rewrite = true;
+                            info!(
+                                "[store-exclusive] exclusive loops are rewritten in the guest's \
+                                 memory, not in its files: a guest that reads its own code (to \
+                                 checksum or verify it) sees single LSE atomics where its files \
+                                 hold load/store-exclusive loops, and each rewritten page is a \
+                                 private copy. The summary lists every rewritten image."
+                            );
+                        }
+                        if mapping.rewrite.failed != 0
+                            && self.warned_rewrite_failures.insert(mapping.path.clone())
+                        {
+                            warn!(
+                                "[store-exclusive] the in-memory rewrite of {} did not complete: \
+                                 {} not written (a mapping that could not be read counts one; \
+                                 debug logs say why). Those loops still retry, and a recorded \
+                                 schedule may not replay",
+                                mapping.path, mapping.rewrite.failed
+                            );
+                        }
+                    }
+                    self.pairs.note(space, mappings, live.as_deref());
+                }
             }
         }
 
@@ -470,7 +1349,29 @@ mod runtime {
         /// Fill the summary: the per-path pairs (INFO view and full report),
         /// and the counts or why there are none (full report only).
         pub(crate) fn fill_summary(&mut self, summary: &mut RunSummary) {
-            summary.exclusive_pairs = self.pairs.per_path();
+            summary.exclusive_pairs = self.pairs.pairs_per_path();
+            summary.exclusive_rewrite_cache_peak = PLANS.lock().unwrap().peak() as u64;
+            summary.counter_reads = self.pairs.counter_reads_per_path();
+            summary.exclusive_rewrites = self
+                .pairs
+                .rewrites_per_path()
+                .into_iter()
+                .map(|(path, rewrite)| {
+                    let Rewrite {
+                        rewritten,
+                        left,
+                        failed,
+                    } = rewrite;
+                    (
+                        path,
+                        ExclusiveRewrite {
+                            rewritten,
+                            left,
+                            failed,
+                        },
+                    )
+                })
+                .collect();
             match self.counts() {
                 Some(Ok(counts)) => summary.store_exclusives = Some(*counts),
                 Some(Err(reason)) => summary.store_exclusives_unavailable = Some(reason.clone()),
@@ -516,11 +1417,13 @@ mod runtime {
                 "; not counted for the whole run (multiplexed, or the task ran on CPUs whose PMU \
                  does not carry these events)"
             };
+            // After an in-memory rewrite, only what it left or could not
+            // write can still retry, in the process where the most can.
             let libraries: Vec<String> = self
                 .pairs
-                .per_path()
-                .iter()
-                .filter(|(_, pairs)| **pairs > 0)
+                .remaining_per_path()
+                .into_iter()
+                .filter(|(_, pairs)| *pairs > 0)
                 .map(|(path, pairs)| format!("{path} ({pairs})"))
                 .collect();
             let sites = if libraries.is_empty() {
@@ -918,6 +1821,11 @@ mod runtime {
         /// The address space this record was made for, and the pedigree of
         /// the thread that scanned it first.
         owner: Option<(MmId, String)>,
+        /// The executable file mappings, by guest address range, that the
+        /// last scan of this address space reported: one not among them (new,
+        /// or a piece of a split) is scanned whatever range triggered the
+        /// scan.
+        reported: BTreeSet<LiveMapping>,
     }
 
     impl ScannedRanges {
@@ -929,6 +1837,13 @@ mod runtime {
                     .iter()
                     .any(|&(from, to, scanned)| !scanned && from < end && start < to)
             })
+        }
+
+        /// Whether `[start, end)` was executable at the last scan: then its
+        /// code may already have run, and a thread may be stopped inside one
+        /// of its sequences. Unknown ranges count as executable.
+        fn was_executable(&self, range: Range) -> bool {
+            was_executable(self.ranges.as_deref(), range)
         }
 
         /// A file mapping made without `PROT_EXEC`, once the ranges are known.
@@ -964,6 +1879,8 @@ mod runtime {
                 _ => {
                     let pedigree = scanner();
                     self.owner = Some((mm, pedigree.clone()));
+                    // A fork's copy: the child's tally starts empty.
+                    self.reported.clear();
                     pedigree
                 }
             };
@@ -980,63 +1897,338 @@ mod runtime {
         len: u64,
     }
 
-    /// A scan result. A count stands while the file keeps the size and
-    /// modification time it was taken at; a failure stands for good, so that
-    /// each mapping of the file is reported the same way.
-    #[derive(Clone, Copy, Debug)]
-    enum Scan {
-        Counted {
-            size: u64,
-            mtime: (i64, i64),
-            pairs: u64,
-        },
-        Failed,
-    }
-
-    /// Scan results for this Hermit process.
-    static SCANS: Mutex<BTreeMap<FileRange, Scan>> = Mutex::new(BTreeMap::new());
-
-    /// The exclusive pairs of one mapping, or `None` where it cannot be
-    /// scanned.
-    fn scan_mapping(tid: Pid, path: &Path, key: FileRange) -> Option<u64> {
-        let cached = SCANS.lock().unwrap().get(&key).copied();
-        if let Some(Scan::Failed) = cached {
-            return None;
-        }
+    fn scan_mapping(tid: Pid, path: &Path, map: &MemoryMap, key: FileRange) -> Option<Found> {
+        // The object the mapping maps, as the rewrite plans it. Nothing is
+        // cached: the scan reads the file's code each time, so no identity
+        // can carry one file's loops to another.
         let result = (|| {
-            let file = open_in_root(tid, path)?;
-            let metadata = file.metadata()?;
-            // The maps device is the superblock's, which on btrfs is not the
-            // subvolume device `stat` gives, so only the inode is compared.
-            if metadata.ino() != key.inode {
+            let (file, _) = open_mapped(tid, path, map, key)?;
+            let stamp = file_stamp(&file)?;
+            let loops = scan_file(&file, stamp.0)?;
+            // Loops from bytes that changed while they were read are not
+            // used.
+            if file_stamp(&file)? != stamp {
                 return Err(std::io::Error::other(
-                    "the name now leads to another file than the mapped one",
+                    "the file changed while it was scanned",
                 ));
             }
-            let (size, mtime) = (metadata.size(), (metadata.mtime(), metadata.mtime_nsec()));
-            let pairs = match cached {
-                Some(Scan::Counted {
-                    size: was,
-                    mtime: then,
-                    pairs,
-                }) if (was, then) == (size, mtime) => pairs,
-                _ => count_file(&file, size, &key)?,
-            };
-            Ok(Scan::Counted { size, mtime, pairs })
+            Ok(loops.found_in(key.offset, key.offset.saturating_add(key.len)))
         })();
-        let scan = result.unwrap_or_else(|error: std::io::Error| {
-            debug!(
-                "[store-exclusive] {} not scanned through /proc/{}/root: {error}",
-                path.display(),
-                tid.as_raw()
+        result
+            .map_err(|error: std::io::Error| {
+                debug!(
+                    "[store-exclusive] {} not scanned through /proc/{}/root: {error}",
+                    path.display(),
+                    tid.as_raw()
+                );
+            })
+            .ok()
+    }
+
+    /// A file's size, modification time and status-change time.
+    type PlanStamp = (u64, (i64, i64), (i64, i64));
+
+    /// The stamp of an open file. The status-change time cannot be set from
+    /// user space, so a file rewritten in place at the same size and with its
+    /// modification time put back still gets a new stamp.
+    fn file_stamp(file: &File) -> std::io::Result<PlanStamp> {
+        let metadata = file.metadata()?;
+        Ok((
+            metadata.size(),
+            (metadata.mtime(), metadata.mtime_nsec()),
+            (metadata.ctime(), metadata.ctime_nsec()),
+        ))
+    }
+
+    /// Open the file a mapping maps, for planning its rewrite.
+    ///
+    /// `/proc/<tid>/map_files/<start>-<end>` is the mapped object itself, so
+    /// it is tried first; Linux opens it only for a tracer with
+    /// `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`. Otherwise the mapping's
+    /// name is opened inside the guest's root and must lead to the same
+    /// inode, and, outside btrfs (where a maps line names the superblock's
+    /// device rather than the subvolume's) and overlayfs (where it names the
+    /// layer's), the same device. What the open proves is returned with it:
+    /// a scan accepts any, a rewrite plan only a proven one.
+    fn open_mapped(
+        tid: Pid,
+        path: &Path,
+        map: &MemoryMap,
+        key: FileRange,
+    ) -> std::io::Result<(File, Opened)> {
+        let (start, end) = map.address;
+        let exact = format!("/proc/{}/map_files/{start:x}-{end:x}", tid.as_raw());
+        let (file, exact) = match File::open(&exact) {
+            Ok(file) => (file, true),
+            Err(_) => (open_in_root(tid, path)?, false),
+        };
+        let metadata = file.metadata()?;
+        let (major, minor) = key.dev;
+        let same_device = metadata.dev() == libc::makedev(major as u32, minor as u32);
+        // SAFETY: an all-zero `statfs` is a valid buffer for fstatfs.
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid descriptor and a `statfs` buffer.
+        // A filesystem that cannot be told counts as unreliable.
+        let device_unreliable = unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } != 0
+            || [BTRFS_SUPER_MAGIC, OVERLAYFS_SUPER_MAGIC].contains(&(fs.f_type as i64));
+        let opened = Opened::of(
+            exact,
+            metadata.ino() == key.inode,
+            same_device,
+            device_unreliable,
+        )
+        .ok_or_else(|| {
+            std::io::Error::other("the name now leads to another file than the mapped one")
+        })?;
+        Ok((file, opened))
+    }
+
+    /// `BTRFS_SUPER_MAGIC` (include/uapi/linux/magic.h).
+    const BTRFS_SUPER_MAGIC: i64 = 0x9123_683e;
+
+    /// `OVERLAYFS_SUPER_MAGIC` (include/uapi/linux/magic.h).
+    const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
+
+    /// The largest file planned in memory: the whole file is read, and a
+    /// larger one is counted as not rewritten rather than risk the
+    /// allocation.
+    const MAX_PLANNED_FILE: u64 = 1 << 30;
+
+    /// The rewrite plans this Hermit process has made, found by the exact
+    /// bytes they were made from ([`ByteCache`]): a plan is a pure function of
+    /// those bytes, so a hit is the plan planning them again would give, and
+    /// no file identity (device, inode, path, time) or digest is trusted. It
+    /// retains at most 128 MiB (a process on a small device maps tens of MB of
+    /// code) and 1024 entries; anything past a bound only costs a re-plan.
+    /// Each run starts it empty ([`RunTally::new_run`]): Hermit runs one
+    /// guest at a time in a process (`--verify` runs each in its own,
+    /// `analyze` its trials one after another). Runs that did overlap in one
+    /// process would share it, and one's start would empty it under the
+    /// other: that costs re-planning and the accuracy of the full report's
+    /// peak, never a plan's bytes or the INFO view.
+    static PLANS: Mutex<ByteCache<Arc<Option<FilePlan>>>> =
+        Mutex::new(ByteCache::new(128 << 20, 1024));
+
+    /// The rewrite plan of the file a mapping maps, from the mapped object's
+    /// bytes, read afresh each time. The bytes are used only if the file kept
+    /// its size, modification and status-change times (the last cannot be
+    /// set from user space) while they were read; planning them is skipped
+    /// when bytes equal to them were planned before ([`PLANS`]).
+    fn plan_for(
+        tid: Pid,
+        path: &Path,
+        map: &MemoryMap,
+        key: FileRange,
+    ) -> Result<Arc<Option<FilePlan>>, String> {
+        let (file, opened) = open_mapped(tid, path, map, key).map_err(|error| error.to_string())?;
+        if !opened.may_plan_writes() {
+            return Err(
+                "the mapped object cannot be proven without /proc/<pid>/map_files on this \
+                 filesystem (btrfs or overlayfs, where an inode number is not an identity)"
+                    .to_owned(),
             );
-            Scan::Failed
-        });
-        SCANS.lock().unwrap().insert(key, scan);
-        match scan {
-            Scan::Counted { pairs, .. } => Some(pairs),
-            Scan::Failed => None,
         }
+        let stamp = file_stamp(&file).map_err(|error| error.to_string())?;
+        let too_large =
+            || format!("the file is larger than the {MAX_PLANNED_FILE} bytes planned in memory");
+        if stamp.0 > MAX_PLANNED_FILE {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(stamp.0 as usize)
+            .map_err(|error| error.to_string())?;
+        // Read at most one byte past the bound, so a file that grows while it
+        // is read can neither pass the bound nor grow the buffer unchecked.
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(&file, MAX_PLANNED_FILE + 1),
+            &mut bytes,
+        )
+        .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 > MAX_PLANNED_FILE {
+            return Err(too_large());
+        }
+        // The bytes read are the file the stamp names only if nothing
+        // changed it meanwhile.
+        if file_stamp(&file).map_err(|error| error.to_string())? != stamp
+            || bytes.len() as u64 != stamp.0
+        {
+            return Err("the file changed while it was read".to_owned());
+        }
+        if let Some(plan) = PLANS.lock().unwrap().get(&bytes) {
+            return Ok(plan);
+        }
+        let plan = Arc::new(
+            crate::aarch64_lse::elf::plan_bytes(&bytes).map_err(|error| error.to_string())?,
+        );
+        let charge = plan_charge(&plan);
+        PLANS.lock().unwrap().insert(bytes, plan.clone(), charge);
+        Ok(plan)
+    }
+
+    /// The guest's memory through `/proc/<tid>/mem`.
+    struct ProcMem(File);
+
+    impl GuestCode for ProcMem {
+        fn read(&self, address: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            self.0.read_exact_at(buf, address)
+        }
+
+        fn write(&self, address: u64, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.write_all_at(bytes, address)
+        }
+    }
+
+    /// Rewrite the canonical exclusive loops of one executable file mapping
+    /// in the guest's memory. `pairs` is what the scan found in it.
+    ///
+    /// A sequence is written only where the guest's memory still holds the
+    /// file's bytes, only where no instruction of it can have run (`new` says
+    /// so for its address range: made by this exec or this `mmap`), and only
+    /// within one page. Memory that already holds the replacement counts as
+    /// rewritten; anything else (relocated text, a debugger's breakpoint, a
+    /// runtime that rewrote itself, text a page drop put back, or old code
+    /// that may be running) is left.
+    ///
+    /// The write goes through `/proc/<tid>/mem`, which may write a private
+    /// read-only page the way a debugger does: Linux copies the page for this
+    /// process alone, so the file and every other process mapping it keep the
+    /// original, and the kernel keeps the instruction cache coherent with the
+    /// written page. A shared or writable mapping is left alone. Each
+    /// sequence is written whole or not at all ([`write_sequence`]); if the
+    /// guest's memory ends up holding neither, the run ends here.
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_mapping(
+        tid: Pid,
+        path: &Path,
+        key: FileRange,
+        map: &MemoryMap,
+        pairs: u64,
+        new: &dyn Fn(u64, u64) -> bool,
+    ) -> (Rewrite, u64) {
+        let all_left = Rewrite {
+            left: pairs,
+            ..Rewrite::default()
+        };
+        // A failure before the plan is placed counts at least one, even in a
+        // mapping whose scan paired nothing: it may hold a split sequence.
+        let all_failed = Rewrite {
+            failed: pairs.max(1),
+            ..Rewrite::default()
+        };
+        if map.perms.contains(MMPermissions::SHARED) || map.perms.contains(MMPermissions::WRITE) {
+            debug!(
+                "[store-exclusive] {} at {:#x} is shared or writable; its exclusive loops are left",
+                path.display(),
+                map.address.0
+            );
+            return (all_left, 0);
+        }
+        let plan = match plan_for(tid, path, map, key) {
+            Ok(plan) => plan,
+            Err(error) => {
+                debug!(
+                    "[store-exclusive] cannot read {} to plan its rewrite: {error}",
+                    path.display()
+                );
+                return (all_failed, 0);
+            }
+        };
+        let Some(plan) = plan.as_ref() else {
+            return (all_left, 0);
+        };
+        let memory = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/{}/mem", tid.as_raw()))
+        {
+            Ok(memory) => ProcMem(memory),
+            Err(error) => {
+                debug!(
+                    "[store-exclusive] cannot open /proc/{}/mem to rewrite {}: {error}",
+                    tid.as_raw(),
+                    path.display()
+                );
+                return (all_failed, 0);
+            }
+        };
+        let mut rewrite = Rewrite::default();
+        let page = page_size();
+        // Sequences that start here and run into the next mapping: left
+        // whole. The scan counted each pair in the mapping that holds its
+        // load, so they are among the `pairs` of this one or the next.
+        let mut crossing = 0;
+        for patch in &plan.patches {
+            let address = match place(
+                patch.offset,
+                patch.original.len() as u64,
+                map.address.0,
+                key.offset,
+                key.len,
+            ) {
+                Placement::Outside => continue,
+                Placement::CrossesEnd => {
+                    crossing += 1;
+                    continue;
+                }
+                Placement::At(address) => address,
+            };
+            if crosses_page(address, patch.original.len() as u64, page) {
+                debug!(
+                    "[store-exclusive] the sequence at {address:#x} crosses a page; left, so that \
+                     no page drop can leave half of it"
+                );
+                continue;
+            }
+            let mut current = vec![0u8; patch.original.len()];
+            if let Err(error) = memory.read(address, &mut current) {
+                debug!("[store-exclusive] cannot read the guest's code at {address:#x}: {error}");
+                rewrite.failed += 1;
+                continue;
+            }
+            let end = address + patch.original.len() as u64;
+            match step(
+                &current,
+                &patch.original,
+                &patch.rewritten,
+                new(address, end),
+            ) {
+                Step::Done => {
+                    rewrite.rewritten += 1;
+                }
+                Step::Leave => {
+                    debug!(
+                        "[store-exclusive] the guest's code at {address:#x} is not the file's, \
+                         or may already have run; left"
+                    );
+                }
+                Step::Write => {
+                    match write_sequence(&memory, address, &patch.original, &patch.rewritten) {
+                        Written::Rewritten => {
+                            rewrite.rewritten += 1;
+                        }
+                        Written::Failed(why) => {
+                            debug!(
+                                "[store-exclusive] the guest's code at {address:#x} was not \
+                                 rewritten: {why}"
+                            );
+                            rewrite.failed += 1;
+                        }
+                        Written::Broken(why) => panic!(
+                            "the in-memory rewrite of {} left the guest's code at {address:#x} \
+                             holding neither its loop nor the replacement: {why}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+        }
+        // Every pair the scan found that was neither rewritten nor failed is
+        // left: refused by the rewriter, not the file's bytes in memory, or
+        // old code that may be running; and so is each sequence split across
+        // this mapping's end.
+        rewrite.left = left_in_mapping(pairs, rewrite.rewritten, rewrite.failed);
+        (rewrite, crossing)
     }
 
     /// Open `path` as the guest names it: resolved inside the guest's root
@@ -1080,25 +2272,33 @@ mod runtime {
         Ok(unsafe { File::from_raw_fd(fd as i32) })
     }
 
-    /// Count the exclusive pairs in the mapped range of a file of `size`
-    /// bytes, in its executable ELF sections only.
-    fn count_file(file: &File, size: u64, key: &FileRange) -> std::io::Result<u64> {
-        // A mapping can extend past the end of its file.
-        let mapped = (key.offset, size.min(key.offset.saturating_add(key.len)));
-        let mut pairs = 0;
-        for (start, end) in code_ranges(file, mapped)? {
-            // A pair cannot span two sections.
-            let mut section = PairCounter::default();
-            read_words(file, start, end, &mut section)?;
-            pairs += section.pairs();
+    /// Scan the mapped range of a file of `size` bytes, in its executable
+    /// ELF sections only, for what [`Found`] names.
+    fn scan_file(file: &File, size: u64) -> std::io::Result<FileLoops> {
+        let ranges = code_ranges(file, size)?;
+        // Bounded like a plan: the whole of a file's code is read, whatever
+        // a process maps of it, so a huge file counts as not scanned.
+        if ranges.iter().map(|(start, end)| end - start).sum::<u64>() > MAX_PLANNED_FILE {
+            return Err(std::io::Error::other(format!(
+                "its code is larger than the {MAX_PLANNED_FILE} bytes scanned"
+            )));
         }
-        Ok(pairs)
+        let mut loops = FileLoops::default();
+        for (start, end) in ranges {
+            // A pair cannot span two sections.
+            let mut section = CodeScan::at(start);
+            read_words(file, start, end, &mut section)?;
+            let found = section.into_loops();
+            loops.pair_loads.extend(found.pair_loads);
+            loops.counter_reads.extend(found.counter_reads);
+        }
+        Ok(loops)
     }
 
-    /// The parts of `mapped` (a file range) that hold instructions: its
-    /// intersections with the file's executable ELF sections, or all of it
-    /// when the file has no section headers.
-    fn code_ranges(file: &File, mapped: (u64, u64)) -> std::io::Result<Vec<(u64, u64)>> {
+    /// The file ranges that hold instructions: the file's executable ELF
+    /// sections, or the whole file when it has no section headers. Scanned
+    /// whole, whatever a process maps of them.
+    fn code_ranges(file: &File, size: u64) -> std::io::Result<Vec<(u64, u64)>> {
         let mut header = [0u8; 64];
         let table = match file.read_exact_at(&mut header, 0) {
             Ok(()) => elf_section_table(&header),
@@ -1106,18 +2306,17 @@ mod runtime {
             Err(error) => return Err(error),
         };
         let Some((offset, count)) = table else {
-            return Ok(vec![mapped]);
+            return Ok(vec![(0, size)]);
         };
         let mut table = vec![0u8; count * 64];
         file.read_exact_at(&mut table, offset)?;
-        Ok(executable_sections(&table)
-            .into_iter()
-            .filter_map(|(offset, size)| {
-                let start = offset.max(mapped.0);
-                let end = offset.saturating_add(size).min(mapped.1);
-                (start < end).then_some((start, end))
-            })
-            .collect())
+        Ok(merge_overlaps(
+            executable_sections(&table)
+                .into_iter()
+                .map(|(offset, length)| (offset, offset.saturating_add(length).min(size)))
+                .filter(|(start, end)| start < end)
+                .collect(),
+        ))
     }
 
     /// Feed `counter` the words of `file` in `start..end`.
@@ -1125,7 +2324,7 @@ mod runtime {
         file: &File,
         start: u64,
         end: u64,
-        counter: &mut PairCounter,
+        counter: &mut CodeScan,
     ) -> std::io::Result<()> {
         let mut buffer = vec![0u8; (1 << 20).min((end - start) as usize)];
         let mut at = start;
@@ -1139,10 +2338,15 @@ mod runtime {
         Ok(())
     }
 
+    /// The name the summary and the warning give a scan whose maps could not
+    /// be read.
+    const UNREADABLE_MAPS: &str =
+        "(the executable mappings of a process whose maps could not be read)";
+
     /// Scan a thread's executable file mappings that overlap `range` (all of
     /// them for `None`): log each with pairs, or that could not be scanned,
     /// at INFO, and report the pairs to the run's tally.
-    async fn report_pairs<G, T>(guest: &mut G, range: Option<(u64, u64)>)
+    async fn report_pairs<G, T>(guest: &mut G, range: Option<(u64, u64)>, trigger: Trigger)
     where
         G: Guest<Detcore<T>>,
         T: RecordOrReplay,
@@ -1162,16 +2366,65 @@ mod runtime {
                     "[store-exclusive] cannot read /proc/{}/maps: {error}",
                     guest.tid().as_raw()
                 );
+                // Fail closed: a run that asked for the rewrite is warned
+                // and told in its summary that this scan could not happen,
+                // so whatever was mapped may still retry.
+                if guest.config().rewrite_exclusives_in_memory {
+                    let space = {
+                        let thread = guest.thread_state();
+                        let mut metadata = thread.memory_metadata.lock().unwrap();
+                        metadata
+                            .exclusive_scan
+                            .space(thread.mm_id, || thread.pedigree.to_string())
+                    };
+                    let mappings = vec![ScannedMapping {
+                        path: UNREADABLE_MAPS.to_owned(),
+                        address: 0,
+                        offset: 0,
+                        len: 0,
+                        found: Found::default(),
+                        rewrite: Rewrite {
+                            failed: 1,
+                            ..Rewrite::default()
+                        },
+                    }];
+                    send(
+                        guest,
+                        Report::Pairs {
+                            space,
+                            mappings,
+                            live: None,
+                        },
+                    )
+                    .await;
+                }
                 return;
             }
         };
-        let space = {
+        let live: Vec<LiveMapping> = maps
+            .iter()
+            .filter(|map| map.perms.contains(MMPermissions::EXECUTE))
+            .filter_map(|map| match &map.pathname {
+                MMapPath::Path(path) => Some(LiveMapping {
+                    path: path.display().to_string(),
+                    address: map.address.0,
+                    len: map.address.1 - map.address.0,
+                }),
+                _ => None,
+            })
+            .collect();
+        let (space, reported) = {
             let thread = guest.thread_state();
             let mut metadata = thread.memory_metadata.lock().unwrap();
             metadata.exclusive_scan.reseed(&maps);
-            metadata
+            let space = metadata
                 .exclusive_scan
-                .space(thread.mm_id, || thread.pedigree.to_string())
+                .space(thread.mm_id, || thread.pedigree.to_string());
+            let reported = std::mem::replace(
+                &mut metadata.exclusive_scan.reported,
+                live.iter().cloned().collect(),
+            );
+            (space, reported)
         };
         let mut mappings = Vec::new();
         for map in &maps {
@@ -1179,8 +2432,17 @@ mod runtime {
                 continue;
             };
             let (start, end) = map.address;
+            // The mappings the triggering call touched, and any the tally
+            // does not hold yet (new to this address space, or a piece of a
+            // mapping a call split).
+            let seen = LiveMapping {
+                path: path.display().to_string(),
+                address: start,
+                len: end - start,
+            };
             if !map.perms.contains(MMPermissions::EXECUTE)
-                || range.is_some_and(|(from, to)| end <= from || to <= start)
+                || (range.is_some_and(|(from, to)| end <= from || to <= start)
+                    && reported.contains(&seen))
             {
                 continue;
             }
@@ -1191,29 +2453,106 @@ mod runtime {
                 len: end - start,
             };
             let shown = path.display().to_string();
-            match scan_mapping(guest.tid(), path, key) {
-                Some(0) => {}
-                Some(pairs) => {
-                    info!(
-                        "[detcore, dtid {}] {} in executable mapping {} (offset {:#x}, {:#x} bytes)",
-                        dettid,
-                        counted(pairs, "store-exclusive (LL/SC) pair"),
-                        shown,
-                        key.offset,
-                        key.len
-                    );
-                    mappings.push((shown, key.offset, key.len, pairs));
+            let in_memory = guest.config().rewrite_exclusives_in_memory;
+            match scan_mapping(guest.tid(), path, map, key) {
+                Some(found) => {
+                    if found != Found::default() {
+                        // Only what was found: a mapping with pairs alone
+                        // keeps the line it always had.
+                        let what = [
+                            (found.pairs, "store-exclusive (LL/SC) pair"),
+                            (found.counter_reads, "EL0 generic-timer counter read"),
+                        ]
+                        .into_iter()
+                        .filter(|(count, _)| *count != 0)
+                        .map(|(count, noun)| counted(count, noun))
+                        .collect::<Vec<_>>()
+                        .join(" and ");
+                        info!(
+                            "[detcore, dtid {}] {} in executable mapping {} (offset {:#x}, {:#x} \
+                             bytes)",
+                            dettid, what, shown, key.offset, key.len
+                        );
+                    }
+                    // Every executable mapping is planned, even one whose scan
+                    // paired nothing: a loop split across two mappings pairs
+                    // in neither, and is counted as left where it starts.
+                    let (rewrite, split) = if in_memory {
+                        // Whether no instruction of `[start, end)` can have
+                        // run. Decided per sequence: the kernel may merge a
+                        // new mapping with an older neighbour into one entry.
+                        let new =
+                            |start: u64, end: u64| sequence_is_new(trigger, range, (start, end));
+                        rewrite_mapping(guest.tid(), path, key, map, found.pairs, &new)
+                    } else {
+                        (Rewrite::default(), 0)
+                    };
+                    if !rewrite.is_empty() {
+                        // Named only when there are any, so the line is
+                        // otherwise the one it always was.
+                        let split = if split == 0 {
+                            String::new()
+                        } else {
+                            format!(" ({} running past the mapping's end)", split)
+                        };
+                        info!(
+                            "[detcore, dtid {}] rewrote {} of the {} in memory in {} (offset \
+                             {:#x}): {} left as the file has them{}, {} could not be written",
+                            dettid,
+                            rewrite.rewritten,
+                            counted(found.pairs, "store-exclusive (LL/SC) pair"),
+                            shown,
+                            key.offset,
+                            rewrite.left,
+                            split,
+                            rewrite.failed
+                        );
+                    }
+                    if found != Found::default() || !rewrite.is_empty() {
+                        mappings.push(ScannedMapping {
+                            path: shown,
+                            address: start,
+                            offset: key.offset,
+                            len: key.len,
+                            found,
+                            rewrite,
+                        });
+                    }
                 }
-                None => info!(
-                    "[detcore, dtid {}] store-exclusive (LL/SC) pairs not scanned in executable \
-                     mapping {} (offset {:#x}, {:#x} bytes)",
-                    dettid, shown, key.offset, key.len
-                ),
+                None => {
+                    info!(
+                        "[detcore, dtid {}] store-exclusive (LL/SC) pairs not scanned in \
+                         executable mapping {} (offset {:#x}, {:#x} bytes)",
+                        dettid, shown, key.offset, key.len
+                    );
+                    // Fail closed: a run that asked for the rewrite is told
+                    // about a mapping it could not even read, whose loops, if
+                    // it has any, still retry.
+                    if in_memory {
+                        mappings.push(ScannedMapping {
+                            path: shown,
+                            address: start,
+                            offset: key.offset,
+                            len: key.len,
+                            found: Found::default(),
+                            rewrite: Rewrite {
+                                failed: 1,
+                                ..Rewrite::default()
+                            },
+                        });
+                    }
+                }
             }
         }
-        if !mappings.is_empty() {
-            send(guest, Report::Pairs { space, mappings }).await;
-        }
+        send(
+            guest,
+            Report::Pairs {
+                space,
+                mappings,
+                live: Some(live),
+            },
+        )
+        .await;
     }
 
     async fn send<G, T>(guest: &mut G, report: Report)
@@ -1242,7 +2581,7 @@ mod runtime {
             send(guest, Report::Attach { root }).await;
         }
         if reads_guest_tasks(guest.config()) {
-            report_pairs(guest, None).await;
+            report_pairs(guest, None, Trigger::Exec).await;
         }
     }
 
@@ -1251,7 +2590,11 @@ mod runtime {
     /// `PROT_EXEC` where a file mapping may not be scanned yet. Anything
     /// else reads no maps: a file mapping made without `PROT_EXEC` is only
     /// recorded, and `PROT_EXEC` on anonymous memory (a JIT) is skipped.
-    pub(crate) fn range_to_scan<G, T>(guest: &G, call: &Syscall, result: i64) -> Option<(u64, u64)>
+    pub(crate) fn range_to_scan<G, T>(
+        guest: &G,
+        call: &Syscall,
+        result: i64,
+    ) -> Option<(Range, Trigger)>
     where
         G: Guest<Detcore<T>>,
         T: RecordOrReplay,
@@ -1259,55 +2602,729 @@ mod runtime {
         if !reads_guest_tasks(guest.config()) {
             return None;
         }
-        let span = |start: u64, len: usize| (start, start.saturating_add(len.max(1) as u64));
+        let metadata = &guest.thread_state().memory_metadata;
+        let mut metadata = metadata.lock().unwrap();
+        scan_after(
+            call,
+            result,
+            page_size(),
+            guest.config().rewrite_exclusives_in_memory,
+            &mut metadata.exclusive_scan,
+        )
+    }
+
+    /// [`range_to_scan`] for an address space whose ranges are `scan`, on
+    /// pages of `page` bytes: what a successful `call` that returned `result`
+    /// makes scan, and why. `in_memory`: the run rewrites in memory.
+    fn scan_after(
+        call: &Syscall,
+        result: i64,
+        page: u64,
+        in_memory: bool,
+        scan: &mut ScannedRanges,
+    ) -> Option<(Range, Trigger)> {
+        let span = |start: u64, len: usize| page_span(start, len as u64, page);
+        // Rewriting in memory, every transition to executable is rescanned,
+        // so that the counts follow a range made writable and executable
+        // again (it is recounted, never written); otherwise only a range
+        // that may hold a mapping not scanned.
+        let made_executable = |scan: &ScannedRanges, start: Option<u64>, len: usize| {
+            let range = span(start.unwrap_or(0), len);
+            let needed = in_memory || scan.needs_scan(range);
+            needed.then_some((range, Trigger::Protected))
+        };
+        // Whether executable file text was in a range at the last scan: a
+        // call that unmaps, moves, replaces or protects it changes the
+        // tally, and the rescan that follows (which never writes) lets it
+        // drop what is gone. Every mode, so that a count-only tally follows
+        // too; anywhere else, nothing to do.
+        let changed = |scan: &ScannedRanges, range: Range| {
+            scan.was_executable(range)
+                .then_some((range, Trigger::Changed))
+        };
         match call {
-            Syscall::Mmap(mmap)
-                if !mmap.flags().contains(MapFlags::MAP_ANONYMOUS) && mmap.fd() >= 0 =>
-            {
+            Syscall::Mmap(mmap) => {
                 let range = span(result as u64, mmap.len());
-                if mmap.prot().contains(ProtFlags::PROT_EXEC) {
-                    return Some(range);
+                let file = !mmap.flags().contains(MapFlags::MAP_ANONYMOUS) && mmap.fd() >= 0;
+                if file && mmap.prot().contains(ProtFlags::PROT_EXEC) {
+                    return Some((range, Trigger::Mapped));
                 }
-                let metadata = &guest.thread_state().memory_metadata;
-                metadata.lock().unwrap().exclusive_scan.add_unscanned(range);
-                None
+                if file {
+                    scan.add_unscanned(range);
+                }
+                // A fixed mapping that replaced executable text.
+                changed(scan, range)
             }
+            // Executable text moved away, or a fixed destination replaced
+            // some. The rescan of the new range also learns the address
+            // space's ranges afresh, so a later page drop is judged by where
+            // the text is now.
+            Syscall::Mremap(mremap) => {
+                let old = span(
+                    mremap.addr().map_or(0, |addr| addr.as_raw() as u64),
+                    mremap.old_len(),
+                );
+                let new = span(result as u64, mremap.new_len());
+                (scan.was_executable(old) || scan.was_executable(new))
+                    .then_some((new, Trigger::Changed))
+            }
+            Syscall::Munmap(munmap) => changed(
+                scan,
+                span(
+                    munmap.addr().map_or(0, |addr| addr.as_raw() as u64),
+                    munmap.len(),
+                ),
+            ),
             Syscall::Mprotect(mprotect) if mprotect.protection().contains(ProtFlags::PROT_EXEC) => {
-                let start = mprotect.addr().map_or(0, |addr| addr.as_raw() as u64);
-                let range = span(start, mprotect.len());
-                let metadata = &guest.thread_state().memory_metadata;
-                let needed = metadata.lock().unwrap().exclusive_scan.needs_scan(range);
-                needed.then_some(range)
+                made_executable(
+                    scan,
+                    mprotect.addr().map(|addr| addr.as_raw() as u64),
+                    mprotect.len(),
+                )
+            }
+            Syscall::PkeyMprotect(mprotect) if mprotect.prot() & libc::PROT_EXEC != 0 => {
+                made_executable(
+                    scan,
+                    mprotect.addr().map(|addr| addr.as_raw() as u64),
+                    mprotect.len(),
+                )
+            }
+            // Text no longer executable.
+            Syscall::Mprotect(mprotect) => changed(
+                scan,
+                span(
+                    mprotect.addr().map_or(0, |addr| addr.as_raw() as u64),
+                    mprotect.len(),
+                ),
+            ),
+            Syscall::PkeyMprotect(mprotect) => changed(
+                scan,
+                span(
+                    mprotect.addr().map_or(0, |addr| addr.as_raw() as u64),
+                    mprotect.len(),
+                ),
+            ),
+            // Dropping a private file mapping's pages puts the file's bytes
+            // back, undoing an in-memory rewrite there: the scan recounts
+            // those loops as left. Only where an executable file mapping
+            // was: an allocator's frequent drops of anonymous memory need no
+            // scan. (MADV_REMOVE fails on a private mapping; it is listed so
+            // that a shared one is recounted too.)
+            Syscall::Madvise(madvise)
+                if in_memory
+                    && matches!(
+                        madvise.advice(),
+                        libc::MADV_DONTNEED | libc::MADV_REMOVE | MADV_DONTNEED_LOCKED
+                    ) =>
+            {
+                let start = madvise.addr().map_or(0, |addr| addr.as_raw() as u64);
+                let range = span(start, madvise.len());
+                scan.was_executable(range)
+                    .then_some((range, Trigger::Dropped))
             }
             _ => None,
         }
     }
 
+    /// The host's page size, which is the guest's.
+    fn page_size() -> u64 {
+        // SAFETY: sysconf has no preconditions.
+        match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+            size if size > 0 => size as u64,
+            _ => 4096,
+        }
+    }
+
+    /// `MADV_DONTNEED_LOCKED` (Linux 5.18), which the `libc` crate does not
+    /// name on every target.
+    const MADV_DONTNEED_LOCKED: i32 = 24;
+
     /// After a [`range_to_scan`]: the executable file mappings in that range.
-    pub(crate) async fn report_new_mapping<G, T>(guest: &mut G, range: (u64, u64))
+    pub(crate) async fn report_new_mapping<G, T>(guest: &mut G, (range, trigger): (Range, Trigger))
     where
         G: Guest<Detcore<T>>,
         T: RecordOrReplay,
     {
-        report_pairs(guest, Some(range)).await;
+        report_pairs(guest, Some(range), trigger).await;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::path::PathBuf;
+
+        use reverie::syscalls::Addr;
+        use reverie::syscalls::AddrMut;
+        use reverie::syscalls::Madvise;
+        use reverie::syscalls::Mmap;
+        use reverie::syscalls::Mprotect;
+        use reverie::syscalls::Mremap;
+        use reverie::syscalls::Munmap;
+        use reverie::syscalls::PkeyMprotect;
+
+        use super::*;
+        use crate::aarch64_lse::elf::elf_with_text;
+        use crate::aarch64_lse::elf::plan_bytes;
+
+        /// nop; ldaxr w8, [x0]; add w8, w8, #1; stlxr w9, w8, [x0];
+        /// cbnz w9, <ldaxr>; ret: one canonical loop, at file offset 0x104
+        /// of [`elf_with_text`]'s image.
+        const ONE_LOOP: [u32; 6] = [
+            0xd503_201f,
+            0x885f_fc08,
+            0x1100_0508,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+
+        /// The same loop adding 2: an image of the same size with other
+        /// bytes.
+        const OTHER_LOOP: [u32; 6] = [
+            0xd503_201f,
+            0x885f_fc08,
+            0x1100_0908,
+            0x8809_fc08,
+            0x35ff_ffa9,
+            0xd65f_03c0,
+        ];
+
+        /// Where [`ONE_LOOP`]'s sequence starts in the image, and its length.
+        const LOOP_AT: usize = 0x104;
+        const LOOP_LEN: usize = 16;
+
+        fn this_process() -> Pid {
+            Pid::from_raw(std::process::id() as i32)
+        }
+
+        /// Why these tests cannot run on this host, if they cannot. They map
+        /// and run code from `/dev/shm`, which a `noexec` mount refuses, and
+        /// with `writes` they write this process's code through
+        /// `/proc/<pid>/mem`, which Linux 6.12's `proc_mem.force_override`
+        /// (or its build-time default) can refuse: a probe write to a private
+        /// read-only page says. A test that cannot run says why and checks
+        /// nothing.
+        fn cannot_run(writes: bool) -> Option<String> {
+            // SAFETY: an all-zero `statvfs` is a valid buffer.
+            let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a `statvfs` buffer.
+            if unsafe { libc::statvfs(c"/dev/shm".as_ptr(), &mut fs) } != 0 {
+                return Some(format!("/dev/shm: {}", std::io::Error::last_os_error()));
+            }
+            if fs.f_flag & libc::ST_NOEXEC != 0 {
+                return Some("/dev/shm is mounted noexec".to_owned());
+            }
+            if !writes {
+                return None;
+            }
+            let len = page_size() as usize;
+            // SAFETY: a new private anonymous page at an address the kernel
+            // chooses, unmapped below.
+            let page = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if page == libc::MAP_FAILED {
+                return Some(format!("mmap: {}", std::io::Error::last_os_error()));
+            }
+            let written = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/proc/self/mem")
+                .and_then(|memory| memory.write_all_at(&[1], page as u64));
+            // SAFETY: the page mapped above, unmapped once.
+            unsafe { libc::munmap(page, len) };
+            written.err().map(|error| {
+                format!(
+                    "a forced write through /proc/self/mem failed ({error}); \
+                     proc_mem.force_override may refuse it"
+                )
+            })
+        }
+
+        /// Whether a test cannot run here, saying why on stderr.
+        fn skipped(writes: bool) -> bool {
+            cannot_run(writes)
+                .map(|reason| eprintln!("skipped: {reason}"))
+                .is_some()
+        }
+
+        /// An image file in a fresh directory on tmpfs: a file opened by name
+        /// is proven to be the mapped one only outside btrfs and overlayfs,
+        /// and an unprivileged test cannot open `/proc/<pid>/map_files`.
+        fn image_file(words: &[u32]) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+            let dir = tempfile::tempdir_in("/dev/shm").expect("a directory on /dev/shm (tmpfs)");
+            let path = dir.path().join("image");
+            let image = elf_with_text(words);
+            std::fs::write(&path, &image).unwrap();
+            (dir, path, image)
+        }
+
+        /// A one-page mapping of a file in this process, unmapped on drop.
+        struct Mapping {
+            address: u64,
+            len: usize,
+        }
+
+        impl Mapping {
+            fn new(path: &Path, flags: libc::c_int) -> Self {
+                let file = File::open(path).unwrap();
+                let len = page_size() as usize;
+                // SAFETY: a new mapping, at an address the kernel chooses, of
+                // a file this test made.
+                let address = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                        flags,
+                        file.as_raw_fd(),
+                        0,
+                    )
+                };
+                assert_ne!(
+                    address,
+                    libc::MAP_FAILED,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                Self {
+                    address: address as u64,
+                    len,
+                }
+            }
+
+            /// The bytes the mapping holds at `offset`, as this process
+            /// reads them.
+            fn bytes(&self, offset: usize, len: usize) -> Vec<u8> {
+                assert!(offset + len <= self.len);
+                // SAFETY: within the mapping, which is readable.
+                unsafe {
+                    std::slice::from_raw_parts((self.address as usize + offset) as *const u8, len)
+                }
+                .to_vec()
+            }
+
+            /// The mapping as this process's maps list it, and its file
+            /// range, as the scan takes them.
+            fn listed(&self) -> (MemoryMap, FileRange) {
+                let map =
+                    crate::procmaps::from_pid(this_process(), |map| map.address.0 == self.address)
+                        .unwrap()
+                        .into_iter()
+                        .next()
+                        .expect("the mapping in /proc/self/maps");
+                let key = FileRange {
+                    dev: map.dev,
+                    inode: map.inode,
+                    offset: map.offset,
+                    len: map.address.1 - map.address.0,
+                };
+                (map, key)
+            }
+
+            /// [`rewrite_mapping`] of this mapping, through
+            /// `/proc/<this process>/mem`, with every sequence new or none.
+            fn rewrite(&self, path: &Path, new: bool) -> (Rewrite, u64) {
+                let (map, key) = self.listed();
+                rewrite_mapping(this_process(), path, key, &map, 1, &|_, _| new)
+            }
+        }
+
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                // SAFETY: the mapping `new` made, unmapped once.
+                unsafe { libc::munmap(self.address as *mut libc::c_void, self.len) };
+            }
+        }
+
+        fn rewrite(rewritten: u64, left: u64, failed: u64) -> Rewrite {
+            Rewrite {
+                rewritten,
+                left,
+                failed,
+            }
+        }
+
+        /// The write goes through `/proc/<pid>/mem` into a private read-only
+        /// executable file mapping, as the guest's are: the mapping then holds
+        /// the replacement, read back, while the file and another mapping of
+        /// it keep the loop. Asking again finds it done; a sequence that is
+        /// not new, or a shared mapping, is left as the file has it.
+        #[test]
+        fn the_rewrite_writes_only_this_private_mapping_through_proc_mem() {
+            if skipped(true) {
+                return;
+            }
+            let (_dir, path, image) = image_file(&ONE_LOOP);
+            let plan = plan_bytes(&image).unwrap().expect("an aarch64 image");
+            let patch = &plan.patches[0];
+            assert_eq!(
+                (patch.offset as usize, patch.original.len()),
+                (LOOP_AT, LOOP_LEN)
+            );
+            assert_eq!(patch.original, image[LOOP_AT..LOOP_AT + LOOP_LEN]);
+
+            let mapping = Mapping::new(&path, libc::MAP_PRIVATE);
+            assert_eq!(mapping.rewrite(&path, true), (rewrite(1, 0, 0), 0));
+            assert_eq!(mapping.bytes(LOOP_AT, LOOP_LEN), patch.rewritten);
+            // Linux copied the page for this mapping alone.
+            assert_eq!(std::fs::read(&path).unwrap(), image);
+            let other = Mapping::new(&path, libc::MAP_PRIVATE);
+            assert_eq!(other.bytes(LOOP_AT, LOOP_LEN), patch.original);
+            // Memory that already holds the replacement counts as rewritten,
+            // whether or not the sequence could have run.
+            assert_eq!(mapping.rewrite(&path, false), (rewrite(1, 0, 0), 0));
+            assert_eq!(mapping.rewrite(&path, true), (rewrite(1, 0, 0), 0));
+
+            // The file's bytes where an instruction may have run: left.
+            assert_eq!(other.rewrite(&path, false), (rewrite(0, 1, 0), 0));
+            assert_eq!(other.bytes(LOOP_AT, LOOP_LEN), patch.original);
+
+            // A shared mapping would write the file: left.
+            let shared = Mapping::new(&path, libc::MAP_SHARED);
+            assert_eq!(shared.rewrite(&path, true), (rewrite(0, 1, 0), 0));
+            assert_eq!(shared.bytes(LOOP_AT, LOOP_LEN), patch.original);
+            assert_eq!(std::fs::read(&path).unwrap(), image);
+        }
+
+        /// A name that leads to another file than the mapped one plans
+        /// nothing: the mapping is counted as failed and keeps its loop.
+        #[test]
+        fn a_mapping_whose_name_now_leads_elsewhere_is_not_written() {
+            if skipped(true) {
+                return;
+            }
+            let (dir, path, image) = image_file(&ONE_LOOP);
+            let mapping = Mapping::new(&path, libc::MAP_PRIVATE);
+            let elsewhere = dir.path().join("elsewhere");
+            std::fs::write(&elsewhere, elf_with_text(&OTHER_LOOP)).unwrap();
+            std::fs::rename(&elsewhere, &path).unwrap();
+
+            let (map, key) = mapping.listed();
+            // A tracer that may open `/proc/<pid>/map_files` (with
+            // `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`) opens the mapped
+            // object itself, whatever the name now leads to.
+            let (start, end) = map.address;
+            if File::open(format!("/proc/self/map_files/{start:x}-{end:x}")).is_ok() {
+                assert_eq!(mapping.rewrite(&path, true), (rewrite(1, 0, 0), 0));
+                return;
+            }
+            let refused = plan_for(this_process(), &path, &map, key).unwrap_err();
+            assert!(refused.contains("another file"), "{refused}");
+            assert_eq!(mapping.rewrite(&path, true), (rewrite(0, 0, 1), 0));
+            assert_eq!(
+                mapping.bytes(LOOP_AT, LOOP_LEN),
+                image[LOOP_AT..LOOP_AT + LOOP_LEN]
+            );
+        }
+
+        /// A plan is the mapped file's bytes as they are now: rewritten in
+        /// place (same inode, same size), the file plans its new loop, and
+        /// no cached plan of the old bytes answers for it. (The change falls
+        /// in a page the cache samples, so this does not test the cache's
+        /// comparison of whole bytes; the model's `ByteCache` test does.)
+        #[test]
+        fn the_plan_follows_the_files_bytes_through_the_cache() {
+            if skipped(false) {
+                return;
+            }
+            let (_dir, path, image) = image_file(&ONE_LOOP);
+            let mapping = Mapping::new(&path, libc::MAP_PRIVATE);
+            let (map, key) = mapping.listed();
+            let before = plan_for(this_process(), &path, &map, key).unwrap();
+            let before = before.as_ref().as_ref().expect("an aarch64 image");
+            assert_eq!(before.patches.len(), 1);
+            assert_eq!(
+                before.patches[0].original,
+                image[LOOP_AT..LOOP_AT + LOOP_LEN]
+            );
+            // Asked again, the same bytes give an equal plan (from the cache,
+            // unless another test emptied it meanwhile).
+            let again = plan_for(this_process(), &path, &map, key).unwrap();
+            assert_eq!(again.as_ref().as_ref(), Some(before));
+
+            let other = elf_with_text(&OTHER_LOOP);
+            assert_eq!(other.len(), image.len());
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .write_all_at(&other, 0)
+                .unwrap();
+            let after = plan_for(this_process(), &path, &map, key).unwrap();
+            let after = after.as_ref().as_ref().expect("an aarch64 image");
+            assert_eq!(after.patches.len(), 1);
+            assert_eq!(
+                after.patches[0].original,
+                other[LOOP_AT..LOOP_AT + LOOP_LEN]
+            );
+            assert_ne!(after.patches[0].original, before.patches[0].original);
+            assert_ne!(after.patches[0].rewritten, before.patches[0].rewritten);
+        }
+
+        const PAGE: u64 = 0x1000;
+        /// Executable file text at the last scan.
+        const TEXT: Range = (0x10000, 0x20000);
+        /// A file mapping without execute permission, not scanned.
+        const DATA: Range = (0x40000, 0x50000);
+
+        fn scanned() -> ScannedRanges {
+            ScannedRanges {
+                ranges: Some(vec![(TEXT.0, TEXT.1, true), (DATA.0, DATA.1, false)]),
+                ..ScannedRanges::default()
+            }
+        }
+
+        fn after(call: Syscall, result: i64, in_memory: bool) -> Option<(Range, Trigger)> {
+            scan_after(&call, result, PAGE, in_memory, &mut scanned())
+        }
+
+        fn munmap(start: u64, len: usize) -> Syscall {
+            Syscall::Munmap(
+                Munmap::new()
+                    .with_addr(Addr::from_raw(start as usize))
+                    .with_len(len),
+            )
+        }
+
+        fn mprotect(start: u64, len: usize, prot: ProtFlags) -> Syscall {
+            Syscall::Mprotect(
+                Mprotect::new()
+                    .with_addr(AddrMut::from_raw(start as usize))
+                    .with_len(len)
+                    .with_protection(prot),
+            )
+        }
+
+        fn mmap(len: usize, prot: ProtFlags, flags: MapFlags, fd: i32) -> Syscall {
+            Syscall::Mmap(
+                Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(prot)
+                    .with_flags(flags)
+                    .with_fd(fd)
+                    .with_offset(0),
+            )
+        }
+
+        fn madvise(start: u64, len: usize, advice: i32) -> Syscall {
+            Syscall::Madvise(
+                Madvise::new()
+                    .with_addr(AddrMut::from_raw(start as usize))
+                    .with_len(len)
+                    .with_advice(advice),
+            )
+        }
+
+        /// Every call that changes where executable file text is rescans
+        /// what it changed, in every mode, and never as a write
+        /// (`Trigger::Changed`); the same calls elsewhere scan nothing.
+        #[test]
+        fn calls_that_change_executable_text_rescan_it_and_others_do_not() {
+            let changed = |start: u64, end: u64| Some(((start, end), Trigger::Changed));
+            for in_memory in [false, true] {
+                // munmap, and a length rounded up to whole pages.
+                assert_eq!(
+                    after(munmap(TEXT.0, 0x1000), 0, in_memory),
+                    changed(0x10000, 0x11000)
+                );
+                assert_eq!(
+                    after(munmap(TEXT.1 - 0x1000, 1), 0, in_memory),
+                    changed(0x1f000, 0x20000)
+                );
+                assert_eq!(after(munmap(DATA.0, 0x1000), 0, in_memory), None);
+                assert_eq!(after(munmap(0x90000, 0x1000), 0, in_memory), None);
+                // Execute permission taken away, by either call.
+                assert_eq!(
+                    after(mprotect(TEXT.0, 0x2000, ProtFlags::PROT_READ), 0, in_memory),
+                    changed(0x10000, 0x12000)
+                );
+                let pkey = Syscall::PkeyMprotect(
+                    PkeyMprotect::new()
+                        .with_addr(AddrMut::from_raw(TEXT.0 as usize))
+                        .with_len(0x1000)
+                        .with_prot(libc::PROT_READ)
+                        .with_pkey(-1),
+                );
+                assert_eq!(after(pkey, 0, in_memory), changed(0x10000, 0x11000));
+                assert_eq!(
+                    after(mprotect(DATA.0, 0x1000, ProtFlags::PROT_READ), 0, in_memory),
+                    None
+                );
+                // Text moved away: the new range is rescanned; data moved: nothing.
+                let mremap = |from: u64| {
+                    Syscall::Mremap(
+                        Mremap::new()
+                            .with_addr(AddrMut::from_raw(from as usize))
+                            .with_old_len(0x1000)
+                            .with_new_len(0x1000)
+                            .with_flags(libc::MREMAP_MAYMOVE as usize)
+                            .with_new_addr(None),
+                    )
+                };
+                assert_eq!(
+                    after(mremap(TEXT.0), 0x80000, in_memory),
+                    changed(0x80000, 0x81000)
+                );
+                assert_eq!(after(mremap(DATA.0), 0x80000, in_memory), None);
+                // A fixed mapping without execute permission over text replaced
+                // it; over nothing executable, it is only recorded.
+                let fixed = MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED;
+                assert_eq!(
+                    after(
+                        mmap(0x1000, ProtFlags::PROT_READ, fixed, 3),
+                        TEXT.0 as i64,
+                        in_memory
+                    ),
+                    changed(0x10000, 0x11000)
+                );
+                assert_eq!(
+                    after(
+                        mmap(0x1000, ProtFlags::PROT_READ, fixed, 3),
+                        0x90000,
+                        in_memory
+                    ),
+                    None
+                );
+                // An executable file mapping is made new; anonymous memory is
+                // never scanned.
+                assert_eq!(
+                    after(
+                        mmap(
+                            0x1000,
+                            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                            MapFlags::MAP_PRIVATE,
+                            3
+                        ),
+                        0x60000,
+                        in_memory
+                    ),
+                    Some(((0x60000, 0x61000), Trigger::Mapped))
+                );
+                assert_eq!(
+                    after(
+                        mmap(
+                            0x1000,
+                            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                            -1
+                        ),
+                        0x70000,
+                        in_memory
+                    ),
+                    None
+                );
+            }
+            // Unknown ranges count as executable.
+            let mut unknown = ScannedRanges::default();
+            assert_eq!(
+                scan_after(&munmap(0x90000, 0x1000), 0, PAGE, false, &mut unknown),
+                changed(0x90000, 0x91000)
+            );
+        }
+
+        /// A range made executable is rescanned where it may hold a mapping
+        /// not scanned, and always when rewriting in memory (recounted, never
+        /// written: `Trigger::Protected` is never new). A page drop over text
+        /// is rescanned only when rewriting in memory, since it puts the
+        /// file's bytes back.
+        #[test]
+        fn protection_and_page_drops_rescan_what_they_may_change() {
+            let exec = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
+            let protected = |start: u64, end: u64| Some(((start, end), Trigger::Protected));
+            assert_eq!(after(mprotect(TEXT.0, 0x1000, exec), 0, false), None);
+            assert_eq!(
+                after(mprotect(TEXT.0, 0x1000, exec), 0, true),
+                protected(0x10000, 0x11000)
+            );
+            assert_eq!(
+                after(mprotect(DATA.0, 0x1000, exec), 0, false),
+                protected(0x40000, 0x41000)
+            );
+            // A file mapping recorded without execute permission is then
+            // scanned when it gains it.
+            let mut ranges = scanned();
+            let data = mmap(0x1000, ProtFlags::PROT_READ, MapFlags::MAP_PRIVATE, 3);
+            assert_eq!(scan_after(&data, 0x90000, PAGE, false, &mut ranges), None);
+            assert_eq!(
+                scan_after(
+                    &mprotect(0x90000, 0x1000, exec),
+                    0,
+                    PAGE,
+                    false,
+                    &mut ranges
+                ),
+                protected(0x90000, 0x91000)
+            );
+            assert!(!sequence_is_new(
+                Trigger::Protected,
+                Some((0x90000, 0x91000)),
+                (0x90000, 0x90010)
+            ));
+
+            for advice in [libc::MADV_DONTNEED, libc::MADV_REMOVE, MADV_DONTNEED_LOCKED] {
+                assert_eq!(
+                    after(madvise(TEXT.0, 0x1000, advice), 0, true),
+                    Some(((0x10000, 0x11000), Trigger::Dropped))
+                );
+                assert_eq!(after(madvise(TEXT.0, 0x1000, advice), 0, false), None);
+                assert_eq!(after(madvise(DATA.0, 0x1000, advice), 0, true), None);
+            }
+            assert_eq!(
+                after(madvise(TEXT.0, 0x1000, libc::MADV_WILLNEED), 0, true),
+                None
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::decode::CodeScan;
     use super::decode::Exclusive;
     use super::decode::PAIR_WINDOW;
-    use super::decode::PairCounter;
     use super::decode::classify;
     use super::decode::count_pairs;
     use super::decode::elf_section_table;
     use super::decode::executable_sections;
+    use super::decode::is_counter_read;
+    use super::decode::scan_words;
+    use super::model::ByteCache;
     use super::model::CpuPmu;
+    use super::model::Found;
+    use super::model::GuestCode;
+    use super::model::LiveMapping;
+    use super::model::Opened;
     use super::model::PairTally;
+    use super::model::Placement;
+    use super::model::Rewrite;
+    use super::model::ScannedMapping;
+    use super::model::Step;
+    use super::model::Trigger;
+    use super::model::Written;
     use super::model::arm_cpu_pmus;
+    use super::model::cached_entry_overhead;
     use super::model::combine;
     use super::model::covering;
+    use super::model::crosses_page;
+    use super::model::left_in_mapping;
+    use super::model::merge_overlaps;
+    use super::model::page_span;
     use super::model::parse_cpu_list;
+    use super::model::place;
+    use super::model::plan_charge;
+    use super::model::sequence_is_new;
+    use super::model::spine_bound;
+    use super::model::step;
+    use super::model::was_executable;
+    use super::model::write_sequence;
 
     // Encodings from GNU as (`.arch armv8.1-a`).
     const LDAXR_X0_X2: u32 = 0xC85F_FC40; // ldaxr x0, [x2]
@@ -1471,15 +3488,15 @@ mod tests {
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect();
-        let mut whole = PairCounter::default();
+        let mut whole = CodeScan::default();
         whole.push_bytes(&bytes);
         assert_eq!(whole.pairs(), 1);
-        let mut split = PairCounter::default();
+        let mut split = CodeScan::default();
         split.push_bytes(&bytes[..8]);
         split.push_bytes(&bytes[8..]);
         assert_eq!(split.pairs(), 1);
         // Big-endian words are other instructions.
-        let mut swapped = PairCounter::default();
+        let mut swapped = CodeScan::default();
         for word in [LDAXR_X0_X2, STLXR_W3_X1_X2] {
             swapped.push_bytes(&word.to_be_bytes());
         }
@@ -1574,33 +3591,687 @@ mod tests {
         assert_eq!(combine(&[(0, 0, 0)]), Some((0, true)));
     }
 
+    /// A mapping as the scan reports it, for the tally tests.
+    fn mapping(path: &str, offset: u64, len: u64, pairs: u64) -> ScannedMapping {
+        ScannedMapping {
+            path: path.to_owned(),
+            // Each test mapping at its own address, one per file offset.
+            address: 0x40_0000 + offset,
+            offset,
+            len,
+            found: Found {
+                pairs,
+                counter_reads: 0,
+            },
+            rewrite: Rewrite::default(),
+        }
+    }
+
     #[test]
     fn tallies_pairs_per_address_space_and_path() {
         let libc = "/lib64/libc.so.6".to_owned();
         let parent = ("0".to_owned(), 1);
         let child = ("01".to_owned(), 0);
         let mut tally = PairTally::default();
-        tally.note(&parent, &[(libc.clone(), 0, 0x1000, 19)]);
+        tally.note(&parent, &[mapping(&libc, 0, 0x1000, 19)], None);
         // Two ranges of one file in one address space add up.
-        tally.note(&parent, &[(libc.clone(), 0x4000, 0x1000, 2)]);
-        assert_eq!(tally.per_path()[&libc], 21);
+        tally.note(&parent, &[mapping(&libc, 0x4000, 0x1000, 2)], None);
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
         // The same ranges in another address space count once.
-        tally.note(&child, &[(libc.clone(), 0, 0x1000, 19)]);
-        assert_eq!(tally.per_path()[&libc], 21);
+        tally.note(&child, &[mapping(&libc, 0, 0x1000, 19)], None);
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
         // mprotect split the first range and rejoined it: the new ranges
         // replace the ones they overlap.
         tally.note(
             &parent,
             &[
-                (libc.clone(), 0, 0x800, 12),
-                (libc.clone(), 0x800, 0x800, 7),
+                mapping(&libc, 0, 0x800, 12),
+                mapping(&libc, 0x800, 0x800, 7),
             ],
+            None,
         );
-        assert_eq!(tally.per_path()[&libc], 21);
-        tally.note(&parent, &[(libc.clone(), 0, 0x1000, 19)]);
-        assert_eq!(tally.per_path()[&libc], 21);
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
+        tally.note(&parent, &[mapping(&libc, 0, 0x1000, 19)], None);
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
         // A later image of the same process is another address space.
-        tally.note(&(parent.0.clone(), 2), &[(libc.clone(), 0, 0x1000, 19)]);
-        assert_eq!(tally.per_path()[&libc], 21);
+        tally.note(
+            &(parent.0.clone(), 2),
+            &[mapping(&libc, 0, 0x1000, 19)],
+            None,
+        );
+        assert_eq!(tally.pairs_per_path()[&libc], 21);
+    }
+
+    /// The tally holds each address space's executable mappings as of its
+    /// last scan: a scan names every executable file mapping it saw, and an
+    /// outcome for anything else there (unmapped, moved, split, no longer
+    /// executable) is dropped, while a scan whose maps could not be read
+    /// drops nothing.
+    #[test]
+    fn the_tally_holds_each_address_spaces_mappings_as_of_its_last_scan() {
+        let libc = "/lib64/libc.so.6";
+        let space = ("0".to_owned(), 1);
+        let left = |offset, pairs| ScannedMapping {
+            rewrite: Rewrite {
+                left: pairs,
+                ..Rewrite::default()
+            },
+            ..mapping(libc, offset, 0x1000, pairs)
+        };
+        let whole = ScannedMapping {
+            len: 0x3000,
+            ..left(0, 3)
+        };
+        let base = whole.address;
+        let seen = |path: &str, address, len| LiveMapping {
+            path: path.to_owned(),
+            address,
+            len,
+        };
+        let mut tally = PairTally::default();
+        tally.note(&space, &[whole], Some(&[seen(libc, base, 0x3000)]));
+        assert_eq!(tally.remaining_per_path().get(libc), Some(&3));
+        // An mprotect of the middle page splits the mapping in three; the
+        // scan that follows reports every piece the tally does not hold, so
+        // the outer pieces are not lost to the middle one.
+        let pieces = [
+            seen(libc, base, 0x1000),
+            seen(libc, base + 0x1000, 0x1000),
+            seen(libc, base + 0x2000, 0x1000),
+        ];
+        tally.note(
+            &space,
+            &[left(0, 1), left(0x1000, 1), left(0x2000, 1)],
+            Some(&pieces),
+        );
+        assert_eq!(tally.remaining_per_path().get(libc), Some(&3));
+        assert_eq!(tally.pairs_per_path().get(libc), Some(&3));
+        // Maps that could not be read leave the tally as it was.
+        tally.note(&space, &[], None);
+        assert_eq!(tally.remaining_per_path().get(libc), Some(&3));
+        // Unmapped, and another file mapped at the same address: a later
+        // scan of the address space no longer sees it.
+        tally.note(
+            &space,
+            &[mapping("/bin/other", 0, 0x1000, 1)],
+            Some(&[seen("/bin/other", base, 0x1000)]),
+        );
+        assert_eq!(tally.remaining_per_path().get(libc), None);
+        assert_eq!(tally.pairs_per_path().get(libc), None);
+        // Another address space is not touched by this one's scans.
+        let mut two = PairTally::default();
+        two.note(&("01".to_owned(), 0), &[left(0, 2)], None);
+        two.note(&space, &[], Some(&[]));
+        assert_eq!(two.remaining_per_path().get(libc), Some(&2));
+    }
+
+    /// The plan cache returns a value only for bytes equal to those it was
+    /// made from, even when the sampled key matches, and never passes its
+    /// bounds on the bytes, values and bookkeeping charged, on entries, or on
+    /// candidates per key: the oldest entries go before a new one is added.
+    #[test]
+    fn the_plan_cache_answers_only_for_equal_bytes_and_stays_bounded() {
+        // 20,000 bytes: the key samples 0..4096, 7952..12048 and
+        // 15904..20000, so bytes 5000 to 7000 are not sampled.
+        let a = vec![7u8; 20_000];
+        let variant = |at: usize| {
+            let mut bytes = a.clone();
+            bytes[at] ^= 1;
+            bytes
+        };
+        let entry = 20_000 + cached_entry_overhead::<u32>();
+        let max = 6 * entry;
+        let spine = spine_bound::<u32>(16);
+        let mut cache = ByteCache::<u32>::new(max + spine, 16);
+        assert_eq!(cache.max_charge(), max, "the spine is set aside");
+        let within = |cache: &ByteCache<u32>| {
+            let (held, entries) = cache.held();
+            assert!(held <= max && entries <= 16);
+            assert!(cache.retained() <= max + spine && cache.peak() <= max + spine);
+            assert!(cache.peak() >= cache.retained());
+        };
+        cache.insert(a.clone(), 1, 0);
+        assert_eq!(cache.get(&a), Some(1));
+        assert_eq!(cache.get(&variant(5000)), None, "same key, other bytes");
+        for (value, at) in [(2, 5000), (3, 6000), (4, 7000)] {
+            cache.insert(variant(at), value, 0);
+            within(&cache);
+        }
+        assert_eq!(cache.get(&variant(6000)), Some(3));
+        // A fifth candidate for the key is not held.
+        cache.insert(variant(5001), 9, 0);
+        assert_eq!(cache.get(&variant(5001)), None);
+        assert_eq!(cache.held(), (4 * entry, 4));
+        // The value's heap counts: room is made first, oldest first, and the
+        // bound is never passed.
+        let big = vec![1u8; 20_001];
+        cache.insert(big.clone(), 10, 2 * entry);
+        within(&cache);
+        assert_eq!((cache.get(&a), cache.get(&variant(5000))), (None, None));
+        assert_eq!(cache.get(&big), Some(10));
+        assert_eq!(cache.held(), (5 * entry + 1, 3));
+        // The peak counts the spine too: the most retained so far is now.
+        assert!(cache.retained() > 5 * entry + 1);
+        assert_eq!(cache.peak(), cache.retained());
+        // Exactly at the bound is allowed; one past it by itself is not held.
+        let fill = vec![3u8; 20_002];
+        cache.insert(
+            fill.clone(),
+            11,
+            max - 20_002 - cached_entry_overhead::<u32>(),
+        );
+        assert_eq!((cache.get(&fill), cache.held()), (Some(11), (max, 1)));
+        cache.insert(vec![2u8; 100], 12, max);
+        assert_eq!(cache.get(&[2u8; 100]), None);
+        within(&cache);
+        // The entry bound: many small files.
+        let mut small = ByteCache::<u32>::new(usize::MAX, 3);
+        for n in 0..10u8 {
+            small.insert(vec![n; 10 + usize::from(n)], u32::from(n), 0);
+            assert!(small.held().1 <= 3);
+        }
+        assert_eq!(small.get(&[9u8; 19]), Some(9));
+        assert_eq!(small.get(&[0u8; 10]), None);
+        // A new run starts empty, with no peak, its spine released.
+        small.clear();
+        assert_eq!(
+            (small.held(), small.peak(), small.retained()),
+            ((0, 0), 0, 0)
+        );
+        assert_eq!(small.get(&[9u8; 19]), None);
+        // And starts counting afresh.
+        small.insert(vec![5u8; 7], 5, 0);
+        let fresh = 7 + cached_entry_overhead::<u32>();
+        assert_eq!(small.held(), (fresh, 1));
+        assert_eq!(small.peak(), small.retained());
+        assert!(small.retained() > fresh);
+        // A bound the spine alone would fill holds nothing.
+        let mut tiny = ByteCache::<u32>::new(spine_bound::<u32>(8), 8);
+        tiny.insert(vec![1u8; 1], 1, 0);
+        assert_eq!((tiny.max_charge(), tiny.held()), (0, (0, 0)));
+    }
+
+    /// A plan is charged for what it holds, by capacity, not length: spare
+    /// room in its vectors counts.
+    #[test]
+    fn a_cached_plan_is_charged_its_allocations() {
+        use std::mem::size_of;
+
+        use crate::aarch64_lse::elf::FilePatch;
+        use crate::aarch64_lse::elf::FilePlan;
+        let mut patches = Vec::with_capacity(10);
+        patches.push(FilePatch {
+            offset: 0,
+            original: Vec::with_capacity(64),
+            rewritten: vec![0; 4],
+        });
+        let mut plan = FilePlan {
+            patches,
+            ..FilePlan::default()
+        };
+        plan.report.patched.insert("rmw", 1);
+        plan.report.refused_examples = Vec::with_capacity(3);
+        plan.report
+            .refused_examples
+            .push((0x10, String::with_capacity(40)));
+        let shared = 2 * size_of::<usize>() + size_of::<Option<FilePlan>>();
+        let expected = shared
+            + 10 * size_of::<FilePatch>()
+            + 64
+            + 4
+            + 3 * size_of::<(u64, String)>()
+            + 40
+            + 1024;
+        assert_eq!(plan_charge(&Some(plan)), expected);
+        assert_eq!(plan_charge(&None), shared);
+    }
+
+    /// The spine's bound is the queue at twice the entries (at least 4
+    /// slots), a node and a 4-candidate list per entry, and saturates.
+    #[test]
+    fn the_plan_cache_spine_bound_is_exact_and_saturates() {
+        use std::mem::size_of;
+        let arc = size_of::<usize>();
+        let slot = size_of::<(usize, u64)>() + arc;
+        let per_key = 1024 + 4 * arc;
+        assert_eq!(spine_bound::<u32>(16), 32 * slot + 16 * per_key);
+        assert_eq!(spine_bound::<u32>(1), 4 * slot + per_key);
+        assert_eq!(spine_bound::<u32>(0), 4 * slot);
+        assert_eq!(spine_bound::<u32>(usize::MAX), usize::MAX);
+        assert_eq!(ByteCache::<u32>::new(usize::MAX, usize::MAX).held(), (0, 0));
+    }
+
+    #[test]
+    fn merges_overlapping_sections_but_keeps_touching_ones_apart() {
+        assert_eq!(
+            merge_overlaps(vec![
+                (0x200, 0x300),
+                (0x100, 0x250),
+                (0x300, 0x400),
+                (0x120, 0x130)
+            ]),
+            [(0x100, 0x300), (0x300, 0x400)]
+        );
+        assert!(merge_overlaps(Vec::new()).is_empty());
+    }
+
+    /// The virtual counter, read from EL0: `MRS Xt, CNTVCT_EL0` and
+    /// `CNTVCTSS_EL0`, with every `Rt`. Encodings from GNU as.
+    #[test]
+    fn counts_the_virtual_counter_reads_an_image_can_make() {
+        for encoding in [0xd53b_e040u32, 0xd53b_e0c0] {
+            for rt in 0..32 {
+                assert!(is_counter_read(encoding | rt), "{:#010x}", encoding | rt);
+            }
+        }
+        // Not counted: `CNTPCT_EL0` and `CNTPCTSS_EL0`, which fault at EL0 on
+        // Linux; `CNTFRQ_EL0`, a constant; `CNTV_TVAL_EL0`, a timer register
+        // that also faults; `CNTKCTL_EL1`, EL1 state; a `NOP` and a
+        // load-exclusive.
+        for other in [
+            0xd53b_e020u32,
+            0xd53b_e0a0,
+            0xd53b_e000,
+            0xd53b_e300,
+            0xd538_e104,
+            0xd503_201f,
+            0xc85f_fc64,
+        ] {
+            assert!(!is_counter_read(other), "{other:#010x}");
+        }
+        // One pass counts both kinds, and a counter read is not mistaken for
+        // part of an exclusive pair: ldaxr; mrs x1, cntvct_el0; stlxr; cbnz.
+        let scan = scan_words([0xc85f_fc64, 0xd53b_e041, 0xc805_fc64, 0x35ff_ffa5]);
+        assert_eq!(scan.pairs(), 1);
+        assert_eq!(scan.counter_reads(), 1);
+    }
+
+    /// A mapping is tallied when it has either kind of finding, and each
+    /// per-path view leaves out the paths with none of its kind.
+    #[test]
+    fn tallies_each_finding_only_where_there_is_one() {
+        let space = ("0".to_owned(), 1);
+        let mut tally = PairTally::default();
+        let linker = ScannedMapping {
+            path: "/system/bin/linker64".to_owned(),
+            address: 0x7000_0000,
+            offset: 0,
+            len: 0x1000,
+            found: Found {
+                pairs: 0,
+                counter_reads: 1,
+            },
+            rewrite: Rewrite::default(),
+        };
+        tally.note(
+            &space,
+            &[linker, mapping("/lib64/libc.so.6", 0, 0x1000, 3)],
+            None,
+        );
+        assert_eq!(
+            tally.pairs_per_path().into_iter().collect::<Vec<_>>(),
+            vec![("/lib64/libc.so.6".to_owned(), 3)]
+        );
+        assert_eq!(
+            tally
+                .counter_reads_per_path()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![("/system/bin/linker64".to_owned(), 1)]
+        );
+    }
+
+    /// A sequence is new, so the in-memory rewrite may write it, only at the
+    /// exec stop and inside the range an mmap just made.
+    #[test]
+    fn only_a_sequence_no_instruction_of_which_can_have_run_is_new() {
+        let seq = |start: u64| (start, start + 24);
+        assert!(sequence_is_new(Trigger::Exec, None, seq(0x1000)));
+        // An mmap: inside its range only. The kernel can merge the new
+        // mapping with an older neighbour into one maps entry, whose older
+        // part may have run.
+        let mapped = Some((0x2000, 0x4000));
+        assert!(sequence_is_new(Trigger::Mapped, mapped, seq(0x2100)));
+        assert!(!sequence_is_new(Trigger::Mapped, mapped, seq(0x1f00)));
+        assert!(!sequence_is_new(Trigger::Mapped, mapped, seq(0x3ff0)));
+        // Text made executable by mprotect may have run before, through
+        // permission changes and moves; text a drop put back has. Never new.
+        for trigger in [Trigger::Protected, Trigger::Dropped, Trigger::Changed] {
+            assert!(!sequence_is_new(trigger, mapped, seq(0x2100)));
+        }
+    }
+
+    /// The memory decides the step: the file's bytes are written only when
+    /// new, the replacement is kept, and anything else is left, including
+    /// the file's bytes in old text (guest-modified, or put back by a drop).
+    #[test]
+    fn writes_the_files_bytes_only_when_new() {
+        let (original, rewritten, other) =
+            (&[1u8, 2, 3, 4][..], &[9u8, 9, 9, 9][..], &[0u8; 4][..]);
+        assert_eq!(step(original, original, rewritten, true), Step::Write);
+        assert_eq!(step(original, original, rewritten, false), Step::Leave);
+        for new in [true, false] {
+            assert_eq!(step(rewritten, original, rewritten, new), Step::Done);
+            assert_eq!(step(other, original, rewritten, new), Step::Leave);
+        }
+    }
+
+    /// A file opened by name proves the mapped object by inode and device;
+    /// where the maps device is not stat's (btrfs, overlayfs) the inode alone
+    /// is enough to count but never to plan a write.
+    #[test]
+    fn only_a_proven_mapped_object_plans_a_write() {
+        for exact in [false, true] {
+            for same_device in [false, true] {
+                for unreliable in [false, true] {
+                    assert_eq!(Opened::of(exact, false, same_device, unreliable), None);
+                }
+            }
+        }
+        assert_eq!(Opened::of(true, true, false, true), Some(Opened::Exact));
+        assert_eq!(
+            Opened::of(false, true, true, false),
+            Some(Opened::SameInodeAndDevice)
+        );
+        assert_eq!(Opened::of(false, true, false, false), None);
+        for same_device in [false, true] {
+            assert_eq!(
+                Opened::of(false, true, same_device, true),
+                Some(Opened::SameInodeOnly)
+            );
+        }
+        assert!(Opened::Exact.may_plan_writes());
+        assert!(Opened::SameInodeAndDevice.may_plan_writes());
+        assert!(!Opened::SameInodeOnly.may_plan_writes());
+    }
+
+    /// A page drop is rescanned where executable file text was, and
+    /// everywhere once the ranges are unknown (as after a move), so a drop at
+    /// a moved mapping's new address is never missed.
+    #[test]
+    fn a_drop_is_rescanned_wherever_text_may_be() {
+        let known = [(0x1000, 0x3000, true), (0x3000, 0x4000, false)];
+        assert!(was_executable(Some(&known), (0x2000, 0x2001)));
+        assert!(!was_executable(Some(&known), (0x3000, 0x4000)));
+        assert!(!was_executable(Some(&known), (0x9000, 0xa000)));
+        assert!(was_executable(None, (0x9000, 0xa000)));
+    }
+
+    /// A sequence within one page is written; one touching two is left, so
+    /// that no page drop can leave half of it. Page-taking calls act on whole
+    /// pages.
+    #[test]
+    fn writes_only_within_a_page_and_spans_whole_pages() {
+        assert!(!crosses_page(0x1000, 24, 0x1000));
+        assert!(!crosses_page(0x1fe8, 24, 0x1000), "ends at the last byte");
+        assert!(crosses_page(0x1fec, 24, 0x1000));
+        assert!(!crosses_page(0x1fec, 24, 0x10000));
+        assert_eq!(page_span(0x1000, 0x1001, 0x1000), (0x1000, 0x3000));
+        assert_eq!(page_span(0x1000, 0x1000, 0x1000), (0x1000, 0x2000));
+        assert_eq!(page_span(0x1000, 0, 0x1000), (0x1000, 0x2000));
+        assert_eq!(page_span(0x10000, 1, 0x10000), (0x10000, 0x20000));
+    }
+
+    /// How a write to [`FakeCode`] goes wrong.
+    #[derive(Clone, Copy)]
+    enum Fault {
+        /// Writes up to the first page boundary after the start, then fails,
+        /// as a `/proc/<pid>/mem` write does when a later page fails.
+        AfterFirstPage,
+        /// Writes everything, but one byte reads back changed.
+        ReadsBackChanged,
+    }
+
+    /// Guest code in a buffer of pages, whose `n`th write can be made to fail.
+    struct FakeCode {
+        bytes: std::cell::RefCell<Vec<u8>>,
+        page: usize,
+        writes: std::cell::Cell<usize>,
+        faults: Vec<(usize, Fault)>,
+    }
+
+    impl FakeCode {
+        fn new(bytes: &[u8], faults: Vec<(usize, Fault)>) -> Self {
+            FakeCode {
+                bytes: std::cell::RefCell::new(bytes.to_vec()),
+                page: 8,
+                writes: std::cell::Cell::new(0),
+                faults,
+            }
+        }
+    }
+
+    impl GuestCode for FakeCode {
+        fn read(&self, address: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            let at = address as usize;
+            buf.copy_from_slice(&self.bytes.borrow()[at..at + buf.len()]);
+            Ok(())
+        }
+
+        fn write(&self, address: u64, bytes: &[u8]) -> std::io::Result<()> {
+            let n = self.writes.get();
+            self.writes.set(n + 1);
+            let at = address as usize;
+            let fault = self
+                .faults
+                .iter()
+                .find(|(nth, _)| *nth == n)
+                .map(|(_, fault)| *fault);
+            let mut memory = self.bytes.borrow_mut();
+            match fault {
+                None => {
+                    memory[at..at + bytes.len()].copy_from_slice(bytes);
+                    Ok(())
+                }
+                Some(Fault::AfterFirstPage) => {
+                    let prefix = (at / self.page + 1) * self.page - at;
+                    memory[at..at + prefix].copy_from_slice(&bytes[..prefix]);
+                    Err(std::io::Error::from_raw_os_error(libc::ENOMEM))
+                }
+                Some(Fault::ReadsBackChanged) => {
+                    memory[at..at + bytes.len()].copy_from_slice(bytes);
+                    memory[at] ^= 0xff;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// A sequence is written whole or not at all, and the result says what
+    /// memory holds: a failure part-way, on either write, ends with the
+    /// original back in place, and only an original that cannot be put back
+    /// is reported as broken.
+    #[test]
+    fn a_sequence_is_written_whole_or_restored_and_says_what_memory_holds() {
+        // A 12-byte sequence at 4 in pages of 8 bytes: it crosses a page.
+        let image = [0u8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let original = &image[4..16];
+        let rewritten = [0xau8; 12];
+        let run = |faults: Vec<(usize, Fault)>| {
+            let code = FakeCode::new(&image, faults);
+            let written = write_sequence(&code, 4, original, &rewritten);
+            let holds = code.bytes.borrow()[4..16].to_vec();
+            (written, holds)
+        };
+        let failed = |written: &Written| matches!(written, Written::Failed(_));
+        let broken = |written: &Written| matches!(written, Written::Broken(_));
+
+        assert_eq!(run(vec![]), (Written::Rewritten, rewritten.to_vec()));
+        // Copying the pages fails after the first: nothing changed.
+        let (written, holds) = run(vec![(0, Fault::AfterFirstPage)]);
+        assert!(failed(&written), "{written:?}");
+        assert_eq!(holds, original);
+        // The replacement fails on its second page, or reads back changed:
+        // the original is written back.
+        for fault in [Fault::AfterFirstPage, Fault::ReadsBackChanged] {
+            let (written, holds) = run(vec![(1, fault)]);
+            assert!(failed(&written), "{written:?}");
+            assert_eq!(holds, original);
+        }
+        // A restore that reports an error may still have put every byte
+        // back: what memory holds decides. Here the failed replacement wrote
+        // only its first page and the failed restore wrote that page back.
+        let (written, holds) = run(vec![(1, Fault::AfterFirstPage), (2, Fault::AfterFirstPage)]);
+        assert!(failed(&written), "{written:?}");
+        assert_eq!(holds, original);
+        // Memory holding neither, after the restore, must not run.
+        for restore in [Fault::AfterFirstPage, Fault::ReadsBackChanged] {
+            let (written, holds) = run(vec![(1, Fault::ReadsBackChanged), (2, restore)]);
+            assert!(broken(&written), "{written:?}");
+            assert!(holds != original && holds != rewritten, "{holds:?}");
+        }
+    }
+
+    /// A file's loops are found by file offset, once, whatever a process
+    /// maps; each mapping holds the pairs whose load-exclusive it maps. So a
+    /// loop split across two mappings, at any instruction boundary, is
+    /// counted exactly once, by the mapping that holds its load, whether or
+    /// not the rewriter would take it and whatever follows the mapping; the
+    /// left count rewrite_mapping keeps then names it exactly once.
+    #[test]
+    fn a_loop_split_across_two_mappings_is_counted_once() {
+        // ldaxr x0, [x2]; add x1, x0, #1; stlxr w3, x1, [x2]; cbnz w3, -12
+        let canonical = [LDAXR_X0_X2, 0x9100_0401, STLXR_W3_X1_X2, 0x35FF_FFA3];
+        // ldaxr; mul (not an idiom the rewriter takes); stlxr; cbnz
+        let refused = [LDAXR_X0_X2, 0x9B02_7C01, STLXR_W3_X1_X2, 0x35FF_FFA3];
+        let base = 0x1000u64;
+        for words in [canonical, refused] {
+            let mut scan = CodeScan::at(base);
+            words.iter().for_each(|word| scan.push(*word));
+            let loops = scan.into_loops();
+            assert_eq!(loops.pair_loads, [base], "the pair is at its load");
+            for split in 0..=4u64 {
+                let boundary = base + 4 * split;
+                let first = loops.found_in(0, boundary).pairs;
+                let second = loops.found_in(boundary, base + 0x1000).pairs;
+                assert_eq!(first + second, 1, "split at {split}");
+                assert_eq!(first, u64::from(split >= 1), "split at {split}");
+                assert_eq!(
+                    left_in_mapping(first, 0, 0) + left_in_mapping(second, 0, 0),
+                    1,
+                    "split at {split}"
+                );
+            }
+            // Mapped alone, with nothing after it, a mapping holding the
+            // load still counts the loop: the file holds it.
+            assert_eq!(loops.found_in(base, base + 4).pairs, 1);
+            assert_eq!(loops.found_in(base + 4, base + 16).pairs, 0);
+        }
+        let original: Vec<u8> = canonical.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let len = original.len() as u64;
+        for split in (4..len).step_by(4) {
+            let first = place(base, len, 0x40_0000, 0, base + split);
+            let second = place(base, len, 0x50_0000, base + split, 0x1000);
+            assert_eq!(first, Placement::CrossesEnd, "split at {split}");
+            assert_eq!(second, Placement::Outside, "split at {split}");
+        }
+        // Counter reads are attributed by offset too.
+        let mut scan = CodeScan::at(0);
+        [0xD53B_E040u32, 0xD53B_E040]
+            .iter()
+            .for_each(|word| scan.push(*word));
+        let loops = scan.into_loops();
+        assert_eq!(loops.found_in(0, 4).counter_reads, 1);
+        assert_eq!(loops.found_in(4, 8).counter_reads, 1);
+    }
+
+    #[test]
+    fn a_patch_is_placed_only_where_the_mapping_holds_all_of_it() {
+        // A mapping of file bytes [0x1000, 0x3000) at 0x7f00_0000.
+        let at = |offset, len| place(offset, len, 0x7f00_0000, 0x1000, 0x2000);
+        assert_eq!(at(0x1000, 16), Placement::At(0x7f00_0000));
+        assert_eq!(at(0x2ff0, 16), Placement::At(0x7f00_1ff0));
+        assert_eq!(at(0x2ff8, 16), Placement::CrossesEnd);
+        assert_eq!(at(0x0ff0, 16), Placement::Outside);
+        assert_eq!(at(0x3000, 16), Placement::Outside);
+    }
+
+    /// The in-memory rewrite is tallied like the pairs: summed over one
+    /// address space's ranges, the largest sum over address spaces, and only
+    /// for the paths it touched.
+    #[test]
+    fn tallies_the_in_memory_rewrite_per_path() {
+        let libc = "/lib64/libc.so.6";
+        let with = |offset, pairs, rewritten, left, failed| ScannedMapping {
+            rewrite: Rewrite {
+                rewritten,
+                left,
+                failed,
+            },
+            ..mapping(libc, offset, 0x1000, pairs)
+        };
+        let mut tally = PairTally::default();
+        tally.note(
+            &("0".to_owned(), 1),
+            &[with(0, 20, 18, 2, 0), with(0x4000, 3, 3, 0, 0)],
+            None,
+        );
+        // A child whose write failed for one loop.
+        tally.note(&("01".to_owned(), 0), &[with(0, 20, 17, 2, 1)], None);
+        tally.note(
+            &("0".to_owned(), 1),
+            &[mapping("/bin/plain", 0, 0x1000, 4)],
+            None,
+        );
+        let rewrites = tally.rewrites_per_path();
+        // One process's counts, so that they add up to its pairs: the one
+        // where the most can still retry, here the child's 2 left and 1 not
+        // written, though the parent mapped more.
+        assert_eq!(
+            rewrites.get(libc),
+            Some(&Rewrite {
+                rewritten: 17,
+                left: 2,
+                failed: 1,
+            })
+        );
+        assert!(!rewrites.contains_key("/bin/plain"), "{rewrites:?}");
+        // What can still retry: the worst process's left and not written,
+        // every pair where no rewrite was attempted, and a split sequence
+        // that only the rewrite saw.
+        tally.note(
+            &("0".to_owned(), 1),
+            &[with(0x9000, 0, 0, 1, 0)].map(|m| ScannedMapping {
+                path: "/lib64/libsplit.so".to_owned(),
+                ..m
+            }),
+            None,
+        );
+        let remaining = tally.remaining_per_path();
+        assert_eq!(remaining.get(libc), Some(&3));
+        assert_eq!(remaining.get("/bin/plain"), Some(&4));
+        assert_eq!(remaining.get("/lib64/libsplit.so"), Some(&1));
+        // Two executable aliases of the same file bytes in one address
+        // space are two mappings: a rewritten copy does not hide an
+        // original one.
+        let mut aliases = PairTally::default();
+        let rewritten_copy = with(0, 3, 3, 0, 0);
+        let original_copy = ScannedMapping {
+            address: 0x7f00_0000,
+            ..with(0, 3, 0, 3, 0)
+        };
+        aliases.note(&("0".to_owned(), 1), &[original_copy, rewritten_copy], None);
+        assert_eq!(aliases.remaining_per_path().get(libc), Some(&3));
+        assert_eq!(aliases.pairs_per_path().get(libc), Some(&6));
+        assert_eq!(
+            aliases.rewrites_per_path().get(libc),
+            Some(&Rewrite {
+                rewritten: 3,
+                left: 3,
+                failed: 0,
+            })
+        );
+        // With equal remaining exposure, the process with more loops.
+        let mut tie = PairTally::default();
+        tie.note(&("0".to_owned(), 1), &[with(0, 20, 18, 2, 0)], None);
+        tie.note(&("01".to_owned(), 0), &[with(0, 4, 2, 2, 0)], None);
+        assert_eq!(
+            tie.rewrites_per_path().get(libc),
+            Some(&Rewrite {
+                rewritten: 18,
+                left: 2,
+                failed: 0,
+            })
+        );
     }
 }

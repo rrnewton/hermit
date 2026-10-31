@@ -110,9 +110,6 @@ reverie-loader = { version = "0.5.4", git = "https://github.com/rrnewton/reverie
 # Use the qualifier as a dependency without adding its unit tests to fixture binaries.
 reverie-liteinst-artifact = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "de4e3baa94acf31ad270fb452e03aead294f833a", default-features = false }
 reverie-loader = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "de4e3baa94acf31ad270fb452e03aead294f833a" }
-# Same exact host source pin as the shared physical launcher and codec consumer.
-# Keep the shared physical-launcher regression in the ordinary unit gate.
-reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "de4e3baa94acf31ad270fb452e03aead294f833a", default-features = false, features = ["exec-stop"] }
 # Exact token locations and digests bind the complete source inventory.
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"
@@ -120,6 +117,13 @@ ruzstd = "0.9.0"
 sha2 = "0.10.9"
 # Parse actual container call arguments, including conditional local labels.
 syn = { version = "2.0.119", features = ["full", "visit"] }
+
+# The in-guest runtime builds only for x86_64; this lets an aarch64 host build
+# the test targets that do not use it.
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+# Same exact host source pin as the shared physical launcher and codec consumer.
+# Keep the shared physical-launcher regression in the ordinary unit gate.
+reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "de4e3baa94acf31ad270fb452e03aead294f833a", default-features = false, features = ["exec-stop"] }
 
 # Always selected with the existing backend feature; fixture exports are a
 # separate producer input, never an exemption from required execution.

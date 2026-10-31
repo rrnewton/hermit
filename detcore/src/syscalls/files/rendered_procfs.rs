@@ -5931,7 +5931,7 @@ mod tests {
         async fn regs(&mut self) -> libc::user_regs_struct {
             // SAFETY: plain integers; zero is a valid value for each.
             let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-            regs.orig_rax = libc::SYS_openat as u64;
+            crate::arch::set_syscall_number(&mut regs, libc::SYS_openat as u64);
             regs
         }
         async fn stack(&mut self) -> Self::Stack {
@@ -6079,12 +6079,12 @@ mod tests {
 
     #[test]
     fn a_cmdline_read_respects_page_protection() {
-        const PAGE: usize = 4096;
+        let page = crate::test_pages::page_size();
         // SAFETY: a fresh private anonymous mapping, unmapped below.
         let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                3 * PAGE,
+                3 * page,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -6093,8 +6093,8 @@ mod tests {
         };
         assert_ne!(base, libc::MAP_FAILED);
         let base = base as usize;
-        let page1 = base + PAGE;
-        let page2 = base + 2 * PAGE;
+        let page1 = base + page;
+        let page2 = base + 2 * page;
         let titled = b"title\0xyz";
         let other = b"abc\0";
         // SAFETY: both ranges lie in the mapping, before its protection
@@ -6106,9 +6106,9 @@ mod tests {
                 titled.len(),
             );
             std::ptr::copy_nonoverlapping(other.as_ptr(), page1 as *mut u8, other.len());
-            assert_eq!(libc::munmap(page2 as *mut libc::c_void, PAGE), 0);
+            assert_eq!(libc::munmap(page2 as *mut libc::c_void, page), 0);
             assert_eq!(
-                libc::mprotect(base as *mut libc::c_void, PAGE, libc::PROT_NONE),
+                libc::mprotect(base as *mut libc::c_void, page, libc::PROT_NONE),
                 0
             );
         }
@@ -6144,7 +6144,7 @@ mod tests {
         assert_eq!(read(&spanning, 6, 64), b"abc\0");
         // SAFETY: the two pages still mapped, unmapped once.
         unsafe {
-            assert_eq!(libc::munmap(base as *mut libc::c_void, 2 * PAGE), 0);
+            assert_eq!(libc::munmap(base as *mut libc::c_void, 2 * page), 0);
         }
     }
 

@@ -4892,7 +4892,8 @@ impl Scheduler {
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
                 .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_chaos_timeslice(cfg.chaos_timeslice)
-                .with_guest_ids(cfg.guest_ids);
+                .with_guest_ids(cfg.guest_ids)
+                .with_rewrite_exclusives_in_memory(cfg.rewrite_exclusives_in_memory);
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -19043,6 +19044,9 @@ impl Scheduler {
                 // GlobalState records what the run learned of its
                 // store-exclusive sequences (aarch64).
                 exclusive_pairs: Default::default(),
+                counter_reads: Default::default(),
+                exclusive_rewrites: Default::default(),
+                exclusive_rewrite_cache_peak: 0,
                 store_exclusives: None,
                 store_exclusives_unavailable: None,
                 guest_deadlock,
@@ -20415,7 +20419,23 @@ mod test {
     extern "C" fn pause_forever(_: *mut libc::c_void) -> libc::c_int {
         loop {
             // SAFETY: pause has no arguments and only waits for a signal.
-            unsafe { libc::syscall(libc::SYS_pause) };
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                libc::syscall(libc::SYS_pause)
+            };
+            // aarch64 has no pause; a ppoll of no descriptors with no timeout
+            // waits for a signal the same way.
+            // SAFETY: ppoll reads nothing through its null pointers.
+            #[cfg(not(target_arch = "x86_64"))]
+            unsafe {
+                libc::syscall(
+                    libc::SYS_ppoll,
+                    std::ptr::null::<libc::pollfd>(),
+                    0 as libc::nfds_t,
+                    std::ptr::null::<libc::timespec>(),
+                    std::ptr::null::<libc::sigset_t>(),
+                )
+            };
         }
     }
 

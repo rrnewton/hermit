@@ -36,6 +36,7 @@
 #![deny(missing_docs)]
 #![allow(clippy::uninlined_format_args)]
 
+pub mod aarch64_lse;
 pub mod access_trace;
 mod arch;
 mod config;
@@ -4183,6 +4184,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 subscription.syscalls([Sysno::alarm, Sysno::pause]);
             }
 
+            // Detcore's exclusive-loop scan (aarch64) follows every call that
+            // changes where executable file text is, and the in-memory
+            // rewrite every call that makes some; `mmap`, `munmap`, `mremap`
+            // and `madvise` are listed above.
+            // Only where the scan runs: under record or replay it does not, and
+            // their event stream stays as it was.
+            #[cfg(target_arch = "aarch64")]
+            if crate::store_exclusive::reads_guest_tasks(config) {
+                subscription.syscalls([Sysno::mprotect, Sysno::pkey_mprotect]);
+            }
+
             if config.virtualize_metadata {
                 subscription.syscalls([Sysno::getdents64, Sysno::fstat, Sysno::statx]);
                 #[cfg(target_arch = "x86_64")]
@@ -7727,6 +7739,8 @@ mod subscription_tests {
             "syslog must reach its deterministic Detcore handler"
         );
         for sysno in [
+            // x86_64 only: aarch64 has faccessat and faccessat2 alone.
+            #[cfg(target_arch = "x86_64")]
             Sysno::access,
             Sysno::faccessat,
             Sysno::faccessat2,
@@ -7952,6 +7966,54 @@ mod subscription_tests {
         }
     }
 
+    /// aarch64: under `--passthru-opt` (record and replay turn it on),
+    /// `mprotect` reaches Detcore exactly where the exclusive-loop scan reads
+    /// guest tasks, which follows it; under `hermit record` and `hermit
+    /// replay`, or a backend whose tasks are not the guest's, the event stream
+    /// stays as it was. `pkey_mprotect` reaches it in every configuration,
+    /// since inotify fault recovery learns protection-key use from it
+    /// (`passthru_opt_intercepts_the_protection_key_calls`). Without
+    /// `--passthru-opt` every call is delivered anyway.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn protection_changes_reach_detcore_where_the_exclusive_scan_runs() {
+        let protection = [Sysno::mprotect, Sysno::pkey_mprotect];
+        for recordreplay_modes in [false, true] {
+            for host_task_reads_reach_guest_threads in [false, true] {
+                for tool_shares_guest_descriptor_table in [false, true] {
+                    for passthru_opt in [false, true] {
+                        let mut config = Config {
+                            recordreplay_modes,
+                            ..strict_config(passthru_opt)
+                        };
+                        config.backend.host_task_reads_reach_guest_threads =
+                            host_task_reads_reach_guest_threads;
+                        config.backend.tool_shares_guest_descriptor_table =
+                            tool_shares_guest_descriptor_table;
+                        let scans = host_task_reads_reach_guest_threads
+                            && !tool_shares_guest_descriptor_table
+                            && !recordreplay_modes;
+                        assert_eq!(crate::store_exclusive::reads_guest_tasks(&config), scans);
+                        let delivered: Vec<Sysno> = <Detcore as Tool>::subscriptions(&config)
+                            .iter_syscalls()
+                            .collect();
+                        for sysno in protection {
+                            let expected = scans || !passthru_opt || sysno == Sysno::pkey_mprotect;
+                            assert_eq!(
+                                delivered.contains(&sysno),
+                                expected,
+                                "{sysno}: passthru_opt={passthru_opt} \
+                                 recordreplay_modes={recordreplay_modes} \
+                                 host_task_reads={host_task_reads_reach_guest_threads} \
+                                 shared_table={tool_shares_guest_descriptor_table}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Detcore declares the serialized-execution contract only where it holds:
     /// threads sequentialized, and both seccomp-filter routes intercepted and
     /// refused.
@@ -8001,6 +8063,8 @@ mod subscription_tests {
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::madvise)
         );
+        // x86_64 only: arch_prctl is an x86 syscall.
+        #[cfg(target_arch = "x86_64")]
         assert!(
             subscriptions
                 .iter_syscalls()
@@ -8606,9 +8670,9 @@ mod finished_syscall_display_tests {
     use reverie::syscalls::AtFlags;
     use reverie::syscalls::ClockGettime;
     use reverie::syscalls::ClockId;
+    use reverie::syscalls::Fstatat;
     use reverie::syscalls::Gettimeofday;
     use reverie::syscalls::LocalMemory;
-    use reverie::syscalls::Newfstatat;
     use reverie::syscalls::PathPtr;
     use reverie::syscalls::StatPtr;
     use reverie::syscalls::Statx;
@@ -8650,9 +8714,10 @@ mod finished_syscall_display_tests {
         statx
     }
 
+    /// `fstatat`, which x86_64 numbers as `newfstatat`.
     fn newfstatat(path: &CString, stat: &libc::stat) -> Syscall {
-        Syscall::Newfstatat(
-            Newfstatat::new()
+        crate::arch::fstatat_syscall(
+            Fstatat::new()
                 .with_dirfd(libc::AT_FDCWD)
                 .with_path(PathPtr::from_ptr(path.as_ptr()))
                 .with_stat(StatPtr::from_ptr(stat as *const libc::stat))
