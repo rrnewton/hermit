@@ -167,6 +167,7 @@ pub(crate) async fn receiver_cleanup(
             "syscall_histogram": histogram,
             "chaos_epochs": [],
             "killed_by_group_signal": false,
+            "passed_descriptors_out": false,
         }}),
     );
     assert_eq!(
