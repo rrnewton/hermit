@@ -3158,7 +3158,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
     // The inotify fault-boundary repair adds three detcore units: 3034 + 3 = 3037, by nextest list.
-    ("test.detcore_unit", 3242),
+    // And the CPU-clock fix-forward's five units (cpu_clock's
+    // the_resolution_is_the_kernels_for_each_kind, cpu_clock::handler_tests'
+    // a_cpu_clock_sleep_that_would_wait_is_refused and
+    // timer_create_checks_the_task_a_cpu_clock_names, thread_cpu_time_tests'
+    // an_exited_leaders_clock_keeps_its_final_time and scheduler's
+    // a_cpu_clock_names_only_tasks_linux_still_has): 3247, listed.
+    // And cpu_clock::handler_tests'
+    // timer_settime_on_a_timer_whose_thread_exited_is_esrch: 3248, listed.
+    ("test.detcore_unit", 3248),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5588,7 +5596,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3242 (2a1a7c67cd) measured the same selection this twin runs; the
     // twin's pin stayed 3037, so the hosted/local count invariant failed
     // on main. 3037 -> 3242 to match that measured recount.
-    ("test.detcore_unit_on_host", 3242),
+    // And the same five CPU-clock fix-forward units: 3247, listed.
+    // And the same timer_settime ESRCH unit: 3248, listed.
+    ("test.detcore_unit_on_host", 3248),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
