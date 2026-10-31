@@ -23561,7 +23561,8 @@ fn branch_free_race_offset_args<'a>(seed: &'a str, extra: &[&'a str]) -> Vec<&'a
 /// `--chaos-instruction-offset` through the schedule-trace engine that
 /// `hermit analyze` uses, end to end, on tests/c/branch_free_race.c:
 /// - a seed that loses updates with `--chaos-instruction-offset=8` is
-///   recorded, format 4, and its schedule trace holds the offsets, each on
+///   recorded in the offsets format (`INSTRUCTION_OFFSET_FORMAT`), and its
+///   schedule trace holds the offsets, each on
 ///   the timer's batch of branches;
 /// - `--replay-schedule-from` with `--die-on-desync` prints the recording's
 ///   line, with no desync;
@@ -23613,7 +23614,13 @@ fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_i
         assert_eq!(lost == 0, fixed, "{label} seed {seed}: {recorded}");
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(&record).expect("no preemption record")).unwrap();
-        assert_eq!(json["format_version"], 2, "{label}");
+        // Both guests record offset decisions, so each record states the
+        // offsets format; a record without one states the format below it.
+        assert_eq!(
+            json["format_version"],
+            detcore::preemptions::INSTRUCTION_OFFSET_FORMAT,
+            "{label}"
+        );
         let events = json["global"].as_array().expect("schedule trace");
         let offsets: Vec<usize> = events
             .iter()
@@ -61778,15 +61785,20 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
     assert_eq!(fs::read(&marker).unwrap(), b"started");
     fs::remove_file(&marker).unwrap();
 
+    // The first format past the newest this Hermit reads.
+    let newest = detcore::preemptions::PREEMPTION_RECORD_FORMAT;
+    let future = newest + 1;
     for (name, value, reason) in [
         (
             "future-format.json",
             serde_json::json!({
                 "per_thread": {}, "global": [],
                 "guest_ids": detcore_model::pid::GuestIds::Namespace,
-                "format_version": 4
+                "format_version": future
             }),
-            "record format Some(4) with 0 time skips: this Hermit reads formats 1 to 3, and time skips need format 2 or later",
+            format!(
+                "record format Some({future}) with 0 time skips: this Hermit reads formats 1 to {newest}, and time skips need format 2 or later"
+            ),
         ),
         (
             "empty-time-skips.json",
@@ -61795,7 +61807,7 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
                 "guest_ids": detcore_model::pid::GuestIds::Namespace,
                 "format_version": 3, "time_skips": []
             }),
-            "an empty list of time skips is written as no list",
+            "an empty list of time skips is written as no list".to_owned(),
         ),
     ] {
         let schedule = directory.path().join(name);
@@ -61832,7 +61844,10 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
                 "{args:?}: {output:?}"
             );
             let diagnostic = stderr(&output);
-            assert!(diagnostic.contains(reason), "{args:?}: {diagnostic}");
+            assert!(
+                diagnostic.contains(reason.as_str()),
+                "{args:?}: {diagnostic}"
+            );
             assert!(
                 diagnostic.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
                 "{args:?}: {diagnostic}"
