@@ -841,6 +841,7 @@ pub struct Config {
         requires = "replay_schedule_from",
         conflicts_with_all = ["chaos", "replay_exhausted_panic"]
     )]
+    #[serde(default)]
     pub replay_continue_fairly: bool,
 
     /// Given schedule events traced on recording or replaying, print the stack trace at the moment
@@ -2139,6 +2140,7 @@ impl fmt::Display for Config {
         }
         if self.replay_edited_preemptions {
             write!(f, " --replay-edited-preemptions")?;
+        }
         if self.replay_continue_fairly {
             write!(f, " --replay-continue-fairly")?;
         }
@@ -3586,7 +3588,6 @@ mod legacy_backend_json {
     /// `access_trace_max_bytes` came after it too; the scheduler writes the
     /// trace, and `hermit run` refuses it on DBT, so they are never written
     /// and read as unset, 0, unset and unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 44] = [
         // `chaos_timeslice_range` came after it too: the scheduler draws the
         // slices, not the runtime, so it is never written and reads as unset.
         // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
@@ -3599,7 +3600,7 @@ mod legacy_backend_json {
         // reads as absent, its serde default.
     /// `replay_continue_fairly` came after it too; only the scheduler reads
     /// it, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 33] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 45] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3790,7 +3791,7 @@ mod legacy_backend_json {
                     | "container_procfs"
                     | "notice_host_network_abstract_binds"
                     | "replay_edited_preemptions"
-                    | "eager_lone_preemptions",
+                    | "eager_lone_preemptions"
                     | "replay_continue_fairly",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
@@ -5083,16 +5084,11 @@ mod tests {
         // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
-        // `access_trace_max_bytes` and
+        // `access_trace_max_bytes`, `replay_continue_fairly` and
         // `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-three fewer, so twenty-nine keys fewer than fields.
+        // forty-four fewer, so thirty keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 29);
-        // `annotated_priority_replay`, `virtual_cpus`,
-        // `notice_host_network_abstract_binds`, `replay_continue_fairly` and
-        // `strict_schedule_boundaries` none: fourteen more keys and thirty-two
-        // fewer, so eighteen keys fewer than fields.
-        assert_eq!(fields.len(), keys.len() + 18);
+        assert_eq!(fields.len(), keys.len() + 30);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

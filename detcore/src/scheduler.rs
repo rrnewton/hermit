@@ -17966,8 +17966,10 @@ impl Scheduler {
                 && due_sleep_grant != Some(resources.tid)
             {
                 *self.chaos_turns_in_slice.entry(resources.tid).or_insert(0) += 1;
+            }
             if self.replay_priorities_released
                 && let Some(fair) = self.fair_continuation.as_mut()
+            {
                 fair.note_selected(resources.tid);
             }
         }
