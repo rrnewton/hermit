@@ -153,6 +153,8 @@ mod tests {
         // pair (PR 4860 rework, allocated revision 19 at integration;
         // digests measured at this head).
         (19, "c19f0246a9e94f4a", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::CpuClockProcess` and `GlobalResponse::CpuClockProcess` (#4885).
+        (20, "ee39a50c882f2239", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
