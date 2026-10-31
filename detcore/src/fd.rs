@@ -4541,13 +4541,20 @@ mod tests {
         left.pair_sockets(&right, false);
         let pipe_end = open(5, FdType::Pipe, 2);
         pipe_end.set_guest_held();
-        assert!(left.queue_rights_to_peer(vec![SentDescriptor {
-            file: (1, 50),
-            open_file: Some(pipe_end.open_file_handle()),
-        }]));
-        let (sent, _) = right
-            .take_queued_rights(&[(1, 50)], false, false)
-            .expect("the send queued it");
+        assert!(left
+            .queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 50),
+                    open_file: Some(pipe_end.in_flight_open_file(true)),
+                    lock_copy: None,
+                }],
+                0,
+            )
+            .is_ok());
+        let sent = right
+            .take_queued_rights(&[(1, 50)], false, false, false, None)
+            .expect("the send queued it")
+            .sent;
         let joined = sent[0]
             .open_file
             .as_ref()
@@ -4558,7 +4565,9 @@ mod tests {
         assert!(!pipe_end.is_guest_held(), "and its withdrawal");
 
         assert!(
-            right.take_queued_rights(&[(1, 60)], false, false).is_none(),
+            right
+                .take_queued_rights(&[(1, 60)], false, false, false, None)
+                .is_none(),
             "nothing queued names a descriptor a guest did not send"
         );
         assert!(
