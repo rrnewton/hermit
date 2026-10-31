@@ -16450,7 +16450,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // two in-guest LiteInst backends (liteinst and in-guest-trap), which came
     // back after the in-guest reset
     // (https://github.com/rrnewton/hermit/issues/3745).
-    if privileged.selected != 5
+    if privileged.selected != 6
         || !bucket_runs_nothing(privileged)
         || privileged.capabilities != vec!["cpuid-faulting".to_string()]
     {
