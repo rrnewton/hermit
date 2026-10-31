@@ -9583,7 +9583,10 @@ where
     T: RecordOrReplay,
 {
     if guest.config().sequentialize_threads {
-        crate::reserved_input::invalidate(guest);
+        // This bookkeeping RPC does not release the scheduler turn:
+        // recv_release_all_resources only records the notification. Preserve
+        // its existing input grant; resource_request revokes it at a real
+        // hand-off. A reply here must neither erase nor mint that authority.
         let resp = send_and_update_time(guest, GlobalRequest::ReleaseAllResources).await;
         match resp.1 {
             GlobalResponse::ReleaseAllResources(x) => x,

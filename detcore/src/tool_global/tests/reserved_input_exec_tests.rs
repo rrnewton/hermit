@@ -517,3 +517,186 @@ async fn actual_nonleader_exec_resumes_once_before_new_image_timer_take_back() {
             .any(|r| matches!(r, GlobalRequest::RequestResources(..)))
     );
 }
+
+#[tokio::test]
+async fn resource_bookkeeping_preserves_only_the_existing_native_operation_grant() {
+    use reverie::syscalls::Syscall;
+    use reverie::syscalls::SyscallArgs;
+
+    use crate::reserved_input::NativeCallOperation;
+
+    let config = Config {
+        guest_ids: detcore_model::pid::GuestIds::Chosen {
+            base: 5000,
+            refuse_host_ids: true,
+        },
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default()
+    };
+    let mut state = GlobalState::initialize(&config, false);
+    let control = ReservedInputControl::new_backend().unwrap();
+    state
+        .install_reserved_input_control(control.clone())
+        .unwrap();
+    let root = DetTid::from_raw(5000);
+    let native = control.backend_register_root(123, 123).unwrap();
+    let native = control
+        .backend_bind_tool_identity(native.task, root.as_raw(), root.as_raw())
+        .unwrap();
+    state.on_reserved_input_task(native).unwrap();
+    crate::reserved_input::register_initial_history(&control, native.task).unwrap();
+    let tool = Detcore::new(Tid::from_raw(root.as_raw()), &config);
+    let mut thread = tool.init_thread_state(Tid::from_raw(root.as_raw()), None);
+    thread.detpid = Some(root);
+    let mut guest = ExecInputGuest {
+        inner: ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: true,
+            ppid: None,
+            private_memory: None,
+        },
+        tool: &tool,
+        control: control.clone(),
+        task: native.task,
+        injections: Vec::new(),
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let start = tool.handle_thread_start(&mut guest);
+        let grants = async {
+            let mut last = Err(crate::scheduler::SkipTurn);
+            for expected in [
+                ResourceID::ParentContinue {
+                    parent: root,
+                    child: root,
+                },
+                ResourceID::MemAddrSpace(root),
+            ] {
+                let granted = crate::scheduler::do_a_turn_blocking(
+                    state.sched.clone(),
+                    state.global_time.clone(),
+                    &last,
+                )
+                .await
+                .unwrap();
+                assert_eq!(granted.tid, root);
+                assert!(granted.resources.contains_key(&expected));
+                last = Ok(granted);
+            }
+        };
+        let (started, ()) = tokio::join!(start, grants);
+        started.unwrap();
+    })
+    .await
+    .unwrap();
+
+    let syscall = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+    let operation = NativeCallOperation::begin(&guest, syscall)
+        .unwrap()
+        .unwrap();
+    // Native completion is scripted, but both RPCs below use the actual
+    // scheduler and the operation's real completion/readmission checks.
+    let physical = operation.binding().begin_native_attempt().unwrap();
+    physical.transition_started();
+    operation.close();
+    let grant = control.current_grant(native.task).unwrap();
+    let turn = state.sched.lock().unwrap().turn;
+    let time = state.global_time.lock().unwrap().as_nanos();
+    crate::tool_global::resource_release_all(&mut guest).await;
+    assert_eq!(control.current_grant(native.task), Some(grant));
+    assert_eq!(state.sched.lock().unwrap().turn, turn);
+    assert_eq!(state.global_time.lock().unwrap().as_nanos(), time);
+    assert_eq!(
+        operation.readmitted().unwrap_err().to_string(),
+        "native operation effects are not closed and complete"
+    );
+    physical.effects_ended();
+    operation.readmitted().unwrap();
+    assert_eq!(control.current_grant(native.task), Some(grant));
+
+    // A real pending resource request must revoke that grant. Only its
+    // committed scheduler reply can permit the completed operation to retire.
+    let operation = NativeCallOperation::begin(&guest, syscall)
+        .unwrap()
+        .unwrap();
+    operation.close();
+    let mut request = Resources::new(root);
+    request.insert(ResourceID::MemAddrSpace(root), Permission::W);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut request = std::pin::pin!(crate::tool_global::resource_request(&mut guest, request));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        assert_eq!(control.current_grant(native.task), None);
+        assert_eq!(
+            operation.readmitted().unwrap_err().to_string(),
+            "native operation lacks its logical readmission"
+        );
+        let granted = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .unwrap();
+        assert_eq!(granted.tid, root);
+        assert!(
+            granted
+                .resources
+                .contains_key(&ResourceID::MemAddrSpace(root))
+        );
+        assert!(matches!(request.await, ResumeStatus::Normal));
+    })
+    .await
+    .unwrap();
+    assert_ne!(control.current_grant(native.task), Some(grant));
+    operation.readmitted().unwrap();
+
+    // Neither a missing grant nor a frozen owner can acquire authority from
+    // the bookkeeping reply. No replacement grant or Drop cleanup is used.
+    for frozen in [false, true] {
+        let operation = NativeCallOperation::begin(&guest, syscall)
+            .unwrap()
+            .unwrap();
+        operation.close();
+        let cohort = if frozen {
+            Some(control.freeze_tasks(&[native.task]).unwrap())
+        } else {
+            control.invalidate_operation(native.task);
+            None
+        };
+        let turn = state.sched.lock().unwrap().turn;
+        crate::tool_global::resource_release_all(&mut guest).await;
+        assert_eq!(control.current_grant(native.task), None);
+        assert_eq!(state.sched.lock().unwrap().turn, turn);
+        assert_eq!(
+            operation.readmitted().unwrap_err().to_string(),
+            "native operation lacks its logical readmission"
+        );
+        if cohort.is_none() {
+            let mut request = Resources::new(root);
+            request.insert(ResourceID::MemAddrSpace(root), Permission::W);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let last = Err(crate::scheduler::SkipTurn);
+                let grant = crate::scheduler::do_a_turn_blocking(
+                    state.sched.clone(),
+                    state.global_time.clone(),
+                    &last,
+                );
+                let (resumed, granted) = tokio::join!(
+                    crate::tool_global::resource_request(&mut guest, request),
+                    grant,
+                );
+                assert!(matches!(resumed, ResumeStatus::Normal));
+                assert_eq!(granted.unwrap().tid, root);
+            })
+            .await
+            .unwrap();
+            operation.readmitted().unwrap();
+        } else {
+            drop(operation);
+            assert_eq!(control.current_grant(native.task), None);
+        }
+    }
+}
