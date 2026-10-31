@@ -87,10 +87,11 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
-    /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
-    /// with its row. Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 28 for PR 4789's
+    /// `StartNewThread` retype (drain/4789), 29 for PR 4884 and 30 for
+    /// PR 4728, none of which is on main yet. Remove an entry when its
+    /// change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[28, 29, 30];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -223,6 +224,12 @@ mod tests {
         // image returns it (the release-05 pidfd pair, renumbered to 27 at
         // its rebase onto C2's 25 and 26; digest measured at this head).
         (27, "74ceb8dd663f2297", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PostCrash`, `GlobalResponse::PostCrash` and
+        // `GlobalResponse::WithPostCrashBound`
+        // (https://github.com/rrnewton/hermit/pull/4867; renumbered to 31 at
+        // this rebase onto main's pidfd revision 27, skipping reserved
+        // 28 (4789), 29 (4884) and 30 (4728); digest measured at this head).
+        (31, "0000000000000000", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
