@@ -969,6 +969,7 @@ impl DbtInvocation {
         // stats path (bind-mounted to the launcher's sink), not the host
         // descriptor path the ptrace/KVM runs use.
         if config.record_host_inputs
+            && options.uses_container()
             && let Some(directory) =
                 dbt_stats_guest_directory(binds.iter().map(|(_, target)| target))
         {

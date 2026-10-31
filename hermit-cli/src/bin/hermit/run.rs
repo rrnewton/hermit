@@ -450,6 +450,7 @@ fn place_host_input_change(
     run1: std::io::Result<HostInputs>,
     run2: std::io::Result<HostInputs>,
     logs: [&Path; 2],
+    backend: Backend,
 ) -> Option<(PatternDifference, [Option<usize>; 2])> {
     let read = |result: std::io::Result<HostInputs>| {
         result
@@ -475,8 +476,15 @@ fn place_host_input_change(
             .ok()
             .and_then(|bytes| {
                 let text = String::from_utf8_lossy(&bytes);
-                open_position(&text, difference.dtid, difference.syscall)
-                    .or_else(|| open_position_for_path(&text, difference.syscall, &difference.path))
+                open_position(&text, difference.dtid, difference.syscall).or_else(|| {
+                    // Only DBT restarts per-thread syscall numbering across
+                    // images; elsewhere an ambiguous (dtid, syscall) refuses.
+                    (backend == Backend::Dbt)
+                        .then(|| {
+                            open_position_for_path(&text, difference.syscall, &difference.path)
+                        })
+                        .flatten()
+                })
             })
     };
     let positions = [place(logs[0], "run 1"), place(logs[1], "run 2")];
@@ -613,7 +621,11 @@ fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'
         }
         // DBT's Detcore client initializes before the guest's first
         // instruction and now collects host inputs through its private
-        // environment, so a change found there is attributable.
+        // environment, so a change found there is attributable. Known
+        // residual: copied CLONE_VFORK children can still mutate files
+        // natively without a recorded guest mutation, so a change a
+        // vfork child caused can be misattributed to the host; the
+        // universal retry bounds the cost (one retry, final red).
         Backend::Dbt => None,
     }
 }
@@ -4463,12 +4475,7 @@ fn passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend() {
             "{backend:?}"
         );
     }
-    for backend in [
-        Backend::Sabre,
-        Backend::Liteinst,
-        Backend::InGuestTrap,
-        Backend::Dbt,
-    ] {
+    for backend in [Backend::Sabre, Backend::Liteinst, Backend::InGuestTrap] {
         assert!(
             unobserved_guest_execution(backend, false).is_some(),
             "{backend:?}"
@@ -15591,7 +15598,7 @@ pub(super) fn conclude_verification(
         run1.host_inputs
             .zip(run2.host_inputs)
             .and_then(|(first, second)| {
-                place_host_input_change(first, second, [&log1_path, &log2_path])
+                place_host_input_change(first, second, [&log1_path, &log2_path], conclusion.backend)
             })
     } else {
         None
