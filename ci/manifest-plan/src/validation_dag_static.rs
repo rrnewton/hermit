@@ -1977,7 +1977,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Composed on measured main ffe313b1: 1212 + 1 = 1213 (Train 5 delta +1).
     // And https://github.com/rrnewton/hermit/pull/4772's two no-namespace
     // analyze tests: 1221 + 2 = 1223.
-    ("test.hermit_unit", 1223),
+    // And analyze::rundata::tests::every_record_written_for_a_trial_states_the_trials_chosen_ids:
+    // 1223 + 1 = 1224.
+    ("test.hermit_unit", 1224),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6240,7 +6242,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // And the same two: 1215 + 2 = 1217.
-    ("test.hermit_unit_on_host", 1217),
+    // And the same trial-record stamping unit: 1217 + 1 = 1218.
+    ("test.hermit_unit_on_host", 1218),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
