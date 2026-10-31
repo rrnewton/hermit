@@ -56454,6 +56454,25 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     assert_eq!(original["format_version"], 3);
     let event_count = original["global"].as_array().unwrap().len();
     assert!(event_count > 0, "{original}");
+    // Raw schedule replay records its own deferred registration priority,
+    // rather than replaying the producer's priority history. Chosen IDs here
+    // are all above the inherited low-ID foreground special case. Keep every
+    // history key and field exact; priority replay still expects the original.
+    let mut schedule_per_thread = original["per_thread"].clone();
+    for (tid, history) in schedule_per_thread.as_object_mut().unwrap() {
+        assert!(
+            tid.parse::<u64>().unwrap() >= 5000,
+            "unexpected chosen ID {tid}"
+        );
+        for field in ["prio_changes", "preemption_rcbs", "chaos_epochs"] {
+            assert_eq!(
+                history[field],
+                serde_json::json!([]),
+                "producer {tid}: {field}"
+            );
+        }
+        history["final_prio"] = serde_json::json!(9999);
+    }
     let schedule_flag = format!("--replay-schedule-from={}", recording.display());
     let priority_flag = format!("--replay-preemptions-from={}", recording.display());
     for route in ["schedule", "priority", "both"] {
@@ -56507,7 +56526,12 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
             "global",
             "per_thread",
         ] {
-            assert_eq!(actual[field], original[field], "{route}: changed {field}");
+            let expected = if route == "schedule" && field == "per_thread" {
+                &schedule_per_thread
+            } else {
+                &original[field]
+            };
+            assert_eq!(&actual[field], expected, "{route}: changed {field}");
         }
         let summary: serde_json::Value =
             serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
