@@ -21905,6 +21905,61 @@ mod test {
         assert_eq!(sched.time_skip_desyncs, 1);
     }
 
+    /// Why a trial schedule whose events go on past every recording's does
+    /// not claim to list its jumps of global time (`hermit-cli`'s
+    /// `time_skip_carry`): past the last listed jump a driven replay
+    /// (`TimeSkipMode::Driven`) and a legacy one (`TimeSkipMode::Legacy`) do
+    /// not make the same jumps. A FIFO open that finds nothing else can run,
+    /// with a sleeper's deadline 2 s ahead, moves global time to that deadline
+    /// in a legacy replay (`fast_forward_to_next_finite_deadline`), and not at
+    /// all in a driven one, which makes only listed jumps
+    /// (`drive_recorded_time_skips`). An idle poller's retry moves it in
+    /// neither.
+    #[test]
+    fn past_its_list_a_driven_replay_makes_no_fifo_open_jump_a_legacy_one_makes() {
+        let jump = |mode: TimeSkipMode, fifo_open: bool| -> Duration {
+            let config = Config::default();
+            let mut sched = Scheduler::new(&config);
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+            sched.time_skip_mode = mode;
+            let start = global_time.lock().unwrap().as_nanos();
+            let sleeper = DetTid::from_raw(7);
+            register_known_thread(&mut sched, sleeper);
+            sched
+                .blocked
+                .timed_waiters
+                .insert(start + Duration::from_secs(2), sleeper);
+            if fifo_open {
+                queued_poller(&mut sched, DetTid::from_raw(5), true);
+                let opener = DetTid::from_raw(9);
+                fifo_open_poll(&mut sched, opener);
+                let _ = turn_answer(&mut sched, opener);
+            } else {
+                let poller = DetTid::from_raw(3);
+                committing_idle_poller(&mut sched, poller, None);
+                let _ = turn_answer(&mut sched, poller);
+            }
+            // As the next pass's step 2 does.
+            if matches!(sched.time_skip_mode, TimeSkipMode::Driven(_)) {
+                sched.drive_recorded_time_skips(&global_time);
+            } else if let Some(pending) = sched.pending_time_skip.take() {
+                sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+            }
+            let now = global_time.lock().unwrap().as_nanos();
+            now.duration_since(start)
+        };
+        assert_eq!(jump(TimeSkipMode::Legacy, true), Duration::from_secs(2));
+        assert_eq!(
+            jump(TimeSkipMode::Driven(VecDeque::new()), true),
+            Duration::ZERO
+        );
+        assert_eq!(jump(TimeSkipMode::Legacy, false), Duration::ZERO);
+        assert_eq!(
+            jump(TimeSkipMode::Driven(VecDeque::new()), false),
+            Duration::ZERO
+        );
+    }
+
     /// A replay of a record without a jump list behaves as before such lists
     /// existed: an idle poller requests no jump, and a FIFO open counts a
     /// timed poll as able to run and moves only to a timer.

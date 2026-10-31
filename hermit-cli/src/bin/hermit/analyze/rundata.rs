@@ -1257,12 +1257,16 @@ impl AnalyzeOpts {
     }
 
     /// Write `record` for a trial to replay, stamped
-    /// ([`Self::stamp_trial_record`]). The record carries the jumps of global
-    /// time of the recorded schedule whose event prefix its events repeat
-    /// furthest (`crate::time_skip_carry`), so its replay jumps where that
-    /// recording did, and is in the oldest format among the recordings read,
-    /// whose rules its events follow. A record that would not validate is
-    /// refused before anything is written.
+    /// ([`Self::stamp_trial_record`]). A record whose events are a prefix of a
+    /// recorded schedule's carries that recording's jumps of global time
+    /// (`crate::time_skip_carry`), so its replay jumps where the recording
+    /// did, and is in the oldest format among the recordings read, whose rules
+    /// its events follow. One whose events go on past every recording's (a
+    /// bisection's splice, an edited schedule) lists no jumps and is written
+    /// below `TIME_SKIPS_FORMAT`, so its replay makes them as a replay of an
+    /// older record does, as main's replays do: no recording lists its jumps
+    /// past that point. A record that would not validate is refused before
+    /// anything is written.
     pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
         let (skips, format) = {
             let sources = self.time_skip_sources.lock().unwrap();
@@ -1271,7 +1275,13 @@ impl AnalyzeOpts {
                 sources.trial_format(),
             )
         };
-        let record = self.stamp_trial_record(record.with_format(format).with_time_skips(skips));
+        let record = match skips {
+            Some(skips) => record.with_format(format).with_time_skips(skips),
+            None => record.with_time_skips(Vec::new()).with_format(
+                format.filter(|format| *format < detcore::preemptions::TIME_SKIPS_FORMAT),
+            ),
+        };
+        let record = self.stamp_trial_record(record);
         record.validate().map_err(anyhow::Error::msg)?;
         record.write_to_disk(path).map_err(anyhow::Error::msg)
     }
@@ -1478,6 +1488,68 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    /// A trial whose events are a prefix of a recording's carries that
+    /// recording's jumps of global time and lists them (a replay of it is
+    /// driven); one spliced past where its events and the recording's part
+    /// lists none and is written in format 1, so a replay of it makes jumps as
+    /// a replay of an older record does (`TimeSkipMode::Legacy`). Past the
+    /// recording's events a driven replay would make no jump where a run
+    /// computes one (detcore's
+    /// `past_its_list_a_driven_replay_makes_no_fifo_open_jump_a_legacy_one_makes`).
+    #[test]
+    fn a_trial_spliced_past_its_recording_lists_no_jumps() {
+        use detcore::preemptions::TimeSkip;
+        use detcore::preemptions::TimeSkipReason;
+        use detcore::types::DetTid;
+        use detcore::types::LogicalTime;
+        use detcore::types::SyscallPhase;
+        let events = |tids: &[i32]| -> Vec<SchedEvent> {
+            tids.iter()
+                .map(|&tid| {
+                    SchedEvent::syscall(
+                        DetTid::from_raw(tid),
+                        reverie::syscalls::Sysno::poll,
+                        SyscallPhase::Posthook,
+                    )
+                })
+                .collect()
+        };
+        let jump = TimeSkip {
+            event: 2,
+            target: LogicalTime::from_nanos(1_000_000),
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        let recorded = events(&[3, 3, 5, 3, 5, 5]);
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        options.time_skip_sources.lock().unwrap().remember(
+            &PreemptionRecord::from_sched_events(recorded.clone())
+                .with_current_format()
+                .with_time_skips(vec![jump]),
+        );
+        let written = |events: Vec<SchedEvent>, name: &str| -> PreemptionRecord {
+            let path = workspace.path().join(name);
+            options.write_trial_schedule(events, &path).unwrap();
+            PreemptionReader::new(&path).load_all()
+        };
+
+        let prefix = written(recorded[..3].to_vec(), "prefix.preempts");
+        assert_eq!(
+            prefix.format_version(),
+            Some(detcore::preemptions::TIME_SKIPS_FORMAT)
+        );
+        assert_eq!(prefix.time_skips(), Some(&[jump][..]));
+        assert!(prefix.lists_its_time_skips());
+
+        let mut events_past = recorded[..3].to_vec();
+        events_past.extend(events(&[5, 3, 3]));
+        let spliced = written(events_past, "spliced.preempts");
+        assert_eq!(spliced.format_version(), None);
+        assert_eq!(spliced.time_skips(), None);
+        assert!(!spliced.lists_its_time_skips());
+    }
 
     /// The records analyze edited (minimization's and the baseline search's)
     /// replay with `--replay-edited-preemptions`, and so do the repro

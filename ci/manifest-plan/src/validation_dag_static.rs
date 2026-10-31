@@ -1913,7 +1913,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six on main 32f85d391 (1202): 1208.
     // The same six on main dc85ec16a (1289): 1295.
     // The same six on #4892's head 83050eb31 (1290): 1296, listed.
-    ("test.hermit_unit", 1296),
+    // And this change's two trial-record units (a schedule past every
+    // recording carries no list; a splice past its recording lists no
+    // jumps): 1298.
+    ("test.hermit_unit", 1298),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3248,7 +3251,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler's a_switch_in_is_neither_progress_nor_an_attempt and
     // a_first_retry_after_an_ordinary_grant_jumps_at_its_second_retry, from
     // the port onto #4892: 3095, listed.
-    ("test.detcore_unit", 3095),
+    // And scheduler's
+    // past_its_list_a_driven_replay_makes_no_fifo_open_jump_a_legacy_one_makes:
+    // 3096.
+    ("test.detcore_unit", 3096),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5712,7 +5718,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two record serde round trips: 3062.
     // The same units on #4892's head 83050eb31 (3074): 3093.
     // And the same two units from the port onto #4892: 3095, listed.
-    ("test.detcore_unit_on_host", 3095),
+    // And the same driven-against-legacy unit: 3096.
+    ("test.detcore_unit_on_host", 3096),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6115,7 +6122,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six on main 32f85d391 (1196): 1202.
     // The same six on main dc85ec16a (1283): 1289.
     // The same six on #4892's head 83050eb31 (1284): 1290, listed.
-    ("test.hermit_unit_on_host", 1290),
+    // And the same two trial-record units: 1292.
+    ("test.hermit_unit_on_host", 1292),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
