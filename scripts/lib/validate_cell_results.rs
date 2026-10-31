@@ -214,9 +214,15 @@ fn collect_snapshot_paths(
             collect_snapshot_paths(&entry.path(), files, custody)?;
         } else if kind.is_file() && entry.file_name() == "results.jsonl" {
             files.push(entry.path());
-        } else if kind.is_symlink() && custody.is_ok() {
-            // The legacy reader ignores links. That behavior remains ordinary
-            // evidence, but cannot attest complete rooted input membership.
+        } else if kind.is_symlink() && entry.file_name() == "results.jsonl" && custody.is_ok() {
+            // The legacy reader opens collected files by name, so a link at
+            // a collected name would be followed and cannot attest complete
+            // rooted input membership. Links at any other name are never
+            // followed by this walk and cannot add or remove a collected
+            // input; retained per-cell evidence legitimately contains them
+            // (a retained recording's dev/fd -> /proc/self/fd). A swap that
+            // changes the collected set is caught by the census membership
+            // fence, which re-walks and compares the exact file set.
             *custody = Err(format!(
                 "raw result authority encountered a link: {}",
                 entry.path().display()
@@ -2741,6 +2747,46 @@ mod tests {
                     &"a".repeat(40),
                     &[PathBuf::from("results.jsonl")].into_iter().collect()
                 )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn raw_snapshot_census_tolerates_retained_recording_links() {
+        // A retained recording keeps its staging links (dev/fd ->
+        // /proc/self/fd) under the result root. Those links are never
+        // followed by the result walk, so the census must still attest;
+        // a link at a collected name still refuses.
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("raw");
+        let recording = root.join("runs/run/cell/verify-runs/1/run1/recording/.tmpX/dev");
+        fs::create_dir_all(&recording).unwrap();
+        fs::create_dir_all(root.join("bucket")).unwrap();
+        let commit = "abababababababababababababababababababab";
+        let mut row = result_row("captured-run", commit);
+        row["attempt"] = 1.into();
+        let bytes = format!("{row}\n").into_bytes();
+        fs::write(root.join("bucket/results.jsonl"), &bytes).unwrap();
+        std::os::unix::fs::symlink("/proc/self/fd", recording.join("fd")).unwrap();
+        let members = [PathBuf::from("bucket/results.jsonl")]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let snapshot = CapturedResults::capture(&root);
+        let census = snapshot.census("captured-run", commit, &members).unwrap();
+        assert_eq!(census.files.len(), 1);
+
+        let alias_root = parent.path().join("alias-raw");
+        fs::create_dir_all(alias_root.join("bucket")).unwrap();
+        fs::write(alias_root.join("bucket/real.jsonl"), &bytes).unwrap();
+        std::os::unix::fs::symlink(
+            alias_root.join("bucket/real.jsonl"),
+            alias_root.join("bucket/results.jsonl"),
+        )
+        .unwrap();
+        let aliased = CapturedResults::capture(&alias_root);
+        assert!(
+            aliased
+                .census("captured-run", commit, &BTreeSet::new())
                 .is_err()
         );
     }
