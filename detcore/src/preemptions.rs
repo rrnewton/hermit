@@ -334,6 +334,9 @@ impl PreemptionRecord {
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
+        // Points are cut at the events the prefix keeps, so a whole prefix and
+        // a longer one keep the same.
+        let kept = global.len();
         let mut reached = BTreeMap::<DetTid, callback_history::Progress>::new();
         for event in &global {
             reached
@@ -394,7 +397,7 @@ impl PreemptionRecord {
                     skips
                         .iter()
                         .take_while(|skip| {
-                            usize::try_from(skip.event).is_ok_and(|event| event <= len)
+                            usize::try_from(skip.event).is_ok_and(|event| event <= kept)
                         })
                         .copied()
                         .collect::<Vec<_>>()
@@ -771,8 +774,39 @@ impl PreemptionRecord {
     /// ([`Self::validate_format`]), whose failure is a refusal rather than a
     /// malformed record, and which readers check separately for that reason.
     pub fn validate_contents(&self) -> Result<(), String> {
+        self.validate_contents_in_stream(self.global.len())
+    }
+
+    /// [`Self::validate_contents`] for a record whose stream of `stream`
+    /// entries its jumps count: its own events, or, for a slice-boundary
+    /// recording's metadata, which holds no events, the recording's stored
+    /// records (`BoundaryRecording::new`, `PreemptionWriter::stream_position`).
+    pub(crate) fn validate_contents_in_stream(&self, stream: usize) -> Result<(), String> {
         self.validate_callback_checkpoints()?;
-        self.validate_histories()
+        self.validate_histories()?;
+        self.validate_time_skip_positions(stream)
+    }
+
+    /// Every jump of global time lies within the stream it counts: at most
+    /// `stream` entries precede it (`TimeSkip::event`), the end included,
+    /// where a replay that has run out of entries makes it. A record with no
+    /// entries holds a jump only at 0. A writer places each jump at the
+    /// entries recorded so far, so a jump past them is no jump of the
+    /// recorded run: a record that holds one is malformed, and a carry or
+    /// prefix that dropped it would claim a complete list its source never
+    /// had.
+    fn validate_time_skip_positions(&self, stream: usize) -> Result<(), String> {
+        if let Some(skip) = self
+            .time_skips
+            .iter()
+            .flatten()
+            .find(|skip| usize::try_from(skip.event).is_ok_and(|event| event > stream))
+        {
+            return Err(format!(
+                "time skip {skip:?} lies past the {stream} entries of the stream it counts"
+            ));
+        }
+        Ok(())
     }
 
     /// Check the record's format and its jumps of global time: a format this
@@ -1926,6 +1960,49 @@ mod tests {
                 "prefix of {len} events"
             );
         }
+    }
+
+    /// A jump of global time lies within the stream it counts, the end
+    /// included: a record with no events holds one only at 0, and a record
+    /// with events holds none past them. A schedule prefix cuts its jumps at
+    /// the events it keeps, so prefixes of M and M + 1 events of an M-event
+    /// record agree.
+    #[test]
+    fn a_jump_past_its_records_stream_is_refused() {
+        let tid = DetTid::from_raw(3);
+        let jump = |event: u64| TimeSkip {
+            event,
+            target: LogicalTime::from_nanos(1_000 * (event + 1)),
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        let record = |events: usize, jumps: Vec<TimeSkip>| {
+            PreemptionRecord::from_sched_events(
+                (0..events)
+                    .map(|count| SchedEvent::branches(tid, count as u32 + 1))
+                    .collect(),
+            )
+            .with_time_skips(jumps)
+        };
+        record(0, vec![jump(0)]).validate().unwrap();
+        record(2, vec![jump(2)]).validate().unwrap();
+        for (events, at) in [(0, 1), (2, 3)] {
+            let refusal = record(events, vec![jump(at)]).validate().unwrap_err();
+            assert!(
+                refusal.contains(&format!("past the {events} entries")),
+                "{events} events, jump at {at}: {refusal}"
+            );
+        }
+        let whole = record(2, vec![jump(1), jump(2)]);
+        assert_eq!(whole.schedule_prefix(2), whole.schedule_prefix(3));
+        assert_eq!(
+            whole.schedule_prefix(3).time_skips(),
+            Some(&[jump(1), jump(2)][..])
+        );
+        // Unvalidated, a jump past the events is cut away by either prefix
+        // alike.
+        let past = record(2, vec![jump(1), jump(3)]);
+        assert_eq!(past.schedule_prefix(2), past.schedule_prefix(3));
+        assert_eq!(past.schedule_prefix(3).time_skips(), Some(&[jump(1)][..]));
     }
 
     /// A schedule prefix keeps the record's format and the jumps of global

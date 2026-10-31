@@ -105,8 +105,15 @@ fn shared_events(left: &[u64], right: &[u64]) -> usize {
 
 impl TimeSkipSources {
     /// Remember `record`. One that made no jump counts as much as one that
-    /// did: a trial that repeats it furthest makes no jump either.
+    /// did: a trial that repeats it furthest makes no jump either. A record
+    /// this Hermit would not replay (`PreemptionRecord::validate`: a format it
+    /// does not read, or a jump past its events) is not remembered at all: a
+    /// trial that repeats it carries nothing from it, rather than a list cut
+    /// down to look complete.
     pub fn remember(&mut self, record: &PreemptionRecord) {
+        if record.validate().is_err() {
+            return;
+        }
         // `None` (format 1) orders before every numbered format.
         let format = record.format_version();
         self.oldest_format = Some(
@@ -246,8 +253,11 @@ mod tests {
         assert_eq!(sources.carried(&stripped), Some(vec![skip(1, 1_000)]));
     }
 
-    /// A record without jumps, and a jump past the end of its events, add
-    /// nothing.
+    /// A record without jumps adds none. Test adapted: a record with a jump
+    /// past the end of its events used to be remembered with the jump left
+    /// out, so a trial that repeated it claimed a complete, shorter list; such
+    /// a record is now refused (`PreemptionRecord::validate`) and not
+    /// remembered, and a trial that repeats its events carries no list.
     #[test]
     fn unplaceable_jumps_are_left_out() {
         let recorded = events(&[3, 5]);
@@ -256,6 +266,8 @@ mod tests {
             &PreemptionRecord::from_sched_events(recorded.clone())
                 .with_time_skips(vec![skip(9, 1_000)]),
         );
+        assert_eq!(sources.carried(&recorded), None);
+        sources.remember(&PreemptionRecord::from_sched_events(recorded.clone()));
         assert_eq!(sources.carried(&recorded), Some(Vec::new()));
     }
 

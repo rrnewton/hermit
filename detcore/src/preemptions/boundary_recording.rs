@@ -96,8 +96,10 @@ impl BoundaryRecording {
     /// as a policy refusal (`RecordFormatRefusal`): a deserializer would lose
     /// that error's type.
     pub fn new(preemptions: PreemptionRecord, schedule: Schedule) -> anyhow::Result<Self> {
+        // The history's jumps count the stored records, as the writer placed
+        // them (`PreemptionWriter::stream_position`).
         preemptions
-            .validate_contents()
+            .validate_contents_in_stream(schedule.records().len())
             .map_err(anyhow::Error::msg)?;
         if !preemptions.global.is_empty() {
             bail!("slice-boundary recording has a second, legacy global event stream");
@@ -578,6 +580,33 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
         assert!(HistoryReader::read(&path).is_err());
         assert_ne!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A slice-boundary recording's jumps count its stored records: one at
+    /// their end is accepted, one past it refused.
+    #[test]
+    fn a_boundary_recordings_jumps_lie_within_its_records() {
+        let records = match sample(true) {
+            Recording::Boundaries(recording) => recording.schedule().records().to_vec(),
+            Recording::Legacy(_) => unreachable!(),
+        };
+        assert_eq!(records.len(), 1);
+        let metadata = |at: u64| {
+            PreemptionRecord::default().with_time_skips(vec![super::super::TimeSkip {
+                event: at,
+                target: LogicalTime::from_nanos(1_000),
+                reason: super::super::TimeSkipReason::IdleGuestPollers,
+            }])
+        };
+        BoundaryRecording::new(metadata(1), Schedule::new(records.clone()).unwrap()).unwrap();
+        let error =
+            BoundaryRecording::new(metadata(2), Schedule::new(records).unwrap()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("past the 1 entries"),
+            "{error:#}"
+        );
+        BoundaryRecording::new(metadata(0), Schedule::new(vec![]).unwrap()).unwrap();
+        assert!(BoundaryRecording::new(metadata(1), Schedule::new(vec![]).unwrap()).is_err());
     }
 
     #[test]
