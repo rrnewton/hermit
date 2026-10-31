@@ -178,6 +178,11 @@ mod tests {
         // renumbered to 21 at landing after main's 20; digests measured at
         // this head).
         (21, "9d583ef0f9243c61", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PostCrash`, `GlobalResponse::PostCrash` and
+        // `GlobalResponse::WithPostCrashBound`
+        // (https://github.com/rrnewton/hermit/pull/4867; revision 21 on its base,
+        // renumbered to 22 after main's 21; digests measured at this head).
+        (22, "abbcf2fc350d02c7", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
