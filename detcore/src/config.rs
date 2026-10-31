@@ -87,13 +87,26 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips. Nothing is reserved at this
-    /// head: 28 is https://github.com/rrnewton/hermit/pull/4789's, 29 is
-    /// https://github.com/rrnewton/hermit/pull/4884's, 30 is this change's
-    /// (https://github.com/rrnewton/hermit/pull/4728), 31 is
-    /// https://github.com/rrnewton/hermit/pull/4867's, and 32, this
-    /// change's layout on top of 31's, is the current revision.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 is held for
+    /// https://github.com/rrnewton/hermit/pull/4909, 34 is withdrawn
+    /// (https://github.com/rrnewton/hermit/pull/4907 shares
+    /// https://github.com/rrnewton/hermit/pull/4884's revision 29, so it
+    /// never lands a row), 35 is
+    /// https://github.com/rrnewton/hermit/pull/4796's, 36 is
+    /// https://github.com/rrnewton/hermit/pull/4791's, 37 is
+    /// https://github.com/rrnewton/hermit/pull/4759's, 38 is released (the
+    /// kvm lane's F2-d changed no layout, so it never lands a row), 39 is
+    /// the kvm lane's 2b-1, 40 is
+    /// https://github.com/rrnewton/hermit/pull/4885's, and 41 is the LSE
+    /// option-4 fix-forward's (the `StoreExclusive` `Rewrite::unmarked`
+    /// retype). 28 is https://github.com/rrnewton/hermit/pull/4789's, 29
+    /// is https://github.com/rrnewton/hermit/pull/4884's, 30 is
+    /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
+    /// https://github.com/rrnewton/hermit/pull/4867's, 32 is that change's
+    /// layout on top of 31's, and 42, this change's
+    /// (https://github.com/rrnewton/hermit/pull/4769), is the current
+    /// revision. Remove an entry when its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39, 40, 41];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -261,6 +274,14 @@ mod tests {
         // here rather than relabel 31 (revopus1's R1 on this change).
         // Digest measured at this head.
         (32, "e178ac33707f23b5", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PublishInstructionOffset` and
+        // `GlobalResponse::PublishInstructionOffset`, appended after
+        // `PostCrash`/`WithPostCrashBound`
+        // (https://github.com/rrnewton/hermit/pull/4769; 26 above
+        // https://github.com/rrnewton/hermit/pull/4728's 25 on its own
+        // base, renumbered to 42 at this rebase onto main's 32, skipping
+        // reserved 33 to 41; digest measured at this head).
+        (42, "c4f23de5bd655318", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
