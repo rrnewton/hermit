@@ -10517,6 +10517,10 @@ fn no_namespace_foreground_socket_write_with_proc_memory_preserves_chosen_ids() 
 /// Establish a collision after launch with a task outside Detcore. The
 /// guest requests the next ID and waits for the native supervisor's ack.
 fn no_namespace_with_external_id_holder(args: &[&str]) -> Output {
+    no_namespace_with_external_id_holder_mode(args, "collide-external")
+}
+
+fn no_namespace_with_external_id_holder_mode(args: &[&str], mode: &str) -> Output {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let request = directory.path().join("request");
     let ack = directory.path().join("ack");
@@ -10532,7 +10536,7 @@ fn no_namespace_with_external_id_holder(args: &[&str]) -> Output {
         .args(args)
         .arg("--")
         .arg(chosen_guest_ids_guest())
-        .arg("collide-external")
+        .arg(mode)
         .arg(&request)
         .arg(&ack);
     let label = format!("{command:?}");
@@ -10801,6 +10805,41 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
     // The record says its IDs came from the host, so a replay refuses it.
     let written = fs::read_to_string(&record).expect("read the preemption record");
     assert!(written.contains("\"guest_ids\":\"Host\""), "{written}");
+
+    // Opening the same pathname FIFOs after CLONE_FILES has made the table
+    // potentially shared cannot prove the installed descriptions. Keep that
+    // accepted permanent admission cost distinct from the ID-collision rows.
+    let late = no_namespace_with_external_id_holder_mode(
+        &["--pid-base=5000"],
+        "collide-external-late-open",
+    );
+    assert_eq!(
+        late.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&late),
+        stderr(&late)
+    );
+    assert!(
+        stderr(&late)
+            .contains("its reserved input is unavailable: native-description-proof-unavailable"),
+        "{}",
+        stderr(&late)
+    );
+    assert!(
+        !stderr(&late).contains("ID 5003 is taken"),
+        "{}",
+        stderr(&late)
+    );
+    assert!(
+        !stderr(&late).contains("got a host ID"),
+        "{}",
+        stderr(&late)
+    );
+    assert_eq!(
+        stdout(&late),
+        "first process 5000\nmain gettid +0\n/proc/self +0\nthread gettid +1\nthread gettid +2\nexternal holder +3\n"
+    );
 }
 
 /// An error Linux gives the guest's own clone stays its answer instead of

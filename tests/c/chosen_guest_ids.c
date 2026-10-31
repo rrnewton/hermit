@@ -230,15 +230,20 @@ done:
   return result;
 }
 
-static int request_external_holder(const char* request_path, const char* ack_path) {
-  int request = open(request_path, O_WRONLY);
-  int ack = open(ack_path, O_RDONLY);
-  pid_t id = first + 3, answer = 0;
-  if (request < 0 || ack < 0) {
-    if (request >= 0) close(request);
-    if (ack >= 0) close(ack);
+static int open_external_holder(const char* request_path, const char* ack_path,
+                                int* request, int* ack) {
+  *request = open(request_path, O_WRONLY);
+  *ack = open(ack_path, O_RDONLY);
+  if (*request < 0 || *ack < 0) {
+    if (*request >= 0) close(*request);
+    if (*ack >= 0) close(*ack);
     return 1;
   }
+  return 0;
+}
+
+static int request_external_holder(int request, int ack) {
+  pid_t id = first + 3, answer = 0;
   int failed = write(request, &id, sizeof id) != (ssize_t)sizeof id ||
       read(ack, &answer, sizeof answer) != (ssize_t)sizeof answer || answer != id;
   close(request);
@@ -655,7 +660,9 @@ int main(int argc, char** argv) {
     return external_holder(argc, argv);
   }
   int collide = argc > 1 && strcmp(argv[1], "collide") == 0;
-  int external = argc == 4 && strcmp(argv[1], "collide-external") == 0;
+  int external_late = argc == 4 && strcmp(argv[1], "collide-external-late-open") == 0;
+  int external = argc == 4 &&
+      (strcmp(argv[1], "collide-external") == 0 || external_late);
   setvbuf(stdout, NULL, _IONBF, 0);
   first = getpid();
   if (argc > 1 && strcmp(argv[1], "cw-neighbor") == 0) {
@@ -684,6 +691,13 @@ int main(int argc, char** argv) {
   }
   report("/proc/self", strtol(link, NULL, 10), first);
 
+  // Acquire the handshake endpoints while this table is proved private. The
+  // supervisor creates no holder until the request below, after both threads.
+  // The late-open mode retains the shared-table proof-unavailable control.
+  int request = -1, ack = -1;
+  if (external && !external_late &&
+      open_external_holder(argv[2], argv[3], &request, &ack) != 0) return 1;
+
   for (int i = 0; i < 2; i++) {
     pthread_t thread;
     pid_t seen = 0;
@@ -698,7 +712,9 @@ int main(int argc, char** argv) {
   }
 
   pid_t holder = collide ? hold(first + 3) : 0;
-  if (external && request_external_holder(argv[2], argv[3]) != 0) return 1;
+  if (external_late &&
+      open_external_holder(argv[2], argv[3], &request, &ack) != 0) return 1;
+  if (external && request_external_holder(request, ack) != 0) return 1;
   pid_t forked = fork();
   if (forked == 0) {
     _exit(0);
