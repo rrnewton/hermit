@@ -19677,6 +19677,20 @@ fn a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays() {
         .to_str()
         .expect("guest path should be UTF-8");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    // The full record includes input-file identities. Reuse one cache file
+    // instead of each container's fresh copy so those identities stay stable.
+    let cache_mount = match fs::read("/etc/ld.so.cache") {
+        Ok(bytes) => {
+            let cache = directory.path().join("ld.so.cache");
+            fs::write(&cache, bytes).unwrap();
+            Some(format!(
+                "--mount=type=bind,source={},target=/etc/ld.so.cache,readonly",
+                cache.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("cannot snapshot /etc/ld.so.cache: {error}"),
+    };
     let path = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
     let run = |extra: &[&str], name: &str| {
         let summary = path(&format!("{name}.summary.json"));
@@ -19689,6 +19703,9 @@ fn a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays() {
             "--chaos",
             &summary_arg,
         ];
+        if let Some(mount) = cache_mount.as_deref() {
+            args.push(mount);
+        }
         args.extend_from_slice(extra);
         args.extend(["--", guest]);
         let output = hermit(&args);
