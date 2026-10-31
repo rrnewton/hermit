@@ -8032,9 +8032,12 @@ pub enum SignalScope {
 /// and `ReplayedSliceEnd` are revision 30, reserved for this change by the
 /// D2 seal; the combined layout on top of 31 appends revision 32.
 /// 40 appends the `CpuClockProcess` pair (drain of PR 4885, allocated
-/// revision 40) after 32, skipping reserved 33 to 39, and is the current
+/// revision 40) after 32, skipping reserved 33 to 39.
+/// https://github.com/rrnewton/hermit/pull/4769's `PublishInstructionOffset`
+/// pair, appended after the `CpuClockProcess` pair at the tail of each
+/// enum, is revision 41, the next revision after 40, and is the current
 /// revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 40;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 41;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

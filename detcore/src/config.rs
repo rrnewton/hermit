@@ -93,9 +93,10 @@ mod tests {
     /// 29 is https://github.com/rrnewton/hermit/pull/4884's, 30 is
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
     /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
-    /// layout on top of 31's, and 40, the `CpuClockProcess` pair allocated
-    /// to https://github.com/rrnewton/hermit/pull/4885, is the current
-    /// revision.
+    /// layout on top of 31's, 40 is the `CpuClockProcess` pair allocated
+    /// to https://github.com/rrnewton/hermit/pull/4885, and 41, this
+    /// change's (https://github.com/rrnewton/hermit/pull/4769), is the
+    /// current revision.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
@@ -270,6 +271,15 @@ mod tests {
         // (the stopless layout on top of 31), skipping reserved 33 to 39;
         // digests measured at this head).
         (40, "3919013da0508f27", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PublishInstructionOffset` and
+        // `GlobalResponse::PublishInstructionOffset`, appended after the
+        // `CpuClockProcess` pair at the tail of each enum
+        // (https://github.com/rrnewton/hermit/pull/4769; 26 above
+        // https://github.com/rrnewton/hermit/pull/4728's 25 on its own
+        // base, renumbered to 41 at this rebase: the next revision after
+        // main's landed 40, skipping only the reserved 33 to 39; digests
+        // measured at this head).
+        (41, "910e9e00bc41b1cd", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
