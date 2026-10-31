@@ -24246,14 +24246,24 @@ fn a_recorded_schedule_replays_its_threads_under_their_recorded_ids() {
 /// whole 20 ms timeslice: the rounds take at least five timeslices of virtual
 /// time (128 ms on an Intel host). In the fair order main runs its writes back
 /// to back once the spinner has had its timeslice: the rounds take less than
-/// two (26 ms). When the main thread spins and a second thread writes,
-/// sleeping 2 ms after each line, taking turns costs the writer a spinner
-/// slice after each line and one during each sleep (211 ms); in the fair
-/// order the woken writer is raised to the floor, ties with the spinner and
-/// goes first, so only the slice during each sleep remains, since a wake does
-/// not preempt (108 ms; 211 ms when the tie went to the lower thread id). The schedule has no events and no per-thread history, as a
-/// prefix-search trial of an empty prefix of a run without one, so the replay
-/// runs out at its first event and nothing guides the rest of the run.
+/// two (26 ms).
+///
+/// When the main thread spins and a second thread writes, sleeping 2 ms after
+/// each line, no sleep costs a spinner timeslice in either order. Past the
+/// schedule a slice ends as in a run without one (`follows_replayed_schedule`):
+/// the spinner's grant while the writer sleeps carries the time left before
+/// the writer's deadline (`Scheduler::grant_deadline_hint`), and the spinner,
+/// whose clock reads are check-ins, ends that slice at its first one past the
+/// deadline (`ThreadState::cap_timeslice_at_deadline`). Taking turns, the
+/// woken writer's next write queues behind the spinner's end-of-slice turn,
+/// so each line costs one whole spinner timeslice besides the sleep: per line
+/// a 20 ms slice, the 2 ms sleep and three turn charges of about 0.5 ms
+/// (23.5 ms, 118 ms for the five lines on an Intel host). In the fair order
+/// the woken writer goes before the spinner, so no line costs a slice: per
+/// line the sleep and two turn charges (17 ms for the five). The schedule has
+/// no events and no per-thread history, as a prefix-search trial of an empty
+/// prefix of a run without one, so the replay runs out at its first event and
+/// nothing guides the rest of the run.
 #[test]
 fn a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write() {
     let _guard = hermit_run_guard();
@@ -24299,7 +24309,18 @@ fn a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write() {
     assert!(fair < 40, "the fair continuation took {fair} ms");
     let spinner_main = ["spinner-main"];
     let in_turn = rounds_took_ms(&spinner_main, &[]);
-    assert!(in_turn >= 150, "spinning main: in turn took {in_turn} ms");
+    // Taking turns, each of the five lines costs one whole 20 ms spinner
+    // timeslice and the writer's 2 ms sleep (see above). The first slice
+    // began before the guest started its clock, by about 1 ms of the
+    // spinner's own time (0.98 ms on an Intel host); the turn charges, three
+    // a line at about 0.5 ms (7.5 ms), more than cover that and are the
+    // margin: 110 ms against 118 ms measured.
+    let spinner_main_floor = 5 * (20 + 2);
+    assert!(
+        in_turn >= spinner_main_floor,
+        "spinning main: in turn took {in_turn} ms, less than a 20 ms spinner \
+         timeslice and the 2 ms sleep for each of five lines ({spinner_main_floor} ms)"
+    );
     let fair = rounds_took_ms(&spinner_main, &["--replay-continue-fairly"]);
     assert!(
         fair * 3 <= in_turn * 2,
