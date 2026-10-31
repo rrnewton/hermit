@@ -197,6 +197,11 @@ mod tests {
         // domain 4 for the same event; whichever of the two lands second merges
         // the item lists and records the next revision.
         (25, "cc045ad597b403b8", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PublishInstructionOffset` and
+        // `GlobalResponse::PublishInstructionOffset` (#4769; 22 on its own
+        // base, renumbered to 26 above #4728's 25; digests measured at this
+        // head).
+        (26, "ebc6cf0b2e5ed74c", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
