@@ -14647,22 +14647,20 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // The cargo row was deselected 2026-10-31
     // (<https://github.com/rrnewton/hermit/issues/4997>); df keeps the
     // fixture/tool contract check.
-    for label in ["df"] {
-        let argv = rows
-            .get(label)
-            .ok_or_else(|| format!("strict-compat bucket: fixture-backed row {label} is absent"))?;
-        let want: [&OsStr; 5] = [
-            "env".as_ref(),
-            "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
-            "bash".as_ref(),
-            workload.as_os_str(),
-            label.as_ref(),
-        ];
-        if argv.as_slice() != want {
-            return Err(format!(
-                "strict-compat bucket: {label} does not use its explicit fixture/tool contract: {argv:?}"
-            ));
-        }
+    let df_argv = rows
+        .get("df")
+        .ok_or("strict-compat bucket: fixture-backed row df is absent")?;
+    let df_want: [&OsStr; 5] = [
+        "env".as_ref(),
+        "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
+        "bash".as_ref(),
+        workload.as_os_str(),
+        "df".as_ref(),
+    ];
+    if df_argv.as_slice() != df_want {
+        return Err(format!(
+            "strict-compat bucket: df does not use its explicit fixture/tool contract: {df_argv:?}"
+        ));
     }
     for (label, path) in [
         ("seq", "/run-state/strict-compat/real-compat-fixtures"),
