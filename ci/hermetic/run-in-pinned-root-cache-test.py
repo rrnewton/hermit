@@ -1744,7 +1744,16 @@ class PinnedGuestPathContract(unittest.TestCase):
         self.assertEqual(len(paths), len(set(paths)), "duplicate guest paths")
         self.assertTrue(paths)
         for path in paths:
-            self.assertRegex(path, r"^/usr/bin/[A-Za-z0-9_-]+$")
+            # The manifest is the exact allowlist (see
+            # assert-build-dependencies.sh): literal paths are admitted as
+            # listed, including /usr/bin/[ and /usr/sbin/*; only canonical
+            # absolute shape is required here.
+            self.assertTrue(path.startswith("/usr/"), path)
+            self.assertNotRegex(path, r"\s")
+            self.assertNotIn("//", path)
+            self.assertNotIn("/./", path)
+            self.assertNotIn("/../", path)
+            self.assertFalse(path.endswith("/.") or path.endswith("/.."), path)
         # The in-guest LiteInst program tests, run by test.cli in the pinned
         # root (formerly hermit-cli/tests/liteinst_advanced.rs).
         source = (

@@ -1339,6 +1339,7 @@ class ContainerChoiceTest(unittest.TestCase):
             self.assertEqual(env["HERMIT_E2E_ROUTE"], target["route"], target["name"])
             expected = target["route"] == "local" and (
                 cell["lane"] == "privileged"
+                or cell.get("category") == "compat"
                 or cell["test"] == "c-programs/environment-and-workdir")
             self.assertEqual(env["HERMIT_E2E_CONTAINER"], "pinned-root" if expected else "", target["name"])
             self.assertEqual(bool(env["HERMIT_E2E_CONTAINER_REASON"]), expected, target["name"])
@@ -1360,14 +1361,16 @@ class ContainerChoiceTest(unittest.TestCase):
         # container and no particular route: a kvm test's DBT verify cell runs locally with
         # its parity reference, and the others go to RE.
         self.assertEqual(targets["c-programs-cpuid-probe-verify-dbt"]["route"], "local")
-        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged"}
+        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged" and c.get("category") != "compat"}
         self.assertTrue(dbt)
         self.assertFalse(dbt & chosen)
         self.assertTrue(any(targets[name]["route"] == "re" for name in dbt))
         # The test's KVM verify cell (enabled 2026-10-08) also runs locally, so it gets the
         # same pinned-root /test workdir its guest asserts, and so do its in-guest LiteInst
         # verify cells (liteinst and in-guest-trap, enabled the same day).
-        self.assertEqual(chosen, privileged | {"c-programs-environment-and-workdir-custom-ptrace",
+        compat = {self.slug(c) for c in self.plan if c.get("category") == "compat"}
+        self.assertTrue(compat, "the plan has compat-lane cells")
+        self.assertEqual(chosen, privileged | compat | {"c-programs-environment-and-workdir-custom-ptrace",
                                                "c-programs-environment-and-workdir-verify-ptrace",
                                                "c-programs-environment-and-workdir-verify-kvm",
                                                "c-programs-environment-and-workdir-verify-liteinst",
@@ -1376,7 +1379,7 @@ class ContainerChoiceTest(unittest.TestCase):
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))
-        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged"}
+        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged" and c.get("category") != "compat"}
         self.assertTrue(dbt)
         self.assertFalse(dbt & chosen)
 

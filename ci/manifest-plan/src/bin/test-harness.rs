@@ -8261,7 +8261,9 @@ sys.exit(1 if failed else 0)
         // compat/strict-<row> tests (https://github.com/rrnewton/hermit/issues/4276),
         // and +1 for supercompat.manifest_compat, the super run type's host
         // bucket of the corpus's heavy rows (same issue).
-        assert_eq!((pinned, direct), (19, 37));
+        // (19, 37) until the compat corpus moved into the pinned root:
+        // e2e.manifest_compat is pinned now, its _on_host twin stays direct.
+        assert_eq!((pinned, direct), (20, 36));
     }
 
     /// The full profile's harness nodes together report each cell of the
@@ -8374,12 +8376,16 @@ sys.exit(1 if failed else 0)
         // qualified 20/20 and joined full; its KVM parity cell stayed
         // unreported until its ptrace verify cell, the reference, joined full
         // after two clean nightly pressure sweeps (2026-10-19 and 2026-10-20).
-        assert_eq!(unreported.len(), 5, "{unreported:?}");
+        // 5 + 2 since the pinned-image move deselected logger and pkg-config
+        // (their SaBRe cells stay applicable in the census but no full node
+        // reports them now), + 3 measured red in the first in-image full
+        // validate (logger@dbt, pkg-config@dbt, pkg-config@kvm).
+        assert_eq!(unreported.len(), 10, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
             .count();
-        assert_eq!(sabre_only, 5, "{unreported:?}");
+        assert_eq!(sabre_only, 7, "{unreported:?}");
     }
 
     #[test]

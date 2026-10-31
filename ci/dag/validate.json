@@ -14421,13 +14421,6 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -15164,13 +15157,6 @@
           "test": "compat/ln",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -16505,20 +16491,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
@@ -17431,13 +17403,6 @@
           "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/shred",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17866,13 +17831,6 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "verify",
           "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/sysctl-random-uuid",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18153,13 +18111,6 @@
           "test": "compat/top",
           "mode": "verify",
           "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/top",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20965,13 +20916,6 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -21624,13 +21568,6 @@
           "test": "compat/ln",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -22783,20 +22720,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
@@ -23555,13 +23478,6 @@
           "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/shred",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -23941,13 +23857,6 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "verify",
           "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/sysctl-random-uuid",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -24207,13 +24116,6 @@
           "test": "compat/top",
           "mode": "verify",
           "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/top",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -46309,13 +46211,6 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -46800,13 +46695,6 @@
           "test": "compat/ln",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -47661,13 +47549,6 @@
           "test": "compat/pinky",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -73088,13 +72969,6 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -73831,13 +73705,6 @@
           "test": "compat/ln",
           "mode": "verify",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/logger",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -75172,20 +75039,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/pkg-config",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
@@ -76098,13 +75951,6 @@
           "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/shred",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -76533,13 +76379,6 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "verify",
           "backend": "in-guest-trap"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/sysctl-random-uuid",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -76820,13 +76659,6 @@
           "test": "compat/top",
           "mode": "verify",
           "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/top",
-          "mode": "verify",
-          "backend": "kvm"
         },
         {
           "lane": "portable",
