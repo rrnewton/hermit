@@ -910,6 +910,18 @@ fn is_outer_policy_refusal(error: &Error) -> bool {
         || error
             .downcast_ref::<detcore::ChosenBinaryInputRefusal>()
             .is_some()
+        || error
+            .downcast_ref::<detcore::preemptions::RecordFormatRefusal>()
+            .is_some()
+        // Tool's transparent forwarding can hide the typed format refusal
+        // from the outer chain. Inspect its typed inner error, never its prose.
+        || error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<reverie::Error>(),
+                Some(reverie::Error::Tool(inner))
+                    if inner.is::<detcore::preemptions::RecordFormatRefusal>()
+            )
+        })
 }
 
 /// Machine-readable classification of a hermit-internal failure, on stderr.
@@ -2091,6 +2103,64 @@ mod tests {
                 classify_failure(&error),
                 "HERMIT_INTERNAL_FAILURE class=cli-error"
             );
+        }
+    }
+
+    #[test]
+    fn record_format_refusal_keeps_policy_status_before_container_startup() {
+        use detcore::preemptions::RecordFormatRefusal;
+        use detcore::preemptions::boundary_recording::Recording;
+
+        const RECORDS: [&[u8]; 2] = [
+            br#"{"per_thread":{},"global":[],"format_version":4}"#,
+            br#"{"per_thread":{},"global":[],"format_version":3,"time_skips":[]}"#,
+        ];
+        for contextual in [false, true] {
+            for wrapped in [false, true] {
+                let adapt = |mut error: Error| {
+                    if contextual {
+                        error = error.context("reading schedule before guest startup");
+                    }
+                    if wrapped {
+                        error = Error::new(reverie::Error::Tool(error));
+                    }
+                    if contextual {
+                        error = error.context("outer launch boundary");
+                    }
+                    error
+                };
+                for bytes in RECORDS {
+                    let refusal = Recording::decode(bytes).unwrap_err();
+                    assert!(refusal.is::<RecordFormatRefusal>());
+                    let prose = adapt(Error::msg(refusal.to_string()));
+                    let refusal = adapt(refusal);
+                    assert_eq!(
+                        failure_exit_code(&refusal),
+                        detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+                    );
+                    assert_eq!(
+                        classify_failure(&refusal),
+                        "HERMIT_POLICY_REFUSAL class=policy-refusal"
+                    );
+                    assert_eq!(failure_exit_code(&prose), HERMIT_INTERNAL_FAILURE_EXIT);
+                    assert_eq!(
+                        classify_failure(&prose),
+                        "HERMIT_INTERNAL_FAILURE class=cli-error"
+                    );
+                }
+                for error in [
+                    Recording::decode(b"{").unwrap_err(),
+                    Error::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                ] {
+                    assert!(!error.is::<RecordFormatRefusal>());
+                    let error = adapt(error);
+                    assert_eq!(failure_exit_code(&error), HERMIT_INTERNAL_FAILURE_EXIT);
+                    assert_eq!(
+                        classify_failure(&error),
+                        "HERMIT_INTERNAL_FAILURE class=cli-error"
+                    );
+                }
+            }
         }
     }
 

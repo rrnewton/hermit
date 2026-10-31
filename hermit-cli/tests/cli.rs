@@ -10557,56 +10557,120 @@ const OWN_PID_NAMESPACE: [&str; 7] = [
     "--net",
 ];
 
+/// C4 deliberately narrows the former continuing-Chosen collision promise:
+/// a successful original clone3 preserves the guest's result, but its mutable
+/// input leaves a permanent lifecycle uncertainty. Reaping the child does not
+/// restore staging. Strict runs name the cost; tolerant records must say Host.
 #[test]
-fn no_namespace_records_distinct_ids_after_a_guest_chosen_child() {
-    for (offset, automatic) in [("1", 2), ("100", 1)] {
+fn no_namespace_preserves_guest_chosen_birth_but_refuses_later_unproved_staging() {
+    for (lifetime, offset) in [("reaped", "1"), ("reaped", "100"), ("live", "3")] {
+        let guest_args = ["guest-chosen-lifecycle", lifetime, offset];
+        let accepted = format!("explicit accepted +{offset}\n");
+        let reaped = format!("explicit reaped +{offset}\n");
+        let before_later = if lifetime == "reaped" {
+            format!("{accepted}{reaped}")
+        } else {
+            accepted
+        };
+        let complete = if lifetime == "live" {
+            format!("{before_later}later child reaped\n{reaped}")
+        } else {
+            format!("{before_later}later child reaped\n")
+        };
+        let native = native_chosen_ids_fixture(&guest_args);
+        assert_success(&native, &guest_args);
+        assert_eq!(stdout(&native), complete);
+
+        let refused = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &guest_args);
+        assert_eq!(
+            refused.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{refused:?}"
+        );
+        assert_eq!(stdout(&refused), before_later);
+        assert!(
+            stderr(&refused)
+                .contains("its reserved input is unavailable: clone-lifecycle-unverified"),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(!stderr(&refused).contains("got a host ID"), "{refused:?}");
+        assert!(
+            !stderr(&refused).contains("host-ID report(s) accepted"),
+            "{refused:?}"
+        );
+
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        let path = directory.path().join("schedule.json");
-        let output = no_namespace_in_own_pid_namespace(
+        let path = directory.path().join("host-after-original-clone3.json");
+        let tolerant = no_namespace_in_own_pid_namespace(
             &[
-                "--pid-base=5000",
+                "--summary",
                 "--record-preemptions-to",
                 path.to_str().unwrap(),
             ],
-            &["explicit-then-fork", offset],
+            &guest_args,
         );
-        assert!(output.status.success(), "{output:?}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_success(&tolerant, &guest_args);
+        assert_eq!(stdout(&tolerant), complete);
         assert!(
-            stdout.contains(&format!("explicit reaped +{offset}\n")),
-            "{stdout}"
+            stderr(&tolerant).contains("clone-lifecycle-unverified")
+                && stderr(&tolerant).contains("got a host ID, not a chosen one")
+                && stderr(&tolerant).contains(
+                    "1 host-ID report(s) accepted; chosen process IDs are not guaranteed"
+                ),
+            "{}",
+            stderr(&tolerant)
         );
-        assert!(
-            stdout.contains(&format!("automatic reaped +{automatic}\n")),
-            "{stdout}"
-        );
-        assert!(stdout.contains("distinct IDs: 1\n"), "{stdout}");
         let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert!(!record["global"].as_array().unwrap().is_empty());
-        assert_eq!(record["guest_ids"]["Chosen"]["base"], 5000);
+        assert_eq!(record["guest_ids"], "Host");
     }
-    // A live guest-chosen ID is reserved too, rather than treated as an
-    // unpredictable external collision. Keep a genuine external opponent in
-    // no_namespace_refuses_a_taken_chosen_id_only_when_asked.
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let path = directory.path().join("live-choice.json");
-    let output = no_namespace_in_own_pid_namespace(
-        &[
-            "--pid-base=5000",
-            "--record-preemptions-to",
-            path.to_str().unwrap(),
-        ],
-        &["collide"],
-    );
-    assert_success(&output, &["collide"]);
-    assert!(
-        stdout(&output).contains("holder +3\nfork returned +4\n"),
-        "{output:?}"
-    );
-    assert!(stdout(&output).contains("0 mismatches\n"), "{output:?}");
-    assert!(!stderr(&output).contains("got a host ID"), "{output:?}");
-    let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-    assert_eq!(record["guest_ids"]["Chosen"]["base"], 5000);
+}
+
+/// A native no-child result cancels the prospective lifecycle cause. The
+/// original clone3 EINVAL must survive and the next fork must still stage.
+#[test]
+fn no_namespace_original_clone3_no_child_keeps_later_chosen_ids() {
+    let guest_args = ["guest-chosen-lifecycle", "no-child", "100"];
+    let native = native_chosen_ids_fixture(&guest_args);
+    assert_success(&native, &guest_args);
+    let text = stdout(&native);
+    let offset = text
+        .strip_prefix("original clone3: Invalid argument\nlater returned ")
+        .unwrap()
+        .strip_suffix("\nlater child reaped\n")
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    assert!(offset > 0, "{text}");
+
+    for base in ["--pid-base=5000", "--summary"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let path = directory.path().join("chosen-after-no-child.json");
+        let output = no_namespace_in_own_pid_namespace(
+            &[base, "--record-preemptions-to", path.to_str().unwrap()],
+            &guest_args,
+        );
+        assert_success(&output, &guest_args);
+        assert_eq!(
+            stdout(&output),
+            "original clone3: Invalid argument\nlater returned +1\nlater child reaped\n"
+        );
+        assert!(
+            !stderr(&output).contains("got a host ID")
+                && !stderr(&output).contains("host-ID report(s) accepted")
+                && !stderr(&output).contains("clone-lifecycle-unverified"),
+            "{}",
+            stderr(&output)
+        );
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(!record["global"].as_array().unwrap().is_empty());
+        let recorded_base = record["guest_ids"]["Chosen"]["base"].as_i64().unwrap();
+        assert!(recorded_base > 0);
+        if base == "--pid-base=5000" {
+            assert_eq!(recorded_base, 5000);
+        }
+    }
 }
 
 #[test]
@@ -56752,5 +56816,155 @@ fn authentic_legacy_chosen_json_is_refused_before_cli_target_start() {
             bytes,
             "{route}: input fixture was changed"
         );
+    }
+}
+
+/// Ordinary Namespace replay keeps the existing typed format-refusal status at
+/// the early loader. This does not use Chosen provenance or namespace-only exec.
+#[test]
+fn namespace_record_format_refusals_are_policy_before_guest_startup() {
+    use detcore::preemptions::RecordFormatRefusal;
+    use detcore::preemptions::boundary_recording::Recording;
+
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("guest-started");
+    let mount = format!(
+        "--mount=type=bind,source={},target={}",
+        directory.path().display(),
+        directory.path().display()
+    );
+    // Exercise the same ordinary Namespace guest and marker mount before using
+    // absence of the marker to distinguish admission from target execution.
+    let positive = [
+        "run",
+        "--max-timeslice=disabled",
+        &mount,
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'namespace-format-started\n'; printf started > \"$1\"",
+        "format-marker",
+        marker.to_str().unwrap(),
+    ];
+    let output = hermit(&positive);
+    assert_success(&output, &positive);
+    assert_eq!(stdout(&output), "namespace-format-started\n");
+    assert_eq!(fs::read(&marker).unwrap(), b"started");
+    fs::remove_file(&marker).unwrap();
+
+    for (name, value, reason) in [
+        (
+            "future-format.json",
+            serde_json::json!({
+                "per_thread": {}, "global": [],
+                "guest_ids": detcore_model::pid::GuestIds::Namespace,
+                "format_version": 4
+            }),
+            "record format Some(4) with 0 time skips: this Hermit reads formats 1 to 3, and time skips need format 2 or later",
+        ),
+        (
+            "empty-time-skips.json",
+            serde_json::json!({
+                "per_thread": {}, "global": [],
+                "guest_ids": detcore_model::pid::GuestIds::Namespace,
+                "format_version": 3, "time_skips": []
+            }),
+            "an empty list of time skips is written as no list",
+        ),
+    ] {
+        let schedule = directory.path().join(name);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let fixture: detcore::preemptions::PreemptionRecord =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            fixture.guest_ids(),
+            Some(detcore_model::pid::GuestIds::Namespace)
+        );
+        assert_eq!(fixture.validate_format().unwrap_err(), reason);
+        let refusal = Recording::decode(&bytes).unwrap_err();
+        assert!(refusal.is::<RecordFormatRefusal>());
+        assert_eq!(refusal.to_string(), reason);
+        fs::write(&schedule, &bytes).unwrap();
+        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
+            let args = [
+                "run",
+                "--max-timeslice=disabled",
+                &mount,
+                option,
+                schedule.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf started > \"$1\"",
+                "format-marker",
+                marker.to_str().unwrap(),
+            ];
+            let output = hermit(&args);
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{args:?}: {output:?}"
+            );
+            let diagnostic = stderr(&output);
+            assert!(diagnostic.contains(reason), "{args:?}: {diagnostic}");
+            assert!(
+                diagnostic.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+                "{args:?}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains("HERMIT_INTERNAL_FAILURE"),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
+            assert!(!diagnostic.to_ascii_lowercase().contains("desync"));
+            assert_eq!(stdout(&output), "");
+            assert!(!marker.exists(), "format-refused Namespace guest ran");
+            assert_eq!(fs::read(&schedule).unwrap(), bytes);
+        }
+    }
+
+    let absent = directory.path().join("absent-schedule.json");
+    let malformed = directory.path().join("malformed-schedule.json");
+    fs::write(&malformed, b"{").unwrap();
+    for (path, diagnostic_kind) in [
+        (&absent, "cannot read preemption record"),
+        (&malformed, "cannot parse preemption record"),
+    ] {
+        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
+            let args = [
+                "run",
+                "--max-timeslice=disabled",
+                &mount,
+                option,
+                path.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf started > \"$1\"",
+                "format-marker",
+                marker.to_str().unwrap(),
+            ];
+            let output = hermit(&args);
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_INTERNAL_FAILURE_EXIT),
+                "{args:?}: {output:?}"
+            );
+            let diagnostic = stderr(&output);
+            assert!(
+                diagnostic.contains(&format!("{diagnostic_kind} {}:", path.display())),
+                "{args:?}: {diagnostic}"
+            );
+            assert!(diagnostic.contains("HERMIT_INTERNAL_FAILURE class=cli-error"));
+            assert!(!diagnostic.contains("HERMIT_POLICY_REFUSAL"));
+            assert!(!diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
+            assert_eq!(stdout(&output), "");
+            assert!(
+                !marker.exists(),
+                "invalid Namespace metadata ran the target"
+            );
+            assert!(!absent.exists());
+            assert_eq!(fs::read(&malformed).unwrap(), b"{");
+        }
     }
 }

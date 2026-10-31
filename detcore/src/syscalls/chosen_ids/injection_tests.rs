@@ -91,6 +91,8 @@ struct CloneGuest {
     attempts: Vec<bool>,
     host_id_reports: AtomicUsize,
     proof_context: bool,
+    real_identity: bool,
+    retain_original_birth: bool,
     registry_queries: Mutex<Vec<i32>>,
     refused_registry_query: Option<usize>,
     input_control: ReservedInputControl,
@@ -121,6 +123,8 @@ impl CloneGuest {
             attempts: Vec::new(),
             host_id_reports: AtomicUsize::new(0),
             proof_context: false,
+            real_identity: false,
+            retain_original_birth: false,
             registry_queries: Mutex::new(Vec::new()),
             refused_registry_query: None,
             input_control,
@@ -190,6 +194,24 @@ impl CloneGuest {
         self.original_set_tid = Some(ids);
     }
 
+    fn set_guest_choice(&mut self, id: i32) {
+        if !self.real_identity {
+            assert!(self.attempts.is_empty());
+            self.real_identity = true;
+            self.thread = ThreadState::new(
+                DetPid::from_raw(std::process::id() as i32),
+                &self.config,
+                (),
+            );
+            (self.input_control, self.input_task) = Self::input_owner(std::process::id() as i32);
+        }
+        let ids = Box::new([id]);
+        *self.original_args =
+            ChosenIdCall::with_set_tid(*self.original_args, ids.as_ptr() as u64, 1);
+        self.original_expected = *self.original_args;
+        self.original_set_tid = Some(ids);
+    }
+
     fn fresh_plan(&self, id: i32) -> ClonePlan {
         let ClonePlan::Chosen(mut chosen) = self.chosen(id) else {
             unreachable!()
@@ -245,7 +267,7 @@ impl Guest<Detcore> for CloneGuest {
     type Stack = Scratch;
 
     fn tid(&self) -> Pid {
-        if self.proof_context {
+        if self.proof_context || self.real_identity {
             // Real readable maps/namespace links for the heap-backed fixture;
             // the scripted RPC still names the exact candidate ID separately.
             Pid::from_raw(std::process::id() as i32)
@@ -307,7 +329,27 @@ impl Guest<Detcore> for CloneGuest {
         )?;
         self.input_control.backend_issued(receipt.id())?;
         let result = self.scripted_call(Syscall::from_raw(number, args), None);
-        if result.is_ok() {
+        if self.retain_original_birth
+            && let Ok(child) = result
+        {
+            // Explicit scripted first-retention event, distinct from merely
+            // returning a positive PID. Native ptrace ownership is not proved
+            // by this fixture; the production policy and registry are real.
+            let child = i32::try_from(child).unwrap();
+            let retained = self.input_control.backend_register_child(
+                self.input_task,
+                child,
+                child,
+                Some(false),
+                Some(false),
+            )?;
+            self.input_control.backend_retained_birth(
+                receipt.id(),
+                retained.task,
+                Some(false),
+                Some(false),
+            )?;
+        } else if result.is_ok() {
             // A mock numeric PID is not a native retained birth.
             self.input_control.backend_unknown_outcome(receipt.id())?;
         } else {
@@ -324,10 +366,17 @@ impl Guest<Detcore> for CloneGuest {
     ) -> Result<Result<i64, Errno>, InputInjectionError> {
         self.input_control
             .backend_begin_preparation(&receipt, scope, image.clone())?;
-        assert_eq!(
-            self.input_control.backend_prepared_stopped(receipt.id())?,
-            image
-        );
+        let prepared = match self.input_control.backend_prepared_stopped(receipt.id()) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // This fixture has not written or issued anything. Model the
+                // backend's proved pre-write refusal settlement, not Drop.
+                assert_eq!(error.reason(), "clone-lifecycle-unverified");
+                self.input_control.backend_not_run(receipt.id())?;
+                return Err(error.into());
+            }
+        };
+        assert_eq!(prepared, image);
         self.input_control.backend_initializing(receipt.id())?;
         // Scripted transport only. The real backend must independently read
         // these bytes through the stopped guest before issuing its syscall.
@@ -615,5 +664,91 @@ async fn an_added_id_without_attribution_evidence_still_refuses_strict_runs() {
         assert!(guest.attempts.is_empty());
         assert!(guest.registry_queries.lock().unwrap().is_empty());
         assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+    }
+}
+
+/// Real GuestChosen planning and injection with a scripted retained birth.
+/// Later staging must honor the accepted C4 cost, even though KCMP-style
+/// copied-memory/table evidence and a successful native result are supplied.
+#[tokio::test]
+async fn retained_guest_chosen_clone3_refuses_later_staging_or_reports_native_ids() {
+    for strict in [true, false] {
+        let mut guest = CloneGuest::new(strict, Ok(6000));
+        guest.set_guest_choice(6000);
+        guest.retain_original_birth = true;
+        let tool = Detcore::new(guest.tid(), &guest.config);
+        let original = guest.original_call();
+        let plan = tool.plan_clone_id(&mut guest, &original).await.unwrap();
+        assert!(matches!(&plan, ClonePlan::GuestChosen));
+        assert_eq!(
+            tool.inject_clone_planned(&mut guest, original, plan, false)
+                .await,
+            Ok(6000)
+        );
+        assert_eq!(guest.attempts, [true]);
+        assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+
+        // The first call is allowed to return unchanged. A later operation
+        // must not reopen staging after its temporary access was readmitted.
+        guest.set_guest_choice(6001);
+        guest.original_result = Ok(6001);
+        let original = guest.original_call();
+        let chosen = guest.chosen(5001);
+        if strict {
+            let refused = std::panic::AssertUnwindSafe(
+                tool.inject_clone_planned(&mut guest, original, chosen, false),
+            )
+            .catch_unwind()
+            .await
+            .expect_err("retained unknown lifecycle must prohibit later strict staging");
+            let reason = refused.downcast_ref::<PolicyRefused>().unwrap();
+            assert!(
+                reason.0.contains("clone-lifecycle-unverified"),
+                "{reason:?}"
+            );
+            assert_eq!(guest.attempts, [true]);
+            assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+        } else {
+            assert_eq!(
+                tool.inject_clone_planned(&mut guest, original, chosen, false)
+                    .await,
+                Ok(6001)
+            );
+            assert_eq!(guest.attempts, [true, true]);
+            assert_eq!(guest.host_id_reports.load(SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn proved_no_child_guest_chosen_clone3_preserves_errno_and_later_staging() {
+    for strict in [true, false] {
+        for errno in [Errno::EINVAL, Errno::EFAULT, Errno::EAGAIN] {
+            let mut guest = CloneGuest::new(strict, Err(errno));
+            guest.set_guest_choice(6000);
+            guest.retain_original_birth = true;
+            let tool = Detcore::new(guest.tid(), &guest.config);
+            let original = guest.original_call();
+            let plan = tool.plan_clone_id(&mut guest, &original).await.unwrap();
+            assert!(matches!(&plan, ClonePlan::GuestChosen));
+            assert_eq!(
+                tool.inject_clone_planned(&mut guest, original, plan, false)
+                    .await,
+                Err(errno)
+            );
+            // EAGAIN is neither an added-ID fallback nor an attribution case.
+            // Reaching the real staged route proves no prospective cause was
+            // committed merely because this original pointer was unknown.
+            guest.rewritten_errno = Errno::EAGAIN;
+            let original = guest.original_call();
+            let chosen = guest.chosen(5001);
+            assert_eq!(
+                tool.inject_clone_planned(&mut guest, original, chosen, false)
+                    .await,
+                Err(Errno::EAGAIN)
+            );
+            assert_eq!(guest.attempts, [true, false]);
+            assert_eq!(guest.host_id_reports.load(SeqCst), 0);
+        }
     }
 }

@@ -253,10 +253,68 @@ static int request_external_holder(int request, int ack) {
   return 0;
 }
 
+/* Original mutable clone3 input deliberately remains original. A retained
+ * birth cannot certify its lifecycle fields for a later reserved-input call.
+ * Keep first-call success/errno independent of that later policy decision. */
+static int reap_lifecycle_holder(pid_t holder) {
+  if (kill(holder, SIGKILL) != 0) return 1;
+  int status = 0;
+  if (waitpid(holder, &status, 0) != holder ||
+      !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) return 1;
+  show("explicit reaped", holder);
+  return 0;
+}
+
+static int guest_chosen_lifecycle(int argc, char** argv) {
+  if (argc != 4) return 1;
+  int live = strcmp(argv[2], "live") == 0;
+  int no_child = strcmp(argv[2], "no-child") == 0;
+  if (!live && !no_child && strcmp(argv[2], "reaped") != 0) return 1;
+  int offset = atoi(argv[3]);
+  if (offset <= 0) return 1;
+  pid_t chosen = first + offset;
+  struct clone_args args;
+  memset(&args, 0, sizeof args);
+  args.exit_signal = SIGCHLD;
+  args.set_tid = (uint64_t)(uintptr_t)&chosen;
+  args.set_tid_size = 1;
+  /* A stable Linux contradiction, still issued as the original GuestChosen
+   * clone3 (not the legacy-clone preflight or an added-ID rewrite). */
+  if (no_child) args.flags = CLONE_SIGHAND;
+  errno = 0;
+  long original = syscall(SYS_clone3, &args, sizeof args);
+  int error = errno;
+  if (original == 0) {
+    if (no_child || getpid() != chosen) _exit(99);
+    for (;;) pause();
+  }
+  if (no_child) {
+    if (original != -1 || error != EINVAL) return 1;
+    printf("original clone3: %s\n", strerror(error));
+  } else {
+    if (original != chosen) return 1;
+    show("explicit accepted", original);
+    if (!live && reap_lifecycle_holder((pid_t)original) != 0) return 1;
+  }
+  pid_t later = fork();
+  if (later < 0) return 1;
+  if (later == 0) _exit(23);
+  int status = 0;
+  if (waitpid(later, &status, 0) != later ||
+      !WIFEXITED(status) || WEXITSTATUS(status) != 23) return 1;
+  if (no_child) show("later returned", later);
+  printf("later child reaped\n");
+  if (live && reap_lifecycle_holder((pid_t)original) != 0) return 1;
+  return 0;
+}
+
 /* One call, as the arguments `sighand`, `own-tid N`, `bad-tid` and
  * `bad-size` ask, and its outcome. */
 static int one_call(int argc, char** argv) {
   const char* what = argv[1];
+  if (strcmp(what, "guest-chosen-lifecycle") == 0) {
+    return guest_chosen_lifecycle(argc, argv);
+  }
   if (strcmp(what, "explicit-then-fork") == 0) {
     if (argc != 3) return 1;
     pid_t chosen = first + atoi(argv[2]);

@@ -158,6 +158,7 @@ fn is_policy_refusal(err: &Error) -> bool {
     fn refuses(cause: &(dyn std::error::Error + 'static)) -> bool {
         cause.is::<detcore::UnsupportedSyscallError>()
             || cause.is::<detcore::preemptions::RecordAdmissionRefusal>()
+            || cause.is::<detcore::preemptions::RecordFormatRefusal>()
             || cause.is::<detcore::ChosenBinaryInputRefusal>()
             || cause.is::<detcore::TerminalReplayRefusal>()
             || cause.is::<detcore::PriorityHistoryRefusal>()
@@ -343,6 +344,59 @@ pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_format_refusal_keeps_its_kind_through_context_and_reverie() {
+        use detcore::preemptions::RecordFormatRefusal;
+        use detcore::preemptions::boundary_recording::Recording;
+
+        const RECORDS: [&[u8]; 2] = [
+            br#"{"per_thread":{},"global":[],"format_version":4}"#,
+            br#"{"per_thread":{},"global":[],"format_version":3,"time_skips":[]}"#,
+        ];
+        for contextual in [false, true] {
+            for wrapped in [false, true] {
+                let adapt = |mut error: Error| {
+                    if contextual {
+                        error = error.context("reading schedule before guest startup");
+                    }
+                    if wrapped {
+                        error = Error::new(reverie::Error::Tool(error));
+                    }
+                    if contextual {
+                        error = error.context("outer launch boundary");
+                    }
+                    error
+                };
+                for bytes in RECORDS {
+                    let refusal = Recording::decode(bytes).unwrap_err();
+                    assert!(refusal.is::<RecordFormatRefusal>());
+                    let prose = adapt(Error::msg(refusal.to_string()));
+                    let serialized = SerializableError::from(adapt(refusal));
+                    assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+                    let bytes =
+                        bincode::serde::encode_to_vec(&serialized, bincode::config::legacy())
+                            .unwrap();
+                    let (decoded, used): (SerializableError, usize) =
+                        bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
+                            .unwrap();
+                    assert_eq!(used, bytes.len());
+                    assert_eq!(decoded, serialized);
+                    assert_eq!(SerializableError::from(prose).kind(), FailureKind::Error);
+                }
+                for error in [
+                    Recording::decode(b"{").unwrap_err(),
+                    Error::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                ] {
+                    assert!(!error.is::<RecordFormatRefusal>());
+                    assert_eq!(
+                        SerializableError::from(adapt(error)).kind(),
+                        FailureKind::Error
+                    );
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn terminal_refusal_is_typed_direct_and_through_reverie() {

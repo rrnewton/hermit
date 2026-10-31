@@ -424,6 +424,14 @@ pub(crate) fn clone_description(
             files: Some(flags & libc::CLONE_FILES as u64 != 0),
         }
     } else {
+        // A retained child authenticates birth and physical sharing, not the
+        // lifecycle bytes imported from an original clone3 pointer. Commit
+        // this Tool-owned cause at birth, before its transient access can be
+        // readmitted. A proved no-child result cancels prospective facts.
+        prospective.push(InputExposure {
+            target: InputTarget::Unknown,
+            cause: "clone-lifecycle-unverified".into(),
+        });
         InputExpectedSharing {
             may_create: true,
             ..InputExpectedSharing::default()
@@ -784,5 +792,113 @@ mod tests {
                 .prospective
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn retained_birth_keeps_unknown_clone3_lifecycle_but_not_known_input_neighbors() {
+        use reverie::reserved_input::InputAbi;
+        use reverie::reserved_input::InputGrantKind;
+        use reverie::reserved_input::InputWrite;
+        use reverie::reserved_input::ReservedInputControl;
+        use reverie::reserved_input::ReservedInputImage;
+        use reverie::reserved_input::ReservedInputLayout;
+
+        for input in ["original-clone3", "immutable-clone3", "register-clone"] {
+            for birth in [false, true] {
+                let control = ReservedInputControl::new_backend().unwrap();
+                let task = control.backend_register_root(5000, 5000).unwrap().task;
+                control
+                    .backend_set_layout(
+                        task,
+                        ReservedInputLayout {
+                            base: reverie::reserved_input::RESERVED_INPUT_BASE,
+                            page_bytes: 4096,
+                            #[cfg(target_arch = "x86_64")]
+                            abi: InputAbi::X86_64,
+                            #[cfg(target_arch = "aarch64")]
+                            abi: InputAbi::Aarch64,
+                        },
+                    )
+                    .unwrap();
+                let grant = control.grant(task, InputGrantKind::Ordinary).unwrap();
+                let mut bytes = [0_u8; 88];
+                bytes[32..40].copy_from_slice(&(libc::SIGCHLD as u64).to_ne_bytes());
+                let (native, immutable) = if input == "register-clone" {
+                    (
+                        call(Sysno::clone, [libc::SIGCHLD as usize, 0, 0, 0, 0, 0]),
+                        None,
+                    )
+                } else {
+                    (
+                        call(Sysno::clone3, [0x1000, bytes.len(), 0, 0, 0, 0]),
+                        (input == "immutable-clone3").then_some((0x1000, bytes.as_slice())),
+                    )
+                };
+                let description = clone_description(native, immutable, Some(libc::SIGCHLD));
+                let number = description.number;
+                let args = description.args;
+                let receipt = control
+                    .prepare_observed_injection(task, 1, description)
+                    .unwrap();
+                control
+                    .backend_bind_injection(&receipt, task, number, args)
+                    .unwrap();
+                control.backend_issued(receipt.id()).unwrap();
+                if birth {
+                    // Scripted native retention/sharing only; this unit is not
+                    // a ptrace decoder or immutable-image transport witness.
+                    let child = control
+                        .backend_register_child(task, 5001, 5001, Some(false), Some(false))
+                        .unwrap();
+                    control
+                        .backend_retained_birth(receipt.id(), child.task, Some(false), Some(false))
+                        .unwrap();
+                } else {
+                    control.backend_no_child(receipt.id()).unwrap();
+                }
+                control
+                    .readmit_injection(receipt.id(), task, grant)
+                    .unwrap();
+                let scope = control.begin_operation(task, 2).unwrap();
+                let layout = control.layout(task).unwrap();
+                let image = ReservedInputImage::new(
+                    layout,
+                    &[InputWrite {
+                        offset: 0,
+                        bytes: &bytes,
+                    }],
+                )
+                .unwrap();
+                let next_call = call(
+                    Sysno::clone3,
+                    [layout.base as usize, bytes.len(), 0, 0, 0, 0],
+                );
+                let next = control
+                    .prepare_injection(
+                        &scope,
+                        clone_description(
+                            next_call,
+                            Some((layout.base, &bytes)),
+                            Some(libc::SIGCHLD),
+                        ),
+                    )
+                    .unwrap();
+                control
+                    .backend_begin_preparation(&next, &scope, image.clone())
+                    .unwrap();
+                match control.backend_prepared_stopped(next.id()) {
+                    Err(error) if birth && input == "original-clone3" => {
+                        assert_eq!(error.to_string(), "clone-lifecycle-unverified");
+                    }
+                    Ok(actual) if !birth || input != "original-clone3" => {
+                        assert_eq!(actual, image);
+                    }
+                    other => panic!("input={input}, birth={birth}: {other:?}"),
+                }
+                // No page write or native issue occurs in this gate probe.
+                control.backend_not_run(next.id()).unwrap();
+                control.finish_operation(scope).unwrap();
+            }
+        }
     }
 }
