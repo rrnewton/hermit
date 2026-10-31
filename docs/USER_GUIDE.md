@@ -521,9 +521,10 @@ ptrace backend's precise timer, and not where the run records or replays
 preemptions or schedules, or uses `--target-timeslice`,
 `--chaos-per-thread-slowdown`, `--imprecise-timers`, turn-numbered triggers
 (`--stop-after-turn`, `--stop-after-iter`, `--signal-at`), stack traces at
-preemptions or events, manual interrupt points, a happens-before program or
-`--gdbserver` (a debugger stopping the thread between skipped ends would see
-Hermit's slice bookkeeping behind its program counter).
+preemptions or events, manual interrupt points, a happens-before program,
+`--chaos-instruction-offset` (each offset is stepped from a stop at its
+branch target) or `--gdbserver` (a debugger stopping the thread between
+skipped ends would see Hermit's slice bookkeeping behind its program counter).
 
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with

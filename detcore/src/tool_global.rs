@@ -1789,8 +1789,13 @@ impl GlobalState {
 
         let preemptions_to_replay: Option<HistoryReader> =
             cfg.replay_preemptions_from.as_ref().map(|path| {
-                // Keep ordinary file/JSON errors in their original panic class.
-                let history = HistoryReader::read(path).unwrap();
+                // Keep ordinary file/JSON errors in their original panic
+                // class; a record of a newer format is a policy refusal.
+                let history =
+                    crate::preemptions::boundary_recording::exit_on_record_format_refusal(
+                        HistoryReader::read(path),
+                    )
+                    .unwrap();
                 history
                     .require_replay_mode(cfg.replay_edited_preemptions)
                     .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
@@ -3456,6 +3461,16 @@ impl GlobalState {
             );
             return (None, R::PublishSignalDispositions(held));
         }
+        // Where the sender's ending timeslice's timer was armed
+        // (`publish_instruction_offset`): the same kind of message.
+        if let GlobalRequest::PublishInstructionOffset(offset) = request {
+            let taken = self
+                .sched
+                .lock()
+                .unwrap()
+                .publish_instruction_offset(dtid, request_mm, offset);
+            return (None, R::PublishInstructionOffset(taken));
+        }
         // A thread's mask from Detcore's copy
         // (`syscalls::signal_shadow::publish_mask`): the same kind of message.
         if let GlobalRequest::PublishSignalMask(mask) = request {
@@ -3726,7 +3741,22 @@ impl GlobalState {
                     .recv_request_resources(from, process, resources, Some(request_mm))
                     .await;
                 match response {
-                    SchedulerRpcResult::Continue(status) => R::ResumeExec(status, duration),
+                    SchedulerRpcResult::Continue(status) => {
+                        // A schedule replay's continuation installs the
+                        // grant's timeslice, and so the offset beside it.
+                        let offset = self
+                            .sched
+                            .lock()
+                            .unwrap()
+                            .take_granted_replay_instruction_offset(dtid, duration);
+                        let response = R::ResumeExec(status, duration);
+                        match offset {
+                            Some(offset) => {
+                                R::WithReplayInstructionOffset(offset, Box::new(response))
+                            }
+                            None => response,
+                        }
+                    }
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -3791,6 +3821,9 @@ impl GlobalState {
             }
             GlobalRequest::PublishSignalMask(_) => {
                 unreachable!("a published mask is answered before clock accounting")
+            }
+            GlobalRequest::PublishInstructionOffset(_) => {
+                unreachable!("a published instruction offset is answered before clock accounting")
             }
             GlobalRequest::PublishRuntimePrivateMemory(_) => {
                 unreachable!("private-memory publication precedes clock accounting")
@@ -4533,7 +4566,16 @@ impl GlobalState {
                     .recv_trace_schedevent(ev, detpid, request_mm, command_bootstrap, access)
                     .await
                 {
-                    SchedulerRpcResult::Continue(response) => R::TraceSchedEvent(response),
+                    SchedulerRpcResult::Continue((response, None)) => R::TraceSchedEvent(response),
+                    // The timeslice's recorded offset rides beside it, only
+                    // where there is one, so a replay of a schedule without
+                    // offsets answers exactly as before.
+                    SchedulerRpcResult::Continue((response, Some(offset))) => {
+                        R::WithReplayInstructionOffset(
+                            offset,
+                            Box::new(R::TraceSchedEvent(response)),
+                        )
+                    }
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -6180,6 +6222,12 @@ impl GlobalState {
             "[detcore, dtid {}] New thread given go-ahead to proceed via {}",
             &dettid, &response_ivar
         );
+        // A new thread installs no replay timeslice from its start grant,
+        // with or without an offset. Whatever the replayer gave it for that
+        // grant goes now, staged or moved by the grant: a signaled start
+        // grant consumes neither, and they must not reach a later grant
+        // (`Scheduler::forget_replay_timeslice`).
+        self.sched.lock().unwrap().forget_replay_timeslice(&dettid);
         if let Some(pr) = &self.preemptions_to_replay {
             let (history, old_prio) = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
@@ -6711,7 +6759,10 @@ impl GlobalState {
         request_mm: MmId,
         command_bootstrap: bool,
         access: Option<Box<crate::access_trace::AccessPayload>>,
-    ) -> SchedulerRpcResult<TraceSchedEventResponse> {
+    ) -> SchedulerRpcResult<(
+        TraceSchedEventResponse,
+        Option<crate::resources::InstructionOffset>,
+    )> {
         let ev = {
             let mut sched = self.lock_rpc_scheduler(false).await;
             if !sched.rpc_incarnation_matches(ev.dettid, request_mm) {
@@ -6774,6 +6825,7 @@ impl GlobalState {
                 print_stack,
                 event_ix: _,
                 timeslice_remaining: mut end_of_timeslice,
+                mut instruction_offset,
             } = consumed;
             trace!(
                 "keep_running :{}, end_of_timeslice: {:?}",
@@ -6801,6 +6853,12 @@ impl GlobalState {
                     return SchedulerRpcResult::ThreadExited;
                 }
                 end_of_timeslice = timeslice;
+                // The offset the replayer put beside this grant's timeslice.
+                instruction_offset = self
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .take_granted_replay_instruction_offset(ev.dettid, timeslice);
                 trace!(
                     "[detcore, dtid {}] Thread reactivated after yielding for replay schedule",
                     &ev.dettid,
@@ -6816,12 +6874,15 @@ impl GlobalState {
                 .lock_rpc_scheduler(false)
                 .await
                 .schedule_replay_reply(ev.dettid);
-            TraceSchedEventResponse {
-                print_stack_strace: print_stack.or(print_stack2),
-                timeslice: end_of_timeslice,
-                schedule_released,
-                schedule_over,
-            }
+            (
+                TraceSchedEventResponse {
+                    print_stack_strace: print_stack.or(print_stack2),
+                    timeslice: end_of_timeslice,
+                    schedule_released,
+                    schedule_over,
+                },
+                instruction_offset.filter(|_| end_of_timeslice.is_some()),
+            )
         } else {
             let print_stack_strace = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
@@ -6838,15 +6899,18 @@ impl GlobalState {
                     None
                 }
             };
-            TraceSchedEventResponse {
-                print_stack_strace,
-                timeslice: None,
-                schedule_released: false,
-                schedule_over: false,
-            }
+            (
+                TraceSchedEventResponse {
+                    print_stack_strace,
+                    timeslice: None,
+                    schedule_released: false,
+                    schedule_over: false,
+                },
+                None,
+            )
         };
 
-        if result.print_stack_strace.is_some() && self.cfg.stacktrace_signal.is_some() {
+        if result.0.print_stack_strace.is_some() && self.cfg.stacktrace_signal.is_some() {
             let _sched = self.lock_rpc_scheduler(false).await;
             self.signal_requested_stacktrace(ev.dettid);
         }
@@ -7081,7 +7145,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 16;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 18;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -7848,6 +7912,11 @@ pub enum GlobalRequest {
     /// A guest task was created with a host ID although Detcore chooses the
     /// IDs (`GlobalState::host_id_tasks`). Appended last.
     GaveHostId,
+    /// Where the timer of the sender's ending timeslice was armed
+    /// (`--chaos-instruction-offset`), for the change point it files next
+    /// (`Scheduler::publish_instruction_offset`). Answered before any clock or
+    /// scheduler accounting. Appended last.
+    PublishInstructionOffset(crate::resources::InstructionOffset),
 }
 
 /// Responses from the global object
@@ -8176,6 +8245,16 @@ pub enum GlobalResponse {
     NextGuestId(Option<i32>),
     /// The answer to `GlobalRequest::GaveHostId`. Appended last.
     GaveHostId(()),
+    /// Whether the scheduler took the offset (it takes nothing from a thread
+    /// it does not know, one killed, or a retired incarnation). Appended last.
+    PublishInstructionOffset(bool),
+    /// A `TraceSchedEvent` or `ResumeExec` answer whose timeslice a schedule
+    /// replay ends where its recording's timer stopped the thread, past its
+    /// branch target (`SchedEvent::instruction_offset`): the thread arms that
+    /// timer (`ThreadState::replay_instruction_offset`). Only around such an
+    /// answer, so a replay of a schedule without offsets answers as before.
+    /// Appended last.
+    WithReplayInstructionOffset(crate::resources::InstructionOffset, Box<GlobalResponse>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -8915,6 +8994,33 @@ where
         guest.send_rpc(message).await.1,
         GlobalResponse::PublishSignalMask(true)
     )
+}
+
+/// Tell the scheduler where the timer of the calling thread's ending timeslice
+/// was armed (`--chaos-instruction-offset`), just before the change point
+/// that ends it, which records it (`Scheduler::publish_instruction_offset`).
+/// Sent like [`publish_signal_mask`], only for a timeslice armed with an
+/// offset, so that a run without the option sends nothing more.
+pub(crate) async fn publish_instruction_offset<G, T>(
+    guest: &mut G,
+    offset: crate::resources::InstructionOffset,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state();
+    let message = (
+        state.thread_logical_time.clone(),
+        state.mm_id,
+        GlobalRequest::PublishInstructionOffset(offset),
+    );
+    // A refusal means the thread is gone or retired: it files no change
+    // point that could record the offset.
+    let answer = guest.send_rpc(message).await.1;
+    debug_assert!(matches!(
+        answer,
+        GlobalResponse::PublishInstructionOffset(_)
+    ));
 }
 
 async fn publish_runtime_private_memory<G, T>(guest: &mut G)
@@ -10234,7 +10340,8 @@ impl std::fmt::Debug for SchedEventForLog<'_> {
         if !self.command_bootstrap {
             return std::fmt::Debug::fmt(self.event, f);
         }
-        f.debug_struct("SchedEvent")
+        let mut event = f.debug_struct("SchedEvent");
+        event
             .field("dettid", &self.event.dettid)
             .field("op", &self.event.op)
             .field("count", &self.event.count)
@@ -10246,8 +10353,12 @@ impl std::fmt::Debug for SchedEventForLog<'_> {
                 "end_rip",
                 &self.event.end_rip.map(CommandBootstrapInstructionPointer),
             )
-            .field("end_time", &self.event.end_time)
-            .finish()
+            .field("end_time", &self.event.end_time);
+        // As `SchedEvent`'s own `Debug`: only an offset that is there.
+        if let Some(offset) = &self.event.instruction_offset {
+            event.field("instruction_offset", offset);
+        }
+        event.finish()
     }
 }
 
@@ -10321,6 +10432,11 @@ pub async fn trace_schedevent_with_access<G, T>(
     {
         guest.thread_state_mut().callback_history.observe_event(&ev);
     }
+    // In a schedule replay, an event that carries an instruction offset is
+    // the one the replayed offset was armed for: that offset is spent. (A
+    // preemption replay takes its offsets from its rows, slice by slice.)
+    let spends_offset =
+        ev.instruction_offset.is_some() && guest.config().replay_schedule_from.is_some();
     let resp = send_and_update_time(
         guest,
         GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap, access.map(Box::new)),
@@ -10328,16 +10444,20 @@ pub async fn trace_schedevent_with_access<G, T>(
     .await;
 
     trace!("trace_schedevent result: {:?}", resp);
-    match resp {
-        (
-            _,
-            GlobalResponse::TraceSchedEvent(TraceSchedEventResponse {
-                print_stack_strace,
-                timeslice,
-                schedule_released,
-                schedule_over,
-            }),
-        ) => {
+    let (instruction_offset, response) = match resp.1 {
+        GlobalResponse::WithReplayInstructionOffset(offset, response) => (Some(offset), *response),
+        response => (None, response),
+    };
+    if spends_offset {
+        guest.thread_state_mut().replay_instruction_offset = None;
+    }
+    match response {
+        GlobalResponse::TraceSchedEvent(TraceSchedEventResponse {
+            print_stack_strace,
+            timeslice,
+            schedule_released,
+            schedule_over,
+        }) => {
             if schedule_released {
                 guest.thread_state_mut().callback_history.release();
             }
@@ -10363,6 +10483,10 @@ pub async fn trace_schedevent_with_access<G, T>(
                 if guest.config().max_timeslice.is_some() {
                     guest.thread_state_mut().max_timeslice_end = Some(end_of_timeslice);
                 }
+                // Where the recorded slice this timeslice replays had its
+                // timer armed past its branch target, or `None`: the timer
+                // `post_handler_hook` arms for this slice.
+                guest.thread_state_mut().replay_instruction_offset = instruction_offset;
             }
         }
         _ => {
@@ -12545,7 +12669,14 @@ mod tests {
         let path = directory.path().join("recording");
         let mut writer = crate::preemptions::PreemptionWriter::new(Some(path.clone()));
         writer.register_thread(tid, DEFAULT_PRIORITY);
-        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(100),
+            10,
+            DEFAULT_PRIORITY,
+            20,
+            None,
+        );
         let mut scheduler = state.sched.lock().unwrap();
         scheduler.preemption_writer = Some(writer);
         let (summary, info_description) = scheduler
@@ -14888,6 +15019,118 @@ mod tests {
                 guest.thread.stats.timeslice_count,
             ),
         )
+    }
+
+    /// The coordinator's half of a schedule replay's exec continuation: the
+    /// `ResumeExec` answer carries the instruction offset beside the timeslice
+    /// its grant consumed (`exec_identity::exec_continuation_slice` reads
+    /// both), through the real RPC and a scheduler turn. The replay pair is
+    /// staged by hand here: the leader transfer that stages it and
+    /// `reconnect_exec`'s installation are not exercised, and no recorded
+    /// trace holds a nonleader exec (`reconnect_exec` refuses one while
+    /// recording, EOPNOTSUPP). A new thread installs no replay timeslice from
+    /// its start grant, with or without an offset, so a start grant, plain or
+    /// signaled, leaves neither the staged pair nor a granted offset behind.
+    #[tokio::test]
+    async fn a_resume_exec_answer_carries_its_grants_offset_and_a_start_grant_drops_it() {
+        let offset = crate::resources::InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let slice = LogicalTime::from_rcbs(123);
+        // 0: exec continuation; 1: start, granted by a turn; 2: start,
+        // answered with a pending signal, which consumes no timeslice.
+        for case in 0..3u8 {
+            let start = case != 0;
+            let (config, state, tid, process) = cancellation_test_state();
+            install_test_registration(&state, tid, Ivar::new());
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            if !start {
+                thread.next_timeslice(&config);
+            }
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .set_replay_timeslice(tid, Some(slice), Some(offset));
+            let mut guest = ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            };
+            let mut request = Box::pin(async {
+                if start {
+                    assert_eq!(
+                        super::thread_start_request(&config, &mut guest, process).await,
+                        None
+                    );
+                    None
+                } else {
+                    let response =
+                        super::send_and_update_time(&mut guest, GlobalRequest::ResumeExec(process))
+                            .await;
+                    Some(crate::tool_global::exec_identity::exec_continuation_slice(
+                        response.1,
+                    ))
+                }
+            });
+            for _ in 0..8 {
+                assert!(futures::poll!(&mut request).is_pending());
+                if state.sched.lock().unwrap().next_turns[&tid]
+                    .req
+                    .try_read()
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            if case == 2 {
+                let response = state.sched.lock().unwrap().next_turns[&tid].resp.clone();
+                response.put(crate::scheduler::SchedResponse::Signaled(Some(vec![
+                    crate::types::SigWrapper(libc::SIGUSR1),
+                ])));
+            } else {
+                crate::scheduler::do_a_turn_blocking(
+                    state.sched.clone(),
+                    state.global_time.clone(),
+                    &Err(crate::scheduler::SkipTurn),
+                )
+                .await
+                .expect("the grant's turn must commit");
+            }
+            let delivered = request.await;
+            if start {
+                assert_eq!(delivered, None);
+            } else {
+                assert_eq!(delivered, Some((Some(slice), Some(offset))));
+            }
+            let scheduler = state.sched.lock().unwrap();
+            assert!(
+                !scheduler.timeslices.contains_key(&tid),
+                "case {case}: the timeslice outlived its grant"
+            );
+            assert!(
+                scheduler.replay_instruction_offsets.is_empty(),
+                "case {case}: the staged offset outlived its grant"
+            );
+            assert!(
+                scheduler.granted_replay_instruction_offsets.is_empty(),
+                "case {case}: the granted offset outlived its grant"
+            );
+        }
+        // Without an offset the continuation's grant is as before.
+        assert_eq!(
+            crate::tool_global::exec_identity::exec_continuation_slice(GlobalResponse::ResumeExec(
+                ResumeStatus::Normal,
+                Some(slice)
+            )),
+            (Some(slice), None)
+        );
     }
 
     #[tokio::test]
@@ -20153,6 +20396,7 @@ mod tests {
             start_rip: None,
             end_rip: None,
             end_time: Some(LogicalTime::from_nanos(1)),
+            instruction_offset: None,
         };
         let next_event = SchedEvent {
             dettid: next_tid,
