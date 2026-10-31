@@ -5568,7 +5568,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
     // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
     // The same three inotify fault-boundary units: 3034 + 3 = 3037.
-    ("test.detcore_unit_on_host", 3037),
+    // The integrated chain tip recount that took test.detcore_unit to
+    // 3242 (2a1a7c67cd) measured the same selection this twin runs; the
+    // twin's pin stayed 3037, so the hosted/local count invariant failed
+    // on main. 3037 -> 3242 to match that measured recount.
+    ("test.detcore_unit_on_host", 3242),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
