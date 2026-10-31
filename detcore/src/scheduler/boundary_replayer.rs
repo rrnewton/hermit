@@ -178,6 +178,7 @@ mod tests {
             start_rip: None,
             end_rip: None,
             end_time: None,
+            instruction_offset: None,
         })
     }
     fn replay(records: Vec<Record>) -> BoundaryReplayer {

@@ -87,6 +87,10 @@ pub struct ChaosEpochTransition {
     pub factor: RcbTimeMultiplier,
 }
 
+/// Where a chaos timeslice with `--chaos-instruction-offset` ends (defined
+/// beside the schedule events, which record it too).
+pub use detcore_model::schedule::InstructionOffset;
+
 /// Identity of one syscall executing outside Hermit's serialized guest turns.
 #[derive(
     PartialEq,

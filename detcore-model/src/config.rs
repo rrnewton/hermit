@@ -771,6 +771,22 @@ pub struct Config {
     #[clap(long, default_value = "0", value_name = "nanos")]
     pub chaos_epoch_length_ns: u64,
 
+    /// Let a chaos preemption land up to this many instructions past the
+    /// conditional branch its timeslice ends on. `0` (the default) is off.
+    ///
+    /// A chaos timeslice ends after a retired conditional branch, so a race
+    /// window with no conditional branch in it is never split. With this set,
+    /// each timeslice that ends on its timer is delivered `k` single steps
+    /// past that branch instead, `k` drawn uniformly from `0..=N` for each
+    /// timeslice from the seed, so a preemption can land inside straight-line
+    /// code. A preemption record keeps each `k` and its branch count, and its
+    /// replay stops at the same instruction. Each step is one ptrace stop, so
+    /// a preemption costs up to `N` more. Needs `--chaos` and the ptrace
+    /// backend's precise timers on x86_64; at most 256.
+    #[serde(default)]
+    #[clap(long, default_value = "0", value_name = "instructions")]
+    pub chaos_instruction_offset: u64,
+
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
     #[clap(long)]
@@ -830,6 +846,24 @@ pub struct Config {
            value_name = "index[,path]",
            value_parser = parse_index_with_path)]
     pub stacktrace_event: Vec<(u64, Option<PathBuf>)>,
+
+    /// Internal, for `hermit analyze`: under `--replay-schedule-from`, each
+    /// `--stacktrace-event` index names a position of the replayed schedule,
+    /// not a traced event count. The stack prints when the replay consumes the
+    /// recorded event at that position, however many events the run observed
+    /// before it: a polling retry the recording did not make, say. A position
+    /// at or past the schedule's end names the events the run makes after the
+    /// replay consumed its last recorded event. A position the replay skips to
+    /// resync, or drops with the rest of a released schedule, never prints and
+    /// is reported as missed.
+    #[serde(default)]
+    #[clap(
+        long,
+        hide = true,
+        requires = "replay_schedule_from",
+        conflicts_with = "strict_schedule_boundaries"
+    )]
+    pub stacktrace_at_schedule_positions: bool,
 
     /// Internal feature used to signal the guest with SIGINT at every `--stacktrace-event`, this is
     /// in-lieu of using hermit's internal stacktrace printing facility, to instead have an external
@@ -1818,10 +1852,13 @@ impl Config {
     /// state at each end), no slice-boundary protocol, no stack traces at
     /// preemptions or events, no turn-numbered triggers (`--stop-after-turn`,
     /// `--stop-after-iter`, `--signal-at`), no happens-before program, no
-    /// manual interrupt points and no syscall-boundary deadline
-    /// (`--target-timeslice`). Never with a gdbserver either: a debugger is
-    /// served at the stops, and between skipped ends it would see Detcore's
-    /// slice bookkeeping lag the guest's program counter.
+    /// manual interrupt points, no syscall-boundary deadline
+    /// (`--target-timeslice`) and no instruction offsets
+    /// ([`Config::slice_ends_need_a_stop`]: an offset is stepped from a real
+    /// stop at its branch target, and processing a skipped end can draw one).
+    /// Never with a gdbserver either: a debugger is served at the stops, and
+    /// between skipped ends it would see Detcore's slice bookkeeping lag the
+    /// guest's program counter.
     pub fn replays_lone_preemptions(&self) -> bool {
         !self.eager_lone_preemptions
             && self.use_preemption_timer()
@@ -1841,6 +1878,7 @@ impl Config {
             && self.signal_at.is_none()
             && self.happens_before.is_none()
             && self.interrupt_at.is_empty()
+            && !self.slice_ends_need_a_stop()
             && !self.gdbserver
     }
 
@@ -1850,6 +1888,18 @@ impl Config {
     /// setting `--max-timeslice=disabled`.
     pub fn use_rcb_time(&self) -> bool {
         self.max_timeslice.is_some() && !self.no_rcb_time
+    }
+
+    /// Whether every chaos timeslice end needs the guest really stopped at
+    /// its PMU branch target: `--chaos-instruction-offset` single-steps from
+    /// that stop to where the timeslice ends. Any optimization that takes a
+    /// slice end without stopping the guest there (for example a lone
+    /// runnable thread's slice end processed at its branch count, which
+    /// [`Config::replays_lone_preemptions`] turns off) must be off while this
+    /// holds, or the offset is lost and a replay of the record no longer
+    /// stops where the recorded run did.
+    pub fn slice_ends_need_a_stop(&self) -> bool {
+        self.chaos && self.chaos_instruction_offset > 0
     }
 
     /// Whether a `FUTEX_WAKE` that woke `woken` waiters makes the waker yield
@@ -2064,6 +2114,13 @@ impl fmt::Display for Config {
                 write!(f, " --chaos-epoch-length-ns={}", self.chaos_epoch_length_ns)?;
             }
         }
+        if self.chaos_instruction_offset > 0 {
+            write!(
+                f,
+                " --chaos-instruction-offset={}",
+                self.chaos_instruction_offset
+            )?;
+        }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
         }
@@ -2132,6 +2189,9 @@ impl fmt::Display for Config {
         }
         if let Some(bytes) = self.access_trace_max_bytes {
             write!(f, " --access-trace-max-bytes={}", bytes)?;
+        }
+        if self.stacktrace_at_schedule_positions {
+            write!(f, " --stacktrace-at-schedule-positions")?;
         }
         if self.preemption_stacktrace {
             write!(f, " --preemption-stacktrace")?;
@@ -3000,7 +3060,9 @@ impl Default for Config {
 /// false. So is [`Config::notice_host_network_abstract_binds`], added after this form
 /// froze, which reads back as false: DBT's runtime then prints no notice for
 /// an abstract `AF_UNIX` bind. So is [`Config::eager_lone_preemptions`], added after this form froze,
-/// which has no effect without a PMU timer and reads back as false. Every
+/// which has no effect without a PMU timer and reads back as false, and
+/// [`Config::stacktrace_at_schedule_positions`], also added later, which reads
+/// back as false: the DBT runtime takes no stack traces. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
@@ -3557,7 +3619,12 @@ mod legacy_backend_json {
     /// `access_trace_max_bytes` came after it too; the scheduler writes the
     /// trace, and `hermit run` refuses it on DBT, so they are never written
     /// and read as unset, 0, unset and unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 44] = [
+    /// `chaos_instruction_offset` came after it as well: the ptrace backend's
+    /// precise timer takes its single steps, and `hermit run` refuses it on
+    /// every other backend, so it is never written and reads as 0.
+    /// `stacktrace_at_schedule_positions` came after it too. It is never
+    /// written and reads as false: the DBT runtime takes no stack traces.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 46] = [
         // `chaos_timeslice_range` came after it too: the scheduler draws the
         // slices, not the runtime, so it is never written and reads as unset.
         // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
@@ -3612,6 +3679,8 @@ mod legacy_backend_json {
         "access_trace_from",
         "access_trace_max_records",
         "access_trace_max_bytes",
+        "chaos_instruction_offset",
+        "stacktrace_at_schedule_positions",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3757,12 +3826,13 @@ mod legacy_backend_json {
                     | "container_procfs"
                     | "notice_host_network_abstract_binds"
                     | "replay_edited_preemptions"
-                    | "eager_lone_preemptions",
+                    | "eager_lone_preemptions"
+                    | "stacktrace_at_schedule_positions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
-                Some("in_guest_reserved_signals" | "access_trace_from") => {
-                    seed.deserialize(U64Deserializer::new(0)).map(Some)
-                }
+                Some(
+                    "in_guest_reserved_signals" | "access_trace_from" | "chaos_instruction_offset",
+                ) => seed.deserialize(U64Deserializer::new(0)).map(Some),
                 // On, as its serde default is.
                 Some("signal_state_copy") => {
                     seed.deserialize(BoolDeserializer::new(true)).map(Some)
@@ -4108,7 +4178,9 @@ mod legacy_backend_json {
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
-                | "access_trace_max_bytes" => Ok(()),
+                | "access_trace_max_bytes"
+                | "chaos_instruction_offset"
+                | "stacktrace_at_schedule_positions" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -4279,6 +4351,20 @@ mod tests {
         }
         let point: TimesliceRange = "4321..4321".parse().unwrap();
         assert_eq!(point.log_uniform(0.7), 4321.0);
+    }
+
+    /// `--chaos-instruction-offset` needs a real stop at every chaos slice
+    /// end; nothing else does, and the option is inert without `--chaos`.
+    #[test]
+    fn only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end() {
+        let mut config = Config::default();
+        assert!(!config.slice_ends_need_a_stop());
+        config.chaos_instruction_offset = 8;
+        assert!(!config.slice_ends_need_a_stop());
+        config.chaos = true;
+        assert!(config.slice_ends_need_a_stop());
+        config.chaos_instruction_offset = 0;
+        assert!(!config.slice_ends_need_a_stop());
     }
 
     /// The four capabilities split out of
@@ -5013,7 +5099,9 @@ mod tests {
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
-                | "access_trace_max_bytes" => {}
+                | "access_trace_max_bytes"
+                | "chaos_instruction_offset"
+                | "stacktrace_at_schedule_positions" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -5047,11 +5135,12 @@ mod tests {
         // `chaos_timeslice_range`, `chaos_timeslice_draw`, `chaos_timeslice`,
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
-        // `access_trace_max_bytes` and
+        // `access_trace_max_bytes`, `chaos_instruction_offset`,
+        // `stacktrace_at_schedule_positions` and
         // `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-three fewer, so twenty-nine keys fewer than fields.
+        // forty-five fewer, so thirty-one keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 29);
+        assert_eq!(fields.len(), keys.len() + 31);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5324,6 +5413,51 @@ mod tests {
         assert_eq!(
             from_legacy_backend_json(&array).unwrap().guest_ids,
             crate::pid::GuestIds::Namespace
+        );
+    }
+
+    /// `chaos_instruction_offset` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads back as 0 from
+    /// both the object and the array form.
+    #[test]
+    fn chaos_instruction_offset_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            chaos: true,
+            chaos_instruction_offset: 16,
+            ..off.clone()
+        };
+        let chaos = Config {
+            chaos: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&chaos).unwrap());
+        assert!(!json.contains("chaos_instruction_offset"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .chaos_instruction_offset,
+            0
+        );
+        assert!(
+            !to_legacy_backend_json(&off)
+                .unwrap()
+                .contains("chaos_instruction_offset")
         );
     }
 
@@ -5883,6 +6017,82 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .eager_lone_preemptions
+        );
+    }
+
+    /// `stacktrace_at_schedule_positions` came after the legacy form froze, so
+    /// it never enters it, and both the object and the array form read it
+    /// back as false.
+    #[test]
+    fn stacktrace_at_schedule_positions_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            stacktrace_at_schedule_positions: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("stacktrace_at_schedule_positions"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .stacktrace_at_schedule_positions
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .stacktrace_at_schedule_positions
+        );
+    }
+
+    /// `--stacktrace-at-schedule-positions` needs a replayed schedule, is
+    /// refused with `--strict-schedule-boundaries` (whose indices are
+    /// boundary-stream positions already), and round-trips through the
+    /// configuration's command line.
+    #[test]
+    fn stacktrace_at_schedule_positions_needs_a_replayed_schedule_and_round_trips() {
+        assert!(Config::try_parse_from(["detcore", "--stacktrace-at-schedule-positions"]).is_err());
+        assert!(
+            Config::try_parse_from([
+                "detcore",
+                "--replay-schedule-from=schedule.json",
+                "--strict-schedule-boundaries",
+                "--stacktrace-at-schedule-positions",
+            ])
+            .is_err()
+        );
+        let config = Config::try_parse_from([
+            "detcore",
+            "--replay-schedule-from=schedule.json",
+            "--stacktrace-event=7",
+            "--stacktrace-at-schedule-positions",
+        ])
+        .unwrap();
+        assert!(config.stacktrace_at_schedule_positions);
+        let rendered = config.to_string();
+        assert!(
+            rendered.contains(" --stacktrace-at-schedule-positions"),
+            "{rendered}"
+        );
+        let words: Vec<String> = shell_words::split(&rendered)
+            .unwrap()
+            .into_iter()
+            .filter(|word| word.starts_with("--replay-") || word.starts_with("--stacktrace-"))
+            .collect();
+        let reparsed =
+            Config::try_parse_from(std::iter::once("detcore".to_owned()).chain(words)).unwrap();
+        assert!(reparsed.stacktrace_at_schedule_positions, "{rendered}");
+        assert_eq!(
+            reparsed.stacktrace_event, config.stacktrace_event,
+            "{rendered}"
         );
     }
 
@@ -7095,6 +7305,14 @@ mod tests {
                 },
             ),
             (
+                "--chaos --chaos-instruction-offset=8",
+                Config {
+                    chaos: true,
+                    chaos_instruction_offset: 8,
+                    ..base.clone()
+                },
+            ),
+            (
                 "--gdbserver",
                 Config {
                     gdbserver: true,
@@ -7105,6 +7323,14 @@ mod tests {
         for (option, config) in off {
             assert!(!config.replays_lone_preemptions(), "{option}");
         }
+        // Chaos alone draws no offsets: its slice ends need no stop.
+        assert!(
+            Config {
+                chaos: true,
+                ..base.clone()
+            }
+            .replays_lone_preemptions()
+        );
     }
 
     #[test]

@@ -55,6 +55,17 @@ pub struct Replayer {
     /// The number of events we've popped from the recording.
     pub events_popped: u64,
 
+    /// How many events the replayed schedule has: the first position past
+    /// its end (`stacktrace_position`).
+    schedule_len: u64,
+    /// The schedule position of the recorded event the last observed event
+    /// consumed, if it consumed one (`stacktrace_position`).
+    last_consumed: Option<u64>,
+    /// The traced index of the first event observed after the replay consumed
+    /// the schedule's last event, if it did (`stacktrace_position`). A release
+    /// does not set it: the positions it drops are never consumed.
+    exhausted_from: Option<u64>,
+
     /// How many observed events in a row have left the schedule's next event
     /// unmatched (`UNMATCHED_EVENTS_BEFORE_RELEASE`).
     unmatched_run: u64,
@@ -169,6 +180,9 @@ fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
         if observed.end_time != expected.end_time {
             msg = "TIME-".to_owned() + &msg;
         }
+        if observed.instruction_offset != expected.instruction_offset {
+            msg = "OFFSET-".to_owned() + &msg;
+        }
         if observed.op == Op::Branch
             && expected.op == Op::Branch
             && observed.count != expected.count
@@ -204,6 +218,13 @@ fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
         return true;
     }
 
+    // Where a timer armed past its branch target stopped the thread: the
+    // replay arms the recorded one, so the observed event carries it exactly
+    // when the expected one does.
+    if observed.instruction_offset != expected.instruction_offset {
+        return true;
+    }
+
     false
 }
 
@@ -227,6 +248,9 @@ fn hard_desync_fields(observed: &SchedEvent, expected: &SchedEvent) -> Vec<&'sta
     }
     if expected.end_rip.is_some() && observed.end_rip != expected.end_rip {
         fields.push("end_rip");
+    }
+    if observed.instruction_offset != expected.instruction_offset {
+        fields.push("instruction_offset");
     }
     fields
 }
@@ -254,6 +278,7 @@ impl Replayer {
     /// Allocate a new replayer.
     pub fn new(i: impl IntoIterator<Item = SchedEvent>) -> Replayer {
         let cursor = ReplayCursor::from_iter(i);
+        let schedule_len = cursor.len() as u64;
         Replayer {
             syscalls_in_flight: BTreeMap::new(),
             kept_retry: None,
@@ -263,6 +288,9 @@ impl Replayer {
             replay_exhausted_panic: false,
             traced_event_count: 0,
             events_popped: 0,
+            schedule_len,
+            last_consumed: None,
+            exhausted_from: None,
             unmatched_run: 0,
             release: None,
         }
@@ -282,7 +310,12 @@ impl Replayer {
     /// RIP, but are followed directly by more branches or by another thread's
     /// event, which marks them as stops too.
     ///
-    /// Branches without a RIP followed by the thread's OtherInstructions
+    /// A batch with an instruction offset (`--chaos-instruction-offset`) is a
+    /// timer preemption too, though its recording follows it with the
+    /// thread's OtherInstructions (the instructions the timer stepped past the
+    /// branch target) and gives it no RIP.
+    ///
+    /// Other branches without a RIP followed by the thread's OtherInstructions
     /// reached a check-in after them: a syscall, a trapped instruction, a
     /// signal or an exec. The thread reaches that check-in on its own, and a
     /// context switch the schedule puts after it happens there. A stop on the
@@ -295,12 +328,19 @@ impl Replayer {
             count,
             dettid,
             end_rip,
+            instruction_offset,
             ..
         } = next
         else {
             return None;
         };
+        // A batch with an instruction offset ended at an offset timer
+        // (`--chaos-instruction-offset`) by construction. Its recording
+        // follows it with the thread's OtherInstructions, the instructions
+        // the timer stepped past the branch target, and gives it no RIP, so
+        // the shape alone would read as a slice that reached a check-in.
         let timer_preemption = end_rip.is_some()
+            || instruction_offset.is_some()
             || self
                 .cursor
                 .peek_nth(1)
@@ -402,6 +442,40 @@ impl Replayer {
         self.release.as_ref()
     }
 
+    /// Where the timer of the slice that [`Self::next_resume`]'s, and the last
+    /// `ReplayAction`'s, timeslice runs to was armed past its branch target,
+    /// if its recording armed it so (`SchedEvent::instruction_offset`). Read
+    /// right after `observe_event`, it belongs to that action's timeslice:
+    /// both come from the next event to replay, the timeslice from its
+    /// branch count (`resolve_time_to_run`) and this from its offset, so an
+    /// offset comes only with a timeslice.
+    pub(super) fn next_instruction_offset(
+        &self,
+    ) -> Option<detcore_model::schedule::InstructionOffset> {
+        let next = self.cursor.peek()?;
+        self.resolve_time_to_run(next)?;
+        next.instruction_offset
+    }
+
+    /// The schedule position of the event just observed, at traced index
+    /// `traced_ix`, for `--stacktrace-at-schedule-positions`: the position of
+    /// the recorded event it consumed, or, once the replay has consumed the
+    /// schedule's last event, a position past the end (the first event after
+    /// it is position `schedule_len`). `None` for an event the replay did not
+    /// consume, and for every event after a release.
+    ///
+    /// Positions follow the recording, not the observed count: an event the
+    /// schedule does not hold (a polling retry the recording did not make,
+    /// say) neither takes a position nor shifts the later ones, and a recorded
+    /// event the replay skips to resync takes no observed event.
+    pub(super) fn stacktrace_position(&self, traced_ix: u64) -> Option<u64> {
+        if let Some(position) = self.last_consumed {
+            return Some(position);
+        }
+        self.exhausted_from
+            .map(|first| self.schedule_len + (traced_ix - first))
+    }
+
     /// Whether the recorded schedule still has an event to replay. Past its
     /// end the run goes on unguided (`ReplayAction::Continue`).
     pub(super) fn has_events_left(&self) -> bool {
@@ -421,6 +495,10 @@ impl Replayer {
         let current_ix = self.traced_event_count;
         self.traced_event_count += 1;
         self.note_syscall_in_flight(observed);
+        self.last_consumed = None;
+        if self.cursor.is_empty() && self.release.is_none() && self.exhausted_from.is_none() {
+            self.exhausted_from = Some(current_ix);
+        }
 
         if let Some(expected) = self.peek_next() {
             debug!(
@@ -499,6 +577,7 @@ impl Replayer {
                         self.cursor.display_first_n(10)
                     );
                 }
+                self.last_consumed = Some(self.schedule_len - self.cursor.len() as u64);
                 let _ = self.pop_next();
                 self.unmatched_run = 0;
             }
@@ -724,6 +803,7 @@ mod builder {
                 start_rip: None,
                 end_rip: InstructionPointer::new(end_rip),
                 end_time: Some(self.time.as_nanos()),
+                instruction_offset: None,
                 op: Op::Syscall(sys_no, SyscallPhase::Prehook),
             }
         }
@@ -736,6 +816,7 @@ mod builder {
                 start_rip: None,
                 end_rip: InstructionPointer::new(end_rip),
                 end_time: Some(self.time.as_nanos()),
+                instruction_offset: None,
                 op: Op::Syscall(sys_no, SyscallPhase::Posthook),
             }
         }
@@ -746,6 +827,7 @@ mod builder {
                 dettid: tid,
                 start_rip: None,
                 end_time: Some(self.time.as_nanos()),
+                instruction_offset: None,
                 op: Op::OtherInstructions,
                 end_rip: InstructionPointer::new(end_rip),
             }
@@ -758,6 +840,7 @@ mod builder {
                 dettid: tid,
                 end_rip: None,
                 end_time: Some(self.time.as_nanos()),
+                instruction_offset: None,
                 op: Op::Branch,
                 start_rip: None,
             }
@@ -792,6 +875,67 @@ mod tests {
                 ..*se
             })
             .collect()
+    }
+
+    /// Schedule positions follow the recording: an observed event the
+    /// schedule does not hold neither takes a position nor shifts the later
+    /// ones, a recorded event the replay skips to resync takes no observed
+    /// event, and positions go on past the schedule's end once its last event
+    /// is consumed.
+    #[test]
+    fn stacktrace_positions_follow_the_schedule_and_continue_past_its_end() {
+        let mut b = builder::SchedTestBuilder::new();
+        let schedule = vec![
+            b.syscall_pre(Sysno::read, SOME_RIP, tid(3)),
+            b.syscall_post(Sysno::read, SOME_RIP, tid(3)),
+            b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
+            b.syscall_post(Sysno::write, SOME_RIP, tid(3)),
+            b.syscall_pre(Sysno::close, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(schedule.clone());
+
+        let _ = replayer.observe_event(&schedule[0]);
+        assert_eq!(replayer.stacktrace_position(0), Some(0));
+        // A polling retry the recording did not make.
+        let retry = SchedEvent {
+            op: Op::Syscall(Sysno::read, SyscallPhase::Polling),
+            ..schedule[0].clone()
+        };
+        let _ = replayer.observe_event(&retry);
+        assert_eq!(replayer.stacktrace_position(1), None);
+        let _ = replayer.observe_event(&schedule[1]);
+        assert_eq!(replayer.stacktrace_position(2), Some(1));
+        // The replay skips recorded positions 2 and 3 to resync on 4.
+        let _ = replayer.observe_event(&schedule[4]);
+        assert_eq!(replayer.stacktrace_position(3), Some(4));
+
+        // Past the end, positions go on from the schedule's length.
+        let after = b.syscall_post(Sysno::close, SOME_RIP, tid(3));
+        let _ = replayer.observe_event(&after);
+        assert_eq!(replayer.stacktrace_position(4), Some(5));
+        let _ = replayer.observe_event(&b.branch(9, tid(5)));
+        assert_eq!(replayer.stacktrace_position(5), Some(6));
+        assert_eq!(replayer.schedule_len, 5);
+    }
+
+    /// A released schedule consumes no further position, and its events
+    /// after the release take none past its end either: the positions the
+    /// release dropped were never consumed.
+    #[test]
+    fn a_released_schedule_takes_no_further_stacktrace_position() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.other(SOME_RIP, tid(3));
+        let spinner = b.other(SOME_RIP + 8, tid(5));
+        let mut replayer = Replayer::new([recorded.clone(), recorded.clone(), recorded]);
+        for _ in 0..UNMATCHED_EVENTS_BEFORE_RELEASE {
+            let _ = replayer.observe_event(&spinner);
+        }
+        assert!(replayer.released());
+        let after = UNMATCHED_EVENTS_BEFORE_RELEASE;
+        let _ = replayer.observe_event(&spinner);
+        assert_eq!(replayer.stacktrace_position(after), None);
+        let _ = replayer.observe_event(&spinner);
+        assert_eq!(replayer.stacktrace_position(after + 1), None);
     }
 
     /// A replay lets go of its schedule once `UNMATCHED_EVENTS_BEFORE_RELEASE`
@@ -1083,6 +1227,112 @@ mod tests {
         assert!(
             replayer.keep_retry_turn(tid(3)),
             "the schedule advanced, so the count starts again"
+        );
+    }
+
+    /// A recorded preemption's instruction offset comes with the timeslice
+    /// the replayer derives from its batch of branches, for the thread that
+    /// keeps running and for one a context switch hands the turn to, and never
+    /// without that timeslice.
+    #[test]
+    fn a_recorded_instruction_offset_comes_with_its_timeslice() {
+        let offset = detcore_model::schedule::InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let mut b = builder::SchedTestBuilder::new();
+        let continuing = vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
+            b.other(SOME_RIP, tid(3)),
+            b.branch(1, tid(5)),
+        ];
+        let mut replayer = Replayer::new(continuing.clone());
+        assert_eq!(replayer.next_instruction_offset(), None);
+        assert_eq!(
+            replayer.observe_event(&continuing[0]),
+            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+        );
+        assert_eq!(replayer.next_instruction_offset(), Some(offset));
+        assert_eq!(
+            replayer.next_resume(),
+            Some((tid(3), Some(LogicalTime::from_rcbs(123))))
+        );
+
+        let switching = vec![
+            b.other(SOME_RIP, tid(5)),
+            b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
+            b.other(SOME_RIP, tid(3)),
+            b.branch(1, tid(5)),
+        ];
+        let mut replayer = Replayer::new(switching.clone());
+        assert_eq!(
+            replayer.observe_event(&switching[0]),
+            ReplayAction::ContextSwitch(true, tid(3), Some(LogicalTime::from_rcbs(123)))
+        );
+        assert_eq!(replayer.next_instruction_offset(), Some(offset));
+
+        // As a recording produces it when the thread kept running after the
+        // slice end: the offset timer's batch, its `OtherInstructions`
+        // event, then a syscall of the same thread at once. The batch keeps
+        // its timeslice and offset (`resolve_time_to_run`), as a timer stop
+        // with its RIP does, so the replay stops the thread where the
+        // recording did before it runs on to the syscall.
+        let continued_to_a_syscall = vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
+            b.other(SOME_RIP, tid(3)),
+            b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(continued_to_a_syscall.clone());
+        assert_eq!(
+            replayer.observe_event(&continued_to_a_syscall[0]),
+            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+        );
+        assert_eq!(replayer.next_instruction_offset(), Some(offset));
+    }
+
+    /// A batch of branches observed without the offset its recording carries
+    /// (a replay that did not stop the thread where its recording did), or
+    /// with another one, is a hard desync that names the offset, and a fatal
+    /// one under `--die-on-desync`.
+    #[test]
+    fn a_missed_instruction_offset_is_a_hard_desync() {
+        let offset = detcore_model::schedule::InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.branch(123, tid(3)).with_instruction_offset(Some(offset));
+        let missed = SchedEvent {
+            instruction_offset: None,
+            ..recorded
+        };
+        let moved = SchedEvent {
+            instruction_offset: Some(detcore_model::schedule::InstructionOffset {
+                instructions: 5,
+                ..offset
+            }),
+            ..recorded
+        };
+        for observed in [&missed, &moved] {
+            assert!(is_desync(observed, &recorded));
+            assert!(is_hard_desync(observed, &recorded));
+            assert_eq!(
+                hard_desync_fields(observed, &recorded),
+                vec!["instruction_offset"]
+            );
+            assert!(compare_desync(observed, &recorded).starts_with("OFFSET-"));
+        }
+        // And in the other direction: an offset the recording does not have.
+        assert!(is_hard_desync(&recorded, &missed));
+        assert!(!is_desync(&recorded, &recorded));
+
+        let mut replayer = Replayer::new(vec![recorded.clone(), b.branch(1, tid(5))]);
+        replayer.die_on_desync = true;
+        assert_eq!(
+            replayer.observe_event(&missed),
+            ReplayAction::Stop(StopReason::FatalDesync)
         );
     }
 

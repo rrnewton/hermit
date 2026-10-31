@@ -94,7 +94,9 @@ pub struct AnalyzeOpts {
     /// replaying all of it the target outcome; a binary search finds the K at which the
     /// outcome flips. Event #K is the scheduling decision that commits the run to the target:
     /// the report shows the stack of the thread the target schedule runs there and of the
-    /// thread the scheduler would run instead.
+    /// thread the scheduler would run instead. Each stack is taken where the trial's replay
+    /// consumes the recorded event at position K, however many polling retries the trial
+    /// made before it.
     ///
     /// Unlike the default search, it needs no baseline schedule, so events that only one of
     /// two unrelated runs executed (timeslices that end at other points, iterations of a
@@ -286,6 +288,13 @@ pub struct AnalyzeOpts {
     /// measured before it.
     #[clap(skip)]
     pub endpoints: EndpointMeasurements,
+
+    /// Whether the analysis replays `--chaos-instruction-offset` decisions:
+    /// its run arguments draw them, or a recording it starts from holds them
+    /// (`AnalyzeOpts::adopt_instruction_offsets`). Its schedule replays then
+    /// run without chaos (`RunData::with_schedule_replay_from`).
+    #[clap(skip)]
+    pub replays_instruction_offsets: bool,
 }
 
 /// `--trial-timeout`.

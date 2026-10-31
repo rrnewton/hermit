@@ -521,9 +521,10 @@ ptrace backend's precise timer, and not where the run records or replays
 preemptions or schedules, or uses `--target-timeslice`,
 `--chaos-per-thread-slowdown`, `--imprecise-timers`, turn-numbered triggers
 (`--stop-after-turn`, `--stop-after-iter`, `--signal-at`), stack traces at
-preemptions or events, manual interrupt points, a happens-before program or
-`--gdbserver` (a debugger stopping the thread between skipped ends would see
-Hermit's slice bookkeeping behind its program counter).
+preemptions or events, manual interrupt points, a happens-before program,
+`--chaos-instruction-offset` (each offset is stepped from a stop at its
+branch target) or `--gdbserver` (a debugger stopping the thread between
+skipped ends would see Hermit's slice bookkeeping behind its program counter).
 
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
@@ -879,7 +880,10 @@ loop), no single swap may separate the outcomes. `--prefix-search` searches
 within the failing schedule instead: each trial replays its first K events and
 then schedules without chaos, and a binary search finds the event at which the
 outcome flips. The report shows the stack of the thread the failing schedule
-runs at that event and of the thread that runs there otherwise:
+runs at that event and of the thread that runs there otherwise. Each stack is
+taken where the trial's replay consumes the recorded event at that schedule
+position, so a trial that makes more or fewer polling retries before it than
+the recording did still shows that event's stack:
 
 ```bash
 hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \

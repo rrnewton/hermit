@@ -420,6 +420,13 @@ impl AnalyzeOpts {
     /// return whether it met the target with the stack at schedule position
     /// `position`: a replayed event, or, at `len`, the first event the
     /// scheduler ran after the prefix.
+    ///
+    /// The stack is requested by schedule position
+    /// (`--stacktrace-at-schedule-positions`), not by traced index: the trial
+    /// can observe events its schedule does not hold before `position`, such
+    /// as a polling retry the recording did not make, and a traced index
+    /// would then name a neighbouring event
+    /// (https://github.com/rrnewton/hermit/issues/4917).
     fn prefix_stack(
         &self,
         runname: &str,
@@ -427,10 +434,7 @@ impl AnalyzeOpts {
         len: usize,
         position: usize,
     ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
-        let mut run = self.prefix_trial(runname, schedule, len)?;
-        let stack_path = run.root_path().with_extension("stack");
-        run.runopts.det_opts.det_config.stacktrace_event =
-            vec![(position as u64, Some(stack_path.clone()))];
+        let (mut run, stack_path) = self.prefix_stack_trial(runname, schedule, len, position)?;
         let is_match = self.launch_prefix_trial(&mut run, RunData::launch)?;
         eprintln!(
             ":: {}\n{}",
@@ -444,6 +448,23 @@ impl AnalyzeOpts {
             Err(_) => None,
         };
         Ok((is_match, stack))
+    }
+
+    /// The prefix trial `prefix_stack` launches, and the file its stack goes
+    /// to: the stack at schedule `position`, requested by position.
+    fn prefix_stack_trial(
+        &self,
+        runname: &str,
+        schedule: &PreemptionRecord,
+        len: usize,
+        position: usize,
+    ) -> anyhow::Result<(RunData, PathBuf)> {
+        let mut run = self.prefix_trial(runname, schedule, len)?;
+        let stack_path = run.root_path().with_extension("stack");
+        let config = &mut run.runopts.det_opts.det_config;
+        config.stacktrace_event = vec![(position as u64, Some(stack_path.clone()))];
+        config.stacktrace_at_schedule_positions = true;
+        Ok((run, stack_path))
     }
 
     /// The completed outcome and schedule of a prefix trial: the replayed
@@ -514,8 +535,8 @@ impl AnalyzeOpts {
             );
         }
         // The thread the scheduler runs at event #decision once the prefix
-        // ends. `--stacktrace-event` names a position of the replayed schedule
-        // only, so the prefix trial without event #decision runs first with its
+        // ends. A stack is requested by a position of the replayed schedule,
+        // so the prefix trial without event #decision runs first with its
         // schedule recorded, and the stack is taken from a replay of that
         // schedule's first decision + 1 events.
         let completed = continuation(&schedule, decision)?;
@@ -915,6 +936,7 @@ impl AnalyzeOpts {
             } else if let Some(path) = &self.run2_preemptions {
                 // Replay from preemption record to record schedule.
                 ro.det_opts.det_config.replay_preemptions_from = Some(path.clone());
+                RunData::draw_no_instruction_offsets(ro);
                 // TODO: if the file already contains a schedule, we don't need to rerun it.
                 // Unless selfcheck is specified.
                 from_where = "--run2-preemptions";
@@ -930,6 +952,7 @@ impl AnalyzeOpts {
 
                 // Otherwise we just assume that a *baseline* (non-chaos) run will do the trick.
                 ro.det_opts.det_config.chaos = false;
+                RunData::draw_no_instruction_offsets(ro);
             }
             newrun.launch()?;
             self.record_endpoint(&newrun);
@@ -1320,12 +1343,16 @@ impl AnalyzeOpts {
         .into_iter()
         .filter_map(|(option, path)| Some((option, path?)))
         .collect();
+        // First: a recording of a format this Hermit does not read is
+        // refused before anything else is read from it.
+        self.refuse_unread_record_formats(&recordings)?;
         self.adopt_recorded_epoch(&recordings)?;
         // Every trial charges expired timed waits as the target did.
         self.adopt_expired_wait_charge(run1.as_deref())?;
         // Every trial registers queued sleeps as the target did.
         self.adopt_recorded_timeslice(&recordings)?;
-        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
+        self.adopt_instruction_offsets(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every
@@ -2194,6 +2221,41 @@ mod tests {
         }
     }
 
+    /// A prefix stack trial asks for its stack by schedule position
+    /// (`--stacktrace-at-schedule-positions`), not by traced index: a trial
+    /// that makes a polling retry its recording did not make would otherwise
+    /// print a neighbouring event's stack
+    /// (https://github.com/rrnewton/hermit/issues/4917). The request names the
+    /// position, its stack file, and the replayed prefix, and the trial's
+    /// repro command carries the option.
+    #[test]
+    fn a_prefix_stack_trial_requests_its_stack_by_schedule_position() {
+        let parent = tempfile::tempdir().unwrap();
+        let tmp_dir = format!("--tmp-dir={}", parent.path().display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        options.phase0_initialize().unwrap();
+        let tid = detcore::types::DetTid::from_raw(3);
+        let target = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 4),
+            SchedEvent::branches(tid, 5),
+        ]);
+        let (run, stack_path) = options
+            .prefix_stack_trial("final_target_for_stacktraces", &target, 3, 2)
+            .unwrap();
+        let config = &run.runopts.det_opts.det_config;
+        assert!(config.stacktrace_at_schedule_positions);
+        assert_eq!(config.stacktrace_event, vec![(2, Some(stack_path))]);
+        assert!(config.replay_schedule_from.is_some());
+        assert!(
+            run.to_repro()
+                .contains(" --stacktrace-at-schedule-positions"),
+            "{}",
+            run.to_repro()
+        );
+    }
+
     /// The final prefix report repeats the trial's counter caveat in its
     /// JSON and immediately below its banner, and omits it for exact counters.
     #[test]
@@ -2752,6 +2814,259 @@ mod tests {
                 "{run_args:?}: {message}"
             );
         }
+    }
+
+    /// `--chaos-instruction-offset` in analyze and bisect: their trials replay
+    /// the offsets the schedule traces carry, so a record with offsets, or
+    /// run arguments that draw them, are analyzed rather than refused. Each
+    /// trial that replays a record, and the baseline without chaos, draws no
+    /// offsets of its own; the search's chaos runs keep the option. Every
+    /// schedule analyze writes (each trial's, the final ones) keeps its
+    /// events' offsets, stamped format 2. Recordings with and without offsets
+    /// combine. Refused before any trial: a record whose rows hold offsets its
+    /// schedule trace does not, a record of a newer format, and offsets the
+    /// trials cannot stop at (imprecise timers, `--imprecise-search`).
+    #[test]
+    fn analyze_carries_instruction_offsets_through_its_trials() {
+        use detcore::preemptions::InstructionOffset;
+        use detcore::preemptions::PreemptionWriter;
+        use detcore::types::DetTid;
+        let dir = tempfile::tempdir().unwrap();
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let batch = |offset: Option<InstructionOffset>| {
+            SchedEvent::branches(tid, 22).with_instruction_offset(offset)
+        };
+        let record = |name: &str, offset: Option<InstructionOffset>| {
+            let mut writer = PreemptionWriter::new(None);
+            writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                detcore::types::LogicalTime::from_nanos(220),
+                22,
+                detcore::DEFAULT_PRIORITY,
+                5,
+                offset,
+            );
+            writer.insert_schedevent(batch(offset));
+            let path = dir.path().join(format!("{name}.json"));
+            std::fs::write(&path, writer.into_string()).unwrap();
+            path
+        };
+        let edited = |name: &str, edit: &dyn Fn(&mut serde_json::Value)| {
+            let path = record(name, Some(offset));
+            let mut json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            edit(&mut json);
+            std::fs::write(&path, json.to_string()).unwrap();
+            path
+        };
+        let prepare = |run1: &Path, run2: Option<&Path>, flags: &[&str], run_args: &[&str]| {
+            let run1 = format!("--run1-preemptions={}", run1.display());
+            let run2 = run2.map(|path| format!("--run2-preemptions={}", path.display()));
+            let mut argv = vec!["hermit", "analyze", run1.as_str()];
+            argv.extend(run2.as_deref());
+            argv.extend(flags);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.prepare(&args.global).map(|_| options)
+        };
+        let with = record("with", Some(offset));
+        let without = record("without", None);
+
+        // Accepted: a record with offsets, alone or beside one without, and
+        // run arguments that draw offsets. Each such analysis replays offsets;
+        // one without any does not.
+        let options = prepare(&with, None, &[], &[]).unwrap();
+        assert!(options.replays_instruction_offsets);
+        assert!(
+            prepare(&with, Some(&without), &[], &[])
+                .unwrap()
+                .replays_instruction_offsets
+        );
+        assert!(
+            prepare(&without, Some(&with), &[], &[])
+                .unwrap()
+                .replays_instruction_offsets
+        );
+        let drawing = prepare(
+            &without,
+            None,
+            &[],
+            &["--chaos", "--chaos-instruction-offset=8"],
+        )
+        .unwrap();
+        assert!(drawing.replays_instruction_offsets);
+        let plain = prepare(&without, None, &[], &["--chaos"]).unwrap();
+        assert!(!plain.replays_instruction_offsets);
+
+        // Its schedule replays run without chaos, whose draws have no offset;
+        // an analysis without offsets keeps chaos in them, as before.
+        let chaotic = prepare(&with, None, &[], &["--chaos"]).unwrap();
+        for (mut analysis, chaos) in [(chaotic, false), (plain.clone(), true)] {
+            analysis.tmp_dir = Some(dir.path().to_path_buf());
+            let raw = RunData::get_raw_runopts(&analysis);
+            assert!(raw.det_opts.det_config.chaos);
+            let replay = RunData::new(&analysis, "schedule-trial".to_owned(), raw)
+                .with_schedule_replay_from(with.clone())
+                .into_runopts();
+            assert_eq!(replay.det_opts.det_config.chaos, chaos);
+            assert_eq!(replay.det_opts.det_config.chaos_instruction_offset, 0);
+        }
+
+        // The search's chaos run keeps the option; a replay and a run without
+        // chaos draw none.
+        let raw = RunData::get_raw_runopts(&drawing);
+        assert_eq!(raw.det_opts.det_config.chaos_instruction_offset, 8);
+        for replay in ["preemptions", "schedule", "baseline"] {
+            let mut trial = raw.clone();
+            let config = &mut trial.det_opts.det_config;
+            match replay {
+                "preemptions" => config.replay_preemptions_from = Some(with.clone()),
+                "schedule" => config.replay_schedule_from = Some(with.clone()),
+                _ => config.chaos = false,
+            }
+            RunData::draw_no_instruction_offsets(&mut trial);
+            assert_eq!(
+                trial.det_opts.det_config.chaos_instruction_offset, 0,
+                "{replay}"
+            );
+        }
+        let mut search = raw;
+        RunData::draw_no_instruction_offsets(&mut search);
+        assert_eq!(search.det_opts.det_config.chaos_instruction_offset, 8);
+
+        // Every schedule analyze writes keeps its events' offsets.
+        let (failing, passing, trial) = (
+            dir.path().join("final-failing.json"),
+            dir.path().join("final-passing.json"),
+            dir.path().join("trial.json"),
+        );
+        options.write_final_schedules(
+            vec![batch(Some(offset))],
+            &failing,
+            vec![batch(None)],
+            &passing,
+        );
+        options
+            .write_trial_schedule(vec![batch(None), batch(Some(offset))], &trial)
+            .unwrap();
+        for (path, expected) in [(&failing, Some(2)), (&passing, None), (&trial, Some(2))] {
+            let json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(json["format_version"].as_u64(), expected, "{json}");
+            let written = PreemptionReader::new(path).load_all();
+            assert_eq!(
+                written.schedule_carries_instruction_offsets(),
+                expected.is_some(),
+                "{json}"
+            );
+        }
+
+        // Refused before any trial.
+        let rows_only = edited("rows-only", &|json| {
+            let object = json.as_object_mut().unwrap();
+            object.remove("format_version");
+            object["global"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("instruction_offset");
+        });
+        // A format this Hermit does not read is refused before anything else
+        // is read from the record: here its epoch, which the run arguments'
+        // --epoch would contradict.
+        let newer = edited("newer", &|json| {
+            json["format_version"] = (detcore::preemptions::PREEMPTION_RECORD_FORMAT + 1).into();
+            json["epoch"] = "2001-02-03T04:05:06Z".into();
+        });
+        // Recorded under --chaos-per-thread-slowdown: its rows hold slowdown
+        // epochs, which a schedule replay without chaos does not apply.
+        let slowed = edited("slowed", &|json| {
+            json["per_thread"]["3"]["chaos_epochs"] =
+                serde_json::json!([{"logical_time": 0, "epoch": 0, "factor": 4294967296_u64}]);
+        });
+        let imprecise_search: &[&str] = &["--imprecise-search"];
+        let epoch: &[&str] = &["--epoch=2026-01-01T00:00:00Z"];
+        for (run1, run2, flags, run_args, expected) in [
+            (
+                &rows_only,
+                None,
+                &[][..],
+                &[][..],
+                "its schedule trace does not record the instruction offsets its rows hold",
+            ),
+            (&without, Some(&rows_only), &[], &[], "--run2-preemptions"),
+            (
+                &newer,
+                None,
+                &[],
+                epoch,
+                "is format 3, written by a newer Hermit",
+            ),
+            (
+                &without,
+                Some(&newer),
+                &[],
+                epoch,
+                "is format 3, written by a newer Hermit",
+            ),
+            (&slowed, None, &[], &[], "recorded with it"),
+            (
+                &with,
+                None,
+                &[],
+                &["--chaos", "--chaos-per-thread-slowdown"],
+                "the run arguments' --chaos-per-thread-slowdown",
+            ),
+            (
+                &with,
+                None,
+                &[],
+                &["--imprecise-timers"],
+                "--imprecise-timers takes no single steps",
+            ),
+            (
+                &without,
+                None,
+                imprecise_search,
+                &["--chaos", "--chaos-instruction-offset=8"],
+                "--imprecise-search searches with imprecise timers",
+            ),
+        ] {
+            let error = prepare(run1, run2.map(PathBuf::as_path), flags, run_args).unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{expected}: {error:#}"
+            );
+        }
+        // Schedule offsets in a record of no format: malformed, an error
+        // rather than a policy refusal.
+        let malformed = edited("malformed", &|json| {
+            json.as_object_mut().unwrap().remove("format_version");
+        });
+        let error = prepare(&malformed, None, &[], &[]).unwrap_err();
+        assert!(error.downcast_ref::<PolicyRefusal>().is_none(), "{error:#}");
+        assert!(format!("{error:#}").contains("malformed"), "{error:#}");
+        // The slowdown refusal names the change that lifts it.
+        let error = prepare(&slowed, None, &[], &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("#4614"), "{error:#}");
+        // An analysis without offsets keeps its slowdown, as before.
+        prepare(
+            &without,
+            None,
+            &[],
+            &["--chaos", "--chaos-per-thread-slowdown"],
+        )
+        .unwrap();
     }
 
     /// Every record analyze writes states the trials' signal-state copy

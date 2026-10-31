@@ -1351,6 +1351,7 @@ fn record_or_replay_config_with_timer_support(
         die_on_desync: true,
         replay_edited_preemptions: false,
         stacktrace_event: Vec::new(),
+        stacktrace_at_schedule_positions: false,
         stacktrace_signal: None,
         access_trace: None,
         access_trace_from: 0,
@@ -1387,6 +1388,7 @@ fn record_or_replay_config_with_timer_support(
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        chaos_instruction_offset: 0,
         fuzz_seed: None,
     }
     .with_backend(|backend| {

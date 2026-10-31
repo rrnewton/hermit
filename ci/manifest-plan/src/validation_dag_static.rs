@@ -1219,7 +1219,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
-    ("test.regular_crates", 1929),
+    // And detcore-model's
+    // only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end
+    // (--chaos-instruction-offset): 1930.
+    // And chaos_instruction_offset_never_enters_the_legacy_form: 1931.
+    // And detcore-model's
+    // an_absent_offset_leaves_an_event_unchanged_and_a_present_one_round_trips
+    // (schedule events carry --chaos-instruction-offset's offsets): 1932.
+    // And hermit-verify's
+    // a_split_keeps_the_instruction_offset_on_the_fragment_that_ends_the_batch
+    // and split_branches_in_file_leaves_an_offset_batch_whole: 1934.
+    // And hermit-verify's
+    // interpolation_refuses_a_newer_record_before_reading_its_settings: 1935.
+    // And detcore-model's stacktrace_at_schedule_positions_never_enters_the_legacy_form and
+    // stacktrace_at_schedule_positions_needs_a_replayed_schedule_and_round_trips
+    // (https://github.com/rrnewton/hermit/issues/4917): 1937.
+    ("test.regular_crates", 1937),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1901,7 +1916,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
-    ("test.hermit_unit", 1289),
+    // And run's chaos_instruction_offset_round_trips_and_is_refused_where_inert
+    // and replay_of_instruction_offsets_is_refused_where_unsupported
+    // (--chaos-instruction-offset): 1291.
+    // And three units of --chaos-instruction-offset in analyze: phases'
+    // analyze_carries_instruction_offsets_through_its_trials, minimize's
+    // minimizing_keeps_each_rows_branch_target_and_instruction_offset and
+    // schedule_search's
+    // a_spliced_branch_batch_keeps_its_instruction_offset_with_its_end: 1294.
+    // And bisect_replays_offset_schedules_without_chaos and
+    // an_offset_batch_is_not_split: 1296.
+    // And analyze::phases' a_prefix_stack_trial_requests_its_stack_by_schedule_position
+    // (https://github.com/rrnewton/hermit/issues/4917): 1297.
+    ("test.hermit_unit", 1297),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3152,7 +3179,32 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
     // The inotify fault-boundary repair adds three detcore units: 3034 + 3 = 3037, by nextest list.
-    ("test.detcore_unit", 3037),
+    // And eight --chaos-instruction-offset units: tool_local's draw, its own
+    // stream and its record/replay hand-off, preemptions' offset rows, the
+    // kept timer, the replay target, a scheduler-recorded offset, and the
+    // hooks arming, recording and replaying one offset slice: 3045.
+    // And a_published_instruction_offset_dies_with_its_thread: 3046.
+    // And six units of schedule-trace instruction offsets: preemptions'
+    // format stamping and minimized rows, the replayer's offset beside its
+    // timeslice and its desync, the scheduler's hand-off with a grant, and the
+    // hooks arming a schedule replay's recorded offset: 3049.
+    // And a_record_is_read_only_in_a_format_this_hermit_reads and
+    // an_edit_of_a_rows_only_record_keeps_it_rows_only: 3051.
+    // And a_resume_exec_answer_carries_its_grants_offset_and_a_start_grant_drops_it:
+    // 3052.
+    // And a_boundary_recording_holding_an_instruction_offset_is_malformed:
+    // 3053.
+    // And a_control_answer_leaves_the_replay_pair_staged_together and
+    // an_envelope_states_its_format_only_inside_it: 3058.
+    // And a_schedule_prefix_keeps_its_sources_record_format, for main's
+    // prefix records: 3059.
+    // And a_record_format_round_trips_through_the_legacy_fields_and_the_envelope,
+    // for main's record serde: 3060.
+    // And a_marked_record_states_its_format_inside_its_envelope: 3061.
+    // And an_unread_stated_format_survives_every_format_raise: 3062.
+    // And https://github.com/rrnewton/hermit/issues/4917's four schedule-position stack units
+    // (two replayer::tests, two scheduler::test): 3066.
+    ("test.detcore_unit", 3066),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4485,7 +4537,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
-    ("test.cli", 744),
+    // And chaos_instruction_offset_splits_a_branch_free_window and
+    // a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets
+    // (tests/c/branch_free_race.c, x86_64 only): 746.
+    // And an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints
+    // (tests/c/branch_free_race.c, x86_64 only): 747.
+    // And a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries
+    // (https://github.com/rrnewton/hermit/issues/4917): 748.
+    ("test.cli", 748),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5057,7 +5116,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
-    ("test.cli_on_host", 663),
+    // And the same two --chaos-instruction-offset tests, not excluded: 665.
+    // And the same schedule-replay and analyze offset test, not excluded: 666.
+    // And the same schedule-position stack test, not excluded: 667.
+    ("test.cli_on_host", 667),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5561,7 +5623,20 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
     // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
     // The same three inotify fault-boundary units: 3034 + 3 = 3037.
-    ("test.detcore_unit_on_host", 3037),
+    // And the same eight --chaos-instruction-offset units: 3045.
+    // And the same published-offset unit: 3046.
+    // And the same six schedule-trace offset units: 3049.
+    // And the same two record-format units: 3051.
+    // And the same replay-grant unit: 3052.
+    // And the same malformed boundary-recording unit: 3053.
+    // And the same control-answer and envelope-format units: 3058.
+    // And the same prefix-record unit: 3059.
+    // And the same record-serde unit: 3060.
+    // And the same marked-record format unit: 3061.
+    // And the same stated-format unit: 3062.
+    // And the same four schedule-position stack units of
+    // https://github.com/rrnewton/hermit/issues/4917: 3066.
+    ("test.detcore_unit_on_host", 3066),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5954,7 +6029,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
-    ("test.hermit_unit_on_host", 1283),
+    // And the same two --chaos-instruction-offset run units: 1285.
+    // And the same three analyze offset units: 1288.
+    // And the same bisect and splitting units: 1290.
+    // And the same prefix stack trial unit of
+    // https://github.com/rrnewton/hermit/issues/4917: 1291.
+    ("test.hermit_unit_on_host", 1291),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6181,7 +6261,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738: the same nine added cases: 1927 - 14 = 1913.
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
-    ("test.regular_crates_on_host", 1915),
+    // And the same --chaos-instruction-offset detcore-model unit: 1916.
+    // And the same legacy-form unit: 1917.
+    // And the same schedule-event offset unit: 1918.
+    // And the same two hermit-verify splitting units: 1920.
+    // And the same hermit-verify interpolation unit: 1921.
+    // And the same two detcore-model units of
+    // https://github.com/rrnewton/hermit/issues/4917: 1923.
+    ("test.regular_crates_on_host", 1923),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

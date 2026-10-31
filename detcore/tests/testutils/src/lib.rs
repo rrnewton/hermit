@@ -183,6 +183,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         die_on_desync: false,
         replay_edited_preemptions: false,
         stacktrace_event: Vec::new(),
+        stacktrace_at_schedule_positions: false,
         stacktrace_signal: None,
         access_trace: None,
         access_trace_from: 0,
@@ -219,6 +220,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        chaos_instruction_offset: 0,
     }
     .with_backend(|backend| {
         detcore::set_kernel_signal_facts(backend, false);
@@ -315,6 +317,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         replay_schedule_from: None,
         replay_exhausted_panic: false,
         stacktrace_event: Vec::new(),
+        stacktrace_at_schedule_positions: false,
         stacktrace_signal: None,
         access_trace: None,
         access_trace_from: 0,
@@ -351,6 +354,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        chaos_instruction_offset: 0,
     }
     .with_backend(|backend| {
         detcore::set_kernel_signal_facts(backend, false);
@@ -447,6 +451,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         die_on_desync: false,
         replay_edited_preemptions: false,
         stacktrace_event: Vec::new(),
+        stacktrace_at_schedule_positions: false,
         stacktrace_signal: None,
         access_trace: None,
         access_trace_from: 0,
@@ -483,6 +488,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        chaos_instruction_offset: 0,
     }
     .with_backend(|backend| {
         detcore::set_kernel_signal_facts(backend, false);
