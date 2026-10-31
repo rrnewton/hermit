@@ -11584,6 +11584,25 @@ sys.exit(1 if failed else 0)
                 .as_sequence_mut()
                 .unwrap()
                 .push(Value::Mapping(group));
+            // Taking the row's replay cell out also takes it out of the
+            // replay slow groups: a slow group may name only rows that
+            // still have a replay cell.
+            if let Some(slow) = replay.get_mut("slow").and_then(Value::as_sequence_mut) {
+                for group in slow.iter_mut() {
+                    if let Some(rows) = group.get_mut("rows").and_then(Value::as_sequence_mut) {
+                        rows.retain(|row| row.as_str() != Some(label.as_str()));
+                    }
+                }
+                slow.retain(|group| {
+                    group
+                        .get("rows")
+                        .and_then(Value::as_sequence)
+                        .is_some_and(|rows| !rows.is_empty())
+                });
+                if slow.is_empty() {
+                    replay.remove("slow");
+                }
+            }
             return serde_yaml::to_string(&manifest).unwrap();
         }
         // A row's cell on the corpus's own backend is full's while the row

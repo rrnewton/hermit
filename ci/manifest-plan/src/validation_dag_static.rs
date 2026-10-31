@@ -1220,7 +1220,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // The retry stack adds three: 1929 + 3 = 1932, re-measured 2026-10-31.
-    ("test.regular_crates", 1932),
+    // The integrated chain adds six: 1932 + 6 = 1938, re-measured in the
+    // test.regular_crates tight loop at 351565c0ae (1937 passed, one failed).
+    ("test.regular_crates", 1938),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4488,7 +4490,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
     // The retry stack adds one cli case: 744 + 1 = 745.
-    ("test.cli", 745),
+    // The integrated chain adds eighteen cli cases: 745 + 18 = 763,
+    // re-measured in the test.cli tight loop at 351565c0ae (763 passed).
+    ("test.cli", 763),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5061,10 +5065,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
     // The same retry-stack cli case: 663 + 1 = 664.
-    ("test.cli_on_host", 664),
+    // The same eighteen integrated-chain cli cases: 664 + 18 = 682.
+    ("test.cli_on_host", 682),
     // The hosted twin carries the local regular_crates selection minus its
-    // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
-    ("test.regular_crates_on_host", 1918),
+    // 14 PMU/timer/replay skips: 1938 - 14 = 1924, re-measured 2026-10-31.
+    ("test.regular_crates_on_host", 1924),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6194,7 +6199,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // The retry stack: the same three added cases: 1932 - 14 = 1918.
-    ("test.regular_crates_on_host", 1918),
+    // The integrated chain: the same six added cases: 1938 - 14 = 1924.
+    ("test.regular_crates_on_host", 1924),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
