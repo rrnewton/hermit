@@ -329,7 +329,7 @@ pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
 /// (deselected with python-dict-hash-iteration under the owner's
 /// deselect-and-fix-forward rule after its CPU cost inside full validates
 /// reached 2.6x solo; root cause:
-/// https://github.com/rrnewton/hermit/issues/4996), so its calibration is
+/// <https://github.com/rrnewton/hermit/issues/4996>), so its calibration is
 /// removed with the cell; its measurements stay in that issue and in the
 /// manifest git history.
 pub const FLIP_2026_10_30_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 2] = [
