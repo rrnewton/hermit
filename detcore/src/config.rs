@@ -140,6 +140,18 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4738, renumbered to 16 at
         // integration; digests measured at this head).
         (16, "182b80da8855a429", "846052997d97693f"),
+        // Adds `GlobalRequest::PublishInstructionOffset` and `GlobalResponse::PublishInstructionOffset` (#4769).
+        (17, "14429e331cedfbc2", "846052997d97693f"),
+        // Adds `GlobalResponse::WithReplayInstructionOffset` (#4845).
+        (18, "ccfae94fb610649c", "846052997d97693f"),
+        // Retypes `GlobalResponse::StartNewThread` (#4789).
+        (19, "a27f21996e6332c8", "846052997d97693f"),
+        // Retypes `GlobalResponse::StartNewThread`: the boxed history, the
+        // first slice and its instruction offset.
+        (20, "546b33a36932da9a", "846052997d97693f"),
+        // Retypes `GlobalResponse::StartNewThread`: the thread's replay
+        // history with its check-in marks (#4902).
+        (21, "c954a325eabb4ddc", "846052997d97693f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

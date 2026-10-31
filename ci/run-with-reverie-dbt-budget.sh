@@ -3111,7 +3111,21 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=de4e3baa94acf31ad270fb452e03aead294f833a
+# CARRY TO b8b453d0d50527ce864b6a9cd74d784eff8d623a (2026-10-30): from
+# de4e3baa94acf31ad270fb452e03aead294f833a. Reverie #1153's two commits on top
+# of it: fail closed when an instruction offset cannot be placed (6a236627),
+# and the LiteInst source-catalog row of reverie/src/pmu_config.rs refreshed
+# for that change (b8b453d0). #1153 is not on Reverie's main branch yet and
+# must land there before this change lands; the pin then moves to the landed
+# revision. git diff is empty under reverie-dbt/ and third-party/ and for
+# the root Cargo.toml, Cargo.lock and rust-toolchain.toml; the repository
+# inputs to the DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4e4afaa7cb1a -> 4e4afaa7cb1a
+#     reverie-dbt/build.rs          3f2abba1b74a -> 3f2abba1b74a
+#     reverie-dbt/native            e2a6ab75ab64 -> e2a6ab75ab64
+# so the inventory, SDK and native inputs, calibrated budget, job width and
+# limits carry unchanged from the de4e3baa entry.
+expected_pin=b8b453d0d50527ce864b6a9cd74d784eff8d623a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

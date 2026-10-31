@@ -137,7 +137,8 @@ pub struct CriticalSchedule {
 }
 
 /// return 2 if first == second (ignores end_time)
-/// return -1 if only count is different
+/// return -1 if only count is different (an instruction offset, like an end
+/// address, names where an event ended, so a different one is not "only")
 /// return -2 otherwise
 pub fn scoring_function(first: SchedEvent, second: SchedEvent) -> i32 {
     let mut score = -2;
@@ -145,6 +146,7 @@ pub fn scoring_function(first: SchedEvent, second: SchedEvent) -> i32 {
         && (first.op == second.op)
         && (first.start_rip == second.start_rip)
         && (first.end_rip == second.end_rip)
+        && (first.instruction_offset == second.instruction_offset)
     {
         score += 1;
     } else {
@@ -911,8 +913,15 @@ fn same_event_except_count(first: &SchedEvent, second: &SchedEvent) -> bool {
     first == second
 }
 
+/// Whether the sub-event search may split `event`. A batch of branches that
+/// an instruction-offset timer ended (`SchedEvent::instruction_offset`) is
+/// not split: its last branches can lie past the timer's branch target (its
+/// steps cross them), so a fragment that started there could not arm the
+/// timer, and its replay would report a skid that no retry removes.
 fn can_split_event(event: &SchedEvent) -> bool {
-    event.count > 0 && (event.op == detcore::types::Op::Branch || event.count == 1)
+    event.count > 0
+        && event.instruction_offset.is_none()
+        && (event.op == detcore::types::Op::Branch || event.count == 1)
 }
 
 fn test_exact_replay<F>(tester: &mut F, requested: &[SchedEvent]) -> anyhow::Result<Option<bool>>
@@ -979,6 +988,11 @@ fn sched_event_fragment(
         count,
         start_rip: keeps_start.then_some(original.start_rip).flatten(),
         end_rip: keeps_end.then_some(original.end_rip).flatten(),
+        // Where a timer armed past its branch target stopped the original is
+        // where it ended: only the fragment that keeps that end keeps it. The
+        // branch target is the thread's absolute count, so it is the same
+        // in that fragment, which starts later.
+        instruction_offset: keeps_end.then_some(original.instruction_offset).flatten(),
         ..*original
     }
 }
@@ -1058,6 +1072,85 @@ mod tests {
         assert_eq!(search(3..100, 58), Some(58));
         assert_eq!(search(4..151, 58), Some(58));
         assert_eq!(binary_search(0..10, &mut |_| Ok(None)).unwrap(), None);
+    }
+
+    /// A batch of branches that a timer armed past its branch target ended
+    /// keeps its instruction offset, like its end address, only in the
+    /// fragment that keeps its end: the sub-event search's splices put a new
+    /// preemption at a branch inside the batch, and the remainder still ends
+    /// where the recording did. Unsplit, the batch keeps it, and a trial
+    /// schedule written from either carries it, stamped format 2.
+    /// The sub-event search does not split a batch of branches that an
+    /// instruction-offset timer ended: the timer's steps can cross branches,
+    /// so the batch's last branches lie past its target, and a fragment that
+    /// started there could not arm the timer.
+    #[test]
+    fn an_offset_batch_is_not_split() {
+        let tid = DetTid::from_raw(3);
+        let offset = detcore::preemptions::InstructionOffset {
+            rcb_target: 100,
+            instructions: 6,
+        };
+        // 104 branches, the last 4 crossed by the timer's 6 steps.
+        let stepped = SchedEvent::branches(tid, 104).with_instruction_offset(Some(offset));
+        assert!(!can_split_event(&stepped));
+        assert!(can_split_event(&SchedEvent::branches(tid, 104)));
+    }
+
+    #[test]
+    fn a_spliced_branch_batch_keeps_its_instruction_offset_with_its_end() {
+        let offset = detcore::preemptions::InstructionOffset {
+            rcb_target: 100,
+            instructions: 3,
+        };
+        let end = std::num::NonZeroUsize::new(0x4000).unwrap();
+        let a = SchedEvent::branches(DetTid::from_raw(3), 8)
+            .with_end_rip(end)
+            .with_instruction_offset(Some(offset));
+        let b = SchedEvent::branches(DetTid::from_raw(5), 9);
+        let pair = [a.clone(), b.clone()];
+        // A4 B7 A4 B2
+        let spliced = create_schedule_with_critical_pair(&[], &[], &pair, 4, 7);
+        assert_eq!(spliced.len(), 4);
+        assert_eq!(
+            (
+                spliced[0].count,
+                spliced[0].end_rip,
+                spliced[0].instruction_offset
+            ),
+            (4, None, None)
+        );
+        assert_eq!(
+            (
+                spliced[2].count,
+                spliced[2].end_rip,
+                spliced[2].instruction_offset
+            ),
+            (4, Some(end), Some(offset))
+        );
+        assert!(spliced[1].instruction_offset.is_none() && spliced[3].instruction_offset.is_none());
+        // Unsplit: the whole batch first.
+        let whole = create_schedule_with_critical_pair(&[], &[], &pair, 8, 9);
+        assert_eq!(whole, vec![a.clone(), b]);
+        for schedule in [spliced, whole] {
+            let record = PreemptionRecord::from_sched_events(schedule);
+            record.validate().unwrap();
+            assert_eq!(
+                record.format_version(),
+                detcore::preemptions::INSTRUCTION_OFFSET_FORMAT
+            );
+        }
+        // An offset, like an end address, makes an event more than "the
+        // same except its count".
+        assert_eq!(scoring_function(a.clone(), a.clone()), 2);
+        assert_eq!(
+            scoring_function(a.clone(), a.clone().with_instruction_offset(None)),
+            -2
+        );
+        assert!(!same_event_except_count(
+            &a,
+            &a.clone().with_instruction_offset(None)
+        ));
     }
 
     #[test]

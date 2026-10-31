@@ -286,6 +286,13 @@ pub struct AnalyzeOpts {
     /// measured before it.
     #[clap(skip)]
     pub endpoints: EndpointMeasurements,
+
+    /// Whether the analysis replays `--chaos-instruction-offset` decisions:
+    /// its run arguments draw them, or a recording it starts from holds them
+    /// (`AnalyzeOpts::adopt_instruction_offsets`). Its schedule replays then
+    /// run without chaos (`RunData::with_schedule_replay_from`).
+    #[clap(skip)]
+    pub replays_instruction_offsets: bool,
 }
 
 /// `--trial-timeout`.
