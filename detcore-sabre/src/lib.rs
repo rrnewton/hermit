@@ -156,6 +156,22 @@ fn remember_coordinator_socket(
 // specification.
 static COORDINATOR_FINGERPRINT: OnceLock<Option<String>> = OnceLock::new();
 
+// This image's canonical fingerprint does not depend on the launch Config.
+// Initialize it at the first Plugin connection, before that Plugin can forward
+// guest fork/clone. Reconnecting a child may run on a 64 KiB guest stack, where
+// rebuilding Config's Clap parser can overflow
+// (https://github.com/rrnewton/hermit/issues/4994).
+// Fork inherits the completed value; CLONE_VM shares it read-only, and exec
+// loads a fresh image. Cache only our value: every connection still checks it
+// against the coordinator before RPC.
+static PLUGIN_FINGERPRINT: OnceLock<String> = OnceLock::new();
+
+fn plugin_config_fingerprint() -> &'static str {
+    PLUGIN_FINGERPRINT
+        .get_or_init(config_wire_fingerprint)
+        .as_str()
+}
+
 /// What the coordinator published to this process image (`None`: nothing),
 /// read once. The flag is true only for the call that read it; later calls,
 /// including a forked child's construction, reuse that reading.
@@ -350,7 +366,7 @@ impl Plugin {
                 unsafe { sabre::take_private_env(CONFIG_FINGERPRINT_ENV) }
                     .map(|v| v.to_string_lossy().into_owned())
             });
-        let ours = config_wire_fingerprint();
+        let ours = plugin_config_fingerprint();
         match expected {
             Some(expected) if expected == ours => {}
             Some(expected) => panic!(
@@ -913,6 +929,25 @@ mod tests {
             remember_coordinator_fingerprint(&unpublished, || panic!("read twice")),
             (None, false)
         );
+    }
+
+    #[test]
+    fn plugin_fingerprint_reuses_the_canonical_value_on_a_small_stack() {
+        let canonical = config_wire_fingerprint();
+        let first = plugin_config_fingerprint();
+        assert_eq!(first, canonical);
+
+        // A reconnect must reuse the initialized image value without building
+        // Clap on its caller's small stack. The mount-table CLI regression also
+        // exercises the real fork/CLONE_FS reconnect on a 64 KiB guest stack.
+        let reused = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(plugin_config_fingerprint)
+            .expect("start small-stack fingerprint reader")
+            .join()
+            .expect("read the initialized fingerprint on a small stack");
+        assert_eq!(reused, canonical);
+        assert!(std::ptr::eq(first, reused));
     }
 
     #[test]
