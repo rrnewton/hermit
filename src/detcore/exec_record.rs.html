@@ -1,0 +1,1079 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `detcore/src/exec_record.rs`."><title>exec_record.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">detcore/</div>exec_record.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-4"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! The image a process executes, which its `/proc/&lt;pid&gt;/exe` link names.
+<a href=#10 id=10 data-nosnippet>10</a>//!
+<a href=#11 id=11 data-nosnippet>11</a>//! Detcore records it at each exec, on every backend, and checks it against
+<a href=#12 id=12 data-nosnippet>12</a>//! the kernel's own link when the exec completes (`tool_global`). Where the
+<a href=#13 id=13 data-nosnippet>13</a>//! backend's own procfs is not the guest's kernel procfs (KVM), the caller's
+<a href=#14 id=14 data-nosnippet>14</a>//! own link (`/proc/self/exe` and its other spellings) is answered from the
+<a href=#15 id=15 data-nosnippet>15</a>//! record while it still names exactly the image the process executes
+<a href=#16 id=16 data-nosnippet>16</a>//! ([`ExecRecord::names_path_exactly`]; `Detcore::readlink_own_task_link`,
+<a href=#17 id=17 data-nosnippet>17</a>//! package K slice E1); otherwise it is answered as before. Where the
+<a href=#18 id=18 data-nosnippet>18</a>//! kernel's link names a launcher in the guest's place (SaBRe's loader,
+<a href=#19 id=19 data-nosnippet>19</a>//! DynamoRIO's library; `Detcore::launched_exe`), the record answers every
+<a href=#20 id=20 data-nosnippet>20</a>//! process's link while the image is at its path, as before. The kernel's
+<a href=#21 id=21 data-nosnippet>21</a>//! link stands elsewhere.
+<a href=#22 id=22 data-nosnippet>22</a>//!
+<a href=#23 id=23 data-nosnippet>23</a>//! Only the path is recorded. Where the image ends, which a program-break
+<a href=#24 id=24 data-nosnippet>24</a>//! model would need, is known only once the image is loaded, and nothing
+<a href=#25 id=25 data-nosnippet>25</a>//! reads it yet.
+<a href=#26 id=26 data-nosnippet>26</a>
+<a href=#27 id=27 data-nosnippet>27</a></span><span class="kw">use </span>std::fs;
+<a href=#28 id=28 data-nosnippet>28</a><span class="kw">use </span>std::io::Read;
+<a href=#29 id=29 data-nosnippet>29</a><span class="kw">use </span>std::os::unix::ffi::OsStrExt;
+<a href=#30 id=30 data-nosnippet>30</a><span class="kw">use </span>std::os::unix::fs::MetadataExt;
+<a href=#31 id=31 data-nosnippet>31</a><span class="kw">use </span>std::os::unix::fs::OpenOptionsExt;
+<a href=#32 id=32 data-nosnippet>32</a><span class="kw">use </span>std::path::Path;
+<a href=#33 id=33 data-nosnippet>33</a><span class="kw">use </span>std::path::PathBuf;
+<a href=#34 id=34 data-nosnippet>34</a>
+<a href=#35 id=35 data-nosnippet>35</a><span class="kw">use </span>serde::Deserialize;
+<a href=#36 id=36 data-nosnippet>36</a><span class="kw">use </span>serde::Serialize;
+<a href=#37 id=37 data-nosnippet>37</a>
+<a href=#38 id=38 data-nosnippet>38</a><span class="doccomment">/// The bytes of a file the kernel reads to find its format
+<a href=#39 id=39 data-nosnippet>39</a>/// (`BINPRM_BUF_SIZE`, include/linux/binfmts.h).
+<a href=#40 id=40 data-nosnippet>40</a></span><span class="kw">const </span>BINPRM_BUF_SIZE: usize = <span class="number">256</span>;
+<a href=#41 id=41 data-nosnippet>41</a>
+<a href=#42 id=42 data-nosnippet>42</a><span class="doccomment">/// The interpreter levels the kernel follows before it refuses an exec with
+<a href=#43 id=43 data-nosnippet>43</a>/// `ELOOP` (`exec_binprm`'s `depth &gt; 5`, fs/exec.c).
+<a href=#44 id=44 data-nosnippet>44</a></span><span class="kw">const </span>MAX_INTERPRETER_DEPTH: usize = <span class="number">5</span>;
+<a href=#45 id=45 data-nosnippet>45</a>
+<a href=#46 id=46 data-nosnippet>46</a><span class="doccomment">/// The image a process executes.
+<a href=#47 id=47 data-nosnippet>47</a></span><span class="attr">#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+<a href=#48 id=48 data-nosnippet>48</a></span><span class="kw">pub struct </span>ExecRecord {
+<a href=#49 id=49 data-nosnippet>49</a>    <span class="doccomment">/// The image's canonical path, as the process's root directory shows it:
+<a href=#50 id=50 data-nosnippet>50</a>    /// what `readlink("/proc/self/exe")` returns while the file is there.
+<a href=#51 id=51 data-nosnippet>51</a>    </span><span class="kw">pub </span>exe: PathBuf,
+<a href=#52 id=52 data-nosnippet>52</a>    <span class="doccomment">/// The image file's device and inode when it was exec'd, which tell
+<a href=#53 id=53 data-nosnippet>53</a>    /// whether the file is still at `exe` ([`Self::is_present`]).
+<a href=#54 id=54 data-nosnippet>54</a>    </span>dev: u64,
+<a href=#55 id=55 data-nosnippet>55</a>    ino: u64,
+<a href=#56 id=56 data-nosnippet>56</a>    <span class="doccomment">/// Its link count and inode change time then: a rename, link or unlink
+<a href=#57 id=57 data-nosnippet>57</a>    /// of the file since changes both, even where the same inode is put back
+<a href=#58 id=58 data-nosnippet>58</a>    /// at `exe`, which Linux's link would no longer name.
+<a href=#59 id=59 data-nosnippet>59</a>    </span>nlink: u64,
+<a href=#60 id=60 data-nosnippet>60</a>    ctime: (i64, i64),
+<a href=#61 id=61 data-nosnippet>61</a>    <span class="doccomment">/// The device and inode of each directory above the image, from its
+<a href=#62 id=62 data-nosnippet>62</a>    /// parent up to the process's root directory, when it was exec'd
+<a href=#63 id=63 data-nosnippet>63</a>    /// ([`Self::names_path_exactly`]).
+<a href=#64 id=64 data-nosnippet>64</a>    </span>directories: Vec&lt;(u64, u64)&gt;,
+<a href=#65 id=65 data-nosnippet>65</a>}
+<a href=#66 id=66 data-nosnippet>66</a>
+<a href=#67 id=67 data-nosnippet>67</a><span class="doccomment">/// The device and inode of each directory above `path`, a canonical path
+<a href=#68 id=68 data-nosnippet>68</a>/// below `root`, from its parent up to `root`, not following a symbolic link
+<a href=#69 id=69 data-nosnippet>69</a>/// at any of them, read with raw syscalls (in-guest Detcore must not call
+<a href=#70 id=70 data-nosnippet>70</a>/// libc's wrappers: `crate::util::raw_syscall`). `None` where one cannot be
+<a href=#71 id=71 data-nosnippet>71</a>/// read or is no directory ([`directory_sample`]).
+<a href=#72 id=72 data-nosnippet>72</a></span><span class="kw">fn </span>directory_chain(root: <span class="kw-2">&amp;</span>Path, path: <span class="kw-2">&amp;</span>Path) -&gt; <span class="prelude-ty">Option</span>&lt;Vec&lt;(u64, u64)&gt;&gt; {
+<a href=#73 id=73 data-nosnippet>73</a>    path.ancestors()
+<a href=#74 id=74 data-nosnippet>74</a>        .skip(<span class="number">1</span>)
+<a href=#75 id=75 data-nosnippet>75</a>        .take_while(|directory| directory.starts_with(root))
+<a href=#76 id=76 data-nosnippet>76</a>        .map(|directory| directory_sample(<span class="kw-2">&amp;</span><span class="kw">crate</span>::util::raw_lstat(directory).ok()<span class="question-mark">?</span>))
+<a href=#77 id=77 data-nosnippet>77</a>        .collect()
+<a href=#78 id=78 data-nosnippet>78</a>}
+<a href=#79 id=79 data-nosnippet>79</a>
+<a href=#80 id=80 data-nosnippet>80</a><span class="doccomment">/// The device and inode of a directory, from its unfollowed status: `None`
+<a href=#81 id=81 data-nosnippet>81</a>/// for anything but a directory, so that another kind of file put in a
+<a href=#82 id=82 data-nosnippet>82</a>/// directory's place never matches it, even where it reuses the freed
+<a href=#83 id=83 data-nosnippet>83</a>/// directory's inode number (a symbolic link to where the directory went).
+<a href=#84 id=84 data-nosnippet>84</a></span><span class="kw">fn </span>directory_sample(stat: <span class="kw-2">&amp;</span>libc::stat) -&gt; <span class="prelude-ty">Option</span>&lt;(u64, u64)&gt; {
+<a href=#85 id=85 data-nosnippet>85</a>    (stat.st_mode &amp; libc::S_IFMT == libc::S_IFDIR).then_some((stat.st_dev, stat.st_ino))
+<a href=#86 id=86 data-nosnippet>86</a>}
+<a href=#87 id=87 data-nosnippet>87</a>
+<a href=#88 id=88 data-nosnippet>88</a><span class="kw">impl </span>ExecRecord {
+<a href=#89 id=89 data-nosnippet>89</a>    <span class="doccomment">/// The image an `execve` of `path` runs, as the kernel finds it: `path`
+<a href=#90 id=90 data-nosnippet>90</a>    /// taken from the working directory `cwd`, every symbolic link followed,
+<a href=#91 id=91 data-nosnippet>91</a>    /// and for a script the interpreter its `#!` line names, level by level,
+<a href=#92 id=92 data-nosnippet>92</a>    /// as `/proc/&lt;pid&gt;/exe` names the interpreter. `root` is the process's
+<a href=#93 id=93 data-nosnippet>93</a>    /// root directory as the caller sees it, and `cwd` is the working
+<a href=#94 id=94 data-nosnippet>94</a>    /// directory below it, absolute.
+<a href=#95 id=95 data-nosnippet>95</a>    ///
+<a href=#96 id=96 data-nosnippet>96</a>    /// `None` where the kernel would refuse the exec (no such file, a
+<a href=#97 id=97 data-nosnippet>97</a>    /// malformed `#!` line, too many interpreter levels), where the caller
+<a href=#98 id=98 data-nosnippet>98</a>    /// cannot look the path up, and for a file the caller cannot read, which
+<a href=#99 id=99 data-nosnippet>99</a>    /// the kernel may still run (an execute-only binary, or a script whose
+<a href=#100 id=100 data-nosnippet>100</a>    /// `#!` line the kernel reads without a permission check): the link is
+<a href=#101 id=101 data-nosnippet>101</a>    /// then the kernel's to answer. A resolution can still be wrong where
+<a href=#102 id=102 data-nosnippet>102</a>    /// the kernel runs a file differently (a `binfmt_misc` handler) or the
+<a href=#103 id=103 data-nosnippet>103</a>    /// caller sees another filesystem; `tool_global` checks every record
+<a href=#104 id=104 data-nosnippet>104</a>    /// against the kernel's own link after the exec.
+<a href=#105 id=105 data-nosnippet>105</a>    </span><span class="kw">pub fn </span>resolve(root: <span class="kw-2">&amp;</span>Path, cwd: <span class="kw-2">&amp;</span>Path, path: <span class="kw-2">&amp;</span>Path) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="self">Self</span>&gt; {
+<a href=#106 id=106 data-nosnippet>106</a>        <span class="self">Self</span>::resolve_from(root, <span class="prelude-val">Some</span>(cwd), path)
+<a href=#107 id=107 data-nosnippet>107</a>    }
+<a href=#108 id=108 data-nosnippet>108</a>
+<a href=#109 id=109 data-nosnippet>109</a>    <span class="doccomment">/// [`Self::resolve`] for a caller whose working directory may be unknown
+<a href=#110 id=110 data-nosnippet>110</a>    /// (`cwd` is `None`): then `None` wherever the kernel would look a
+<a href=#111 id=111 data-nosnippet>111</a>    /// relative path up from it (a relative `path`, or a script whose `#!`
+<a href=#112 id=112 data-nosnippet>112</a>    /// line names a relative interpreter).
+<a href=#113 id=113 data-nosnippet>113</a>    </span><span class="kw">pub fn </span>resolve_from(root: <span class="kw-2">&amp;</span>Path, cwd: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>Path&gt;, path: <span class="kw-2">&amp;</span>Path) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="self">Self</span>&gt; {
+<a href=#114 id=114 data-nosnippet>114</a>        <span class="kw">let </span>from_cwd = |path: <span class="kw-2">&amp;</span>Path| {
+<a href=#115 id=115 data-nosnippet>115</a>            <span class="kw">if </span>path.is_absolute() {
+<a href=#116 id=116 data-nosnippet>116</a>                <span class="prelude-val">Some</span>(path.to_path_buf())
+<a href=#117 id=117 data-nosnippet>117</a>            } <span class="kw">else </span>{
+<a href=#118 id=118 data-nosnippet>118</a>                <span class="prelude-val">Some</span>(cwd<span class="question-mark">?</span>.join(path))
+<a href=#119 id=119 data-nosnippet>119</a>            }
+<a href=#120 id=120 data-nosnippet>120</a>        };
+<a href=#121 id=121 data-nosnippet>121</a>        <span class="kw">let </span><span class="kw-2">mut </span>spelled = from_cwd(path)<span class="question-mark">?</span>;
+<a href=#122 id=122 data-nosnippet>122</a>        <span class="kw">for _ in </span><span class="number">0</span>..=MAX_INTERPRETER_DEPTH {
+<a href=#123 id=123 data-nosnippet>123</a>            <span class="kw">let </span>found = <span class="kw">crate</span>::util::canonicalize(<span class="kw-2">&amp;</span>below(root, <span class="kw-2">&amp;</span>spelled)<span class="question-mark">?</span>).ok()<span class="question-mark">?</span>;
+<a href=#124 id=124 data-nosnippet>124</a>            <span class="comment">// Linux execs only a regular file, and refuses anything else
+<a href=#125 id=125 data-nosnippet>125</a>            // (EACCES) before it opens it.
+<a href=#126 id=126 data-nosnippet>126</a>            </span><span class="kw">if </span>!fs::metadata(<span class="kw-2">&amp;</span>found).ok()<span class="question-mark">?</span>.is_file() {
+<a href=#127 id=127 data-nosnippet>127</a>                <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#128 id=128 data-nosnippet>128</a>            }
+<a href=#129 id=129 data-nosnippet>129</a>            <span class="kw">match </span>script_interpreter(<span class="kw-2">&amp;</span>found) {
+<a href=#130 id=130 data-nosnippet>130</a>                Script::Not =&gt; <span class="kw">return </span><span class="self">Self</span>::at(root, <span class="kw-2">&amp;</span>found),
+<a href=#131 id=131 data-nosnippet>131</a>                <span class="comment">// The kernel opens the interpreter from the caller's working
+<a href=#132 id=132 data-nosnippet>132</a>                // directory, as it opened the script.
+<a href=#133 id=133 data-nosnippet>133</a>                </span>Script::Interpreter(interpreter) =&gt; spelled = from_cwd(<span class="kw-2">&amp;</span>interpreter)<span class="question-mark">?</span>,
+<a href=#134 id=134 data-nosnippet>134</a>                Script::Declined | Script::Unread =&gt; <span class="kw">return </span><span class="prelude-val">None</span>,
+<a href=#135 id=135 data-nosnippet>135</a>            }
+<a href=#136 id=136 data-nosnippet>136</a>        }
+<a href=#137 id=137 data-nosnippet>137</a>        <span class="prelude-val">None
+<a href=#138 id=138 data-nosnippet>138</a>    </span>}
+<a href=#139 id=139 data-nosnippet>139</a>
+<a href=#140 id=140 data-nosnippet>140</a>    <span class="doccomment">/// The record of the image at `found`, a canonical path the caller sees
+<a href=#141 id=141 data-nosnippet>141</a>    /// below `root`, as that file is now.
+<a href=#142 id=142 data-nosnippet>142</a>    </span><span class="kw">pub fn </span>at(root: <span class="kw-2">&amp;</span>Path, found: <span class="kw-2">&amp;</span>Path) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="self">Self</span>&gt; {
+<a href=#143 id=143 data-nosnippet>143</a>        <span class="kw">let </span>metadata = fs::metadata(found).ok()<span class="question-mark">?</span>;
+<a href=#144 id=144 data-nosnippet>144</a>        <span class="prelude-val">Some</span>(<span class="self">Self </span>{
+<a href=#145 id=145 data-nosnippet>145</a>            exe: Path::new(<span class="string">"/"</span>).join(found.strip_prefix(root).ok()<span class="question-mark">?</span>),
+<a href=#146 id=146 data-nosnippet>146</a>            dev: metadata.dev(),
+<a href=#147 id=147 data-nosnippet>147</a>            ino: metadata.ino(),
+<a href=#148 id=148 data-nosnippet>148</a>            nlink: metadata.nlink(),
+<a href=#149 id=149 data-nosnippet>149</a>            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+<a href=#150 id=150 data-nosnippet>150</a>            directories: directory_chain(root, found).unwrap_or_default(),
+<a href=#151 id=151 data-nosnippet>151</a>        })
+<a href=#152 id=152 data-nosnippet>152</a>    }
+<a href=#153 id=153 data-nosnippet>153</a>
+<a href=#154 id=154 data-nosnippet>154</a>    <span class="doccomment">/// The image file's device and inode when it was exec'd.
+<a href=#155 id=155 data-nosnippet>155</a>    </span><span class="kw">pub fn </span>identity(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; (u64, u64) {
+<a href=#156 id=156 data-nosnippet>156</a>        (<span class="self">self</span>.dev, <span class="self">self</span>.ino)
+<a href=#157 id=157 data-nosnippet>157</a>    }
+<a href=#158 id=158 data-nosnippet>158</a>
+<a href=#159 id=159 data-nosnippet>159</a>    <span class="doccomment">/// Whether the image's file is still at its path, untouched, for a
+<a href=#160 id=160 data-nosnippet>160</a>    /// process whose root directory the caller sees at `root`: the same
+<a href=#161 id=161 data-nosnippet>161</a>    /// inode, with the link count and change time it had at the exec. A
+<a href=#162 id=162 data-nosnippet>162</a>    /// rename or link of the image since, or a change of its mode, reads as
+<a href=#163 id=163 data-nosnippet>163</a>    /// absent, so the caller refuses rather than name a path Linux's link
+<a href=#164 id=164 data-nosnippet>164</a>    /// might not.
+<a href=#165 id=165 data-nosnippet>165</a>    </span><span class="kw">pub fn </span>is_present(<span class="kw-2">&amp;</span><span class="self">self</span>, root: <span class="kw-2">&amp;</span>Path) -&gt; bool {
+<a href=#166 id=166 data-nosnippet>166</a>        below(root, <span class="kw-2">&amp;</span><span class="self">self</span>.exe)
+<a href=#167 id=167 data-nosnippet>167</a>            .and_then(|path| fs::symlink_metadata(path).ok())
+<a href=#168 id=168 data-nosnippet>168</a>            .is_some_and(|now| {
+<a href=#169 id=169 data-nosnippet>169</a>                (
+<a href=#170 id=170 data-nosnippet>170</a>                    now.dev(),
+<a href=#171 id=171 data-nosnippet>171</a>                    now.ino(),
+<a href=#172 id=172 data-nosnippet>172</a>                    now.nlink(),
+<a href=#173 id=173 data-nosnippet>173</a>                    (now.ctime(), now.ctime_nsec()),
+<a href=#174 id=174 data-nosnippet>174</a>                ) == (<span class="self">self</span>.dev, <span class="self">self</span>.ino, <span class="self">self</span>.nlink, <span class="self">self</span>.ctime)
+<a href=#175 id=175 data-nosnippet>175</a>            })
+<a href=#176 id=176 data-nosnippet>176</a>    }
+<a href=#177 id=177 data-nosnippet>177</a>
+<a href=#178 id=178 data-nosnippet>178</a>    <span class="doccomment">/// Whether the image's path still names exactly the file the process
+<a href=#179 id=179 data-nosnippet>179</a>    /// executes, as Linux's `exe` link renders it (`d_path` of the image's
+<a href=#180 id=180 data-nosnippet>180</a>    /// dentry), for a process whose root directory the caller sees at
+<a href=#181 id=181 data-nosnippet>181</a>    /// `root`: the file is untouched at its path ([`Self::is_present`]), and
+<a href=#182 id=182 data-nosnippet>182</a>    /// every directory above it is the one that was there at the exec (its
+<a href=#183 id=183 data-nosnippet>183</a>    /// device and inode, not following a symbolic link). A directory has one
+<a href=#184 id=184 data-nosnippet>184</a>    /// dentry, so the same directory inode at a path is that path's dentry,
+<a href=#185 id=185 data-nosnippet>185</a>    /// and the same untouched file in the same directory under the same name
+<a href=#186 id=186 data-nosnippet>186</a>    /// is the same dentry: a rename of the image or of any directory above
+<a href=#187 id=187 data-nosnippet>187</a>    /// it, another directory or a symbolic link put at one of their paths,
+<a href=#188 id=188 data-nosnippet>188</a>    /// and a hard link of the image put back at its path all read as not
+<a href=#189 id=189 data-nosnippet>189</a>    /// exact. (Mounts are refused in the guest.)
+<a href=#190 id=190 data-nosnippet>190</a>    </span><span class="kw">pub fn </span>names_path_exactly(<span class="kw-2">&amp;</span><span class="self">self</span>, root: <span class="kw-2">&amp;</span>Path) -&gt; bool {
+<a href=#191 id=191 data-nosnippet>191</a>        <span class="self">self</span>.is_present(root)
+<a href=#192 id=192 data-nosnippet>192</a>            &amp;&amp; !<span class="self">self</span>.directories.is_empty()
+<a href=#193 id=193 data-nosnippet>193</a>            &amp;&amp; below(root, <span class="kw-2">&amp;</span><span class="self">self</span>.exe)
+<a href=#194 id=194 data-nosnippet>194</a>                .and_then(|path| directory_chain(root, <span class="kw-2">&amp;</span>path))
+<a href=#195 id=195 data-nosnippet>195</a>                .is_some_and(|now| now == <span class="self">self</span>.directories)
+<a href=#196 id=196 data-nosnippet>196</a>    }
+<a href=#197 id=197 data-nosnippet>197</a>}
+<a href=#198 id=198 data-nosnippet>198</a>
+<a href=#199 id=199 data-nosnippet>199</a><span class="doccomment">/// The program interpreter (`PT_INTERP`) the ELF64 image at `path` names,
+<a href=#200 id=200 data-nosnippet>200</a>/// which the kernel opens and maps at the exec (`load_elf_binary`,
+<a href=#201 id=201 data-nosnippet>201</a>/// fs/binfmt_elf.c), or `None` for any other file, an image without one, and
+<a href=#202 id=202 data-nosnippet>202</a>/// one the caller cannot read. Like the kernel, this refuses a name shorter
+<a href=#203 id=203 data-nosnippet>203</a>/// than 2 or longer than `PATH_MAX` bytes or one whose last byte is not NUL,
+<a href=#204 id=204 data-nosnippet>204</a>/// and the name is the string up to its first NUL, which `open_exec` opens.
+<a href=#205 id=205 data-nosnippet>205</a></span><span class="kw">pub fn </span>program_interpreter(path: <span class="kw-2">&amp;</span>Path) -&gt; <span class="prelude-ty">Option</span>&lt;PathBuf&gt; {
+<a href=#206 id=206 data-nosnippet>206</a>    <span class="kw">let </span>file = <span class="kw">crate</span>::util::RawFd::open(path, libc::O_RDONLY).ok()<span class="question-mark">?</span>;
+<a href=#207 id=207 data-nosnippet>207</a>    <span class="kw">let </span>read_exact = |offset: u64, buffer: <span class="kw-2">&amp;mut </span>[u8]| {
+<a href=#208 id=208 data-nosnippet>208</a>        (file.read_at(buffer, offset).ok()<span class="question-mark">? </span>== buffer.len()).then_some(())
+<a href=#209 id=209 data-nosnippet>209</a>    };
+<a href=#210 id=210 data-nosnippet>210</a>    <span class="kw">let </span><span class="kw-2">mut </span>header = [<span class="number">0_u8</span>; <span class="number">64</span>];
+<a href=#211 id=211 data-nosnippet>211</a>    read_exact(<span class="number">0</span>, <span class="kw-2">&amp;mut </span>header)<span class="question-mark">?</span>;
+<a href=#212 id=212 data-nosnippet>212</a>    <span class="kw">if </span>header[..<span class="number">4</span>] != <span class="kw-2">*</span><span class="string">b"\x7fELF" </span>|| header[<span class="number">4</span>] != <span class="number">2 </span>|| header[<span class="number">5</span>] != <span class="number">1 </span>{
+<a href=#213 id=213 data-nosnippet>213</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#214 id=214 data-nosnippet>214</a>    }
+<a href=#215 id=215 data-nosnippet>215</a>    <span class="kw">let </span>u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + <span class="number">1</span>]]);
+<a href=#216 id=216 data-nosnippet>216</a>    <span class="kw">let </span>phoff = u64::from_le_bytes(header[<span class="number">32</span>..<span class="number">40</span>].try_into().unwrap());
+<a href=#217 id=217 data-nosnippet>217</a>    <span class="kw">let </span>(phentsize, phnum) = (usize::from(u16_at(<span class="number">54</span>)), u16_at(<span class="number">56</span>));
+<a href=#218 id=218 data-nosnippet>218</a>    <span class="kw">if </span>phentsize &lt; <span class="number">56 </span>{
+<a href=#219 id=219 data-nosnippet>219</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#220 id=220 data-nosnippet>220</a>    }
+<a href=#221 id=221 data-nosnippet>221</a>    <span class="kw">let </span><span class="kw-2">mut </span>entry = <span class="macro">vec!</span>[<span class="number">0_u8</span>; phentsize];
+<a href=#222 id=222 data-nosnippet>222</a>    <span class="kw">for </span>index <span class="kw">in </span><span class="number">0</span>..u64::from(phnum) {
+<a href=#223 id=223 data-nosnippet>223</a>        read_exact(phoff.checked_add(index * phentsize <span class="kw">as </span>u64)<span class="question-mark">?</span>, <span class="kw-2">&amp;mut </span>entry)<span class="question-mark">?</span>;
+<a href=#224 id=224 data-nosnippet>224</a>        <span class="kw">if </span>u32::from_le_bytes(entry[..<span class="number">4</span>].try_into().unwrap()) != <span class="number">3 </span>{
+<a href=#225 id=225 data-nosnippet>225</a>            <span class="kw">continue</span>; <span class="comment">// not PT_INTERP
+<a href=#226 id=226 data-nosnippet>226</a>        </span>}
+<a href=#227 id=227 data-nosnippet>227</a>        <span class="kw">let </span>field = |at: usize| u64::from_le_bytes(entry[at..at + <span class="number">8</span>].try_into().unwrap());
+<a href=#228 id=228 data-nosnippet>228</a>        <span class="kw">let </span>(offset, size) = (field(<span class="number">8</span>), field(<span class="number">32</span>));
+<a href=#229 id=229 data-nosnippet>229</a>        <span class="kw">if </span>size &lt; <span class="number">2 </span>|| size &gt; libc::PATH_MAX <span class="kw">as </span>u64 {
+<a href=#230 id=230 data-nosnippet>230</a>            <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#231 id=231 data-nosnippet>231</a>        }
+<a href=#232 id=232 data-nosnippet>232</a>        <span class="kw">let </span><span class="kw-2">mut </span>name = <span class="macro">vec!</span>[<span class="number">0_u8</span>; size <span class="kw">as </span>usize];
+<a href=#233 id=233 data-nosnippet>233</a>        read_exact(offset, <span class="kw-2">&amp;mut </span>name)<span class="question-mark">?</span>;
+<a href=#234 id=234 data-nosnippet>234</a>        <span class="kw">if </span>name.last() != <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span><span class="number">0</span>) {
+<a href=#235 id=235 data-nosnippet>235</a>            <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#236 id=236 data-nosnippet>236</a>        }
+<a href=#237 id=237 data-nosnippet>237</a>        <span class="kw">let </span>end = name.iter().position(|byte| <span class="kw-2">*</span>byte == <span class="number">0</span>)<span class="question-mark">?</span>;
+<a href=#238 id=238 data-nosnippet>238</a>        <span class="kw">return </span><span class="prelude-val">Some</span>(PathBuf::from(std::ffi::OsStr::from_bytes(<span class="kw-2">&amp;</span>name[..end])));
+<a href=#239 id=239 data-nosnippet>239</a>    }
+<a href=#240 id=240 data-nosnippet>240</a>    <span class="prelude-val">None
+<a href=#241 id=241 data-nosnippet>241</a></span>}
+<a href=#242 id=242 data-nosnippet>242</a>
+<a href=#243 id=243 data-nosnippet>243</a><span class="doccomment">/// What decides where Linux starts a process's program break after it execs
+<a href=#244 id=244 data-nosnippet>244</a>/// an ELF image (`load_elf_binary`, fs/binfmt_elf.c), from the image's file
+<a href=#245 id=245 data-nosnippet>245</a>/// header and program headers.
+<a href=#246 id=246 data-nosnippet>246</a></span><span class="attr">#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+<a href=#247 id=247 data-nosnippet>247</a></span><span class="kw">pub struct </span>ElfLayout {
+<a href=#248 id=248 data-nosnippet>248</a>    <span class="doccomment">/// Whether the image is `ET_DYN` (position-independent) rather than
+<a href=#249 id=249 data-nosnippet>249</a>    /// `ET_EXEC`.
+<a href=#250 id=250 data-nosnippet>250</a>    </span><span class="kw">pub </span>position_independent: bool,
+<a href=#251 id=251 data-nosnippet>251</a>    <span class="doccomment">/// Whether the image names a program interpreter (`PT_INTERP`).
+<a href=#252 id=252 data-nosnippet>252</a>    </span><span class="kw">pub </span>interpreter: bool,
+<a href=#253 id=253 data-nosnippet>253</a>    <span class="doccomment">/// The virtual address of the image's program headers before the load
+<a href=#254 id=254 data-nosnippet>254</a>    /// bias, as Linux finds it for `AT_PHDR` (since Linux 5.18): `e_phoff` in
+<a href=#255 id=255 data-nosnippet>255</a>    /// the last `PT_LOAD` segment whose file range holds it, or 0 where none
+<a href=#256 id=256 data-nosnippet>256</a>    /// does (`AT_PHDR` is then the bias itself).
+<a href=#257 id=257 data-nosnippet>257</a>    </span><span class="kw">pub </span>phdr: u64,
+<a href=#258 id=258 data-nosnippet>258</a>    <span class="doccomment">/// The end of the highest `PT_LOAD` segment in memory, `p_vaddr +
+<a href=#259 id=259 data-nosnippet>259</a>    /// p_memsz`, before the load bias: the end of its bss.
+<a href=#260 id=260 data-nosnippet>260</a>    </span><span class="kw">pub </span>end: u64,
+<a href=#261 id=261 data-nosnippet>261</a>    <span class="doccomment">/// The first executable `PT_LOAD` segment's file offset and virtual
+<a href=#262 id=262 data-nosnippet>262</a>    /// address, each page-aligned down: where its text mapping starts in the
+<a href=#263 id=263 data-nosnippet>263</a>    /// file and, before the load bias, in memory. `None` without one.
+<a href=#264 id=264 data-nosnippet>264</a>    </span><span class="kw">pub </span>text: <span class="prelude-ty">Option</span>&lt;(u64, u64)&gt;,
+<a href=#265 id=265 data-nosnippet>265</a>    <span class="doccomment">/// `mm-&gt;end_data - mm-&gt;start_data` as Linux sets them: the highest
+<a href=#266 id=266 data-nosnippet>266</a>    /// segment end in the file (`p_vaddr + p_filesz`) less the highest
+<a href=#267 id=267 data-nosnippet>267</a>    /// segment start, which `RLIMIT_DATA` counts with the heap
+<a href=#268 id=268 data-nosnippet>268</a>    /// (`check_data_rlimit`).
+<a href=#269 id=269 data-nosnippet>269</a>    </span><span class="kw">pub </span>data_span: u64,
+<a href=#270 id=270 data-nosnippet>270</a>    <span class="doccomment">/// The page size Linux maps the segments with and aligns the program
+<a href=#271 id=271 data-nosnippet>271</a>    /// break to: `ELF_MIN_ALIGN`, the larger of `ELF_EXEC_PAGESIZE` and
+<a href=#272 id=272 data-nosnippet>272</a>    /// `PAGE_SIZE` (fs/binfmt_elf.c), which is the host's page size, since
+<a href=#273 id=273 data-nosnippet>273</a>    /// `ELF_EXEC_PAGESIZE` is `PAGE_SIZE` on arm64 and 4096 on x86_64.
+<a href=#274 id=274 data-nosnippet>274</a>    </span><span class="kw">pub </span>page: u64,
+<a href=#275 id=275 data-nosnippet>275</a>}
+<a href=#276 id=276 data-nosnippet>276</a>
+<a href=#277 id=277 data-nosnippet>277</a><span class="kw">impl </span>ElfLayout {
+<a href=#278 id=278 data-nosnippet>278</a>    <span class="doccomment">/// The layout of the ELF64 image at `path` (`ET_EXEC` or `ET_DYN`), or
+<a href=#279 id=279 data-nosnippet>279</a>    /// `None` for any other file, one without a loadable segment, and one the
+<a href=#280 id=280 data-nosnippet>280</a>    /// caller cannot read.
+<a href=#281 id=281 data-nosnippet>281</a>    </span><span class="kw">pub fn </span>read(path: <span class="kw-2">&amp;</span>Path) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="self">Self</span>&gt; {
+<a href=#282 id=282 data-nosnippet>282</a>        <span class="self">Self</span>::read_file(<span class="kw-2">&amp;</span><span class="kw">crate</span>::util::RawFd::open(path, libc::O_RDONLY).ok()<span class="question-mark">?</span>)
+<a href=#283 id=283 data-nosnippet>283</a>    }
+<a href=#284 id=284 data-nosnippet>284</a>
+<a href=#285 id=285 data-nosnippet>285</a>    <span class="doccomment">/// [`Self::read`] of an open file, read with raw syscalls: in-guest
+<a href=#286 id=286 data-nosnippet>286</a>    /// Detcore must not call libc's wrappers (`crate::util::raw_syscall`).
+<a href=#287 id=287 data-nosnippet>287</a>    </span><span class="kw">pub fn </span>read_file(file: <span class="kw-2">&amp;</span><span class="kw">crate</span>::util::RawFd) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="self">Self</span>&gt; {
+<a href=#288 id=288 data-nosnippet>288</a>        <span class="kw">let </span>read_exact = |offset: u64, buffer: <span class="kw-2">&amp;mut </span>[u8]| {
+<a href=#289 id=289 data-nosnippet>289</a>            (file.read_at(buffer, offset).ok()<span class="question-mark">? </span>== buffer.len()).then_some(())
+<a href=#290 id=290 data-nosnippet>290</a>        };
+<a href=#291 id=291 data-nosnippet>291</a>        <span class="kw">let </span><span class="kw-2">mut </span>header = [<span class="number">0_u8</span>; <span class="number">64</span>];
+<a href=#292 id=292 data-nosnippet>292</a>        read_exact(<span class="number">0</span>, <span class="kw-2">&amp;mut </span>header)<span class="question-mark">?</span>;
+<a href=#293 id=293 data-nosnippet>293</a>        <span class="self">Self</span>::parse(<span class="kw-2">&amp;</span>header, read_exact, <span class="kw">crate</span>::page::page_size())
+<a href=#294 id=294 data-nosnippet>294</a>    }
+<a href=#295 id=295 data-nosnippet>295</a>
+<a href=#296 id=296 data-nosnippet>296</a>    <span class="doccomment">/// [`Self::read`] of an image whose 64-byte file header is `header`,
+<a href=#297 id=297 data-nosnippet>297</a>    /// reading its program headers through `read_at(offset, buffer)`, on a
+<a href=#298 id=298 data-nosnippet>298</a>    /// host whose pages are `page` bytes.
+<a href=#299 id=299 data-nosnippet>299</a>    </span><span class="kw">fn </span>parse(
+<a href=#300 id=300 data-nosnippet>300</a>        header: <span class="kw-2">&amp;</span>[u8; <span class="number">64</span>],
+<a href=#301 id=301 data-nosnippet>301</a>        <span class="kw-2">mut </span>read_at: <span class="kw">impl </span>FnMut(u64, <span class="kw-2">&amp;mut </span>[u8]) -&gt; <span class="prelude-ty">Option</span>&lt;()&gt;,
+<a href=#302 id=302 data-nosnippet>302</a>        page: u64,
+<a href=#303 id=303 data-nosnippet>303</a>    ) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="self">Self</span>&gt; {
+<a href=#304 id=304 data-nosnippet>304</a>        <span class="kw">let </span>u16_at = |at: usize| u16::from_le_bytes([header[at], header[at + <span class="number">1</span>]]);
+<a href=#305 id=305 data-nosnippet>305</a>        <span class="kw">let </span>u64_at = |at: usize| u64::from_le_bytes(header[at..at + <span class="number">8</span>].try_into().unwrap());
+<a href=#306 id=306 data-nosnippet>306</a>        <span class="comment">// ELF magic, 64-bit class, little-endian data, ET_EXEC or ET_DYN.
+<a href=#307 id=307 data-nosnippet>307</a>        </span><span class="kw">if </span>header[..<span class="number">4</span>] != <span class="kw-2">*</span><span class="string">b"\x7fELF" </span>|| header[<span class="number">4</span>] != <span class="number">2 </span>|| header[<span class="number">5</span>] != <span class="number">1 </span>{
+<a href=#308 id=308 data-nosnippet>308</a>            <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#309 id=309 data-nosnippet>309</a>        }
+<a href=#310 id=310 data-nosnippet>310</a>        <span class="kw">let </span>position_independent = <span class="kw">match </span>u16_at(<span class="number">16</span>) {
+<a href=#311 id=311 data-nosnippet>311</a>            <span class="number">2 </span>=&gt; <span class="bool-val">false</span>, <span class="comment">// ET_EXEC
+<a href=#312 id=312 data-nosnippet>312</a>            </span><span class="number">3 </span>=&gt; <span class="bool-val">true</span>,  <span class="comment">// ET_DYN
+<a href=#313 id=313 data-nosnippet>313</a>            </span><span class="kw">_ </span>=&gt; <span class="kw">return </span><span class="prelude-val">None</span>,
+<a href=#314 id=314 data-nosnippet>314</a>        };
+<a href=#315 id=315 data-nosnippet>315</a>        <span class="kw">let </span>(phoff, phentsize, phnum) = (u64_at(<span class="number">32</span>), usize::from(u16_at(<span class="number">54</span>)), u16_at(<span class="number">56</span>));
+<a href=#316 id=316 data-nosnippet>316</a>        <span class="kw">if </span>phentsize &lt; <span class="number">56 </span>{
+<a href=#317 id=317 data-nosnippet>317</a>            <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#318 id=318 data-nosnippet>318</a>        }
+<a href=#319 id=319 data-nosnippet>319</a>        <span class="kw">let </span><span class="kw-2">mut </span>entry = <span class="macro">vec!</span>[<span class="number">0_u8</span>; phentsize];
+<a href=#320 id=320 data-nosnippet>320</a>        <span class="kw">let </span>(<span class="kw-2">mut </span>phdr, <span class="kw-2">mut </span>end, <span class="kw-2">mut </span>interpreter) = (<span class="number">0</span>, <span class="prelude-val">None</span>::&lt;u64&gt;, <span class="bool-val">false</span>);
+<a href=#321 id=321 data-nosnippet>321</a>        <span class="kw">let </span>(<span class="kw-2">mut </span>text, <span class="kw-2">mut </span>start_data, <span class="kw-2">mut </span>end_data) = (<span class="prelude-val">None</span>::&lt;(u64, u64)&gt;, <span class="number">0_u64</span>, <span class="number">0_u64</span>);
+<a href=#322 id=322 data-nosnippet>322</a>        <span class="kw">for </span>index <span class="kw">in </span><span class="number">0</span>..u64::from(phnum) {
+<a href=#323 id=323 data-nosnippet>323</a>            read_at(phoff.checked_add(index * phentsize <span class="kw">as </span>u64)<span class="question-mark">?</span>, <span class="kw-2">&amp;mut </span>entry)<span class="question-mark">?</span>;
+<a href=#324 id=324 data-nosnippet>324</a>            <span class="kw">let </span>field = |at: usize| u64::from_le_bytes(entry[at..at + <span class="number">8</span>].try_into().unwrap());
+<a href=#325 id=325 data-nosnippet>325</a>            <span class="kw">match </span>u32::from_le_bytes(entry[..<span class="number">4</span>].try_into().unwrap()) {
+<a href=#326 id=326 data-nosnippet>326</a>                <span class="number">1 </span>=&gt; {} <span class="comment">// PT_LOAD
+<a href=#327 id=327 data-nosnippet>327</a>                </span><span class="number">3 </span>=&gt; {
+<a href=#328 id=328 data-nosnippet>328</a>                    <span class="comment">// PT_INTERP
+<a href=#329 id=329 data-nosnippet>329</a>                    </span>interpreter = <span class="bool-val">true</span>;
+<a href=#330 id=330 data-nosnippet>330</a>                    <span class="kw">continue</span>;
+<a href=#331 id=331 data-nosnippet>331</a>                }
+<a href=#332 id=332 data-nosnippet>332</a>                <span class="kw">_ </span>=&gt; <span class="kw">continue</span>,
+<a href=#333 id=333 data-nosnippet>333</a>            }
+<a href=#334 id=334 data-nosnippet>334</a>            <span class="kw">let </span>(offset, vaddr, filesz, memsz) = (field(<span class="number">8</span>), field(<span class="number">16</span>), field(<span class="number">32</span>), field(<span class="number">40</span>));
+<a href=#335 id=335 data-nosnippet>335</a>            <span class="comment">// PF_X.
+<a href=#336 id=336 data-nosnippet>336</a>            </span><span class="kw">if </span>text.is_none() &amp;&amp; u32::from_le_bytes(entry[<span class="number">4</span>..<span class="number">8</span>].try_into().unwrap()) &amp; <span class="number">1 </span>!= <span class="number">0 </span>{
+<a href=#337 id=337 data-nosnippet>337</a>                text = <span class="prelude-val">Some</span>((offset &amp; !(page - <span class="number">1</span>), vaddr &amp; !(page - <span class="number">1</span>)));
+<a href=#338 id=338 data-nosnippet>338</a>            }
+<a href=#339 id=339 data-nosnippet>339</a>            <span class="kw">if </span>offset &lt;= phoff &amp;&amp; phoff &lt; offset.checked_add(filesz)<span class="question-mark">? </span>{
+<a href=#340 id=340 data-nosnippet>340</a>                phdr = (phoff - offset).checked_add(vaddr)<span class="question-mark">?</span>;
+<a href=#341 id=341 data-nosnippet>341</a>            }
+<a href=#342 id=342 data-nosnippet>342</a>            start_data = start_data.max(vaddr);
+<a href=#343 id=343 data-nosnippet>343</a>            end_data = end_data.max(vaddr.checked_add(filesz)<span class="question-mark">?</span>);
+<a href=#344 id=344 data-nosnippet>344</a>            <span class="kw">let </span>segment_end = vaddr.checked_add(memsz)<span class="question-mark">?</span>;
+<a href=#345 id=345 data-nosnippet>345</a>            end = <span class="prelude-val">Some</span>(end.map_or(segment_end, |end| end.max(segment_end)));
+<a href=#346 id=346 data-nosnippet>346</a>        }
+<a href=#347 id=347 data-nosnippet>347</a>        <span class="prelude-val">Some</span>(<span class="self">Self </span>{
+<a href=#348 id=348 data-nosnippet>348</a>            position_independent,
+<a href=#349 id=349 data-nosnippet>349</a>            interpreter,
+<a href=#350 id=350 data-nosnippet>350</a>            phdr,
+<a href=#351 id=351 data-nosnippet>351</a>            end: end<span class="question-mark">?</span>,
+<a href=#352 id=352 data-nosnippet>352</a>            text,
+<a href=#353 id=353 data-nosnippet>353</a>            data_span: end_data.saturating_sub(start_data),
+<a href=#354 id=354 data-nosnippet>354</a>            page,
+<a href=#355 id=355 data-nosnippet>355</a>        })
+<a href=#356 id=356 data-nosnippet>356</a>    }
+<a href=#357 id=357 data-nosnippet>357</a>
+<a href=#358 id=358 data-nosnippet>358</a>    <span class="doccomment">/// Where Linux starts the program break of a process that exec'd this
+<a href=#359 id=359 data-nosnippet>359</a>    /// image, given the `AT_PHDR` its exec reported, with address
+<a href=#360 id=360 data-nosnippet>360</a>    /// randomization off: the end of the highest loaded segment at the load
+<a href=#361 id=361 data-nosnippet>361</a>    /// bias, page-aligned up (`mm-&gt;start_brk = mm-&gt;brk =
+<a href=#362 id=362 data-nosnippet>362</a>    /// ELF_PAGEALIGN(elf_brk)`), or why there is no answer.
+<a href=#363 id=363 data-nosnippet>363</a>    </span><span class="kw">pub fn </span>start_brk(<span class="kw-2">&amp;</span><span class="self">self</span>, at_phdr: u64) -&gt; <span class="prelude-ty">Result</span>&lt;u64, <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str&gt; {
+<a href=#364 id=364 data-nosnippet>364</a>        <span class="kw">let </span>bias = at_phdr
+<a href=#365 id=365 data-nosnippet>365</a>            .checked_sub(<span class="self">self</span>.phdr)
+<a href=#366 id=366 data-nosnippet>366</a>            .ok_or(<span class="string">"AT_PHDR below the image's program headers"</span>)<span class="question-mark">?</span>;
+<a href=#367 id=367 data-nosnippet>367</a>        <span class="self">self</span>.start_brk_at_bias(bias)
+<a href=#368 id=368 data-nosnippet>368</a>    }
+<a href=#369 id=369 data-nosnippet>369</a>
+<a href=#370 id=370 data-nosnippet>370</a>    <span class="doccomment">/// [`Self::start_brk`] for an image loaded at load bias `bias`.
+<a href=#371 id=371 data-nosnippet>371</a>    </span><span class="kw">pub fn </span>start_brk_at_bias(<span class="kw-2">&amp;</span><span class="self">self</span>, bias: u64) -&gt; <span class="prelude-ty">Result</span>&lt;u64, <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str&gt; {
+<a href=#372 id=372 data-nosnippet>372</a>        <span class="kw">if </span><span class="self">self</span>.position_independent &amp;&amp; !<span class="self">self</span>.interpreter {
+<a href=#373 id=373 data-nosnippet>373</a>            <span class="comment">// Recent kernels (6.17's load_elf_binary) move it to
+<a href=#374 id=374 data-nosnippet>374</a>            // ELF_ET_DYN_BASE even without randomization, unless built with
+<a href=#375 id=375 data-nosnippet>375</a>            // CONFIG_COMPAT_BRK.
+<a href=#376 id=376 data-nosnippet>376</a>            </span><span class="kw">return </span><span class="prelude-val">Err</span>(
+<a href=#377 id=377 data-nosnippet>377</a>                <span class="string">"a position-independent image without an interpreter, whose break depends on the kernel's build"</span>,
+<a href=#378 id=378 data-nosnippet>378</a>            );
+<a href=#379 id=379 data-nosnippet>379</a>        }
+<a href=#380 id=380 data-nosnippet>380</a>        bias.checked_add(<span class="self">self</span>.end)
+<a href=#381 id=381 data-nosnippet>381</a>            .and_then(|end| end.checked_add(<span class="self">self</span>.page - <span class="number">1</span>))
+<a href=#382 id=382 data-nosnippet>382</a>            .map(|end| end &amp; !(<span class="self">self</span>.page - <span class="number">1</span>))
+<a href=#383 id=383 data-nosnippet>383</a>            .ok_or(<span class="string">"an image ending past the address space"</span>)
+<a href=#384 id=384 data-nosnippet>384</a>    }
+<a href=#385 id=385 data-nosnippet>385</a>}
+<a href=#386 id=386 data-nosnippet>386</a>
+<a href=#387 id=387 data-nosnippet>387</a><span class="doccomment">/// The load bias of the image file at `path` with inode `ino`, in a
+<a href=#388 id=388 data-nosnippet>388</a>/// process whose `/proc/&lt;pid&gt;/maps` reads `maps`: the start of the file's
+<a href=#389 id=389 data-nosnippet>389</a>/// executable mapping at the text segment's offset less the text segment's
+<a href=#390 id=390 data-nosnippet>390</a>/// address ([`ElfLayout::text`]), or why there is none. The executable
+<a href=#391 id=391 data-nosnippet>391</a>/// mapping, because a launcher may also map the file to read it (SaBRe's
+<a href=#392 id=392 data-nosnippet>392</a>/// rewriter maps it read-only at offset 0) and may not map the image's first
+<a href=#393 id=393 data-nosnippet>393</a>/// page at all. The file is matched by inode and its whole pathname as the
+<a href=#394 id=394 data-nosnippet>394</a>/// reader sees it, not by device: maps shows the superblock's device, which
+<a href=#395 id=395 data-nosnippet>395</a>/// on btrfs and overlay is not the `st_dev` a `stat` of the file reports.
+<a href=#396 id=396 data-nosnippet>396</a>/// Where several such mappings give different biases, there is no answer.
+<a href=#397 id=397 data-nosnippet>397</a>/// This is
+<a href=#398 id=398 data-nosnippet>398</a>/// how Detcore finds an image's bias where the kernel exec'd a launcher,
+<a href=#399 id=399 data-nosnippet>399</a>/// whose `AT_PHDR` the process's auxiliary vector holds.
+<a href=#400 id=400 data-nosnippet>400</a></span><span class="kw">pub fn </span>load_bias(
+<a href=#401 id=401 data-nosnippet>401</a>    maps: <span class="kw-2">&amp;</span>[u8],
+<a href=#402 id=402 data-nosnippet>402</a>    path: <span class="kw-2">&amp;</span>Path,
+<a href=#403 id=403 data-nosnippet>403</a>    ino: u64,
+<a href=#404 id=404 data-nosnippet>404</a>    (text_offset, text_page): (u64, u64),
+<a href=#405 id=405 data-nosnippet>405</a>) -&gt; <span class="prelude-ty">Result</span>&lt;u64, <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str&gt; {
+<a href=#406 id=406 data-nosnippet>406</a>    <span class="comment">// Bytes, not text: a pathname in the mappings is whatever bytes the file
+<a href=#407 id=407 data-nosnippet>407</a>    // was named with.
+<a href=#408 id=408 data-nosnippet>408</a>    </span><span class="kw">fn </span>text(field: <span class="kw-2">&amp;</span>[u8]) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt; {
+<a href=#409 id=409 data-nosnippet>409</a>        std::str::from_utf8(field).ok()
+<a href=#410 id=410 data-nosnippet>410</a>    }
+<a href=#411 id=411 data-nosnippet>411</a>    <span class="comment">// As the mappings show it: Linux writes a newline in a pathname as
+<a href=#412 id=412 data-nosnippet>412</a>    // `\012` (`show_map_vma`, `seq_file_path(m, file, "\n")`).
+<a href=#413 id=413 data-nosnippet>413</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>displayed = Vec::new();
+<a href=#414 id=414 data-nosnippet>414</a>    <span class="kw">for </span><span class="kw-2">&amp;</span>byte <span class="kw">in </span>path.as_os_str().as_bytes() {
+<a href=#415 id=415 data-nosnippet>415</a>        <span class="kw">if </span>byte == <span class="string">b'\n' </span>{
+<a href=#416 id=416 data-nosnippet>416</a>            displayed.extend_from_slice(<span class="string">b"\\012"</span>);
+<a href=#417 id=417 data-nosnippet>417</a>        } <span class="kw">else </span>{
+<a href=#418 id=418 data-nosnippet>418</a>            displayed.push(byte);
+<a href=#419 id=419 data-nosnippet>419</a>        }
+<a href=#420 id=420 data-nosnippet>420</a>    }
+<a href=#421 id=421 data-nosnippet>421</a>    <span class="kw">let </span><span class="kw-2">mut </span>biases = maps.split(|<span class="kw-2">&amp;</span>byte| byte == <span class="string">b'\n'</span>).filter_map(|line| {
+<a href=#422 id=422 data-nosnippet>422</a>        <span class="kw">let </span><span class="kw-2">mut </span>fields = line.splitn(<span class="number">6</span>, |byte| byte.is_ascii_whitespace());
+<a href=#423 id=423 data-nosnippet>423</a>        <span class="kw">let </span>range = text(fields.next()<span class="question-mark">?</span>)<span class="question-mark">?</span>;
+<a href=#424 id=424 data-nosnippet>424</a>        <span class="kw">let </span>permissions = fields.next()<span class="question-mark">?</span>;
+<a href=#425 id=425 data-nosnippet>425</a>        <span class="kw">let </span>offset = u64::from_str_radix(text(fields.next()<span class="question-mark">?</span>)<span class="question-mark">?</span>, <span class="number">16</span>).ok()<span class="question-mark">?</span>;
+<a href=#426 id=426 data-nosnippet>426</a>        <span class="kw">let </span>_device = fields.next()<span class="question-mark">?</span>;
+<a href=#427 id=427 data-nosnippet>427</a>        <span class="kw">let </span>map_ino: u64 = text(fields.next()<span class="question-mark">?</span>)<span class="question-mark">?</span>.parse().ok()<span class="question-mark">?</span>;
+<a href=#428 id=428 data-nosnippet>428</a>        <span class="kw">let </span>pathname = fields.next()<span class="question-mark">?</span>.trim_ascii_start();
+<a href=#429 id=429 data-nosnippet>429</a>        <span class="kw">if </span>!permissions.contains(<span class="kw-2">&amp;</span><span class="string">b'x'</span>)
+<a href=#430 id=430 data-nosnippet>430</a>            || offset != text_offset
+<a href=#431 id=431 data-nosnippet>431</a>            || map_ino != ino
+<a href=#432 id=432 data-nosnippet>432</a>            || pathname != displayed
+<a href=#433 id=433 data-nosnippet>433</a>        {
+<a href=#434 id=434 data-nosnippet>434</a>            <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#435 id=435 data-nosnippet>435</a>        }
+<a href=#436 id=436 data-nosnippet>436</a>        <span class="kw">let </span>start = u64::from_str_radix(range.split_once(<span class="string">'-'</span>)<span class="question-mark">?</span>.<span class="number">0</span>, <span class="number">16</span>).ok()<span class="question-mark">?</span>;
+<a href=#437 id=437 data-nosnippet>437</a>        start.checked_sub(text_page)
+<a href=#438 id=438 data-nosnippet>438</a>    });
+<a href=#439 id=439 data-nosnippet>439</a>    <span class="kw">let </span>bias = biases
+<a href=#440 id=440 data-nosnippet>440</a>        .next()
+<a href=#441 id=441 data-nosnippet>441</a>        .ok_or(<span class="string">"no executable mapping of the image's text"</span>)<span class="question-mark">?</span>;
+<a href=#442 id=442 data-nosnippet>442</a>    <span class="kw">if </span>biases.any(|other| other != bias) {
+<a href=#443 id=443 data-nosnippet>443</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(<span class="string">"executable mappings of the image's text at different biases"</span>);
+<a href=#444 id=444 data-nosnippet>444</a>    }
+<a href=#445 id=445 data-nosnippet>445</a>    <span class="prelude-val">Ok</span>(bias)
+<a href=#446 id=446 data-nosnippet>446</a>}
+<a href=#447 id=447 data-nosnippet>447</a>
+<a href=#448 id=448 data-nosnippet>448</a><span class="doccomment">/// The kernel's `start_brk` in a `/proc/&lt;pid&gt;/stat` line: field 47, counted
+<a href=#449 id=449 data-nosnippet>449</a>/// past the command, which may hold spaces and parentheses.
+<a href=#450 id=450 data-nosnippet>450</a></span><span class="kw">pub fn </span>stat_start_brk(stat: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Option</span>&lt;u64&gt; {
+<a href=#451 id=451 data-nosnippet>451</a>    stat[stat.rfind(<span class="string">')'</span>)<span class="question-mark">? </span>+ <span class="number">1</span>..]
+<a href=#452 id=452 data-nosnippet>452</a>        .split_ascii_whitespace()
+<a href=#453 id=453 data-nosnippet>453</a>        .nth(<span class="number">47 </span>- <span class="number">3</span>)<span class="question-mark">?
+<a href=#454 id=454 data-nosnippet>454</a>        </span>.parse()
+<a href=#455 id=455 data-nosnippet>455</a>        .ok()
+<a href=#456 id=456 data-nosnippet>456</a>}
+<a href=#457 id=457 data-nosnippet>457</a>
+<a href=#458 id=458 data-nosnippet>458</a><span class="doccomment">/// What Detcore found when it checked its model of a process's program break
+<a href=#459 id=459 data-nosnippet>459</a>/// ([`ElfLayout::start_brk`]) against the kernel's `start_brk`.
+<a href=#460 id=460 data-nosnippet>460</a></span><span class="attr">#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+<a href=#461 id=461 data-nosnippet>461</a></span><span class="kw">pub enum </span>BrkCheck {
+<a href=#462 id=462 data-nosnippet>462</a>    <span class="doccomment">/// The model equals the kernel's start.
+<a href=#463 id=463 data-nosnippet>463</a>    </span>Equal(u64),
+<a href=#464 id=464 data-nosnippet>464</a>    <span class="doccomment">/// The model differs from the kernel's start: a Detcore defect.
+<a href=#465 id=465 data-nosnippet>465</a>    </span>Differs {
+<a href=#466 id=466 data-nosnippet>466</a>        <span class="doccomment">/// Detcore's start.
+<a href=#467 id=467 data-nosnippet>467</a>        </span>model: u64,
+<a href=#468 id=468 data-nosnippet>468</a>        <span class="doccomment">/// The kernel's start.
+<a href=#469 id=469 data-nosnippet>469</a>        </span>kernel: u64,
+<a href=#470 id=470 data-nosnippet>470</a>    },
+<a href=#471 id=471 data-nosnippet>471</a>    <span class="doccomment">/// No model, for the reason given.
+<a href=#472 id=472 data-nosnippet>472</a>    </span>Unmodeled(<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str),
+<a href=#473 id=473 data-nosnippet>473</a>    <span class="doccomment">/// Not compared: the kernel randomized the break, which Linux's rule then
+<a href=#474 id=474 data-nosnippet>474</a>    /// does not give.
+<a href=#475 id=475 data-nosnippet>475</a>    </span>Randomized(u64),
+<a href=#476 id=476 data-nosnippet>476</a>    <span class="doccomment">/// Not compared: whether the kernel randomized the break is unknown.
+<a href=#477 id=477 data-nosnippet>477</a>    </span>RandomizationUnknown(u64),
+<a href=#478 id=478 data-nosnippet>478</a>    <span class="doccomment">/// Not compared: the kernel's start cannot be read.
+<a href=#479 id=479 data-nosnippet>479</a>    </span>KernelUnread(u64),
+<a href=#480 id=480 data-nosnippet>480</a>}
+<a href=#481 id=481 data-nosnippet>481</a>
+<a href=#482 id=482 data-nosnippet>482</a><span class="kw">impl </span>BrkCheck {
+<a href=#483 id=483 data-nosnippet>483</a>    <span class="doccomment">/// The outcome for a model (or why there is none), whether the kernel
+<a href=#484 id=484 data-nosnippet>484</a>    /// randomized the break (`None`: unknown), and the kernel's start (`None`:
+<a href=#485 id=485 data-nosnippet>485</a>    /// unread).
+<a href=#486 id=486 data-nosnippet>486</a>    </span><span class="kw">pub fn </span>of(
+<a href=#487 id=487 data-nosnippet>487</a>        model: <span class="prelude-ty">Result</span>&lt;u64, <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str&gt;,
+<a href=#488 id=488 data-nosnippet>488</a>        randomized: <span class="prelude-ty">Option</span>&lt;bool&gt;,
+<a href=#489 id=489 data-nosnippet>489</a>        kernel: <span class="prelude-ty">Option</span>&lt;u64&gt;,
+<a href=#490 id=490 data-nosnippet>490</a>    ) -&gt; <span class="self">Self </span>{
+<a href=#491 id=491 data-nosnippet>491</a>        <span class="kw">let </span>model = <span class="kw">match </span>model {
+<a href=#492 id=492 data-nosnippet>492</a>            <span class="prelude-val">Ok</span>(model) =&gt; model,
+<a href=#493 id=493 data-nosnippet>493</a>            <span class="prelude-val">Err</span>(reason) =&gt; <span class="kw">return </span><span class="self">Self</span>::Unmodeled(reason),
+<a href=#494 id=494 data-nosnippet>494</a>        };
+<a href=#495 id=495 data-nosnippet>495</a>        <span class="kw">match </span>(randomized, kernel) {
+<a href=#496 id=496 data-nosnippet>496</a>            (<span class="prelude-val">Some</span>(<span class="bool-val">true</span>), <span class="kw">_</span>) =&gt; <span class="self">Self</span>::Randomized(model),
+<a href=#497 id=497 data-nosnippet>497</a>            (<span class="prelude-val">None</span>, <span class="kw">_</span>) =&gt; <span class="self">Self</span>::RandomizationUnknown(model),
+<a href=#498 id=498 data-nosnippet>498</a>            (<span class="prelude-val">Some</span>(<span class="bool-val">false</span>), <span class="prelude-val">None</span>) =&gt; <span class="self">Self</span>::KernelUnread(model),
+<a href=#499 id=499 data-nosnippet>499</a>            (<span class="prelude-val">Some</span>(<span class="bool-val">false</span>), <span class="prelude-val">Some</span>(kernel)) <span class="kw">if </span>kernel == model =&gt; <span class="self">Self</span>::Equal(model),
+<a href=#500 id=500 data-nosnippet>500</a>            (<span class="prelude-val">Some</span>(<span class="bool-val">false</span>), <span class="prelude-val">Some</span>(kernel)) =&gt; <span class="self">Self</span>::Differs { model, kernel },
+<a href=#501 id=501 data-nosnippet>501</a>        }
+<a href=#502 id=502 data-nosnippet>502</a>    }
+<a href=#503 id=503 data-nosnippet>503</a>}
+<a href=#504 id=504 data-nosnippet>504</a>
+<a href=#505 id=505 data-nosnippet>505</a><span class="kw">impl </span>std::fmt::Display <span class="kw">for </span>BrkCheck {
+<a href=#506 id=506 data-nosnippet>506</a>    <span class="kw">fn </span>fmt(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span>std::fmt::Formatter&lt;<span class="lifetime">'_</span>&gt;) -&gt; std::fmt::Result {
+<a href=#507 id=507 data-nosnippet>507</a>        <span class="kw">match </span><span class="self">self </span>{
+<a href=#508 id=508 data-nosnippet>508</a>            <span class="self">Self</span>::Equal(model) =&gt; <span class="macro">write!</span>(f, <span class="string">"model {model:#x} equals the kernel's start_brk"</span>),
+<a href=#509 id=509 data-nosnippet>509</a>            <span class="self">Self</span>::Differs { model, kernel } =&gt; <span class="macro">write!</span>(
+<a href=#510 id=510 data-nosnippet>510</a>                f,
+<a href=#511 id=511 data-nosnippet>511</a>                <span class="string">"model {model:#x} differs from the kernel's start_brk {kernel:#x}"
+<a href=#512 id=512 data-nosnippet>512</a>            </span>),
+<a href=#513 id=513 data-nosnippet>513</a>            <span class="self">Self</span>::Unmodeled(reason) =&gt; <span class="macro">write!</span>(f, <span class="string">"not modeled: {reason}"</span>),
+<a href=#514 id=514 data-nosnippet>514</a>            <span class="self">Self</span>::Randomized(model) =&gt; <span class="macro">write!</span>(
+<a href=#515 id=515 data-nosnippet>515</a>                f,
+<a href=#516 id=516 data-nosnippet>516</a>                <span class="string">"model {model:#x} not compared: the kernel randomized the break"
+<a href=#517 id=517 data-nosnippet>517</a>            </span>),
+<a href=#518 id=518 data-nosnippet>518</a>            <span class="self">Self</span>::RandomizationUnknown(model) =&gt; <span class="macro">write!</span>(
+<a href=#519 id=519 data-nosnippet>519</a>                f,
+<a href=#520 id=520 data-nosnippet>520</a>                <span class="string">"model {model:#x} not compared: whether the kernel randomized the break is unknown"
+<a href=#521 id=521 data-nosnippet>521</a>            </span>),
+<a href=#522 id=522 data-nosnippet>522</a>            <span class="self">Self</span>::KernelUnread(model) =&gt; <span class="macro">write!</span>(
+<a href=#523 id=523 data-nosnippet>523</a>                f,
+<a href=#524 id=524 data-nosnippet>524</a>                <span class="string">"model {model:#x} not compared: the kernel's start_brk is unreadable"
+<a href=#525 id=525 data-nosnippet>525</a>            </span>),
+<a href=#526 id=526 data-nosnippet>526</a>        }
+<a href=#527 id=527 data-nosnippet>527</a>    }
+<a href=#528 id=528 data-nosnippet>528</a>}
+<a href=#529 id=529 data-nosnippet>529</a>
+<a href=#530 id=530 data-nosnippet>530</a><span class="doccomment">/// The value of entry `key` in an auxiliary vector read from
+<a href=#531 id=531 data-nosnippet>531</a>/// `/proc/&lt;pid&gt;/auxv` as `auxv`, native-endian pairs ended by `AT_NULL`.
+<a href=#532 id=532 data-nosnippet>532</a></span><span class="kw">pub fn </span>auxv_entry(auxv: <span class="kw-2">&amp;</span>[u8], key: u64) -&gt; <span class="prelude-ty">Option</span>&lt;u64&gt; {
+<a href=#533 id=533 data-nosnippet>533</a>    auxv.as_chunks::&lt;<span class="number">16</span>&gt;()
+<a href=#534 id=534 data-nosnippet>534</a>        .<span class="number">0
+<a href=#535 id=535 data-nosnippet>535</a>        </span>.iter()
+<a href=#536 id=536 data-nosnippet>536</a>        .map(|pair| {
+<a href=#537 id=537 data-nosnippet>537</a>            <span class="kw">let </span>word = |at: usize| u64::from_ne_bytes(pair[at..at + <span class="number">8</span>].try_into().unwrap());
+<a href=#538 id=538 data-nosnippet>538</a>            (word(<span class="number">0</span>), word(<span class="number">8</span>))
+<a href=#539 id=539 data-nosnippet>539</a>        })
+<a href=#540 id=540 data-nosnippet>540</a>        .take_while(|<span class="kw-2">&amp;</span>(entry, <span class="kw">_</span>)| entry != <span class="number">0</span>)
+<a href=#541 id=541 data-nosnippet>541</a>        .find_map(|(entry, value)| (entry == key).then_some(value))
+<a href=#542 id=542 data-nosnippet>542</a>}
+<a href=#543 id=543 data-nosnippet>543</a>
+<a href=#544 id=544 data-nosnippet>544</a><span class="doccomment">/// `path`, absolute in a root directory the caller sees at `root`, as the
+<a href=#545 id=545 data-nosnippet>545</a>/// caller spells it.
+<a href=#546 id=546 data-nosnippet>546</a></span><span class="kw">fn </span>below(root: <span class="kw-2">&amp;</span>Path, path: <span class="kw-2">&amp;</span>Path) -&gt; <span class="prelude-ty">Option</span>&lt;PathBuf&gt; {
+<a href=#547 id=547 data-nosnippet>547</a>    <span class="prelude-val">Some</span>(root.join(path.strip_prefix(<span class="string">"/"</span>).ok()<span class="question-mark">?</span>))
+<a href=#548 id=548 data-nosnippet>548</a>}
+<a href=#549 id=549 data-nosnippet>549</a>
+<a href=#550 id=550 data-nosnippet>550</a><span class="doccomment">/// What the kernel's script handler makes of a file.
+<a href=#551 id=551 data-nosnippet>551</a></span><span class="attr">#[derive(Debug, PartialEq, Eq)]
+<a href=#552 id=552 data-nosnippet>552</a></span><span class="kw">enum </span>Script {
+<a href=#553 id=553 data-nosnippet>553</a>    <span class="doccomment">/// Not a script.
+<a href=#554 id=554 data-nosnippet>554</a>    </span>Not,
+<a href=#555 id=555 data-nosnippet>555</a>    <span class="doccomment">/// A file the caller may not read, which the kernel may still execute.
+<a href=#556 id=556 data-nosnippet>556</a>    </span>Unread,
+<a href=#557 id=557 data-nosnippet>557</a>    <span class="doccomment">/// A script; the kernel executes this interpreter path.
+<a href=#558 id=558 data-nosnippet>558</a>    </span>Interpreter(PathBuf),
+<a href=#559 id=559 data-nosnippet>559</a>    <span class="doccomment">/// A `#!` line that names no interpreter the kernel would run.
+<a href=#560 id=560 data-nosnippet>560</a>    </span>Declined,
+<a href=#561 id=561 data-nosnippet>561</a>}
+<a href=#562 id=562 data-nosnippet>562</a>
+<a href=#563 id=563 data-nosnippet>563</a><span class="doccomment">/// What the kernel's script handler makes of the file at `path`.
+<a href=#564 id=564 data-nosnippet>564</a></span><span class="kw">fn </span>script_interpreter(path: <span class="kw-2">&amp;</span>Path) -&gt; Script {
+<a href=#565 id=565 data-nosnippet>565</a>    <span class="kw">let </span><span class="kw-2">mut </span>header = Vec::with_capacity(BINPRM_BUF_SIZE);
+<a href=#566 id=566 data-nosnippet>566</a>    <span class="comment">// Nonblocking and without a controlling terminal, so that a file
+<a href=#567 id=567 data-nosnippet>567</a>    // replaced by a FIFO or device since it was checked cannot wait.
+<a href=#568 id=568 data-nosnippet>568</a>    </span><span class="kw">let </span>read = fs::OpenOptions::new()
+<a href=#569 id=569 data-nosnippet>569</a>        .read(<span class="bool-val">true</span>)
+<a href=#570 id=570 data-nosnippet>570</a>        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+<a href=#571 id=571 data-nosnippet>571</a>        .open(path)
+<a href=#572 id=572 data-nosnippet>572</a>        .and_then(|file| file.take(BINPRM_BUF_SIZE <span class="kw">as </span>u64).read_to_end(<span class="kw-2">&amp;mut </span>header));
+<a href=#573 id=573 data-nosnippet>573</a>    <span class="kw">match </span>read {
+<a href=#574 id=574 data-nosnippet>574</a>        <span class="prelude-val">Ok</span>(<span class="kw">_</span>) =&gt; parse_script(<span class="kw-2">&amp;</span>header),
+<a href=#575 id=575 data-nosnippet>575</a>        <span class="prelude-val">Err</span>(<span class="kw">_</span>) =&gt; Script::Unread,
+<a href=#576 id=576 data-nosnippet>576</a>    }
+<a href=#577 id=577 data-nosnippet>577</a>}
+<a href=#578 id=578 data-nosnippet>578</a>
+<a href=#579 id=579 data-nosnippet>579</a><span class="doccomment">/// Source of truth: `load_script()` in fs/binfmt_script.c. The kernel reads
+<a href=#580 id=580 data-nosnippet>580</a>/// the first [`BINPRM_BUF_SIZE`] bytes into a zeroed buffer. The line ends at
+<a href=#581 id=581 data-nosnippet>581</a>/// the first newline, and the interpreter path at a space, tab or NUL (so a
+<a href=#582 id=582 data-nosnippet>582</a>/// short file with no newline ends at the zeroes). A line with no newline
+<a href=#583 id=583 data-nosnippet>583</a>/// whose interpreter path runs to the end of the buffer may be truncated, and
+<a href=#584 id=584 data-nosnippet>584</a>/// the kernel declines it.
+<a href=#585 id=585 data-nosnippet>585</a></span><span class="kw">fn </span>parse_script(header: <span class="kw-2">&amp;</span>[u8]) -&gt; Script {
+<a href=#586 id=586 data-nosnippet>586</a>    <span class="kw">let </span><span class="kw-2">mut </span>buffer = [<span class="number">0_u8</span>; BINPRM_BUF_SIZE];
+<a href=#587 id=587 data-nosnippet>587</a>    <span class="kw">let </span>read = header.len().min(BINPRM_BUF_SIZE);
+<a href=#588 id=588 data-nosnippet>588</a>    buffer[..read].copy_from_slice(<span class="kw-2">&amp;</span>header[..read]);
+<a href=#589 id=589 data-nosnippet>589</a>    <span class="kw">let </span><span class="prelude-val">Some</span>(line) = buffer.strip_prefix(<span class="string">b"#!"</span>) <span class="kw">else </span>{
+<a href=#590 id=590 data-nosnippet>590</a>        <span class="kw">return </span>Script::Not;
+<a href=#591 id=591 data-nosnippet>591</a>    };
+<a href=#592 id=592 data-nosnippet>592</a>    <span class="kw">let </span>(line, ended) = <span class="kw">match </span>line.iter().position(|<span class="kw-2">&amp;</span>byte| byte == <span class="string">b'\n'</span>) {
+<a href=#593 id=593 data-nosnippet>593</a>        <span class="prelude-val">Some</span>(end) =&gt; (<span class="kw-2">&amp;</span>line[..end], <span class="bool-val">true</span>),
+<a href=#594 id=594 data-nosnippet>594</a>        <span class="prelude-val">None </span>=&gt; (line, <span class="bool-val">false</span>),
+<a href=#595 id=595 data-nosnippet>595</a>    };
+<a href=#596 id=596 data-nosnippet>596</a>    <span class="kw">let </span>start = line
+<a href=#597 id=597 data-nosnippet>597</a>        .iter()
+<a href=#598 id=598 data-nosnippet>598</a>        .position(|<span class="kw-2">&amp;</span>byte| byte != <span class="string">b' ' </span>&amp;&amp; byte != <span class="string">b'\t'</span>)
+<a href=#599 id=599 data-nosnippet>599</a>        .unwrap_or(line.len());
+<a href=#600 id=600 data-nosnippet>600</a>    <span class="kw">let </span>rest = <span class="kw-2">&amp;</span>line[start..];
+<a href=#601 id=601 data-nosnippet>601</a>    <span class="kw">let </span>end = rest
+<a href=#602 id=602 data-nosnippet>602</a>        .iter()
+<a href=#603 id=603 data-nosnippet>603</a>        .position(|<span class="kw-2">&amp;</span>byte| <span class="macro">matches!</span>(byte, <span class="string">b' ' </span>| <span class="string">b'\t' </span>| <span class="number">0</span>));
+<a href=#604 id=604 data-nosnippet>604</a>    <span class="kw">if </span>end.is_none() &amp;&amp; !ended {
+<a href=#605 id=605 data-nosnippet>605</a>        <span class="kw">return </span>Script::Declined;
+<a href=#606 id=606 data-nosnippet>606</a>    }
+<a href=#607 id=607 data-nosnippet>607</a>    <span class="kw">let </span>interpreter = <span class="kw-2">&amp;</span>rest[..end.unwrap_or(rest.len())];
+<a href=#608 id=608 data-nosnippet>608</a>    <span class="kw">if </span>interpreter.is_empty() {
+<a href=#609 id=609 data-nosnippet>609</a>        <span class="kw">return </span>Script::Declined;
+<a href=#610 id=610 data-nosnippet>610</a>    }
+<a href=#611 id=611 data-nosnippet>611</a>    Script::Interpreter(PathBuf::from(std::ffi::OsStr::from_bytes(interpreter)))
+<a href=#612 id=612 data-nosnippet>612</a>}
+<a href=#613 id=613 data-nosnippet>613</a>
+<a href=#614 id=614 data-nosnippet>614</a><span class="attr">#[cfg(test)]
+<a href=#615 id=615 data-nosnippet>615</a></span><span class="kw">mod </span>tests {
+<a href=#616 id=616 data-nosnippet>616</a>    <span class="kw">use </span>std::os::unix::fs::PermissionsExt;
+<a href=#617 id=617 data-nosnippet>617</a>
+<a href=#618 id=618 data-nosnippet>618</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#619 id=619 data-nosnippet>619</a>
+<a href=#620 id=620 data-nosnippet>620</a>    <span class="attr">#[test]
+<a href=#621 id=621 data-nosnippet>621</a>    </span><span class="kw">fn </span>an_elf_layout_gives_linuxs_start_of_the_program_break() {
+<a href=#622 id=622 data-nosnippet>622</a>        <span class="comment">// A real image: this test binary, linked by the toolchain.
+<a href=#623 id=623 data-nosnippet>623</a>        </span><span class="kw">let </span>layout = ElfLayout::read(<span class="kw-2">&amp;</span>std::env::current_exe().unwrap()).unwrap();
+<a href=#624 id=624 data-nosnippet>624</a>        <span class="macro">assert!</span>(layout.end &gt; layout.phdr);
+<a href=#625 id=625 data-nosnippet>625</a>        <span class="comment">// Its text segment is executable and page-aligned in file and memory.
+<a href=#626 id=626 data-nosnippet>626</a>        </span><span class="kw">let </span>(text_offset, text_page) = layout.text.unwrap();
+<a href=#627 id=627 data-nosnippet>627</a>        <span class="macro">assert_eq!</span>((text_offset % layout.page, text_page % layout.page), (<span class="number">0</span>, <span class="number">0</span>));
+<a href=#628 id=628 data-nosnippet>628</a>        <span class="macro">assert_eq!</span>(layout.page, <span class="kw">crate</span>::page::page_size());
+<a href=#629 id=629 data-nosnippet>629</a>        <span class="comment">// A non-ELF file and a 32-bit or big-endian header have none.
+<a href=#630 id=630 data-nosnippet>630</a>        </span><span class="macro">assert_eq!</span>(ElfLayout::read(Path::new(<span class="string">"/proc/self/status"</span>)), <span class="prelude-val">None</span>);
+<a href=#631 id=631 data-nosnippet>631</a>        <span class="kw">let </span><span class="kw-2">mut </span>header = [<span class="number">0_u8</span>; <span class="number">64</span>];
+<a href=#632 id=632 data-nosnippet>632</a>        header[..<span class="number">4</span>].copy_from_slice(<span class="string">b"\x7fELF"</span>);
+<a href=#633 id=633 data-nosnippet>633</a>        header[<span class="number">4</span>] = <span class="number">1</span>;
+<a href=#634 id=634 data-nosnippet>634</a>        header[<span class="number">5</span>] = <span class="number">1</span>;
+<a href=#635 id=635 data-nosnippet>635</a>        <span class="macro">assert_eq!</span>(ElfLayout::parse(<span class="kw-2">&amp;</span>header, |<span class="kw">_</span>, <span class="kw">_</span>| <span class="prelude-val">None</span>, <span class="number">4096</span>), <span class="prelude-val">None</span>);
+<a href=#636 id=636 data-nosnippet>636</a>
+<a href=#637 id=637 data-nosnippet>637</a>        <span class="comment">// A synthetic ET_EXEC image with two loads: text at 0x400000 holding
+<a href=#638 id=638 data-nosnippet>638</a>        // the program headers at file offset 64, and data at 0x403e10 whose
+<a href=#639 id=639 data-nosnippet>639</a>        // bss runs to 0x4050b0.
+<a href=#640 id=640 data-nosnippet>640</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>header = [<span class="number">0_u8</span>; <span class="number">64</span>];
+<a href=#641 id=641 data-nosnippet>641</a>        header[..<span class="number">4</span>].copy_from_slice(<span class="string">b"\x7fELF"</span>);
+<a href=#642 id=642 data-nosnippet>642</a>        header[<span class="number">4</span>] = <span class="number">2</span>;
+<a href=#643 id=643 data-nosnippet>643</a>        header[<span class="number">5</span>] = <span class="number">1</span>;
+<a href=#644 id=644 data-nosnippet>644</a>        header[<span class="number">16</span>..<span class="number">18</span>].copy_from_slice(<span class="kw-2">&amp;</span><span class="number">2_u16</span>.to_le_bytes());
+<a href=#645 id=645 data-nosnippet>645</a>        header[<span class="number">32</span>..<span class="number">40</span>].copy_from_slice(<span class="kw-2">&amp;</span><span class="number">64_u64</span>.to_le_bytes());
+<a href=#646 id=646 data-nosnippet>646</a>        header[<span class="number">54</span>..<span class="number">56</span>].copy_from_slice(<span class="kw-2">&amp;</span><span class="number">56_u16</span>.to_le_bytes());
+<a href=#647 id=647 data-nosnippet>647</a>        header[<span class="number">56</span>..<span class="number">58</span>].copy_from_slice(<span class="kw-2">&amp;</span><span class="number">3_u16</span>.to_le_bytes());
+<a href=#648 id=648 data-nosnippet>648</a>        <span class="kw">let </span>program_header = |kind: u32, offset: u64, vaddr: u64, filesz: u64, memsz: u64| {
+<a href=#649 id=649 data-nosnippet>649</a>            <span class="kw">let </span><span class="kw-2">mut </span>entry = [<span class="number">0_u8</span>; <span class="number">56</span>];
+<a href=#650 id=650 data-nosnippet>650</a>            entry[..<span class="number">4</span>].copy_from_slice(<span class="kw-2">&amp;</span>kind.to_le_bytes());
+<a href=#651 id=651 data-nosnippet>651</a>            entry[<span class="number">8</span>..<span class="number">16</span>].copy_from_slice(<span class="kw-2">&amp;</span>offset.to_le_bytes());
+<a href=#652 id=652 data-nosnippet>652</a>            entry[<span class="number">16</span>..<span class="number">24</span>].copy_from_slice(<span class="kw-2">&amp;</span>vaddr.to_le_bytes());
+<a href=#653 id=653 data-nosnippet>653</a>            entry[<span class="number">32</span>..<span class="number">40</span>].copy_from_slice(<span class="kw-2">&amp;</span>filesz.to_le_bytes());
+<a href=#654 id=654 data-nosnippet>654</a>            entry[<span class="number">40</span>..<span class="number">48</span>].copy_from_slice(<span class="kw-2">&amp;</span>memsz.to_le_bytes());
+<a href=#655 id=655 data-nosnippet>655</a>            entry
+<a href=#656 id=656 data-nosnippet>656</a>        };
+<a href=#657 id=657 data-nosnippet>657</a>        <span class="kw">let </span>entries = [
+<a href=#658 id=658 data-nosnippet>658</a>            program_header(<span class="number">6</span>, <span class="number">64</span>, <span class="number">0x400040</span>, <span class="number">0xa8</span>, <span class="number">0xa8</span>), <span class="comment">// PT_PHDR, not loaded
+<a href=#659 id=659 data-nosnippet>659</a>            </span>program_header(<span class="number">1</span>, <span class="number">0</span>, <span class="number">0x400000</span>, <span class="number">0x1000</span>, <span class="number">0x1000</span>),
+<a href=#660 id=660 data-nosnippet>660</a>            program_header(<span class="number">1</span>, <span class="number">0x2e10</span>, <span class="number">0x403e10</span>, <span class="number">0x290</span>, <span class="number">0x12a0</span>),
+<a href=#661 id=661 data-nosnippet>661</a>        ];
+<a href=#662 id=662 data-nosnippet>662</a>        <span class="kw">let </span>read_at = |offset: u64, buffer: <span class="kw-2">&amp;mut </span>[u8]| {
+<a href=#663 id=663 data-nosnippet>663</a>            <span class="kw">let </span>index = usize::try_from((offset - <span class="number">64</span>) / <span class="number">56</span>).ok()<span class="question-mark">?</span>;
+<a href=#664 id=664 data-nosnippet>664</a>            buffer.copy_from_slice(entries.get(index)<span class="question-mark">?</span>);
+<a href=#665 id=665 data-nosnippet>665</a>            <span class="prelude-val">Some</span>(())
+<a href=#666 id=666 data-nosnippet>666</a>        };
+<a href=#667 id=667 data-nosnippet>667</a>        <span class="kw">let </span>layout = ElfLayout::parse(<span class="kw-2">&amp;</span>header, read_at, <span class="number">4096</span>).unwrap();
+<a href=#668 id=668 data-nosnippet>668</a>        <span class="macro">assert_eq!</span>(
+<a href=#669 id=669 data-nosnippet>669</a>            layout,
+<a href=#670 id=670 data-nosnippet>670</a>            ElfLayout {
+<a href=#671 id=671 data-nosnippet>671</a>                position_independent: <span class="bool-val">false</span>,
+<a href=#672 id=672 data-nosnippet>672</a>                interpreter: <span class="bool-val">false</span>,
+<a href=#673 id=673 data-nosnippet>673</a>                phdr: <span class="number">0x400040</span>,
+<a href=#674 id=674 data-nosnippet>674</a>                end: <span class="number">0x4050b0</span>,
+<a href=#675 id=675 data-nosnippet>675</a>                <span class="comment">// The synthetic headers carry no flags, so no executable
+<a href=#676 id=676 data-nosnippet>676</a>                // segment.
+<a href=#677 id=677 data-nosnippet>677</a>                </span>text: <span class="prelude-val">None</span>,
+<a href=#678 id=678 data-nosnippet>678</a>                data_span: <span class="number">0x290</span>,
+<a href=#679 id=679 data-nosnippet>679</a>                page: <span class="number">4096</span>,
+<a href=#680 id=680 data-nosnippet>680</a>            }
+<a href=#681 id=681 data-nosnippet>681</a>        );
+<a href=#682 id=682 data-nosnippet>682</a>        <span class="macro">assert_eq!</span>(layout.start_brk(<span class="number">0x400040</span>), <span class="prelude-val">Ok</span>(<span class="number">0x406000</span>));
+<a href=#683 id=683 data-nosnippet>683</a>        <span class="macro">assert!</span>(layout.start_brk(<span class="number">0x400000</span>).is_err());
+<a href=#684 id=684 data-nosnippet>684</a>        <span class="comment">// On a host with 64 KiB pages the same image's break starts at the
+<a href=#685 id=685 data-nosnippet>685</a>        // next 64 KiB boundary.
+<a href=#686 id=686 data-nosnippet>686</a>        </span><span class="kw">let </span>large_pages = ElfLayout::parse(<span class="kw-2">&amp;</span>header, read_at, <span class="number">0x10000</span>).unwrap();
+<a href=#687 id=687 data-nosnippet>687</a>        <span class="macro">assert_eq!</span>(
+<a href=#688 id=688 data-nosnippet>688</a>            large_pages,
+<a href=#689 id=689 data-nosnippet>689</a>            ElfLayout {
+<a href=#690 id=690 data-nosnippet>690</a>                page: <span class="number">0x10000</span>,
+<a href=#691 id=691 data-nosnippet>691</a>                ..layout
+<a href=#692 id=692 data-nosnippet>692</a>            }
+<a href=#693 id=693 data-nosnippet>693</a>        );
+<a href=#694 id=694 data-nosnippet>694</a>        <span class="macro">assert_eq!</span>(large_pages.start_brk(<span class="number">0x400040</span>), <span class="prelude-val">Ok</span>(<span class="number">0x410000</span>));
+<a href=#695 id=695 data-nosnippet>695</a>        <span class="comment">// An end already on a page boundary stays there, at any bias.
+<a href=#696 id=696 data-nosnippet>696</a>        </span><span class="kw">let </span>aligned = ElfLayout {
+<a href=#697 id=697 data-nosnippet>697</a>            end: <span class="number">0x406000</span>,
+<a href=#698 id=698 data-nosnippet>698</a>            ..layout
+<a href=#699 id=699 data-nosnippet>699</a>        };
+<a href=#700 id=700 data-nosnippet>700</a>        <span class="macro">assert_eq!</span>(aligned.start_brk(<span class="number">0x400040</span>), <span class="prelude-val">Ok</span>(<span class="number">0x406000</span>));
+<a href=#701 id=701 data-nosnippet>701</a>        <span class="comment">// A position-independent image with an interpreter at its bias.
+<a href=#702 id=702 data-nosnippet>702</a>        </span><span class="kw">let </span>dynamic = ElfLayout {
+<a href=#703 id=703 data-nosnippet>703</a>            position_independent: <span class="bool-val">true</span>,
+<a href=#704 id=704 data-nosnippet>704</a>            interpreter: <span class="bool-val">true</span>,
+<a href=#705 id=705 data-nosnippet>705</a>            ..aligned
+<a href=#706 id=706 data-nosnippet>706</a>        };
+<a href=#707 id=707 data-nosnippet>707</a>        <span class="macro">assert_eq!</span>(
+<a href=#708 id=708 data-nosnippet>708</a>            dynamic.start_brk(<span class="number">0x5555_5555_4000 </span>+ <span class="number">0x400040</span>),
+<a href=#709 id=709 data-nosnippet>709</a>            <span class="prelude-val">Ok</span>(<span class="number">0x5555_5595_a000</span>)
+<a href=#710 id=710 data-nosnippet>710</a>        );
+<a href=#711 id=711 data-nosnippet>711</a>        <span class="comment">// Without an interpreter (a static PIE, or the dynamic loader run
+<a href=#712 id=712 data-nosnippet>712</a>        // directly), the kernel's build decides: no model.
+<a href=#713 id=713 data-nosnippet>713</a>        </span><span class="kw">let </span>static_pie = ElfLayout {
+<a href=#714 id=714 data-nosnippet>714</a>            interpreter: <span class="bool-val">false</span>,
+<a href=#715 id=715 data-nosnippet>715</a>            ..dynamic
+<a href=#716 id=716 data-nosnippet>716</a>        };
+<a href=#717 id=717 data-nosnippet>717</a>        <span class="macro">assert!</span>(static_pie.start_brk(<span class="number">0x5555_5555_4000 </span>+ <span class="number">0x400040</span>).is_err());
+<a href=#718 id=718 data-nosnippet>718</a>        <span class="comment">// Program headers outside every load: Linux's AT_PHDR is the bias.
+<a href=#719 id=719 data-nosnippet>719</a>        </span><span class="kw">let </span>unloaded = ElfLayout { phdr: <span class="number">0</span>, ..layout };
+<a href=#720 id=720 data-nosnippet>720</a>        <span class="macro">assert_eq!</span>(unloaded.start_brk(<span class="number">0</span>), <span class="prelude-val">Ok</span>(<span class="number">0x406000</span>));
+<a href=#721 id=721 data-nosnippet>721</a>        <span class="comment">// A PT_INTERP entry and ET_DYN are read from the headers.
+<a href=#722 id=722 data-nosnippet>722</a>        </span>header[<span class="number">16</span>..<span class="number">18</span>].copy_from_slice(<span class="kw-2">&amp;</span><span class="number">3_u16</span>.to_le_bytes());
+<a href=#723 id=723 data-nosnippet>723</a>        header[<span class="number">56</span>..<span class="number">58</span>].copy_from_slice(<span class="kw-2">&amp;</span><span class="number">4_u16</span>.to_le_bytes());
+<a href=#724 id=724 data-nosnippet>724</a>        <span class="kw">let </span>with_interp = [
+<a href=#725 id=725 data-nosnippet>725</a>            entries[<span class="number">0</span>],
+<a href=#726 id=726 data-nosnippet>726</a>            program_header(<span class="number">3</span>, <span class="number">0x2a8</span>, <span class="number">0x4002a8</span>, <span class="number">0x1c</span>, <span class="number">0x1c</span>), <span class="comment">// PT_INTERP
+<a href=#727 id=727 data-nosnippet>727</a>            </span>entries[<span class="number">1</span>],
+<a href=#728 id=728 data-nosnippet>728</a>            entries[<span class="number">2</span>],
+<a href=#729 id=729 data-nosnippet>729</a>        ];
+<a href=#730 id=730 data-nosnippet>730</a>        <span class="kw">let </span>read_at = |offset: u64, buffer: <span class="kw-2">&amp;mut </span>[u8]| {
+<a href=#731 id=731 data-nosnippet>731</a>            <span class="kw">let </span>index = usize::try_from((offset - <span class="number">64</span>) / <span class="number">56</span>).ok()<span class="question-mark">?</span>;
+<a href=#732 id=732 data-nosnippet>732</a>            buffer.copy_from_slice(with_interp.get(index)<span class="question-mark">?</span>);
+<a href=#733 id=733 data-nosnippet>733</a>            <span class="prelude-val">Some</span>(())
+<a href=#734 id=734 data-nosnippet>734</a>        };
+<a href=#735 id=735 data-nosnippet>735</a>        <span class="macro">assert_eq!</span>(
+<a href=#736 id=736 data-nosnippet>736</a>            ElfLayout::parse(<span class="kw-2">&amp;</span>header, read_at, <span class="number">4096</span>).unwrap(),
+<a href=#737 id=737 data-nosnippet>737</a>            ElfLayout {
+<a href=#738 id=738 data-nosnippet>738</a>                position_independent: <span class="bool-val">true</span>,
+<a href=#739 id=739 data-nosnippet>739</a>                interpreter: <span class="bool-val">true</span>,
+<a href=#740 id=740 data-nosnippet>740</a>                ..layout
+<a href=#741 id=741 data-nosnippet>741</a>            }
+<a href=#742 id=742 data-nosnippet>742</a>        );
+<a href=#743 id=743 data-nosnippet>743</a>    }
+<a href=#744 id=744 data-nosnippet>744</a>
+<a href=#745 id=745 data-nosnippet>745</a>    <span class="doccomment">/// The kernel's own `start_brk` for a real image, a shell exec'd without
+<a href=#746 id=746 data-nosnippet>746</a>    /// address randomization, is what its layout and `AT_PHDR` give.
+<a href=#747 id=747 data-nosnippet>747</a>    </span><span class="attr">#[test]
+<a href=#748 id=748 data-nosnippet>748</a>    </span><span class="kw">fn </span>the_kernels_start_of_the_break_is_what_the_layout_gives() {
+<a href=#749 id=749 data-nosnippet>749</a>        <span class="kw">use </span>std::os::unix::process::CommandExt;
+<a href=#750 id=750 data-nosnippet>750</a>        <span class="kw">let </span><span class="kw-2">mut </span>command = std::process::Command::new(<span class="string">"/bin/sh"</span>);
+<a href=#751 id=751 data-nosnippet>751</a>        command
+<a href=#752 id=752 data-nosnippet>752</a>            .args([<span class="string">"-c"</span>, <span class="string">"read line"</span>])
+<a href=#753 id=753 data-nosnippet>753</a>            .stdin(std::process::Stdio::piped());
+<a href=#754 id=754 data-nosnippet>754</a>        <span class="comment">// SAFETY: personality(2) is async-signal-safe.
+<a href=#755 id=755 data-nosnippet>755</a>        </span><span class="kw">unsafe </span>{
+<a href=#756 id=756 data-nosnippet>756</a>            command.pre_exec(|| {
+<a href=#757 id=757 data-nosnippet>757</a>                <span class="kw">if </span>libc::personality(libc::ADDR_NO_RANDOMIZE <span class="kw">as </span>libc::c_ulong) == -<span class="number">1 </span>{
+<a href=#758 id=758 data-nosnippet>758</a>                    <span class="kw">return </span><span class="prelude-val">Err</span>(std::io::Error::last_os_error());
+<a href=#759 id=759 data-nosnippet>759</a>                }
+<a href=#760 id=760 data-nosnippet>760</a>                <span class="prelude-val">Ok</span>(())
+<a href=#761 id=761 data-nosnippet>761</a>            });
+<a href=#762 id=762 data-nosnippet>762</a>        }
+<a href=#763 id=763 data-nosnippet>763</a>        <span class="comment">// `spawn` returns once the exec has happened.
+<a href=#764 id=764 data-nosnippet>764</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>child = command.spawn().unwrap();
+<a href=#765 id=765 data-nosnippet>765</a>        <span class="kw">let </span>process = PathBuf::from(<span class="macro">format!</span>(<span class="string">"/proc/{}"</span>, child.id()));
+<a href=#766 id=766 data-nosnippet>766</a>        <span class="kw">let </span>image = fs::read_link(process.join(<span class="string">"exe"</span>)).unwrap();
+<a href=#767 id=767 data-nosnippet>767</a>        <span class="kw">let </span>at_phdr = auxv_entry(<span class="kw-2">&amp;</span>fs::read(process.join(<span class="string">"auxv"</span>)).unwrap(), libc::AT_PHDR).unwrap();
+<a href=#768 id=768 data-nosnippet>768</a>        <span class="kw">let </span>start_brk = stat_start_brk(<span class="kw-2">&amp;</span>fs::read_to_string(process.join(<span class="string">"stat"</span>)).unwrap()).unwrap();
+<a href=#769 id=769 data-nosnippet>769</a>        <span class="kw">let </span>maps = fs::read(process.join(<span class="string">"maps"</span>)).unwrap();
+<a href=#770 id=770 data-nosnippet>770</a>        drop(child.stdin.take());
+<a href=#771 id=771 data-nosnippet>771</a>        child.wait().unwrap();
+<a href=#772 id=772 data-nosnippet>772</a>        <span class="kw">let </span>layout = ElfLayout::read(<span class="kw-2">&amp;</span>image).unwrap();
+<a href=#773 id=773 data-nosnippet>773</a>        <span class="macro">assert_eq!</span>(layout.start_brk(at_phdr), <span class="prelude-val">Ok</span>(start_brk), <span class="string">"{image:?}"</span>);
+<a href=#774 id=774 data-nosnippet>774</a>        <span class="comment">// The same start from the image's executable mapping, as Detcore
+<a href=#775 id=775 data-nosnippet>775</a>        // finds it where the kernel exec'd a launcher.
+<a href=#776 id=776 data-nosnippet>776</a>        </span><span class="kw">let </span>ino = std::os::unix::fs::MetadataExt::ino(<span class="kw-2">&amp;</span>fs::metadata(<span class="kw-2">&amp;</span>image).unwrap());
+<a href=#777 id=777 data-nosnippet>777</a>        <span class="kw">let </span>bias = load_bias(<span class="kw-2">&amp;</span>maps, <span class="kw-2">&amp;</span>image, ino, layout.text.unwrap()).unwrap();
+<a href=#778 id=778 data-nosnippet>778</a>        <span class="macro">assert_eq!</span>(layout.start_brk_at_bias(bias), <span class="prelude-val">Ok</span>(start_brk), <span class="string">"{image:?}"</span>);
+<a href=#779 id=779 data-nosnippet>779</a>    }
+<a href=#780 id=780 data-nosnippet>780</a>
+<a href=#781 id=781 data-nosnippet>781</a>    <span class="attr">#[test]
+<a href=#782 id=782 data-nosnippet>782</a>    </span><span class="kw">fn </span>the_start_of_the_break_is_field_47_past_the_command() {
+<a href=#783 id=783 data-nosnippet>783</a>        <span class="kw">let </span>fields: Vec&lt;String&gt; = (<span class="number">3</span>..=<span class="number">52</span>).map(|field| field.to_string()).collect();
+<a href=#784 id=784 data-nosnippet>784</a>        <span class="kw">let </span>stat = <span class="macro">format!</span>(<span class="string">"12 (a) b) (c) {}\n"</span>, fields.join(<span class="string">" "</span>));
+<a href=#785 id=785 data-nosnippet>785</a>        <span class="macro">assert_eq!</span>(stat_start_brk(<span class="kw-2">&amp;</span>stat), <span class="prelude-val">Some</span>(<span class="number">47</span>));
+<a href=#786 id=786 data-nosnippet>786</a>        <span class="macro">assert_eq!</span>(stat_start_brk(<span class="string">"12 (a) S 1 2"</span>), <span class="prelude-val">None</span>);
+<a href=#787 id=787 data-nosnippet>787</a>        <span class="macro">assert_eq!</span>(stat_start_brk(<span class="string">"12 a S"</span>), <span class="prelude-val">None</span>);
+<a href=#788 id=788 data-nosnippet>788</a>    }
+<a href=#789 id=789 data-nosnippet>789</a>
+<a href=#790 id=790 data-nosnippet>790</a>    <span class="attr">#[test]
+<a href=#791 id=791 data-nosnippet>791</a>    </span><span class="kw">fn </span>a_break_check_compares_only_where_linuxs_rule_gives_the_kernels_start() {
+<a href=#792 id=792 data-nosnippet>792</a>        <span class="macro">assert_eq!</span>(
+<a href=#793 id=793 data-nosnippet>793</a>            BrkCheck::of(<span class="prelude-val">Ok</span>(<span class="number">0x406000</span>), <span class="prelude-val">Some</span>(<span class="bool-val">false</span>), <span class="prelude-val">Some</span>(<span class="number">0x406000</span>)),
+<a href=#794 id=794 data-nosnippet>794</a>            BrkCheck::Equal(<span class="number">0x406000</span>)
+<a href=#795 id=795 data-nosnippet>795</a>        );
+<a href=#796 id=796 data-nosnippet>796</a>        <span class="kw">let </span>differs = BrkCheck::of(<span class="prelude-val">Ok</span>(<span class="number">0x406000</span>), <span class="prelude-val">Some</span>(<span class="bool-val">false</span>), <span class="prelude-val">Some</span>(<span class="number">0x407000</span>));
+<a href=#797 id=797 data-nosnippet>797</a>        <span class="macro">assert_eq!</span>(
+<a href=#798 id=798 data-nosnippet>798</a>            differs,
+<a href=#799 id=799 data-nosnippet>799</a>            BrkCheck::Differs {
+<a href=#800 id=800 data-nosnippet>800</a>                model: <span class="number">0x406000</span>,
+<a href=#801 id=801 data-nosnippet>801</a>                kernel: <span class="number">0x407000
+<a href=#802 id=802 data-nosnippet>802</a>            </span>}
+<a href=#803 id=803 data-nosnippet>803</a>        );
+<a href=#804 id=804 data-nosnippet>804</a>        <span class="macro">assert_eq!</span>(
+<a href=#805 id=805 data-nosnippet>805</a>            differs.to_string(),
+<a href=#806 id=806 data-nosnippet>806</a>            <span class="string">"model 0x406000 differs from the kernel's start_brk 0x407000"
+<a href=#807 id=807 data-nosnippet>807</a>        </span>);
+<a href=#808 id=808 data-nosnippet>808</a>        <span class="macro">assert_eq!</span>(
+<a href=#809 id=809 data-nosnippet>809</a>            BrkCheck::of(<span class="prelude-val">Ok</span>(<span class="number">0x406000</span>), <span class="prelude-val">Some</span>(<span class="bool-val">true</span>), <span class="prelude-val">Some</span>(<span class="number">0x1234000</span>)),
+<a href=#810 id=810 data-nosnippet>810</a>            BrkCheck::Randomized(<span class="number">0x406000</span>)
+<a href=#811 id=811 data-nosnippet>811</a>        );
+<a href=#812 id=812 data-nosnippet>812</a>        <span class="macro">assert_eq!</span>(
+<a href=#813 id=813 data-nosnippet>813</a>            BrkCheck::of(<span class="prelude-val">Ok</span>(<span class="number">0x406000</span>), <span class="prelude-val">None</span>, <span class="prelude-val">Some</span>(<span class="number">0x406000</span>)),
+<a href=#814 id=814 data-nosnippet>814</a>            BrkCheck::RandomizationUnknown(<span class="number">0x406000</span>)
+<a href=#815 id=815 data-nosnippet>815</a>        );
+<a href=#816 id=816 data-nosnippet>816</a>        <span class="macro">assert_eq!</span>(
+<a href=#817 id=817 data-nosnippet>817</a>            BrkCheck::of(<span class="prelude-val">Ok</span>(<span class="number">0x406000</span>), <span class="prelude-val">Some</span>(<span class="bool-val">false</span>), <span class="prelude-val">None</span>),
+<a href=#818 id=818 data-nosnippet>818</a>            BrkCheck::KernelUnread(<span class="number">0x406000</span>)
+<a href=#819 id=819 data-nosnippet>819</a>        );
+<a href=#820 id=820 data-nosnippet>820</a>        <span class="macro">assert_eq!</span>(
+<a href=#821 id=821 data-nosnippet>821</a>            BrkCheck::of(<span class="prelude-val">Err</span>(<span class="string">"no exec record"</span>), <span class="prelude-val">Some</span>(<span class="bool-val">false</span>), <span class="prelude-val">Some</span>(<span class="number">0x406000</span>)),
+<a href=#822 id=822 data-nosnippet>822</a>            BrkCheck::Unmodeled(<span class="string">"no exec record"</span>)
+<a href=#823 id=823 data-nosnippet>823</a>        );
+<a href=#824 id=824 data-nosnippet>824</a>    }
+<a href=#825 id=825 data-nosnippet>825</a>
+<a href=#826 id=826 data-nosnippet>826</a>    <span class="attr">#[test]
+<a href=#827 id=827 data-nosnippet>827</a>    </span><span class="kw">fn </span>a_load_bias_comes_from_the_images_executable_mapping() {
+<a href=#828 id=828 data-nosnippet>828</a>        <span class="comment">// A non-PIE image's text and data, another file's text, a read-only
+<a href=#829 id=829 data-nosnippet>829</a>        // mapping of the whole image at offset 0 (as SaBRe's rewriter makes),
+<a href=#830 id=830 data-nosnippet>830</a>        // and a position-independent image whose name has a space.
+<a href=#831 id=831 data-nosnippet>831</a>        </span><span class="kw">let </span>listed = <span class="string">"\
+<a href=#832 id=832 data-nosnippet>832</a>00401000-00402000 r-xp 00001000 00:20 1234 /dir/image
+<a href=#833 id=833 data-nosnippet>833</a>00402000-00403000 r--p 00002000 00:20 1234 /dir/image
+<a href=#834 id=834 data-nosnippet>834</a>555555553000-555555554000 r-xp 00001000 00:20 99 /other
+<a href=#835 id=835 data-nosnippet>835</a>7ffff7bac000-7ffff7bb1000 r--p 00000000 00:20 1234 /dir/image
+<a href=#836 id=836 data-nosnippet>836</a>7ffff7fc6000-7ffff7fc7000 r-xp 00001000 00:21 5678 /with spaces
+<a href=#837 id=837 data-nosnippet>837</a>"</span>;
+<a href=#838 id=838 data-nosnippet>838</a>        <span class="kw">let </span>maps = listed.as_bytes();
+<a href=#839 id=839 data-nosnippet>839</a>        <span class="kw">let </span>path = |path: <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str| Path::new(path);
+<a href=#840 id=840 data-nosnippet>840</a>        <span class="kw">let </span>text = (<span class="number">0x1000</span>, <span class="number">0x401000</span>);
+<a href=#841 id=841 data-nosnippet>841</a>        <span class="macro">assert_eq!</span>(load_bias(maps, path(<span class="string">"/dir/image"</span>), <span class="number">1234</span>, text), <span class="prelude-val">Ok</span>(<span class="number">0</span>));
+<a href=#842 id=842 data-nosnippet>842</a>        <span class="macro">assert!</span>(load_bias(maps, path(<span class="string">"/dir/image"</span>), <span class="number">4321</span>, text).is_err());
+<a href=#843 id=843 data-nosnippet>843</a>        <span class="macro">assert!</span>(load_bias(maps, path(<span class="string">"/dir/ima"</span>), <span class="number">1234</span>, text).is_err());
+<a href=#844 id=844 data-nosnippet>844</a>        <span class="comment">// The same inode and name under another directory (another
+<a href=#845 id=845 data-nosnippet>845</a>        // filesystem's file) is not the image.
+<a href=#846 id=846 data-nosnippet>846</a>        </span><span class="macro">assert!</span>(load_bias(maps, path(<span class="string">"/elsewhere/image"</span>), <span class="number">1234</span>, text).is_err());
+<a href=#847 id=847 data-nosnippet>847</a>        <span class="comment">// Two executable mappings of the text at different biases: no answer.
+<a href=#848 id=848 data-nosnippet>848</a>        </span><span class="kw">let </span>twice =
+<a href=#849 id=849 data-nosnippet>849</a>            <span class="macro">format!</span>(<span class="string">"{listed}7ffff0001000-7ffff0002000 r-xp 00001000 00:20 1234 /dir/image\n"</span>);
+<a href=#850 id=850 data-nosnippet>850</a>        <span class="macro">assert!</span>(load_bias(twice.as_bytes(), path(<span class="string">"/dir/image"</span>), <span class="number">1234</span>, text).is_err());
+<a href=#851 id=851 data-nosnippet>851</a>        <span class="comment">// The same bias twice is still one answer.
+<a href=#852 id=852 data-nosnippet>852</a>        </span><span class="kw">let </span>again = <span class="macro">format!</span>(<span class="string">"{listed}00401000-00402000 r-xp 00001000 00:20 1234 /dir/image\n"</span>);
+<a href=#853 id=853 data-nosnippet>853</a>        <span class="macro">assert_eq!</span>(
+<a href=#854 id=854 data-nosnippet>854</a>            load_bias(again.as_bytes(), path(<span class="string">"/dir/image"</span>), <span class="number">1234</span>, text),
+<a href=#855 id=855 data-nosnippet>855</a>            <span class="prelude-val">Ok</span>(<span class="number">0</span>)
+<a href=#856 id=856 data-nosnippet>856</a>        );
+<a href=#857 id=857 data-nosnippet>857</a>        <span class="comment">// A text segment at another offset has no executable mapping here.
+<a href=#858 id=858 data-nosnippet>858</a>        </span><span class="macro">assert_eq!</span>(
+<a href=#859 id=859 data-nosnippet>859</a>            load_bias(maps, path(<span class="string">"/dir/image"</span>), <span class="number">1234</span>, (<span class="number">0x2000</span>, <span class="number">0x402000</span>)).ok(),
+<a href=#860 id=860 data-nosnippet>860</a>            <span class="prelude-val">None
+<a href=#861 id=861 data-nosnippet>861</a>        </span>);
+<a href=#862 id=862 data-nosnippet>862</a>        <span class="comment">// A position-independent image at its bias.
+<a href=#863 id=863 data-nosnippet>863</a>        </span><span class="macro">assert_eq!</span>(
+<a href=#864 id=864 data-nosnippet>864</a>            load_bias(maps, path(<span class="string">"/with spaces"</span>), <span class="number">5678</span>, (<span class="number">0x1000</span>, <span class="number">0x1000</span>)),
+<a href=#865 id=865 data-nosnippet>865</a>            <span class="prelude-val">Ok</span>(<span class="number">0x7ffff7fc5000</span>)
+<a href=#866 id=866 data-nosnippet>866</a>        );
+<a href=#867 id=867 data-nosnippet>867</a>        <span class="comment">// A name that is not UTF-8, anywhere in the mappings, is still bytes
+<a href=#868 id=868 data-nosnippet>868</a>        // to compare.
+<a href=#869 id=869 data-nosnippet>869</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>named = maps.to_vec();
+<a href=#870 id=870 data-nosnippet>870</a>        named.extend_from_slice(<span class="string">b"7ffff7fd0000-7ffff7fd1000 r-xp 00001000 00:21 42 /n\xffme\n"</span>);
+<a href=#871 id=871 data-nosnippet>871</a>        <span class="kw">let </span>unnamed = Path::new(std::ffi::OsStr::from_bytes(<span class="string">b"/n\xffme"</span>));
+<a href=#872 id=872 data-nosnippet>872</a>        <span class="macro">assert_eq!</span>(
+<a href=#873 id=873 data-nosnippet>873</a>            load_bias(<span class="kw-2">&amp;</span>named, unnamed, <span class="number">42</span>, (<span class="number">0x1000</span>, <span class="number">0x1000</span>)),
+<a href=#874 id=874 data-nosnippet>874</a>            <span class="prelude-val">Ok</span>(<span class="number">0x7ffff7fcf000</span>)
+<a href=#875 id=875 data-nosnippet>875</a>        );
+<a href=#876 id=876 data-nosnippet>876</a>        <span class="macro">assert_eq!</span>(load_bias(<span class="kw-2">&amp;</span>named, path(<span class="string">"/dir/image"</span>), <span class="number">1234</span>, text), <span class="prelude-val">Ok</span>(<span class="number">0</span>));
+<a href=#877 id=877 data-nosnippet>877</a>        <span class="comment">// A newline in the name, which the mappings show as `\012`.
+<a href=#878 id=878 data-nosnippet>878</a>        </span>named.extend_from_slice(
+<a href=#879 id=879 data-nosnippet>879</a>            <span class="string">b"7ffff7fe0000-7ffff7fe1000 r-xp 00001000 00:21 43 /line\\012break\n"</span>,
+<a href=#880 id=880 data-nosnippet>880</a>        );
+<a href=#881 id=881 data-nosnippet>881</a>        <span class="kw">let </span>broken = Path::new(<span class="string">"/line\nbreak"</span>);
+<a href=#882 id=882 data-nosnippet>882</a>        <span class="macro">assert_eq!</span>(
+<a href=#883 id=883 data-nosnippet>883</a>            load_bias(<span class="kw-2">&amp;</span>named, broken, <span class="number">43</span>, (<span class="number">0x1000</span>, <span class="number">0x1000</span>)),
+<a href=#884 id=884 data-nosnippet>884</a>            <span class="prelude-val">Ok</span>(<span class="number">0x7ffff7fdf000</span>)
+<a href=#885 id=885 data-nosnippet>885</a>        );
+<a href=#886 id=886 data-nosnippet>886</a>        <span class="comment">// The model at a bias from the mapping: the synthetic image's end
+<a href=#887 id=887 data-nosnippet>887</a>        // page-aligned up from the bias.
+<a href=#888 id=888 data-nosnippet>888</a>        </span><span class="kw">let </span>layout = ElfLayout {
+<a href=#889 id=889 data-nosnippet>889</a>            position_independent: <span class="bool-val">true</span>,
+<a href=#890 id=890 data-nosnippet>890</a>            interpreter: <span class="bool-val">true</span>,
+<a href=#891 id=891 data-nosnippet>891</a>            phdr: <span class="number">0x40</span>,
+<a href=#892 id=892 data-nosnippet>892</a>            end: <span class="number">0x50b0</span>,
+<a href=#893 id=893 data-nosnippet>893</a>            text: <span class="prelude-val">Some</span>((<span class="number">0x1000</span>, <span class="number">0x1000</span>)),
+<a href=#894 id=894 data-nosnippet>894</a>            data_span: <span class="number">0x290</span>,
+<a href=#895 id=895 data-nosnippet>895</a>            page: <span class="number">4096</span>,
+<a href=#896 id=896 data-nosnippet>896</a>        };
+<a href=#897 id=897 data-nosnippet>897</a>        <span class="macro">assert_eq!</span>(layout.start_brk_at_bias(<span class="number">0x555555556000</span>), <span class="prelude-val">Ok</span>(<span class="number">0x55555555c000</span>));
+<a href=#898 id=898 data-nosnippet>898</a>    }
+<a href=#899 id=899 data-nosnippet>899</a>
+<a href=#900 id=900 data-nosnippet>900</a>    <span class="attr">#[test]
+<a href=#901 id=901 data-nosnippet>901</a>    </span><span class="kw">fn </span>an_auxiliary_vector_entry_is_read_up_to_its_end() {
+<a href=#902 id=902 data-nosnippet>902</a>        <span class="kw">let </span>auxv: Vec&lt;u8&gt; = [(<span class="number">3_u64</span>, <span class="number">0x400040_u64</span>), (<span class="number">6</span>, <span class="number">4096</span>), (<span class="number">0</span>, <span class="number">0</span>), (<span class="number">9</span>, <span class="number">1</span>)]
+<a href=#903 id=903 data-nosnippet>903</a>            .iter()
+<a href=#904 id=904 data-nosnippet>904</a>            .flat_map(|(key, value)| [key.to_ne_bytes(), value.to_ne_bytes()].concat())
+<a href=#905 id=905 data-nosnippet>905</a>            .collect();
+<a href=#906 id=906 data-nosnippet>906</a>        <span class="macro">assert_eq!</span>(auxv_entry(<span class="kw-2">&amp;</span>auxv, <span class="number">3</span>), <span class="prelude-val">Some</span>(<span class="number">0x400040</span>));
+<a href=#907 id=907 data-nosnippet>907</a>        <span class="macro">assert_eq!</span>(auxv_entry(<span class="kw-2">&amp;</span>auxv, <span class="number">6</span>), <span class="prelude-val">Some</span>(<span class="number">4096</span>));
+<a href=#908 id=908 data-nosnippet>908</a>        <span class="macro">assert_eq!</span>(auxv_entry(<span class="kw-2">&amp;</span>auxv, <span class="number">9</span>), <span class="prelude-val">None</span>);
+<a href=#909 id=909 data-nosnippet>909</a>        <span class="macro">assert_eq!</span>(auxv_entry(<span class="kw-2">&amp;</span>auxv[..<span class="number">20</span>], <span class="number">6</span>), <span class="prelude-val">None</span>);
+<a href=#910 id=910 data-nosnippet>910</a>    }
+<a href=#911 id=911 data-nosnippet>911</a>
+<a href=#912 id=912 data-nosnippet>912</a>    <span class="attr">#[test]
+<a href=#913 id=913 data-nosnippet>913</a>    </span><span class="kw">fn </span>a_script_line_names_its_interpreter_as_the_kernel_reads_it() {
+<a href=#914 id=914 data-nosnippet>914</a>        <span class="kw">let </span>interpreter = |path: <span class="kw-2">&amp;</span>str| Script::Interpreter(PathBuf::from(path));
+<a href=#915 id=915 data-nosnippet>915</a>        <span class="macro">assert_eq!</span>(parse_script(<span class="string">b"\x7fELF"</span>), Script::Not);
+<a href=#916 id=916 data-nosnippet>916</a>        <span class="macro">assert_eq!</span>(parse_script(<span class="string">b"#!/bin/sh\n"</span>), interpreter(<span class="string">"/bin/sh"</span>));
+<a href=#917 id=917 data-nosnippet>917</a>        <span class="macro">assert_eq!</span>(parse_script(<span class="string">b"#! \t/bin/sh -e\n"</span>), interpreter(<span class="string">"/bin/sh"</span>));
+<a href=#918 id=918 data-nosnippet>918</a>        <span class="comment">// A carriage return is part of the path to the kernel.
+<a href=#919 id=919 data-nosnippet>919</a>        </span><span class="macro">assert_eq!</span>(parse_script(<span class="string">b"#!/bin/sh\r\n"</span>), interpreter(<span class="string">"/bin/sh\r"</span>));
+<a href=#920 id=920 data-nosnippet>920</a>        <span class="macro">assert_eq!</span>(parse_script(<span class="string">b"#!/bin/sh -x"</span>), interpreter(<span class="string">"/bin/sh"</span>));
+<a href=#921 id=921 data-nosnippet>921</a>        <span class="comment">// A short file with no newline: the path ends at the zeroed buffer.
+<a href=#922 id=922 data-nosnippet>922</a>        </span><span class="macro">assert_eq!</span>(parse_script(<span class="string">b"#!/bin/sh"</span>), interpreter(<span class="string">"/bin/sh"</span>));
+<a href=#923 id=923 data-nosnippet>923</a>        <span class="comment">// One that fills the buffer may be truncated.
+<a href=#924 id=924 data-nosnippet>924</a>        </span><span class="kw">let </span>long = [<span class="string">b"#!/"</span>.as_slice(), <span class="kw-2">&amp;</span>[<span class="string">b'a'</span>; BINPRM_BUF_SIZE]].concat();
+<a href=#925 id=925 data-nosnippet>925</a>        <span class="macro">assert_eq!</span>(parse_script(<span class="kw-2">&amp;</span>long), Script::Declined);
+<a href=#926 id=926 data-nosnippet>926</a>        <span class="macro">assert_eq!</span>(parse_script(<span class="string">b"#!\n"</span>), Script::Declined);
+<a href=#927 id=927 data-nosnippet>927</a>        <span class="macro">assert_eq!</span>(parse_script(<span class="string">b"#!\0/bin/sh\n"</span>), Script::Declined);
+<a href=#928 id=928 data-nosnippet>928</a>    }
+<a href=#929 id=929 data-nosnippet>929</a>
+<a href=#930 id=930 data-nosnippet>930</a>    <span class="attr">#[test]
+<a href=#931 id=931 data-nosnippet>931</a>    #[allow(clippy::disallowed_methods)] </span><span class="comment">// std::fs::canonicalize is the independent oracle
+<a href=#932 id=932 data-nosnippet>932</a>    </span><span class="kw">fn </span>a_script_resolves_to_its_interpreter_and_a_link_to_its_file() {
+<a href=#933 id=933 data-nosnippet>933</a>        <span class="kw">let </span>directory = tempfile::tempdir().unwrap();
+<a href=#934 id=934 data-nosnippet>934</a>        <span class="kw">let </span>root = std::fs::canonicalize(directory.path()).unwrap();
+<a href=#935 id=935 data-nosnippet>935</a>        <span class="kw">let </span>interpreter = std::env::current_exe().unwrap();
+<a href=#936 id=936 data-nosnippet>936</a>        <span class="kw">let </span>interpreter = std::fs::canonicalize(<span class="kw-2">&amp;</span>interpreter).unwrap();
+<a href=#937 id=937 data-nosnippet>937</a>        <span class="kw">let </span>script = root.join(<span class="string">"script"</span>);
+<a href=#938 id=938 data-nosnippet>938</a>        fs::write(<span class="kw-2">&amp;</span>script, <span class="macro">format!</span>(<span class="string">"#!{}\n"</span>, interpreter.display())).unwrap();
+<a href=#939 id=939 data-nosnippet>939</a>        fs::set_permissions(<span class="kw-2">&amp;</span>script, fs::Permissions::from_mode(<span class="number">0o755</span>)).unwrap();
+<a href=#940 id=940 data-nosnippet>940</a>        std::os::unix::fs::symlink(<span class="string">"script"</span>, root.join(<span class="string">"link"</span>)).unwrap();
+<a href=#941 id=941 data-nosnippet>941</a>
+<a href=#942 id=942 data-nosnippet>942</a>        <span class="kw">let </span>record = ExecRecord::resolve(Path::new(<span class="string">"/"</span>), <span class="kw-2">&amp;</span>root, Path::new(<span class="string">"link"</span>)).unwrap();
+<a href=#943 id=943 data-nosnippet>943</a>        <span class="macro">assert_eq!</span>(record.exe, interpreter);
+<a href=#944 id=944 data-nosnippet>944</a>        <span class="macro">assert!</span>(record.is_present(Path::new(<span class="string">"/"</span>)));
+<a href=#945 id=945 data-nosnippet>945</a>
+<a href=#946 id=946 data-nosnippet>946</a>        <span class="comment">// The same file seen below another root is named from that root.
+<a href=#947 id=947 data-nosnippet>947</a>        </span><span class="kw">let </span>image = root.join(<span class="string">"image"</span>);
+<a href=#948 id=948 data-nosnippet>948</a>        fs::copy(<span class="kw-2">&amp;</span>interpreter, <span class="kw-2">&amp;</span>image).unwrap();
+<a href=#949 id=949 data-nosnippet>949</a>        <span class="kw">let </span>record = ExecRecord::resolve(<span class="kw-2">&amp;</span>root, Path::new(<span class="string">"/"</span>), Path::new(<span class="string">"/image"</span>)).unwrap();
+<a href=#950 id=950 data-nosnippet>950</a>        <span class="macro">assert_eq!</span>(record.exe, Path::new(<span class="string">"/image"</span>));
+<a href=#951 id=951 data-nosnippet>951</a>        <span class="macro">assert!</span>(record.is_present(<span class="kw-2">&amp;</span>root));
+<a href=#952 id=952 data-nosnippet>952</a>
+<a href=#953 id=953 data-nosnippet>953</a>        <span class="comment">// A file removed or replaced at the path is no longer the image.
+<a href=#954 id=954 data-nosnippet>954</a>        </span>fs::remove_file(<span class="kw-2">&amp;</span>image).unwrap();
+<a href=#955 id=955 data-nosnippet>955</a>        <span class="macro">assert!</span>(!record.is_present(<span class="kw-2">&amp;</span>root));
+<a href=#956 id=956 data-nosnippet>956</a>        fs::copy(<span class="kw-2">&amp;</span>interpreter, <span class="kw-2">&amp;</span>image).unwrap();
+<a href=#957 id=957 data-nosnippet>957</a>        <span class="macro">assert!</span>(!record.is_present(<span class="kw-2">&amp;</span>root));
+<a href=#958 id=958 data-nosnippet>958</a>
+<a href=#959 id=959 data-nosnippet>959</a>        <span class="comment">// The same inode put back at the path after a rename is not the
+<a href=#960 id=960 data-nosnippet>960</a>        // image's link any more: Linux's link follows the renamed name.
+<a href=#961 id=961 data-nosnippet>961</a>        </span><span class="kw">let </span>image = root.join(<span class="string">"image"</span>);
+<a href=#962 id=962 data-nosnippet>962</a>        <span class="kw">let </span>record = ExecRecord::resolve(<span class="kw-2">&amp;</span>root, Path::new(<span class="string">"/"</span>), Path::new(<span class="string">"/image"</span>)).unwrap();
+<a href=#963 id=963 data-nosnippet>963</a>        fs::hard_link(<span class="kw-2">&amp;</span>image, root.join(<span class="string">"alias"</span>)).unwrap();
+<a href=#964 id=964 data-nosnippet>964</a>        fs::rename(<span class="kw-2">&amp;</span>image, root.join(<span class="string">"moved"</span>)).unwrap();
+<a href=#965 id=965 data-nosnippet>965</a>        fs::hard_link(root.join(<span class="string">"alias"</span>), <span class="kw-2">&amp;</span>image).unwrap();
+<a href=#966 id=966 data-nosnippet>966</a>        <span class="macro">assert!</span>(!record.is_present(<span class="kw-2">&amp;</span>root));
+<a href=#967 id=967 data-nosnippet>967</a>
+<a href=#968 id=968 data-nosnippet>968</a>        <span class="comment">// With its link count back where it was, a rename still changed
+<a href=#969 id=969 data-nosnippet>969</a>        // the inode's change time.
+<a href=#970 id=970 data-nosnippet>970</a>        </span><span class="kw">let </span>image = root.join(<span class="string">"relinked"</span>);
+<a href=#971 id=971 data-nosnippet>971</a>        fs::copy(<span class="kw-2">&amp;</span>interpreter, <span class="kw-2">&amp;</span>image).unwrap();
+<a href=#972 id=972 data-nosnippet>972</a>        fs::hard_link(<span class="kw-2">&amp;</span>image, root.join(<span class="string">"second"</span>)).unwrap();
+<a href=#973 id=973 data-nosnippet>973</a>        <span class="kw">let </span>record = ExecRecord::at(<span class="kw-2">&amp;</span>root, <span class="kw-2">&amp;</span>image).unwrap();
+<a href=#974 id=974 data-nosnippet>974</a>        fs::rename(<span class="kw-2">&amp;</span>image, root.join(<span class="string">"away"</span>)).unwrap();
+<a href=#975 id=975 data-nosnippet>975</a>        fs::rename(root.join(<span class="string">"second"</span>), <span class="kw-2">&amp;</span>image).unwrap();
+<a href=#976 id=976 data-nosnippet>976</a>        <span class="macro">assert_eq!</span>(fs::metadata(<span class="kw-2">&amp;</span>image).unwrap().nlink(), <span class="number">2</span>);
+<a href=#977 id=977 data-nosnippet>977</a>        <span class="macro">assert!</span>(!record.is_present(<span class="kw-2">&amp;</span>root));
+<a href=#978 id=978 data-nosnippet>978</a>
+<a href=#979 id=979 data-nosnippet>979</a>        <span class="comment">// Linux refuses to exec anything but a regular file (EACCES) before
+<a href=#980 id=980 data-nosnippet>980</a>        // it opens it, and so does the resolution: an open of a FIFO with no
+<a href=#981 id=981 data-nosnippet>981</a>        // writer would wait forever.
+<a href=#982 id=982 data-nosnippet>982</a>        </span><span class="kw">let </span>fifo = root.join(<span class="string">"fifo"</span>);
+<a href=#983 id=983 data-nosnippet>983</a>        <span class="kw">let </span>fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+<a href=#984 id=984 data-nosnippet>984</a>        <span class="macro">assert_eq!</span>(<span class="kw">unsafe </span>{ libc::mkfifo(fifo_name.as_ptr(), <span class="number">0o755</span>) }, <span class="number">0</span>);
+<a href=#985 id=985 data-nosnippet>985</a>        <span class="macro">assert_eq!</span>(
+<a href=#986 id=986 data-nosnippet>986</a>            ExecRecord::resolve(<span class="kw-2">&amp;</span>root, Path::new(<span class="string">"/"</span>), Path::new(<span class="string">"/fifo"</span>)),
+<a href=#987 id=987 data-nosnippet>987</a>            <span class="prelude-val">None
+<a href=#988 id=988 data-nosnippet>988</a>        </span>);
+<a href=#989 id=989 data-nosnippet>989</a>        <span class="macro">assert_eq!</span>(
+<a href=#990 id=990 data-nosnippet>990</a>            ExecRecord::resolve(Path::new(<span class="string">"/"</span>), Path::new(<span class="string">"/"</span>), Path::new(<span class="string">"/dev/null"</span>)),
+<a href=#991 id=991 data-nosnippet>991</a>            <span class="prelude-val">None
+<a href=#992 id=992 data-nosnippet>992</a>        </span>);
+<a href=#993 id=993 data-nosnippet>993</a>
+<a href=#994 id=994 data-nosnippet>994</a>        <span class="macro">assert_eq!</span>(
+<a href=#995 id=995 data-nosnippet>995</a>            ExecRecord::resolve(<span class="kw-2">&amp;</span>root, Path::new(<span class="string">"/"</span>), Path::new(<span class="string">"/missing"</span>)),
+<a href=#996 id=996 data-nosnippet>996</a>            <span class="prelude-val">None
+<a href=#997 id=997 data-nosnippet>997</a>        </span>);
+<a href=#998 id=998 data-nosnippet>998</a>        <span class="comment">// A file whose header the caller cannot read is the kernel's to
+<a href=#999 id=999 data-nosnippet>999</a>        // resolve (Linux runs an execute-only script's interpreter): its
+<a href=#1000 id=1000 data-nosnippet>1000</a>        // header reads as unread, never as not a script.
+<a href=#1001 id=1001 data-nosnippet>1001</a>        </span><span class="macro">assert_eq!</span>(script_interpreter(<span class="kw-2">&amp;</span>root), Script::Unread);
+<a href=#1002 id=1002 data-nosnippet>1002</a>    }
+<a href=#1003 id=1003 data-nosnippet>1003</a>
+<a href=#1004 id=1004 data-nosnippet>1004</a>    <span class="attr">#[test]
+<a href=#1005 id=1005 data-nosnippet>1005</a>    </span><span class="kw">fn </span>only_a_directory_samples_as_one() {
+<a href=#1006 id=1006 data-nosnippet>1006</a>        <span class="comment">// SAFETY: an all-zero `stat` is a valid value.
+<a href=#1007 id=1007 data-nosnippet>1007</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>stat: libc::stat = <span class="kw">unsafe </span>{ std::mem::zeroed() };
+<a href=#1008 id=1008 data-nosnippet>1008</a>        stat.st_dev = <span class="number">7</span>;
+<a href=#1009 id=1009 data-nosnippet>1009</a>        stat.st_ino = <span class="number">42</span>;
+<a href=#1010 id=1010 data-nosnippet>1010</a>        stat.st_mode = libc::S_IFDIR | <span class="number">0o755</span>;
+<a href=#1011 id=1011 data-nosnippet>1011</a>        <span class="macro">assert_eq!</span>(directory_sample(<span class="kw-2">&amp;</span>stat), <span class="prelude-val">Some</span>((<span class="number">7</span>, <span class="number">42</span>)));
+<a href=#1012 id=1012 data-nosnippet>1012</a>        <span class="comment">// A symbolic link, or any other file, with the recorded directory's
+<a href=#1013 id=1013 data-nosnippet>1013</a>        // device and inode (a freed inode number reused) is not that
+<a href=#1014 id=1014 data-nosnippet>1014</a>        // directory.
+<a href=#1015 id=1015 data-nosnippet>1015</a>        </span><span class="kw">for </span>kind <span class="kw">in </span>[
+<a href=#1016 id=1016 data-nosnippet>1016</a>            libc::S_IFLNK,
+<a href=#1017 id=1017 data-nosnippet>1017</a>            libc::S_IFREG,
+<a href=#1018 id=1018 data-nosnippet>1018</a>            libc::S_IFIFO,
+<a href=#1019 id=1019 data-nosnippet>1019</a>            libc::S_IFSOCK,
+<a href=#1020 id=1020 data-nosnippet>1020</a>            libc::S_IFCHR,
+<a href=#1021 id=1021 data-nosnippet>1021</a>            libc::S_IFBLK,
+<a href=#1022 id=1022 data-nosnippet>1022</a>        ] {
+<a href=#1023 id=1023 data-nosnippet>1023</a>            stat.st_mode = kind | <span class="number">0o777</span>;
+<a href=#1024 id=1024 data-nosnippet>1024</a>            <span class="macro">assert_eq!</span>(directory_sample(<span class="kw-2">&amp;</span>stat), <span class="prelude-val">None</span>, <span class="string">"{kind:o}"</span>);
+<a href=#1025 id=1025 data-nosnippet>1025</a>        }
+<a href=#1026 id=1026 data-nosnippet>1026</a>        <span class="comment">// And a chain through such a file is no chain.
+<a href=#1027 id=1027 data-nosnippet>1027</a>        </span><span class="kw">let </span>directory = tempfile::tempdir().unwrap();
+<a href=#1028 id=1028 data-nosnippet>1028</a>        <span class="kw">let </span>root = <span class="kw">crate</span>::util::canonicalize(directory.path()).unwrap();
+<a href=#1029 id=1029 data-nosnippet>1029</a>        fs::create_dir(root.join(<span class="string">"away"</span>)).unwrap();
+<a href=#1030 id=1030 data-nosnippet>1030</a>        std::os::unix::fs::symlink(<span class="string">"away"</span>, root.join(<span class="string">"a"</span>)).unwrap();
+<a href=#1031 id=1031 data-nosnippet>1031</a>        <span class="macro">assert_eq!</span>(directory_chain(<span class="kw-2">&amp;</span>root, <span class="kw-2">&amp;</span>root.join(<span class="string">"a/image"</span>)), <span class="prelude-val">None</span>);
+<a href=#1032 id=1032 data-nosnippet>1032</a>        <span class="macro">assert!</span>(directory_chain(<span class="kw-2">&amp;</span>root, <span class="kw-2">&amp;</span>root.join(<span class="string">"away/image"</span>)).is_some());
+<a href=#1033 id=1033 data-nosnippet>1033</a>    }
+<a href=#1034 id=1034 data-nosnippet>1034</a>
+<a href=#1035 id=1035 data-nosnippet>1035</a>    <span class="attr">#[test]
+<a href=#1036 id=1036 data-nosnippet>1036</a>    </span><span class="kw">fn </span>a_renamed_directory_above_the_image_is_not_its_path() {
+<a href=#1037 id=1037 data-nosnippet>1037</a>        <span class="kw">let </span>directory = tempfile::tempdir().unwrap();
+<a href=#1038 id=1038 data-nosnippet>1038</a>        <span class="kw">let </span>root = <span class="kw">crate</span>::util::canonicalize(directory.path()).unwrap();
+<a href=#1039 id=1039 data-nosnippet>1039</a>        fs::create_dir(root.join(<span class="string">"a"</span>)).unwrap();
+<a href=#1040 id=1040 data-nosnippet>1040</a>        fs::create_dir(root.join(<span class="string">"b"</span>)).unwrap();
+<a href=#1041 id=1041 data-nosnippet>1041</a>        <span class="kw">let </span>image = root.join(<span class="string">"a/image"</span>);
+<a href=#1042 id=1042 data-nosnippet>1042</a>        fs::write(<span class="kw-2">&amp;</span>image, <span class="string">b"image"</span>).unwrap();
+<a href=#1043 id=1043 data-nosnippet>1043</a>        fs::hard_link(<span class="kw-2">&amp;</span>image, root.join(<span class="string">"b/image"</span>)).unwrap();
+<a href=#1044 id=1044 data-nosnippet>1044</a>        <span class="kw">let </span>record = ExecRecord::at(<span class="kw-2">&amp;</span>root, <span class="kw-2">&amp;</span>image).unwrap();
+<a href=#1045 id=1045 data-nosnippet>1045</a>        <span class="macro">assert_eq!</span>(record.exe, Path::new(<span class="string">"/a/image"</span>));
+<a href=#1046 id=1046 data-nosnippet>1046</a>        <span class="macro">assert!</span>(record.names_path_exactly(<span class="kw-2">&amp;</span>root));
+<a href=#1047 id=1047 data-nosnippet>1047</a>        <span class="comment">// The image's directory renamed away and another directory holding a
+<a href=#1048 id=1048 data-nosnippet>1048</a>        // link of the same file renamed into its place: the file is untouched
+<a href=#1049 id=1049 data-nosnippet>1049</a>        // at the path, but Linux's link names /away/image.
+<a href=#1050 id=1050 data-nosnippet>1050</a>        </span>fs::rename(root.join(<span class="string">"a"</span>), root.join(<span class="string">"away"</span>)).unwrap();
+<a href=#1051 id=1051 data-nosnippet>1051</a>        fs::rename(root.join(<span class="string">"b"</span>), root.join(<span class="string">"a"</span>)).unwrap();
+<a href=#1052 id=1052 data-nosnippet>1052</a>        <span class="macro">assert!</span>(record.is_present(<span class="kw-2">&amp;</span>root));
+<a href=#1053 id=1053 data-nosnippet>1053</a>        <span class="macro">assert!</span>(!record.names_path_exactly(<span class="kw-2">&amp;</span>root));
+<a href=#1054 id=1054 data-nosnippet>1054</a>        <span class="comment">// Renamed back: the same directories at the same paths.
+<a href=#1055 id=1055 data-nosnippet>1055</a>        </span>fs::rename(root.join(<span class="string">"a"</span>), root.join(<span class="string">"b"</span>)).unwrap();
+<a href=#1056 id=1056 data-nosnippet>1056</a>        fs::rename(root.join(<span class="string">"away"</span>), root.join(<span class="string">"a"</span>)).unwrap();
+<a href=#1057 id=1057 data-nosnippet>1057</a>        <span class="macro">assert!</span>(record.names_path_exactly(<span class="kw-2">&amp;</span>root));
+<a href=#1058 id=1058 data-nosnippet>1058</a>        <span class="comment">// A symbolic link in a directory's place.
+<a href=#1059 id=1059 data-nosnippet>1059</a>        </span>fs::rename(root.join(<span class="string">"a"</span>), root.join(<span class="string">"away"</span>)).unwrap();
+<a href=#1060 id=1060 data-nosnippet>1060</a>        std::os::unix::fs::symlink(<span class="string">"away"</span>, root.join(<span class="string">"a"</span>)).unwrap();
+<a href=#1061 id=1061 data-nosnippet>1061</a>        <span class="macro">assert!</span>(!record.names_path_exactly(<span class="kw-2">&amp;</span>root));
+<a href=#1062 id=1062 data-nosnippet>1062</a>    }
+<a href=#1063 id=1063 data-nosnippet>1063</a>
+<a href=#1064 id=1064 data-nosnippet>1064</a>    <span class="doccomment">/// The test binary, a dynamically linked executable, names its program
+<a href=#1065 id=1065 data-nosnippet>1065</a>    /// interpreter, which exists where the kernel found it; a file that is
+<a href=#1066 id=1066 data-nosnippet>1066</a>    /// not ELF names none.
+<a href=#1067 id=1067 data-nosnippet>1067</a>    </span><span class="attr">#[test]
+<a href=#1068 id=1068 data-nosnippet>1068</a>    </span><span class="kw">fn </span>an_image_names_its_program_interpreter_as_the_kernel_reads_it() {
+<a href=#1069 id=1069 data-nosnippet>1069</a>        <span class="kw">let </span>interpreter = program_interpreter(Path::new(<span class="string">"/proc/self/exe"</span>))
+<a href=#1070 id=1070 data-nosnippet>1070</a>            .expect(<span class="string">"the test binary is dynamically linked"</span>);
+<a href=#1071 id=1071 data-nosnippet>1071</a>        <span class="macro">assert!</span>(interpreter.is_absolute(), <span class="string">"{}"</span>, interpreter.display());
+<a href=#1072 id=1072 data-nosnippet>1072</a>        <span class="macro">assert!</span>(interpreter.exists(), <span class="string">"{}"</span>, interpreter.display());
+<a href=#1073 id=1073 data-nosnippet>1073</a>        <span class="kw">let </span>directory = tempfile::tempdir().unwrap();
+<a href=#1074 id=1074 data-nosnippet>1074</a>        <span class="kw">let </span>script = directory.path().join(<span class="string">"script"</span>);
+<a href=#1075 id=1075 data-nosnippet>1075</a>        fs::write(<span class="kw-2">&amp;</span>script, <span class="string">"#!/bin/sh\n"</span>).unwrap();
+<a href=#1076 id=1076 data-nosnippet>1076</a>        <span class="macro">assert_eq!</span>(program_interpreter(<span class="kw-2">&amp;</span>script), <span class="prelude-val">None</span>);
+<a href=#1077 id=1077 data-nosnippet>1077</a>    }
+<a href=#1078 id=1078 data-nosnippet>1078</a>}
+</code></pre></div></section></main></body></html>

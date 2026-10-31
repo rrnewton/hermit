@@ -1,0 +1,32 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Exit status for a run that DEADLOCKED UNDER HERMIT’S MODEL: Detcore’s scheduler found every remaining guest thread blocked on something no later turn can supply (its “Deadlock detected” report) and ended the run."><title>HERMIT_GUEST_DEADLOCK_EXIT in detcore_model - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="detcore_model" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc constant"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">HERMIT_GUEST_DEADLOCK_EXIT</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../detcore_model/index.html">detcore_<wbr>model</a><span class="version">0.5.4</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">detcore_model</a></div><h1>Constant <span class="constant">HERMIT_<wbr>GUEST_<wbr>DEADLOCK_<wbr>EXIT</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/detcore_model/lib.rs.html#97">Source</a> </span></div><pre class="rust item-decl"><code>pub const HERMIT_GUEST_DEADLOCK_EXIT: <a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.i32.html">i32</a> = 121;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Exit status for a run that DEADLOCKED UNDER HERMIT’S MODEL: Detcore’s
+scheduler found every remaining guest thread blocked on something no later
+turn can supply (its “Deadlock detected” report) and ended the run.</p>
+<p>⚠️ A VERDICT OF HERMIT’S MODEL, NOT THE GUEST’S RESULT. “No possible wake”
+means no wake that Detcore models: under Hermit’s sequentialized virtual
+time “no thread can be woken now” is also “no thread can ever be woken” BY
+ANYTHING HERMIT MODELS. When the model is complete for the program, Linux
+would leave it hung forever and the hang is reported instead of reproduced.
+When it is not, the deadlock is Hermit’s bug: the tests record robust-futex
+owner death, dash’s sigsuspend, raw exit, KVM’s kill and happens-before
+re-admission each once reported this way. So the status is neither a guest
+status nor <code>HERMIT_INTERNAL_FAILURE_EXIT</code> (125), and <code>--verify</code>, chaos-stress
+and <code>analyze</code> do not take it as a guest result by default. A caller that
+needs to know which it was compares a native run (<code>docs/ERROR_CATALOG.md</code>).
+Before this, the scheduler exited the container child 1 and the parent’s
+classifier turned the deadlock into <code>class=container-child-exit</code> and 125.</p>
+<p>⚠️ ONLY A GUEST DEADLOCK EXITS THIS. The scheduler’s <code>HERMIT_DEADLOCK:</code>
+verdicts (an invariant of Hermit’s own bookkeeping broke, or a backend never
+reported a death the kernel owed) still exit 1 and stay internal failures,
+and a happens-before refusal still exits <a href="constant.HERMIT_POLICY_REFUSAL_EXIT.html" title="constant detcore_model::HERMIT_POLICY_REFUSAL_EXIT"><code>HERMIT_POLICY_REFUSAL_EXIT</code></a>.</p>
+<p>⚠️ WHY 121. It extends the reserved band downwards by one (121 guest
+deadlock, 122 refusal, 123 log cap, 124 deadline, 125 hermit broke, 126/127
+exec-level), so the reserved codes stay contiguous and the guest range loses
+only its top value. It is not a signal status (<code>signal_from_exit_status</code> is
+<code>None</code>), so the classifier arms cannot both match. As with every other code,
+a guest may still exit 121 of its own accord: the stderr line
+<a href="constant.HERMIT_MODEL_DEADLOCK_LINE.html" title="constant detcore_model::HERMIT_MODEL_DEADLOCK_LINE"><code>HERMIT_MODEL_DEADLOCK_LINE</code></a> is the discriminator, present only when the
+scheduler declared the deadlock. See the allocation table above the
+constants in <code>hermit-cli/src/lib.rs</code>.</p>
+<p>It lives here for the reason <a href="constant.HERMIT_POLICY_REFUSAL_EXIT.html" title="constant detcore_model::HERMIT_POLICY_REFUSAL_EXIT"><code>HERMIT_POLICY_REFUSAL_EXIT</code></a> does: <code>detcore</code>
+emits it and <code>hermit-cli</code> recognises it.</p>
+</div></details></section></div></main></body></html>

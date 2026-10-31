@@ -1,0 +1,419 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `detcore/src/scheduler/guest_mask_publication.rs`."><title>guest_mask_publication.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">detcore/scheduler/</div>guest_mask_publication.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! A5 step 3c.1e, sub-slice A (Detcore groundwork; dev-hermit
+<a href=#10 id=10 data-nosnippet>10</a>//! ai_docs/2026-10-16-a5-signal-delivery-design.md, "3c.1e plan of record and
+<a href=#11 id=11 data-nosnippet>11</a>//! decisions D56-D68", and ai_docs/evidence/a5-3c1e-20261024/plan-3c1e-r4.md
+<a href=#12 id=12 data-nosnippet>12</a>//! section 1 A with the parts it carries from revisions 3 and 2;
+<a href=#13 id=13 data-nosnippet>13</a>//! &lt;https://github.com/rrnewton/hermit/issues/4485&gt;): what the scheduler
+<a href=#14 id=14 data-nosnippet>14</a>//! holds of a guest thread's mask under the in-guest delivery gate
+<a href=#15 id=15 data-nosnippet>15</a>//! (`Config::in_guest_signal_delivery`), beyond the mask each request
+<a href=#16 id=16 data-nosnippet>16</a>//! publishes (step 3c.1b, `Scheduler::record_request_guest_mask`):
+<a href=#17 id=17 data-nosnippet>17</a>//!
+<a href=#18 id=18 data-nosnippet>18</a>//! - IR-18's tri-state: a published mask is [`PublishedGuestMask::Known`],
+<a href=#19 id=19 data-nosnippet>19</a>//!   or [`PublishedGuestMask::Unknown`] after a rejoin that returned under
+<a href=#20 id=20 data-nosnippet>20</a>//!   the guest's own mask (`ContinuationMask::Restored`) but published none,
+<a href=#21 id=21 data-nosnippet>21</a>//!   on a backend that keeps the guest's mask apart for that thread, so that
+<a href=#22 id=22 data-nosnippet>22</a>//!   no reader shows the call's earlier, temporary mask as the one in force
+<a href=#23 id=23 data-nosnippet>23</a>//!   (`Scheduler::keep_mask_for_continuation`); on a backend that keeps none
+<a href=#24 id=24 data-nosnippet>24</a>//!   (every backend before step 3c.1e B) nothing is published then, and
+<a href=#25 id=25 data-nosnippet>25</a>//!   readers take `SigBlk`, which is the guest's own mask. The `/proc` status
+<a href=#26 id=26 data-nosnippet>26</a>//!   reader refuses by name on `Unknown` (`HERMIT_GUEST_MASK_UNKNOWN`); every
+<a href=#27 id=27 data-nosnippet>27</a>//!   scheduler-internal reader takes `Unknown` as nothing published (the
+<a href=#28 id=28 data-nosnippet>28</a>//!   kernel's `SigBlk`), as it takes a request that publishes nothing.
+<a href=#29 id=29 data-nosnippet>29</a>//! - Fork-child seeding: a new task starts with its creator's published own
+<a href=#30 id=30 data-nosnippet>30</a>//!   mask, never a masked call's temporary mask that the creator still
+<a href=#31 id=31 data-nosnippet>31</a>//!   publishes, as Linux's child starts with its creator's `blocked`
+<a href=#32 id=32 data-nosnippet>32</a>//!   (`arch_dup_task_struct`, kernel/fork.c:1086-1091 at v6.12, from
+<a href=#33 id=33 data-nosnippet>33</a>//!   `dup_task_struct`, :1112; `copy_process` empties only `pending`,
+<a href=#34 id=34 data-nosnippet>34</a>//!   :2268) ([`Scheduler::seed_child_guest_sigmask`]).
+<a href=#35 id=35 data-nosnippet>35</a>//! - IR-23(a): a masked wait that must make an RPC before its first probe (the
+<a href=#36 id=36 data-nosnippet>36</a>//!   publication of expired virtual timerfds, `timerfd::publish_expired`,
+<a href=#37 id=37 data-nosnippet>37</a>//!   while the process holds an armed virtual timerfd) first publishes its
+<a href=#38 id=38 data-nosnippet>38</a>//!   temporary mask, with the ignored signals it keeps pending from its entry
+<a href=#39 id=39 data-nosnippet>39</a>//!   in each queue (D37's held masks), through the non-yielding
+<a href=#40 id=40 data-nosnippet>40</a>//!   `GlobalRequest::PublishTemporaryMask`
+<a href=#41 id=41 data-nosnippet>41</a>//!   ([`Scheduler::publish_temporary_mask`]). Linux has installed that mask
+<a href=#42 id=42 data-nosnippet>42</a>//!   for the call's duration (`set_user_sigmask`, kernel/signal.c:3169 at
+<a href=#43 id=43 data-nosnippet>43</a>//!   v6.12), so a cross-process `/proc` reader during the RPC sees it. The
+<a href=#44 id=44 data-nosnippet>44</a>//!   next request the thread files supersedes it; a call that files none
+<a href=#45 id=45 data-nosnippet>45</a>//!   withdraws it as it returns ([`Scheduler::withdraw_temporary_mask`]),
+<a href=#46 id=46 data-nosnippet>46</a>//!   which puts back what was published before it.
+<a href=#47 id=47 data-nosnippet>47</a>//! - The committed-send window record for `HERMIT_IGNORED_REALTIME_INSTANCES`:
+<a href=#48 id=48 data-nosnippet>48</a>//!   while such a publication is in force, each send the scheduler commits to
+<a href=#49 id=49 data-nosnippet>49</a>//!   the thread, from its two current commit points (`NotifySignalPending`'s
+<a href=#50 id=50 data-nosnippet>50</a>//!   handler, which runs only after the guest's injected send succeeded, and
+<a href=#51 id=51 data-nosnippet>51</a>//!   `send_guest_signal` after its `kill` succeeded), is recorded with its
+<a href=#52 id=52 data-nosnippet>52</a>//!   queue: a thread-directed send in the private queue, a process-directed
+<a href=#53 id=53 data-nosnippet>53</a>//!   one in the shared queue ([`Scheduler::note_committed_send_in_window`]).
+<a href=#54 id=54 data-nosnippet>54</a>//!   The withdrawal answers it, so the call's end (D37's R2) can tell a
+<a href=#55 id=55 data-nosnippet>55</a>//!   real-time instance sent in the window from one kept from entry, which
+<a href=#56 id=56 data-nosnippet>56</a>//!   the pending bits cannot (plan revision 3, section 1 A).
+<a href=#57 id=57 data-nosnippet>57</a>//!
+<a href=#58 id=58 data-nosnippet>58</a>//! Every function here is a no-op with the gate off, and nothing sets the
+<a href=#59 id=59 data-nosnippet>59</a>//! gate before step 3c.1f.
+<a href=#60 id=60 data-nosnippet>60</a>
+<a href=#61 id=61 data-nosnippet>61</a></span><span class="kw">use </span>serde::Deserialize;
+<a href=#62 id=62 data-nosnippet>62</a><span class="kw">use </span>serde::Serialize;
+<a href=#63 id=63 data-nosnippet>63</a>
+<a href=#64 id=64 data-nosnippet>64</a><span class="kw">use </span><span class="kw">super</span>::Scheduler;
+<a href=#65 id=65 data-nosnippet>65</a><span class="kw">use </span><span class="kw">crate</span>::types::DetTid;
+<a href=#66 id=66 data-nosnippet>66</a>
+<a href=#67 id=67 data-nosnippet>67</a><span class="doccomment">/// A guest mask the scheduler holds for a thread under the in-guest delivery
+<a href=#68 id=68 data-nosnippet>68</a>/// gate (IR-18's tri-state; absent means nothing published, and readers take
+<a href=#69 id=69 data-nosnippet>69</a>/// the kernel's `SigBlk`). It travels in a bincode RPC, so it has no
+<a href=#70 id=70 data-nosnippet>70</a>/// `skip_serializing_if`.
+<a href=#71 id=71 data-nosnippet>71</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+<a href=#72 id=72 data-nosnippet>72</a></span><span class="kw">pub enum </span>PublishedGuestMask {
+<a href=#73 id=73 data-nosnippet>73</a>    <span class="doccomment">/// The mask the thread published.
+<a href=#74 id=74 data-nosnippet>74</a>    </span>Known(u64),
+<a href=#75 id=75 data-nosnippet>75</a>    <span class="doccomment">/// The thread published none where its mask changed: a rejoin that
+<a href=#76 id=76 data-nosnippet>76</a>    /// returned under the guest's own mask, on a backend that otherwise keeps
+<a href=#77 id=77 data-nosnippet>77</a>    /// the guest's mask apart for that thread. A reader must not take the
+<a href=#78 id=78 data-nosnippet>78</a>    /// kernel's `SigBlk` for it, which after step 3c.1e B is the in-guest
+<a href=#79 id=79 data-nosnippet>79</a>    /// runtime's mask.
+<a href=#80 id=80 data-nosnippet>80</a>    </span>Unknown,
+<a href=#81 id=81 data-nosnippet>81</a>}
+<a href=#82 id=82 data-nosnippet>82</a>
+<a href=#83 id=83 data-nosnippet>83</a><span class="doccomment">/// The answer to a `/proc` status reader's `GlobalRequest::PublishedGuestSigmask`
+<a href=#84 id=84 data-nosnippet>84</a>/// under the in-guest delivery gate (an appended response variant,
+<a href=#85 id=85 data-nosnippet>85</a>/// `GlobalResponse::GuestSigmaskForStatus`): the published mask, tri-state,
+<a href=#86 id=86 data-nosnippet>86</a>/// and the ignored signals a temporary-mask publication keeps pending from
+<a href=#87 id=87 data-nosnippet>87</a>/// the call's entry in each queue (D37's held masks; zero without one).
+<a href=#88 id=88 data-nosnippet>88</a></span><span class="attr">#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+<a href=#89 id=89 data-nosnippet>89</a></span><span class="kw">pub struct </span>StatusGuestMask {
+<a href=#90 id=90 data-nosnippet>90</a>    <span class="doccomment">/// What the thread published, if anything.
+<a href=#91 id=91 data-nosnippet>91</a>    </span><span class="kw">pub </span>mask: <span class="prelude-ty">Option</span>&lt;PublishedGuestMask&gt;,
+<a href=#92 id=92 data-nosnippet>92</a>    <span class="doccomment">/// `SigPnd_entry ∩ I ∩ own`: ignored signals kept pending in the private
+<a href=#93 id=93 data-nosnippet>93</a>    /// queue from the masked call's entry.
+<a href=#94 id=94 data-nosnippet>94</a>    </span><span class="kw">pub </span>held_private: u64,
+<a href=#95 id=95 data-nosnippet>95</a>    <span class="doccomment">/// `ShdPnd_entry ∩ I ∩ own`: the same in the shared queue.
+<a href=#96 id=96 data-nosnippet>96</a>    </span><span class="kw">pub </span>held_shared: u64,
+<a href=#97 id=97 data-nosnippet>97</a>}
+<a href=#98 id=98 data-nosnippet>98</a>
+<a href=#99 id=99 data-nosnippet>99</a><span class="doccomment">/// The payload of `GlobalRequest::PublishTemporaryMask` (IR-23(a)): a
+<a href=#100 id=100 data-nosnippet>100</a>/// publication, filed once per masked call before the first expired-timerfd
+<a href=#101 id=101 data-nosnippet>101</a>/// publication, or its withdrawal as a call that filed no later request
+<a href=#102 id=102 data-nosnippet>102</a>/// returns. It travels in a bincode RPC, so it has no
+<a href=#103 id=103 data-nosnippet>103</a>/// `skip_serializing_if`.
+<a href=#104 id=104 data-nosnippet>104</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+<a href=#105 id=105 data-nosnippet>105</a></span><span class="kw">pub enum </span>TemporaryMaskControl {
+<a href=#106 id=106 data-nosnippet>106</a>    <span class="doccomment">/// `thread` waits under `mask` (as Linux installs it, without SIGKILL
+<a href=#107 id=107 data-nosnippet>107</a>    /// and SIGSTOP), keeping the ignored signals `held_private` and
+<a href=#108 id=108 data-nosnippet>108</a>    /// `held_shared` pending from its entry.
+<a href=#109 id=109 data-nosnippet>109</a>    </span>Publish {
+<a href=#110 id=110 data-nosnippet>110</a>        <span class="doccomment">/// The thread, the sender itself.
+<a href=#111 id=111 data-nosnippet>111</a>        </span>thread: DetTid,
+<a href=#112 id=112 data-nosnippet>112</a>        <span class="doccomment">/// The temporary mask.
+<a href=#113 id=113 data-nosnippet>113</a>        </span>mask: u64,
+<a href=#114 id=114 data-nosnippet>114</a>        <span class="doccomment">/// `SigPnd_entry ∩ I ∩ own`.
+<a href=#115 id=115 data-nosnippet>115</a>        </span>held_private: u64,
+<a href=#116 id=116 data-nosnippet>116</a>        <span class="doccomment">/// `ShdPnd_entry ∩ I ∩ own`.
+<a href=#117 id=117 data-nosnippet>117</a>        </span>held_shared: u64,
+<a href=#118 id=118 data-nosnippet>118</a>    },
+<a href=#119 id=119 data-nosnippet>119</a>    <span class="doccomment">/// `thread`'s call returned with its publication still in force: answer
+<a href=#120 id=120 data-nosnippet>120</a>    /// and close the committed-send window, and put back what was published
+<a href=#121 id=121 data-nosnippet>121</a>    /// before it, unless `keep_published`.
+<a href=#122 id=122 data-nosnippet>122</a>    </span>Withdraw {
+<a href=#123 id=123 data-nosnippet>123</a>        <span class="doccomment">/// The thread, the sender itself.
+<a href=#124 id=124 data-nosnippet>124</a>        </span>thread: DetTid,
+<a href=#125 id=125 data-nosnippet>125</a>        <span class="doccomment">/// The call ended interrupted (`-ERESTARTNOHAND` or `-EINTR`): Linux
+<a href=#126 id=126 data-nosnippet>126</a>        /// does not restore the own mask at the return
+<a href=#127 id=127 data-nosnippet>127</a>        /// (`restore_saved_sigmask_unless`, fs/select.c:301,
+<a href=#128 id=128 data-nosnippet>128</a>        /// fs/eventpoll.c:2495 and :2547 at v6.12); the delivery then sets
+<a href=#129 id=129 data-nosnippet>129</a>        /// `blocked` to the temporary mask with the handler's `sa_mask` and
+<a href=#130 id=130 data-nosnippet>130</a>        /// the signal (`signal_delivered`, kernel/signal.c:2951-2954), and
+<a href=#131 id=131 data-nosnippet>131</a>        /// the temporary mask leaves `blocked` only at `rt_sigreturn`, which
+<a href=#132 id=132 data-nosnippet>132</a>        /// restores the own mask saved in the frame. So the temporary mask
+<a href=#133 id=133 data-nosnippet>133</a>        /// stays published until the thread's next request; step 3c.1e B/C's
+<a href=#134 id=134 data-nosnippet>134</a>        /// in-guest delivery must file one before the handler's code runs,
+<a href=#135 id=135 data-nosnippet>135</a>        /// so that the published mask is the handler's.
+<a href=#136 id=136 data-nosnippet>136</a>        </span>keep_published: bool,
+<a href=#137 id=137 data-nosnippet>137</a>    },
+<a href=#138 id=138 data-nosnippet>138</a>}
+<a href=#139 id=139 data-nosnippet>139</a>
+<a href=#140 id=140 data-nosnippet>140</a><span class="doccomment">/// The sends the scheduler committed to a thread while its temporary-mask
+<a href=#141 id=141 data-nosnippet>141</a>/// publication was in force, by queue, as signal bits: the answer to a
+<a href=#142 id=142 data-nosnippet>142</a>/// withdrawal. It travels in a bincode RPC, so it has no
+<a href=#143 id=143 data-nosnippet>143</a>/// `skip_serializing_if`.
+<a href=#144 id=144 data-nosnippet>144</a></span><span class="attr">#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+<a href=#145 id=145 data-nosnippet>145</a></span><span class="kw">pub struct </span>CommittedSendWindow {
+<a href=#146 id=146 data-nosnippet>146</a>    <span class="doccomment">/// Thread-directed sends (the private queue).
+<a href=#147 id=147 data-nosnippet>147</a>    </span><span class="kw">pub </span>sent_private: u64,
+<a href=#148 id=148 data-nosnippet>148</a>    <span class="doccomment">/// Process-directed sends (the shared queue).
+<a href=#149 id=149 data-nosnippet>149</a>    </span><span class="kw">pub </span>sent_shared: u64,
+<a href=#150 id=150 data-nosnippet>150</a>}
+<a href=#151 id=151 data-nosnippet>151</a>
+<a href=#152 id=152 data-nosnippet>152</a><span class="doccomment">/// One temporary-mask publication in force (`Scheduler::temporary_mask_publications`).
+<a href=#153 id=153 data-nosnippet>153</a></span><span class="attr">#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+<a href=#154 id=154 data-nosnippet>154</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>TemporaryMaskPublication {
+<a href=#155 id=155 data-nosnippet>155</a>    <span class="doccomment">/// What the thread had published before it, put back by a withdrawal.
+<a href=#156 id=156 data-nosnippet>156</a>    </span>prior: <span class="prelude-ty">Option</span>&lt;PublishedGuestMask&gt;,
+<a href=#157 id=157 data-nosnippet>157</a>    <span class="doccomment">/// Whether that was a temporary mask (`Scheduler::temporary_guest_sigmasks`).
+<a href=#158 id=158 data-nosnippet>158</a>    </span>prior_temporary: bool,
+<a href=#159 id=159 data-nosnippet>159</a>    <span class="doccomment">/// D37's held masks.
+<a href=#160 id=160 data-nosnippet>160</a>    </span>held_private: u64,
+<a href=#161 id=161 data-nosnippet>161</a>    held_shared: u64,
+<a href=#162 id=162 data-nosnippet>162</a>    <span class="doccomment">/// The committed-send window record.
+<a href=#163 id=163 data-nosnippet>163</a>    </span>window: CommittedSendWindow,
+<a href=#164 id=164 data-nosnippet>164</a>}
+<a href=#165 id=165 data-nosnippet>165</a>
+<a href=#166 id=166 data-nosnippet>166</a><span class="kw">impl </span>Scheduler {
+<a href=#167 id=167 data-nosnippet>167</a>    <span class="doccomment">/// What the scheduler holds as `dettid`'s published guest mask, tri-state
+<a href=#168 id=168 data-nosnippet>168</a>    /// (IR-18): `Known`, `Unknown`, or `None` for nothing published.
+<a href=#169 id=169 data-nosnippet>169</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>published_guest_mask_state(<span class="kw-2">&amp;</span><span class="self">self</span>, dettid: DetTid) -&gt; <span class="prelude-ty">Option</span>&lt;PublishedGuestMask&gt; {
+<a href=#170 id=170 data-nosnippet>170</a>        <span class="kw">match </span><span class="self">self</span>.saved_guest_sigmasks.get(<span class="kw-2">&amp;</span>dettid) {
+<a href=#171 id=171 data-nosnippet>171</a>            <span class="prelude-val">Some</span>(mask) =&gt; <span class="prelude-val">Some</span>(PublishedGuestMask::Known(<span class="kw-2">*</span>mask)),
+<a href=#172 id=172 data-nosnippet>172</a>            <span class="prelude-val">None </span><span class="kw">if </span><span class="self">self</span>.unknown_guest_sigmasks.contains(<span class="kw-2">&amp;</span>dettid) =&gt; {
+<a href=#173 id=173 data-nosnippet>173</a>                <span class="prelude-val">Some</span>(PublishedGuestMask::Unknown)
+<a href=#174 id=174 data-nosnippet>174</a>            }
+<a href=#175 id=175 data-nosnippet>175</a>            <span class="prelude-val">None </span>=&gt; <span class="prelude-val">None</span>,
+<a href=#176 id=176 data-nosnippet>176</a>        }
+<a href=#177 id=177 data-nosnippet>177</a>    }
+<a href=#178 id=178 data-nosnippet>178</a>
+<a href=#179 id=179 data-nosnippet>179</a>    <span class="doccomment">/// The answer to a `/proc` status reader under the gate
+<a href=#180 id=180 data-nosnippet>180</a>    /// ([`StatusGuestMask`]).
+<a href=#181 id=181 data-nosnippet>181</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>status_guest_mask(<span class="kw-2">&amp;</span><span class="self">self</span>, dettid: DetTid) -&gt; StatusGuestMask {
+<a href=#182 id=182 data-nosnippet>182</a>        <span class="kw">let </span>held = <span class="self">self</span>.temporary_mask_publications.get(<span class="kw-2">&amp;</span>dettid);
+<a href=#183 id=183 data-nosnippet>183</a>        StatusGuestMask {
+<a href=#184 id=184 data-nosnippet>184</a>            mask: <span class="self">self</span>.published_guest_mask_state(dettid),
+<a href=#185 id=185 data-nosnippet>185</a>            held_private: held.map_or(<span class="number">0</span>, |held| held.held_private),
+<a href=#186 id=186 data-nosnippet>186</a>            held_shared: held.map_or(<span class="number">0</span>, |held| held.held_shared),
+<a href=#187 id=187 data-nosnippet>187</a>        }
+<a href=#188 id=188 data-nosnippet>188</a>    }
+<a href=#189 id=189 data-nosnippet>189</a>
+<a href=#190 id=190 data-nosnippet>190</a>    <span class="doccomment">/// Make `dettid`'s published mask `mask` (`None`: nothing), whatever it
+<a href=#191 id=191 data-nosnippet>191</a>    /// was, `Unknown` included.
+<a href=#192 id=192 data-nosnippet>192</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>put_guest_mask_state(
+<a href=#193 id=193 data-nosnippet>193</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#194 id=194 data-nosnippet>194</a>        dettid: DetTid,
+<a href=#195 id=195 data-nosnippet>195</a>        mask: <span class="prelude-ty">Option</span>&lt;PublishedGuestMask&gt;,
+<a href=#196 id=196 data-nosnippet>196</a>    ) {
+<a href=#197 id=197 data-nosnippet>197</a>        <span class="kw">match </span>mask {
+<a href=#198 id=198 data-nosnippet>198</a>            <span class="prelude-val">Some</span>(PublishedGuestMask::Known(mask)) =&gt; {
+<a href=#199 id=199 data-nosnippet>199</a>                <span class="self">self</span>.saved_guest_sigmasks.insert(dettid, mask);
+<a href=#200 id=200 data-nosnippet>200</a>                <span class="self">self</span>.unknown_guest_sigmasks.remove(<span class="kw-2">&amp;</span>dettid);
+<a href=#201 id=201 data-nosnippet>201</a>            }
+<a href=#202 id=202 data-nosnippet>202</a>            <span class="prelude-val">Some</span>(PublishedGuestMask::Unknown) =&gt; {
+<a href=#203 id=203 data-nosnippet>203</a>                <span class="self">self</span>.saved_guest_sigmasks.remove(<span class="kw-2">&amp;</span>dettid);
+<a href=#204 id=204 data-nosnippet>204</a>                <span class="self">self</span>.unknown_guest_sigmasks.insert(dettid);
+<a href=#205 id=205 data-nosnippet>205</a>            }
+<a href=#206 id=206 data-nosnippet>206</a>            <span class="prelude-val">None </span>=&gt; {
+<a href=#207 id=207 data-nosnippet>207</a>                <span class="self">self</span>.saved_guest_sigmasks.remove(<span class="kw-2">&amp;</span>dettid);
+<a href=#208 id=208 data-nosnippet>208</a>                <span class="self">self</span>.unknown_guest_sigmasks.remove(<span class="kw-2">&amp;</span>dettid);
+<a href=#209 id=209 data-nosnippet>209</a>            }
+<a href=#210 id=210 data-nosnippet>210</a>        }
+<a href=#211 id=211 data-nosnippet>211</a>    }
+<a href=#212 id=212 data-nosnippet>212</a>
+<a href=#213 id=213 data-nosnippet>213</a>    <span class="doccomment">/// [`Self::put_guest_mask_state`], for tests outside the scheduler.
+<a href=#214 id=214 data-nosnippet>214</a>    </span><span class="attr">#[cfg(test)]
+<a href=#215 id=215 data-nosnippet>215</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>put_guest_mask_state_for_test(
+<a href=#216 id=216 data-nosnippet>216</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#217 id=217 data-nosnippet>217</a>        dettid: DetTid,
+<a href=#218 id=218 data-nosnippet>218</a>        mask: <span class="prelude-ty">Option</span>&lt;PublishedGuestMask&gt;,
+<a href=#219 id=219 data-nosnippet>219</a>    ) {
+<a href=#220 id=220 data-nosnippet>220</a>        <span class="self">self</span>.put_guest_mask_state(dettid, mask);
+<a href=#221 id=221 data-nosnippet>221</a>    }
+<a href=#222 id=222 data-nosnippet>222</a>
+<a href=#223 id=223 data-nosnippet>223</a>    <span class="doccomment">/// IR-18: `dettid` is readmitted on a rejoin that returned under the
+<a href=#224 id=224 data-nosnippet>224</a>    /// guest's own mask (`ContinuationMask::Restored`: no temporary mask, and
+<a href=#225 id=225 data-nosnippet>225</a>    /// not unknown) but published none. The mask its call published, possibly
+<a href=#226 id=226 data-nosnippet>226</a>    /// a temporary one, no longer holds. Where the backend keeps the guest's
+<a href=#227 id=227 data-nosnippet>227</a>    /// mask apart from the kernel's for this thread (it has published its own
+<a href=#228 id=228 data-nosnippet>228</a>    /// mask at a request, `own_mask_publishers`), the scheduler does not know
+<a href=#229 id=229 data-nosnippet>229</a>    /// the mask Linux restored: `Unknown` (the `/proc` status reader refuses,
+<a href=#230 id=230 data-nosnippet>230</a>    /// defect-only once step 3c.1e B publishes at every request). Otherwise,
+<a href=#231 id=231 data-nosnippet>231</a>    /// as on every backend before B (none implements
+<a href=#232 id=232 data-nosnippet>232</a>    /// `Guest::resume_signal_mask`), the kernel's `SigBlk` is the guest's own
+<a href=#233 id=233 data-nosnippet>233</a>    /// mask: nothing is published, so readers take it, as for any request
+<a href=#234 id=234 data-nosnippet>234</a>    /// that publishes nothing. A failed vfork's rejoin (`VforkFailed`) takes
+<a href=#235 id=235 data-nosnippet>235</a>    /// the same rule. Under the gate only.
+<a href=#236 id=236 data-nosnippet>236</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>restored_rejoin_published_nothing(<span class="kw-2">&amp;mut </span><span class="self">self</span>, dettid: DetTid) {
+<a href=#237 id=237 data-nosnippet>237</a>        <span class="kw">if </span>!<span class="self">self</span>.in_guest_signal_delivery || !<span class="self">self</span>.next_turns.contains_key(<span class="kw-2">&amp;</span>dettid) {
+<a href=#238 id=238 data-nosnippet>238</a>            <span class="kw">return</span>;
+<a href=#239 id=239 data-nosnippet>239</a>        }
+<a href=#240 id=240 data-nosnippet>240</a>        <span class="self">self</span>.temporary_guest_sigmasks.remove(<span class="kw-2">&amp;</span>dettid);
+<a href=#241 id=241 data-nosnippet>241</a>        <span class="kw">let </span>mask = <span class="self">self</span>.unknown_unless_kernel_shows_own(dettid);
+<a href=#242 id=242 data-nosnippet>242</a>        <span class="self">self</span>.put_guest_mask_state(dettid, mask);
+<a href=#243 id=243 data-nosnippet>243</a>    }
+<a href=#244 id=244 data-nosnippet>244</a>
+<a href=#245 id=245 data-nosnippet>245</a>    <span class="doccomment">/// What to publish for `dettid` when the scheduler does not hold the
+<a href=#246 id=246 data-nosnippet>246</a>    /// guest's own mask for it: `Unknown` where its backend keeps the guest's
+<a href=#247 id=247 data-nosnippet>247</a>    /// mask apart from the kernel's (it has published its own mask at a
+<a href=#248 id=248 data-nosnippet>248</a>    /// request, `own_mask_publishers`), and otherwise nothing, so readers
+<a href=#249 id=249 data-nosnippet>249</a>    /// take the kernel's `SigBlk`, which is then the guest's own mask.
+<a href=#250 id=250 data-nosnippet>250</a>    </span><span class="kw">fn </span>unknown_unless_kernel_shows_own(<span class="kw-2">&amp;</span><span class="self">self</span>, dettid: DetTid) -&gt; <span class="prelude-ty">Option</span>&lt;PublishedGuestMask&gt; {
+<a href=#251 id=251 data-nosnippet>251</a>        <span class="self">self</span>.own_mask_publishers
+<a href=#252 id=252 data-nosnippet>252</a>            .contains(<span class="kw-2">&amp;</span>dettid)
+<a href=#253 id=253 data-nosnippet>253</a>            .then_some(PublishedGuestMask::Unknown)
+<a href=#254 id=254 data-nosnippet>254</a>    }
+<a href=#255 id=255 data-nosnippet>255</a>
+<a href=#256 id=256 data-nosnippet>256</a>    <span class="doccomment">/// Fork-child seeding, under the gate only: `child`, just registered by
+<a href=#257 id=257 data-nosnippet>257</a>    /// `parent`'s `clone`, `fork` or `vfork` in `parent`'s turn, starts with
+<a href=#258 id=258 data-nosnippet>258</a>    /// the guest's own mask as `parent` published it, `Known` or `Unknown`
+<a href=#259 id=259 data-nosnippet>259</a>    /// (nothing when `parent` published nothing, so `child`'s readers take
+<a href=#260 id=260 data-nosnippet>260</a>    /// its `SigBlk`, which the kernel copied from `parent`'s). Linux's child
+<a href=#261 id=261 data-nosnippet>261</a>    /// starts with its creator's `blocked` (`arch_dup_task_struct`,
+<a href=#262 id=262 data-nosnippet>262</a>    /// kernel/fork.c:1086-1091 at v6.12, from `dup_task_struct`, :1112) and
+<a href=#263 id=263 data-nosnippet>263</a>    /// an empty `pending` (:2268); its first request then publishes its own.
+<a href=#264 id=264 data-nosnippet>264</a>    /// A temporary mask `parent` still publishes
+<a href=#265 id=265 data-nosnippet>265</a>    /// (`Scheduler::temporary_guest_sigmasks`: a masked call's, which Linux
+<a href=#266 id=266 data-nosnippet>266</a>    /// takes down before the call returns, or, after an interrupted end,
+<a href=#267 id=267 data-nosnippet>267</a>    /// keeps through the signal's delivery together with the handler's
+<a href=#268 id=268 data-nosnippet>268</a>    /// `sa_mask` and the signal, `signal_delivered`, kernel/signal.c:2951-2954,
+<a href=#269 id=269 data-nosnippet>269</a>    /// until `rt_sigreturn`) is not the mask `parent` holds at the `fork`, and
+<a href=#270 id=270 data-nosnippet>270</a>    /// is not copied: `child` takes what a rejoin that publishes nothing takes
+<a href=#271 id=271 data-nosnippet>271</a>    /// ([`Self::unknown_unless_kernel_shows_own`]). An ordinary clone first
+<a href=#272 id=272 data-nosnippet>272</a>    /// publishes the creator's current mask (`tool_global::create_child_thread`),
+<a href=#273 id=273 data-nosnippet>273</a>    /// which clears the mark, so this applies only where that publishes
+<a href=#274 id=274 data-nosnippet>274</a>    /// nothing.
+<a href=#275 id=275 data-nosnippet>275</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>seed_child_guest_sigmask(<span class="kw-2">&amp;mut </span><span class="self">self</span>, parent: DetTid, child: DetTid) {
+<a href=#276 id=276 data-nosnippet>276</a>        <span class="kw">if </span>!<span class="self">self</span>.in_guest_signal_delivery || parent == child {
+<a href=#277 id=277 data-nosnippet>277</a>            <span class="kw">return</span>;
+<a href=#278 id=278 data-nosnippet>278</a>        }
+<a href=#279 id=279 data-nosnippet>279</a>        <span class="kw">let </span>inherited = <span class="kw">if </span><span class="self">self</span>.temporary_guest_sigmasks.contains(<span class="kw-2">&amp;</span>parent) {
+<a href=#280 id=280 data-nosnippet>280</a>            <span class="self">self</span>.unknown_unless_kernel_shows_own(parent)
+<a href=#281 id=281 data-nosnippet>281</a>        } <span class="kw">else </span>{
+<a href=#282 id=282 data-nosnippet>282</a>            <span class="self">self</span>.published_guest_mask_state(parent)
+<a href=#283 id=283 data-nosnippet>283</a>        };
+<a href=#284 id=284 data-nosnippet>284</a>        <span class="self">self</span>.temporary_mask_publications.remove(<span class="kw-2">&amp;</span>child);
+<a href=#285 id=285 data-nosnippet>285</a>        <span class="self">self</span>.temporary_guest_sigmasks.remove(<span class="kw-2">&amp;</span>child);
+<a href=#286 id=286 data-nosnippet>286</a>        <span class="self">self</span>.put_guest_mask_state(child, inherited);
+<a href=#287 id=287 data-nosnippet>287</a>    }
+<a href=#288 id=288 data-nosnippet>288</a>
+<a href=#289 id=289 data-nosnippet>289</a>    <span class="doccomment">/// IR-23(a), the answer to `GlobalRequest::PublishTemporaryMask`, in the
+<a href=#290 id=290 data-nosnippet>290</a>    /// sender's own turn, with no scheduling decision. Under the gate only;
+<a href=#291 id=291 data-nosnippet>291</a>    /// `None` with it off or for a thread the scheduler does not know, and
+<a href=#292 id=292 data-nosnippet>292</a>    /// for a withdrawal with no publication in force (a later request
+<a href=#293 id=293 data-nosnippet>293</a>    /// superseded it).
+<a href=#294 id=294 data-nosnippet>294</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>temporary_mask_control(
+<a href=#295 id=295 data-nosnippet>295</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#296 id=296 data-nosnippet>296</a>        sender: DetTid,
+<a href=#297 id=297 data-nosnippet>297</a>        control: TemporaryMaskControl,
+<a href=#298 id=298 data-nosnippet>298</a>    ) -&gt; <span class="prelude-ty">Option</span>&lt;CommittedSendWindow&gt; {
+<a href=#299 id=299 data-nosnippet>299</a>        <span class="kw">match </span>control {
+<a href=#300 id=300 data-nosnippet>300</a>            TemporaryMaskControl::Publish {
+<a href=#301 id=301 data-nosnippet>301</a>                thread,
+<a href=#302 id=302 data-nosnippet>302</a>                mask,
+<a href=#303 id=303 data-nosnippet>303</a>                held_private,
+<a href=#304 id=304 data-nosnippet>304</a>                held_shared,
+<a href=#305 id=305 data-nosnippet>305</a>            } <span class="kw">if </span>thread == sender =&gt; {
+<a href=#306 id=306 data-nosnippet>306</a>                <span class="self">self</span>.publish_temporary_mask(thread, mask, held_private, held_shared);
+<a href=#307 id=307 data-nosnippet>307</a>                <span class="prelude-val">None
+<a href=#308 id=308 data-nosnippet>308</a>            </span>}
+<a href=#309 id=309 data-nosnippet>309</a>            TemporaryMaskControl::Withdraw {
+<a href=#310 id=310 data-nosnippet>310</a>                thread,
+<a href=#311 id=311 data-nosnippet>311</a>                keep_published,
+<a href=#312 id=312 data-nosnippet>312</a>            } <span class="kw">if </span>thread == sender =&gt; <span class="self">self</span>.withdraw_temporary_mask(thread, keep_published),
+<a href=#313 id=313 data-nosnippet>313</a>            <span class="kw">_ </span>=&gt; <span class="prelude-val">None</span>,
+<a href=#314 id=314 data-nosnippet>314</a>        }
+<a href=#315 id=315 data-nosnippet>315</a>    }
+<a href=#316 id=316 data-nosnippet>316</a>
+<a href=#317 id=317 data-nosnippet>317</a>    <span class="doccomment">/// `thread` waits under the temporary mask `mask` from now, keeping the
+<a href=#318 id=318 data-nosnippet>318</a>    /// ignored signals `held_private` and `held_shared` pending from its
+<a href=#319 id=319 data-nosnippet>319</a>    /// entry: the published mask becomes `mask` (readers, the `/proc` status
+<a href=#320 id=320 data-nosnippet>320</a>    /// reader included, take it in place of what the thread's latest request
+<a href=#321 id=321 data-nosnippet>321</a>    /// published), the held masks are kept for the status reader, and the
+<a href=#322 id=322 data-nosnippet>322</a>    /// committed-send window opens. Under the gate only. Returns whether the
+<a href=#323 id=323 data-nosnippet>323</a>    /// publication was taken.
+<a href=#324 id=324 data-nosnippet>324</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>publish_temporary_mask(
+<a href=#325 id=325 data-nosnippet>325</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#326 id=326 data-nosnippet>326</a>        thread: DetTid,
+<a href=#327 id=327 data-nosnippet>327</a>        mask: u64,
+<a href=#328 id=328 data-nosnippet>328</a>        held_private: u64,
+<a href=#329 id=329 data-nosnippet>329</a>        held_shared: u64,
+<a href=#330 id=330 data-nosnippet>330</a>    ) -&gt; bool {
+<a href=#331 id=331 data-nosnippet>331</a>        <span class="kw">if </span>!<span class="self">self</span>.in_guest_signal_delivery || !<span class="self">self</span>.next_turns.contains_key(<span class="kw-2">&amp;</span>thread) {
+<a href=#332 id=332 data-nosnippet>332</a>            <span class="kw">return </span><span class="bool-val">false</span>;
+<a href=#333 id=333 data-nosnippet>333</a>        }
+<a href=#334 id=334 data-nosnippet>334</a>        <span class="kw">let </span>(prior, prior_temporary) = <span class="kw">match </span><span class="self">self</span>.temporary_mask_publications.get(<span class="kw-2">&amp;</span>thread) {
+<a href=#335 id=335 data-nosnippet>335</a>            <span class="comment">// A second publication in the same call keeps the first one's
+<a href=#336 id=336 data-nosnippet>336</a>            // prior (the call files the pair once, so this does not happen).
+<a href=#337 id=337 data-nosnippet>337</a>            </span><span class="prelude-val">Some</span>(publication) =&gt; (publication.prior, publication.prior_temporary),
+<a href=#338 id=338 data-nosnippet>338</a>            <span class="prelude-val">None </span>=&gt; (
+<a href=#339 id=339 data-nosnippet>339</a>                <span class="self">self</span>.published_guest_mask_state(thread),
+<a href=#340 id=340 data-nosnippet>340</a>                <span class="self">self</span>.temporary_guest_sigmasks.contains(<span class="kw-2">&amp;</span>thread),
+<a href=#341 id=341 data-nosnippet>341</a>            ),
+<a href=#342 id=342 data-nosnippet>342</a>        };
+<a href=#343 id=343 data-nosnippet>343</a>        <span class="self">self</span>.put_guest_mask_state(thread, <span class="prelude-val">Some</span>(PublishedGuestMask::Known(mask)));
+<a href=#344 id=344 data-nosnippet>344</a>        <span class="self">self</span>.temporary_guest_sigmasks.insert(thread);
+<a href=#345 id=345 data-nosnippet>345</a>        <span class="self">self</span>.temporary_mask_publications.insert(
+<a href=#346 id=346 data-nosnippet>346</a>            thread,
+<a href=#347 id=347 data-nosnippet>347</a>            TemporaryMaskPublication {
+<a href=#348 id=348 data-nosnippet>348</a>                prior,
+<a href=#349 id=349 data-nosnippet>349</a>                prior_temporary,
+<a href=#350 id=350 data-nosnippet>350</a>                held_private,
+<a href=#351 id=351 data-nosnippet>351</a>                held_shared,
+<a href=#352 id=352 data-nosnippet>352</a>                window: CommittedSendWindow::default(),
+<a href=#353 id=353 data-nosnippet>353</a>            },
+<a href=#354 id=354 data-nosnippet>354</a>        );
+<a href=#355 id=355 data-nosnippet>355</a>        <span class="bool-val">true
+<a href=#356 id=356 data-nosnippet>356</a>    </span>}
+<a href=#357 id=357 data-nosnippet>357</a>
+<a href=#358 id=358 data-nosnippet>358</a>    <span class="doccomment">/// `thread`'s masked call returned with its temporary-mask publication
+<a href=#359 id=359 data-nosnippet>359</a>    /// still in force (it filed no request since): the committed-send window
+<a href=#360 id=360 data-nosnippet>360</a>    /// is answered and closed, with the held masks, and what was published
+<a href=#361 id=361 data-nosnippet>361</a>    /// before it is put back, as Linux restores the thread's own mask as the
+<a href=#362 id=362 data-nosnippet>362</a>    /// call returns (`restore_saved_sigmask_unless`, fs/select.c:301,
+<a href=#363 id=363 data-nosnippet>363</a>    /// fs/eventpoll.c:2495 and :2547 at v6.12). On an interrupted end
+<a href=#364 id=364 data-nosnippet>364</a>    /// (`keep_published`) Linux does not restore it at the return, and the
+<a href=#365 id=365 data-nosnippet>365</a>    /// delivery keeps the temporary mask in `blocked` with the handler's
+<a href=#366 id=366 data-nosnippet>366</a>    /// `sa_mask` and the signal until `rt_sigreturn` (`signal_delivered`,
+<a href=#367 id=367 data-nosnippet>367</a>    /// kernel/signal.c:2951-2954), so it stays published until the thread's
+<a href=#368 id=368 data-nosnippet>368</a>    /// next request.
+<a href=#369 id=369 data-nosnippet>369</a>    /// `None` when no publication is in force.
+<a href=#370 id=370 data-nosnippet>370</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>withdraw_temporary_mask(
+<a href=#371 id=371 data-nosnippet>371</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#372 id=372 data-nosnippet>372</a>        thread: DetTid,
+<a href=#373 id=373 data-nosnippet>373</a>        keep_published: bool,
+<a href=#374 id=374 data-nosnippet>374</a>    ) -&gt; <span class="prelude-ty">Option</span>&lt;CommittedSendWindow&gt; {
+<a href=#375 id=375 data-nosnippet>375</a>        <span class="kw">let </span>publication = <span class="self">self</span>.temporary_mask_publications.remove(<span class="kw-2">&amp;</span>thread)<span class="question-mark">?</span>;
+<a href=#376 id=376 data-nosnippet>376</a>        <span class="kw">if </span>!keep_published {
+<a href=#377 id=377 data-nosnippet>377</a>            <span class="self">self</span>.put_guest_mask_state(thread, publication.prior);
+<a href=#378 id=378 data-nosnippet>378</a>            <span class="kw">if </span>!publication.prior_temporary {
+<a href=#379 id=379 data-nosnippet>379</a>                <span class="self">self</span>.temporary_guest_sigmasks.remove(<span class="kw-2">&amp;</span>thread);
+<a href=#380 id=380 data-nosnippet>380</a>            }
+<a href=#381 id=381 data-nosnippet>381</a>        }
+<a href=#382 id=382 data-nosnippet>382</a>        <span class="prelude-val">Some</span>(publication.window)
+<a href=#383 id=383 data-nosnippet>383</a>    }
+<a href=#384 id=384 data-nosnippet>384</a>
+<a href=#385 id=385 data-nosnippet>385</a>    <span class="doccomment">/// A later publication by `thread` (a request it filed, or an explicit
+<a href=#386 id=386 data-nosnippet>386</a>    /// `SetSavedGuestSigmask`) supersedes its temporary-mask publication: the
+<a href=#387 id=387 data-nosnippet>387</a>    /// held masks and the window go with it, and nothing is put back.
+<a href=#388 id=388 data-nosnippet>388</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>forget_temporary_mask_publication(<span class="kw-2">&amp;mut </span><span class="self">self</span>, thread: DetTid) {
+<a href=#389 id=389 data-nosnippet>389</a>        <span class="self">self</span>.temporary_mask_publications.remove(<span class="kw-2">&amp;</span>thread);
+<a href=#390 id=390 data-nosnippet>390</a>    }
+<a href=#391 id=391 data-nosnippet>391</a>
+<a href=#392 id=392 data-nosnippet>392</a>    <span class="doccomment">/// The committed-send window record: a send of `signal` the scheduler has
+<a href=#393 id=393 data-nosnippet>393</a>    /// just committed to `target`, thread-directed (`private`) or
+<a href=#394 id=394 data-nosnippet>394</a>    /// process-directed, from one of its two current commit points
+<a href=#395 id=395 data-nosnippet>395</a>    /// (`NotifySignalPending`'s handler, after the guest's injected send
+<a href=#396 id=396 data-nosnippet>396</a>    /// succeeded; `send_guest_signal`, after its `kill` succeeded). Recorded
+<a href=#397 id=397 data-nosnippet>397</a>    /// only while `target` holds a temporary-mask publication; nothing is
+<a href=#398 id=398 data-nosnippet>398</a>    /// kept, or even looked up, with the gate off.
+<a href=#399 id=399 data-nosnippet>399</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>note_committed_send_in_window(
+<a href=#400 id=400 data-nosnippet>400</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#401 id=401 data-nosnippet>401</a>        target: DetTid,
+<a href=#402 id=402 data-nosnippet>402</a>        signal: i32,
+<a href=#403 id=403 data-nosnippet>403</a>        private: bool,
+<a href=#404 id=404 data-nosnippet>404</a>    ) {
+<a href=#405 id=405 data-nosnippet>405</a>        <span class="kw">if </span>!<span class="self">self</span>.in_guest_signal_delivery {
+<a href=#406 id=406 data-nosnippet>406</a>            <span class="kw">return</span>;
+<a href=#407 id=407 data-nosnippet>407</a>        }
+<a href=#408 id=408 data-nosnippet>408</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(publication) = <span class="self">self</span>.temporary_mask_publications.get_mut(<span class="kw-2">&amp;</span>target) <span class="kw">else </span>{
+<a href=#409 id=409 data-nosnippet>409</a>            <span class="kw">return</span>;
+<a href=#410 id=410 data-nosnippet>410</a>        };
+<a href=#411 id=411 data-nosnippet>411</a>        <span class="kw">let </span>bit = <span class="kw">super</span>::kernel_signal_bit(signal);
+<a href=#412 id=412 data-nosnippet>412</a>        <span class="kw">if </span>private {
+<a href=#413 id=413 data-nosnippet>413</a>            publication.window.sent_private |= bit;
+<a href=#414 id=414 data-nosnippet>414</a>        } <span class="kw">else </span>{
+<a href=#415 id=415 data-nosnippet>415</a>            publication.window.sent_shared |= bit;
+<a href=#416 id=416 data-nosnippet>416</a>        }
+<a href=#417 id=417 data-nosnippet>417</a>    }
+<a href=#418 id=418 data-nosnippet>418</a>}
+</code></pre></div></section></main></body></html>

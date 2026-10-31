@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BUNDLE_RECORD_ENV","BUNDLE_RECORD_SCHEMA","DIGEST_CACHE_DIR_ENV"],"fn":["binary_digest","file_digest","manifest_plan_accepted","record_from_env","recorded_hermit_sha256"],"struct":["BundleRecord"]};

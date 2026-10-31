@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CacheStatus"],"fn":["default_cache_dir","load_or_generate"],"struct":["InstructionMap","InstructionMapResult","InstructionSite","ModificationTime"]};

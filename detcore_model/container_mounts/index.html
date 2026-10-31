@@ -1,0 +1,64 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The guest’s container mount table: the mounts `/proc/&#60;pid&#62;/mountinfo` and `/proc/&#60;pid&#62;/mounts` show, which hermit-cli builds once, in the completed container namespace before the guest starts, and Detcore renders on every backend (package K slice K3a, https://github.com/rrnewton/hermit/issues/4213)."><title>detcore_model::container_mounts - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore_model" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module container_mounts</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore_model/index.html">detcore_<wbr>model</a><span class="version">0.5.4</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module container_<wbr>mounts</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore_<wbr>model</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore_model</a></div><h1>Module <span>container_<wbr>mounts</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore_model/container_mounts.rs.html#9-1266">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The guest’s container mount table: the mounts <code>/proc/&lt;pid&gt;/mountinfo</code> and
+<code>/proc/&lt;pid&gt;/mounts</code> show, which hermit-cli builds once, in the completed
+container namespace before the guest starts, and Detcore renders on every
+backend (package K slice K3a,
+<a href="https://github.com/rrnewton/hermit/issues/4213">https://github.com/rrnewton/hermit/issues/4213</a>).</p>
+<p>A container’s mount namespace starts as a copy of the host’s, so a table
+read from the kernel has a row for every host mount that existed when
+Hermit started: other users’ FUSE checkouts, other agents’ bind mounts,
+logind’s <code>/run/user/&lt;uid&gt;</code>. Which of those exist changes from one run to
+the next, and a row added or removed renumbers every row after it. The
+table below shows only the mounts a fixed rule selects
+(<a href="struct.ContainerMountTable.html#method.select" title="associated function detcore_model::container_mounts::ContainerMountTable::select"><code>ContainerMountTable::select</code></a>), so host mounts outside that rule, made
+or removed between two runs, change nothing the guest reads.</p>
+<p>The rows the rule shows are still host facts where they are host mounts:</p>
+<ul>
+<li>the base mountpoints;</li>
+<li>the host mounts above a mount Hermit installed (rule 3). A mount Hermit
+stages below <code>/tmp</code> is installed first in its private tmp directory,
+below <code>$TMPDIR</code> or <code>--tmp</code>, so rule 3 then shows the host mount holding
+that directory too;</li>
+<li>the copies a recursive bind of the plan makes of the host mounts below
+its source (every user <code>--bind</code> and <code>--mount type=bind</code> of a directory
+is recursive), which are the bind’s own rows (rule 1), ephemeral seeds
+included, so they come and go with the host’s mounts below that source.</li>
+</ul>
+<p>The kernel lists mounts in creation order (by unique mount ID since Linux
+6.8, in attach order before). The host rows are the copies made when the
+container’s namespace was created, so a host remount moves no row; only a
+host unmount and a new mount at a shown row’s path, between two runs,
+moves that row.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.ContainerMount.html" title="struct detcore_model::container_mounts::ContainerMount">Container<wbr>Mount</a></dt><dd>One row of the guest’s mount table: every field of a Linux
+<code>/proc/&lt;pid&gt;/mountinfo</code> line, as the kernel wrote it in the completed
+container namespace (paths and the source escaped as the kernel escapes
+them), except the parent, which names the nearest mount the table shows
+(<a href="struct.ContainerMountTable.html#method.select" title="associated function detcore_model::container_mounts::ContainerMountTable::select"><code>ContainerMountTable::select</code></a>). Mount IDs, devices and peer groups are
+the kernel’s raw values; Detcore numbers them for the guest through the
+same pools that number <code>stat</code>, <code>statx</code> and fdinfo.</dd><dt><a class="struct" href="struct.ContainerMountTable.html" title="struct detcore_model::container_mounts::ContainerMountTable">Container<wbr>Mount<wbr>Table</a></dt><dd>The guest’s container mount table (see the module documentation).</dd><dt><a class="struct" href="struct.Installation.html" title="struct detcore_model::container_mounts::Installation">Installation</a></dt><dd>One installation of the container’s mount plan, as hermit-cli recorded it
+while installing it, in the completed namespace before the guest starts.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.BASE_MOUNTPOINTS.html" title="constant detcore_model::container_mounts::BASE_MOUNTPOINTS">BASE_<wbr>MOUNTPOINTS</a></dt><dd>The mountpoints the guest sees whenever its container has a mount at one:
+the filesystems every Linux program may expect to find, modelled on the
+minimal machine of gVisor’s <code>/proc</code>. A host mount at any other path is
+hidden unless it holds a mount Hermit installed (<a href="struct.ContainerMountTable.html#method.select" title="associated function detcore_model::container_mounts::ContainerMountTable::select"><code>ContainerMountTable::select</code></a>).</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.assign_installed_rows.html" title="fn detcore_model::container_mounts::assign_installed_rows">assign_<wbr>installed_<wbr>rows</a></dt><dd>Assign each row the plan created to the installation that created it, for
+a plan installed as the namespace’s last mounts, one mount operation after
+another, in a namespace whose propagation from the host was cut (made
+private) before the plan’s first mount, so that no host row can follow
+it: <code>namespace</code> lists rows in creation order (the kernel’s row order), so
+the plan’s rows are its end, each installation’s together and in plan
+order, each starting with the one row the operation created at its target
+(a recursive bind’s copies of the mounts below its source follow it).
+Walking back from the last row, a row is</dd><dt><a class="fn" href="fn.check_installed_rows.html" title="fn detcore_model::container_mounts::check_installed_rows">check_<wbr>installed_<wbr>rows</a></dt><dd>Refuse a walk (<a href="fn.assign_installed_rows.html" title="fn detcore_model::container_mounts::assign_installed_rows"><code>assign_installed_rows</code></a>) whose result does not show the
+plan as installed: every installation that creates a row (one with a
+mountpoint) must have been given a row at its own recorded target, and
+the row given to the first installation must be the container’s own
+<code>/proc</code> (<code>is_plans_first_row</code>; a copy of the host’s <code>/proc</code>, at the same
+path but earlier, would mean the walk ran past the plan into the host’s
+rows). The reason names the first installation that fails.</dd><dt><a class="fn" href="fn.owned_mounts.html" title="fn detcore_model::container_mounts::owned_mounts">owned_<wbr>mounts</a></dt><dd>The rows of <code>namespace</code> the installations made, split into Hermit’s (the
+plan’s own: rule 1 of <a href="struct.ContainerMountTable.html#method.select" title="associated function detcore_model::container_mounts::ContainerMountTable::select"><code>ContainerMountTable::select</code></a>) and a backend’s own.
+A created row counts only at, or below, a mountpoint its installation
+names, so no row a later mount’s symbolic link redirects a path onto can be
+taken for an installation’s. A recursive bind’s copy of a mount below its
+source takes the owner of the row it copies: a backend’s own mount staged
+below Hermit’s private tmp directory stays a backend’s in the bind of that
+directory over <code>/tmp</code>.</dd><dt><a class="fn" href="fn.parse_container_mounts.html" title="fn detcore_model::container_mounts::parse_container_mounts">parse_<wbr>container_<wbr>mounts</a></dt><dd>Parse a Linux <code>/proc/&lt;pid&gt;/mountinfo</code> snapshot into its rows, in the
+grammar <a href="../procfs/fn.parse_mountinfo.html" title="fn detcore_model::procfs::parse_mountinfo"><code>crate::procfs::parse_mountinfo</code></a> accepts: <code>None</code> for a malformed
+row, an optional field this crate cannot map, or a repeated mount ID.</dd></dl></section></div></main></body></html>

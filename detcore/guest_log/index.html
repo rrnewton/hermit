@@ -1,0 +1,47 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Detcore’s warnings from inside the guest, printed by the coordinator."><title>detcore::guest_log - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module guest_log</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.5.4</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module guest_<wbr>log</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#functions" title="Functions">Functions</a></li><li><a href="#types" title="Type Aliases">Type Aliases</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a></div><h1>Module <span>guest_<wbr>log</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/guest_log.rs.html#9-779">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Detcore’s warnings from inside the guest, printed by the coordinator.</p>
+<p>WHY THIS IS NEEDED. Where Detcore runs in the guest’s own process (DBT,
+SaBRe, in-guest LiteInst and in-guest-trap), nothing printed its <code>tracing</code>
+events: a warning that ptrace and KVM print at the default level was lost.</p>
+<p>One mechanism serves every such runtime. The runtime installs <a href="fn.subscriber.html" title="fn detcore::guest_log::subscriber"><code>subscriber</code></a>
+with the one synchronous coordinator request it already has for Tool
+callbacks (the one shared open file control uses). The subscriber sends each
+WARN and ERROR event as one <code>GlobalRequest::GuestLog</code>, and the coordinator
+emits it again with the event’s own level and target (<code>emit</code>). So the
+run’s own filter decides, per target, exactly as it does for ptrace’s
+events, and the line reads as ptrace’s does, without span context.</p>
+<p>WHY ONLY WARN AND ERROR. Verification compares every INFO record, and a
+guest record printed when it arrives would land at a host-timed place
+among the run’s ordered records. Warnings and errors are not compared, and
+they are what a default run prints. DETLOG records, which are INFO or
+DEBUG, keep their own ordered and counted channels (<a href="../detlog/index.html" title="mod detcore::detlog"><code>crate::detlog</code></a>, or
+the runtime’s own, <a href="struct.OwnChannel.html" title="struct detcore::guest_log::OwnChannel"><code>OwnChannel</code></a>).</p>
+<p>A runtime with its own channel (<a href="struct.OwnChannel.html" title="struct detcore::guest_log::OwnChannel"><code>OwnChannel</code></a>) runs it at the run’s own
+level, so it sends nothing: its channel already has every event the run
+prints.</p>
+<p>An event that cannot be sent (outside a Tool callback, while another
+request of the process is in flight, or from inside the send itself) is
+counted, per address space. The next request that gets through carries the
+count, which the coordinator prints as a warning; Detcore also sends any
+count still held when a thread exits, at <code>exit_group</code>, before an exec
+(<code>prepare_exec</code>, every exec path), before an injected <code>exit_group</code> and at
+an unrecoverable shutdown (<code>flush_unsent</code>), and last in each thread’s exit
+hook, through the hook’s own connection (<code>flush_unsent_through</code>). A
+process killed where its runtime runs no exit hook, or a warning after its
+last such point, leaves a count that cannot be reported. (DBT with no coordinator prints its warnings on its own
+diagnostic channel instead.) Nothing is written to
+the guest’s own descriptors, and formatting uses only Rust’s allocator (see
+<code>detcore/clippy.toml</code> for the C library calls that would use the guest’s
+heap).</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.GuestLogRecord.html" title="struct detcore::guest_log::GuestLogRecord">Guest<wbr>LogRecord</a></dt><dd>One Detcore event from inside the guest.</dd><dt><a class="struct" href="struct.OwnChannel.html" title="struct detcore::guest_log::OwnChannel">OwnChannel</a></dt><dd>A runtime’s own channel for its events: DBT’s, which carries its DETLOG
+records through <code>tracing</code> (where other runtimes use <a href="../detlog/index.html" title="mod detcore::detlog"><code>crate::detlog</code></a>’s
+forwarder), to its protected verification evidence or to its diagnostic
+output, at the level the run asked for. It takes every event up to
+<code>max_level</code>, exactly as the runtime’s own subscriber did. A subscriber with
+an own channel sends nothing to the coordinator: events above the run’s
+level are not printed there either.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.install.html" title="fn detcore::guest_log::install">install</a></dt><dd>Installs <a href="fn.subscriber.html" title="fn detcore::guest_log::subscriber"><code>subscriber</code></a> as this process’s global default. Returns false,
+and changes nothing, when the process already has a global subscriber.</dd><dt><a class="fn" href="fn.level_code.html" title="fn detcore::guest_log::level_code">level_<wbr>code</a></dt><dd>The number this module gives <code>level</code>: 1 for ERROR up to 5 for TRACE.</dd><dt><a class="fn" href="fn.subscriber.html" title="fn detcore::guest_log::subscriber">subscriber</a></dt><dd>The subscriber an in-guest runtime installs as its global default: it sends
+WARN and ERROR events through <code>call</code>, and writes every event up to its
+level to <code>own</code>, when the runtime has one.</dd></dl><h2 id="types" class="section-header">Type Aliases<a href="#types" class="anchor">§</a></h2><dl class="item-table"><dt><a class="type" href="type.CoordinatorCall.html" title="type detcore::guest_log::CoordinatorCall">Coordinator<wbr>Call</a></dt><dd>An in-guest runtime’s one synchronous request to Detcore’s global state from
+inside a Tool callback: it sends the request and waits for the answer, and
+refuses with an error where it cannot send. The runtime’s shared open file
+transport sends through the same function.</dd></dl></section></div></main></body></html>

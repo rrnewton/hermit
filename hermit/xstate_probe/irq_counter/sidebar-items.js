@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CALIBRATION_SLACK","MIN_CALIBRATION_TICKS"],"enum":["CounterRefusal"],"fn":["calibration_verdict","interrupts_of","interrupts_taken_event","parse_proc_interrupts","snapshot_proc_interrupts"],"struct":["CpuInterrupts","CpuModel","IrqCounter"]};
