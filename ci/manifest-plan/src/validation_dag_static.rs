@@ -3505,7 +3505,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at 360e99b2e24: a81e8a3fbfd (PR 4862) added two lit tests
     // without moving this pin; the shard executed 292, all passing, in
     // the full validate at that head.
-    ("test.hermit_integration_2", 292),
+    // Registering the two fifo_jump_replay lit cases adds two and the
+    // guest-held-polls deselection (issue 5001) removes one from the
+    // executed set: 292 + 2 - 1 = 293, re-measured at 185c2c1d3c
+    // (293 passed in the shard's tight loop).
+    ("test.hermit_integration_2", 293),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5704,7 +5708,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // whole-node twin executes 61 + 292 + 349 = 702.
     // The integrated chain grows shard 3 to 361 (see its pin): 61 + 292 +
     // 361 = 714.
-    ("test.hermit_integration_on_host", 714),
+    // Shard 2 then grows to 293 (see its pin): 61 + 293 + 361 = 715.
+    ("test.hermit_integration_on_host", 715),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

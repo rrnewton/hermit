@@ -959,7 +959,8 @@ mod tests {
             // 349), so the on-host population is 702.
             // The integrated chain grows shard 3 to 361 (61 + 292 + 361),
             // so the on-host population is 714.
-            assert_eq!(population, 714);
+            // Shard 2 then grows to 293 (61 + 293 + 361): 715.
+            assert_eq!(population, 715);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
