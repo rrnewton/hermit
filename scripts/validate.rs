@@ -16803,7 +16803,30 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     // ATTRIBUTION — cpuid-probe@kvm needs both capabilities and its siblings
     // only cpuid-faulting. A host lacking both withholds the privileged bucket
     // for the one capability every cell lacks, instead of refusing the run.
+    // The whole privileged plan no longer reaches that check on such a host:
+    // the 338-cell flip of 2026-10-30 added the kvm-python-examples and
+    // kvm-shell-environment replay cells on ptrace (cpuid-faulting) beside
+    // their kvm verify cells, so privileged/applications is now withheld by
+    // two capabilities with none shared, and the driver refuses it (the same
+    // fail-closed rule the full plan's portable buckets already obeyed).
+    let mut full_privileged = plan_for("privileged")?;
+    match withhold_vacuous_manifest_nodes(root, &mut full_privileged, &both_absent) {
+        Err(why)
+            if why.contains("privileged/applications")
+                && why.contains("no single capability shared") => {}
+        other => {
+            return Err(format!(
+                "host-inapplicable cells: the privileged plan with both capabilities absent \
+                 must refuse privileged/applications, whose flip-added replay cells mix \
+                 cpuid-faulting with the bucket's kvm cells; got {other:?}"
+            ));
+        }
+    }
+    // So the c-programs attribution is exercised on that bucket's node alone.
     let mut plan = plan_for("privileged")?;
+    plan.cfg
+        .steps
+        .retain(|step| step.tag() == "privileged-only-e2e.manifest_c_programs");
     withhold_vacuous_manifest_nodes(root, &mut plan, &both_absent)?;
     let c_programs = plan
         .host_inapplicable
@@ -16872,7 +16895,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         "  host-inapplicable cells: plan rows {kvm_total} kvm withheld / {c_programs_all} portable \
          c-programs counted, portable {} running recorded / {} withheld, full {} running \
          recorded / {} withheld, qualifying 2 complete / violating 2 NO_RESULT, attribution 1 \
-         shared / 3 refused",
+         shared / 4 refused",
         portable_partial.len(),
         portable_whole.len(),
         portable_partial.len() + privileged_partial.len(),
