@@ -135,6 +135,13 @@ pub struct PreemptionRecord {
     /// is nonzero. Zero, and absent, for a run that counted none, for other
     /// architectures, and for records written before the field existed.
     store_exclusive_failures: HostObservedCount,
+    /// Whether the run that produced this record rewrote exclusive loops in
+    /// the guest's memory (`Config::rewrite_exclusives_in_memory`, aarch64).
+    /// The rewrite changes the instructions the guest retires while every
+    /// file stays the same, so a replay under the other setting would run
+    /// other code with nothing to tell it apart, and is refused. Written only
+    /// when on, so absent means off, as for every record made before it.
+    rewrite_exclusives_in_memory: bool,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -187,6 +194,7 @@ impl PreemptionRecord {
             expired_wait_runs_charged_once: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
+            rewrite_exclusives_in_memory: false,
         }
     }
 
@@ -251,6 +259,7 @@ impl PreemptionRecord {
             host_inputs,
             store_exclusive_failures: _,
             replay_departed_at,
+            rewrite_exclusives_in_memory,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -303,6 +312,8 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             // A prefix of an inexact record is inexact too.
             replay_departed_at: *replay_departed_at,
+            // A setting of the recorded run, which a replay must share.
+            rewrite_exclusives_in_memory: *rewrite_exclusives_in_memory,
         }
     }
 
@@ -394,6 +405,20 @@ impl PreemptionRecord {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        self
+    }
+
+    /// Whether the run this record came from rewrote exclusive loops in the
+    /// guest's memory.
+    pub fn rewrite_exclusives_in_memory(&self) -> bool {
+        self.rewrite_exclusives_in_memory
+    }
+
+    /// The same record, stating whether the trials it came from rewrote
+    /// exclusive loops in the guest's memory; analyze stamps it on every
+    /// record it writes, as it stamps the pipe-wake latency.
+    pub fn with_rewrite_exclusives_in_memory(mut self, on: bool) -> Self {
+        self.rewrite_exclusives_in_memory = on;
         self
     }
 
@@ -508,6 +533,7 @@ impl PreemptionRecord {
             host_inputs: self.host_inputs.clone(),
             // A count of this run's host, not part of the preemptions.
             store_exclusive_failures: HostObservedCount::default(),
+            rewrite_exclusives_in_memory: self.rewrite_exclusives_in_memory,
         }
     }
 
@@ -576,6 +602,7 @@ impl PreemptionRecord {
             expired_wait_runs_charged_once: false,
             host_inputs: None,
             store_exclusive_failures: HostObservedCount::default(),
+            rewrite_exclusives_in_memory: false,
         }
     }
 
@@ -1287,6 +1314,33 @@ mod tests {
     }
 
     #[test]
+    fn the_in_memory_exclusive_rewrite_round_trips_and_is_compared() {
+        let off = PreemptionWriter::new(None).into_string();
+        assert!(!off.contains("rewrite_exclusives_in_memory"), "{off}");
+        let on = PreemptionWriter::new(None)
+            .with_rewrite_exclusives_in_memory(true)
+            .into_string();
+        assert!(on.contains("\"rewrite_exclusives_in_memory\":true"), "{on}");
+        let back: PreemptionRecord = serde_json::from_str(&on).unwrap();
+        assert!(back.rewrite_exclusives_in_memory());
+        assert!(back.clone_preemptions_only().rewrite_exclusives_in_memory());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        std::fs::write(&path, &on).unwrap();
+        assert_eq!(read_recorded_rewrite_exclusives_in_memory(&path), Ok(true));
+        std::fs::write(&path, &off).unwrap();
+        assert_eq!(read_recorded_rewrite_exclusives_in_memory(&path), Ok(false));
+        for (recorded, replay) in [(false, false), (true, true), (true, false), (false, true)] {
+            assert_eq!(
+                rewrite_exclusives_in_memory_mismatch("--replay-schedule-from=x", recorded, replay)
+                    .is_some(),
+                recorded != replay,
+                "{recorded} replayed with {replay}"
+            );
+        }
+    }
+
+    #[test]
     fn the_signal_state_copy_setting_round_trips_and_is_compared() {
         let unsaid = PreemptionRecord::from_sched_events(Vec::new());
         assert_eq!(unsaid.signal_state_copy(), None);
@@ -1727,6 +1781,28 @@ mod tests {
         }
     }
 
+    /// Whether the recorded run rewrote exclusive loops in memory is a setting
+    /// a replay of the record must share, so a prefix record keeps it, for
+    /// any length.
+    #[test]
+    fn a_schedule_prefix_keeps_the_in_memory_exclusive_rewrite_setting() {
+        let tid = DetTid::from_raw(3);
+        for on in [false, true] {
+            let record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ])
+            .with_rewrite_exclusives_in_memory(on);
+            for len in [0, 1, 2, 9] {
+                assert_eq!(
+                    record.schedule_prefix(len).rewrite_exclusives_in_memory(),
+                    on,
+                    "prefix of {len} events"
+                );
+            }
+        }
+    }
+
     /// A replay of a schedule's first events keeps the callback checkpoints
     /// of the slices those events end, for the threads they run, and no later
     /// ones: the slice end at the prefix's own end belongs to the event after
@@ -2079,6 +2155,13 @@ impl PreemptionWriter {
     /// and before the record is flushed.
     pub fn set_host_inputs(&mut self, inputs: HostInputSet) {
         self.inner.host_inputs = Some(inputs);
+    }
+
+    /// Store whether the run rewrites exclusive loops in the guest's memory
+    /// (`Config::rewrite_exclusives_in_memory`).
+    pub fn with_rewrite_exclusives_in_memory(mut self, on: bool) -> Self {
+        self.inner.rewrite_exclusives_in_memory = on;
+        self
     }
 
     /// Store the store-exclusives that failed in the run (aarch64), counted
@@ -2711,6 +2794,45 @@ pub fn guest_ids_mismatch(
         format!(
             "{source} was recorded with guest process IDs {recorded}, and this replay's would be \
              {replay}. The record names every thread by its ID, so the replay cannot follow it."
+        )
+    })
+}
+
+/// Read only whether the run that wrote a preemption record file rewrote
+/// exclusive loops in the guest's memory, as [`read_recorded_epoch`] reads
+/// the epoch. A record without the field was made without the rewrite.
+pub fn read_recorded_rewrite_exclusives_in_memory(path: &Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct RewriteOnly {
+        #[serde(default)]
+        rewrite_exclusives_in_memory: bool,
+    }
+    Ok(boundary_recording::read_settings::<RewriteOnly>(path)?.rewrite_exclusives_in_memory)
+}
+
+/// The refusal of a replay that would rewrite exclusive loops in the guest's
+/// memory where the record's run did not, or the other way round, naming the
+/// record by `source` (an option and a path); `None` when they agree.
+pub fn rewrite_exclusives_in_memory_mismatch(
+    source: &str,
+    recorded: bool,
+    replay: bool,
+) -> Option<String> {
+    let show = |on: bool| {
+        if on {
+            "exclusive loops rewritten in the guest's memory (--rewrite-exclusives)"
+        } else {
+            "exclusive loops as the files have them"
+        }
+    };
+    (recorded != replay).then(|| {
+        format!(
+            "{source} was recorded with {} and would be replayed with {}. The rewrite changes \
+             the instructions the guest retires, so the replay cannot reproduce the run. \
+             Replay with {}.",
+            show(recorded),
+            show(replay),
+            show(recorded),
         )
     })
 }

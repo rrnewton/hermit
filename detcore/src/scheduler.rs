@@ -4892,7 +4892,8 @@ impl Scheduler {
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
                 .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_chaos_timeslice(cfg.chaos_timeslice)
-                .with_guest_ids(cfg.guest_ids);
+                .with_guest_ids(cfg.guest_ids)
+                .with_rewrite_exclusives_in_memory(cfg.rewrite_exclusives_in_memory);
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -19043,7 +19044,11 @@ impl Scheduler {
                 // GlobalState records what the run learned of its
                 // store-exclusive sequences (aarch64).
                 exclusive_pairs: Default::default(),
+                counter_reads: Default::default(),
+                exclusive_rewrites: Default::default(),
+                exclusive_rewrite_cache_peak: 0,
                 store_exclusives: None,
+                exclusive_pairs_not_rewritten: Default::default(),
                 store_exclusives_unavailable: None,
                 guest_deadlock,
                 guest_ids: None,

@@ -110,6 +110,8 @@ use super::verify::retain_logs_after_verification_error;
 use super::verify::retain_verification_error;
 use super::verify::retain_verification_logs;
 use super::verify::run_verification_execution;
+use super::verify::store_exclusive_retries;
+use super::verify::store_exclusive_retries_line;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
 use super::verify::verification_log_level;
@@ -1044,10 +1046,61 @@ struct PreparedMounts {
     identity_sources: IdentityGuard,
 }
 
+/// A rewritten copy of one guest file, bind-mounted over the path the guest
+/// knows it by, so preprocessing never changes what the program sees of
+/// itself. Used by the e9patch preprocessor and by the aarch64 exclusive-loop
+/// rewrite.
 #[derive(Debug, Clone)]
-struct E9patchOverlay {
+struct PreprocessOverlay {
     source: PathBuf,
     target: PathBuf,
+    /// For an exclusive-loop overlay, the sequences its copy rewrote. They
+    /// reach the guest only once the container has mounted the copy, so they
+    /// are reported as applied from inside it, and as planned before.
+    rewritten: Option<usize>,
+}
+
+/// The line `--rewrite-exclusives` prints for one file it rewrote into the
+/// overlay cache: what the copy holds is planned, not applied, until the
+/// container mounts it over the original
+/// ([`exclusive_rewrite_applied_lines`]).
+fn exclusive_rewrite_planned_line(
+    guest_path: &Path,
+    report: &hermit::aarch64_lse::elf::FileReport,
+) -> String {
+    let mount = if report.patched_total() == 0 {
+        "nothing to rewrite, so no copy is mounted"
+    } else {
+        "applied when the container mounts the copy"
+    };
+    format!(
+        ":: Exclusive-loop rewrite: {}: exclusive_instructions={}; planned={} {:?}; \
+         left_alone={} {:?}; skipped_segments={:?}; {mount}",
+        guest_path.display(),
+        report.exclusive_instructions,
+        report.patched_total(),
+        report.patched,
+        report.refused_total(),
+        report.refused,
+        report.skipped_segments,
+    )
+}
+
+/// The lines that state the exclusive-loop overlays as applied, printed from
+/// inside the container, after its mounts succeeded: one per mounted copy.
+fn exclusive_rewrite_applied_lines(overlays: &[PreprocessOverlay]) -> Vec<String> {
+    overlays
+        .iter()
+        .filter_map(|overlay| {
+            overlay.rewritten.map(|rewritten| {
+                format!(
+                    ":: Exclusive-loop rewrite applied: {}: rewritten={rewritten}, mounted over \
+                     the original",
+                    overlay.target.display()
+                )
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1513,6 +1566,47 @@ pub struct RunOpts {
     /// `SOURCE:TARGET` to choose a target under `/tmp`; the source must already exist.
     #[clap(long, value_name = "path")]
     pub(crate) bind: Vec<Bind>,
+
+    /// Rewrite canonical aarch64 load/store-exclusive retry loops to single
+    /// LSE atomic instructions before the guest runs them.
+    ///
+    /// An `LDXR`/`STXR` pair retries whenever an exception clears the local
+    /// exclusive monitor between the two, and each retry retires the loop's
+    /// branches again, so the same guest work does not retire the same number
+    /// of branches. A single atomic instruction cannot retry. This is
+    /// preprocessing for the ptrace backend, not a backend, and anything that
+    /// is not a fully decoded canonical loop is left alone and reported.
+    ///
+    /// Where the guest has a mount namespace, a rewritten copy of the guest
+    /// executable (and of each `--rewrite-exclusives-also` file) is
+    /// bind-mounted over the original. With `--no-namespace` there is nothing
+    /// to carry such an overlay, so the loops of every executable file the
+    /// guest maps are rewritten in its memory instead, as each is mapped; see
+    /// `--rewrite-exclusives-mode`.
+    #[clap(long)]
+    pub(crate) rewrite_exclusives: bool,
+
+    /// Also rewrite this file (a shared library the guest loads), with
+    /// `--rewrite-exclusives` in overlay mode. Repeatable.
+    #[clap(long, value_name = "FILE", requires = "rewrite_exclusives")]
+    pub(crate) rewrite_exclusives_also: Vec<PathBuf>,
+
+    /// Where `--rewrite-exclusives` applies its rewrite. `overlay` rewrites
+    /// copies of the guest executable and the `--rewrite-exclusives-also`
+    /// files and bind-mounts them over the originals, which needs a mount
+    /// namespace. `memory` rewrites the loops of every executable file the
+    /// guest maps, in the guest's own pages, before any of their instructions
+    /// run: the files are untouched, and a guest that reads its own code sees
+    /// the rewritten instructions. `auto`, the default, is `memory` under
+    /// `--no-namespace` and `overlay` otherwise.
+    #[clap(
+        long,
+        value_enum,
+        value_name = "MODE",
+        default_value_t,
+        requires = "rewrite_exclusives"
+    )]
+    pub(crate) rewrite_exclusives_mode: RewriteExclusivesMode,
 
     /// Select guest networking. `local` creates an isolated loopback interface; `host` exposes the
     /// host network and compromises isolation and deterministic reproducibility.
@@ -2008,7 +2102,18 @@ pub struct RunOpts {
 
     /// Read-only overlay that exposes the rewritten ELF at its original guest path.
     #[clap(skip)]
-    e9patch_overlay: Option<E9patchOverlay>,
+    e9patch_overlay: Option<PreprocessOverlay>,
+
+    /// Runtime-only: the rewritten files `--rewrite-exclusives` produced,
+    /// each bind-mounted over the path the guest loads it from.
+    #[clap(skip)]
+    exclusive_rewrite_overlays: Vec<PreprocessOverlay>,
+
+    /// Runtime-only: the guest path of every file the overlay rewrite was
+    /// given, rewritten or not (the executable and each
+    /// `--rewrite-exclusives-also` file), for `Config::rewrite_exclusives_overlay`.
+    #[clap(skip)]
+    exclusive_rewrite_covered: Vec<PathBuf>,
 
     /// Runtime-only: how many of the last `--mount`s and `--bind`s a backend
     /// adapter added to the caller's (`with_dbt_mounts`). They are installed
@@ -2148,6 +2253,26 @@ pub(super) fn apply_base_environment(
     apply_base_and_explicit_environment(command, base_env, env)?;
     disable_sanitizer_leak_detection(command);
     Ok(())
+}
+
+/// One prepared analysis's key, its overlays, and the guest paths of every
+/// file its overlay rewrite was given.
+type PreparedTrialPreprocessing = (String, Vec<PreprocessOverlay>, Vec<PathBuf>);
+/// The overlays prepared for analyze trials in this process, by
+/// [`RunOpts::trial_preprocessing_key`].
+static PREPARED_TRIAL_PREPROCESSING: std::sync::Mutex<Vec<PreparedTrialPreprocessing>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Where `--rewrite-exclusives` applies its rewrite.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum RewriteExclusivesMode {
+    /// `memory` under `--no-namespace`, `overlay` otherwise.
+    #[default]
+    Auto,
+    /// Bind-mount rewritten copies of the named files over the originals.
+    Overlay,
+    /// Rewrite every executable file mapping in the guest's memory.
+    Memory,
 }
 
 #[derive(Debug, Default, Clone, Copy, Parser, Eq, PartialEq)]
@@ -2343,6 +2468,23 @@ impl fmt::Display for RunOpts {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.in_guest_exec_stop {
             write!(f, " --in-guest-exec-stop")?;
+        }
+        // The rewrite changes which instructions the guest executes, so a
+        // reproducer without it reproduces a different program.
+        if self.rewrite_exclusives {
+            write!(f, " --rewrite-exclusives")?;
+            match self.rewrite_exclusives_mode {
+                RewriteExclusivesMode::Auto => {}
+                RewriteExclusivesMode::Overlay => write!(f, " --rewrite-exclusives-mode=overlay")?,
+                RewriteExclusivesMode::Memory => write!(f, " --rewrite-exclusives-mode=memory")?,
+            }
+            for also in &self.rewrite_exclusives_also {
+                write!(
+                    f,
+                    " --rewrite-exclusives-also={}",
+                    shell_words::quote(&also.to_string_lossy())
+                )?;
+            }
         }
         let mut dop = self.det_opts.det_config.clone();
         // Fail-closed is the `run` default, so serialize only the compatibility
@@ -3033,6 +3175,170 @@ fn pending_exec_stop_epoch_cannot_be_admitted_by_later_package_appearance() {
     }
 }
 
+/// A reproducer that drops the rewrite flags reproduces a different program,
+/// because the guest's instructions are not the same ones.
+/// An exclusive-loop overlay is reported as rewritten only from inside the
+/// container, once mounted: the line printed when the copy is prepared says
+/// planned, and a plan whose mount never happens has no other line.
+#[test]
+fn an_exclusive_rewrite_overlay_reports_rewritten_only_once_mounted() {
+    let mut report = hermit::aarch64_lse::elf::FileReport {
+        exclusive_instructions: 28,
+        ..Default::default()
+    };
+    report.patched.insert("rmw", 5);
+    report.patched.insert("swap", 4);
+    let planned = exclusive_rewrite_planned_line(Path::new("/bin/guest"), &report);
+    assert!(planned.contains("planned=9"), "{planned}");
+    assert!(
+        planned.contains("applied when the container mounts the copy"),
+        "{planned}"
+    );
+    assert!(!planned.contains("rewritten"), "{planned}");
+    // A file with nothing to rewrite gets no copy, and no promise of one.
+    let nothing = hermit::aarch64_lse::elf::FileReport::default();
+    let planned = exclusive_rewrite_planned_line(Path::new("/bin/plain"), &nothing);
+    assert!(planned.contains("planned=0"), "{planned}");
+    assert!(planned.contains("no copy is mounted"), "{planned}");
+    let overlays = [
+        PreprocessOverlay {
+            source: PathBuf::from("/cache/guest"),
+            target: PathBuf::from("/bin/guest"),
+            rewritten: Some(9),
+        },
+        // e9patch's overlay rewrites no exclusive loop.
+        PreprocessOverlay {
+            source: PathBuf::from("/cache/patched-echo"),
+            target: PathBuf::from("/bin/echo"),
+            rewritten: None,
+        },
+    ];
+    assert_eq!(
+        exclusive_rewrite_applied_lines(&overlays),
+        [":: Exclusive-loop rewrite applied: /bin/guest: rewritten=9, mounted over the original"]
+    );
+    assert!(exclusive_rewrite_applied_lines(&[]).is_empty());
+}
+
+/// An analyze trial is refused where `--rewrite-exclusives` cannot apply even
+/// when its key is already in the prepared-overlay cache: the cache holds
+/// artifacts, not permission.
+#[test]
+fn analyze_trials_are_refused_before_the_rewrite_cache_is_consulted() {
+    for (args, refusal) in [
+        (
+            &[
+                "--no-namespace",
+                "--no-sequentialize-threads",
+                "--rewrite-exclusives",
+            ][..],
+            "under --no-sequentialize-threads",
+        ),
+        (
+            &[
+                "--namespace-only",
+                "--rewrite-exclusives",
+                "--rewrite-exclusives-mode=memory",
+            ][..],
+            "which --namespace-only does not run",
+        ),
+        (
+            &[
+                "--no-namespace",
+                "--rewrite-exclusives",
+                "--rewrite-exclusives-mode=overlay",
+            ][..],
+            "has no mount namespace to carry them",
+        ),
+        (
+            &["--image=example.invalid/guest", "--rewrite-exclusives"][..],
+            "which an --image launch does not mount",
+        ),
+    ] {
+        let mut argv = vec!["hermit", "run"];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["--", "/nonexistent/guest"]);
+        let mut trial = run_opts_for(&argv);
+        PREPARED_TRIAL_PREPROCESSING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((trial.trial_preprocessing_key(), Vec::new(), Vec::new()));
+        let error = trial
+            .prepare_trial_preprocessing()
+            .expect_err("a cached key must not admit a refused trial");
+        assert!(
+            format!("{error:#}").contains(refusal),
+            "{args:?}: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn the_exclusive_rewrite_is_retained_in_reproducers() {
+    let mut plain = run_opts_for(&["hermit", "run", "--", "/nonexistent/guest"]);
+    plain.validate_args_with_perf_support(true).unwrap();
+    assert!(!plain.to_string().contains("--rewrite-exclusives"));
+
+    let mut rewritten = run_opts_for(&[
+        "hermit",
+        "run",
+        "--rewrite-exclusives",
+        "--rewrite-exclusives-also=/lib/a space.so",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    rewritten.validate_args_with_perf_support(true).unwrap();
+    let rendered = rewritten.to_string();
+    assert!(rendered.contains(" --rewrite-exclusives"), "{rendered}");
+    assert!(
+        rendered.contains(" --rewrite-exclusives-also='/lib/a space.so'"),
+        "a path with a space must come back shell-quoted: {rendered}"
+    );
+    // A namespaced run overlays files; Detcore does not rewrite memory.
+    assert!(
+        !rewritten
+            .effective_det_config()
+            .rewrite_exclusives_in_memory
+    );
+    assert!(
+        !rendered.contains("--rewrite-exclusives-mode"),
+        "{rendered}"
+    );
+
+    // Under --no-namespace the default is the in-memory rewrite, which the
+    // reproducer carries through --no-namespace itself; an explicit mode is
+    // carried as given.
+    for (args, in_memory, mode) in [
+        (&["--no-namespace", "--rewrite-exclusives"][..], true, None),
+        (
+            &["--rewrite-exclusives", "--rewrite-exclusives-mode=memory"][..],
+            true,
+            Some(" --rewrite-exclusives-mode=memory"),
+        ),
+        (
+            &["--rewrite-exclusives", "--rewrite-exclusives-mode=overlay"][..],
+            false,
+            Some(" --rewrite-exclusives-mode=overlay"),
+        ),
+    ] {
+        let mut argv = vec!["hermit", "run"];
+        argv.extend_from_slice(args);
+        argv.extend(["--", "/nonexistent/guest"]);
+        let mut opts = run_opts_for(&argv);
+        opts.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(
+            opts.effective_det_config().rewrite_exclusives_in_memory,
+            in_memory,
+            "{args:?}"
+        );
+        let rendered = opts.to_string();
+        assert!(rendered.contains(" --rewrite-exclusives"), "{rendered}");
+        if let Some(mode) = mode {
+            assert!(rendered.contains(mode), "{rendered}");
+        }
+    }
+}
+
 #[test]
 fn exec_stop_opt_in_is_uniform_and_retained_in_reproducers() {
     let mut ordinary = run_opts_for(&["hermit", "run", "--", "/nonexistent/guest"]);
@@ -3720,9 +4026,10 @@ fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
         "/bin/echo",
         "hello",
     ]);
-    ro.e9patch_overlay = Some(E9patchOverlay {
+    ro.e9patch_overlay = Some(PreprocessOverlay {
         source: PathBuf::from("/cache/patched-echo"),
         target: PathBuf::from("/bin/echo"),
+        rewritten: None,
     });
     let command = ro.guest_command().unwrap();
     assert_eq!(command.get_program(), "/bin/echo");
@@ -9189,6 +9496,35 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Refuses a replay of a record under the other in-memory exclusive
+    /// rewrite setting, as `refuse_replay_under_another_signal_state_copy`
+    /// refuses the other copy setting: the rewrite changes the instructions
+    /// the guest retires while the files stay the same.
+    fn refuse_replay_under_another_exclusive_rewrite(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded = detcore::preemptions::read_recorded_rewrite_exclusives_in_memory(path)
+                .map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::rewrite_exclusives_in_memory_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                self.rewrites_exclusives_in_memory(),
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -10161,6 +10497,7 @@ impl RunOpts {
         self.refuse_replay_under_another_expired_wait_charge()?;
         self.refuse_replay_under_another_cap_preemption_charge()?;
         self.refuse_replay_under_other_guest_ids()?;
+        self.refuse_replay_under_another_exclusive_rewrite()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -10322,6 +10659,9 @@ impl RunOpts {
         }
         if backend == Backend::E9patch {
             self.prepare_e9patch_program()?;
+        }
+        if self.rewrite_exclusives {
+            self.prepare_exclusive_rewrite(backend)?;
         }
         let private_engagement_summary = if self.backend_engagement_json.is_some()
             && backend == Backend::Ptrace
@@ -12153,6 +12493,219 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Applies to a trial the preprocessing `RunOpts::main` does before a run
+    /// and `RunOpts::run` does not: the exclusive-loop rewrite of
+    /// `--rewrite-exclusives`. `hermit analyze` and `hermit bisect` start every
+    /// trial through `RunOpts::run`, so without this a trial ran the original
+    /// images while its printed reproducer, which carries the option, ran the
+    /// rewritten ones.
+    ///
+    /// Every trial of one analysis shares the program, the
+    /// `--rewrite-exclusives-also` files, the backend, the mounts and binds and
+    /// the working directory and `PATH` the guest program is resolved with, so
+    /// the overlays are prepared once per process for those inputs and reused:
+    /// one rewrite and one report per analysis, not one per trial. The key is
+    /// all of them and whether the rewrite is in memory, so a second analysis
+    /// in one process (as tests run) with other mounts or the other mode
+    /// prepares, and checks, its own.
+    pub(crate) fn prepare_trial_preprocessing(&mut self) -> Result<(), Error> {
+        if !self.rewrite_exclusives {
+            return Ok(());
+        }
+        // Every trial is checked, before anything prepared is reused: the
+        // cache holds artifacts, not permission.
+        self.validate_exclusive_rewrite(self.selected_backend())?;
+        let key = self.trial_preprocessing_key();
+        let mut prepared = PREPARED_TRIAL_PREPROCESSING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, overlays, covered)) = prepared.iter().find(|(seen, _, _)| *seen == key) {
+            self.exclusive_rewrite_overlays = overlays.clone();
+            self.exclusive_rewrite_covered = covered.clone();
+            return Ok(());
+        }
+        self.exclusive_rewrite_overlays.clear();
+        self.exclusive_rewrite_covered.clear();
+        self.prepare_exclusive_rewrite(self.selected_backend())?;
+        prepared.push((
+            key,
+            self.exclusive_rewrite_overlays.clone(),
+            self.exclusive_rewrite_covered.clone(),
+        ));
+        Ok(())
+    }
+
+    /// What decides the overlays one analysis prepares (see
+    /// [`Self::prepare_trial_preprocessing`]).
+    fn trial_preprocessing_key(&self) -> String {
+        format!(
+            "{:?}",
+            (
+                &self.program,
+                &self.rewrite_exclusives_also,
+                self.rewrites_exclusives_in_memory(),
+                self.selected_backend(),
+                &self.mount,
+                &self.bind,
+                std::env::current_dir().ok(),
+                std::env::var_os("PATH"),
+            )
+        )
+    }
+
+    /// Rewrite the guest executable's canonical exclusive loops (and those of
+    /// any file named by `--rewrite-exclusives-also`) into content-addressed
+    /// copies, and overlay each copy on the path the guest loads it from.
+    ///
+    /// The rewrite is a pure function of the input bytes, so the cache key is
+    /// the input digest: two runs of one `--verify` pair, and a replay of a
+    /// recording, map identical bytes.
+    fn prepare_exclusive_rewrite(&mut self, backend: Backend) -> Result<(), Error> {
+        self.validate_exclusive_rewrite(backend)?;
+        if self.rewrites_exclusives_in_memory() {
+            // Detcore rewrites each executable file mapping as the guest maps
+            // it (`rewrite_exclusives_in_memory` in its config), so there is
+            // nothing to prepare here.
+            crate::tracing::diagnostic_eprintln!(
+                ":: Exclusive-loop rewrite: in the guest's memory, as each executable file is \
+                 mapped; the files are unchanged"
+            );
+            return Ok(());
+        }
+        self.prepare_exclusive_rewrite_overlays()
+    }
+
+    /// Refuse `--rewrite-exclusives` where it cannot apply: the flag
+    /// combinations first, which are wrong on any host, then the backend and
+    /// the host. Every run that rewrites checks this, including each analyze
+    /// trial before it looks for prepared overlays.
+    fn validate_exclusive_rewrite(&self, backend: Backend) -> Result<(), Error> {
+        let in_memory = self.rewrites_exclusives_in_memory();
+        anyhow::ensure!(
+            !in_memory || self.rewrite_exclusives_also.is_empty(),
+            "--rewrite-exclusives-also names files for the overlay; rewriting in memory covers \
+             every executable file the guest maps"
+        );
+        anyhow::ensure!(
+            in_memory || !self.no_namespace,
+            "--rewrite-exclusives-mode=overlay bind-mounts rewritten files over the originals, \
+             and a --no-namespace guest has no mount namespace to carry them; rewriting in \
+             memory (the default under --no-namespace) needs none"
+        );
+        // An image launch builds its own container, without the overlay
+        // mounts, so the guest would run the original code.
+        anyhow::ensure!(
+            in_memory || self.image.is_none(),
+            "--rewrite-exclusives-mode=overlay bind-mounts rewritten copies, which an --image \
+             launch does not mount; use --rewrite-exclusives-mode=memory"
+        );
+        // Detcore does the rewrite; --namespace-only runs the guest without it.
+        anyhow::ensure!(
+            !in_memory || !self.namespace_only,
+            "--rewrite-exclusives in the guest's memory is done by Detcore, which \
+             --namespace-only does not run; use --rewrite-exclusives-mode=overlay"
+        );
+        // Detcore writes a new mapping's code while the guest's other threads
+        // are stopped; with threads running concurrently, one could be inside
+        // that code during the write.
+        anyhow::ensure!(
+            !in_memory || self.strict || !self.no_sequentialize_threads,
+            "--rewrite-exclusives in the guest's memory writes code that another thread could \
+             be running under --no-sequentialize-threads; run with threads sequentialized, or \
+             with --rewrite-exclusives-mode=overlay"
+        );
+        anyhow::ensure!(
+            backend == Backend::Ptrace,
+            "--rewrite-exclusives is preprocessing for the ptrace backend; \
+             backend `{backend:?}` would run the rewritten image under a different runtime"
+        );
+        anyhow::ensure!(
+            hermit::aarch64_lse::host_has_lse_atomics(),
+            "--rewrite-exclusives rewrites exclusive loops into FEAT_LSE atomic instructions, \
+             which this host does not execute (no HWCAP_ATOMICS); the rewritten image would \
+             raise SIGILL"
+        );
+        Ok(())
+    }
+
+    /// The overlay half of [`Self::prepare_exclusive_rewrite`]: rewrite the
+    /// files into the cache and overlay each copy on its guest path.
+    fn prepare_exclusive_rewrite_overlays(&mut self) -> Result<(), Error> {
+        let (guest, host) = self.resolve_guest_and_host_program()?;
+        let guest = self.resolve_e9patch_overlay_target(&guest, &host)?;
+        let mut files = vec![(guest, host)];
+        for also in &self.rewrite_exclusives_also {
+            let path = fs::canonicalize(also).with_context(|| {
+                format!(
+                    "--rewrite-exclusives-also {} cannot be resolved",
+                    also.display()
+                )
+            })?;
+            // The overlay binds the rewritten copy over this path, so it is
+            // both the host path read and the guest path mounted: a file the
+            // guest reaches under a different path would be rewritten here
+            // and loaded unrewritten there.
+            anyhow::ensure!(
+                self.mapped_or_visible_host_program(&path).as_deref() == Some(path.as_path()),
+                "--rewrite-exclusives-also {} must name a path the guest loads unchanged; \
+                 this run's mounts map it elsewhere",
+                path.display()
+            );
+            files.push((path.clone(), path));
+        }
+        // The overlay mechanism is e9patch's, so its checks apply here too:
+        // a custom mount must not hide the target or the cached artifact.
+        self.validate_e9patch_mount_targets()?;
+        let cache = hermit::aarch64_lse::cache_dir()?;
+        self.exclusive_rewrite_covered = files.iter().map(|(guest, _)| guest.clone()).collect();
+        for (guest_path, host_path) in files {
+            let input = fs::read(&host_path)
+                .with_context(|| format!("reading {} to rewrite", host_path.display()))?;
+            let digest = detcore::Digest::new(&input);
+            let name = host_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image".to_owned());
+            let output = cache.join(format!(
+                "v{}-{digest}-{name}",
+                hermit::aarch64_lse::REWRITE_FORMAT_VERSION
+            ));
+            // Rewrite into memory first, always: it is the same pure function
+            // of the same bytes, so it is also the check that a cached file
+            // is the one this version of the rewriter would have written. A
+            // cache entry that differs -- an older rewriter's, or anyone
+            // else's -- is replaced rather than mounted.
+            let mut rewritten = input.clone();
+            let report = hermit::aarch64_lse::elf::rewrite_bytes(&mut rewritten)?;
+            if report.is_some() && fs::read(&output).ok().as_deref() != Some(&rewritten) {
+                hermit::aarch64_lse::elf::write_rewritten(&output, &rewritten, &host_path)?;
+            }
+            let Some(report) = report else {
+                crate::tracing::diagnostic_eprintln!(
+                    ":: Exclusive-loop rewrite: {} is not an aarch64 ELF image; left unchanged",
+                    guest_path.display()
+                );
+                continue;
+            };
+            crate::tracing::diagnostic_eprintln!(
+                "{}",
+                exclusive_rewrite_planned_line(&guest_path, &report)
+            );
+            for (addr, why) in &report.refused_examples {
+                tracing::info!("exclusive loop left alone at {addr:#x}: {why}");
+            }
+            if report.patched_total() != 0 {
+                self.validate_e9patch_source_visibility(&output)?;
+                self.exclusive_rewrite_overlays.push(PreprocessOverlay {
+                    source: output,
+                    target: guest_path,
+                    rewritten: Some(report.patched_total()),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_e9patch_program(&mut self) -> Result<(), Error> {
         let (guest, host) = self.resolve_guest_and_host_program()?;
         self.e9patch_program = Some(guest.clone());
@@ -12189,9 +12742,10 @@ impl RunOpts {
         if prepared.patched_sites != 0 {
             self.validate_e9patch_mount_targets()?;
             self.validate_e9patch_source_visibility(&prepared.binary)?;
-            self.e9patch_overlay = Some(E9patchOverlay {
+            self.e9patch_overlay = Some(PreprocessOverlay {
                 source: prepared.binary,
                 target: overlay_target,
+                rewritten: None,
             });
         }
         let rewrite_cache = if prepared.patched_sites == 0 {
@@ -12660,7 +13214,14 @@ impl RunOpts {
         }
 
         let mut child = match command.spawn() {
-            Ok(child) => child,
+            Ok(child) => {
+                // The child's mounts, the overlays among them, were made
+                // before spawn returned.
+                for line in exclusive_rewrite_applied_lines(&self.exclusive_rewrite_overlays) {
+                    crate::tracing::diagnostic_eprintln!("{line}");
+                }
+                child
+            }
             Err(error) => {
                 let Some(errno) = super::container::group_kill_filter_failure(&listener_socket)
                 else {
@@ -13377,6 +13938,7 @@ impl RunOpts {
                 dbt: dbt_comparison,
                 backend: self.selected_backend(),
                 passthru_opt: self.det_opts.det_config.passthru_opt,
+                rewrite_exclusives: Some(self.rewrite_exclusives),
             },
             CompletedVerificationRun {
                 output: &out1,
@@ -13707,7 +14269,11 @@ impl RunOpts {
             .collect::<Vec<_>>();
         mounts.extend(user_mounts);
 
-        if let Some(overlay) = &self.e9patch_overlay {
+        for overlay in self
+            .exclusive_rewrite_overlays
+            .iter()
+            .chain(self.e9patch_overlay.iter())
+        {
             let target = if let Ok(relative_path) = overlay.target.strip_prefix(TMP_DIR) {
                 tmpfs.join(relative_path)
             } else {
@@ -13865,6 +14431,10 @@ impl RunOpts {
         let mut options = self.clone();
         options.det_opts.det_config.annotated_priority_replay =
             options.annotated_priority_replay_admission()?;
+        // Each run counts its store-exclusives (aarch64), so that a
+        // divergence a retried load/store-exclusive loop explains is named
+        // (`conclude_verification`).
+        options.det_opts.det_config.count_store_exclusives = true;
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
         let resources = format!(
@@ -14679,7 +15249,29 @@ impl RunOpts {
         config.host_input_log = self.host_input_log.clone();
         config.untraced_code_range = untraced_code_range(self.selected_backend());
         config.fatal_core_capture = self.fatal_core_capture();
+        // A pure function of the flags, so every trial of an analysis and
+        // both runs of a `--verify` pair rewrite alike.
+        config.rewrite_exclusives_in_memory = self.rewrites_exclusives_in_memory();
+        // The files the overlay rewrite was given, so the run can name the
+        // mapped files it was not; empty without the overlay.
+        config.rewrite_exclusives_overlay =
+            if self.rewrite_exclusives && !config.rewrite_exclusives_in_memory {
+                self.exclusive_rewrite_covered.clone()
+            } else {
+                Vec::new()
+            };
         config
+    }
+
+    /// Whether `--rewrite-exclusives` rewrites the guest's memory rather than
+    /// overlaying rewritten files.
+    pub(crate) fn rewrites_exclusives_in_memory(&self) -> bool {
+        self.rewrite_exclusives
+            && match self.rewrite_exclusives_mode {
+                RewriteExclusivesMode::Auto => self.no_namespace,
+                RewriteExclusivesMode::Overlay => false,
+                RewriteExclusivesMode::Memory => true,
+            }
     }
 
     /// Where and within what bounds the tracer keeps fatal cores, or `None`,
@@ -15106,6 +15698,11 @@ impl RunOpts {
     ) -> Result<(ExitStatus, Option<Output>, Option<detcore::TerminalOutcome>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
         hermit::proc_mount::warn_if_readonly_proc();
+        // Inside the container: its mounts, the overlays among them, are in
+        // place.
+        for line in exclusive_rewrite_applied_lines(&self.exclusive_rewrite_overlays) {
+            crate::tracing::diagnostic_eprintln!("{line}");
+        }
 
         let backend = self.runtime_backend();
         let command = self.guest_command()?;
@@ -15210,6 +15807,9 @@ impl RunOpts {
         }
         let mut forwarded_detlogs = forwarded_detlogs.open_in_container()?;
         hermit::proc_mount::warn_if_readonly_proc();
+        for line in exclusive_rewrite_applied_lines(&self.exclusive_rewrite_overlays) {
+            crate::tracing::diagnostic_eprintln!("{line}");
+        }
 
         let (log, _guard) = self.verification_run_log(log_file, global)?;
 
@@ -15463,6 +16063,10 @@ pub(super) struct VerificationConclusion<'a> {
     pub(super) backend: Backend,
     /// Whether both runs used `--passthru-opt`.
     pub(super) passthru_opt: bool,
+    /// Whether both runs had `--rewrite-exclusives`, when known: what a
+    /// divergence that store-exclusive failures explain suggests
+    /// ([`store_exclusive_retries`]).
+    pub(super) rewrite_exclusives: Option<bool>,
 }
 
 /// Compare two completed verification runs, publish the report to the
@@ -15483,6 +16087,7 @@ pub(super) fn conclude_verification(
         dbt,
         backend,
         passthru_opt,
+        rewrite_exclusives,
     } = conclusion;
     let out1 = run1.output;
     let out2 = run2.output;
@@ -15570,6 +16175,14 @@ pub(super) fn conclude_verification(
     #[cfg(feature = "dbt")]
     let dbt_messages = dbt.map(|comparison| comparison.apply(&mut outcome));
     outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
+    // A divergence that failed store-exclusives explain is named as such
+    // (aarch64): reporting only, the verdict stays what the comparison found.
+    outcome.store_exclusive_retries = store_exclusive_retries(
+        outcome.verdict,
+        summary1.as_ref(),
+        summary2.as_ref(),
+        rewrite_exclusives,
+    );
 
     // A divergence that a host file changing during one run explains is
     // named as such: only a divergence is examined, and only a change
@@ -15623,6 +16236,18 @@ pub(super) fn conclude_verification(
     if let Some(change) = &host_input_change {
         // The divergence stays a failure; this names its cause.
         eprintln!("HERMIT_HOST_INPUT_CHANGED {change}");
+    }
+    if host_input_change.is_some() {
+        // The published verdict is that infrastructure error, not a
+        // divergence, so no cause of a divergence is named.
+        outcome.store_exclusive_retries = None;
+    }
+    if let Some(retries) = &outcome.store_exclusive_retries {
+        // Likewise: a possible cause named, the verdict unchanged.
+        eprintln!(
+            "HERMIT_STORE_EXCLUSIVE_RETRIES {}",
+            store_exclusive_retries_line(retries)
+        );
     }
     Ok(outcome)
 }
