@@ -178,6 +178,8 @@ mod tests {
         // renumbered to 21 at landing after main's 20; digests measured at
         // this head).
         (21, "9d583ef0f9243c61", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::PublishInstructionOffset` and `GlobalResponse::PublishInstructionOffset` (#4769).
+        (22, "b77520aaf61af745", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
