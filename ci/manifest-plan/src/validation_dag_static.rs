@@ -1904,7 +1904,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
     // H1 host-input evidence adds one hermit-run unit: 1289 + 1 = 1290.
     // And this change's two no-namespace analyze tests: 1290 + 2 = 1292.
-    ("test.hermit_unit", 1292),
+    // And analyze::rundata::tests::every_record_written_for_a_trial_states_the_trials_chosen_ids:
+    // 1292 + 1 = 1293.
+    ("test.hermit_unit", 1293),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5972,7 +5974,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4912 unit: 1282 + 1 = 1283.
     // The same H1 path-fallback unit: 1283 + 1 = 1284.
     // And the same two: 1284 + 2 = 1286.
-    ("test.hermit_unit_on_host", 1286),
+    // And the same trial-record stamping unit: 1286 + 1 = 1287.
+    ("test.hermit_unit_on_host", 1287),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
