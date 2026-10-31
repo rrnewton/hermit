@@ -258,6 +258,10 @@ impl RunData {
         }
 
         self.runopts.validate_args()?;
+        // A trial starts through `RunOpts::run`, which applies none of the
+        // preprocessing `RunOpts::main` does, so the trial runs the image its
+        // reproducer names only if it is prepared here.
+        self.runopts.prepare_trial_preprocessing()?;
 
         let repro_file = self.root_path().with_extension("repro");
         std::fs::write(repro_file, self.to_repro() + "\n")?;
@@ -1218,10 +1222,15 @@ impl AnalyzeOpts {
         Ok(())
     }
 
+    /// Whether the trials rewrite exclusive loops in the guest's memory.
+    pub fn trial_rewrite_exclusives_in_memory(&self) -> bool {
+        RunData::get_raw_runopts(self).rewrites_exclusives_in_memory()
+    }
+
     /// `record` stamped with the trials' `--pipe-wake-latency`, signal-state
-    /// copy setting and `--expired-wait-charge`, as every record analyze
-    /// writes must be: a record that omitted one would be accepted when
-    /// replayed under another value
+    /// copy setting, `--expired-wait-charge` and in-memory exclusive rewrite,
+    /// as every record analyze writes must be: a record that omitted one would
+    /// be accepted, or refused, when replayed under another value
     /// (<https://github.com/rrnewton/hermit/issues/4380>).
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
         record
@@ -1231,6 +1240,7 @@ impl AnalyzeOpts {
                 self.trial_expired_wait_charge() == ExpiredWaitCharge::Once,
             )
             .with_cap_preemption_charge(self.trial_cap_preemption_charge())
+            .with_rewrite_exclusives_in_memory(self.trial_rewrite_exclusives_in_memory())
     }
 
     /// Whether the trials cap preemption charges (`--cap-preemption-charge`
@@ -1270,7 +1280,9 @@ impl AnalyzeOpts {
     /// (`--no-signal-state-copy`), which a record without that field does not
     /// state, so it is accepted under either, and for the trials'
     /// `--expired-wait-charge` ([`Self::adopt_expired_wait_charge`]), which a
-    /// record without that field states as `each`.
+    /// record without that field states as `each`, and for the in-memory
+    /// exclusive-loop rewrite, which a record without that field was made
+    /// without.
     pub fn refuse_recordings_under_another_pipe_wake_latency(
         &self,
         recordings: &[(&str, &Path)],
@@ -1334,6 +1346,15 @@ impl AnalyzeOpts {
                 &format!("{option} {}", path.display()),
                 recorded,
                 config.cap_preemption_charge,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+            let recorded = detcore::preemptions::read_recorded_rewrite_exclusives_in_memory(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::rewrite_exclusives_in_memory_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                self.trial_rewrite_exclusives_in_memory(),
             ) {
                 return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
             }
