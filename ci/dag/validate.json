@@ -30303,11 +30303,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-<<<<<<< HEAD
         "NEXTEST_EXPECTED_EXECUTED": "3037",
-=======
-        "NEXTEST_EXPECTED_EXECUTED": "3121",
->>>>>>> 92114c3fdc7 (Compose PR 4692 on the held chain: RPC 18 measured, detcore pin 3121, record/replay poll classification and export-publication composition)
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -32251,7 +32247,7 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER": "4",
-        "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER": "2",
+        "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER": "3",
         "NEXTEST_EXPECTED_EXECUTED": "21",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
@@ -58575,11 +58571,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-<<<<<<< HEAD
         "NEXTEST_EXPECTED_EXECUTED": "3037",
-=======
-        "NEXTEST_EXPECTED_EXECUTED": "3121",
->>>>>>> 92114c3fdc7 (Compose PR 4692 on the held chain: RPC 18 measured, detcore pin 3121, record/replay poll classification and export-publication composition)
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,

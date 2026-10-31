@@ -3150,23 +3150,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4897 adds two detcore units: 2979 + 2 = 2981, re-measured at this integration head.
     // The 4843 overshoot fix adds eighteen detcore units: 2981 + 18 = 2999, re-measured at this integration head.
     // The socketpair readiness increment adds one detcore unit: 2999 + 1 = 3000, re-measured at this integration head.
-<<<<<<< HEAD
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
     // The inotify fault-boundary repair adds three detcore units: 3034 + 3 = 3037, by nextest list.
     ("test.detcore_unit", 3037),
-=======
-    // PR 4864-combined adds thirty-six detcore units: 3000 + 36 = 3036, re-measured at this integration head.
-    // PR 4918 adds four detcore units: 3036 + 4 = 3040, re-measured at this integration head.
-    // PR 4911 adds three detcore units: 3040 + 3 = 3043, re-measured at this integration head.
-    // PR 4661 adds six detcore units: 3043 + 6 = 3049, re-measured at this integration head.
-    // PR 4921 adds twenty-eight detcore units: 3049 + 28 = 3077, re-measured at this integration head.
-    // PR 4916 adds two detcore units: 3077 + 2 = 3079, re-measured at this integration head.
-    // PR 4947 adds the drawn-timeslice prefix unit: 3079 + 1 = 3080, re-measured at this integration head.
-    // PR 4692 adds forty-one detcore units: 3080 + 41 = 3121, re-measured at this integration head.
-    ("test.detcore_unit", 3121),
->>>>>>> 92114c3fdc7 (Compose PR 4692 on the held chain: RPC 18 measured, detcore pin 3121, record/replay poll classification and export-publication composition)
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5576,23 +5564,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4897 units: 2979 + 2 = 2981.
     // The same eighteen 4843 overshoot fix units: 2981 + 18 = 2999.
     // The same socketpair readiness unit: 2999 + 1 = 3000.
-<<<<<<< HEAD
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
     // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
     // The same three inotify fault-boundary units: 3034 + 3 = 3037.
     ("test.detcore_unit_on_host", 3037),
-=======
-    // The same thirty-six PR 4864-combined units: 3000 + 36 = 3036.
-    // The same four PR 4918 units: 3036 + 4 = 3040.
-    // The same three PR 4911 units: 3040 + 3 = 3043.
-    // The same six PR 4661 units: 3043 + 6 = 3049.
-    // The same twenty-eight PR 4921 units: 3049 + 28 = 3077.
-    // The same two PR 4916 units: 3077 + 2 = 3079.
-    // The same PR 4947 drawn-timeslice prefix unit: 3079 + 1 = 3080.
-    // The same forty-one PR 4692 units: 3080 + 41 = 3121.
-    ("test.detcore_unit_on_host", 3121),
->>>>>>> 92114c3fdc7 (Compose PR 4692 on the held chain: RPC 18 measured, detcore pin 3121, record/replay poll classification and export-publication composition)
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
