@@ -17872,24 +17872,6 @@ impl Scheduler {
             .unwrap_or(false)
     }
 
-    /// Whether `tid` is queued as a poller whose attempts depend only on guest
-    /// actions (`polls_only_guest_state`), whatever its backoff, and whose
-    /// request retries after an attempt that moved nothing
-    /// (`waits_after_a_failed_attempt`), made no earlier than `progress`
-    /// (`latest_progress`): its latest attempt (`last_commit_at`) is at or
-    /// after it.
-    fn is_idle_guest_poller(&self, tid: DetTid, progress: u64) -> bool {
-        self.run_queue.contains_tid(tid)
-            && self.attempted_since(tid, progress)
-            // A poll with a timeout ends at its own deadline, which
-            // `fast_forward_to_next_finite_deadline` does not consider, so it is
-            // not idle: jumping over it, or opening in the kernel while it waits,
-            // would end it late.
-            && self.request_satisfies(tid, |rs| {
-                self.waits_on_guest_state(rs) && rs.poll_deadline.is_none()
-            })
-    }
-
     /// A retry, after an attempt that moved nothing, of a poll whose attempts
     /// depend only on guest actions (`is_idle_guest_poller`).
     fn waits_on_guest_state(&self, rs: &Resources) -> bool {
