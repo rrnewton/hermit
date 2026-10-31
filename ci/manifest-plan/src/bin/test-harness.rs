@@ -8439,12 +8439,16 @@ sys.exit(1 if failed else 0)
         // (their SaBRe cells stay applicable in the census but no full node
         // reports them now), + 3 measured red in the first in-image full
         // validate (logger@dbt, pkg-config@dbt, pkg-config@kvm).
-        assert_eq!(unreported.len(), 10, "{unreported:?}");
+        // 10 + 6 since the 2026-10-31 deselection of cargo and gcov
+        // (<https://github.com/rrnewton/hermit/issues/4997>): their dbt, kvm
+        // and SaBRe cells stay applicable in the census but no full node
+        // reports them now.
+        assert_eq!(unreported.len(), 16, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
             .count();
-        assert_eq!(sabre_only, 7, "{unreported:?}");
+        assert_eq!(sabre_only, 9, "{unreported:?}");
     }
 
     #[test]
