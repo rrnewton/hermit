@@ -13182,8 +13182,8 @@ mod tests {
     mod gated_wait_turn_tests;
     mod guest_mask_publication_tests;
     mod replay_departure_tests;
-    mod reserved_input_exec_tests;
     mod replay_departure_transport;
+    mod reserved_input_exec_tests;
     mod sigkill_deregistration_tests;
     mod stopping_refusal_tests;
     mod temporary_mask_publication_tests;

@@ -3588,16 +3588,16 @@ mod legacy_backend_json {
     /// `access_trace_max_bytes` came after it too; the scheduler writes the
     /// trace, and `hermit run` refuses it on DBT, so they are never written
     /// and read as unset, 0, unset and unset.
-        // `chaos_timeslice_range` came after it too: the scheduler draws the
-        // slices, not the runtime, so it is never written and reads as unset.
-        // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
-        // reason; they read as `slice` and unset.
-        // `guest_ids` came after it too: DBT numbers its guest itself, so it
-        // is never written and reads as `GuestIds::Namespace`, its serde
-        // default.
-        // `detlog_anon` came after it too: a coordinator-side ptrace-only
-        // diagnostic the other backends refuse, so it is never written and
-        // reads as absent, its serde default.
+    // `chaos_timeslice_range` came after it too: the scheduler draws the
+    // slices, not the runtime, so it is never written and reads as unset.
+    // `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
+    // reason; they read as `slice` and unset.
+    // `guest_ids` came after it too: DBT numbers its guest itself, so it
+    // is never written and reads as `GuestIds::Namespace`, its serde
+    // default.
+    // `detlog_anon` came after it too: a coordinator-side ptrace-only
+    // diagnostic the other backends refuse, so it is never written and
+    // reads as absent, its serde default.
     /// `replay_continue_fairly` came after it too; only the scheduler reads
     /// it, so it is never written and reads as false.
     const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 45] = [
@@ -4144,7 +4144,7 @@ mod legacy_backend_json {
                 | "access_trace_from"
                 | "access_trace_max_records"
                 | "access_trace_max_bytes" => Ok(()),
-                | "replay_continue_fairly" => Ok(()),
+                "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -5050,7 +5050,7 @@ mod tests {
                 | "access_trace_from"
                 | "access_trace_max_records"
                 | "access_trace_max_bytes" => {}
-                | "replay_continue_fairly" => {}
+                "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
         }
