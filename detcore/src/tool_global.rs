@@ -8000,8 +8000,10 @@ pub enum SignalScope {
 /// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair. 28 retypes `StartNewThread` (PR #4789, renumbered
-// after pidfd's 27).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 28;
+// after pidfd's 27). 35 follows main's 28 (29-34 are reserved for changes
+// not on this base); #4796's TraceSchedEvent/WithWatchOrder retype is this
+// revision's.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 35;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
