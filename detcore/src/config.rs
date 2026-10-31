@@ -188,6 +188,10 @@ mod tests {
         // request's payload types. Renumbered to 24 at landing on top of
         // Train 6's revision 23; digest measured at this combined head.
         (24, "b31c27eec3d0d5b4", "f013e36743d8d9e6"),
+        // Retypes `GlobalRequest::TraceSchedEvent`; adds `GlobalResponse::WithWatchOrder` (#4796;
+        // 22 on its own base, renumbered to 25 after main's 24; digests measured at
+        // this head).
+        (25, "972afd3cae07a4c4", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
