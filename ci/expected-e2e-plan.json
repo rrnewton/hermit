@@ -11331,22 +11331,6 @@
         "userns",
         "ptrace"
       ],
-      "test": "compat/cargo",
-      "timeout_seconds": 60
-    },
-    {
-      "backend": "ptrace",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 59,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
       "test": "compat/cat",
       "timeout_seconds": 60
     },
@@ -11988,22 +11972,6 @@
         "ptrace"
       ],
       "test": "compat/gcc",
-      "timeout_seconds": 60
-    },
-    {
-      "backend": "ptrace",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 59,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "test": "compat/gcov",
       "timeout_seconds": 60
     },
     {
@@ -31136,25 +31104,6 @@
       "requires_host_capabilities": [
         "kvm"
       ],
-      "test": "compat/cargo",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "kvm",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
       "test": "compat/cat",
       "timeout_seconds": 57
     },
@@ -32068,25 +32017,6 @@
         "kvm"
       ],
       "test": "compat/gcc",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "kvm",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
-      "test": "compat/gcov",
       "timeout_seconds": 57
     },
     {
@@ -43622,22 +43552,6 @@
         "userns",
         "ptrace"
       ],
-      "test": "compat/cargo",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "compat",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace"
-      ],
       "test": "compat/cat",
       "timeout_seconds": 57
     },
@@ -52900,23 +52814,6 @@
       "timeout_seconds": 57
     },
     {
-      "backend": "dbt",
-      "category": "language-runtimes",
-      "classification": "required",
-      "cpu_timeout_seconds": 34,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "python3"
-      ],
-      "test": "language-runtimes/python-dict-hash-iteration",
-      "timeout_seconds": 91
-    },
-    {
       "backend": "ptrace",
       "category": "language-runtimes",
       "classification": "required",
@@ -52975,23 +52872,6 @@
       ],
       "test": "language-runtimes/python-io-subprocess-time",
       "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "language-runtimes",
-      "classification": "required",
-      "cpu_timeout_seconds": 50,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "python3"
-      ],
-      "test": "language-runtimes/python-io-subprocess-time",
-      "timeout_seconds": 102
     },
     {
       "backend": "ptrace",

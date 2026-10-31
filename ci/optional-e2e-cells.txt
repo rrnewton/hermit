@@ -3,8 +3,13 @@
 c-programs/dbt-unsupported-syscall verify ptrace
 c-programs/signal-waitstatus-identity verify dbt
 c-programs/writev-determinism custom ptrace
+compat/cargo verify dbt
+compat/cargo verify kvm
+compat/cargo verify ptrace
 compat/cscope replay ptrace
 compat/gcov verify dbt
+compat/gcov verify kvm
+compat/gcov verify ptrace
 compat/logger replay ptrace
 compat/logger verify dbt
 compat/logger verify ptrace

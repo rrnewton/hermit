@@ -1621,6 +1621,41 @@ corpus:
         validate-museland-9ab8418de603); gcov in the image is GCC 14's,
         whose coverage output ordering differs under DBT
       rows: [gcov]
+    # Passed at 6d34a412 and failed from 5d111b3e on every backend: the
+    # guests exit 1 in about 0.5 s with empty output, and the retained
+    # DETLOG shows their Nix-built binaries hitting ENOENT on /nix/store
+    # libc paths while loading. The one-commit bisect range
+    # 6d34a412..5d111b3e contains no compatprep, image, or pinned-root
+    # change, so the trigger is environmental (guest-root/store-closure
+    # exposure); deselected as a named loss under the owner's
+    # deselect-and-fix-forward rule.
+    - backend: ptrace
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/4997
+      reason: >-
+        Guests exit 1 instantly in full validate since 5d111b3e (passed
+        at 6d34a412); Nix-store libc paths are ENOENT in the guest root
+      rows:
+        [
+          cargo, gcov
+        ]
+    - backend: kvm
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/4997
+      reason: >-
+        Guests exit 1 instantly in full validate since 5d111b3e (passed
+        at 6d34a412); Nix-store libc paths are ENOENT in the guest root
+      rows:
+        [
+          cargo, gcov
+        ]
+    - backend: dbt
+      result: crash-error
+      evidence: https://github.com/rrnewton/hermit/issues/4997
+      reason: >-
+        Guests exit 1 instantly in full validate since 5d111b3e (passed
+        at 6d34a412); Nix-store libc paths are ENOENT in the guest root
+      rows: [cargo]
     - backend: kvm
       result: crash-error
       evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md

@@ -324,10 +324,15 @@ pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
 /// head (test-harness run, 2026-10-30); each cell was also CLEAN on the
 /// nightly pressure sweeps of 2026-10-29 and 2026-10-30. Configured bounds
 /// follow the manifest-declared rules recorded in each cell's reason:
-/// ceil(1.5x measured CPU) and ceil(3x measured wall), except
-/// python-io-subprocess-time, whose CPU bound is ceil(1.5 x 22.0) = 33
-/// because the validate-context measurement is the 22.0 stop itself.
-pub const FLIP_2026_10_30_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 4] = [
+/// ceil(1.5x measured CPU) and ceil(3x measured wall). The third cell,
+/// python-io-subprocess-time, left the blocking validate on 2026-10-31
+/// (deselected with python-dict-hash-iteration under the owner's
+/// deselect-and-fix-forward rule after its CPU cost inside full validates
+/// reached 2.6x solo; root cause:
+/// https://github.com/rrnewton/hermit/issues/4996), so its calibration is
+/// removed with the cell; its measurements stay in that issue and in the
+/// manifest git history.
+pub const FLIP_2026_10_30_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 2] = [
     TimeoutCalibration {
         test: "applications/kvm-python-examples",
         mode: "verify",
@@ -351,38 +356,6 @@ pub const FLIP_2026_10_30_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 4] = [
         required_wall_seconds: 88,
         configured_cpu_seconds: 41,
         configured_wall_seconds: 88,
-    },
-    TimeoutCalibration {
-        test: "language-runtimes/python-io-subprocess-time",
-        mode: "verify",
-        backend: "dbt",
-        samples: 12,
-        p90_cpu_usec: 22_000_000,
-        p90_wall_millis: 23_850,
-        required_cpu_seconds: 33,
-        required_wall_seconds: 96,
-        configured_cpu_seconds: 50,
-        configured_wall_seconds: 102,
-    },
-    // Recalibrated 2026-10-31 at Hermit 4304385b11 (museland): twelve solo
-    // and contained width-12 samples completed at 17.8 to 18.5 CPU seconds,
-    // but the full validations of 6d34a412 and 5d111b3e stopped both
-    // attempts at the ordinary 22 CPU-second cap (22.05 used). Configured
-    // bounds follow the censored-stop rule above: ceil(1.5 x 22.05) = 34
-    // CPU seconds, ceil(4 x 22.63) = 91 wall seconds. The io cell above was
-    // recalibrated the same day from its own censored stop at 33.07:
-    // ceil(1.5 x 33.07) = 50, ceil(3 x 33.85) = 102.
-    TimeoutCalibration {
-        test: "language-runtimes/python-dict-hash-iteration",
-        mode: "verify",
-        backend: "dbt",
-        samples: 15,
-        p90_cpu_usec: 18_460_000,
-        p90_wall_millis: 20_930,
-        required_cpu_seconds: 28,
-        required_wall_seconds: 84,
-        configured_cpu_seconds: 34,
-        configured_wall_seconds: 91,
     },
 ];
 

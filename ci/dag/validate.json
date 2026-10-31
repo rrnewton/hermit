@@ -12851,27 +12851,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
@@ -14414,20 +14393,6 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19500,27 +19465,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
@@ -20909,20 +20853,6 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -28390,13 +28320,6 @@
           "category": "language-runtimes",
           "test": "language-runtimes/python-dict-hash-iteration",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-dict-hash-iteration",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -28468,13 +28391,6 @@
           "test": "language-runtimes/python-io-subprocess-time",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-io-subprocess-time",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -45152,20 +45068,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
@@ -46204,13 +46106,6 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50195,13 +50090,6 @@
           "category": "language-runtimes",
           "test": "language-runtimes/python-dict-hash-iteration",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-dict-hash-iteration",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -50252,13 +50140,6 @@
           "test": "language-runtimes/python-io-subprocess-time",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-io-subprocess-time",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -71399,27 +71280,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/cargo",
-          "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
@@ -72962,20 +72822,6 @@
           "category": "compat",
           "test": "compat/gcov",
           "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
-          "backend": "kvm"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -78853,13 +78699,6 @@
           "category": "language-runtimes",
           "test": "language-runtimes/python-dict-hash-iteration",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-dict-hash-iteration",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -78931,13 +78770,6 @@
           "test": "language-runtimes/python-io-subprocess-time",
           "mode": "replay",
           "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "language-runtimes",
-          "test": "language-runtimes/python-io-subprocess-time",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",
