@@ -1494,8 +1494,11 @@ fn dbt_verify_run(
             writer.write(verify_run::STDOUT, &output.stdout)?;
             writer.write(verify_run::STDERR, &output.stderr)?;
             writer.write(verify_run::DBT_STATS, records.records()?)?;
-            if let Some(host_inputs) = &host_inputs {
-                writer.write(verify_run::HOST_INPUTS, host_inputs)?;
+            if let Some(host_inputs) = &host_inputs
+                && let Err(error) = writer.write(verify_run::HOST_INPUTS, host_inputs)
+            {
+                // Evidence only: never fail a completed run over it.
+                eprintln!("WARNING: cannot write the paired host-input record: {error}");
             }
             (
                 verify_run::VerifyRunOutcome::Completed {
