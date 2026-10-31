@@ -30,6 +30,9 @@ pub use disjoint_main::*;
 mod framework_retries;
 pub use framework_retries::*;
 
+mod retry_rollup;
+pub use retry_rollup::*;
+
 /// The stable fields emitted by `validate/aggregate.py --json` and JSONL stores.
 /// Optional fields reflect honest reconstructed rows where a measurement was not
 /// available; unrecognized fields are retained for forward compatibility.
