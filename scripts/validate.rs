@@ -14546,10 +14546,13 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         .find(|step| step.tag() == "e2e.manifest_compat")
         .cloned()
         .ok_or("strict-compat bucket: e2e.manifest_compat is absent")?;
+    // The host compatprep.fixtures step is retired from full/portable
+    // whenever its pinned twin exists (issue 4997, one writer), so the
+    // preparation node in the full plan is the pinned one.
     let prep = first
         .steps
         .iter()
-        .find(|step| step.tag() == "compatprep.fixtures")
+        .find(|step| step.tag() == "compatprep.fixtures_in_pinned_root")
         .ok_or("strict-compat bucket: fixture-preparation node is absent")?;
     let selector = format!(
         "target/debug/test-harness run --lane portable --category compat {}",
@@ -14736,6 +14739,10 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         ));
     }
     let mut execution_prep = prep.clone();
+    // The bracket's stand-in keeps the retired host step's tag: the two
+    // observed steps below depend on "compatprep.fixtures" by that name.
+    execution_prep.group = "compatprep".into();
+    execution_prep.job = "fixtures".into();
     execution_prep.deps.clear();
     execution_prep.cmd = "true".into();
     execution_prep.timeout = 10;
