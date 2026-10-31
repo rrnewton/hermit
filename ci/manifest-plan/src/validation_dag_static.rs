@@ -1901,7 +1901,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
-    ("test.hermit_unit", 1289),
+    // And fifteen for the aarch64 exclusive-loop rewrite: thirteen in
+    // hermit-cli/src/aarch64_lse (the decoder, the four idioms and their
+    // refusals), one for the packed-relative-relocation decoder, and one
+    // that the rewrite flags survive into a printed reproducer: 1304,
+    // listed. Derived with this node's own selection: `cargo nextest list
+    // -p hermit-run --features third-party-backends,kvm-native-test-support
+    // --lib --bins` lists 1310, of which this node's `--skip` patterns
+    // remove 5 and one `#[ignore]` test is listed but never executed.
+    ("test.hermit_unit", 1304),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4485,7 +4493,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
-    ("test.cli", 744),
+    // And the --rewrite-exclusives refusal test under --no-namespace: 745.
+    ("test.cli", 745),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5057,7 +5066,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
-    ("test.cli_on_host", 663),
+    // And the same test: 664.
+    ("test.cli_on_host", 664),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5954,7 +5964,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
-    ("test.hermit_unit_on_host", 1283),
+    // And the same fifteen store-exclusive rewrite tests as test.hermit_unit: 1298.
+    ("test.hermit_unit_on_host", 1298),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
