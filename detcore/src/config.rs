@@ -88,8 +88,10 @@ mod tests {
 
     /// Revisions reserved for a change that is not on this base yet, which
     /// `GLOBAL_RPC_REVISIONS` therefore skips: 30 (PR #4728, returned for
-    /// a clean rebase). Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[30];
+    /// a clean rebase) and 32-34 (assigned to changes pending elsewhere in
+    /// ignored/drain-20261103/rpc-revisions.tsv), which 4796's 35 skips.
+    /// Remove an entry when its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[30, 32, 33, 34];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -240,6 +242,12 @@ mod tests {
         // this rebase onto main's pidfd revision 27, skipping reserved
         // 30 (4728); digest measured at this head).
         (31, "b4bbaec490287ee5", "f013e36743d8d9e6"),
+        // Retypes `GlobalRequest::TraceSchedEvent`; adds
+        // `GlobalResponse::WithWatchOrder` (#4796). Renumbered to 35 at
+        // its rebase onto main's 31, skipping 30 and 32-34 (reserved in
+        // ignored/drain-20261103/rpc-revisions.tsv); digest measured at
+        // this head.
+        (35, "972afd3cae07a4c4", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

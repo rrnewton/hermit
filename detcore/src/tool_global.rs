@@ -8045,8 +8045,10 @@ pub enum SignalScope {
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair. 27 is pidfd's `PidfdSelfQualificationRefusal`;
 // 29 is PR 4884's `StoreExclusive` retype, and this change's `PostCrash`
-// pair is 31 (30 is reserved for 4728).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 31;
+// pair is 31 (30 is reserved for 4728). 35 follows main's 31 (30 and 32-34
+// are reserved for changes not on this base); #4796's
+// TraceSchedEvent/WithWatchOrder retype is this revision's.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 35;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
