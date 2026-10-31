@@ -1859,7 +1859,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validate at 24fbff99c7a saw 1224 before 11c35a504a6 added one):
     // 1202 + 23 = 1225.
     // And container::tests::superblock_options_leave_out_the_owner: 1222.
-    ("test.hermit_unit", 1222),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
+    // And run::a_mount_the_private_dev_mqueue_would_cover_is_refused_before_its_target_is_looked_for:
+    // 1223.
+    ("test.hermit_unit", 1223),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
@@ -5794,7 +5796,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
     // And the container's superblock-owner test: 1216.
-    ("test.hermit_unit_on_host", 1216),
+    // And the same private /dev/mqueue refusal-order unit: 1217.
+    ("test.hermit_unit_on_host", 1217),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
