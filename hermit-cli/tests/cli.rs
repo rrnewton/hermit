@@ -56951,7 +56951,11 @@ fn namespace_only_keeps_ignoring_schedule_inputs() {
                     marker.to_str().unwrap(),
                 ]);
                 let output = hermit(&args);
-                assert_eq!(output.status.code(), Some(125), "{args:?}: {output:?}");
+                assert_eq!(
+                    output.status.code(),
+                    Some(HERMIT_INTERNAL_FAILURE_EXIT),
+                    "{args:?}: {output:?}"
+                );
                 let diagnostic = stderr(&output);
                 assert!(
                     diagnostic.contains(&format!("{diagnostic_kind} {}:", path.display())),
