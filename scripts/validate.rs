@@ -14581,10 +14581,10 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     // extracted from validate.sh, the 25 of
     // https://github.com/rrnewton/hermit/issues/4269, less the 4 heavy rows
     // the super run type runs (218 - 4), less the logger and pkg-config
-    // rows deselected with the pinned-image move (214 - 2), less the
-    // cargo and gcov rows deselected 2026-10-31 (212 - 2;
-    // <https://github.com/rrnewton/hermit/issues/4997>).
-    let expected = 210;
+    // rows deselected with the pinned-image move (214 - 2). The cargo and
+    // gcov rows deselected 2026-10-31 under issue 4997 came back the same
+    // day once the fixture race was fixed (271ec81bd4).
+    let expected = 212;
     if rows.len() != expected {
         return Err(format!(
             "strict-compat bucket: compat.yaml has {} CI rows; the full run has {expected}",
@@ -14644,23 +14644,22 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     }
     canonicalizing_compat_operand_bracket(root)?;
     let workload = root.join("tests/compat/real_compat_workload.sh");
-    // The cargo row was deselected 2026-10-31
-    // (<https://github.com/rrnewton/hermit/issues/4997>); df keeps the
-    // fixture/tool contract check.
-    let df_argv = rows
-        .get("df")
-        .ok_or("strict-compat bucket: fixture-backed row df is absent")?;
-    let df_want: [&OsStr; 5] = [
-        "env".as_ref(),
-        "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
-        "bash".as_ref(),
-        workload.as_os_str(),
-        "df".as_ref(),
-    ];
-    if df_argv.as_slice() != df_want {
-        return Err(format!(
-            "strict-compat bucket: df does not use its explicit fixture/tool contract: {df_argv:?}"
-        ));
+    for label in ["cargo", "df"] {
+        let argv = rows
+            .get(label)
+            .ok_or_else(|| format!("strict-compat bucket: fixture-backed row {label} is absent"))?;
+        let want: [&OsStr; 5] = [
+            "env".as_ref(),
+            "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
+            "bash".as_ref(),
+            workload.as_os_str(),
+            label.as_ref(),
+        ];
+        if argv.as_slice() != want {
+            return Err(format!(
+                "strict-compat bucket: {label} does not use its explicit fixture/tool contract: {argv:?}"
+            ));
+        }
     }
     for (label, path) in [
         ("seq", "/run-state/strict-compat/real-compat-fixtures"),

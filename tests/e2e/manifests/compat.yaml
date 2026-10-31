@@ -1621,41 +1621,10 @@ corpus:
         validate-museland-9ab8418de603); gcov in the image is GCC 14's,
         whose coverage output ordering differs under DBT
       rows: [gcov]
-    # Passed at 6d34a412 and failed from 5d111b3e on every backend: the
-    # guests exit 1 in about 0.5 s with empty output, and the retained
-    # DETLOG shows their Nix-built binaries hitting ENOENT on /nix/store
-    # libc paths while loading. The one-commit bisect range
-    # 6d34a412..5d111b3e contains no compatprep, image, or pinned-root
-    # change, so the trigger is environmental (guest-root/store-closure
-    # exposure); deselected as a named loss under the owner's
-    # deselect-and-fix-forward rule.
-    - backend: ptrace
-      result: crash-error
-      evidence: https://github.com/rrnewton/hermit/issues/4997
-      reason: >-
-        Guests exit 1 instantly in full validate since 5d111b3e (passed
-        at 6d34a412); Nix-store libc paths are ENOENT in the guest root
-      rows:
-        [
-          cargo, gcov
-        ]
-    - backend: kvm
-      result: crash-error
-      evidence: https://github.com/rrnewton/hermit/issues/4997
-      reason: >-
-        Guests exit 1 instantly in full validate since 5d111b3e (passed
-        at 6d34a412); Nix-store libc paths are ENOENT in the guest root
-      rows:
-        [
-          cargo, gcov
-        ]
-    - backend: dbt
-      result: crash-error
-      evidence: https://github.com/rrnewton/hermit/issues/4997
-      reason: >-
-        Guests exit 1 instantly in full validate since 5d111b3e (passed
-        at 6d34a412); Nix-store libc paths are ENOENT in the guest root
-      rows: [cargo]
+    # The cargo/gcov verify cells deselected here on 2026-10-31 under
+    # issue 4997 were re-enabled the same day once the fixture race was
+    # fixed (271ec81bd4): one writer for the shared fixtures, published
+    # atomically, so cells no longer see inputs swapped mid-run.
     - backend: kvm
       result: crash-error
       evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
@@ -1821,22 +1790,9 @@ corpus:
           Replay reads a different 11-byte readlink target than the recording
           at scheduler turn 112, in 3 of 3 runs
         rows: [lsof]
-      # Same guest-root/store-closure class as the cargo/gcov verify
-      # deselection above, on the replay side: in the full validates of
-      # 2026-10-31 at dbc4144586 the Nix-toolchain guests died in about a
-      # second (cargo and rustc exit 1, gcov exit 139, about 1 CPU-second
-      # each; a passing rustc replay takes 24.9 CPU-seconds), and cargo's
-      # retained capture shows its replay matching the recording bitwise,
-      # so the guest itself fails in that environment. The identical
-      # bucket passes in a single-bucket run at the same SHA.
-      - result: replay-failure
-        evidence: https://github.com/rrnewton/hermit/issues/4997
-        reason: >-
-          Nix-toolchain guests die in about a second in full validates
-          (guest exit 1/139 at about 1 CPU-second) while the same bucket
-          passes standalone at the same SHA; guest-root/store-closure
-          exposure, the verify-side class of the same issue
-        rows: [cargo, gcov, rustc]
+      # The cargo/gcov/rustc replay cells deselected here on 2026-10-31
+      # under issue 4997 were re-enabled the same day once the fixture
+      # race was fixed (271ec81bd4).
       - result: replay-failure
         evidence: https://github.com/rrnewton/hermit/issues/4536
         reason: >-

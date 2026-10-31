@@ -10,37 +10,37 @@
     "all": {
       "cells": 3055,
       "applicable": 2243,
-      "selectable": 1751,
-      "population": 2985,
-      "population_candidate_selected": 1751,
-      "population_candidate_not_selected": 472,
-      "population_candidate_disabled": 762
+      "selectable": 1754,
+      "population": 2995,
+      "population_candidate_selected": 1754,
+      "population_candidate_not_selected": 475,
+      "population_candidate_disabled": 766
     },
     "by_backend": {
       "dbt": {
         "cells": 611,
         "applicable": 559,
-        "selectable": 553,
-        "population": 597,
-        "population_candidate_selected": 553,
-        "population_candidate_not_selected": 1,
+        "selectable": 554,
+        "population": 599,
+        "population_candidate_selected": 554,
+        "population_candidate_not_selected": 2,
         "population_candidate_disabled": 43
       },
       "in-guest-trap": {
         "cells": 611,
         "applicable": 314,
         "selectable": 314,
-        "population": 597,
+        "population": 599,
         "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 283
+        "population_candidate_disabled": 285
       },
       "kvm": {
         "cells": 611,
         "applicable": 578,
-        "selectable": 569,
-        "population": 597,
-        "population_candidate_selected": 569,
+        "selectable": 571,
+        "population": 599,
+        "population_candidate_selected": 571,
         "population_candidate_not_selected": 3,
         "population_candidate_disabled": 25
       },
@@ -48,18 +48,18 @@
         "cells": 611,
         "applicable": 315,
         "selectable": 315,
-        "population": 597,
+        "population": 599,
         "population_candidate_selected": 315,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 282
+        "population_candidate_disabled": 284
       },
       "sabre": {
         "cells": 611,
         "applicable": 477,
         "selectable": 0,
-        "population": 597,
+        "population": 599,
         "population_candidate_selected": 0,
-        "population_candidate_not_selected": 468,
+        "population_candidate_not_selected": 470,
         "population_candidate_disabled": 129
       }
     }
@@ -1665,11 +1665,11 @@
     {"test_id":"compat/cal","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/cal","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/cal","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
-    {"test_id":"compat/cargo","backend":"dbt","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
-    {"test_id":"compat/cargo","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
-    {"test_id":"compat/cargo","backend":"kvm","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
-    {"test_id":"compat/cargo","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
-    {"test_id":"compat/cargo","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
+    {"test_id":"compat/cargo","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"compat/cargo","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
+    {"test_id":"compat/cargo","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"compat/cargo","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
+    {"test_id":"compat/cargo","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/cat","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/cat","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/cat","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -1925,11 +1925,11 @@
     {"test_id":"compat/gcc","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/gcc","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/gcc","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
-    {"test_id":"compat/gcov","backend":"dbt","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
-    {"test_id":"compat/gcov","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
-    {"test_id":"compat/gcov","backend":"kvm","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
-    {"test_id":"compat/gcov","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
-    {"test_id":"compat/gcov","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Guests exit 1 instantly in full validate since 5d111b3e (passed at 6d34a412); Nix-store libc paths are ENOENT in the guest root"},
+    {"test_id":"compat/gcov","backend":"dbt","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: dbt verify is not selected by full validation: Measured diverged under DBT in the pinned image (full validate validate-museland-9ab8418de603); gcov in the image is GCC 14's, whose coverage output ordering differs under DBT"},
+    {"test_id":"compat/gcov","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
+    {"test_id":"compat/gcov","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"compat/gcov","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
+    {"test_id":"compat/gcov","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/getconf","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/getconf","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Did not pass 10 of 10 verify runs on in-guest-trap with the maximum timeslice disabled in the first local survey of 2026-10-08, which ran without the compat fixtures; the second survey did not run this sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/getconf","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

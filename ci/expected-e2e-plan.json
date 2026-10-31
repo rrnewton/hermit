@@ -54094,6 +54094,149 @@
       ],
       "test": "system-utils/clock-exec-continuity",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/cargo",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "dbt",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/cargo",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "compat/cargo",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/cargo",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/gcov",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "kvm",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "compat/gcov",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/gcov",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "replay",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "compat/rustc",
+      "timeout_seconds": 177
     }
   ],
   "schema": 1
