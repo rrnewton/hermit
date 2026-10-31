@@ -22,7 +22,8 @@ mkdir -p "$ROOT"
 trap 'if [[ -f "$ROOT/PASS" ]]; then rm -rf "$ROOT"; else echo "kept failing run at $ROOT" >&2; fi' EXIT
 STATE="$ROOT/state"
 FIXTURES="$STATE/strict-compat/real-compat-fixtures"
-mkdir -p "$STATE/strict-compat"
+# Deliberately no pre-created strict-compat directory: preparation must
+# work on a fresh run state, lock file first.
 
 bash "$PWD/tests/compat/prepare_real_compat_fixtures.sh" "$FIXTURES" >/dev/null
 cp "$FIXTURES/SHA256SUMS" "$ROOT/expected.sums"

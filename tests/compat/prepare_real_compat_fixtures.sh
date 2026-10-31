@@ -22,6 +22,9 @@ readonly FINAL_ROOT=$1
 # identical; a lock file serializes concurrent builders of that path.
 readonly BUILD_ROOT="${FINAL_ROOT}.build"
 readonly OLD_ROOT="${FINAL_ROOT}.old"
+# The lock lives beside the fixture root; its parent (the run state's
+# strict-compat directory) may not exist yet on a fresh run state.
+mkdir -p "${FINAL_ROOT%/*}"
 exec 9>"${FINAL_ROOT}.prep.lock"
 flock 9
 trap 'rm -rf "$BUILD_ROOT" "$OLD_ROOT"' EXIT
