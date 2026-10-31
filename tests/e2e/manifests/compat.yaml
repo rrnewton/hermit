@@ -1821,6 +1821,22 @@ corpus:
           Replay reads a different 11-byte readlink target than the recording
           at scheduler turn 112, in 3 of 3 runs
         rows: [lsof]
+      # Same guest-root/store-closure class as the cargo/gcov verify
+      # deselection above, on the replay side: in the full validates of
+      # 2026-10-31 at dbc4144586 the Nix-toolchain guests died in about a
+      # second (cargo and rustc exit 1, gcov exit 139, about 1 CPU-second
+      # each; a passing rustc replay takes 24.9 CPU-seconds), and cargo's
+      # retained capture shows its replay matching the recording bitwise,
+      # so the guest itself fails in that environment. The identical
+      # bucket passes in a single-bucket run at the same SHA.
+      - result: replay-failure
+        evidence: https://github.com/rrnewton/hermit/issues/4997
+        reason: >-
+          Nix-toolchain guests die in about a second in full validates
+          (guest exit 1/139 at about 1 CPU-second) while the same bucket
+          passes standalone at the same SHA; guest-root/store-closure
+          exposure, the verify-side class of the same issue
+        rows: [cargo, gcov, rustc]
       - result: replay-failure
         evidence: https://github.com/rrnewton/hermit/issues/4536
         reason: >-

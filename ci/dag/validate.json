@@ -12844,13 +12844,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/cargo",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
@@ -14386,13 +14379,6 @@
           "category": "compat",
           "test": "compat/gcc",
           "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -16969,13 +16955,6 @@
           "category": "compat",
           "test": "compat/ruby",
           "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/rustc",
-          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -19458,13 +19437,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/cargo",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
@@ -20846,13 +20818,6 @@
           "category": "compat",
           "test": "compat/gcc",
           "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -23084,13 +23049,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rustc",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/sar-resource-tables",
           "mode": "replay",
           "backend": "ptrace"
@@ -24961,13 +24919,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/cargo",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
@@ -25312,13 +25263,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/gcc",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -25886,13 +25830,6 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/ruby",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/rustc",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -45061,13 +44998,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/cargo",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
@@ -46099,13 +46029,6 @@
           "category": "compat",
           "test": "compat/gcc",
           "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -47779,13 +47702,6 @@
           "category": "compat",
           "test": "compat/ruby",
           "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/rustc",
-          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -71273,13 +71189,6 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/cargo",
-          "mode": "replay",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
           "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
@@ -72815,13 +72724,6 @@
           "category": "compat",
           "test": "compat/gcc",
           "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/gcov",
-          "mode": "replay",
           "backend": "ptrace"
         },
         {
@@ -75398,13 +75300,6 @@
           "category": "compat",
           "test": "compat/ruby",
           "mode": "verify",
-          "backend": "ptrace"
-        },
-        {
-          "lane": "portable",
-          "category": "compat",
-          "test": "compat/rustc",
-          "mode": "replay",
           "backend": "ptrace"
         },
         {

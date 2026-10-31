@@ -1424,8 +1424,12 @@ mod tests {
         }
         // 215 gated on the flip-fixed base, minus the three replay cells
         // deselected with the pinned-image move (logger, pkg-config,
-        // mountpoint) = 212.
-        assert_eq!((gated, refused), (212, UNSELECTED_REPLAY.len()));
+        // mountpoint) = 212, minus the cargo, gcov and rustc replay cells
+        // deselected 2026-10-31 (their Nix-toolchain guests die in about a
+        // second in full validates while the bucket passes standalone at
+        // the same SHA; <https://github.com/rrnewton/hermit/issues/4997>)
+        // = 209.
+        assert_eq!((gated, refused), (209, UNSELECTED_REPLAY.len()));
     }
 
     /// The replay cells seen to fail, each with its issue: lsof in the
@@ -1434,7 +1438,7 @@ mod tests {
     /// shared /tmp. compat/flex and compat/timeout are selected since their
     /// replay stall (https://github.com/rrnewton/hermit/issues/3964) and false
     /// deadlock (https://github.com/rrnewton/hermit/issues/3963) were fixed.
-    const UNSELECTED_REPLAY: [(&str, &str); 6] = [
+    const UNSELECTED_REPLAY: [(&str, &str); 9] = [
         (
             "compat/lsof",
             "https://github.com/rrnewton/hermit/issues/3966",
@@ -1462,6 +1466,21 @@ mod tests {
         (
             "compat/mountpoint",
             "https://github.com/rrnewton/hermit/issues/4979",
+        ),
+        // Deselected 2026-10-31: the Nix-toolchain guests die in about a
+        // second in full validates while the bucket passes standalone at
+        // the same SHA (guest-root/store-closure exposure).
+        (
+            "compat/cargo",
+            "https://github.com/rrnewton/hermit/issues/4997",
+        ),
+        (
+            "compat/gcov",
+            "https://github.com/rrnewton/hermit/issues/4997",
+        ),
+        (
+            "compat/rustc",
+            "https://github.com/rrnewton/hermit/issues/4997",
         ),
     ];
 
