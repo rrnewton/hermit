@@ -140,6 +140,9 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4738, renumbered to 16 at
         // integration; digests measured at this head).
         (16, "182b80da8855a429", "846052997d97693f"),
+        // `Found::unverified_pairs` (#4908), and the digest now covers the
+        // StoreExclusive request's payload types.
+        (17, "4f45752840eb3cd0", "846052997d97693f"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -157,13 +160,53 @@ mod tests {
         code
     }
 
+    /// The types `GlobalRequest::StoreExclusive` carries, declared in
+    /// `store_exclusive.rs` inside its modules. Their fields cross the RPC in
+    /// positional bincode as the enums' own do.
+    const STORE_EXCLUSIVE_PAYLOAD: [&str; 5] = [
+        "pub enum Report {",
+        "pub struct ScannedMapping {",
+        "pub struct Found {",
+        "pub struct Rewrite {",
+        "pub struct LiveMapping {",
+    ];
+
+    /// The lines of code, as [`definition`] gives them, of the type that
+    /// `source` declares, indented, on the line `header`, through the brace
+    /// at that indentation that closes it.
+    fn nested_definition(source: &str, header: &str) -> Vec<String> {
+        let mut lines = source.lines().skip_while(|line| line.trim() != header);
+        let first = lines
+            .next()
+            .unwrap_or_else(|| panic!("{header} is declared"));
+        let close = format!("{}}}", &first[..first.len() - first.trim_start().len()]);
+        let mut code: Vec<String> = lines
+            .take_while(|line| *line != close)
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .map(str::to_owned)
+            .collect();
+        code.insert(0, header.to_owned());
+        code
+    }
+
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
-    /// `source`: their variants, payload types, order and attributes, not
+    /// `source`, and of the StoreExclusive payload's types in `payload`:
+    /// their variants, fields, payload types, order and attributes, not
     /// their documentation.
-    fn definition_digest(source: &str) -> String {
+    fn definition_digest(source: &str, payload: &str) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
-        fnv_domains(&[(0, request.as_bytes()), (1, response.as_bytes())])
+        let payload = STORE_EXCLUSIVE_PAYLOAD
+            .iter()
+            .map(|header| nested_definition(payload, header).join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fnv_domains(&[
+            (0, request.as_bytes()),
+            (1, response.as_bytes()),
+            (3, payload.as_bytes()),
+        ])
     }
 
     fn resources_definition_digest(source: &str) -> String {
@@ -179,7 +222,8 @@ mod tests {
     #[test]
     fn the_global_rpc_revision_matches_its_definitions() {
         let source = include_str!("tool_global.rs");
-        let digest = definition_digest(source);
+        let payload = include_str!("store_exclusive.rs");
+        let digest = definition_digest(source, payload);
         let resources = include_str!("resources.rs");
         let resources_digest = resources_definition_digest(resources);
         let revision = crate::tool_global::GLOBAL_RPC_REVISION;
@@ -209,13 +253,13 @@ mod tests {
             "pub enum GlobalRequest {\n    /// Documentation only.\n\n",
             1,
         );
-        assert_eq!(definition_digest(&documented), digest);
+        assert_eq!(definition_digest(&documented, payload), digest);
         let added = source.replacen(
             "pub enum GlobalRequest {\n",
             "pub enum GlobalRequest {\n    Added(u32),\n",
             1,
         );
-        assert_ne!(definition_digest(&added), digest);
+        assert_ne!(definition_digest(&added, payload), digest);
         // Retype GlobalRequest's VirtualInotifyCookies wherever it sits: later
         // revisions append variants after it.
         let retyped = source.replacen(
@@ -224,7 +268,23 @@ mod tests {
             1,
         );
         assert_ne!(retyped, source);
-        assert_ne!(definition_digest(&retyped), digest);
+        assert_ne!(definition_digest(&retyped, payload), digest);
+        // A field added to a payload type changes it too; its documentation
+        // does not.
+        let grown = payload.replacen(
+            "    pub struct Found {\n",
+            "    pub struct Found {\n        pub added: u64,\n",
+            1,
+        );
+        assert_ne!(grown, payload);
+        assert_ne!(definition_digest(source, &grown), digest);
+        let documented = payload.replacen(
+            "    pub struct Found {\n",
+            "    pub struct Found {\n        /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, payload);
+        assert_eq!(definition_digest(source, &documented), digest);
 
         let documented = resources.replacen(
             "pub struct Resources {\n",
