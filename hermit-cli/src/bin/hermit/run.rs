@@ -12430,8 +12430,9 @@ impl RunOpts {
         self.guest_ids_drawn_from_host =
             guest_ids_drawn_from_host(self.no_namespace, ids, required.is_some() || self.strict);
         self.det_opts.det_config.guest_ids = ids;
-        // Namespace-only execs the command directly: it does not construct
-        // Detcore or read a schedule. Keep its ignored replay options ignored.
+        // Namespace-only execs the command directly without Detcore replay or
+        // Chosen provenance admission. Inherited option-metadata validation
+        // still runs; only this execution-specific replay preflight is bypassed.
         if !self.namespace_only {
             detcore::preemptions::validate_config_replay_inputs(&self.det_opts.det_config)?;
         }

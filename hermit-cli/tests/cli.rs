@@ -56396,26 +56396,111 @@ fn chosen_json_requires_provenance_before_the_cli_starts_the_guest() {
     }
 }
 
-/// This direct exec path constructs no Detcore and never consumes a schedule.
-/// Its previously ignored replay options remain ignored, even when their paths
-/// do not exist. The ordinary Detcore path is covered by the refusal above.
+/// Direct exec bypasses Detcore replay and its Chosen provenance admission.
+/// Replay options still undergo the inherited settings-metadata validation:
+/// readable records with unqualified provenance are ignored by execution, while
+/// absent files and malformed JSON remain ordinary pre-start CLI errors.
 #[test]
 fn namespace_only_keeps_ignoring_schedule_inputs() {
     let directory = tempfile::tempdir().unwrap();
+    let schedule = directory.path().join("unqualified-chosen.json");
+    let marker = directory.path().join("guest-started");
+    // Namespace-only supplies a private /tmp. Bind this fixture explicitly so
+    // successful execution proves the same marker path used by the negatives.
+    let mount = format!(
+        "--mount=type=bind,source={},target={}",
+        directory.path().display(),
+        directory.path().display()
+    );
+    let chosen = detcore_model::pid::GuestIds::Chosen {
+        base: 5000,
+        refuse_host_ids: true,
+    };
+    for metadata in [None, Some(serde_json::json!({"contract": "future-input"}))] {
+        let mut value = serde_json::json!({
+            "per_thread": {}, "global": [], "guest_ids": chosen,
+            "format_version": 3
+        });
+        if let Some(metadata) = metadata {
+            value["reserved_input"] = metadata;
+        }
+        let fixture: detcore::preemptions::PreemptionRecord =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(fixture.format_version(), Some(3));
+        fixture.validate_format().unwrap();
+        assert!(value.get("time_skips").is_none());
+        // These same bytes require a provenance refusal for Chosen replay;
+        // the positive below must exercise the direct-exec bypass instead.
+        let refusal = fixture
+            .validate_replay_inputs("namespace-only fixture", chosen)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&schedule, &bytes).unwrap();
+        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
+            let args = [
+                "run",
+                "--namespace-only",
+                &mount,
+                option,
+                schedule.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf 'namespace-only-started\n'; printf started > \"$1\"",
+                "namespace-marker",
+                marker.to_str().unwrap(),
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), "namespace-only-started\n");
+            assert!(!stderr(&output).contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
+            assert_eq!(fs::read(&schedule).unwrap(), bytes);
+            assert_eq!(fs::read(&marker).unwrap(), b"started");
+            fs::remove_file(&marker).unwrap();
+        }
+    }
+
     let absent = directory.path().join("absent-schedule.json");
-    let args = [
-        "run",
-        "--namespace-only",
-        "--replay-schedule-from",
-        absent.to_str().unwrap(),
-        "--",
-        "/bin/echo",
-        "namespace-only-started",
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "namespace-only-started\n");
-    assert!(!stderr(&output).contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
+    let malformed = directory.path().join("malformed-schedule.json");
+    fs::write(&malformed, b"{").unwrap();
+    for (path, diagnostic_kind) in [
+        (&absent, "cannot read preemption record"),
+        (&malformed, "cannot parse preemption record"),
+    ] {
+        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
+            for mode in ["--namespace-only", "--no-namespace"] {
+                let mut args = vec!["run", mode];
+                if mode == "--namespace-only" {
+                    args.push(&mount);
+                }
+                args.extend([
+                    option,
+                    path.to_str().unwrap(),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "printf started > \"$1\"",
+                    "metadata-marker",
+                    marker.to_str().unwrap(),
+                ]);
+                let output = hermit(&args);
+                assert_eq!(output.status.code(), Some(125), "{args:?}: {output:?}");
+                let diagnostic = stderr(&output);
+                assert!(
+                    diagnostic.contains(&format!("{diagnostic_kind} {}:", path.display())),
+                    "{args:?}: {diagnostic}"
+                );
+                assert!(diagnostic.contains("HERMIT_INTERNAL_FAILURE class=cli-error"));
+                assert!(!diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
+                assert_eq!(stdout(&output), "");
+                assert!(!marker.exists(), "invalid metadata ran the target");
+                assert!(!absent.exists());
+                assert_eq!(fs::read(&malformed).unwrap(), b"{");
+            }
+        }
+    }
 }
 
 /// This declaration must come from the real target-image setup callback. The
