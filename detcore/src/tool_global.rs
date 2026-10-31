@@ -7668,7 +7668,7 @@ pub enum SignalScope {
 /// holds: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 26;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 27;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

@@ -202,6 +202,11 @@ mod tests {
         // base, renumbered to 26 above #4728's 25; digests measured at this
         // head).
         (26, "ebc6cf0b2e5ed74c", "f013e36743d8d9e6"),
+        // Adds `GlobalResponse::WithReplayInstructionOffset` and
+        // `SchedEvent::instruction_offset`, which the event's bincode always
+        // writes and domain 4 covers (#4845; 23 on its own base, renumbered to
+        // 27 above #4728's 25 and #4769's 26; digests measured at this head).
+        (27, "be6e61e57815f791", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
