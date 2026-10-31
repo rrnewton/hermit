@@ -372,7 +372,7 @@ impl Guest<Detcore> for CloneGuest {
                 // This fixture has not written or issued anything. Model the
                 // backend's proved pre-write refusal settlement, not Drop.
                 assert_eq!(error.reason(), "clone-lifecycle-unverified");
-                self.input_control.backend_not_run(receipt.id())?;
+                self.input_control.backend_settled_not_run(receipt.id())?;
                 return Err(error.into());
             }
         };

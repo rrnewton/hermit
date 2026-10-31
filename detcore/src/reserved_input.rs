@@ -896,7 +896,7 @@ mod tests {
                     other => panic!("input={input}, birth={birth}: {other:?}"),
                 }
                 // No page write or native issue occurs in this gate probe.
-                control.backend_not_run(next.id()).unwrap();
+                control.backend_settled_not_run(next.id()).unwrap();
                 control.finish_operation(scope).unwrap();
             }
         }
