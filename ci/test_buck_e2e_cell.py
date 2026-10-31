@@ -148,7 +148,7 @@ if outcome == "HOST-INAPPLICABLE":
     with open(results, "w") as f:
         if os.environ.get("FAKE_WITHHELD_ROW"):
             f.write(json.dumps({"test": test, "mode": mode, "backend": backend,
-                                "outcome": os.environ["FAKE_WITHHELD_ROW"],
+                                "outcome": os.environ["FAKE_WITHHELD_ROW"], "attempt": 1,
                                 "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
     with open(host(flag("--junit")), "w") as f:
         f.write("<testsuite/>\n")
@@ -176,7 +176,7 @@ if outcome == "HOST-INAPPLICABLE":
     sys.exit(1)
 with open(results, "w") as f:
     f.write(json.dumps({"test": test, "mode": mode, "backend": backend, "outcome": outcome,
-                        "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
+                        "attempt": 1, "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
 with open(host(flag("--junit")), "w") as f:
     f.write("<testsuite/>\n")
 status = "passed" if outcome == "PASS" else "failed"

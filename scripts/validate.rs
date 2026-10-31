@@ -36045,6 +36045,7 @@ mod raw_census_publication_tests {
         assert_eq!(row["framework_retries_v1"]["retried_cells_final_pass"], 1);
         assert_eq!(row["result"], "pass");
         row.as_object_mut().unwrap().remove("framework_retries_v1");
+        row.as_object_mut().unwrap().remove("retry_rollup_v1");
         assert_eq!(row, original);
         add_framework_retries(&mut row, Some(Err("unreadable".into())));
         assert_eq!(row["framework_retries_error"], "unreadable");

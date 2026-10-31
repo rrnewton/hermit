@@ -1219,7 +1219,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
-    ("test.regular_crates", 1929),
+    // The retry stack adds three: 1929 + 3 = 1932, re-measured 2026-10-31.
+    ("test.regular_crates", 1932),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1901,7 +1902,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
-    ("test.hermit_unit", 1289),
+    // H1 host-input evidence adds one hermit-run unit: 1289 + 1 = 1290.
+    ("test.hermit_unit", 1290),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4485,7 +4487,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
-    ("test.cli", 744),
+    // The retry stack adds one cli case: 744 + 1 = 745.
+    ("test.cli", 745),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5057,7 +5060,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
-    ("test.cli_on_host", 663),
+    // The same retry-stack cli case: 663 + 1 = 664.
+    ("test.cli_on_host", 664),
+    // The hosted twin carries the local regular_crates selection minus its
+    // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
+    ("test.regular_crates_on_host", 1918),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5954,7 +5961,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
-    ("test.hermit_unit_on_host", 1283),
+    // The same H1 path-fallback unit: 1283 + 1 = 1284.
+    ("test.hermit_unit_on_host", 1284),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6181,7 +6189,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738: the same nine added cases: 1927 - 14 = 1913.
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
-    ("test.regular_crates_on_host", 1915),
+    // The retry stack: the same three added cases: 1932 - 14 = 1918.
+    ("test.regular_crates_on_host", 1918),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
