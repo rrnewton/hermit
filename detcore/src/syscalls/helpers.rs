@@ -8028,6 +8028,9 @@ pub(crate) mod kernel_signal_wait_failures {
                             ),
                         );
                     }
+                    GlobalRequest::PendingRealTimeExpirations(_) => {
+                        return (None, GlobalResponse::PendingRealTimeExpirations(0));
+                    }
                     _ => panic!("unexpected proof fixture RPC: {:?}", message.2),
                 }
             }
