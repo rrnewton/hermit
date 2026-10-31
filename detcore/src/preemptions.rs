@@ -1021,12 +1021,17 @@ impl PreemptionRecord {
 
     /// State at least `format`: a record holds every feature up to the
     /// format it states, so a feature only ever raises it, and never lowers
-    /// what another feature stated.
+    /// what another feature stated. A stated format this Hermit does not
+    /// read ([`reads_format`]: 0, an explicit 1, or one above
+    /// [`PREEMPTION_RECORD_FORMAT`]) stays as stated, so that reading the
+    /// record still refuses it (`validate_format`): raised, it would make a
+    /// refused record readable.
     fn raise_format(&mut self, format: u32) {
-        self.format_version = Some(
-            self.format_version
-                .map_or(format, |stated| stated.max(format)),
-        );
+        self.format_version = Some(match self.format_version {
+            None => format,
+            Some(stated) if !reads_format(Some(stated)) => stated,
+            Some(stated) => stated.max(format),
+        });
     }
 
     /// Timestamp stripping preserves the event/progress relation, unlike an editor.
@@ -2198,6 +2203,65 @@ mod tests {
             instructions: 0,
         });
         assert!(zero_steps.validate().unwrap_err().contains("zero steps"));
+    }
+
+    /// A record stating a format this Hermit does not read (0, an explicit 1,
+    /// or one above `PREEMPTION_RECORD_FORMAT`) keeps it through every path
+    /// that raises a record's format for an instruction offset: a schedule
+    /// adopting its events' format (`adopt_event_offsets_format`), and the
+    /// writer's offset rows and offset events (`raise_format`). Written and
+    /// read back, it still states that format, and reading still refuses it
+    /// by name (`validate_format`, main's message).
+    #[test]
+    fn an_unread_stated_format_survives_every_format_raise() {
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let event = SchedEvent::branches(tid, 20).with_instruction_offset(Some(offset));
+        for stated in [
+            0,
+            1,
+            PREEMPTION_RECORD_FORMAT + 1,
+            PREEMPTION_RECORD_FORMAT + 2,
+        ] {
+            let mut json: serde_json::Value = serde_json::from_str(
+                &PreemptionRecord::from_sched_events(vec![event.clone()]).to_string(),
+            )
+            .unwrap();
+            json["format_version"] = stated.into();
+            let read: PreemptionRecord = serde_json::from_str(&json.to_string()).unwrap();
+            assert_eq!(read.format_version(), Some(stated));
+
+            let mut adopted = read.clone();
+            adopted.adopt_event_offsets_format();
+            let mut writer = PreemptionWriter::new(None);
+            writer.inner = read;
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(10),
+                18,
+                DEFAULT_PRIORITY,
+                5,
+                Some(offset),
+            );
+            writer.insert_schedevent(event.clone());
+            for (path, written) in [
+                ("adopted", adopted.to_string()),
+                ("written", writer.into_string()),
+            ] {
+                let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+                assert_eq!(back.format_version(), Some(stated), "{path}: {written}");
+                assert!(back.validate().is_err(), "{path}: {written}");
+                assert_eq!(
+                    back.validate_format(),
+                    Err(unread_format_message(Some(stated), 0)),
+                    "{path}"
+                );
+            }
+        }
     }
 
     /// Every format a record can state, read as a replay reads it
