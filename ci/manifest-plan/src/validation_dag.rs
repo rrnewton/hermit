@@ -753,14 +753,18 @@ const PROFILES: [Profile; 11] = [
         // full and portable each gained build.liteinst_runtime_in_pinned_root,
         // the ordinary in-guest Detcore runtime's prebuild, which carries the
         // same two labels: 101/102 and 80/81 before.
+        // 102/103 since the host compatprep.fixtures step retired from
+        // full/portable whenever its pinned-root twin exists (one writer
+        // for the shared fixtures, issue 4997): 103/104 before.
         label: "full",
-        direct_steps: 103,
-        selected_steps: 104,
+        direct_steps: 102,
+        selected_steps: 103,
     },
     Profile {
+        // 81/82 with the same host-fixtures retirement: 82/83 before.
         label: "portable",
-        direct_steps: 82,
-        selected_steps: 83,
+        direct_steps: 81,
+        selected_steps: 82,
     },
     Profile {
         label: "quick",
@@ -2485,6 +2489,32 @@ fn split_pinned_workspace_twin(twin: Step) -> Result<[Step; 2], String> {
     Ok([compile, prepare])
 }
 
+/// One writer for the shared compat fixtures (issue 4997). The host
+/// compatprep.fixtures and its pinned-root twin both build
+/// $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures, with different
+/// toolchains, and the bucket depends only on the twin. If the host copy
+/// kept its full/portable labels it stayed selected with no consumer and
+/// could rm -rf and rebuild the shared directory while cells were reading
+/// it, so the same cell saw different inputs across runs. When the twin
+/// exists, retire the host copy from the local profiles; the authored
+/// hosted variant (compatprep.fixtures_on_host) is a separate step.
+fn retire_host_fixtures_when_twin_present(cfg: &mut DagConfig, twins: &[Step]) {
+    let twin_present = cfg
+        .steps
+        .iter()
+        .chain(twins.iter())
+        .any(|step| step.tag() == "compatprep.fixtures_in_pinned_root");
+    if !twin_present {
+        return;
+    }
+    for step in &mut cfg.steps {
+        if step.tag() == "compatprep.fixtures" {
+            step.labels
+                .retain(|label| label != "full" && label != "portable");
+        }
+    }
+}
+
 fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     cfg.steps.retain(|step| {
         step.tag() != PINNED_ROOT_FETCH_TAG && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
@@ -2666,6 +2696,7 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
                 .retain(|label| label != "portable-strict-compat-only");
         }
     }
+    retire_host_fixtures_when_twin_present(cfg, &twins);
     cfg.steps.push(pinned_root_fetch()?);
     cfg.steps.extend(twins);
     route_host_consumers_to_pinned_build(cfg)?;
@@ -3550,9 +3581,27 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
         .difference(&selected_tags)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if dropped != replaced {
+    // A replaced producer may already be absent from full: since issue
+    // 4997 the host compatprep.fixtures step is retired from full/portable
+    // whenever its pinned-root twin exists (one writer for the shared
+    // fixtures), so full cannot drop it again. It must still never be
+    // selected by the Buck selection.
+    let kept_replaced = replaced
+        .intersection(&selected_tags)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !kept_replaced.is_empty() {
         return Err(format!(
-            "the Buck E2E selection drops {dropped:?}, but replaces {replaced:?}"
+            "the Buck E2E selection still selects replaced node(s) {kept_replaced:?}"
+        ));
+    }
+    let expected_dropped = replaced
+        .intersection(&full_tags)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if dropped != expected_dropped {
+        return Err(format!(
+            "the Buck E2E selection drops {dropped:?}, but replaces {replaced:?} (of which full had {expected_dropped:?})"
         ));
     }
     // The stage needs only the pinned Reverie, so it overlaps the producers
@@ -4506,10 +4555,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // same environment (443 + 3). 444 since the host compatprep.fixtures
     // reaches Hermit through build.host_hermit_link like every other host
     // consumer, so the retired build.workspace/build.e2e_artifact base
-    // producers stay retired (446 - 2).
-    if cfg.steps.len() != 444 {
+    // producers stay retired (446 - 2). 446 again with the host-fixtures
+    // retirement (issue 4997): build.workspace and build.e2e_artifact are
+    // retained as unlabeled host bases beside their pinned twins in the
+    // generated superset (444 + 2).
+    if cfg.steps.len() != 446 {
         return Err(format!(
-            "superset has {} steps, expected 444",
+            "superset has {} steps, expected 446",
             cfg.steps.len()
         ));
     }
@@ -5933,6 +5985,30 @@ sys.exit(37)
             mode: Some("verify".into()),
             backend: Some("ptrace".into()),
         }
+    }
+
+    fn fixture_step(job: &str, labels: &[&str]) -> Step {
+        let text = format!(
+            r#"{{"description":"","steps":[{{"group":"compatprep","job":"{job}","cmd":"true","labels":{},"timeout":1,"cpu_timeout":1,"hint":{{"rss_baseline_bytes":1,"hard_mem_max_bytes":1}}}}]}}"#,
+            serde_json::to_string(labels).unwrap()
+        );
+        dag_from_json(&text).unwrap().steps.remove(0)
+    }
+
+    #[test]
+    fn host_fixtures_retire_only_when_pinned_twin_present() {
+        // No twin: the host prep is the only writer and keeps its labels.
+        let mut cfg = DagConfig {
+            steps: vec![fixture_step("fixtures", &["full", "portable"])],
+            ..Default::default()
+        };
+        retire_host_fixtures_when_twin_present(&mut cfg, &[]);
+        assert_eq!(cfg.steps[0].labels, ["full", "portable"]);
+
+        // Twin present: the host copy must not stay selected (issue 4997).
+        let twin = fixture_step("fixtures_in_pinned_root", &["full", "portable"]);
+        retire_host_fixtures_when_twin_present(&mut cfg, &[twin]);
+        assert!(cfg.steps[0].labels.is_empty(), "{:?}", cfg.steps[0].labels);
     }
 
     fn owner(result_manifests: Vec<DagManifest>) -> Step {

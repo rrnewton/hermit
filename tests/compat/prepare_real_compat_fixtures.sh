@@ -14,8 +14,19 @@ if (($# != 1)); then
     exit 2
 fi
 
-readonly FIXTURE_ROOT=$1
-rm -rf "$FIXTURE_ROOT"
+readonly FINAL_ROOT=$1
+# Build in a staging sibling and publish by rename. Two prep nodes (host and
+# pinned-root twin) can run in one validation; a reader must never observe
+# the rm -rf/rebuild window or a half-written tree (issue 4997). The staging
+# name is fixed (no PID), so two builds of the same final path are byte
+# identical; a lock file serializes concurrent builders of that path.
+readonly BUILD_ROOT="${FINAL_ROOT}.build"
+readonly OLD_ROOT="${FINAL_ROOT}.old"
+exec 9>"${FINAL_ROOT}.prep.lock"
+flock 9
+trap 'rm -rf "$BUILD_ROOT" "$OLD_ROOT"' EXIT
+rm -rf "$BUILD_ROOT" "$OLD_ROOT"
+FIXTURE_ROOT=$BUILD_ROOT
 mkdir -p "$FIXTURE_ROOT/binutils" "$FIXTURE_ROOT/gprof" "$FIXTURE_ROOT/gcov" \
     "$FIXTURE_ROOT/lsof" "$FIXTURE_ROOT/df" "$FIXTURE_ROOT/toolchain"
 
@@ -49,6 +60,7 @@ __attribute__((noinline)) int compat_line(int value) {
 }
 EOF
 gcc -g -O0 -fno-ident -frandom-seed=hermit-binutils \
+    -ffile-prefix-map="$FIXTURE_ROOT=." -fdebug-prefix-map="$FIXTURE_ROOT=." \
     -c "$FIXTURE_ROOT/binutils/fixture.c" \
     -o "$FIXTURE_ROOT/binutils/with-symbols.o"
 /usr/bin/readelf -SW "$FIXTURE_ROOT/binutils/with-symbols.o" | grep -q '\.symtab'
@@ -84,6 +96,8 @@ EOF
 (
     cd "$FIXTURE_ROOT/gcov"
     gcc --coverage -O0 -fno-ident -frandom-seed=hermit-gcov \
+        -ffile-prefix-map="$FIXTURE_ROOT=." -fdebug-prefix-map="$FIXTURE_ROOT=." \
+        -fprofile-prefix-path="$FIXTURE_ROOT" \
         -Wl,--build-id=none coverage.c -o coverage
     ./coverage >program.out
 )
@@ -113,4 +127,21 @@ EOF
 
 # Prevent host build time from becoming guest-visible input.
 find "$FIXTURE_ROOT" -exec touch -h -d @1 {} +
-printf 'prepared real compatibility fixtures: %s\n' "$FIXTURE_ROOT"
+# Content manifest, so a test can prove two preparations are the same inputs.
+(
+    cd "$FIXTURE_ROOT"
+    find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
+    find . -type l -print0 | sort -z | while IFS= read -r -d '' link; do
+        printf 'SYMLINK %s -> %s\n' "$link" "$(readlink "$link")"
+    done >>SHA256SUMS
+)
+# Atomic publish: rename the old tree aside, rename the new tree in, then drop
+# the old tree. A concurrent reader sees the whole old tree or the whole new
+# tree, never a missing or partial one.
+if [[ -e "$FINAL_ROOT" ]]; then
+    mv "$FINAL_ROOT" "$OLD_ROOT"
+fi
+mv "$BUILD_ROOT" "$FINAL_ROOT"
+rm -rf "$OLD_ROOT"
+trap - EXIT
+printf 'prepared real compatibility fixtures: %s\n' "$FINAL_ROOT"
