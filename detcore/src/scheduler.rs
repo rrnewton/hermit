@@ -18854,8 +18854,14 @@ impl Scheduler {
     /// (https://github.com/rrnewton/hermit/issues/4472). The point is the
     /// consumption of the last recorded event, or the replayer's release of
     /// the rest of the schedule after a long run of events that match none of
-    /// it (`Replayer::release_schedule`). Either is a scheduled event of a
-    /// running thread, so it is the same in every run.
+    /// it (`Replayer::release_schedule`). Consumption of the last recorded
+    /// event is a scheduled event of a running thread, so it is the same in
+    /// every run. A release is not: matching polling retries reset the
+    /// mismatch streak, and retry membership can depend on host readiness,
+    /// so when the release fires can depend on host timing. The release's
+    /// reported event number excludes polling retries and is a stable
+    /// diagnostic coordinate; it does not make the release decision itself
+    /// host-timing independent.
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()
