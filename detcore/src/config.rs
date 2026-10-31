@@ -217,6 +217,11 @@ mod tests {
         // the pair became 25 and 26, appended after main's 22 to 24, at their
         // rebase onto batch5a (digests measured at this head, above SP2).
         (26, "b5fc7394708905c9", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::CpuClockProcess` and `GlobalResponse::CpuClockProcess`
+        // (https://github.com/rrnewton/hermit/pull/4885; revision 20 at its base,
+        // renumbered to 27 after main's 26 at the drain rebase; digests measured
+        // at this head).
+        (27, "956e7e45a14ae3e9", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
