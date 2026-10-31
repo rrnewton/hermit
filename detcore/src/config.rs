@@ -223,6 +223,11 @@ mod tests {
         // image returns it (the release-05 pidfd pair, renumbered to 27 at
         // its rebase onto C2's 25 and 26; digest measured at this head).
         (27, "74ceb8dd663f2297", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::CpuClockProcess` and `GlobalResponse::CpuClockProcess`
+        // (https://github.com/rrnewton/hermit/pull/4885; revision 20 at its base,
+        // renumbered to 28 after main's 27 at the drain rebase; digests measured
+        // at this head).
+        (28, "956e7e45a14ae3e9", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
