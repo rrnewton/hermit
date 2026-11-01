@@ -995,7 +995,9 @@ mod tests {
             // Shard 2 recounts to 294 in run1470 (61 + 294 + 358): 713.
             // The flock model's flock_exclusion tests grow shard 2 to
             // 304 (61 + 304 + 358): 723.
-            assert_eq!(population, 723);
+            // The Codex review of slice SP2 adds two: 306 (61 + 306 + 358): 725.
+            // Its Claude review adds five: 311 (61 + 311 + 358): 730.
+            assert_eq!(population, 730);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

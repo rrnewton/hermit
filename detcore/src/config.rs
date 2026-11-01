@@ -185,8 +185,12 @@ mod tests {
         // `GlobalResponse::LedgerLockRows` and `GlobalResponse::GuestLockRows`
         // (the kvm lane's slice SP2, Detcore's flock model; revision 21 on its
         // own base, renumbered to 22 at its rebase onto main's 21; digests
-        // measured at this head).
-        (22, "a5b2db022b4c4b49", "f013e36743d8d9e6"),
+        // measured at this head). Serialized fields this digest does not cover:
+        // `procfs::locks::FlockRequest`, `FlockOutcome` and `FlockPoll`, whose
+        // `Waiting` carries whether a retry deleted the description's lock
+        // (SP2's review round, before any release of revision 22, which also
+        // made `GlobalResponse::FlockCancel` a unit answer).
+        (22, "d041bc2417f228ae", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

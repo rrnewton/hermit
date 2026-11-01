@@ -2486,20 +2486,23 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     // writer, so a copied child must fail closed rather than expose native
     // pipe/socket inode identities.
     // A copied pre-exec child has no Detcore Tool, whose flock model decides
-    // every lock operation: each valid one is refused by name, ENOLCK with a
-    // diagnostic under every policy (a copied child's fail-closed exit could
-    // strand its suspended vfork parent, as below), and only a malformed one
-    // keeps the kernel's errno (`copied_child_flock_action`).
+    // every lock operation, so each valid one is refused by name, through the
+    // unsupported-operation policy as the OFD arm below refuses its calls: the
+    // default fail-closed policy ends the run, and the
+    // --allow-unsupported-syscalls opt-out answers ENOLCK without executing
+    // the call. Only a malformed operation, which changes no lock, keeps the
+    // kernel's errno (`copied_child_flock_action`).
     if sysno == Sysno::flock {
         let operation = (!args.is_null()).then(|| unsafe { args.add(1).read() as i32 });
         let action = copied_child_flock_action(operation);
-        if action == -libc::ENOLCK
-            && let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get()
-        {
-            emit_marker(
-                *emit,
-                b"detcore-dbt: refusing flock in copied child: Detcore's flock model decides every lock operation, and a copied child cannot reach it\n",
-            );
+        if action == -libc::ENOLCK {
+            if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+                emit_marker(
+                    *emit,
+                    b"detcore-dbt: refusing flock in copied child: Detcore's flock model decides every lock operation, and a copied child cannot reach it\n",
+                );
+            }
+            return if strict { 1 } else { -libc::ENOLCK };
         }
         return action;
     }

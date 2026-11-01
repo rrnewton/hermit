@@ -4380,12 +4380,14 @@ impl GlobalState {
             ) => {
                 let mut sched = self.lock_rpc_scheduler(false).await;
                 // The exec leaves its process's descriptor table
-                // (`LockLedger::exec`); `TableExec` names what survived. A
+                // (`LockLedger::exec`), and the flock waits of the threads it
+                // killed end with them; `TableExec` names what survived. A
                 // backend that rebuilds the table under new identities takes
                 // the descriptions' flock locks out of the model first
                 // (`LockLedger::flock_exec_rebuilds_table`).
                 {
                     let mut ledger = self.lock_ledger.lock().unwrap();
+                    ledger.prune(|process| sched.process_is_alive(process));
                     if self.cfg.backend.rediscovers_descriptors_after_exec {
                         ledger.flock_exec_rebuilds_table(detpid);
                     }
@@ -5505,22 +5507,24 @@ impl GlobalState {
                     }
                 })
             }
+            // A release first lets go of what processes that have exited held
+            // (`LockLedger::prune`), as each flock request does, so that the
+            // waiters a release wakes never include a call that ended with its
+            // process.
             GlobalRequest::TableReleased(open_file, remaining) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
-                self.lock_ledger
-                    .lock()
-                    .unwrap()
-                    .release(process, open_file, remaining);
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                ledger.release(process, open_file, remaining);
                 R::TableReleased(())
             }
             GlobalRequest::TableExec(surviving) => {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let process = sched.registered_process(dtid).unwrap_or(dtid);
-                self.lock_ledger
-                    .lock()
-                    .unwrap()
-                    .exec_kept(process, &surviving);
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                ledger.prune(|process| sched.process_is_alive(process));
+                ledger.exec_kept(process, &surviving);
                 R::TableExec(())
             }
             GlobalRequest::AliasedInode(inode) => {
@@ -5584,7 +5588,8 @@ impl GlobalState {
                     // On an inode the flock model decides, the model's locks
                     // and waiters are the rows, in place of the kernel's
                     // (`LockLedger::flock_kernel_rows`), each owner in the
-                    // kernel's numbering, as the capture's rows have theirs.
+                    // kernel's numbering, as the capture's rows have theirs;
+                    // a capture whose rows cannot be told apart is refused.
                     let model_rows = ledger.flock_kernel_rows(
                         &rows,
                         &mut kept,
@@ -5598,7 +5603,7 @@ impl GlobalState {
                                 .map(i64::from)
                         },
                     );
-                    R::GuestLockRows(Ok((kept, model_rows)))
+                    R::GuestLockRows(model_rows.map(|model_rows| (kept, model_rows)))
                 }
             }
             GlobalRequest::AuxvFromKernel(why, cmdline) => {
@@ -5710,7 +5715,8 @@ impl GlobalState {
                 let sched = self.lock_rpc_scheduler(false).await;
                 let mut ledger = self.lock_ledger.lock().unwrap();
                 ledger.prune(|process| sched.process_is_alive(process));
-                R::FlockCancel(ledger.flock_cancel(dtid))
+                ledger.flock_cancel(dtid);
+                R::FlockCancel(())
             }
             GlobalRequest::FlockCloseCheck(open_file, remaining, mapped, maps_inode) => {
                 let sched = self.lock_rpc_scheduler(false).await;
@@ -9048,9 +9054,8 @@ pub enum GlobalResponse {
     Flock(crate::procfs::locks::FlockOutcome),
     /// The answer to `GlobalRequest::FlockPoll`. Appended last.
     FlockPoll(crate::procfs::locks::FlockPoll),
-    /// Where a release had handed the cancelled waiter its lock, the
-    /// processes whose teardown its mirror may wait for. Appended last.
-    FlockCancel(Option<Vec<DetPid>>),
+    /// Appended last.
+    FlockCancel(()),
     /// Why the close must be refused, or `None`. Appended last.
     FlockCloseCheck(Option<String>),
     /// Appended last.
@@ -12465,10 +12470,9 @@ where
     }
 }
 
-/// The caller's queued `flock` ends without a lock, at a signal; where a
-/// release had handed it its lock already, the processes whose teardown its
-/// mirror may wait for (`procfs::locks::LockLedger::flock_cancel`).
-pub(crate) async fn flock_cancel<G, T>(guest: &mut G) -> Option<Vec<DetPid>>
+/// The caller's queued `flock` ends without a lock, at a signal
+/// (`procfs::locks::LockLedger::flock_cancel`).
+pub(crate) async fn flock_cancel<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -12477,7 +12481,7 @@ where
         .await
         .1
     {
-        GlobalResponse::FlockCancel(granted) => granted,
+        GlobalResponse::FlockCancel(()) => {}
         _ => unreachable!(),
     }
 }

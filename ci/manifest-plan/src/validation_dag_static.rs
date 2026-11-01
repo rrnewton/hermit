@@ -3259,7 +3259,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // units, thirteen in procfs::locks, two in syscalls::files::flock_model and
     // two in fd: 3390 + 17 = 3407, listed by cargo nextest list -p
     // hermit-detcore --lib --bins at its rebased head.
-    ("test.detcore_unit", 3407),
+    // The Codex review of slice SP2 adds six: three in procfs::locks (a
+    // private descriptor table makes an inode the kernel's) and three in
+    // syscalls::files::flock_model (the mirror's retry and backstop after a
+    // holder's exit): 3407 + 6 = 3413, listed. Its Claude review adds five in
+    // procfs::locks (Linux's tree of blocked requests: a blocking upgrade, a
+    // cancelled waiter, a converting retry, a retry that blocks again after
+    // deleting its description's lock, and an exec's killed waiters), the
+    // hand-off test becoming the wake-and-retry one: 3413 + 5 = 3418, listed.
+    ("test.detcore_unit", 3418),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3620,7 +3628,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test as the copied vfork child's refusal
     // (https://github.com/rrnewton/hermit/issues/4173): 294 + 10 = 304,
     // listed by cargo nextest list at its rebased head.
-    ("test.hermit_integration_2", 304),
+    // The Codex review of slice SP2 adds two flock_exclusion tests (a private
+    // descriptor table, a stopped waiter): 304 + 2 = 306, listed. Its Claude
+    // review adds five (the kernel path's restore, fail-closed and
+    // unknown-state refusals, an outside lock's refused mirror, and an exec's
+    // killed waiter): 306 + 5 = 311, listed.
+    ("test.hermit_integration_2", 311),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5856,7 +5869,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same received-control region-table unit test: 3387 + 1 = 3388.
     // The same two N2 detcore units: 3388 + 2 = 3390.
     // The same seventeen flock-model units: 3390 + 17 = 3407.
-    ("test.detcore_unit_on_host", 3407),
+    // And the review's six: 3407 + 6 = 3413, and its second half's five:
+    // 3413 + 5 = 3418.
+    ("test.detcore_unit_on_host", 3418),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5986,7 +6001,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Shard 2 recounts to 294 in run1470: 61 + 294 + 358 = 713.
     // The flock model's flock_exclusion tests grow shard 2 to 304 (see
     // its pin): 61 + 304 + 358 = 723, listed at its rebased head.
-    ("test.hermit_integration_on_host", 723),
+    // And the review's two flock_exclusion tests: 61 + 306 + 358 = 725, and
+    // its second half's five: 61 + 311 + 358 = 730.
+    ("test.hermit_integration_on_host", 730),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
