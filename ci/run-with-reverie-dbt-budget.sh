@@ -3134,7 +3134,17 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05
+# CARRY TO 19c014c6507e7e5b179012a778ce2603ab940c2c (2026-11-01): from 1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05.
+# 1c22fadd..19c014c6 is three commits: 53e1a819 (LinuxEmu: a retired
+# shared descriptor drops every thread's copy at once), 91e700e3
+# (LinuxEmu: a call keeps its descriptor copies; fork and exec copy the
+# shared table) and 19c014c6 (LinuxEmu: end the run by name when a
+# call-end replacement or limit restore fails).
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=19c014c6507e7e5b179012a778ce2603ab940c2c
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
