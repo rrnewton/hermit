@@ -3485,6 +3485,12 @@ impl LegacyBackendKeys {
         backend.reports_sigreturns = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
+        // Added after the legacy form froze, and false for DBT, the form's
+        // only reader, whose guest threads are host tasks whose exits run
+        // Linux's robust-list walk. KVM, the one backend that reports true,
+        // is preserved exactly only by the versioned envelope of
+        // `encode_backend_config_json`, never by these keys.
+        backend.kernel_never_walks_robust_lists = false;
         // Added after the legacy form froze (Reverie 9443a6b2): it reads
         // back as the starting constant's true, which is also DBT's value,
         // the form's only reader, so a DBT configuration stays exact. The
@@ -4529,6 +4535,9 @@ mod tests {
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
         backend.reports_sigreturns = false;
+        // Added after the legacy form froze: it reads back as false (see
+        // `LegacyBackendKeys::capabilities`).
+        backend.kernel_never_walks_robust_lists = false;
         // Added after the legacy form froze: it reads back as true (see
         // `LegacyBackendKeys::capabilities`).
         backend.provides_guest_backtraces = true;
@@ -5195,8 +5204,8 @@ mod tests {
     /// configuration reads back as false
     /// (`supports_blocked_wait_signal_interruption` and the four split out of
     /// it, `delivers_preemption_timer_events`,
-    /// `runs_guest_code_between_injections`, `reports_sigreturns`) never enter
-    /// it, whatever their
+    /// `runs_guest_code_between_injections`, `reports_sigreturns`,
+    /// `kernel_never_walks_robust_lists`) never enter it, whatever their
     /// value: the legacy string keeps its bytes, and they read
     /// back as false from both the object and the array form.
     #[test]
@@ -5210,6 +5219,7 @@ mod tests {
         on.backend.delivers_preemption_timer_events = true;
         on.backend.runs_guest_code_between_injections = true;
         on.backend.reports_sigreturns = true;
+        on.backend.kernel_never_walks_robust_lists = true;
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         for key in [
@@ -5221,6 +5231,7 @@ mod tests {
             "delivers_preemption_timer_events",
             "runs_guest_code_between_injections",
             "reports_sigreturns",
+            "kernel_never_walks_robust_lists",
         ] {
             assert!(!json.contains(key), "{json}");
         }
@@ -5239,6 +5250,7 @@ mod tests {
             assert!(!backend.delivers_preemption_timer_events);
             assert!(!backend.runs_guest_code_between_injections);
             assert!(!backend.reports_sigreturns);
+            assert!(!backend.kernel_never_walks_robust_lists);
             assert_eq!(backend, legacy_expressible(BackendCapabilities::DBT));
         }
     }

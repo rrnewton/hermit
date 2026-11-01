@@ -9443,6 +9443,7 @@ mod tests {
         assert!(sabre.reports_physical_process_exits);
         assert!(sabre.tracks_process_children);
         assert!(!sabre.runs_exit_robust_list);
+        assert!(!sabre.kernel_never_walks_robust_lists);
         assert!(!sabre.requires_thread_directed_process_signals);
         let ptrace = prepare_backend_config(config, Backend::Ptrace).backend;
         assert!(!ptrace.tool_shares_guest_descriptor_table);
@@ -9453,6 +9454,7 @@ mod tests {
         assert!(!ptrace.reports_physical_process_exits);
         assert!(ptrace.tracks_process_children);
         assert!(ptrace.runs_exit_robust_list);
+        assert!(!ptrace.kernel_never_walks_robust_lists);
         assert!(!ptrace.requires_thread_directed_process_signals);
     }
 
@@ -9506,6 +9508,9 @@ mod tests {
         assert!(kvm.backend.needs_killed_thread_rpc_cancellation);
         assert!(kvm.backend.tracks_process_children);
         assert!(!kvm.backend.runs_exit_robust_list);
+        // No Linux task exits for a KVM guest thread, so Detcore makes the
+        // robust-list owner-word transition itself.
+        assert!(kvm.backend.kernel_never_walks_robust_lists);
         assert!(!kvm.backend.requires_thread_directed_process_signals);
 
         // A controlled run needs both the backend's process-signal control and
@@ -9585,6 +9590,9 @@ mod tests {
             "virtualizes_guest_sigalrm": in_guest_liteinst,
             "tracks_process_children": !dbt,
             "runs_exit_robust_list": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // Reverie d9ec58c7: KVM's guest threads are not host tasks, so
+            // no Linux exit walks their robust lists.
+            "kernel_never_walks_robust_lists": kvm,
             "requires_thread_directed_process_signals": dbt,
             "supports_parked_write_signal_interruption":
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
@@ -9881,6 +9889,7 @@ mod tests {
         assert!(config.backend.needs_killed_thread_rpc_cancellation);
         assert!(!config.backend.tracks_process_children);
         assert!(!config.backend.runs_exit_robust_list);
+        assert!(!config.backend.kernel_never_walks_robust_lists);
         assert!(config.backend.requires_thread_directed_process_signals);
     }
 

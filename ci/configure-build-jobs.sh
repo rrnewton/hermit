@@ -3298,8 +3298,20 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 52324f65b5961aed575ae870045fff71d2e48bd0 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 52324f65b5961aed575ae870045fff71d2e48bd0 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 93d3a168bb713b8fc420f591d91b35325a43d1df (2026-11-02): from 52324f65b5961aed575ae870045fff71d2e48bd0.
+# 52324f65..93d3a168 is two commits, the chain's copies of N2's 3ec1338c
+# and d9ec58c7: e020621e (Tool::handle_exec_commit, a Tool hook at an
+# exec's point of no return, which KVM calls) and 93d3a168
+# (BackendCapabilities gains kernel_never_walks_robust_lists, true for
+# KVM alone, and KVM's UserMemory implements
+# MemoryAccess::compare_exchange_u32). The reverie-dbt tree, the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 93d3a168bb713b8fc420f591d91b35325a43d1df ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 93d3a168bb713b8fc420f591d91b35325a43d1df (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
