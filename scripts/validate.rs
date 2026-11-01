@@ -26095,6 +26095,12 @@ fn write_ledger_with_snapshot(
         );
         record["landing_signal"] = serde_json::json!(signal);
         record["flaky_tests"] = serde_json::json!(top_flaky);
+        // Diagnosis beside the signal (owner follow-up, 2026-10-31): retries
+        // by failed-attempt class and the infra-recovered count, so the
+        // infra classifier's trustworthiness can be judged before any
+        // clean-green rule keys on it. The signal above is unchanged.
+        record["retries_by_class"] = serde_json::json!(rollup.retries_by_class);
+        record["infra_recovered"] = serde_json::json!(rollup.infra_recovered);
         eprintln!(
             "validate: landing signal: {signal} ({} retries; flaky: {})",
             rollup.total_retries + extra_retries,
