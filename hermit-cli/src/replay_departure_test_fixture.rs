@@ -121,9 +121,11 @@ pub(crate) async fn receiver_cleanup(
     );
     let start = request(&thread, json!({"StartNewThread": [tid, tid, null, null]}));
     let reply = state.receive_rpc(from, start).await;
+    // The admitted history, with no first slice and no instruction offset:
+    // only a schedule replay hands a starting thread its first recorded slice.
     assert_eq!(
         granted_lifecycle_reply(&mut thread, reply),
-        json!({"StartNewThread": history}),
+        json!({"StartNewThread": [history.into_iter(), null, null]}),
         "startup must return this actual admitted history",
     );
 
