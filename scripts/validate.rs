@@ -13380,16 +13380,8 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             }
         }));
         retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        // Close over the selected nodes' declared dependencies: a
-        // focused run must not prune a declared dep whose outputs the
-        // selected node consumes from disk (test.cli reads the
-        // prepared-nextest producer's current.json, written via
-        // build.e2e_artifact_in_pinned_root). The producer allowlist
-        // above only ever approximated this closure and silently
-        // dropped such producers, making --only test.cli un-runnable
-        // in a fresh checkout.
         let cfg =
-            dagrun::select_steps_by_tags(&lane_cfg, &tags.into_iter().collect::<Vec<_>>(), false)?;
+            dagrun::select_steps_by_tags(&lane_cfg, &tags.into_iter().collect::<Vec<_>>(), true)?;
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
