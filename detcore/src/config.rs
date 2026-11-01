@@ -178,6 +178,15 @@ mod tests {
         // renumbered to 21 at landing after main's 20; digests measured at
         // this head).
         (21, "9d583ef0f9243c61", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::Flock`, `FlockPoll`, `FlockCancel`,
+        // `FlockCloseCheck`, `FlockHostDecided`, `FlockMapped`,
+        // `FlockUnfollowable`, `FlockTeardownPending` and `FlockHeldBy` and
+        // their responses, after slice N3's, and retypes
+        // `GlobalResponse::LedgerLockRows` and `GlobalResponse::GuestLockRows`
+        // (the kvm lane's slice SP2, Detcore's flock model; revision 21 on its
+        // own base, renumbered to 22 at its rebase onto main's 21; digests
+        // measured at this head).
+        (22, "a5b2db022b4c4b49", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
