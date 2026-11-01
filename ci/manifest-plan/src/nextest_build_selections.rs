@@ -993,7 +993,9 @@ mod tests {
             // The runtime_private maps/smaps #[ignore]s (same issue) drop
             // shard 3 to 358 (61 + 293 + 358): 712.
             // Shard 2 recounts to 294 in run1470 (61 + 294 + 358): 713.
-            assert_eq!(population, 713);
+            // The flock model's flock_exclusion tests grow shard 2 to
+            // 304 (61 + 304 + 358): 723.
+            assert_eq!(population, 723);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

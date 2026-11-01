@@ -2154,9 +2154,13 @@ pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
 ) -> i32 {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if successful_process_clone_result(sysnum, result) && !scratch.runtime_state.is_null() {
-        unsafe { &mut *scratch.runtime_state }
-            .state
-            .forget_flock_modes();
+        let state = &unsafe { &mut *scratch.runtime_state }.state;
+        state.forget_flock_modes();
+        // The child's table is a copy of this one: the descriptions the lock
+        // ledger does not follow now have references it never saw taken.
+        if raw_flags & libc::CLONE_FILES as u64 == 0 {
+            state.mark_untracked_references_escaped();
+        }
     }
 
     if result > 0
@@ -2362,6 +2366,12 @@ pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(scratch: *mut c_void, p
 // TODO-HUMAN-REVIEW(PR-644): Review fork-safe policy enforcement before copied children bypass.
 // TODO-HUMAN-REVIEW(PR-978): Review extending the copied-child gate from the
 // Unsupported set to the full deterministic-refusal boundary.
+/// A copied child cannot reach Detcore, whose flock model decides every lock
+/// operation through a description it follows (`flock_model`): a native
+/// `LOCK_UN` would release a lock the model still grants, and a native
+/// `LOCK_NB` take one it does not know, which a later mirror would find. So
+/// every valid operation is refused, and only a malformed one, which changes
+/// no lock, still reaches the kernel for its own errno.
 fn copied_child_flock_action(operation: Option<i32>) -> i32 {
     let Some(operation) = operation else {
         return -libc::ENOLCK;
@@ -2370,11 +2380,7 @@ fn copied_child_flock_action(operation: Option<i32>) -> i32 {
     let base = operation & !libc::LOCK_NB;
     let valid = operation & !known_flags == 0
         && matches!(base, libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN);
-    if !valid || base == libc::LOCK_UN || operation & libc::LOCK_NB != 0 {
-        0
-    } else {
-        -libc::ENOLCK
-    }
+    if valid { -libc::ENOLCK } else { 0 }
 }
 
 /// Whether a copied child's `fcntl` with these arguments sets or clears an OFD
@@ -2479,20 +2485,31 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     // Detcore mediation. This ABI has neither syscall arguments nor a memory
     // writer, so a copied child must fail closed rather than expose native
     // pipe/socket inode identities.
-    // A copied pre-exec child has no Detcore Tool. Preserve kernel handling
-    // for malformed operations, nonblocking locks, and unlock; only blocking
-    // acquisitions can strand the child behind a parent that is waiting for it.
+    // A copied pre-exec child has no Detcore Tool, whose flock model decides
+    // every lock operation: each valid one is refused by name, ENOLCK with a
+    // diagnostic under every policy (a copied child's fail-closed exit could
+    // strand its suspended vfork parent, as below), and only a malformed one
+    // keeps the kernel's errno (`copied_child_flock_action`).
     if sysno == Sysno::flock {
         let operation = (!args.is_null()).then(|| unsafe { args.add(1).read() as i32 });
-        return copied_child_flock_action(operation);
+        let action = copied_child_flock_action(operation);
+        if action == -libc::ENOLCK
+            && let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get()
+        {
+            emit_marker(
+                *emit,
+                b"detcore-dbt: refusing flock in copied child: Detcore's flock model decides every lock operation, and a copied child cannot reach it\n",
+            );
+        }
+        return action;
     }
     // pidfd_getfd NEVER RUNS NATIVELY IN A COPIED CHILD because it is the one native
     // route by which a copied child can reach an open file description that
     // ANOTHER guest process holds a Detcore claim about. A sibling that took
     // LOCK_SH through Detcore holds a known mode for its description; a
     // copied child that duplicates that description with pidfd_getfd and
-    // runs LOCK_UN natively (the flock arm above lets unlock through) makes
-    // the sibling's claim stale, and its next refused blocking upgrade would
+    // changes its locks natively (an OFD lock, or a flock before the flock arm
+    // above refused every lock operation) makes the sibling's claim stale, and its next refused blocking upgrade would
     // "restore" a lock it no longer holds. The instrumented root mediates
     // pidfd_getfd (self only); a copied child cannot enter that handler.
     // Evidence capture refuses this call too, but only in verify runs. The
@@ -6077,18 +6094,9 @@ mod tests {
             );
         }
 
-        for operation in [libc::LOCK_SH, libc::LOCK_EX] {
-            let mut args = [0; 6];
-            args[1] = operation as u64;
-            assert_eq!(
-                copied_child_action_with_args(libc::SYS_flock, args),
-                -libc::ENOLCK,
-                "a copied child must not enter a blocking flock operation",
-            );
-        }
         for operation in [
-            0,
-            libc::LOCK_SH | libc::LOCK_EX,
+            libc::LOCK_SH,
+            libc::LOCK_EX,
             libc::LOCK_SH | libc::LOCK_NB,
             libc::LOCK_EX | libc::LOCK_NB,
             libc::LOCK_UN,
@@ -6098,8 +6106,18 @@ mod tests {
             args[1] = operation as u64;
             assert_eq!(
                 copied_child_action_with_args(libc::SYS_flock, args),
+                -libc::ENOLCK,
+                "a copied child must not change a lock Detcore's flock model decides \
+                 (operation {operation})",
+            );
+        }
+        for operation in [0, libc::LOCK_SH | libc::LOCK_EX] {
+            let mut args = [0; 6];
+            args[1] = operation as u64;
+            assert_eq!(
+                copied_child_action_with_args(libc::SYS_flock, args),
                 0,
-                "operation {operation} must retain kernel validation or safe nonblocking behavior",
+                "operation {operation} must retain kernel validation",
             );
         }
         assert_eq!(
