@@ -3251,7 +3251,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the background-starts format above main's formats): 3278.
     // And a_format_this_hermit_does_not_read_survives_the_starts_cap: 3279.
     // And a_boundary_recording_with_background_starts_is_refused_by_name: 3386.
-    ("test.detcore_unit", 3386),
+    // And a_released_schedule_replay_is_over_though_a_later_start_is_queued
+    // and a_released_schedule_has_no_events_left_though_starts_remain (a
+    // released schedule replay is over with later background starts queued):
+    // 3319.
+    // And a_schedule_replay_ends_after_its_last_start_past_its_last_event:
+    // 3320.
+    ("test.detcore_unit", 3389),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5770,7 +5776,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two background-starts format units: 3278.
     // And the same unread-format cap unit: 3279.
     // And the same boundary-recording starts unit: 3386.
-    ("test.detcore_unit_on_host", 3386),
+    // And the same two released-schedule units: 3319.
+    // And the same last-start unit: 3389.
+    ("test.detcore_unit_on_host", 3389),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
