@@ -931,7 +931,6 @@
         ".agents/**",
         ".claude/**",
         ".llms/**",
-        "CLAUDE.md",
         "scripts/check-skill-discovery.rs"
       ]
     },
