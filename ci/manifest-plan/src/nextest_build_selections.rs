@@ -997,7 +997,8 @@ mod tests {
             // 304 (61 + 304 + 358): 723.
             // The Codex review of slice SP2 adds two: 306 (61 + 306 + 358): 725.
             // Its Claude review adds five: 311 (61 + 311 + 358): 730.
-            assert_eq!(population, 730);
+            // Its third round adds two: 313 (61 + 313 + 358): 732.
+            assert_eq!(population, 732);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

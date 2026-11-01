@@ -3267,7 +3267,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cancelled waiter, a converting retry, a retry that blocks again after
     // deleting its description's lock, and an exec's killed waiters), the
     // hand-off test becoming the wake-and-retry one: 3413 + 5 = 3418, listed.
-    ("test.detcore_unit", 3418),
+    // Its third round adds three in procfs::locks (a grant waits once for the
+    // exited holders it conflicts with, a re-blocking retry that wakes
+    // requests says so, a waited grant a mapping alone keeps is refused):
+    // 3418 + 3 = 3421, listed.
+    ("test.detcore_unit", 3421),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3632,8 +3636,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // descriptor table, a stopped waiter): 304 + 2 = 306, listed. Its Claude
     // review adds five (the kernel path's restore, fail-closed and
     // unknown-state refusals, an outside lock's refused mirror, and an exec's
-    // killed waiter): 306 + 5 = 311, listed.
-    ("test.hermit_integration_2", 311),
+    // killed waiter): 306 + 5 = 311, listed. Its third round adds two (a
+    // waiting call whose description a mapping alone keeps is refused by
+    // name, on ptrace and on DBT): 311 + 2 = 313, listed.
+    ("test.hermit_integration_2", 313),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5870,8 +5876,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two N2 detcore units: 3388 + 2 = 3390.
     // The same seventeen flock-model units: 3390 + 17 = 3407.
     // And the review's six: 3407 + 6 = 3413, and its second half's five:
-    // 3413 + 5 = 3418.
-    ("test.detcore_unit_on_host", 3418),
+    // 3413 + 5 = 3418, and its third round's three: 3418 + 3 = 3421.
+    ("test.detcore_unit_on_host", 3421),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6002,8 +6008,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The flock model's flock_exclusion tests grow shard 2 to 304 (see
     // its pin): 61 + 304 + 358 = 723, listed at its rebased head.
     // And the review's two flock_exclusion tests: 61 + 306 + 358 = 725, and
-    // its second half's five: 61 + 311 + 358 = 730.
-    ("test.hermit_integration_on_host", 730),
+    // its second half's five: 61 + 311 + 358 = 730, and its third round's
+    // two: 61 + 313 + 358 = 732.
+    ("test.hermit_integration_on_host", 732),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
