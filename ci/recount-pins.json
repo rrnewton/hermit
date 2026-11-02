@@ -7,6 +7,8 @@
     {"name": "privileged-test.cli_kvm", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"privileged-test\\.cli_kvm\", (?P<count>[0-9]+)\\)"},
     {"name": "test.hermit_integration_2", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.hermit_integration_2\", (?P<count>[0-9]+)\\)"},
     {"name": "test.hermit_integration_3", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.hermit_integration_3\", (?P<count>[0-9]+)\\)"},
-    {"name": "test.record_replay", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.record_replay\", (?P<count>[0-9]+)\\)"}
+    {"name": "test.record_replay", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.record_replay\", (?P<count>[0-9]+)\\)"},
+    {"name": "test.cli_on_host", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.cli_on_host\", (?P<count>[0-9]+)\\)"},
+    {"name": "test.hermit_unit_on_host", "file": "ci/manifest-plan/src/validation_dag_static.rs", "pattern": "\\(\"test\\.hermit_unit_on_host\", (?P<count>[0-9]+)\\)"}
   ]
 }
