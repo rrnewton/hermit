@@ -8428,6 +8428,7 @@ pub enum GlobalRequest {
             MmId,
             crate::syscalls::robust_list::RobustListSnapshot,
         )>,
+    ),
     /// A thread a SIGKILL ended takes the robust list its sender recorded for
     /// it, in its exit callback (`Scheduler::take_sigkill_robust_list`).
     /// Answered before clock accounting. Appended last.
@@ -8458,9 +8459,12 @@ pub enum GlobalRequest {
     /// table (`procfs::locks::LedgerIdentity`,
     /// `procfs::locks::LockLedger::note_locks_taken`). Appended last.
     DescriptionLocksTaken(
+        OpenFileId,
+        Vec<crate::procfs::locks::HeldLock>,
         Vec<crate::procfs::locks::HeldLock>,
         u32,
         crate::procfs::locks::LedgerIdentity,
+    ),
     /// The owner each of these locks, held through this description, shows
     /// on a lock line of a rendered fdinfo
     /// (`procfs::locks::LockLedger::owners`). Appended last.

@@ -895,7 +895,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             .as_ref()
             .map_or(syscall, |translated| translated.call);
         crate::reserved_input::before_native_call(guest, call)?;
-        let result = if crate::record_or_replay::injects_only::<T>() {
         // A self-sentinel `pidfd_send_signal` the executing kernel spells
         // differently from the guest: the model and the record or replay
         // tool see the guest's call, and only its injection is respelled.
