@@ -3245,7 +3245,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And
     // scm_rights::tests::a_refused_receive_may_have_installed_descriptors_only_where_it_names_a_control_buffer:
     // 3384 + 1 = 3385, by nextest list.
-    ("test.detcore_unit", 3385),
+    // And io::tests::msg_len_meets_only_control_buffers_that_share_its_bytes: 3385 + 1 = 3386.
+    ("test.detcore_unit", 3386),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4614,7 +4615,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds seven cli
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // And an_scm_rights_receipt_over_its_own_header_is_a_named_refusal: 787 + 1 = 788.
-    ("test.cli", 788),
+    // And an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal: 788 + 1 = 789.
+    ("test.cli", 789),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5252,7 +5254,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // growth as test.cli): 699 + 7 = 706.
     // And the same an_scm_rights_receipt_over_its_own_header_is_a_named_refusal, not excluded:
     // 706 + 1 = 707.
-    ("test.cli_on_host", 707),
+    // And the same an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal, not excluded:
+    // 707 + 1 = 708.
+    ("test.cli_on_host", 708),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5812,7 +5816,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // And the same receipt unit test: 3384 + 1 = 3385.
-    ("test.detcore_unit_on_host", 3385),
+    // And the same sendmmsg msg_len unit test: 3385 + 1 = 3386.
+    ("test.detcore_unit_on_host", 3386),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
