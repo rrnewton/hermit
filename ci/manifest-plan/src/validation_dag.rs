@@ -1349,6 +1349,28 @@ fn retire_unconsumed_host_producers(cfg: &mut DagConfig) {
 pub const PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra ' %q' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload""#;
 pub(super) const LEGACY_PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1""#;
 
+/// `HERMIT_VALIDATE_PINNED_IMAGE=<name@sha256:...>` override (historical probes).
+pub fn pinned_image_override_from_env() -> Result<Option<String>, String> {
+    match std::env::var("HERMIT_VALIDATE_PINNED_IMAGE") {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("HERMIT_VALIDATE_PINNED_IMAGE: {error}")),
+        Ok(value) => {
+            let Some((name, digest)) = value.split_once("@sha256:") else {
+                return Err(format!("invalid exact image reference '{value}'"));
+            };
+            if name.is_empty()
+                || digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(format!("invalid exact image reference '{value}'"));
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
 fn needs_proc_locks_runtime(tag: &str) -> bool {
     matches!(
         tag,
@@ -1378,8 +1400,14 @@ fn pinned_root_command(step: &Step) -> String {
     // A width channel that the root does not forward leaves the command at its
     // own default however wide the step was admitted.
     env_names.extend(step.jobs_env.as_deref().filter(|name| !name.is_empty()));
-    let mut argv = vec![
-        "./ci/hermetic/run-in-pinned-root.sh".to_string(),
+    let mut argv = vec!["./ci/hermetic/run-in-pinned-root.sh".to_string()];
+    // Historical-probe override: emit the exact override digest so the node
+    // runs the rebuilt image. Absent/unset keeps the committed digest path
+    // byte-identical (no --digest; the wrapper reads ci/hermetic/image.digest).
+    if let Ok(Some(override_ref)) = pinned_image_override_from_env() {
+        argv.extend(["--digest".into(), override_ref]);
+    }
+    argv.extend([
         "--src".into(),
         ".".into(),
         "--out".into(),
@@ -1387,7 +1415,7 @@ fn pinned_root_command(step: &Step) -> String {
         "--src-rw".into(),
         "--cargo-home".into(),
         "ignored/hermetic/split/cargo".into(),
-    ];
+    ]);
     // Proc-locks snapshots include OFD locks from other PID namespaces. Share
     // the native host lease inode, not one file per container or validation.
     if needs_proc_locks_runtime(&step.tag()) {

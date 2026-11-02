@@ -16,13 +16,75 @@ use crate::validate_admission::BoundExecutionPlan;
 
 const WRAPPER: &str = "./ci/hermetic/run-in-pinned-root.sh";
 
+/// Historical-probe image override: `HERMIT_VALIDATE_PINNED_IMAGE=<name@sha256:...>`.
+/// When set, pinned-root nodes run the override image instead of the committed
+/// `ci/hermetic/image.digest`. Such runs are non-qualifying by construction:
+/// the ledger row carries `image_override` and `pass_row_qualifies` refuses it.
+pub(crate) const PINNED_IMAGE_OVERRIDE_ENV: &str = "HERMIT_VALIDATE_PINNED_IMAGE";
+pub(crate) const IMAGE_OVERRIDE_LABEL: &str = "rebuilt-from-lock";
+
+pub(crate) fn pinned_image_override() -> Result<Option<String>, String> {
+    match std::env::var(PINNED_IMAGE_OVERRIDE_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("{PINNED_IMAGE_OVERRIDE_ENV}: {error}")),
+        Ok(value) => validate_image_reference(&value).map(Some),
+    }
+}
+
+pub(crate) fn validate_image_reference(value: &str) -> Result<String, String> {
+    let Some((name, digest)) = value.split_once("@sha256:") else {
+        return Err(format!(
+            "invalid exact image reference '{value}'; expected NAME@sha256:64-lowercase-hex"
+        ));
+    };
+    if name.is_empty()
+        || name.chars().any(char::is_whitespace)
+        || digest.len() != 64
+        || !digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "invalid exact image reference '{value}'; expected NAME@sha256:64-lowercase-hex"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+pub(crate) fn committed_digest(root: &Path) -> Option<String> {
+    std::fs::read_to_string(root.join("ci/hermetic/image.digest"))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| validate_image_reference(text).is_ok())
+}
+
+/// Inject `--digest <override>` into every pinned-root step command.
+pub(crate) fn inject_digest(cfg: &mut DagConfig, second: Option<&mut DagConfig>, digest: &str) {
+    for cfg in std::iter::once(cfg).chain(second) {
+        for step in &mut cfg.steps {
+            if step.cmd.starts_with(WRAPPER) && !step.cmd.contains(" --digest ") {
+                step.cmd = step
+                    .cmd
+                    .replacen(WRAPPER, &format!("{WRAPPER} --digest {digest}"), 1);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Probe {
     env: BTreeMap<String, String>,
     consumers: Vec<String>,
+    digest: Option<String>,
 }
 
 fn selected_probes(cfg: &DagConfig, second: Option<&DagConfig>) -> Result<Vec<Probe>, String> {
+    selected_probes_with_override(cfg, second, pinned_image_override()?.as_deref())
+}
+
+fn selected_probes_with_override(
+    cfg: &DagConfig,
+    second: Option<&DagConfig>,
+    override_digest: Option<&str>,
+) -> Result<Vec<Probe>, String> {
     let mut groups: BTreeMap<BTreeMap<String, String>, Vec<String>> = BTreeMap::new();
     for cfg in std::iter::once(cfg).chain(second) {
         for step in &cfg.steps {
@@ -50,15 +112,27 @@ fn selected_probes(cfg: &DagConfig, second: Option<&DagConfig>) -> Result<Vec<Pr
                 .iter()
                 .position(|arg| arg == "--")
                 .ok_or_else(|| format!("{}: missing pinned-root payload boundary", step.tag()))?;
+            // Without an override, any --digest/--check-image is refused
+            // (committed digest enforced). With an override, exactly one
+            // `--digest <override>` is admitted; a mismatched digest refuses.
+            let header = &argv[1..boundary];
+            let digest_args: Vec<&str> = header
+                .windows(2)
+                .filter(|pair| pair[0] == "--digest")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            let digest_ok = match override_digest {
+                None => digest_args.is_empty(),
+                Some(expected) => digest_args.len() == 1 && digest_args[0] == expected,
+            };
             let tail = &argv[boundary..];
             if tail.len() != 6
                 || tail[1] != "bash"
                 || tail[2] != "-c"
                 || tail[4] != "bash"
                 || tail[3] != hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
-                || argv[1..boundary]
-                    .iter()
-                    .any(|arg| arg == "--digest" || arg == "--check-image")
+                || header.iter().any(|arg| arg == "--check-image")
+                || !digest_ok
             {
                 return Err(format!(
                     "{}: unrecognized canonical pinned-root invocation; cannot bind its image",
@@ -73,16 +147,21 @@ fn selected_probes(cfg: &DagConfig, second: Option<&DagConfig>) -> Result<Vec<Pr
     }
     Ok(groups
         .into_iter()
-        .map(|(env, consumers)| Probe { env, consumers })
+        .map(|(env, consumers)| Probe {
+            env,
+            consumers,
+            digest: override_digest.map(str::to_string),
+        })
         .collect())
 }
 
 fn probe_command(root: &Path, probe: &Probe) -> Command {
     let mut command = Command::new(root.join(WRAPPER));
-    command
-        .arg("--check-image")
-        .current_dir(root)
-        .envs(&probe.env);
+    command.arg("--check-image");
+    if let Some(digest) = &probe.digest {
+        command.args(["--digest", digest]);
+    }
+    command.current_dir(root).envs(&probe.env);
     command
 }
 
@@ -107,9 +186,19 @@ fn refusal(profile: &str, reason: String) -> Box<RunSummary> {
 fn admit_with(
     plan: &BoundExecutionPlan,
     profile: &str,
+    inspect: impl FnMut(&Probe) -> std::io::Result<ExitStatus>,
+) -> Result<(), Box<RunSummary>> {
+    let override_digest = pinned_image_override().map_err(|e| refusal(profile, e))?;
+    admit_with_override(plan, profile, override_digest.as_deref(), inspect)
+}
+
+fn admit_with_override(
+    plan: &BoundExecutionPlan,
+    profile: &str,
+    override_digest: Option<&str>,
     mut inspect: impl FnMut(&Probe) -> std::io::Result<ExitStatus>,
 ) -> Result<(), Box<RunSummary>> {
-    let probes = selected_probes(&plan.cfg, plan.second.as_ref())
+    let probes = selected_probes_with_override(&plan.cfg, plan.second.as_ref(), override_digest)
         .map_err(|error| refusal(profile, error))?;
     for probe in probes {
         let status = inspect(&probe).map_err(|error| {
@@ -650,6 +739,42 @@ exit 91
                 assert_eq!(refused.executed_tests, Some(0));
             }
         }
+    }
+
+    #[test]
+    fn override_admitted_labelled_and_mismatch_refused() {
+        let (canonical, _, _) = crate::load_committed_validation_dag(root()).unwrap();
+        let pinned = canonical
+            .steps
+            .iter()
+            .find(|s| s.tag() == "test.regular_crates")
+            .unwrap()
+            .clone();
+        let override_ref =
+            format!("localhost/hermit-hermetic-validate@sha256:{}", "a".repeat(64));
+        // No override: a --digest form is still refused (unchanged default).
+        let mut injected = canonical.with_steps(vec![pinned.clone()]);
+        inject_digest(&mut injected, None, &override_ref);
+        assert!(selected_probes_with_override(&injected, None, None).is_err());
+        // Override admitted only when the command digest matches it exactly.
+        let probes =
+            selected_probes_with_override(&injected, None, Some(&override_ref)).unwrap();
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].digest.as_deref(), Some(override_ref.as_str()));
+        let other = format!("localhost/hermit-hermetic-validate@sha256:{}", "b".repeat(64));
+        assert!(selected_probes_with_override(&injected, None, Some(&other)).is_err());
+        // Admission probes the override image via --digest.
+        let plan = BoundExecutionPlan::bind(&injected, None, None).unwrap();
+        let mut seen = Vec::new();
+        admit_with_override(&plan, "fixture", Some(&override_ref), |probe| {
+            seen.push(probe.digest.clone());
+            Ok(ExitStatus::from_raw(0))
+        })
+        .unwrap_or_else(|s| panic!("{:?}", s.detail));
+        assert_eq!(seen, vec![Some(override_ref.clone())]);
+        assert_eq!(IMAGE_OVERRIDE_LABEL, "rebuilt-from-lock");
+        assert!(validate_image_reference(&override_ref).is_ok());
+        assert!(validate_image_reference("name@sha256:bad").is_err());
     }
 
     #[test]

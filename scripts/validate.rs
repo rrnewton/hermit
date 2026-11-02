@@ -26054,6 +26054,14 @@ fn write_ledger_with_snapshot(
         "cwd": ctx.cwd,
         "profile": ctx.profile,
         "selection_mode": ctx.selection_mode,
+        // Pinned-image identity (start_unit.py resolve_digest field names).
+        // `image_override` present => non-qualifying historical probe.
+        "image_digest": validate_pinned_image::pinned_image_override().ok().flatten()
+            .or_else(|| validate_pinned_image::committed_digest(std::path::Path::new(&ctx.cwd))),
+        "pinned_image_digest": validate_pinned_image::pinned_image_override().ok().flatten()
+            .or_else(|| validate_pinned_image::committed_digest(std::path::Path::new(&ctx.cwd))),
+        "image_override": validate_pinned_image::pinned_image_override().ok().flatten()
+            .map(|_| validate_pinned_image::IMAGE_OVERRIDE_LABEL),
         "release_builder": ctx.release_builder,
         "e2e_runner": ctx.e2e_runner,
         "e2e_payload": e2e_payload_identity(ctx.release_builder),
@@ -29262,6 +29270,27 @@ fn run(
             &plan.profile,
             "committed-DAG scheduler boundary",
             vec![error],
+        );
+    }
+
+    // Historical-probe image override (non-qualifying): inject the override
+    // digest into pinned-root commands before binding, so admission and the
+    // nodes agree on the exact image. No override = byte-identical plan.
+    let image_override = match validate_pinned_image::pinned_image_override() {
+        Ok(value) => value,
+        Err(error) => {
+            return RunSummary::refused(2, &plan.profile, "pinned image override", vec![error]);
+        }
+    };
+    if let Some(digest) = &image_override {
+        let mut second = plan.second.take();
+        validate_pinned_image::inject_digest(&mut plan.cfg, second.as_mut(), digest);
+        plan.second = second;
+        plan.cacheable = false;
+        eprintln!(
+            "validate: {}={digest} ({}); this run is non-qualifying and its record is labelled as such",
+            validate_pinned_image::PINNED_IMAGE_OVERRIDE_ENV,
+            validate_pinned_image::IMAGE_OVERRIDE_LABEL
         );
     }
 

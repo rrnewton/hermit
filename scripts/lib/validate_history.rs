@@ -651,6 +651,10 @@ fn has_blocking_failure(rows: &[serde_json::Value], key: &CacheKey<'_>) -> bool 
 /// carrying an unproven floor. The cost is one real run in the rare case of an
 /// identical tree.
 fn pass_row_qualifies(row: &serde_json::Value) -> bool {
+    // A pinned-image override run is a historical probe, never landing evidence.
+    if row.get("image_override").is_some_and(|v| !v.is_null()) {
+        return false;
+    }
     if row.get("admission_floor_evidence").is_some()
         && !serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone())
             .is_ok_and(|original| {
