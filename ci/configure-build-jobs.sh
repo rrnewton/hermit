@@ -3285,8 +3285,21 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 97eae9b7b070b2f3155233a3ce55f35c9af3f212 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 97eae9b7b070b2f3155233a3ce55f35c9af3f212 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 52324f65b5961aed575ae870045fff71d2e48bd0 (2026-11-02): from 97eae9b7b070b2f3155233a3ce55f35c9af3f212.
+# Interval: the Linux provider writes only the control messages a
+# receive returns (2a228455, from 9d6b9825), reports its hugetlbfs view
+# refusal as UnsupportedSharedFile, which Error::is_named_refusal now
+# counts among the refusals by name (f619cd75, from d4dfab1a), and cites
+# two filed issues in comments (52324f65, from 6aec7999), each with
+# provider unit tests. No reverie-dbt file is added, removed or changed,
+# and the root Cargo.toml, Cargo.lock and rust-toolchain.toml are
+# unchanged.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 52324f65b5961aed575ae870045fff71d2e48bd0 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 52324f65b5961aed575ae870045fff71d2e48bd0 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
