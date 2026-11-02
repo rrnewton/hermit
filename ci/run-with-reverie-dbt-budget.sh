@@ -3212,7 +3212,20 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=a311fbc493a6afebd9755bbee5b61fe77b710374
+# CARRY TO 97eae9b7b070b2f3155233a3ce55f35c9af3f212 (2026-11-02): from a311fbc493a6afebd9755bbee5b61fe77b710374.
+# Interval: the Linux provider takes zero-length writes on owned sockets
+# to the host (2dfd78fe, from aad791a9), receives recvfrom and recvmsg
+# into staging laid out like the guest buffer (6106f99c, from a986177b),
+# refuses shared views of hugetlbfs files by name (1afff700, from
+# 02ea6be2), and writes back only the msghdr fields Linux writes after a
+# receive (97eae9b7, from 9a9bbb7c), each with a provider unit test. No
+# reverie-dbt file is added, removed or changed, and the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=97eae9b7b070b2f3155233a3ce55f35c9af3f212
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
