@@ -3246,7 +3246,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scm_rights::tests::a_refused_receive_may_have_installed_descriptors_only_where_it_names_a_control_buffer:
     // 3384 + 1 = 3385, by nextest list.
     // And io::tests::msg_len_meets_only_control_buffers_that_share_its_bytes: 3385 + 1 = 3386.
-    ("test.detcore_unit", 3386),
+    // And io::tests::timestamps_are_canonicalized_only_in_the_control_bytes_written:
+    // 3386 + 1 = 3387.
+    ("test.detcore_unit", 3387),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5817,7 +5819,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // And the same receipt unit test: 3384 + 1 = 3385.
     // And the same sendmmsg msg_len unit test: 3385 + 1 = 3386.
-    ("test.detcore_unit_on_host", 3386),
+    // And the same written-control-extent unit test: 3386 + 1 = 3387.
+    ("test.detcore_unit_on_host", 3387),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
