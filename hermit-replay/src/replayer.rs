@@ -1758,6 +1758,27 @@ impl Replayer {
         path: &Path,
         flags: OFlag,
     ) -> io::Result<bool> {
+        // Kernel-provided directories (procfs, sysfs) exist only in the
+        // guest kernel's view, so there is nothing to create beneath the
+        // replay root. Walking the spelled absolute path in this controller
+        // process resolves `self` (and any recorded tid) to controller-side
+        // identities that do not name the guest's directories, and the walk
+        // failed with ENOENT for `/proc/self/task/<tid>` (issue 5066),
+        // which the caller turned into a panic. Decline materialization:
+        // the caller reserves a virtual descriptor and replay serves the
+        // open and its later operations from the recorded events.
+        if path.is_absolute()
+            && path.components().nth(1).is_some_and(|component| {
+                component.as_os_str() == "proc" || component.as_os_str() == "sys"
+            })
+        {
+            tracing::debug!(
+                ?syscall,
+                ?path,
+                "recorded open directory is kernel-provided; keeping it virtual"
+            );
+            return Ok(false);
+        }
         let root = crate::record_replay_path::open_process_root(guest.pid())?;
         let start = if path.is_absolute() {
             crate::record_replay_path::open_process_root(guest.pid())?

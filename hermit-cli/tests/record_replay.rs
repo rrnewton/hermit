@@ -393,6 +393,47 @@ fn record_replay_flocks_a_self_created_file_opened_by_relative_path() {
     );
 }
 
+/// Issue 5066: a guest that opens its own procfs task directory
+/// (`/proc/self/task/<tid>`) records a successful directory open, and replay
+/// must not try to materialize that kernel-provided directory by walking
+/// the spelled path in the controller process (where `self` is the
+/// controller and the recorded tid does not exist): replay panicked with
+/// "failed to materialize recorded open directory".
+#[test]
+fn record_replay_opens_a_proc_self_task_directory() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args([
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            "import ctypes, os; tid = ctypes.CDLL(None).syscall(186); fd = os.open(f'/proc/self/task/{tid}', os.O_RDONLY | os.O_DIRECTORY); print('opened-task-dir', flush=True); os.close(fd); fd = os.open('/proc/self', os.O_RDONLY | os.O_DIRECTORY); print('opened-self', flush=True); os.close(fd)",
+        ]);
+    let output = command_output(command, "record/replay of a /proc/self/task directory open");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined_output.contains("failed to materialize recorded open directory"),
+        "replay panicked materializing a procfs directory:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("opened-task-dir"),
+        "the guest did not open its task directory:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
 /// Records `script` with standard output `record_stdout`, then lets `prepare`
 /// reset host state and replays the recording with `--autopilot` and standard
 /// output `replay_stdout`, returning the replay's output.
