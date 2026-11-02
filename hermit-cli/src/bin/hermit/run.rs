@@ -3426,6 +3426,36 @@ fn the_exclusive_rewrite_is_refused_for_an_image_run() {
     }
 }
 
+/// Trials reuse prepared overlays only for the same inputs: another
+/// `--tmp`, `--workdir`, `--image` or guest environment, or a file whose
+/// bytes changed, is another preparation.
+#[test]
+fn trial_preparations_are_keyed_by_every_input_they_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let library = directory.path().join("liblse.so");
+    std::fs::write(&library, b"first").unwrap();
+    let also = format!("--rewrite-exclusives-also={}", library.display());
+    let key = |extra: &[&str]| {
+        let mut argv = vec!["hermit", "run", "--rewrite-exclusives", &also];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["--", "/nonexistent/guest"]);
+        run_opts_for(&argv).trial_preprocessing_key()
+    };
+    let plain = key(&[]);
+    assert_eq!(key(&[]), plain, "the same inputs share one preparation");
+    for other in [
+        "--tmp=/var/tmp/elsewhere",
+        "--workdir=/elsewhere",
+        "--image=example.invalid/guest",
+        "--env=PATH=/elsewhere",
+        "--base-env=empty",
+    ] {
+        assert_ne!(key(&[other]), plain, "{other}");
+    }
+    std::fs::write(&library, b"second").unwrap();
+    assert_ne!(key(&[]), plain, "a file whose bytes changed");
+}
+
 #[test]
 fn exec_stop_opt_in_is_uniform_and_retained_in_reproducers() {
     let mut ordinary = run_opts_for(&["hermit", "run", "--", "/nonexistent/guest"]);
@@ -13013,31 +13043,20 @@ impl RunOpts {
     /// images while its printed reproducer, which carries the option, ran the
     /// rewritten ones.
     ///
-    /// Every trial of one analysis shares the program, the
-    /// `--rewrite-exclusives-also` files, the backend, the mounts and binds and
-    /// the working directory and `PATH` the guest program is resolved with, so
-    /// the overlays are prepared once per process for those inputs and reused:
-    /// one rewrite and one report per analysis, not one per trial. The key is
-    /// all of them, so a second analysis in one process (as tests run) with
-    /// other mounts prepares, and checks, its own.
+    /// Every trial of one analysis shares the inputs the preparation reads
+    /// ([`Self::trial_preprocessing_key`]), so the overlays are prepared once
+    /// per process for those inputs and reused: one rewrite and one report
+    /// per analysis, not one per trial. The key is all of them, so a second
+    /// analysis in one process (as tests run) with other mounts, another
+    /// `/tmp` or working directory, or a changed file prepares, and checks,
+    /// its own.
     pub(crate) fn prepare_trial_preprocessing(&mut self) -> Result<(), Error> {
         static PREPARED: std::sync::Mutex<Vec<(String, Vec<ExecutableOverlayMount>)>> =
             std::sync::Mutex::new(Vec::new());
         if !self.rewrite_exclusives {
             return Ok(());
         }
-        let key = format!(
-            "{:?}",
-            (
-                &self.program,
-                &self.rewrite_exclusives_also,
-                self.selected_backend(),
-                &self.mount,
-                &self.bind,
-                std::env::current_dir().ok(),
-                std::env::var_os("PATH"),
-            )
-        );
+        let key = self.trial_preprocessing_key();
         let mut prepared = PREPARED
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -13049,6 +13068,69 @@ impl RunOpts {
         self.prepare_exclusive_rewrite(self.selected_backend())?;
         prepared.push((key, self.exclusive_rewrite_overlays.clone()));
         Ok(())
+    }
+
+    /// What decides the overlays one analysis prepares (see
+    /// [`Self::prepare_trial_preprocessing`]): every input the preparation
+    /// reads. The options that place the guest's files: the program, the
+    /// `--rewrite-exclusives-also` files, the backend, the mounts and binds,
+    /// `--tmp`, `--workdir`, `--image`, the guest environment, and the host's
+    /// working directory and `PATH`. And the files those resolve to, as the
+    /// preparation resolves them, each with a digest of its bytes: a file
+    /// that changed between two analyses gets a new copy, not the one made
+    /// from its old bytes. A file that does not resolve or read keys as its
+    /// error, which the preparation then reports.
+    fn trial_preprocessing_key(&self) -> String {
+        let mut files = vec![
+            self.resolve_guest_and_host_program()
+                .and_then(|(guest, host)| {
+                    Ok((self.resolve_executable_overlay_target(&guest, &host)?, host))
+                }),
+        ];
+        files.extend(self.rewrite_exclusives_also.iter().map(|also| {
+            fs::canonicalize(also)
+                .map(|path| (path.clone(), path))
+                .map_err(Error::from)
+        }));
+        let files: Vec<String> = files
+            .into_iter()
+            .map(|file| match file {
+                Ok((guest, host)) => match fs::read(&host) {
+                    Ok(bytes) => format!(
+                        "{} at {}: {}",
+                        guest.display(),
+                        host.display(),
+                        detcore::Digest::new(&bytes)
+                    ),
+                    Err(error) => format!("{}: {error}", host.display()),
+                },
+                Err(error) => format!("{error:#}"),
+            })
+            .collect();
+        format!(
+            "{:?}",
+            (
+                (
+                    &self.program,
+                    &self.rewrite_exclusives_also,
+                    self.selected_backend(),
+                ),
+                (
+                    &self.mount,
+                    &self.bind,
+                    &self.tmp,
+                    &self.workdir,
+                    &self.image
+                ),
+                (
+                    &self.base_env,
+                    &self.env,
+                    std::env::current_dir().ok(),
+                    std::env::var_os("PATH"),
+                ),
+                files,
+            )
+        )
     }
 
     /// Rewrite the guest executable's canonical exclusive loops (and those of
