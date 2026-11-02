@@ -316,7 +316,7 @@ impl OciRunOpts {
         self.run.refuse_unready_exec_stop()?;
         // Every `hermit oci run` runs from an image, so this is refused
         // before the store is opened or the reference resolved.
-        self.run.refuse_exclusive_rewrite_in_an_image()?;
+        self.run.refuse_exclusive_rewrite_for_image_launch(true)?;
         // `hermit oci run` takes its image as a positional; the inherited
         // `--image` flag would be a second, unresolved way to say the same
         // thing. Reject the ambiguity rather than silently picking one.
