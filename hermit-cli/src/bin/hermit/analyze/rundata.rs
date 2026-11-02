@@ -3547,7 +3547,7 @@ mod tests {
                 let error = result.unwrap_err();
                 assert!(
                     error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
                         .is_some(),
                     "{error:#}"
                 );
