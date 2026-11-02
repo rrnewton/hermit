@@ -1910,7 +1910,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Includes 29 inherited additions missed by the old pin and six fix regressions.
     // Recount at a7ecd1755834d559c82c6ee633bf4e6eeef6ee3f: ten timing-report
     // tests and three review regressions retain all 1328 prior names: 1341.
-    ("test.hermit_unit", 1341),
+    // Recount at 636929f9b3fcd6faeaffe80a16c85365f0187398: four original
+    // tests and one minimized-report regression retain all 1341 names: 1346.
+    ("test.hermit_unit", 1346),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3161,7 +3163,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
     // The inotify fault-boundary repair adds three detcore units: 3034 + 3 = 3037, by nextest list.
-    ("test.detcore_unit", 3242),
+    // Recount at 636929f9b3fcd6faeaffe80a16c85365f0187398:
+    // a_record_too_varied_to_renumber_keeps_its_priorities retains all 3242: 3243.
+    ("test.detcore_unit", 3243),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5579,7 +5583,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3242 (2a1a7c67cd) measured the same selection this twin runs; the
     // twin's pin stayed 3037, so the hosted/local count invariant failed
     // on main. 3037 -> 3242 to match that measured recount.
-    ("test.detcore_unit_on_host", 3242),
+    // The same priority-preservation addition, measured with this host selection at
+    // 636929f9b3fcd6faeaffe80a16c85365f0187398: 3243 active names.
+    ("test.detcore_unit_on_host", 3243),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5978,7 +5984,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3cb2f62f64de85ee7e9a7deabb9802dc9ee250b8: 1322 active names.
     // The same thirteen additions, measured with this host selection at
     // a7ecd1755834d559c82c6ee633bf4e6eeef6ee3f: 1335 active names.
-    ("test.hermit_unit_on_host", 1335),
+    // The same five additions, measured with this host selection at
+    // 636929f9b3fcd6faeaffe80a16c85365f0187398: 1340 active names.
+    ("test.hermit_unit_on_host", 1340),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
