@@ -57,16 +57,20 @@ pub fn host_has_lse_atomics() -> bool {
 
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
 
-/// Where rewritten images are cached, created private to this user.
+/// Where rewritten images are cached, without creating or checking
+/// anything: the directory [`cache_dir`] uses. It follows this process's
+/// environment (`XDG_CACHE_HOME`, `HOME`), so a caller that remembers what
+/// it prepared must remember this too.
 ///
 /// Never under `/tmp`: Hermit replaces the guest's `/tmp` with an isolated
-/// directory, so an artifact there would not be visible to the guest that has
-/// to map it.
-pub fn cache_dir() -> anyhow::Result<PathBuf> {
+/// directory, so an artifact there would not be visible to the guest that
+/// has to map it.
+pub fn cache_path() -> PathBuf {
     let base = dirs::cache_dir().map_or_else(
         || PathBuf::from("/var/tmp").join(format!("hermit-{}", nix::unistd::geteuid().as_raw())),
         |dir| dir.join("hermit"),
@@ -79,7 +83,17 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
     } else {
         base
     };
-    let dir = base.join("exclusive-rewrites");
+    base.join("exclusive-rewrites")
+}
+
+/// Where rewritten images are cached ([`cache_path`]), created private to
+/// this user.
+pub fn cache_dir() -> anyhow::Result<PathBuf> {
+    let dir = cache_path();
+    let base = dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dir.clone());
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create the rewrite cache {}", dir.display()))?;
     // The cache holds images the guest will execute, so every directory this
