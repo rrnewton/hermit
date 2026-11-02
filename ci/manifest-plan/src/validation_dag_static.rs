@@ -3318,7 +3318,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3601 + 1 = 3602.
     // And #4929 slice 2's 26 detcore units, rebased onto this stack: 3602 + 26
     // = 3628.
-    ("test.detcore_unit", 3628),
+    // And its poll-mark unit ("Keep waking a KVM poller now that main marks poll
+    // with EINTR"): 3628 + 1 = 3629.
+    ("test.detcore_unit", 3629),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5997,7 +5999,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four SIGSHARE S3a-1 reader units: 3597 + 4 = 3601.
     // And the same S3a-2 send-latch unit: 3601 + 1 = 3602.
     // And the same 26 #4929 slice 2 units: 3602 + 26 = 3628.
-    ("test.detcore_unit_on_host", 3628),
+    // And the same poll-mark unit: 3628 + 1 = 3629.
+    ("test.detcore_unit_on_host", 3629),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
