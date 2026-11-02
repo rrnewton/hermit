@@ -1,0 +1,4 @@
+[herdr-run] engine=rust (tracked Cargo launcher: rs/bin/herdr-run)
+[herdr-run] rust cache=verified source=7940999a905d binary=0eea71e2a969
+GH-PACED WARNING [hermit-bot3] read budget 250/hour per host reached (250 used in the last hour); sleeping 3 s (next slot 4:48 AM ET)
+GH-PACED WARNING [hermit-bot3] read budget 250/hour per host reached (250 used in the last hour); sleeping 1 s (next slot 4:48 AM ET)

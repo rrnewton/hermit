@@ -1,0 +1,45 @@
+4709: name the standalone in-guest CPU profile instead of unresolved auto
+
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+The queue isolated the 4709 stack alone and test.regular_crates
+failed on the two hermit-inguest-engine native_config round-trip
+tests (also red in batch be275ee6). The standalone native default
+is built on Config::default(), which since this stack carries the
+clap default `auto`; the legacy standalone encoding never writes
+cpu_profile and reads it as x86-64-v2, so the sent configuration no
+longer round-tripped — and a standalone in-guest launch would have
+handed Detcore an unresolved profile. strict_default again names
+x86-64-v2 explicitly, and a standalone selection that still carries
+`auto` names the same profile. A coordinated configuration arrives
+already resolved by its launcher and is untouched.
+
+Determinism
+
+The named profile is the constant the legacy standalone encoding
+already reads, not derived from host state. Config encoding,
+fingerprints and guest-visible behaviour for every resolved launch
+are unchanged; only a standalone in-guest launch that named no
+profile gets the v2 it always ran with instead of an unresolved
+request Detcore refuses.
+
+Linux Semantics
+
+No Linux behaviour Hermit presents changes. This chooses the
+virtual CPU for standalone in-guest launches that named none; the
+CPUID answers are the existing x86-64-v2 table.
+
+Test Plan:
+
+- Reproduced at 2f77218fef6:
+  `cargo nextest run -p hermit-inguest-engine -E 'test(native_config)'`
+  FAILED the two round-trip tests (decoded cpu_profile x86-64-v2
+  vs sent auto). On main the clap default is the enum default
+  (x86-64-v2), so the sent configuration round-tripped.
+- At this head: native_config 9/9 pass; hermit-inguest-engine
+  41/41; detcore-model config slice 108/108; fmt and Clippy
+  (hermit-inguest-engine, --all-targets -D warnings) clean.
+- Full-profile evidence is the merge queue's resubmission run at
+  this exact head.

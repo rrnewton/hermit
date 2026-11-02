@@ -1,0 +1,16 @@
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-run --bin hermit mapped_launch_path_preserves_an_exact_file_bind -- --exact
+Running as unit: run-p58687-i3547459018.scope; invocation ID: 7a480d7380fb43688ac183e0a3ec8fd8
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+RC=0
+=== systemd-run --user --scope -p MemoryHigh=40G -p MemoryMax=60G cargo test -q -p hermit-run --test cli replay_only_ignores_an_unused_requested_cpu_profile -- --exact --test-threads=1
+Running as unit: run-p142606-i3547459386.scope; invocation ID: d082d4e2adbf4f7d9f59e36e08f8efe9
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 906 filtered out; finished in 0.49s
+
+RC=0

@@ -1,0 +1,1283 @@
+ARTCTL1
+1793863541
+configerator_proxy
+{
+  "killed": false,
+  "max_events": 10000,
+  "graphapi_disabled": false,
+  "graphapi_debug": false,
+  "overrides": {
+    "(buck2-forkserver)": {
+        "killed": true
+    },
+    "FalconProxy": {
+        "killed": true
+    },
+    "UcbGpuBandwidthServer": {
+        "killed": true
+    },
+    "VLLM::EngineCore": {
+        "killed": true
+    },
+    "VLLM::Worker_DP0_TP4_EP4": {
+        "killed": true
+    },
+    "VLLM::Worker_TP1_EP1": {
+        "killed": true
+    },
+    "VLLM::Worker_TP2_EP2": {
+        "killed": true
+    },
+    "VLLM::Worker_TP5_EP5": {
+        "killed": true
+    },
+    "VLLM::Worker_TP6_EP6": {
+        "killed": true
+    },
+    "__cvm_worker": {
+        "killed": true
+    },
+    "__worker": {
+        "killed": true
+    },
+    "adb": {
+        "sample_rate": 1.0
+    },
+    "adb_helper": {
+        "killed": true
+    },
+    "adconv_penguin_server": {
+        "killed": true
+    },
+    "agent_guardrails_plugin": {
+        "killed": true
+    },
+    "agent_mesh_server": {
+        "killed": true
+    },
+    "agentcloud_orchestrator": {
+        "killed": true
+    },
+    "agentcloudctl": {
+        "sample_rate": 0.01
+    },
+    "ai_gateway_server": {
+        "killed": true
+    },
+    "arc": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "atlas-preparer": {
+        "killed": true
+    },
+    "autodev_manifold_daemon.par": {
+        "killed": true
+    },
+    "autodev_manifold_daemon_standalone": {
+        "killed": true
+    },
+    "autodocs_server": {
+        "killed": true
+    },
+    "axon_cordis_server": {
+        "killed": true
+    },
+    "axon_server": {
+        "killed": true
+    },
+    "axon_server.r1b": {
+        "killed": true
+    },
+    "axon_server.r1c": {
+        "killed": true
+    },
+    "axon_server_common": {
+        "killed": true
+    },
+    "axon_server_hookfix": {
+        "killed": true
+    },
+    "axon_sim_runner": {
+        "killed": true
+    },
+    "axon_sim_server": {
+        "killed": true
+    },
+    "backfill_eval_datasets": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "bento": {
+        "sample_rate": 1.0
+    },
+    "bento-engine": {
+        "sample_rate": 1.0
+    },
+    "bento_cli engine": {
+        "sample_rate": 1.0
+    },
+    "bento_engine": {
+        "sample_rate": 1.0
+    },
+    "bento_kernel_ads_metric_data_service_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_ads_online_training_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_ads_ranking_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_ads_roam_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_decision_intelligence_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_decision_intelligence_binary#native-main#bundle-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "bento_kernel_default": {
+        "killed": true
+    },
+    "bento_kernel_default_binary#native-main#bundle-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "bento_kernel_fi_ml_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_fluent2_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_gain_dev_binary#native-main#bundle-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "bento_kernel_igml_assistant_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_lead_ads_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_lead_ads_binary#native-main#bundle-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "bento_kernel_mvai_binary#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bento_kernel_mvai_binary#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "bento_kernel_pyper": {
+        "killed": true
+    },
+    "bento_kernel_st_debug_binary#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "bfs2_wrapper": {
+        "killed": true
+    },
+    "biggrep_client": {
+        "sample_rate": 1.0
+    },
+    "bin_master": {
+        "killed": true
+    },
+    "buck2-daemon": {
+        "killed": true
+    },
+    "buck2-health-check": {
+        "killed": true
+    },
+    "buck2-tpx": {
+        "killed": true
+    },
+    "buck2d[full-fbsource]": {
+        "killed": true
+    },
+    "buck2d[trunk-hg-full-fbsource]": {
+        "killed": true
+    },
+    "buck2d[trunk-hg-www-plus-fbsource]": {
+        "killed": true
+    },
+    "bundle_service": {
+        "killed": true
+    },
+    "bwrap": {
+        "killed": true
+    },
+    "capacity_operator_service#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "capacity_service.par": {
+        "killed": true
+    },
+    "cathode_ios_simulator_stream_worker": {
+        "killed": true
+    },
+    "ccrafter": {
+        "killed": true
+    },
+    "cf": {
+        "killed": true
+    },
+    "cf_server_alert_triage_agent_v3#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "cf_server_bmg_smithy_agent#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "cf_server_dpp_triage_agent#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "cf_server_iso_health_rca#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "cf_server_iso_health_rca#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "cf_server_trevi_eval_local#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "cf_server_trevi_eval_local#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "cf_server_unified_auto#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "chataccd": {
+        "killed": true
+    },
+    "chataccd-capture-submit": {
+        "killed": true
+    },
+    "chataccd-post-tool-use": {
+        "killed": true
+    },
+    "chronos": {
+        "sample_rate": 1.0
+    },
+    "chronos2": {
+        "sample_rate": 1.0
+    },
+    "claude": {
+        "killed": true
+    },
+    "claude-hook-to-codex": {
+        "killed": true
+    },
+    "claude-meta": {
+        "sample_rate": 0.0,
+        "fallback_agent_tracing_disabled": true
+    },
+    "claude-meta debug": {
+        "sample_rate": 1.0
+    },
+    "claude-meta mode": {
+        "sample_rate": 1.0
+    },
+    "claude-meta rules-info": {
+        "sample_rate": 1.0
+    },
+    "clf_sidecar": {
+        "killed": true
+    },
+    "clf_sidecar_dispatcher_jdk11": {
+        "killed": true
+    },
+    "clf_sidecar_flink_clf_jex": {
+        "killed": true
+    },
+    "clf_sidecar_morse_bucket_sorter_local": {
+        "killed": true
+    },
+    "clf_sidecar_orc_dump": {
+        "killed": true
+    },
+    "clf_sidecar_skycastle_jex": {
+        "killed": true
+    },
+    "clf_sidecar_skycastle_linux": {
+        "killed": true
+    },
+    "clf_sidecar_spark-test-launcher": {
+        "killed": true
+    },
+    "clf_sidecar_spark_all_sidecar": {
+        "killed": true
+    },
+    "clf_sidecar_ws_client-d2_launcher-deps": {
+        "killed": true
+    },
+    "clicat": {
+        "sample_rate": 1.0,
+        "fallback_agent_tracing_disabled": true
+    },
+    "clippy_request_processor": {
+        "killed": true
+    },
+    "clowder_xar": {
+        "sample_rate": 1.0
+    },
+    "codemod-jest-e2e": {
+        "killed": true
+    },
+    "codex": {
+        "killed": true
+    },
+    "codex-meta": {
+        "killed": true
+    },
+    "codimango": {
+        "sample_rate": 1.0
+    },
+    "codimango-bench": {
+        "sample_rate": 1.0
+    },
+    "conf": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "conf-rs": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "conf-xar": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "conf.par": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "configerator": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "configerator2": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "configerator_real": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "confucius.par": {
+        "killed": true
+    },
+    "corp_clicat": {
+        "sample_rate": 1.0,
+        "fallback_agent_tracing_disabled": true
+    },
+    "cpp_server": {
+        "killed": true
+    },
+    "cvm_proxy_server": {
+        "killed": true
+    },
+    "cws_aria_server": {
+        "killed": true
+    },
+    "cws_waltz_api_server": {
+        "killed": true
+    },
+    "dataswarm-cli": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "dataswarm.archive_fbpkg_versions": {
+        "sample_rate": 1.0
+    },
+    "dataswarm.authorize_pipeline": {
+        "sample_rate": 1.0
+    },
+    "dataswarm.build": {
+        "sample_rate": 1.0
+    },
+    "dataswarm.find_pipeline_hlt": {
+        "sample_rate": 1.0
+    },
+    "dataswarm.find_valid_schedule": {
+        "sample_rate": 1.0
+    },
+    "dataswarm.maintainer": {
+        "sample_rate": 1.0
+    },
+    "dataswarm.nbackfill": {
+        "sample_rate": 1.0
+    },
+    "dataswarm.status": {
+        "sample_rate": 1.0
+    },
+    "dataswarm.tasks_metadata_exporter": {
+        "sample_rate": 1.0
+    },
+    "dataswarm.tester": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "dataswarm.version": {
+        "sample_rate": 1.0
+    },
+    "dataswarm_cli": {
+        "sample_rate": 0.01
+    },
+    "db": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "db_rust": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "devai_grader_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "devai_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "devmate-cli-bridge": {
+        "killed": true
+    },
+    "devmate_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "devserver-agent-service": {
+        "killed": true
+    },
+    "dm-core-thrift-server": {
+        "killed": true
+    },
+    "dm_core_thrift_server": {
+        "killed": true
+    },
+    "dpp_client_sidecar": {
+        "killed": true
+    },
+    "dpp_worker": {
+        "killed": true
+    },
+    "dq": {
+        "sample_rate": 1.0
+    },
+    "dynolog": {
+        "killed": true
+    },
+    "edenfs": {
+        "killed": true
+    },
+    "edenfsctl": {
+        "sample_rate": 1.0
+    },
+    "edgeos": {
+        "sample_rate": 0.1
+    },
+    "ehs_server": {
+        "killed": true
+    },
+    "ek": {
+        "sample_rate": 1.0
+    },
+    "ek_daemon": {
+        "killed": true
+    },
+    "embedded_master": {
+        "killed": true
+    },
+    "erlcanary": {
+        "sample_rate": 1.0
+    },
+    "faas_worker.par": {
+        "killed": true
+    },
+    "fast_mux": {
+        "killed": true
+    },
+    "fb-relay-compiler server": {
+        "killed": true
+    },
+    "fb303c": {
+        "sample_rate": 1.0
+    },
+    "fbagentc": {
+        "killed": true
+    },
+    "fbcode_hello": {
+        "sample_rate": 1.0
+    },
+    "fbpython": {
+        "killed": true
+    },
+    "fbpython.edge": {
+        "killed": true
+    },
+    "feature_proposal_cli": {
+        "sample_rate": 1.0
+    },
+    "fixit2-linttool": {
+        "sample_rate": 1.0
+    },
+    "flow_cli": {
+        "killed": true
+    },
+    "flow_cli.exe": {
+        "killed": true
+    },
+    "frontier-thrift-proxy": {
+        "killed": true
+    },
+    "fully_remote_replayer_main": {
+        "killed": true
+    },
+    "fwdproxy_ssh_proxy": {
+        "sample_rate": 1.0
+    },
+    "gateway-relay": {
+        "sample_rate": 1.0
+    },
+    "gen_ai_ipnext": {
+        "sample_rate": 1.0
+    },
+    "git": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "gojira_session_hook": {
+        "killed": true
+    },
+    "google-mux": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "guardrails_cli": {
+        "killed": true
+    },
+    "guardrails_srv": {
+        "killed": true
+    },
+    "helix_server": {
+        "killed": true
+    },
+    "hg": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "hh_client": {
+        "sample_rate": 1.0
+    },
+    "hh_server": {
+        "killed": true
+    },
+    "hh_server_request": {
+        "sample_rate": 1.0
+    },
+    "hhvm": {
+        "killed": true
+    },
+    "holodeck_queue_worker_binary": {
+        "killed": true
+    },
+    "hphpi": {
+        "killed": true
+    },
+    "hrana_server": {
+        "killed": true
+    },
+    "hub-sidecar-clippy": {
+        "killed": true
+    },
+    "hub-sidecar-clippy-test": {
+        "killed": true
+    },
+    "hub-sidecar-default": {
+        "killed": true
+    },
+    "icsp": {
+        "sample_rate": 1.0
+    },
+    "icspcli": {
+        "sample_rate": 1.0
+    },
+    "icspctl": {
+        "sample_rate": 1.0
+    },
+    "idb": {
+        "sample_rate": 1.0
+    },
+    "idb-par": {
+        "sample_rate": 1.0
+    },
+    "imoc": {
+        "sample_rate": 1.0
+    },
+    "index_server_lite": {
+        "killed": true
+    },
+    "injector_server": {
+        "killed": true
+    },
+    "inrack_aggregator_server": {
+        "killed": true
+    },
+    "integration_loop": {
+        "killed": true
+    },
+    "invoke_xar_via_trampoline": {
+        "killed": true
+    },
+    "ip_python_predictor_cu_vllm": {
+        "killed": true
+    },
+    "java": {
+        "killed": true
+    },
+    "jf": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0,
+        "outgoing_observability_flags": 66952
+    },
+    "jf_token": {
+        "killed": true
+    },
+    "jk": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "jk-probe.exe": {
+        "sample_rate": 1.0
+    },
+    "jk-py": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "jk_probe": {
+        "sample_rate": 1.0
+    },
+    "jk_py": {
+        "sample_rate": 1.0
+    },
+    "jk_py.par": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "kepler_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "lattice_master": {
+        "killed": true
+    },
+    "launcher_sensitive": {
+        "killed": true
+    },
+    "launchpad": {
+        "sample_rate": 1.0
+    },
+    "light_vllm#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "light_vllm#native-main#bundle-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "llm-rules": {
+        "killed": true
+    },
+    "llm_loadgen": {
+        "killed": true
+    },
+    "logger_cat": {
+        "killed": true
+    },
+    "lumos_trace_analysis_service": {
+        "killed": true
+    },
+    "luna_next_thrift_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "m4_service": {
+        "killed": true
+    },
+    "mailbox-cli": {
+        "sample_rate": 1.0
+    },
+    "main_cli#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "main_py3": {
+        "sample_rate": 0.01
+    },
+    "main_py3_pxar": {
+        "sample_rate": 0.01
+    },
+    "manifold": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "mapi_rig_server_item3final": {
+        "killed": true
+    },
+    "mapi_rig_server_score": {
+        "killed": true
+    },
+    "mapi_rig_server_score_meter": {
+        "killed": true
+    },
+    "mare_service": {
+        "killed": true
+    },
+    "mast": {
+        "sample_rate": 1.0
+    },
+    "master3.par": {
+        "killed": true
+    },
+    "mco": {
+        "sample_rate": 1.0
+    },
+    "mco_cli_bin": {
+        "sample_rate": 1.0
+    },
+    "mco_cli_bin#native-main#bundle-runtime#python#py_version_3_14": {
+        "sample_rate": 1.0
+    },
+    "mco_cli_bin.par": {
+        "sample_rate": 1.0
+    },
+    "memex_server.par": {
+        "killed": true
+    },
+    "meta": {
+        "killed": true
+    },
+    "meta-android-device-control.par": {
+        "killed": true
+    },
+    "meta-devui-validation#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "meta-events-stream": {
+        "killed": true
+    },
+    "meta-events-stream.par": {
+        "killed": true
+    },
+    "meta-ios-device-control.par": {
+        "killed": true
+    },
+    "meta-opsmate-skills-scout#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "meta.real": {
+        "killed": true
+    },
+    "mighty-watchdog": {
+        "killed": true
+    },
+    "migrationator_server": {
+        "killed": true
+    },
+    "miniperf": {
+        "killed": true
+    },
+    "mm-server": {
+        "killed": true
+    },
+    "mslsc": {
+        "sample_rate": 1.0
+    },
+    "mui": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "muse": {
+        "killed": true
+    },
+    "mux#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "mysql": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "mysqld": {
+        "killed": true
+    },
+    "mysqldump": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "neosql_lease_server": {
+        "killed": true
+    },
+    "nest-docker-client": {
+        "killed": true
+    },
+    "nest-docker-client-133.server": {
+        "killed": true
+    },
+    "nest-thrift-proxy": {
+        "killed": true
+    },
+    "nest_build_node_server": {
+        "killed": true
+    },
+    "offline_policy_zone_mcp_server#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "offline_policy_zone_mcp_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "oilfs": {
+        "killed": true
+    },
+    "oilfs-wrapper": {
+        "sample_rate": 1.0
+    },
+    "oilfs.bin": {
+        "killed": true
+    },
+    "old_faas_worker.par": {
+        "killed": true
+    },
+    "optimizer_server": {
+        "killed": true
+    },
+    "osc_opossum": {
+        "sample_rate": 1.0
+    },
+    "overqueued_buck2_worker": {
+        "killed": true
+    },
+    "periodic_task_server#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "periodic_task_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "php": {
+        "killed": true
+    },
+    "phps": {
+        "sample_rate": 1.0
+    },
+    "pi": {
+        "killed": true
+    },
+    "pixelcloud": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "playground_worker": {
+        "killed": true
+    },
+    "polestar": {
+        "sample_rate": 0.01
+    },
+    "polestar.polestar_cli": {
+        "sample_rate": 0.01
+    },
+    "polestar_cli": {
+        "sample_rate": 0.01
+    },
+    "polestar_cli#native-main#bundle-runtime#python#py_version_3_14": {
+        "sample_rate": 0.01
+    },
+    "polyglot_sidecar": {
+        "killed": true
+    },
+    "pool_balancer_server": {
+        "killed": true
+    },
+    "presto": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "presto-launcher": {
+        "sample_rate": 1.0
+    },
+    "presto.java": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "privacy-aware": {
+        "killed": true
+    },
+    "px": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "px.exe": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "pyfmt": {
+        "sample_rate": 1.0
+    },
+    "python3": {
+        "killed": true
+    },
+    "python3.12": {
+        "killed": true
+    },
+    "raas_server": {
+        "killed": true
+    },
+    "rackspecs_server": {
+        "killed": true
+    },
+    "reclient": {
+        "killed": true
+    },
+    "registration_authority_service": {
+        "killed": true
+    },
+    "remote_examiner_scheduler": {
+        "killed": true
+    },
+    "resource_injector_server": {
+        "killed": true
+    },
+    "rift": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "rift admin worker": {
+        "killed": true
+    },
+    "rift-cli-bridge": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "rift-cli-convert-nvfp4": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "rift-cli-hub": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "rift-cli-ipnext": {
+        "killed": false,
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0
+    },
+    "rift.py#native-main#platform-runtime#python#py_version_3_12 serve": {
+        "killed": true
+    },
+    "run_workspace": {
+        "sample_rate": 1.0
+    },
+    "scheduler_proxy_main": {
+        "killed": true
+    },
+    "scm_telem_log": {
+        "killed": true
+    },
+    "score_twiddler_server": {
+        "killed": true
+    },
+    "scribe_cat": {
+        "killed": true
+    },
+    "scsc": {
+        "sample_rate": 1.0
+    },
+    "scuba": {
+        "sample_rate": 1.0
+    },
+    "scutil": {
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "secrets_tool": {
+        "sample_rate": 1.0
+    },
+    "server": {
+        "killed": true
+    },
+    "server#native-main#bundle-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "server#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "server-local#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "server.par": {
+        "killed": true
+    },
+    "server2.par": {
+        "killed": true
+    },
+    "server3.par": {
+        "killed": true
+    },
+    "server_provisioner": {
+        "killed": true
+    },
+    "server_ranking#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "server_tr#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "service-dev#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "service_axon_server": {
+        "killed": true
+    },
+    "sglang::scheduler_TP4_EP4": {
+        "killed": true
+    },
+    "sglang::scheduler_TP6_EP6": {
+        "killed": true
+    },
+    "sglang_inference.par": {
+        "killed": true
+    },
+    "shuffler_service": {
+        "killed": true
+    },
+    "skycastle2": {
+        "sample_rate": 1.0
+    },
+    "sl": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "continue_non_agent": true
+    },
+    "sl-acl-checker": {
+        "killed": true
+    },
+    "smc_bridge_test": {
+        "killed": true
+    },
+    "sp_dbproxy": {
+        "killed": true
+    },
+    "sp_node_agent": {
+        "killed": true
+    },
+    "srconveyor": {
+        "killed": true
+    },
+    "stress_tester_server#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "stress_tester_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "surfguard_server": {
+        "killed": true
+    },
+    "suscp": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "suscp2": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "sush": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "sush2": {
+        "observe_sample_rate": 0.01,
+        "sample_rate": 1.0,
+        "fallback_agent_trace_sample_rate": 1.0
+    },
+    "t4_sidecar_fullbody_batch#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "t4_sidecar_fullbody_batch#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "tasks": {
+        "sample_rate": 1.0
+    },
+    "thrift_proxy": {
+        "killed": true
+    },
+    "thrift_replayer": {
+        "sample_rate": 0.01
+    },
+    "thrift_replayer_stable": {
+        "sample_rate": 0.01
+    },
+    "thrift_server#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "thriftdbg": {
+        "sample_rate": 1.0
+    },
+    "torchx": {
+        "sample_rate": 1.0
+    },
+    "tpai": {
+        "killed": true
+    },
+    "tpai_inference_revproxy": {
+        "killed": true
+    },
+    "tracing": {
+        "killed": true
+    },
+    "tw.real": {
+        "sample_rate": 1.0
+    },
+    "ucmp_controller": {
+        "killed": true
+    },
+    "ugs_gateway_reconciler": {
+        "killed": true
+    },
+    "unified_cli": {
+        "sample_rate": 1.0
+    },
+    "uwsgi": {
+        "killed": true
+    },
+    "validate_command": {
+        "killed": true
+    },
+    "validate_command_rs": {
+        "killed": true
+    },
+    "vmproxy": {
+        "killed": true
+    },
+    "watchman": {
+        "killed": true
+    },
+    "worker#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "wp_scenario_service_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "wrench_mcp_server#native-main#platform-runtime#python#py_version_3_12": {
+        "killed": true
+    },
+    "wrench_mcp_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "www_mcp_server#native-main#platform-runtime#python#py_version_3_14": {
+        "killed": true
+    },
+    "x2dev_proxy": {
+        "killed": true
+    },
+    "x509whoami": {
+        "killed": true
+    },
+    "xet_local_thrift_service": {
+        "killed": true
+    },
+    "yaml2json_binary": {
+        "sample_rate": 1.0
+    },
+    "yarn": {
+        "sample_rate": 1.0,
+        "outgoing_blacklist": [
+          "scribe_cat",
+          "fwdproxy"
+        ]
+    },
+    "zippy_proxy": {
+        "killed": true
+    }
+  },
+  "transports": [
+    "file_spool",
+    "scribe_socket",
+    "scribe_cat",
+    "graphapi"
+  ],
+  "observe_sample_rate": 0.01,
+  "cache_ttl_secs": 300,
+  "sample_rate": 0.01,
+  "outgoing_blacklist": [
+    "fbagent",
+    "fbagent_router_zero",
+    "SmcUpdatesNotifier",
+    "ProducerService",
+    "Smc2",
+    "FacebookService.BaseService.getStatus",
+    "BaseService.getStatus",
+    "DynoLogService",
+    "OdsRouter.setOdsRawValuesWithTags"
+  ],
+  "root_disabled": false,
+  "root_policy": "",
+  "max_trace_age_sec": 3600,
+  "normal_trace_outgoing_enabled": true,
+  "fallback_agent_tracing_disabled": false,
+  "fallback_agent_trace_policy": "art_cli_lite_fallback",
+  "fallback_agent_trace_sample_rate": 0.0001,
+  "fallback_agent_trace_scuba_mirror": true,
+  "killed_chokepoints": [
+    
+  ],
+  "edge_batching_disabled": false,
+  "killed_transports": [
+    
+  ],
+  "fork_isolation_disabled": false,
+  "inbound_agent_id_disabled": false,
+  "meta_ipv6_internal_disabled": false,
+  "atexit_finish_disabled": false,
+  "detached_spawn_isolation_disabled": false,
+  "windows_exit_guard_disabled": false,
+  "bounded_emission_waits_disabled": false,
+  "native_child_env_disabled": false,
+  "thrift_event_handler_disabled": false,
+  "spawn_env_key_match_disabled": false,
+  "emission_identity_disabled": false,
+  "chokepoint_overrides": {
+    "hack_cli": {
+        "sample_rate": 1.0
+    },
+    "thrift_init": {
+        "sample_rate": 1.0,
+        "max_trace_age_sec": 315360000
+    }
+  },
+  "seam_attribution_disabled": false,
+  "okhttp_constructor_hook_disabled": false,
+  "multiprocessing_propagation_disabled": false,
+  "detach_agent_signals_disabled": false,
+  "request_child_agent_gate_disabled": false,
+  "hack_traceparent_edge_disabled": false,
+  "hack_named_cli_disabled": false,
+  "explicit_name_wins_disabled": false,
+  "outgoing_observability_flags": 0,
+  "exit_code_disabled": false,
+  "process_start_disabled": false,
+  "ambient_artillery_context_disabled": false
+}

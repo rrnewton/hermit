@@ -1,0 +1,21 @@
+drain 4709: repair the two P3 regression tests
+
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+The exact-file-bind regression now compares the mapped path's raw
+OsStr, so it detects the old SOURCE/ spelling that PathBuf equality
+treated as SOURCE. The replay-only flag-v3 row now puts
+--cpu-profile before `--`, so it exercises the unused requested
+profile instead of passing the flag to the guest as an argument.
+
+No product behaviour changes. The remaining completed-launch-view
+limitation is handled separately under the coordinator waiver
+recorded 2026-11-05 3:19 AM ET and follow-up minibead dh-dw4dy.
+
+Validation: mapped_launch_path_preserves_an_exact_file_bind passes
+and fails on the source.join(suffix) mutant with
+Some("/host/prog-source/") != Some("/host/prog-source");
+replay_only_ignores_an_unused_requested_cpu_profile passes;
+cargo fmt --all -- --check passes.

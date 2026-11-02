@@ -1,0 +1,7 @@
+[herdr-run] engine=rust (tracked Cargo launcher: rs/bin/herdr-run)
+[herdr-run] rust cache=verified source=888f99e408f2 binary=0eea71e2a969
+GH-PACED ********************************************************************
+GH-PACED REFUSED [hermit-bot3] content guard: write body is 67475 bytes across 1 source(s), over the 8192-byte limit
+GH-PACED REFUSED [hermit-bot3] not running `pr edit` (exit 65)
+GH-PACED REFUSED [hermit-bot3] GitHub text is for short human notes. Keep evidence on the host and post a pointer (path + sha256, a tracked file, or a commit).
+GH-PACED ********************************************************************

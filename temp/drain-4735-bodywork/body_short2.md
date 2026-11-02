@@ -1,0 +1,32 @@
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+Owner: musetrain (muse, devbig014) since 2026-11-06T01:13Z
+
+Candidate: `drain/4735` @ `90bbe4baf480b5d1edbeb9584ee3a77abb1618ab` (submitted by the coordinator to the merge queue at that exact head; full-profile queue validation is the landing evidence). Author: VladimirMakaev; the original PR head is `bcb86b5490c2ad537d8b9fcf7741b27de1bb836f` on `vm/aarch64-lse-rewrite`. Original 67,489-byte description (sha256 9e4a941b5bfc73d7a547b94d7974923950379af7227048d8b67d17a7c5f39e51): see this description's GitHub edit history. Not claimed landed.
+
+**Plain Language Summary and Project Impact**
+
+On aarch64 a load/store-exclusive retry loop retires a variable number of branches for the same work: any exception between the pair clears the exclusive monitor, the store-exclusive fails, and the loop runs again, so Hermit's retired-branch counting cannot replay such a program exactly. `hermit run --rewrite-exclusives` rewrites each canonical exclusive loop in the guest executable (and any `--rewrite-exclusives-also` file) into a single FEAT_LSE atomic instruction and bind-mounts the rewritten copy over the loaded path. Before: a four-thread atomic-counter guest diverged in all four `--strict --verify --verify-strict` runs; after: it reaches bitwise parity in all four.
+
+**Background**
+
+Four idioms ending in `CBNZ Rs, <loop top>` are recognised and replaced in place at the same length (Rmw, Swap, CasCompare, CasZero), so every PC, branch target, unwind entry and signal PC stays valid and no trampoline is needed. Only `SHF_EXECINSTR` sections are scanned, and by default only `$x`-marked code ranges are rewritten (`$d` wins ties); stripped files are left alone as `no-mapping-symbols` and sections with an unsupported mapping symbol are refused as `unsupported-mapping-symbol`. `--rewrite-exclusives-stripped=heuristic` is an explicit opt-in with documented residuals (a mistaken classification can corrupt data) and is refused with `--verify-json`/`--verify-run`. `hermit rewrite-exclusives FILE...` reports the analysis without running anything. This is binary rewriting as preprocessing for the ptrace backend (like e9patch); it loads no Detcore tool through Reverie, is not a backend, and is refused on every other backend and under `--no-namespace`. `analyze`/`bisect` trials prepare the same overlays.
+
+**Determinism**
+
+The rewrite is a pure function of the input bytes and policy; each cached copy is named by format, policy, a digest of the rewritten bytes and the source mode, written via a temporary name and renamed, so a `--verify` pair and a replay map byte-identical images. A single atomic has no retry, so an interrupted site cannot add branches. Pair-to-atomic ordering is carried exactly (`AL`/`A`/`L`/plain); the one strictly stronger case (a failed `CASAL` release) cannot break a program and is unobservable under sequentialized threads.
+
+**Linux Semantics**
+
+No syscall result, errno, signal or `/proc`/`/sys` behaviour is emulated differently; the guest keeps its executable path via the bind mount (as for e9patch). Guest-observable differences the original body documents: the guest reads its rewritten instructions, the backing file is the cache copy (device/inode/mountinfo), a fault PC is one instruction later, FEAT_LSE2 misaligned atomics and a failed CAS write check differ from the original. Instruction semantics are architectural (Arm ARM DDI 0487 L.a, B2.9, C3.2.6, C3.2.12).
+
+**Validation**
+
+At `drain/4735` `90bbe4baf480b5d1edbeb9584ee3a77abb1618ab` (x86_64 unit/planner scope; no aarch64 execution is claimed on this host): the approved fix `40cf47bb3092269dd1e29478d51a6b9aad82a0ff` (ADRP+LDR reader gap, `REWRITE_FORMAT_VERSION` 6 to 7) cherry-picked cleanly onto `049ec3004350`, one commit to `90bbe4ba`. Targeted at the exact head: hermit-detcore `aarch64_lse` 77 passed; `record_serde`/`reserved_input`/`preemptions` 151 passed; hermit-run provenance 5 passed plus `aarch64_lse` 1 passed; `cargo fmt` and Clippy clean; DAG `--check` passed. Merge-tree vs main `1db0a95883`: mechanical DAG-pair conflicts only. Merge-queue full validate is pending and is the landing evidence. The author's original aarch64 record (Grace/Neoverse V2, ptrace backend, L2 bitwise parity 4/4 and schedule replay 6/6 with the rewrite, coverage and PMU companion study) is in the archived body; no L3/L4 is claimed here.
+
+**Review history**
+
+`mushep18` APPROVED-AT muse `47a7f9abe2e528902e82ee41b573763d036f3497`; `revastra2` APPROVED-AT codex `049ec30043500f567345b3534641e2f006598f94` (provenance-r4). Vladimir's fix `40cf47bb` carries two approvals (per the coordinator). A one-commit delta ack at `90bbe4ba` has been requested from `revastra2` and is pending.
+
+**Human Review Required**
+
+Trigger 3 (new determinization strategy): post-facto human review remains required, as in the archived body.

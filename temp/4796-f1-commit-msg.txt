@@ -1,0 +1,43 @@
+4796: report a blocked re-arm after exec as an uncovered interval
+
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+A thread that armed its watches, blocked SIGTRAP and exec'd could not
+re-arm in the new image, but the access trace summarized it as one
+clean armed thread and printed no incomplete-coverage warning. The
+watch ledger now closes the armed interval at a blocked/ignored
+re-arm report and summarizes the new image as its own uncovered
+interval, in the trace and in the run summary warning. Earlier
+genuine arms and hits are preserved; the thread is not relabelled as
+never armed overall.
+
+Determinism
+
+Reporting only. Interval closing is a pure function of the recorded
+watch-status sequence for each thread, summaries stay in thread and
+interval order, and no schedule, signal mask or guest-visible result
+changes. The same recorded run therefore writes the same summaries
+and warning on every replay.
+
+Linux Semantics
+
+No guest semantics change: exec still keeps the blocked signal mask
+and clears the debug registers exactly as before, and a refused
+re-arm still runs the new image unwatched. Only Hermit's coverage
+reporting for that interval changes.
+
+Validation
+
+New unit a_blocked_rearm_after_exec_is_reported_without_erasing_prior_hits
+fails before the fix (unarmed []) and passes after (armed interval with
+its hit, then SigtrapBlocked interval). New CLI case
+a_blocked_rearm_after_exec_reports_the_uncovered_interval passes beside
+the positive re-arm control
+a_watch_survives_exec_into_an_image_that_stores_first. Targeted suite:
+detcore lib 3729, detcore-model 347, watch 26/access 5, CLI watch 2 and
+access_trace 12, validation_dag 42, DAG canonical, fmt and package
+Clippy clean. Count pins recount detcore +1 and cli +1 (and on-host
+twins); DAG regenerated. No RPC definition changed, so revision 45's
+digest is unchanged.

@@ -1,0 +1,58 @@
+4709: keep each launch's own refusal ahead of the auto profile's
+
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+The merge queue's batch containing 4709 went red on two tests this
+change caused. An executable-selected backend run that named no CPU
+profile was refused for the unset `auto` default before the
+--virtual-cpus qualification it should have reported, and recording
+an initial executable with no shebang was refused by auto's
+classification instead of reaching the recorder's ENOEXEC
+explanation. Both are ordering defects in the new default: `auto`
+is what an unnamed profile means, so it must not preempt a launch's
+own refusals. The adapter pre-check now defers `auto` to launch
+admission (where a resolved nondefault profile on an unqualified
+backend is still refused), and the record path lets a readable
+initial program that is neither ELF nor script keep its own
+ENOEXEC fault under the unmarked-image profile. Explicit
+`--cpu-profile auto` on the run path still refuses a not-an-image
+program by name, as its tests require.
+
+Determinism
+
+Admission ordering only. No profile is guessed from host state: the
+adapter path resolves or refuses `auto` at the same launch admission
+as every other path, and the record path names x86-64-v2 only where
+no ISA declaration can exist (a readable non-ELF, non-script initial
+program), whose exec then fails before any guest instruction runs.
+Schedules, virtual time and guest-visible results are unchanged.
+
+Linux Semantics
+
+Matches the kernel's order of faults: execve of a readable file
+that is neither ELF nor a script fails ENOEXEC
+(fs/exec.c's exec_binprm after binfmt handlers decline), and
+Hermit's recorder explains that the shell fallback is unsupported.
+Auto's classification no longer replaces that fault with its own
+on the record path.
+
+Test Plan:
+
+- Queue batch v5 (#4722, #5163, #4709, #5120 at be275ee6f5) failed
+  6 nodes; attribution by exact reproduction: at 00652486392,
+  app::backend_hook static_adapter_options_keep_core_parser_and_
+  config_rules FAILED (passes on main d3a12c64) and
+  record_rejects_initial_executable_without_shebang FAILED (passes
+  on main); the native_config round-trips fail identically on
+  pristine main (host SIGABRT), the deadline_slice_cap replay test
+  passes on both main and this branch, and the ptrace_completion
+  real_random set is the documented host failure set.
+- At this head: both caused tests pass; CLI auto tests
+  auto_resolves_the_lowest_profile_the_guest_declares and
+  an_unset_profile_is_auto pass (explicit-auto refusal preserved);
+  CLI cpu_profile slice 15/15 and auto slice 10/10; hermit-run lib
+  1301 passed with only the host pinned_cpu (2) and real_random (5)
+  failures that do not touch this change.
+- Full-profile evidence is the merge queue's run at this exact head.

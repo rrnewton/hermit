@@ -1,0 +1,77 @@
+    /// While a backgrounded vfork-gated child holds the schedule (step 3
+    /// commits nothing but a SIGCHLD taker's or group-exit decider's turn
+    /// until it is readmitted), a preemption replay whose record does not
+    /// readmit it at this point, because its next readmission is later or it
+    /// has none left, waits; once the point has not moved for the valve, it
+    /// leaves its record and readmits the child as a fresh run would, rather
+    /// than freezing.
+    #[test]
+    fn a_preemption_replay_off_its_record_does_not_freeze_on_a_gated_vfork_child() {
+        let parent = DetTid::from_raw(7);
+        let child = ExternalOpId::new(DetTid::from_raw(25), 4);
+        for log in [
+            vec![Rejoin {
+                turn: 20,
+                wakes: 0,
+                calls: vec![(child.tid, 4)],
+                popped: None,
+            }],
+            vec![],
+        ] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.rejoin_from_preemption_record = true;
+            scheduler.vfork_barriers.insert(parent, Some(child.tid));
+            background(&mut scheduler, child, true);
+            queue_worker(&mut scheduler, DetTid::from_raw(9));
+            replaying(&mut scheduler, &log);
+            scheduler.turn = 12;
+            assert!(scheduler.step2c_process_io_blockers().is_ok(), "{log:?}");
+            assert!(
+                scheduler
+                    .blocked
+                    .external_io_blockers
+                    .contains_key(&child.tid)
+            );
+            scheduler.replay_gated_since = Some((
+                (12, 0),
+                std::time::Instant::now()
+                    .checked_sub(Scheduler::REJOIN_STALL_VALVE)
+                    .unwrap(),
+            ));
+            assert!(scheduler.step2c_process_io_blockers().is_err(), "{log:?}");
+            assert!(scheduler.rejoin_replay.is_none(), "{log:?}");
+            assert!(scheduler.rejoin_refusal.is_none(), "{log:?}");
+            assert!(scheduler.step2c_process_io_blockers().is_ok(), "{log:?}");
+            assert!(scheduler.run_queue.contains_tid(child.tid), "{log:?}");
+        }
+    }
+
+    /// A preemption replay whose record has no readmission left lets queued
+    /// pollers run while a finished call stays parked, as its recording did
+    /// if it ended with the call still out; past the valve it leaves its
+    /// record and readmits the call, rather than parking it for good.
+    #[test]
+    fn a_preemption_replay_past_its_last_readmission_parks_a_finished_call_only_up_to_the_valve() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let mut scheduler = run_rejoin_fixture(op_id, true, true);
+        scheduler.rejoin_from_preemption_record = true;
+        replaying(&mut scheduler, &[]);
+        scheduler.turn = 12;
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(
+            scheduler
+                .blocked
+                .external_io_blockers
+                .contains_key(&op_id.tid)
+        );
+        assert!(scheduler.replay_exhausted_since.is_some());
+        scheduler.turn = 4000;
+        scheduler.replay_exhausted_since =
+            std::time::Instant::now().checked_sub(Scheduler::REJOIN_STALL_VALVE);
+        assert!(scheduler.step2c_process_io_blockers().is_err());
+        assert!(scheduler.rejoin_replay.is_none());
+        assert!(scheduler.rejoin_refusal.is_none());
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.run_queue.contains_tid(op_id.tid));
+    }
+

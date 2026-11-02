@@ -1,0 +1,22 @@
+Running as unit: run-p2477560-i3558630924.scope; invocation ID: 289d5def1fce432e99a36230a6981141
+
+running 1 test
+access_trace::tests::a_blocked_rearm_after_exec_is_reported_without_erasing_prior_hits --- FAILED
+
+failures:
+
+---- access_trace::tests::a_blocked_rearm_after_exec_is_reported_without_erasing_prior_hits stdout ----
+
+thread 'access_trace::tests::a_blocked_rearm_after_exec_is_reported_without_erasing_prior_hits' (3559189) panicked at detcore/src/access_trace.rs:4170:9:
+assertion `left == right` failed
+  left: Some(WatchRunSummary { armed: 1, unarmed: [], hits: 1 })
+ right: Some(WatchRunSummary { armed: 1, unarmed: [(DetPid(3), SigtrapBlocked)], hits: 1 })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    access_trace::tests::a_blocked_rearm_after_exec_is_reported_without_erasing_prior_hits
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3728 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p hermit-detcore --lib`

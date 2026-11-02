@@ -1,0 +1,11 @@
+Running as unit: run-p2029255-i3545708341.scope; invocation ID: d23dc1f7427449e0845fec158781261b
+   Compiling hermit-detcore v0.5.4 (/home/newton/work/dev-hermit/worktrees/slots/musetrain-20261101/temp/drain-4709/detcore)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.68s
+     Running unittests src/lib.rs (target/debug/deps/detcore-26d83e239e423986)
+
+running 2 tests
+test tool_global::tests::reserved_input_exec_tests::actual_nonleader_exec_resumes_once_before_new_image_timer_take_back ... ok
+test tool_global::tests::reserved_input_exec_tests::actual_root_start_and_same_leader_exec_retain_turn_for_timer_take_back ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3730 filtered out; finished in 0.01s
+

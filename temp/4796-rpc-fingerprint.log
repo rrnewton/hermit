@@ -1,0 +1,22 @@
+Running as unit: run-p911730-i3553215471.scope; invocation ID: 6faaacccd16b46e3b8bc9d37e3085c76
+
+running 1 test
+config::tests::the_global_rpc_revision_matches_its_definitions --- FAILED
+
+failures:
+
+---- config::tests::the_global_rpc_revision_matches_its_definitions stdout ----
+
+thread 'config::tests::the_global_rpc_revision_matches_its_definitions' (1126954) panicked at detcore/src/config.rs:438:9:
+assertion `left == right` failed: GlobalRequest, GlobalResponse or Resources changed: append (46, "b434f4f465fdbb8d", "f013e36743d8d9e6") to GLOBAL_RPC_REVISIONS and set GLOBAL_RPC_REVISION to 46, so that runtimes and coordinators from either side of the change refuse each other
+  left: Some((45, "e909c0d8e85f5336", "f013e36743d8d9e6"))
+ right: Some((45, "b434f4f465fdbb8d", "f013e36743d8d9e6"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    config::tests::the_global_rpc_revision_matches_its_definitions
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3727 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p hermit-detcore --lib`

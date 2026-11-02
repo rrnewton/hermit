@@ -1,0 +1,35 @@
+drain/4796: seal the rebase onto main 5c4cbb15 (RPC 45, DAG regenerated)
+
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+Mechanical rebase seal for PR 4796 (--watch) onto current main.
+The global RPC revision is live-computed as 45: main's last row is
+40, main reserves 33-39, queued heads at this rebase carry 41 and
+42, and the allocation table reserves 43 (PR 4627) and 44
+(kvm-2b-3), so this head reserves 41-44 and appends its
+TraceSchedEvent/WithWatchOrder row as 45 with the digest measured
+at this head (b434f4f465fdbb8d). The validation DAG was recomposed
+as main plus this PR's intended count deltas and regenerated with
+the DAG tool; no intended DAG entry was dropped and no count was
+lowered.
+
+Determinism
+
+Digest, count-pin and generated-file recomputation only. The
+replayed commits' conflict resolutions are additive unions: the
+watch fields and summaries sit beside main's stacktrace-position,
+post-crash and stopless fields, and every test from both sides is
+kept.
+
+Linux Semantics
+
+No behaviour change in this seal commit.
+
+Validation
+
+config::tests::the_global_rpc_revision_matches_its_definitions
+passes with the re-pinned digest, and generate-validation-dag
+--check is canonical at this tree. Full targeted results are in
+the drain status for this head.

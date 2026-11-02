@@ -1,0 +1,2 @@
+[herdr-run] engine=rust (tracked Cargo launcher: rs/bin/herdr-run)
+[herdr-run] rust cache=verified source=888f99e408f2 binary=0eea71e2a969

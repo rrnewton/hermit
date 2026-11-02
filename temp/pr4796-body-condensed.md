@@ -1,0 +1,38 @@
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+Owner: musetrain (muse, devbig014) since 2026-11-05T10:38Z
+
+Candidate: `drain/4796` @ `1ab1d22bce0c5832d5e6fc3faf5598c56b5e2fe3` on base main `5c4cbb15fa23ff7b7e6aa6e3bab5463acc87d413` (submitted to the merge queue at that exact head; full-profile queue validation is the landing evidence). Author: VladimirMakaev; the original PR head is `c5b4f7edfe861f7147f3253a116ecb46d4afaa11`. This condensed body replaced the original 45,196-byte body (sha256 `fc05c7f321dbdd8e2af3d72ad9524fcce7ec082645782d5df187f7f663be2a7f`), archived byte-faithfully by the drain coordinator before the edit (Option B).
+
+**Plain Language Summary and Project Impact**
+
+`hermit analyze` can name the syscalls whose order decides a run, but not a race on plain memory: two threads that write one global without a syscall leave nothing in the access trace. With `--watch=ADDR[:LEN][:w|rw]` (up to four), Detcore arms the x86-64 debug registers of every guest thread on those bytes through Reverie's hardware watchpoints, and each access a thread's own instruction makes becomes a `watch_hit` record in the access trace: the thread, the instruction after the access, the event it follows and, for a thread's first 64 hits, its stack. `--watch-from=EVENT` arms the watches only once the run has recorded that many events. A watch hit stops the thread in the tracer only: the schedule and every output of the run are those of the same run without it, and a hit that could have changed the guest stops the run instead. Per thread, the first 64 hits are recorded with stacks and the last 64 without — 128 records per thread per run, whatever image changes happen in between.
+
+The drain delta on top of the author's stack fixes coverage reporting around exec: a thread that armed, blocked SIGTRAP, and exec'd cannot re-arm in the new image (exec clears the debug registers), and that uncovered interval is now reported in the trace and in the incomplete-coverage warning — including when the new image later unblocks SIGTRAP and observation resumes — without erasing the earlier image's genuine arms and hits and without resetting the per-thread hit budget.
+
+**Determinism**
+
+`--watch` only observes. No request is added: the watch order rides on replies the thread already receives, arming writes the stopped thread's debug registers through ptrace in the tracer (RCBs count user mode only), and a hit is a forced SIGTRAP that Reverie suppresses after the access retires, so nothing runs twice. `on_watchpoint_hit` records no event and charges no time; where a hit's stop could still move a timer event, Reverie says so and `--watch` refuses the run. The summary and interval reporting are pure functions of the recorded watch-status and hit sequence per thread, in thread and interval order. With-and-without equality tests compare every recorded event, its thread and its virtual time.
+
+**Linux Semantics**
+
+No Linux behaviour Hermit presents changes. The design rests on the kernel rules the original body cites at v6.16: debug registers are per thread and not inherited (`copy_thread` zeroes the child's, `arch/x86/kernel/process.c:181`), exec drops them (`flush_ptrace_hw_breakpoint`, process.c:278) while keeping the blocked signal mask, and a hit arrives as a forced SIGTRAP (`force_sig_info_to_task`, kernel/signal.c:1294-1312), which is why a thread that blocks or ignores SIGTRAP cannot be armed and is reported instead. Stores made while a thread is uncovered still run unwatched, exactly as native execution proceeds.
+
+**Validation**
+
+At `drain/4796` `1ab1d22bce0c5832d5e6fc3faf5598c56b5e2fe3` (ptrace backend; targeted slices; full profile runs in the merge queue at the exact head):
+
+- detcore lib 3731/3731; detcore-model 347/347; hermit-run watch 26, run_config 24, races 51, access 5.
+- CLI watch 2/2; CLI `access_trace::` 13/13, including the blocked-exec case, the recovered re-arm case (blocked exec, store, unblock, store: three summaries, one hit, warning), and the positive exec control.
+- hermit-manifest-plan `validation_dag::` 42/42; DAG regenerated and canonical (detcore pins 3534, cli 802, cli_on_host 721); `cargo fmt --all -- --check` and package Clippy `-D warnings` clean. Global RPC revision 45, digest unchanged by the drain delta.
+- Red-first evidence for the delta: both new ledger units failed at the parent head (empty unarmed list after recovery; 256 records for one thread across intervals) and pass at this head with exactly first 64 + last 64 = 128.
+- Independent audits at the exact head reproduced the counts and the exec witnesses through `safehermit` (including a 200/50-hit tail-spanning case: 128 total).
+
+The author's original validation record (strict-host chaos/replay equality, `--verify-strict` bitwise parity, hot-word overhead of about 30 µs per hit) is in the archived pre-condense body.
+
+**Human Review Required**
+
+Trigger 3 (new determinization strategy), as classified for the drain: dual adversarial review at the exact head `1ab1d22bce0c5832d5e6fc3faf5598c56b5e2fe3` — Codex-family APPROVED and Claude-family APPROVED, after two review rounds on the exec-interval reporting (permanently blocked case, then recovery and the per-thread budget). Post-facto human review remains required.
+
+**Not claimed**
+
+Watchpoints on aarch64 or any backend but ptrace (refused); accesses the kernel makes for a syscall; the two unwatched windows the original body names (a new thread before it unblocks SIGTRAP or reaches its first stop with a reply); a thread that blocks SIGTRAP at every stop is reported, not watched.

@@ -1,0 +1,21 @@
+drain 4709: pin direct post-exec tests to x86-64-v2
+
+[hermit2, musetrain, tbh-1005, devbig014, role=impl]
+
+Plain Language Summary and Project Impact
+
+The rebase onto current main brought in two reserved-input exec tests
+that invoke Detcore's post-exec callback directly, without a launch to
+resolve the new Auto CPU-profile default. Those fixtures now name the
+x86-64-v2 profile a launch of their unmarked image would resolve, as
+the existing direct post-exec fixtures do. Their assertions are
+unchanged.
+
+This also commits the validation DAG regenerated at the rebased head,
+so the generated expected-executed counts match the typed DAG already
+in the branch.
+
+Validation: both reserved-input actual-exec tests pass; the sequential
+Detcore exec_ slice passes 187 tests; targeted CPU-profile, exec-record,
+manifest, CLI auto, formatting, DAG freshness, and workspace Clippy
+checks pass.
