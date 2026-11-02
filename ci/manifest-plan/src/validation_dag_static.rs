@@ -1953,7 +1953,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // kvm_failure_tests::kvm_vfork_child_refusals_are_policy_refusals
     // (https://github.com/rrnewton/hermit/issues/5025): 1330 + 1 = 1331,
     // measured by nextest list.
-    ("test.hermit_unit", 1331),
+    ("test.hermit_unit", 1333),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4592,7 +4592,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Package K slice K8-d's
     // the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux: 779 + 1
     // = 780, measured by nextest list.
-    ("test.cli", 780),
+    ("test.cli", 781),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
