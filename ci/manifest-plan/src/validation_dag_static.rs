@@ -1958,7 +1958,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
     // hermit-run units: 1331 + 2 = 1333, measured by the 216dbc929a full
     // validate.
-    ("test.hermit_unit", 1333),
+    ("test.hermit_unit", 1335),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4605,7 +4605,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // = 780, measured by nextest list.
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds seven cli
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
-    ("test.cli", 787),
+    ("test.cli", 788),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5233,7 +5233,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same K8-d cli case: 698 + 1 = 699, measured by nextest list.
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
-    ("test.cli_on_host", 706),
+    ("test.cli_on_host", 707),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6197,7 +6197,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same KVM vfork-child refusal unit: 1324 + 1 = 1325, measured by
     // nextest list.
     // Train 1 recount (same growth as test.hermit_unit): 1325 + 2 = 1327.
-    ("test.hermit_unit_on_host", 1327),
+    ("test.hermit_unit_on_host", 1329),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
