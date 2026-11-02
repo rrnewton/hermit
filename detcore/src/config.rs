@@ -87,16 +87,18 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 39 are reserved for
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 36 and 38 to 39 are reserved for
     /// pending changes in the coordinator's allocation table (39 for kvm
     /// 2b-1). At this head 28 is https://github.com/rrnewton/hermit/pull/4789's,
     /// 29 is https://github.com/rrnewton/hermit/pull/4884's, 30 is
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
     /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
-    /// layout on top of 31's, and 40, the `CpuClockProcess` pair allocated
-    /// to https://github.com/rrnewton/hermit/pull/4885, is the current
-    /// revision.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39];
+    /// layout on top of 31's, 40 is the `CpuClockProcess` pair allocated
+    /// to https://github.com/rrnewton/hermit/pull/4885, and 41, PR #4759's
+    /// `TraceSchedEventResponse::backstop` renumbered from its allocated
+    /// 37 at its rebase after 40 landed, is the current revision. Remove
+    /// an entry when its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 38, 39];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -270,6 +272,15 @@ mod tests {
         // (the stopless layout on top of 31), skipping reserved 33 to 39;
         // digests measured at this head).
         (40, "3919013da0508f27", "f013e36743d8d9e6"),
+        // Adds `TraceSchedEventResponse::backstop`, the replay backstop of a
+        // schedule replay of a record whose slices ran without the
+        // `--max-timeslice` bound, which `GlobalResponse::TraceSchedEvent`
+        // carries. The reply's fields are digested as `TRACE_REPLY_WIRE`
+        // items, so the field changes the digest in domain 5
+        // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
+        // 25 on its own base after main's 24, renumbered to 41 at its rebase
+        // after landed 40; digest measured at this head).
+        (41, "0000000000000000", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -557,6 +568,27 @@ mod tests {
         assert_ne!(documented, replayer);
         assert_eq!(
             definition_digest(source, payload, schedule, &documented),
+            digest
+        );
+
+        // The reply this change extends is covered the same way: a field
+        // added to `TraceSchedEventResponse`, or its backstop removed,
+        // changes the digest (domain 5); the positional response a runtime
+        // decodes changes with it.
+        let nested_added = source.replacen(
+            "pub struct TraceSchedEventResponse {\n",
+            "pub struct TraceSchedEventResponse {\n    added: bool,\n",
+            1,
+        );
+        assert_ne!(nested_added, source);
+        assert_ne!(
+            definition_digest(&nested_added, payload, schedule, replayer),
+            digest
+        );
+        let nested_removed = source.replacen("    backstop: Option<LogicalTime>,\n", "", 1);
+        assert_ne!(nested_removed, source);
+        assert_ne!(
+            definition_digest(&nested_removed, payload, schedule, replayer),
             digest
         );
 
