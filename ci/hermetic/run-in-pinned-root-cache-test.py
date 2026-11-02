@@ -104,6 +104,7 @@ class CargoCacheMounts(unittest.TestCase):
         git_location=None,
         command=None,
         caller_affinity=None,
+        v11_image=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -121,6 +122,9 @@ class CargoCacheMounts(unittest.TestCase):
         if run_state is not None:
             env["VALIDATE_RUN_STATE"] = str(run_state)
             forwarded += ["--env", "VALIDATE_RUN_STATE"]
+        if v11_image is not None:
+            env["HERMIT_MAPPED_PACKET_V11_IMAGE"] = str(v11_image)
+            forwarded += ["--env", "HERMIT_MAPPED_PACKET_V11_IMAGE"]
         result = subprocess.run(
             [
                 "bash",
@@ -648,6 +652,48 @@ class CargoCacheMounts(unittest.TestCase):
                 ]
             ],
         )
+
+    def test_explicit_v11_fixture_is_mounted_read_only_without_copying_its_bytes(self):
+        fixture = self.root / "external V11 fixture.elf"
+        contents = b"test-only fixture transport; not the qualified V11 operand"
+        fixture.write_bytes(contents)
+        before = fixture.stat()
+        result, calls = self.invoke(v11_image=fixture)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        self.assertIn(
+            f"type=bind,source={fixture},destination=/run/hermit-mapped-packet-v11.elf,ro=true",
+            argv,
+        )
+        self.assertIn(
+            "HERMIT_MAPPED_PACKET_V11_IMAGE=/run/hermit-mapped-packet-v11.elf", argv
+        )
+        self.assertEqual(fixture.read_bytes(), contents)
+        after = fixture.stat()
+        self.assertEqual((after.st_dev, after.st_ino, after.st_size),
+                         (before.st_dev, before.st_ino, before.st_size))
+        self.assertEqual(argv[-2:], ["/not-executed/command", "literal argument"])
+
+    def test_invalid_v11_fixture_refuses_before_container_launch(self):
+        regular = self.root / "actual fixture.elf"
+        regular.write_bytes(b"preserve external bytes")
+        symlink = self.root / "fixture symlink.elf"
+        symlink.symlink_to(regular)
+        fifo = self.root / "fixture fifo"
+        os.mkfifo(fifo)
+        comma = self.root / "fixture,with-delimiter.elf"
+        comma.write_bytes(b"preserve delimiter bytes")
+        for fixture in ["relative.elf", self.root / "missing.elf", self.root,
+                        symlink, fifo, comma]:
+            with self.subTest(fixture=fixture):
+                self.capture.unlink(missing_ok=True)
+                result, calls = self.invoke(v11_image=fixture)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("HERMIT_MAPPED_PACKET_V11_IMAGE", result.stderr)
+                self.assertFalse(any(call[0] == "run" for call in calls))
+        self.assertEqual(regular.read_bytes(), b"preserve external bytes")
+        self.assertEqual(comma.read_bytes(), b"preserve delimiter bytes")
 
     def test_relocates_real_nested_submodule_configs_without_changing_host_metadata(
         self,

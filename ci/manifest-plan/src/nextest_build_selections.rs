@@ -10,6 +10,15 @@
 
 pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
     match tag {
+        "test.in_guest_trap_native_liteinst_on" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "liteinst,native-exec,exec-stop-launcher,mm-cancellation-test-support",
+            "--bins",
+            "--test",
+            "cli",
+        ]),
         "test.regular_crates" | "test.isolated_detcore_workdir" => Some(&[
             "--workspace",
             "--exclude",
@@ -818,6 +827,35 @@ mod tests {
     use super::*;
     use crate::nextest_binaries::REQUIRED_ENV;
     use crate::nextest_binaries::SELECTION_ENV;
+
+    #[test]
+    fn native_liteinst_on_has_the_exact_supported_prepared_selection() {
+        let selection = for_step("test.in_guest_trap_native_liteinst_on").unwrap();
+        assert_eq!(
+            selection,
+            &[
+                "-p",
+                "hermit-run",
+                "--features",
+                "liteinst,native-exec,exec-stop-launcher,mm-cancellation-test-support",
+                "--bins",
+                "--test",
+                "cli",
+            ]
+        );
+        let graph = crate::validation_dag_static::config();
+        let step = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.in_guest_trap_native_liteinst_on")
+            .unwrap();
+        assert_command_selection(step).unwrap();
+        assert_eq!(step.env[REQUIRED_ENV], "1");
+        assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "2");
+        assert!(step.cmd.ends_with(
+            "-E '(binary(=hermit) & test(=native_exec_run::tests::initial_redemption_preserves_bootstrap_mask_immediate_and_delayed)) | (binary(=cli) & test(=native_exec_checks_its_declared_inputs_without_an_ordinary_preload))'"
+        ));
+    }
 
     #[test]
     fn child_time_rpc_is_prepared_and_executed_in_both_integration_variants() {

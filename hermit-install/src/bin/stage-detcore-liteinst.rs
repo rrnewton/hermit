@@ -1,5 +1,8 @@
 //! Finalize the ordinary packaged Detcore preload after the outer Cargo build.
 //! This executable must never be called by a Cargo build script.
+#[path = "../../../liteinst-runtime-build/consumer_policy.rs"]
+mod consumer_policy;
+
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -84,6 +87,7 @@ fn run() -> proof::Result<()> {
         proof::VerifiedCompiledSources::resolve_content(&expectation, &mut runner)?
     };
     let pending = resources.join(format!(".libdetcore_liteinst.so.{serial}"));
+    let mut current_build_sources = None;
     let result = (|| {
         let profile_inputs = proof::FileIdentity::read(&manifest)?;
         let profile_document: toml::Value = fs::read_to_string(&manifest)
@@ -124,10 +128,11 @@ fn run() -> proof::Result<()> {
                 && package.crate_types == ["cdylib"],
             "fresh metadata selected a different Detcore runtime",
         )?;
-        let cargo_args = vec![
+        let mut cargo_args = vec![
             "build".into(),
             "--locked".into(),
             "--offline".into(),
+            "--no-default-features".into(),
             "--manifest-path".into(),
             manifest.to_string_lossy().into_owned(),
             "-p".into(),
@@ -139,6 +144,14 @@ fn run() -> proof::Result<()> {
             target.to_string_lossy().into_owned(),
             "--message-format=json-render-diagnostics".into(),
         ];
+        let features: Vec<String> = if cfg!(feature = "liteinst") {
+            vec!["liteinst".into()]
+        } else {
+            Vec::new()
+        };
+        if !features.is_empty() {
+            cargo_args.extend(["--features".into(), features.join(",")]);
+        }
         let cargo_version = runner.text("cargo", &["--version", "--verbose"], &root)?;
         let rustc_version = runner.text("rustc", &["--version", "--verbose"], &root)?;
         let output = runner.run("cargo", &cargo_args, &root)?;
@@ -147,7 +160,7 @@ fn run() -> proof::Result<()> {
         let artifact = proof::select_artifact(
             std::str::from_utf8(&output).map_err(|e| e.to_string())?,
             package,
-            &[],
+            &features,
             &expected_profile,
             &target,
         )?;
@@ -155,10 +168,32 @@ fn run() -> proof::Result<()> {
             artifact.reported_path == target.join("liteinst-runtime/libdetcore_liteinst.so"),
             "Cargo reported a different ordinary runtime output",
         )?;
+        current_build_sources = if cfg!(feature = "liteinst") {
+            None
+        } else {
+            let build_command = runner
+                .commands
+                .last()
+                .ok_or("ordinary runtime build command was not retained")?
+                .clone();
+            let policy = proof::VerifiedConsumerPolicy::resolve(
+                &sources,
+                consumer_policy::specification(proof::ConsumerRecipe::Allocation101LayoutB),
+                &mut runner,
+            )?;
+            Some(sources.with_consumer_build(
+                &policy,
+                &build_command,
+                &artifact.reported_path,
+                &target,
+                &mut runner,
+            )?)
+        };
+        let sources = current_build_sources.as_ref().unwrap_or(&sources);
         let qualification = proof::qualify_detcore_constructor_with_sources(
             &artifact.reported_path,
             &mut runner,
-            &sources,
+            sources,
         )?;
         qualifier_source.verify()?;
         profile_inputs.verify()?;
@@ -189,6 +224,7 @@ fn run() -> proof::Result<()> {
             "compiled_sources":sources.record(),"qualification":qualification}),
         )
     })();
+    let sources = current_build_sources.as_ref().unwrap_or(&sources);
     let result = close(result, sources.verify_unchanged(&mut runner));
     let mut record = match result {
         Ok(record) => record,
@@ -197,8 +233,8 @@ fn run() -> proof::Result<()> {
             return Err(error);
         }
     };
-    fs::rename(&pending, &installed).map_err(|e| e.to_string())?;
     let publication = (|| {
+        fs::rename(&pending, &installed).map_err(|e| e.to_string())?;
         let installed_identity = proof::FileIdentity::read(&installed)?;
         require(
             record["qualification"]["artifact"]["sha256"] == installed_identity.sha256,
@@ -234,6 +270,7 @@ fn run() -> proof::Result<()> {
         Ok(())
     })();
     if let Err(error) = close(publication, sources.verify_unchanged(&mut runner)) {
+        let _ = fs::remove_file(&pending);
         let _ = fs::remove_file(&installed);
         let _ = fs::remove_file(&receipt);
         return Err(error);

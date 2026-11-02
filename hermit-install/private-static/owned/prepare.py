@@ -29,7 +29,7 @@ PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
-RUNTIME_COHORT_SHA256 = 'fe8e6cec39c0ea76212833d5e453603dffc71d305fcdd919a7f5cde9cf5622ae'
+RUNTIME_COHORT_SHA256 = 'c5e847f9699800d25868f80ba5ea2d81221aeefb0fc63b359903f52b42a256d6'
 REQUIRED_HANDOFF_SOURCE_SHA256 = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
 
 
@@ -1252,9 +1252,9 @@ def main():
                     digests[key]=values[0];result[key.lower()]=values[0]
                 manifest = str(Path(c['H']) / 'detcore-liteinst/Cargo.toml')
                 features = 'exec-native-injection,exec-private-init,loader-private-runtime'
-                metadata_args = ['metadata','--locked','--offline','--format-version=1','--manifest-path',manifest,
+                metadata_args = ['metadata','--locked','--offline','--no-default-features','--format-version=1','--manifest-path',manifest,
                                  '--filter-platform','x86_64-unknown-linux-musl','--features',features]
-                archive_args = ['rustc','--locked','--offline','--manifest-path',manifest,'--lib','--target',
+                archive_args = ['rustc','--locked','--offline','--no-default-features','--manifest-path',manifest,'--lib','--target',
                                 'x86_64-unknown-linux-musl','--profile','liteinst-runtime','--features',features,
                                 '--crate-type','staticlib','--message-format=json-render-diagnostics','--target-dir',c['target']]
                 # Original outer and nested owner controls resolve before the link.

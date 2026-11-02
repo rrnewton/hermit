@@ -176,21 +176,21 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
 // Its two fixed package members are original regular files, authenticated by
 // RetainedImage's original identity/byte contract, never a seal exemption for
 // an arbitrary role. These records confer no runtime/source qualification.
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RetainedPackageFileMeta {
     pub(crate) state: [u64; 8],
     pub(crate) sha256: String,
 }
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MappedPackageMeta {
     pub(crate) image: RetainedPackageFileMeta,
     pub(crate) descriptor: RetainedPackageFileMeta,
 }
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MappedPackageManifest {
@@ -200,7 +200,7 @@ struct MappedPackageManifest {
     image_fd: RawFd,
     descriptor_fd: RawFd,
 }
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 fn decode_with_mapped_package(bytes: &[u8]) -> Result<(Manifest, Option<MappedPackageManifest>)> {
     // The final concrete decoder still denies unknown fields and schemas.
     // A schema probe changes no legacy schema or sealed-role validation.
@@ -221,7 +221,7 @@ fn decode_with_mapped_package(bytes: &[u8]) -> Result<(Manifest, Option<MappedPa
     envelope.sealed.objects.clear();
     Ok((sealed, Some(envelope)))
 }
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 fn package_fd_set(
     package: &MappedPackageManifest,
     manifest_fd: RawFd,
@@ -437,7 +437,7 @@ impl VerifyInputsOpts {
         SealedFiles::seal(inputs)?.export()
     }
     pub fn main(&self) -> Result<hermit::ExitStatus> {
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         ensure!(
             !self.in_guest_exec_stop,
             "exec-stop-launcher-not-compiled: mapped verify-inputs requires the loader feature"
@@ -465,20 +465,20 @@ impl VerifyInputsOpts {
             .collect::<Result<Vec<_>>>()?;
         // Authenticate resources once, before consuming real stdin. The
         // inherited original OFDs, not later path discovery, serve both runs.
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let image = self
             .in_guest_exec_stop
             .then(super::mapped_first_admission::RetainedImage::open)
             .transpose()?;
         let stdin = freeze_stdin(super::startup_stdin()?)?;
         let (producer, objects) = self.capture_objects(&inputs)?;
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let bytes = if let Some(image) = image {
             encode_with_mapped_package(producer, objects, self.manifest_fd, image)?
         } else {
             serde_json::to_vec(&place(producer, objects, self.manifest_fd)?)?
         };
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let bytes = serde_json::to_vec(&place(producer, objects, self.manifest_fd)?)?;
         let (manifest_fd, _, _) =
             seal_into_memfd(c"hermit-shared-inputs-manifest", &mut bytes.as_slice())?;
@@ -568,7 +568,7 @@ fn place_object_fd(fd: OwnedFd, manifest_fd: RawFd) -> Result<(RawFd, OwnedFd)> 
 /// Consumes the holder's image after exporting its original OFDs. The caller
 /// seals these bytes with its original manifest producer; neither child run
 /// may re-discover a resource path.
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 pub(crate) fn encode_with_mapped_package(
     producer: String,
     objects: Vec<(SharedObjectMeta, OwnedFd)>,
@@ -642,7 +642,7 @@ pub(crate) struct AdoptedInputs {
     producer: String,
     manifest: OwnedFd,
     objects: Vec<(SharedObjectMeta, OwnedFd)>,
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     mapped_package: Option<super::mapped_first_admission::RetainedImage>,
 }
 
@@ -650,7 +650,7 @@ impl AdoptedInputs {
     /// Hand the checked objects to their owner's [`SharedInputs::adopt`].
     #[allow(dead_code)] // The native-exec consumer is the first caller.
     pub(crate) fn into_inputs<T: SharedInputs>(self) -> Result<T> {
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         ensure!(
             self.mapped_package.is_none(),
             "mapped package must be explicitly retained before consuming inputs"
@@ -667,7 +667,7 @@ impl AdoptedInputs {
             producer,
             manifest: File::open("/dev/null")?.into(),
             objects,
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             mapped_package: None,
         })
     }
@@ -724,13 +724,13 @@ impl AdoptedInputs {
     }
     /// Presence DATA only, so callers can reject a mapped package in a
     /// non-mapped domain before retaining unrelated generic inputs.
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     pub(crate) fn has_mapped_package(&self) -> bool {
         self.mapped_package.is_some()
     }
     /// Transfer the original image owner once; native/ordinary sealed inputs
     /// remain here for their existing consumer. Missing/repeated take refuses.
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     pub(crate) fn take_mapped_package(
         &mut self,
     ) -> Result<super::mapped_first_admission::RetainedImage> {
@@ -765,17 +765,17 @@ pub(crate) fn adopt(manifest_fd: RawFd) -> Result<AdoptedInputs> {
     let manifest_owner = unsafe { OwnedFd::from_raw_fd(manifest_fd) };
     let mut bytes = Vec::new();
     File::open(format!("/proc/self/fd/{manifest_fd}"))?.read_to_end(&mut bytes)?;
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     let (manifest, package) = decode_with_mapped_package(&bytes)?;
-    #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+    #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
     let manifest = decode_manifest(&bytes)?;
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     let mut seen = package
         .as_ref()
         .map(|package| package_fd_set(package, manifest_fd))
         .transpose()?
         .unwrap_or_default();
-    #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+    #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
     let mut seen = std::collections::BTreeSet::new();
     let mut objects = Vec::with_capacity(manifest.objects.len());
     for object in manifest.objects {
@@ -815,7 +815,7 @@ pub(crate) fn adopt(manifest_fd: RawFd) -> Result<AdoptedInputs> {
         };
         objects.push((meta, owned));
     }
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     let mapped_package = package
         .map(|package| {
             let files = [package.image_fd, package.descriptor_fd].map(|fd| {
@@ -836,7 +836,7 @@ pub(crate) fn adopt(manifest_fd: RawFd) -> Result<AdoptedInputs> {
         producer: manifest.producer,
         manifest: manifest_owner,
         objects,
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         mapped_package,
     })
 }
@@ -905,7 +905,7 @@ pub(crate) fn retire_inherited_keeping_shared_inputs(
     if let Some((_, Ok(adopted))) = entry.as_ref() {
         kept.push(adopted.manifest.as_fd());
         kept.extend(adopted.objects.iter().map(|(_, object)| object.as_fd()));
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         if let Some(package) = &adopted.mapped_package {
             kept.extend(package.pair_fds());
         }
@@ -1015,7 +1015,7 @@ mod tests {
         );
         drop(args);
 
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         {
             // A wrong backend must retain its typed refusal before consuming
             // even an ordinary holder. Cover top-level and direct entry.
@@ -1097,7 +1097,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+    #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
     #[test]
     fn mapped_holder_without_feature_refuses_before_stdin_or_program() {
         let opts = VerifyInputsOpts::try_parse_from([
@@ -1144,7 +1144,7 @@ mod tests {
             (13, *detcore::Digest::new(b"original DATA"))
         );
     }
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     fn numeric_package_envelope() -> serde_json::Value {
         // Decoder DATA only: this does not model an executable package positive.
         serde_json::json!({"schema":3,
@@ -1155,7 +1155,7 @@ mod tests {
                        "descriptor":{"state":[9,10,11,12,13,14,15,16],"sha256":"33".repeat(32)}},
             "image_fd":206,"descriptor_fd":207})
     }
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     #[test]
     fn package_envelope_preserves_legacy_schema_and_all_sealed_metadata() {
         let value = numeric_package_envelope();
@@ -1177,7 +1177,7 @@ mod tests {
             assert!(decode_with_mapped_package(&serde_json::to_vec(&bad).unwrap()).is_err());
         }
     }
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     #[test]
     fn package_envelope_refuses_foreign_missing_duplicate_and_unknown_members() {
         let value = numeric_package_envelope();
@@ -1207,7 +1207,7 @@ mod tests {
         unknown["schema"] = 4.into();
         assert!(decode_with_mapped_package(&serde_json::to_vec(&unknown).unwrap()).is_err());
     }
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     #[test]
     fn package_descriptors_require_distinct_live_nonreserved_numbers() {
         let high_file = || {
@@ -1279,7 +1279,7 @@ mod tests {
                 producer: producer.into(),
                 manifest: File::open("/dev/null").unwrap().into(),
                 objects,
-                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
                 mapped_package: None,
             }
         };

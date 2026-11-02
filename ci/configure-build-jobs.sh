@@ -3258,8 +3258,15 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3df91c9c71bdc5c77571974cbabfca20183a08de ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3df91c9c71bdc5c77571974cbabfca20183a08de (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 4a986e54d4b249f43d1058a1b1cf3c650ca353f3 (2026-11-02): from 3df91c9c71bdc5c77571974cbabfca20183a08de.
+# Port the optional LiteInst site-patching feature onto current Reverie main,
+# retaining its shared in-guest loader/preload/RPC and native-exec paths.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between these pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba). The measured DynamoRIO
+# SDK build budget carries unchanged; this is not runtime qualification.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4a986e54d4b249f43d1058a1b1cf3c650ca353f3 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4a986e54d4b249f43d1058a1b1cf3c650ca353f3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

@@ -2355,6 +2355,203 @@ fn parse_buck_build_pin_binding(line: &str) -> Result<Option<String>, String> {
 const UNSTAMPED_RELEASE_ALIAS: &str =
     "release_build_env = hermit_build_env if release_unstamped else {";
 
+/// Recognize only literal, top-level Buck target calls that bind the shared env.
+/// This is not a Starlark evaluator: unsupported provenance syntax fails closed.
+/// Older --repo checkouts need the original pair; the explicit trap-only pair
+/// is optional only as a complete pair, with every name/kind/env checked.
+fn buck_build_env_consumers(contents: &str) -> Result<usize, String> {
+    let bytes = contents.as_bytes();
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let start = cursor;
+        match bytes[cursor] {
+            b if b.is_ascii_whitespace() => cursor += 1,
+            b'#' => {
+                while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                    cursor += 1;
+                }
+            }
+            quote @ (b'\'' | b'"') => {
+                let width = if bytes[cursor..].starts_with(&[quote; 3]) {
+                    3
+                } else {
+                    1
+                };
+                cursor += width;
+                loop {
+                    if cursor >= bytes.len() {
+                        return Err("unterminated Buck string".to_string());
+                    }
+                    if bytes[cursor] == b'\\' {
+                        cursor += 2;
+                    } else if bytes[cursor..].starts_with(&[quote; 3][..width]) {
+                        cursor += width;
+                        break;
+                    } else if width == 1 && bytes[cursor] == b'\n' {
+                        return Err("newline in a single-line Buck string".to_string());
+                    } else {
+                        cursor += 1;
+                    }
+                }
+                tokens.push((&contents[start..cursor], start));
+            }
+            b if b.is_ascii_alphanumeric() || b == b'_' => {
+                cursor += 1;
+                while cursor < bytes.len()
+                    && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+                {
+                    cursor += 1;
+                }
+                tokens.push((&contents[start..cursor], start));
+            }
+            b'\\' => {
+                return Err(
+                    "unsupported Buck line continuation outside a string/comment".to_string(),
+                );
+            }
+            b if b.is_ascii() => {
+                cursor += 1;
+                tokens.push((&contents[start..cursor], start));
+            }
+            _ => return Err("non-ASCII Buck syntax outside a string/comment".to_string()),
+        }
+    }
+
+    let targets = [
+        ("rust_library", "\"libhermit\""),
+        ("rust_binary", "\"hermit\""),
+        ("rust_library", "\"libhermit-trap-only\""),
+        ("rust_binary", "\"hermit-trap-only\""),
+    ];
+    let closing = |open| match open {
+        "(" => ")",
+        "[" => "]",
+        "{" => "}",
+        _ => "",
+    };
+    let mut counts = [0usize; 4];
+    let mut nesting = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let (rule, offset) = tokens[index];
+        let at_line_start = offset == 0 || bytes[offset - 1] == b'\n';
+        if nesting.is_empty()
+            && at_line_start
+            && tokens.get(index + 1).is_some_and(|token| token.0 == "(")
+        {
+            let mut stack = vec!["("];
+            let mut arguments = Vec::new();
+            let mut argument_start = index + 2;
+            let mut end = argument_start;
+            loop {
+                let token = tokens.get(end).ok_or("unterminated Buck call")?.0;
+                match token {
+                    "(" | "[" | "{" => stack.push(token),
+                    ")" | "]" | "}" => {
+                        if stack.pop().map(closing) != Some(token) {
+                            return Err("mismatched Buck call delimiter".to_string());
+                        }
+                        if stack.is_empty() {
+                            if argument_start < end {
+                                arguments.push(&tokens[argument_start..end]);
+                            }
+                            break;
+                        }
+                    }
+                    "," if stack.len() == 1 => {
+                        arguments.push(&tokens[argument_start..end]);
+                        argument_start = end + 1;
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
+            let mut names = Vec::new();
+            let mut envs = Vec::new();
+            let mut expands_kwargs = false;
+            for argument in arguments {
+                if argument.first().is_some_and(|token| token.0 == "*") {
+                    expands_kwargs = true;
+                }
+                if argument.get(1).is_some_and(|token| token.0 == "=") {
+                    match argument[0].0 {
+                        "name" => names.push(argument),
+                        "env" => envs.push(argument),
+                        _ => {}
+                    }
+                }
+            }
+            let name = match names.as_slice() {
+                [argument] if argument.len() == 3 => Some(argument[2].0),
+                [] => None,
+                _ => return Err("ambiguous or nonliteral Buck target name".to_string()),
+            };
+            let target = targets
+                .iter()
+                .position(|(_, expected)| Some(*expected) == name);
+            let mentions_env = envs
+                .iter()
+                .any(|argument| argument.iter().any(|token| token.0 == "hermit_build_env"));
+            if target.is_some() || mentions_env {
+                let target =
+                    target.ok_or("shared build env is consumed by an unexpected target")?;
+                let head_end = contents[offset..]
+                    .find('\n')
+                    .map_or(contents.len(), |n| offset + n);
+                let tail_start = contents[..tokens[end].1].rfind('\n').map_or(0, |n| n + 1);
+                let tail_end = contents[tokens[end].1..]
+                    .find('\n')
+                    .map_or(contents.len(), |n| tokens[end].1 + n);
+                if rule != targets[target].0
+                    || contents[offset..head_end]
+                        .split('#')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .strip_suffix('(')
+                        != Some(rule)
+                    || contents[tail_start..tail_end]
+                        .split('#')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        != ")"
+                    || expands_kwargs
+                    || envs.len() != 1
+                    || envs[0].len() != 3
+                    || envs[0][2].0 != "hermit_build_env"
+                {
+                    return Err(format!(
+                        "{} must be one literal {} call with its own shared env",
+                        targets[target].1, targets[target].0
+                    ));
+                }
+                counts[target] += 1;
+                if counts[target] != 1 {
+                    return Err(format!("duplicate Buck target {}", targets[target].1));
+                }
+            }
+            index = end + 1;
+            continue;
+        }
+        match rule {
+            "(" | "[" | "{" => nesting.push(rule),
+            ")" | "]" | "}" if nesting.pop().map(closing) != Some(rule) => {
+                return Err("mismatched top-level Buck delimiter".to_string());
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if !nesting.is_empty() || counts[0] != 1 || counts[1] != 1 || counts[2] != counts[3] {
+        return Err(
+            "require libhermit/hermit and either both or neither trap-only targets".to_string(),
+        );
+    }
+    Ok(counts.iter().sum())
+}
+
 fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     let path = root.join(BUCK_BUILD_PIN_SITE);
     let contents = match fs::read_to_string(&path) {
@@ -2385,20 +2582,24 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
             _ => invalid_mentions.push((index + 1, code)),
         }
     }
+    let named_consumers = buck_build_env_consumers(&contents);
     if build_env_starts.len() != 1
-        || build_env_consumers != 2
+        || named_consumers.as_ref().ok() != Some(&build_env_consumers)
         || release_aliases > 1
         || !invalid_mentions.is_empty()
     {
         loud_header("BUCK BUILD ENV MISSING OR AMBIGUOUS - BLOCKED");
         eprintln!("Canonical Reverie pin: {pin}");
         eprintln!(
-            "Expected exactly one canonical `hermit_build_env = {{` block, two `env = hermit_build_env,` consumers, at most one `{UNSTAMPED_RELEASE_ALIAS}` line, and no reassignment or mutation in {BUCK_BUILD_PIN_SITE}; found {} block opener(s), {} consumer(s), {} alias line(s), and {} unsupported active mention(s).",
+            "Expected one canonical `hermit_build_env = {{` block, named libhermit/hermit consumers and either both or neither named trap-only consumers, at most one `{UNSTAMPED_RELEASE_ALIAS}` line, and no reassignment or mutation in {BUCK_BUILD_PIN_SITE}; found {} block opener(s), {} consumer(s), {} alias line(s), and {} unsupported active mention(s).",
             build_env_starts.len(),
             build_env_consumers,
             release_aliases,
             invalid_mentions.len()
         );
+        if let Err(reason) = named_consumers {
+            eprintln!("Buck target provenance: {reason}.");
+        }
         for (line, code) in &invalid_mentions {
             eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: {code}");
         }
@@ -3987,7 +4188,7 @@ mod tests {
         fs::write(
             buck_dir.join("BUCK"),
             format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n"
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\nrust_library(\n    name = \"libhermit\",\n    env = hermit_build_env,\n)\nrust_binary(\n    name = \"hermit\",\n    env = hermit_build_env,\n)\n"
             ),
         )
         .expect("write stale Buck binding");
@@ -4720,7 +4921,7 @@ mod tests {
         let buck = buck_dir.join("BUCK");
         let consumed = |body: String| {
             format!(
-                "{body}rust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n"
+                "{body}rust_library(\n    name = \"libhermit\",\n    env = hermit_build_env,\n)\nrust_binary(\n    name = \"hermit\",\n    env = hermit_build_env,\n)\n"
             )
         };
 
@@ -4882,7 +5083,7 @@ mod tests {
         fs::write(
             &buck,
             format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\n"
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    name = \"libhermit\",\n    env = hermit_build_env,\n)\n"
             ),
         )
         .expect("write build environment with one consumer");
@@ -4893,6 +5094,222 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove Buck fixture");
+    }
+
+    #[test]
+    fn buck_build_pin_binding_accepts_the_actual_four_target_source() {
+        let source = include_str!("../hermit-cli/BUCK");
+        assert_eq!(
+            buck_build_env_consumers(source).expect("recognize actual four target calls"),
+            4,
+            "the real ON and trap-only pairs must each bind their own shared env"
+        );
+        let pin = source
+            .lines()
+            .find_map(|line| parse_buck_build_pin_binding(line).ok().flatten())
+            .expect("actual Buck has a literal canonical pin");
+        let root = temp_path("buck-actual-four-targets");
+        fs::create_dir_all(root.join("hermit-cli")).expect("create actual Buck fixture directory");
+        fs::write(root.join("hermit-cli/BUCK"), source).expect("write actual Buck source");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, &pin).expect("check actual Buck source"),
+            0
+        );
+        fs::remove_dir_all(root).expect("remove actual Buck fixture");
+    }
+
+    #[test]
+    fn buck_build_pin_binding_requires_named_pairs_within_their_own_calls() {
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        let header = format!("hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n");
+        let target = |kind: &str, name: &str, env: &str| {
+            format!("{kind}(\n    name = \"{name}\",\n    env = {env},\n)\n")
+        };
+        let lib = target("rust_library", "libhermit", "hermit_build_env");
+        let bin = target("rust_binary", "hermit", "hermit_build_env");
+        let off_lib = target("rust_library", "libhermit-trap-only", "hermit_build_env");
+        let off_bin = target("rust_binary", "hermit-trap-only", "hermit_build_env");
+        let pair = format!("{lib}{bin}");
+        let four = format!("{pair}{off_lib}{off_bin}");
+        let root = temp_path("buck-named-consumers");
+        fs::create_dir_all(root.join("hermit-cli")).expect("create named Buck fixture directory");
+        let buck = root.join("hermit-cli/BUCK");
+        for source in [&pair, &four] {
+            fs::write(&buck, format!("{header}{source}")).expect("write valid named consumers");
+            assert_eq!(
+                check_buck_build_pin_binding(&root, pin).expect("check valid named consumers"),
+                0,
+                "the original pair and the complete explicit OFF pair are maintained topologies"
+            );
+        }
+        let cases = [
+            (
+                "missing mandatory binary",
+                lib.clone(),
+                "require libhermit/hermit",
+            ),
+            (
+                "misnamed mandatory binary",
+                format!(
+                    "{lib}{}",
+                    target("rust_binary", "not-hermit", "hermit_build_env")
+                ),
+                "unexpected target",
+            ),
+            (
+                "right name wrong rule kind",
+                format!(
+                    "{}{bin}",
+                    target("rust_binary", "libhermit", "hermit_build_env")
+                ),
+                "must be one literal rust_library",
+            ),
+            (
+                "duplicate original name",
+                format!("{lib}{lib}{bin}"),
+                "duplicate Buck target",
+            ),
+            (
+                "partial OFF pair",
+                format!("{pair}{off_lib}"),
+                "require libhermit/hermit",
+            ),
+            (
+                "misnamed OFF binary",
+                format!(
+                    "{pair}{off_lib}{}",
+                    target("rust_binary", "not-hermit-trap-only", "hermit_build_env")
+                ),
+                "unexpected target",
+            ),
+            (
+                "OFF name wrong rule kind",
+                format!(
+                    "{pair}{off_lib}{}",
+                    target("rust_library", "hermit-trap-only", "hermit_build_env")
+                ),
+                "must be one literal rust_binary",
+            ),
+            (
+                "duplicate OFF name",
+                format!("{four}{off_lib}"),
+                "duplicate Buck target",
+            ),
+            (
+                "unrelated target consumes env",
+                format!(
+                    "{pair}{}",
+                    target("rust_library", "other", "hermit_build_env")
+                ),
+                "unexpected target",
+            ),
+            (
+                "non-Rust call impersonates binary",
+                format!(
+                    "{lib}{}",
+                    target("configured_alias", "hermit", "hermit_build_env")
+                ),
+                "must be one literal rust_binary",
+            ),
+            (
+                "name and env in different calls",
+                format!(
+                    "rust_library(\n    name = \"libhermit\",\n    deps = nested(\n        env = hermit_build_env,\n    ),\n)\n{bin}"
+                ),
+                "must be one literal rust_library",
+            ),
+            (
+                "duplicate env with a second value",
+                format!(
+                    "{}{bin}",
+                    lib.replace(
+                        "    env = hermit_build_env,",
+                        "    env = hermit_build_env,\n    env = other_env,"
+                    )
+                ),
+                "must be one literal rust_library",
+            ),
+            (
+                "wrong env in a named OFF target",
+                format!(
+                    "{pair}{off_lib}{}",
+                    target("rust_binary", "hermit-trap-only", "other_env")
+                ),
+                "must be one literal rust_binary",
+            ),
+            (
+                "conditional target does not run",
+                format!("{}{bin}", lib.replacen(")\n", ") if False else None\n", 1)),
+                "must be one literal rust_library",
+            ),
+            (
+                "continued prefix suppresses mandatory library",
+                format!("False and \\\n{pair}"),
+                "unsupported Buck line continuation outside a string/comment",
+            ),
+            (
+                "continued prefix suppresses a library in the four-target source",
+                format!("False and \\\n{four}"),
+                "unsupported Buck line continuation outside a string/comment",
+            ),
+            (
+                "computed target name",
+                format!(
+                    "{}{bin}",
+                    lib.replace("name = \"libhermit\",", "name = \"libhermit\" + \"\",")
+                ),
+                "ambiguous or nonliteral Buck target name",
+            ),
+            (
+                "kwargs can override provenance",
+                format!(
+                    "{}{bin}",
+                    lib.replace(
+                        "    env = hermit_build_env,",
+                        "    env = hermit_build_env,\n    **{\"env\": other_env}"
+                    )
+                ),
+                "must be one literal rust_library",
+            ),
+            (
+                "quoted target spoof",
+                format!("\"\"\"\n{pair}\"\"\"\n"),
+                "require libhermit/hermit",
+            ),
+            (
+                "comment target spoof",
+                pair.lines()
+                    .map(|line| format!("# {line}\n"))
+                    .collect::<String>(),
+                "require libhermit/hermit",
+            ),
+            (
+                "nested target calls are not top level",
+                format!("holder = [\n{pair}]\n"),
+                "require libhermit/hermit",
+            ),
+            (
+                "malformed call boundary",
+                format!("{}{bin}", lib.replacen(")\n", "]\n", 1)),
+                "mismatched Buck call delimiter",
+            ),
+        ];
+        for (label, targets, expected) in cases {
+            let source = format!("{header}{targets}");
+            let error = buck_build_env_consumers(&source)
+                .expect_err("invalid consumer identity/call must fail the named-target guard");
+            assert!(
+                error.contains(expected),
+                "{label}: expected {expected}, got {error}"
+            );
+            fs::write(&buck, source).expect("write invalid named consumer fixture");
+            assert_eq!(
+                check_buck_build_pin_binding(&root, pin).expect("classify invalid named consumer"),
+                1,
+                "{label} must not satisfy Buck compile-time provenance"
+            );
+        }
+        fs::remove_dir_all(root).expect("remove named Buck fixtures");
     }
 
     #[test]

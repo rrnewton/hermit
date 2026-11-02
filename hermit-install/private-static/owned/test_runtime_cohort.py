@@ -66,13 +66,28 @@ class ContentCohort(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,'one complete reviewed content cohort'):
                     self.apply(root,bad)
 
-    def current_fixture(self, root):
+    def optional_feature_fixture(self, root):
         source = D.parents[2]
-        for owner, path, _, _ in cohort.FINAL_FUNCTION_SECTIONS_054:
+        for owner, path, _, _ in cohort.OPTIONAL_LITEINST_054:
             relative = Path(path) if owner == 'H' else Path('reverie') / path
             target = root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source / relative, target)
+
+    runtime_feature_check = (
+        b'            launch\n'
+        b'                .validate_runtime_features(cfg!(feature = "liteinst"))\n'
+        b'                .unwrap_or_else(|error| fail(&error));\n'
+    )
+
+    def current_fixture(self, root):
+        # Reconstruct the earlier literal cohort only in a temporary fixture.
+        # Its unchanged complete-file digest still has to match independently.
+        self.optional_feature_fixture(root)
+        runtime = root / 'detcore-liteinst/src/lib.rs'
+        raw = runtime.read_bytes()
+        self.assertEqual(raw.count(self.runtime_feature_check), 1)
+        runtime.write_bytes(raw.replace(self.runtime_feature_check, b''))
 
     # Reverse only the two reviewed section-directive hunks in a temporary
     # fixture. The historical complete-file digest must still match exactly.
@@ -119,6 +134,26 @@ class ContentCohort(unittest.TestCase):
             self.current_fixture(root)
             self.assert_complete_cohort(root, 'function-sections-054-content-v1',
                                         cohort.FINAL_FUNCTION_SECTIONS_054)
+
+    def test_optional_liteinst_runtime_source_cohort_keeps_all_31_exact_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.optional_feature_fixture(root)
+            self.assert_complete_cohort(root, 'optional-liteinst-054-content-v1',
+                                        cohort.OPTIONAL_LITEINST_054)
+
+    def test_modified_runtime_feature_check_is_not_a_reviewed_cohort(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.optional_feature_fixture(root)
+            runtime = root / 'detcore-liteinst/src/lib.rs'
+            raw = runtime.read_bytes()
+            self.assertEqual(raw.count(self.runtime_feature_check), 1)
+            runtime.write_bytes(raw.replace(
+                self.runtime_feature_check,
+                self.runtime_feature_check.replace(b'cfg!(feature = "liteinst")', b'true')))
+            with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
+                cohort.bind(root)
 
     def test_development_runtime_source_cohort_keeps_all_31_exact_files(self):
         with tempfile.TemporaryDirectory() as directory:

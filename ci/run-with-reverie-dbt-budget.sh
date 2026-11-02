@@ -3198,7 +3198,14 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=3df91c9c71bdc5c77571974cbabfca20183a08de
+# CARRY TO 4a986e54d4b249f43d1058a1b1cf3c650ca353f3 (2026-11-02): from 3df91c9c71bdc5c77571974cbabfca20183a08de.
+# Port the optional LiteInst site-patching feature onto current Reverie main,
+# retaining its shared in-guest loader/preload/RPC and native-exec paths.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between these pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba). The measured DynamoRIO
+# SDK build budget carries unchanged; this is not runtime qualification.
+expected_pin=4a986e54d4b249f43d1058a1b1cf3c650ca353f3
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

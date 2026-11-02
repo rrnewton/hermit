@@ -597,6 +597,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.arbitrary_binaries",
     "test.record_replay",
     "test.cli",
+    "test.in_guest_trap_native_liteinst_on",
     "test.liteinst_allocator",
     "test.liteinst_stacks",
     "test.isolated_dbt_workdir",
@@ -652,6 +653,9 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     // and the parity post-pass's two activation variables, so a run that
     // selects or disables parity cells does so inside the pinned root too.
     "HERMIT_EPOCH",
+    // The wrapper mounts this explicit historical fixture read-only; the
+    // retained map/cancel tests still enforce its fixed complete identity.
+    "HERMIT_MAPPED_PACKET_V11_IMAGE",
     crate::parity::PARITY_POST_PASS_ENV,
     crate::parity::PARITY_SELECT_ENV,
     crate::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
@@ -763,14 +767,15 @@ const PROFILES: [Profile; 11] = [
         // on KVM held to its gap ledger, adds one full-only node: 102/103
         // before.
         label: "full",
-        direct_steps: 103,
-        selected_steps: 104,
+        direct_steps: 105,
+        selected_steps: 106,
     },
     Profile {
         // 81/82 with the same host-fixtures retirement: 82/83 before.
+        // Add the trap-only cohort and enabled native control.
         label: "portable",
-        direct_steps: 81,
-        selected_steps: 82,
+        direct_steps: 83,
+        selected_steps: 84,
     },
     Profile {
         label: "quick",
@@ -1360,6 +1365,7 @@ fn needs_proc_locks_runtime(tag: &str) -> bool {
             | "test.hermit_integration_3"
             | "e2e.manifest_c_programs"
             | "quick.e2e_verify"
+            | "test.in_guest_trap_no_liteinst"
     )
 }
 
@@ -1672,8 +1678,8 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         local_prepare,
         "./ci/nextest-binaries.rs prepare hosted-portable",
     );
-    // The hosted profile has its own selections, so its workspace build
-    // compiles their union rather than the local full profile's.
+    // Logical hosted selections stay separate, while both validate-profile
+    // producers compile the same physical feature union.
     let local_prebuild = crate::nextest_binaries::unified_prebuild_command(cfg, "full")?;
     let hosted_prebuild =
         crate::nextest_binaries::unified_prebuild_command(cfg, HOSTED_PORTABLE_LABEL)?;
@@ -3153,9 +3159,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // outside the per-commit smoke pair (2026-10-26).
     // 147 with privileged-test.deadline_slice_cap_kvm, the KVM gap-ledger
     // producer (2026-10-30).
-    if expected.len() != 147 {
+    // The trap-only cohort and enabled native control add two producers.
+    if expected.len() != 149 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 147",
+            "structured result producer registry has {} entries, expected 149",
             expected.len()
         ));
     }
@@ -3180,9 +3187,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // sabrecompat.sabre_examples, the archived SaBRe suite outside the smoke
     // pair, adds one.
     // privileged-test.deadline_slice_cap_kvm's required KVM tests add one.
-    if expected_counts.len() != 53 {
+    // The enabled native control adds one exact two-identity Nextest row.
+    if expected_counts.len() != 54 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 53",
+            "Nextest expected-count registry has {} entries, expected 54",
             expected_counts.len()
         ));
     }
@@ -3337,7 +3345,8 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // Conformance 3: the three isolation-matrix nodes (2026-10-17).
     // sabrecompat.sabre_examples adds the 78th Nextest writer (2026-10-26).
     // KvmGapLedger 1: privileged-test.deadline_slice_cap_kvm (2026-10-30).
-    if actual_group_counts != [78, 56, 7, 2, 3, 1] {
+    // Add one Nextest producer and one envelope producer; retain every group.
+    if actual_group_counts != [79, 56, 8, 2, 3, 1] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -4573,9 +4582,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // producers stay retired (446 - 2).
     // 445 with privileged-test.deadline_slice_cap_kvm, the deadline_slice_cap
     // suite on KVM held to its gap ledger (444 + 1).
-    if cfg.steps.len() != 445 {
+    // Add the separate OFF cohort and ON native control to all 445 main steps.
+    if cfg.steps.len() != 447 {
         return Err(format!(
-            "superset has {} steps, expected 445",
+            "superset has {} steps, expected 447",
             cfg.steps.len()
         ));
     }
@@ -7265,7 +7275,7 @@ sys.exit(37)
         // and the retired base producers stay retired (104 full nodes).
         // (103 full nodes), and 102 with privileged-test.deadline_slice_cap_kvm
         // (105 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 102);
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 103);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

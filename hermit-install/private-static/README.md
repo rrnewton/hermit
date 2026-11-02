@@ -2,8 +2,9 @@
 
 This producer is separate from the ordinary GNU LiteInst DSO finalizer. It
 builds the private musl image used only by Hermit compiled with
-`exec-stop-launcher,liteinst` and launched with `--in-guest-exec-stop` on
-`in-guest-trap`. The flag is off by default. Its first domain is a direct run
+`exec-stop-launcher,in-guest-trap` and launched with `--in-guest-exec-stop` on
+`in-guest-trap`. The `liteinst` patching feature is independent of this launch route. The flag is
+off by default. Its first domain is a direct run
 with a real log file, or an explicit singleton verification run. Debugger,
 namespace-only and network trace routes remain refused. Other admission checks,
 including disabled timer/RCB-time requirements, remain in their existing owners.
@@ -52,7 +53,7 @@ link, emitted-code inspection and physical guest/cancellation checks.
 
 ## Explicit singleton verification
 
-With `exec-stop-launcher,liteinst` compiled, `--in-guest-exec-stop` on
+With `exec-stop-launcher,in-guest-trap` compiled, `--in-guest-exec-stop` on
 `in-guest-trap` also admits `--verify` and `--verify-strict`. Both use the
 existing verification owner and comparator. Complete stdout, stderr and exit
 status are captured; INFO uses the existing bounded sink and sticky loss

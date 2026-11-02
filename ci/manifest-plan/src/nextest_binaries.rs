@@ -1577,9 +1577,51 @@ pub fn unified_selection(
     Ok(union)
 }
 
+/// Physical compilation is shared by the two validate-profile producers.
+/// Their logical selections and record keys remain profile-specific; features
+/// contributed by either producer must nevertheless reach the same test ELFs.
+fn compilation_selections(
+    cfg: &dagrun::model::DagConfig,
+    profile: &str,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut combined = config_selections(cfg, profile)?;
+    if unifies(profile) {
+        for peer in ["full", "hosted-portable"] {
+            for (key, selection) in config_selections(cfg, peer)? {
+                if let Some(previous) = combined.insert(key.clone(), selection.clone()) {
+                    if previous != selection {
+                        return Err(format!("shared compilation selection {key} conflicts"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(combined)
+}
+
+/// Keep the original listing/union algorithm on the physical producer path,
+/// but publish only this profile's logical metadata selection keys.
+fn preparation_listings(
+    cfg: &dagrun::model::DagConfig,
+    profile: &str,
+) -> Result<Vec<Listing>, String> {
+    let logical = config_selections(cfg, profile)?;
+    let physical = compilation_selections(cfg, profile)?;
+    let mut plan = listings(profile, &physical)?;
+    for listing in &mut plan {
+        listing.1.retain(|key| logical.contains_key(key));
+        if listing.1.is_empty() {
+            return Err(format!(
+                "{profile} has a listing without logical record keys"
+            ));
+        }
+    }
+    Ok(plan)
+}
+
 /// The workspace build a producer of a unifying profile runs immediately before
-/// preparing it: exactly the profile's unified selection, so preparation
-/// compiles nothing it did not already build (see [`unified_selection`]).
+/// preparing it: the shared physical selection for validate profiles, so
+/// preparation compiles nothing it did not already build.
 pub fn unified_prebuild_command(
     cfg: &dagrun::model::DagConfig,
     profile: &str,
@@ -1589,7 +1631,7 @@ pub fn unified_prebuild_command(
             "profile {profile} lists each selection separately and has no unified workspace build"
         ));
     }
-    let unified = unified_selection(&config_selections(cfg, profile)?)?;
+    let unified = unified_selection(&compilation_selections(cfg, profile)?)?;
     let cargo_profile = cargo_profile_for(profile)
         .map(|name| format!(" --profile {name}"))
         .unwrap_or_default();
@@ -1846,7 +1888,9 @@ fn selection_metadata(unified: &Value, cargo: &Value, args: &[String]) -> Result
 
 pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let selections = profile_selections(&root, profile)?;
+    let graph = fs::read_to_string(root.join("ci/dag/validate.json")).map_err(|e| e.to_string())?;
+    let graph = dagrun::io::dag_from_json(&graph).map_err(|e| e.to_string())?;
+    let selections = config_selections(&graph, profile)?;
     let cargo_profile = cargo_profile_for(profile);
     let artifacts = LockedArtifacts::open(&root, true)?;
     let generation = artifacts.root.join(format!(
@@ -1884,7 +1928,10 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     // binaries-metadata is the part of its listing that its Cargo selectors
     // name, and a listing of one selection must keep every executable Cargo
     // listed for it, which checks the matcher against Cargo on every run.
-    for (index, (listing, keys)) in listings(profile, &selections)?.into_iter().enumerate() {
+    for (index, (listing, keys)) in preparation_listings(&graph, profile)?
+        .into_iter()
+        .enumerate()
+    {
         let mut args = vec![
             "nextest".into(),
             "list".into(),
@@ -1955,7 +2002,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         Some(cargo_profile)
             if unifies(profile) && UNIFIED_CPU_WRAPPER_PROFILES.contains(&profile) =>
         {
-            let selection = unified_selection(&selections)?;
+            let selection = unified_selection(&compilation_selections(&graph, profile)?)?;
             selection
                 .iter()
                 .any(|arg| arg == "--workspace")
@@ -2425,6 +2472,82 @@ mod tests {
             assert!(unified_selection(&pair).is_err(), "{refused} was unified");
         }
         assert!(unified_selection(&BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn validate_producers_share_physical_features_but_keep_logical_record_keys() {
+        let graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let expected = args(
+            "--workspace --all-targets --features hermit-run/exec-stop-launcher,hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/liteinst,hermit-run/mm-cancellation-test-support,hermit-run/native-exec,hermit-run/third-party-backends",
+        );
+        for (profile, count) in [("full", 21), ("hosted-portable", 15)] {
+            let logical = config_selections(&graph, profile).unwrap();
+            let physical = compilation_selections(&graph, profile).unwrap();
+            assert_eq!(logical.len(), count);
+            assert_eq!(unified_selection(&physical).unwrap(), expected);
+            let plan = preparation_listings(&graph, profile).unwrap();
+            assert_eq!(plan.len(), 1);
+            assert_eq!(plan[0].0, expected);
+            assert_eq!(plan[0].1, logical.keys().cloned().collect::<Vec<_>>());
+            for (key, selection) in logical {
+                assert_eq!(physical.get(&key), Some(&selection));
+            }
+            assert!(
+                unified_prebuild_command(&graph, profile)
+                    .unwrap()
+                    .contains(&expected.join(" "))
+            );
+        }
+        for profile in ["quick", "super", "privileged"] {
+            let logical = config_selections(&graph, profile).unwrap();
+            assert_eq!(compilation_selections(&graph, profile).unwrap(), logical);
+            assert_eq!(
+                preparation_listings(&graph, profile).unwrap(),
+                listings(profile, &logical).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_physical_compilation_refuses_a_peer_selection_it_cannot_reproduce() {
+        let mut graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let step = graph
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.hermit_unit")
+            .unwrap();
+        step.env.insert(
+            SELECTION_ENV.into(),
+            serde_json::to_string(&args("-p hermit-run --all-features --lib")).unwrap(),
+        );
+        for profile in ["full", "hosted-portable"] {
+            assert!(unified_prebuild_command(&graph, profile).is_err());
+            assert!(preparation_listings(&graph, profile).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_physical_compilation_refuses_an_unsupported_hosted_peer_selection() {
+        let mut graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let full_logical = config_selections(&graph, "full").unwrap();
+        for profile in ["full", "hosted-portable"] {
+            assert!(unified_prebuild_command(&graph, profile).is_ok());
+            assert!(preparation_listings(&graph, profile).is_ok());
+        }
+        let step = graph
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.hermit_unit_on_host")
+            .unwrap();
+        step.env.insert(
+            SELECTION_ENV.into(),
+            serde_json::to_string(&args("-p hermit-run --all-features --lib")).unwrap(),
+        );
+        assert_eq!(config_selections(&graph, "full").unwrap(), full_logical);
+        for profile in ["full", "hosted-portable"] {
+            assert!(unified_prebuild_command(&graph, profile).is_err());
+            assert!(preparation_listings(&graph, profile).is_err());
+        }
     }
 
     /// Two members: `a` has a library, a tested and an untested binary and two

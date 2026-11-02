@@ -6,10 +6,29 @@
 
 set -euo pipefail
 
-if (( $# != 3 && $# != 4 )) || { (( $# == 4 )) && [[ $4 != --allocator-fixture ]]; }; then
-    echo "Usage: $0 <cargo-profile> <stable-runtime-path> <runtime-target-root> [--allocator-fixture]" >&2
+usage() {
+    echo "Usage: $0 <cargo-profile> <stable-runtime-path> <runtime-target-root> [--allocator-fixture] [--without-liteinst]"
+    echo "Build and qualify the standalone preload, then atomically stage it and its revision."
+    echo "--without-liteinst omits syscall site patching; --allocator-fixture adds diagnostic exports."
+}
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+    usage
+    exit 0
+fi
+if (( $# < 3 || $# > 5 )); then
+    usage >&2
     exit 2
 fi
+
+liteinst_enabled=1
+liteinst_allocator_fixture=0
+for liteinst_option in "${@:4}"; do
+    case "$liteinst_option" in
+        --allocator-fixture) liteinst_allocator_fixture=1 ;;
+        --without-liteinst) liteinst_enabled=0 ;;
+        *) echo "Unknown runtime build option: $liteinst_option; use --help" >&2; exit 2 ;;
+    esac
+done
 
 root_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 liteinst_profile=$1
@@ -94,9 +113,17 @@ cleanup_liteinst_temp_stage() {
 }
 trap cleanup_liteinst_temp_stage EXIT
 
-liteinst_features=()
-if [[ ${4:-} == --allocator-fixture ]]; then
-    liteinst_features=(--features allocator-fixture)
+liteinst_feature_names=()
+if (( liteinst_allocator_fixture )); then
+    liteinst_feature_names+=(allocator-fixture)
+fi
+if (( liteinst_enabled )); then
+    liteinst_feature_names+=(liteinst)
+fi
+liteinst_features=(--no-default-features)
+if (( ${#liteinst_feature_names[@]} )); then
+    liteinst_feature_list=$(IFS=,; echo "${liteinst_feature_names[*]}")
+    liteinst_features+=(--features "$liteinst_feature_list")
 fi
 HERMIT_LITEINST_STAGE=$liteinst_temp_stage HERMIT_LITEINST_REVERIE_PIN=$reverie_pin "${CARGO:-cargo}" build \
     --locked \

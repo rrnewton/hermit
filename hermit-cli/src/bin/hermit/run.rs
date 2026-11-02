@@ -210,7 +210,7 @@ type NativeContainerRun = super::native_exec_cli::PhysicalContainer;
 #[cfg(not(feature = "native-exec"))]
 type NativeContainerRun = ();
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 struct MappedVerificationRun {
     image: std::sync::Arc<super::mapped_first_admission::RetainedImage>,
     policy: super::mapped_first_admission::CapturePolicy,
@@ -233,7 +233,7 @@ impl ForwardedDetlogPlan {
         !self.requires_socket()
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     pub(super) fn open_mapped_in_container(&mut self) -> Result<(OwnedFd, OwnedFd), Error> {
         self.open_in_container()?
             .ok_or_else(|| Error::msg("mapped verification requires its actual DETLOG plan"))
@@ -1072,6 +1072,28 @@ impl std::fmt::Display for DeterminismLossRecorded {
 }
 
 impl std::error::Error for DeterminismLossRecorded {}
+
+/// Give a prior loss its usual verification run name without discarding the
+/// strict refusal, policy class, or cleanup context that crossed the boundary.
+#[cfg(feature = "in-guest-trap")]
+fn name_recorded_verification_loss(error: Error, run: VerificationRun, single_run: bool) -> Error {
+    let Some(loss) = error.downcast_ref::<hermit::VerificationDeterminismLoss>() else {
+        return error;
+    };
+    let reason = loss.reason().to_owned();
+    let run = if single_run {
+        "run"
+    } else {
+        match run {
+            VerificationRun::Run1 => "run 1",
+            VerificationRun::Run2 => "run 2",
+        }
+    };
+    error.context(DeterminismLossRecorded {
+        run: run.to_owned(),
+        reason,
+    })
+}
 
 impl RunLatches {
     /// Refuses to compare `run` when either latch is set.
@@ -1989,7 +2011,7 @@ pub struct RunOpts {
     ld_so_cache_snapshot: Option<super::container::LdSoCacheSnapshot>,
     /// Exact original package for both verification runs: inherited from the
     /// shared-input holder, or opened once by inline verification.
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     #[clap(skip)]
     mapped_shared_image: Option<std::sync::Arc<super::mapped_first_admission::RetainedImage>>,
 
@@ -2903,7 +2925,7 @@ fn assert_exec_stop_not_ready(error: &Error) {
     );
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[test]
 fn exec_stop_admission_reads_the_global_backend_before_launch() {
     use clap::Parser;
@@ -2936,7 +2958,7 @@ fn exec_stop_admission_reads_the_global_backend_before_launch() {
     }
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[test]
 fn exec_stop_verification_admits_both_shared_comparators_without_clearing_flags() {
     for strict in [false, true] {
@@ -2975,7 +2997,7 @@ fn exec_stop_verification_admits_both_shared_comparators_without_clearing_flags(
     }
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[test]
 fn exec_stop_verification_preserves_unsupported_domain_refusals() {
     // Clap rejects some of these combinations too. Check the runtime guard
@@ -3054,7 +3076,7 @@ fn exec_stop_verification_preserves_unsupported_domain_refusals() {
     );
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[test]
 fn admitted_exec_stop_captures_one_effective_epoch() {
     let mut run = run_opts_for(&[
@@ -3091,7 +3113,7 @@ fn admitted_exec_stop_captures_one_effective_epoch() {
     assert_eq!(calls.get(), 1);
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[test]
 fn pending_exec_stop_epoch_cannot_be_admitted_by_later_package_appearance() {
     let mut run = run_opts_for(&[
@@ -6817,7 +6839,7 @@ fn in_guest_refusal(backend_flag: &str, options: &[&str]) -> Result<(), anyhow::
 /// caller selected.
 #[test]
 fn in_guest_trap_refuses_the_options_liteinst_refuses() {
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     {
         let error = in_guest_refusal("--backend=in-guest-trap", &[]).unwrap_err();
         assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
@@ -9850,7 +9872,10 @@ impl RunOpts {
             return Ok(());
         }
         let config = &self.det_opts.det_config;
-        let reason = if cfg!(feature = "liteinst") && config.max_timeslice.is_some() {
+        let backend = self.selected_backend();
+        let included = (backend == Backend::Liteinst && cfg!(feature = "liteinst"))
+            || (backend != Backend::Liteinst && cfg!(feature = "in-guest-trap"));
+        let reason = if included && config.max_timeslice.is_some() {
             "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
              set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
              --max-timeslice=disabled"
@@ -9886,7 +9911,10 @@ impl RunOpts {
     /// check whether the LiteInst runtime is installed later, with the other
     /// backends.
     fn refuse_liteinst_without_the_feature(&self) -> Result<(), Error> {
-        if cfg!(feature = "liteinst") || !self.uses_in_guest_liteinst() {
+        let backend = self.selected_backend();
+        let included = (backend != Backend::Liteinst || cfg!(feature = "liteinst"))
+            && (backend != Backend::InGuestTrap || cfg!(feature = "in-guest-trap"));
+        if included || !self.uses_in_guest_liteinst() {
             return Ok(());
         }
         self.selected_backend().ensure_available()
@@ -10133,7 +10161,7 @@ impl RunOpts {
 
     // Pure option/availability admission. Availability comes from an already
     // retained package or initial discovery; actual file checks remain required.
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     fn exec_stop_common_domain(&self, package_available: bool) -> bool {
         self.selected_backend() == Backend::InGuestTrap
             && package_available
@@ -10147,7 +10175,7 @@ impl RunOpts {
                 .is_ok_and(|command| command.find_program().is_ok())
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     fn exec_stop_verification_domain(&self, package_available: bool) -> bool {
         self.exec_stop_common_domain(package_available)
             && ((self.verify && self.verify_run.is_none())
@@ -10157,7 +10185,7 @@ impl RunOpts {
             && !self.no_namespace
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     fn mapped_command_config(
         &self,
         identity_sources: Option<&IdentityGuard>,
@@ -10217,7 +10245,7 @@ impl RunOpts {
         Ok((log, guard))
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     fn exec_stop_direct_domain(&self, package_available: bool) -> bool {
         self.exec_stop_common_domain(package_available) && !self.verify && self.verify_run.is_none()
     }
@@ -10225,13 +10253,13 @@ impl RunOpts {
     /// Admit the opt-in packaged first-image direct-run or verification domain. Resource
     /// availability does not replace the retained image and actual startup checks.
     pub(crate) fn refuse_unready_exec_stop(&self) -> Result<(), Error> {
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let package_available = self.in_guest_exec_stop
             && !self.exec_stop_epoch_refused
             && self.selected_backend() == Backend::InGuestTrap
             && (self.mapped_shared_image.is_some()
                 || super::mapped_first_admission::packaged_image_declared());
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let package_available = false;
         self.refuse_unready_exec_stop_with_availability(package_available)
     }
@@ -10241,7 +10269,7 @@ impl RunOpts {
         &self,
         package_available: bool,
     ) -> Result<(), Error> {
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let _ = package_available;
         if self.in_guest_exec_stop {
             if self.verify_run.is_some() && self.epoch_omitted {
@@ -10254,7 +10282,7 @@ impl RunOpts {
                     "--in-guest-exec-stop: exec-stop-runtime-not-ready: native successor verification is not admitted",
                 ));
             }
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             if !self.exec_stop_epoch_refused
                 && (self.exec_stop_direct_domain(package_available)
                     || self.exec_stop_verification_domain(package_available))
@@ -10364,7 +10392,7 @@ impl RunOpts {
         if let Some(fd) = self.native_exec_shared_inputs {
             let adopted = super::verify_inputs::take_adopted(fd)?;
             self.adopt_shared_ld_so_cache(&adopted)?;
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             let adopted = {
                 let mut adopted = adopted;
                 if self.in_guest_exec_stop {
@@ -10395,7 +10423,7 @@ impl RunOpts {
     }
 
     pub(crate) fn prepare_mapped_verification_inputs(&mut self) -> Result<(), Error> {
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         if self.in_guest_exec_stop {
             // Reject unsupported options before consuming the holder's entry.
             // Availability here is only a precheck: each caller still performs
@@ -12720,13 +12748,13 @@ impl RunOpts {
             options.annotated_priority_replay_admission()?;
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let mapped_image = if self.in_guest_exec_stop {
             Some(super::mapped_first_admission::RetainedImage::open()?)
         } else {
             None
         };
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let mapped_image: Option<()> = None;
         let resources = if network_trace.is_some() {
             "network trace descriptor"
@@ -12747,7 +12775,7 @@ impl RunOpts {
                 }
                 #[cfg(not(feature = "native-exec"))]
                 let _ = native;
-                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
                 if let Some(image) = mapped_image.as_ref() {
                     return options.run_mapped_in_container(
                         &global,
@@ -12756,16 +12784,16 @@ impl RunOpts {
                         image,
                     );
                 }
-                #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+                #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
                 let _ = mapped_image;
                 options.run_in_container(&global, capture_output, identity)
             },
         )?;
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         if let Some(image) = mapped_image.as_ref() {
             image.verify()?;
         }
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let _ = mapped_image;
         Ok(value)
     }
@@ -13208,7 +13236,7 @@ impl RunOpts {
             .then(branch_counter_verdict);
 
         let execute = || {
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             let mapped_image = if self.in_guest_exec_stop {
                 Some(
                     self.mapped_shared_image
@@ -13218,7 +13246,7 @@ impl RunOpts {
             } else {
                 None
             };
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             if let Some(image) = mapped_image {
                 image.verify()?;
             }
@@ -13229,13 +13257,13 @@ impl RunOpts {
                 VerificationRun::Run1,
                 #[cfg(feature = "dbt")]
                 None,
-                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
                 mapped_image.map(|image| MappedVerificationRun {
                     image: image.clone(),
                     policy: super::mapped_first_admission::CapturePolicy::Full,
                 }),
             );
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             if let Some(image) = mapped_image {
                 return finish_mapped_verification_image(result, image.verify());
             }
@@ -13357,7 +13385,7 @@ impl RunOpts {
         } else {
             None
         };
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let mapped_image = if self.in_guest_exec_stop {
             self.refuse_unready_exec_stop()?;
             Some(std::sync::Arc::new(
@@ -13370,7 +13398,7 @@ impl RunOpts {
             global,
             #[cfg(feature = "dbt")]
             dbt,
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             mapped_image,
         )
     }
@@ -13380,25 +13408,25 @@ impl RunOpts {
         &self,
         global: &GlobalOpts,
         #[cfg(feature = "dbt")] mut dbt: Option<super::backends::DbtVerification>,
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped_image: Option<
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))] mapped_image: Option<
             std::sync::Arc<super::mapped_first_admission::RetainedImage>,
         >,
     ) -> Result<ExitStatus, Error> {
         // Admission inside the common pair owner and each container must use
         // this same retained package too. Resource paths may disappear after
         // opening; neither run may turn them into a second mutable input.
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let retained_options = mapped_image.as_ref().map(|image| {
             let mut options = self.clone();
             options.mapped_shared_image = Some(image.clone());
             options
         });
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let pair_options = retained_options.as_ref().unwrap_or(self);
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let pair_options = self;
         pair_options.verify_with_execution(|options, log, path, forwarded, run| {
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             if let Some(image) = mapped_image.as_ref() {
                 image.verify()?;
             }
@@ -13409,13 +13437,13 @@ impl RunOpts {
                 run,
                 #[cfg(feature = "dbt")]
                 dbt.as_mut(),
-                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
                 mapped_image.as_ref().map(|image| MappedVerificationRun {
                     image: image.clone(),
                     policy: super::mapped_first_admission::CapturePolicy::Full,
                 }),
             );
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             if let Some(image) = mapped_image.as_ref() {
                 // The same opened image is checked after owned finalization on
                 // both outcomes. A close error cannot replace an execution error.
@@ -14434,12 +14462,12 @@ impl RunOpts {
         global: &GlobalOpts,
         _run: VerificationRun,
         #[cfg(feature = "dbt")] dbt: Option<&mut super::backends::DbtVerification>,
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped: Option<
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))] mapped: Option<
             MappedVerificationRun,
         >,
     ) -> Result<VerificationRunOutput, Error> {
         let (log_file, _log_path) = log;
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         anyhow::ensure!(
             self.in_guest_exec_stop == mapped.is_some(),
             "mapped verification requires its retained image context"
@@ -14473,37 +14501,43 @@ impl RunOpts {
                 ""
             },
         );
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let guards = (Some(log_file), network_trace, forwarded_detlogs, mapped);
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let guards = (Some(log_file), network_trace, forwarded_detlogs);
-        self.launch_in_container(guards, &resources, None, move |guards, identity, native| {
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
-            let (log, _, forwarded, mapped) = guards;
-            #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
-            let (log, _, forwarded) = guards;
-            options.run_verify_in_container(
-                log,
-                forwarded,
-                &global,
-                identity,
-                native,
-                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
-                mapped.as_ref(),
-            )
-        })
-        .map(
-            |((output, skid_overshoots, latches, terminal_outcome), _guards)| {
-                VerificationRunOutput {
-                    output,
-                    skid_overshoots,
-                    latches,
-                    terminal_outcome,
-                    #[cfg(feature = "dbt")]
-                    dbt: None,
-                }
-            },
-        )
+        let result = self
+            .launch_in_container(guards, &resources, None, move |guards, identity, native| {
+                #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
+                let (log, _, forwarded, mapped) = guards;
+                #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
+                let (log, _, forwarded) = guards;
+                options.run_verify_in_container(
+                    log,
+                    forwarded,
+                    &global,
+                    identity,
+                    native,
+                    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
+                    mapped.as_ref(),
+                )
+            })
+            .map(
+                |((output, skid_overshoots, latches, terminal_outcome), _guards)| {
+                    VerificationRunOutput {
+                        output,
+                        skid_overshoots,
+                        latches,
+                        terminal_outcome,
+                        #[cfg(feature = "dbt")]
+                        dbt: None,
+                    }
+                },
+            );
+        #[cfg(feature = "in-guest-trap")]
+        let result = result.map_err(|error| {
+            name_recorded_verification_loss(error, _run, self.verify_run.is_some())
+        });
+        result
     }
 
     fn merge_from_env_settings(&self, command: &mut Command) -> anyhow::Result<()> {
@@ -15629,7 +15663,7 @@ impl RunOpts {
         )))
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     fn run_mapped_in_container(
         &self,
         global: &GlobalOpts,
@@ -15777,11 +15811,11 @@ impl RunOpts {
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
         native: Option<NativeContainerRun>,
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped: Option<
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))] mapped: Option<
             &MappedVerificationRun,
         >,
     ) -> Result<(Output, u64, RunLatches, Option<detcore::TerminalOutcome>), Error> {
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         if let Some(mapped) = mapped {
             anyhow::ensure!(
                 identity_sources.is_some(),
@@ -15894,7 +15928,7 @@ impl RunOpts {
     }
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 fn finish_mapped_verification_image<T>(
     outcome: Result<T, Error>,
     close: std::io::Result<()>,
@@ -15911,7 +15945,7 @@ fn finish_mapped_verification_image<T>(
     }
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 fn finish_mapped_verification_log(
     outcome: Result<Output, Error>,
     mut log: SharedLog,
@@ -16449,7 +16483,7 @@ mod tests {
     /// The outer package gate owns source/qualification binding. This selected
     /// test requires its actual installation and the regular-file stdin-cat
     /// fixture; neither missing operand is a reason to skip a real execution.
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     #[test]
     #[ignore = "requires the fresh qualified private runtime and piped_stdin_cat fixture; run the exact package gate"]
     fn mapped_verification_retains_actual_package_after_parent_rename() {
@@ -16814,7 +16848,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     #[test]
     fn mapped_verification_requires_unconsumed_real_forwarded_plan() {
         assert!(
@@ -16830,9 +16864,9 @@ mod tests {
         assert_channel_eof_after_last_writer(&receiver);
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     struct VerificationFlushFailure;
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     impl Write for VerificationFlushFailure {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             Ok(bytes.len())
@@ -16845,7 +16879,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     #[test]
     fn mapped_verification_late_flush_refuses_output_comparison() {
         let output = Output {
@@ -16869,7 +16903,7 @@ mod tests {
         assert!(latches.refuse_comparison("private unit").is_err());
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     #[test]
     fn mapped_verification_execution_error_survives_late_flush_failure() {
         let error = finish_mapped_verification_log(
@@ -16887,7 +16921,7 @@ mod tests {
         assert!(format!("{error:#}").contains("original setup error"));
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     #[test]
     fn mapped_verification_image_close_preserves_original_error() {
         let error = finish_mapped_verification_image::<()>(
@@ -17352,6 +17386,81 @@ mod tests {
         assert!(
             refusal.contains("log sink failure: injected write failure"),
             "{refusal}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "in-guest-trap")]
+    fn a_prior_loss_on_a_failed_verification_keeps_its_run_name_and_refusal() {
+        for (run, single_run, label) in [
+            (VerificationRun::Run1, false, "run 1"),
+            (VerificationRun::Run2, false, "run 2"),
+            (VerificationRun::Run1, true, "run"),
+        ] {
+            let reason = "process 7 exited without deregistering";
+            let error = hermit::VerificationDeterminismLoss::attach(
+                Error::new(hermit::LiteinstInGuestRefusal::for_backend(
+                    Backend::InGuestTrap,
+                    "no guest process reported LiteInst statistics",
+                )),
+                reason.to_owned(),
+            );
+            let serialized = hermit::SerializableError::from(error);
+            assert_eq!(serialized.kind(), hermit::FailureKind::PolicyRefusal);
+            let bytes =
+                bincode::serde::encode_to_vec(&serialized, bincode::config::legacy()).unwrap();
+            let (decoded, used): (hermit::SerializableError, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(used, bytes.len());
+            let error = super::super::container::classify_container_result::<()>(Ok(Err(decoded)))
+                .unwrap_err();
+            let error = name_recorded_verification_loss(error, run, single_run);
+            let loss = error.downcast_ref::<DeterminismLossRecorded>().unwrap();
+            assert_eq!(loss.run, label);
+            assert_eq!(loss.reason, reason);
+            assert_eq!(
+                error.to_string(),
+                format!("{label}: determinism loss recorded: {reason}"),
+            );
+            assert!(
+                error
+                    .downcast_ref::<super::super::container::PolicyRefusal>()
+                    .is_some()
+            );
+            assert!(format!("{error:#}").contains("no guest process reported LiteInst statistics"));
+            assert_eq!(
+                super::super::verify::run_failure_of(&error),
+                Some(hermit::canonical_verdict::RunFailure::DeterminismLoss),
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "in-guest-trap")]
+    fn a_failed_verification_without_prior_loss_stays_a_policy_refusal() {
+        let original = Error::new(hermit::LiteinstInGuestRefusal::for_backend(
+            Backend::InGuestTrap,
+            "no guest process reported LiteInst statistics",
+        ));
+        let serialized = hermit::SerializableError::from(original);
+        let bytes = bincode::serde::encode_to_vec(&serialized, bincode::config::legacy()).unwrap();
+        let (decoded, used): (hermit::SerializableError, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+        assert_eq!(used, bytes.len());
+        let error =
+            super::super::container::classify_container_result::<()>(Ok(Err(decoded))).unwrap_err();
+        let message = format!("{error:#}");
+        let error = name_recorded_verification_loss(error, VerificationRun::Run1, false);
+        assert!(error.downcast_ref::<DeterminismLossRecorded>().is_none());
+        assert!(
+            error
+                .downcast_ref::<super::super::container::PolicyRefusal>()
+                .is_some()
+        );
+        assert_eq!(format!("{error:#}"), message);
+        assert_eq!(
+            super::super::verify::run_failure_of(&error),
+            Some(hermit::canonical_verdict::RunFailure::PolicyRefusal),
         );
     }
 

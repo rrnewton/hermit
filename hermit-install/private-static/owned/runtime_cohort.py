@@ -155,12 +155,22 @@ FINAL_FUNCTION_SECTIONS_054 = tuple(
     if (row[0], row[1]) == ('R', 'reverie-inguest/src/trap.rs') else row
     for row in FINAL_DEVELOPMENT_054
 )
+# The optional-feature port adds the explicit launch/runtime feature agreement
+# check before ordinary Detcore initialization. Retain the complete 31-file
+# tuple and every older cohort. These are literal source DATA; independent
+# review, the actual archive/link and entry qualification remain mandatory.
+OPTIONAL_LITEINST_054 = tuple(
+    ('H', 'detcore-liteinst/src/lib.rs', 30606, 'fb41150450705389c17fd69eba7514e786d8a52c58243d6a0cd860da58ca6255')
+    if (row[0], row[1]) == ('H', 'detcore-liteinst/src/lib.rs') else row
+    for row in FINAL_FUNCTION_SECTIONS_054
+)
 COHORTS = (("historical-bounded-bootstrap", HISTORICAL),
            ("merged-runtime-content-v1", CURRENT_MERGED),
            ("final-candidate-content-v1", FINAL_CANDIDATE_V1),
            ("development-051-content-v1", FINAL_DEVELOPMENT_051),
            ("development-054-content-v1", FINAL_DEVELOPMENT_054),
-           ("function-sections-054-content-v1", FINAL_FUNCTION_SECTIONS_054))
+           ("function-sections-054-content-v1", FINAL_FUNCTION_SECTIONS_054),
+           ("optional-liteinst-054-content-v1", OPTIONAL_LITEINST_054))
 
 
 def need(ok, message):

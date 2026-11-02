@@ -445,6 +445,20 @@ for name in "${pass_env[@]}"; do
             extra_mounts+=(--mount "type=bind,source=$counts_dir,destination=/dagrun-test-counts")
             env_args+=(-e "DAGRUN_TEST_COUNTS_PATH=/dagrun-test-counts/$counts_file")
             ;;
+        HERMIT_MAPPED_PACKET_V11_IMAGE)
+            # This is an explicit historical map/cancel input, not a runtime
+            # package. The unchanged tests retain and recheck its exact bytes,
+            # length and open-file identity; the wrapper only makes the named
+            # host file available in fresh validation containers.
+            v11_image=${!name}
+            if [[ $v11_image != /* || ! -f $v11_image || -L $v11_image ||
+                  $v11_image == *','* || $v11_image == *$'\n'* || $v11_image == *$'\r'* ]]; then
+                echo "run-in-pinned-root: HERMIT_MAPPED_PACKET_V11_IMAGE must name an absolute regular file without a symlink or mount delimiter" >&2
+                exit 2
+            fi
+            extra_mounts+=(--mount "type=bind,source=$v11_image,destination=/run/hermit-mapped-packet-v11.elf,ro=true")
+            env_args+=(-e HERMIT_MAPPED_PACKET_V11_IMAGE=/run/hermit-mapped-packet-v11.elf)
+            ;;
         *) env_args+=(--env "$name") ;;
     esac
 done

@@ -16,7 +16,7 @@ def require(ok, message):
         raise ValueError(message)
 
 
-def verify(install):
+def verify(install, liteinst=True):
     resources = Path(install) / "rsrcs"
     runtime = resources / "libdetcore_liteinst.so"
     receipt = resources / "libdetcore_liteinst.package.json"
@@ -32,7 +32,8 @@ def verify(install):
     require(profiles["liteinst-runtime"]["inherits"] == "validate" and profiles["liteinst-runtime"]["lto"] is False,
             "ordinary packaging did not retain the reviewed LTO profile")
     artifact = record["cargo_artifact"]
-    require(artifact["features"] == [], "packaged runtime is not the ordinary feature mode")
+    features = ["liteinst"] if liteinst else []
+    require(artifact["features"] == features, "packaged runtime differs from the requested ordinary feature mode")
     require(artifact["profile"] == {"opt_level": "3", "debuginfo": 0, "debug_assertions": True,
                                       "overflow_checks": True, "test": False}, "wrong compiler profile")
     sources = record["compiled_sources"]
@@ -66,9 +67,12 @@ def verify(install):
     digest = hashlib.sha256(runtime.read_bytes()).hexdigest()
     require(digest == record["installed"]["sha256"] == qualification["artifact"]["sha256"], "installed runtime differs from qualified bytes")
     args = record["cargo_argv"]
-    require(args == ["build", "--locked", "--offline", "--manifest-path", sources["manifest"]["path"],
+    expected_args = ["build", "--locked", "--offline", "--no-default-features", "--manifest-path", sources["manifest"]["path"],
                      "-p", "detcore-liteinst", "--lib", "--profile", "liteinst-runtime", "--target-dir",
-                     str(Path(artifact["reported_path"]).parent.parent), "--message-format=json-render-diagnostics"],
+                     str(Path(artifact["reported_path"]).parent.parent), "--message-format=json-render-diagnostics"]
+    if features:
+        expected_args += ["--features", ",".join(features)]
+    require(args == expected_args,
             "receipt does not identify the fixed ordinary runtime build")
     commands = record["commands"]
     require(commands and all(command["status"] == 0 for command in commands), "unsuccessful producer command")
@@ -79,8 +83,12 @@ def verify(install):
 
 if __name__ == "__main__":
     try:
-        require(len(sys.argv) == 2, "usage: verify-packaged-detcore.py INSTALL")
-        verify(sys.argv[1])
+        args = sys.argv[1:]
+        liteinst = "--without-liteinst" not in args
+        if not liteinst:
+            args.remove("--without-liteinst")
+        require(len(args) == 1, "usage: verify-packaged-detcore.py [--without-liteinst] INSTALL")
+        verify(args[0], liteinst=liteinst)
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"verify-packaged-detcore: {error}", file=sys.stderr)
         sys.exit(2)
