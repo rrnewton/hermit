@@ -101,8 +101,9 @@ mod tests {
     /// `HostFileIdentity::content` layout of
     /// https://github.com/rrnewton/hermit/pull/4791, 45 is
     /// https://github.com/rrnewton/hermit/pull/4796's `TraceSchedEvent`/
-    /// `WithWatchOrder` revision, and 46, package K item 2b slice 2b-1's,
-    /// is current.
+    /// `WithWatchOrder` revision, 46 is package K item 2b slice 2b-1's,
+    /// and 47, https://github.com/rrnewton/hermit/pull/4759's
+    /// replay-backstop row, is the current revision.
     /// 42 to 44 are queued or advisory claims at this rebase
     /// (42 on drain/4759, 43 for PR 4627, 44 for kvm-2b-3 in the
     /// allocation table). Remove an entry when its change lands, with
@@ -312,6 +313,16 @@ mod tests {
         // old base, moved to 7 because main's 41 took domain 6 for
         // `HostFileIdentity`. Digest measured at this head.
         (46, "4d737837b0cced3f", "f013e36743d8d9e6"),
+        // Adds `TraceSchedEventResponse::backstop`, the replay backstop of a
+        // schedule replay of a record whose slices ran without the
+        // `--max-timeslice` bound, which `GlobalResponse::TraceSchedEvent`
+        // carries. The reply's fields are digested as `TRACE_REPLY_WIRE`
+        // items, so the field changes the digest in domain 5
+        // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
+        // 25 on its own base after main's 24, assigned 47 at its rebase
+        // onto 46, skipping 33 to 39 reserved for pending changes; digest
+        // measured at this head).
+        (47, "dc130f48394e5528", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -750,6 +761,27 @@ mod tests {
                 host_input,
                 task_stat
             ),
+            digest
+        );
+
+        // The reply this change extends is covered the same way: a field
+        // added to `TraceSchedEventResponse`, or its backstop removed,
+        // changes the digest (domain 5); the positional response a runtime
+        // decodes changes with it.
+        let nested_added = source.replacen(
+            "pub struct TraceSchedEventResponse {\n",
+            "pub struct TraceSchedEventResponse {\n    added: bool,\n",
+            1,
+        );
+        assert_ne!(nested_added, source);
+        assert_ne!(
+            definition_digest(&nested_added, payload, schedule, replayer, host_input, task_stat),
+            digest
+        );
+        let nested_removed = source.replacen("    backstop: Option<LogicalTime>,\n", "", 1);
+        assert_ne!(nested_removed, source);
+        assert_ne!(
+            definition_digest(&nested_removed, payload, schedule, replayer, host_input, task_stat),
             digest
         );
 
