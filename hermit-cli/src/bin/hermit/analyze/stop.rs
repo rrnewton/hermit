@@ -35,8 +35,16 @@
 //! first instruction ([`spawn_blocking_stop_signals`]). Beyond the pidfd, the
 //! handler stores the signal in an atomic ([`check`]) and reads `/proc`,
 //! which reads the same from every thread.
+//!
+//! A signal the handler cannot pass on to a child it found (no descriptor
+//! left for the scan or the pidfd, a pidfd call that fails for any reason
+//! but the child having gone) is never swallowed: analyze says so on stderr
+//! and dies of the signal by its default action, as it would without the
+//! handler, and the trial's container init dies with it by its parent-death
+//! signal; only the workspace stays behind ([`signal_children`]).
 
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
@@ -62,6 +70,15 @@ const INHERITED_CAPACITY: usize = 64;
 /// reaps them, so their PIDs cannot be reused while analyze runs.
 static INHERITED: [AtomicI32; INHERITED_CAPACITY] =
     [const { AtomicI32::new(0) }; INHERITED_CAPACITY];
+
+/// The `/proc` directory the handler scans, opened when it is installed and
+/// kept for the life of the process, so a scan needs no descriptor for it;
+/// -1 until then.
+static PROC_DIR: AtomicI32 = AtomicI32::new(-1);
+
+/// Set while a handler scans `/proc` through [`PROC_DIR`], whose offset
+/// every scan moves.
+static SCANNING: AtomicBool = AtomicBool::new(false);
 
 /// A stop signal arrived: analyze starts no further trial and reads no
 /// result of the trial it ended.
@@ -114,8 +131,46 @@ extern "C" fn on_stop_signal(signal: libc::c_int) {
     // handler interrupted from reading a value the handler left.
     let errno = unsafe { *libc::__errno_location() };
     container::request_stop(signal);
-    signal_children(pid, signal, inherited);
+    if let Err(undelivered) = signal_children(pid, signal, inherited) {
+        die_by_default_action(signal, undelivered);
+    }
     unsafe { *libc::__errno_location() = errno };
+}
+
+/// End analyze by `signal`'s default action, after saying on stderr that
+/// its handler could not pass the signal on (`undelivered`): the stop is
+/// then what it would be without the handler. The trial's container init
+/// dies with analyze by its parent-death signal, and the workspace stays.
+/// Async-signal-safe.
+fn die_by_default_action(signal: libc::c_int, undelivered: Undelivered) -> ! {
+    let mut name = [0u8; 10];
+    let mut errno = [0u8; 10];
+    for part in [
+        &b"hermit analyze: could not pass signal "[..],
+        pid_digits(signal, &mut name).unwrap_or(b"?"),
+        b" on to the run it started (",
+        undelivered.call.as_bytes(),
+        b" failed with errno ",
+        pid_digits(undelivered.errno, &mut errno).unwrap_or(b"?"),
+        b"), so it dies of the signal as it would without its handler, and leaves its \
+          workspace\n",
+    ] {
+        // SAFETY: write(2) reads `part.len()` bytes of `part`.
+        unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
+    }
+    // SAFETY: sigaction(2), sigemptyset(3), sigaddset(3), pthread_sigmask(3),
+    // raise(3) and _exit(2) are async-signal-safe, and every pointer refers
+    // to a local that outlives the call. An all-zero sigaction is SIG_DFL.
+    unsafe {
+        let default: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, &default, std::ptr::null_mut());
+        let mut unblock: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut unblock);
+        libc::sigaddset(&mut unblock, signal);
+        libc::raise(signal);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+        libc::_exit(128 + signal)
+    }
 }
 
 /// Whether `pid` is a child analyze had when it installed the handler.
@@ -143,8 +198,9 @@ impl StopSignals {
     /// itself as PID 1 too, so the handler could not tell the two apart.
     /// Nothing is installed either when the handler could not find the run's
     /// container init ([`record_inherited_children`]), or could not signal it
-    /// safely: on a kernel that opens no pidfds ([`opens_pidfds`]). Such an
-    /// analyze dies of the signal, or ignores it, as before.
+    /// safely: where a pidfd cannot be opened, signalled through, or waited on
+    /// ([`usable_pidfds`]). Such an analyze dies of the signal, or ignores
+    /// it, as before.
     ///
     /// Call it while analyze runs no other thread: the query and the install
     /// are two steps.
@@ -161,7 +217,7 @@ impl StopSignals {
         }
         // Before any disposition changes: a handler that recorded a stop but
         // could not end the run in progress would leave that run going.
-        if !opens_pidfds(pid) || !record_inherited_children(pid) {
+        if !usable_pidfds(pid) || !record_inherited_children(pid) {
             return Ok(guard);
         }
         HOLDER.store(pid, Ordering::Relaxed);
@@ -222,7 +278,7 @@ fn record_inherited_children(pid: libc::pid_t) -> bool {
         .ok()
         .and_then(|link| link.to_str()?.parse::<libc::pid_t>().ok())
         == Some(pid);
-    if !own_proc {
+    if !own_proc || proc_dir().is_none() {
         return false;
     }
     for slot in &INHERITED {
@@ -230,14 +286,41 @@ fn record_inherited_children(pid: libc::pid_t) -> bool {
     }
     let mut recorded = 0;
     let mut fits = true;
-    for_each_child(pid, |_, child| match INHERITED.get(recorded) {
+    let scanned = for_each_child(pid, |child| match INHERITED.get(recorded) {
         Some(slot) => {
             slot.store(child, Ordering::Relaxed);
             recorded += 1;
         }
         None => fits = false,
     });
-    fits
+    scanned.is_ok() && fits
+}
+
+/// The `/proc` directory [`for_each_child`] scans ([`PROC_DIR`]), opened on
+/// first use; `None` if it cannot be opened.
+fn proc_dir() -> Option<libc::c_int> {
+    let open = PROC_DIR.load(Ordering::Acquire);
+    if open >= 0 {
+        return Some(open);
+    }
+    // SAFETY: open(2) on a NUL-terminated literal.
+    let opened = unsafe {
+        libc::open(
+            c"/proc".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if opened < 0 {
+        return None;
+    }
+    match PROC_DIR.compare_exchange(-1, opened, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Some(opened),
+        Err(other) => {
+            // SAFETY: `opened` was opened above and is not shared.
+            unsafe { libc::close(opened) };
+            Some(other)
+        }
+    }
 }
 
 /// The action installed for `signal`, read without changing it.
@@ -252,35 +335,77 @@ fn current_action(signal: libc::c_int) -> anyhow::Result<libc::sigaction> {
     Ok(current)
 }
 
+/// A system call that failed while the handler passed a signal on, and its
+/// errno: the signal may not have reached a child it should have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Undelivered {
+    call: &'static str,
+    errno: libc::c_int,
+}
+
+impl Undelivered {
+    /// The `call` that just failed, with this thread's errno.
+    fn now(call: &'static str) -> Self {
+        // SAFETY: errno is this thread's.
+        let errno = unsafe { *libc::__errno_location() };
+        Self { call, errno }
+    }
+}
+
 /// Send `signal` to every child of `parent` that `skip` does not name;
-/// returns how many it reached. Async-signal-safe, as [`for_each_child`].
+/// returns how many it reached, or the call that failed when it may not have
+/// reached one. Async-signal-safe, as [`for_each_child`].
 ///
 /// The handler can run on any thread that does not block the signal, and a
 /// child found here can be reaped meanwhile on another thread, and its PID
 /// given to a process analyze did not start. So each child is signalled
-/// through a pidfd ([`signal_child`]), never by its number.
+/// through a pidfd ([`signal_child`]), never by its number. A child that is
+/// gone, or a PID that names another process by the time its pidfd is open,
+/// is not an error; a scan that could not read `/proc`, or a pidfd call that
+/// failed otherwise, is, and the handler then ends analyze by the signal's
+/// default action ([`die_by_default_action`]) rather than leave the run
+/// going.
+///
+/// One scan runs at a time: [`PROC_DIR`]'s offset is shared. A handler that
+/// finds another scanning, on another thread, leaves the children to it; a
+/// container init exits on the first stop signal it gets.
 pub(super) fn signal_children(
     parent: libc::pid_t,
     signal: libc::c_int,
     skip: impl Fn(libc::pid_t) -> bool,
-) -> usize {
+) -> Result<usize, Undelivered> {
+    if SCANNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(0);
+    }
     let mut reached = 0;
-    for_each_child(parent, |proc_dir, child| {
-        if skip(child) {
+    let mut failed = None;
+    let scanned = for_each_child(parent, |child| {
+        if skip(child) || failed.is_some() {
             return;
         }
         #[cfg(test)]
         tests::in_the_window(child);
-        if signal_child(proc_dir, parent, child, signal) {
-            reached += 1;
+        match signal_child(parent, child, signal) {
+            Ok(true) => reached += 1,
+            Ok(false) => {}
+            Err(undelivered) => failed = Some(undelivered),
         }
     });
-    reached
+    SCANNING.store(false, Ordering::Release);
+    scanned?;
+    match failed {
+        Some(undelivered) => Err(undelivered),
+        None => Ok(reached),
+    }
 }
 
-/// Send `signal` to `pid` through a pidfd if `pid` is a child of `parent`;
-/// returns whether a process received it. Async-signal-safe: system calls on
-/// stack buffers.
+/// Send `signal` to `pid` through a pidfd if `pid` is a child of `parent`:
+/// `Ok(true)` if a child received it, `Ok(false)` if `pid` names no child of
+/// `parent` any more, and the failed call otherwise. Async-signal-safe:
+/// system calls on stack buffers.
 ///
 /// A pidfd names the process that held `pid` when it was opened, and a signal
 /// sent through it reaches that process or, once it is reaped, none: the
@@ -289,28 +414,34 @@ pub(super) fn signal_children(
 /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/pid.c?h=v6.9#n629>;
 /// `pidfd_send_signal` and `kill_pid_info_type`,
 /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v6.9#n1483>).
-/// The parent is read again after the pidfd is open. If it still names
-/// `parent`, the pidfd's process is that child, or it was reaped and `pid`
-/// went to another child of `parent`, and then the signal reaches no one. A
-/// process that is not `parent`'s child at that point is left alone.
+/// Which process that is, is checked through the pidfd too, after it is
+/// open: `waitid(P_PIDFD, ..., WNOHANG | WNOWAIT)` succeeds only for a child
+/// of the caller's thread group, running or exited and not yet reaped, and
+/// reaps nothing; for any other process it fails with ECHILD
+/// (`kernel_waitid_prepare` and `eligible_child`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/exit.c?h=v6.9#n1679>).
+/// The check needs no descriptor beyond the pidfd. `parent` other than the
+/// calling process's own PID is checked through `/proc` instead, for tests.
 fn signal_child(
-    proc_dir: libc::c_int,
     parent: libc::pid_t,
     pid: libc::pid_t,
     signal: libc::c_int,
-) -> bool {
-    let mut digits = [0u8; 10];
-    let Some(name) = pid_digits(pid, &mut digits) else {
-        return false;
-    };
+) -> Result<bool, Undelivered> {
     // SAFETY: pidfd_open(2) has no memory arguments.
     let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     let Some(pidfd) = libc::c_int::try_from(opened).ok().filter(|&fd| fd >= 0) else {
-        return false;
+        let undelivered = Undelivered::now("pidfd_open");
+        return match undelivered.errno {
+            libc::ESRCH => Ok(false),
+            _ => Err(undelivered),
+        };
     };
-    let reached = parent_of(proc_dir, name) == Some(parent)
+    let delivered = is_child(parent, pid, pidfd).and_then(|child| {
+        if !child {
+            return Ok(false);
+        }
         // SAFETY: pidfd_send_signal(2) with no siginfo; `pidfd` is open.
-        && unsafe {
+        let sent = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
                 pidfd,
@@ -318,36 +449,104 @@ fn signal_child(
                 std::ptr::null::<libc::siginfo_t>(),
                 0,
             )
-        } == 0;
+        };
+        if sent == 0 {
+            return Ok(true);
+        }
+        let undelivered = Undelivered::now("pidfd_send_signal");
+        match undelivered.errno {
+            // It exited after the check.
+            libc::ESRCH => Ok(false),
+            _ => Err(undelivered),
+        }
+    });
     // SAFETY: `pidfd` is the descriptor opened above.
     unsafe { libc::close(pidfd) };
-    reached
+    delivered
+}
+
+/// Whether `pidfd`, opened for `pid`, names a child of `parent`: through the
+/// pidfd itself for analyze's own children ([`signal_child`]), else (in
+/// tests) by `pid`'s parent in `/proc`.
+fn is_child(
+    parent: libc::pid_t,
+    pid: libc::pid_t,
+    pidfd: libc::c_int,
+) -> Result<bool, Undelivered> {
+    // SAFETY: getpid(2) has no preconditions.
+    if parent != unsafe { libc::getpid() } {
+        let mut digits = [0u8; 10];
+        let Some(name) = pid_digits(pid, &mut digits) else {
+            return Ok(false);
+        };
+        let proc_dir = proc_dir().ok_or_else(|| Undelivered::now("open /proc"))?;
+        return Ok(parent_of(proc_dir, name)? == Some(parent));
+    }
+    // SAFETY: an all-zero siginfo_t is a valid out-parameter for waitid(2).
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let waited = unsafe {
+        libc::waitid(
+            libc::P_PIDFD,
+            pidfd as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+        )
+    };
+    if waited == 0 {
+        return Ok(true);
+    }
+    let undelivered = Undelivered::now("waitid");
+    match undelivered.errno {
+        libc::ECHILD => Ok(false),
+        _ => Err(undelivered),
+    }
 }
 
 /// `pid` in decimal digits, written into `buffer`.
 fn pid_digits(pid: libc::pid_t, buffer: &mut [u8; 10]) -> Option<&[u8]> {
-    let mut rest = u32::try_from(pid).ok().filter(|&rest| rest > 0)?;
+    let mut rest = u32::try_from(pid).ok()?;
     let mut start = buffer.len();
-    while rest > 0 {
+    loop {
         start -= 1;
         buffer[start] = b'0' + (rest % 10) as u8;
         rest /= 10;
+        if rest == 0 {
+            break;
+        }
     }
     Some(&buffer[start..])
 }
 
-/// Whether this kernel opens pidfds, which [`signal_child`] needs: Linux
-/// 5.3 and later, unless a seccomp filter refuses the call.
-fn opens_pidfds(pid: libc::pid_t) -> bool {
+/// Whether [`signal_child`] can work here, tried on this process (`pid`): a
+/// pidfd opens (Linux 5.3), a null signal goes through it (5.1), and
+/// `waitid` takes it (`P_PIDFD`, Linux 5.4), answering ECHILD since a process
+/// is not its own child. A seccomp filter can refuse any of the three.
+fn usable_pidfds(pid: libc::pid_t) -> bool {
     // SAFETY: pidfd_open(2) has no memory arguments.
     let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    match libc::c_int::try_from(opened) {
-        Ok(pidfd) if pidfd >= 0 => {
-            // SAFETY: `pidfd` was just opened here.
-            unsafe { libc::close(pidfd) };
-            true
-        }
-        _ => false,
+    let Some(pidfd) = libc::c_int::try_from(opened).ok().filter(|&fd| fd >= 0) else {
+        return false;
+    };
+    // SAFETY: pidfd_send_signal(2) with signal 0 and no siginfo sends nothing;
+    // waitid(2) writes only `info`; `pidfd` is open until the close.
+    unsafe {
+        let sends = libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        ) == 0;
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let waits = libc::waitid(
+            libc::P_PIDFD,
+            pidfd as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+        ) == -1
+            && *libc::__errno_location() == libc::ECHILD;
+        libc::close(pidfd);
+        sends && waits
     }
 }
 
@@ -386,8 +585,9 @@ where
     spawned
 }
 
-/// Call `visit` with the open `/proc` directory and the PID of every child
-/// of `parent`.
+/// Call `visit` with the PID of every child of `parent`; the failed call if
+/// `/proc` could not be read whole, when a child may have been missed. A
+/// process that exits during the scan is not a failure.
 ///
 /// Reverie gives the trial's container init's PID out only once the trial
 /// has ended, so a signal handler finds the init here: the processes whose
@@ -395,20 +595,19 @@ where
 /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/proc/array.c?h=v6.9#n534>).
 /// `/proc/<pid>/task/<tid>/children` would be shorter, but kernels built
 /// without CONFIG_PROC_CHILDREN (which comes with checkpoint/restore) leave it
-/// out.
+/// out. The directory is [`PROC_DIR`], read from its start; each `stat` file
+/// takes one descriptor while it is read.
 ///
 /// Async-signal-safe: system calls on stack buffers, no allocation, no lock,
 /// no panic.
-fn for_each_child(parent: libc::pid_t, mut visit: impl FnMut(libc::c_int, libc::pid_t)) {
-    // SAFETY: open(2) on a NUL-terminated literal.
-    let proc_dir = unsafe {
-        libc::open(
-            c"/proc".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if proc_dir < 0 {
-        return;
+fn for_each_child(
+    parent: libc::pid_t,
+    mut visit: impl FnMut(libc::pid_t),
+) -> Result<(), Undelivered> {
+    let proc_dir = proc_dir().ok_or_else(|| Undelivered::now("open /proc"))?;
+    // SAFETY: lseek(2) has no memory arguments.
+    if unsafe { libc::lseek(proc_dir, 0, libc::SEEK_SET) } < 0 {
+        return Err(Undelivered::now("lseek /proc"));
     }
     let reclen_at = std::mem::offset_of!(libc::dirent64, d_reclen);
     let name_at = std::mem::offset_of!(libc::dirent64, d_name);
@@ -423,8 +622,11 @@ fn for_each_child(parent: libc::pid_t, mut visit: impl FnMut(libc::c_int, libc::
                 entries.len(),
             )
         };
+        if filled < 0 {
+            return Err(Undelivered::now("getdents64 /proc"));
+        }
         let Some(filled) = usize::try_from(filled).ok().filter(|&filled| filled > 0) else {
-            break;
+            return Ok(());
         };
         let mut records = entries.get(..filled).unwrap_or_default();
         while let Some(length) = records
@@ -441,25 +643,29 @@ fn for_each_child(parent: libc::pid_t, mut visit: impl FnMut(libc::c_int, libc::
                 .position(|&byte| byte == 0)
                 .unwrap_or(name.len())];
             if let Some(pid) = parse_pid(name)
-                && parent_of(proc_dir, name) == Some(parent)
+                && parent_of(proc_dir, name)? == Some(parent)
             {
-                visit(proc_dir, pid);
+                visit(pid);
             }
             records = &records[length..];
         }
     }
-    // SAFETY: `proc_dir` is the descriptor opened above.
-    unsafe { libc::close(proc_dir) };
 }
 
 /// The parent of the process named `pid` (its decimal digits) in the open
-/// `/proc` directory `proc_dir`.
-fn parent_of(proc_dir: libc::c_int, pid: &[u8]) -> Option<libc::pid_t> {
+/// `/proc` directory `proc_dir`; `None` once it has exited, and the failed
+/// call when its `stat` cannot be read otherwise (no descriptor left).
+fn parent_of(proc_dir: libc::c_int, pid: &[u8]) -> Result<Option<libc::pid_t>, Undelivered> {
     const STAT: &[u8] = b"/stat\0";
     let mut path = [0u8; 32];
-    path.get_mut(..pid.len())?.copy_from_slice(pid);
-    path.get_mut(pid.len()..pid.len() + STAT.len())?
-        .copy_from_slice(STAT);
+    let Some(()) = path
+        .get_mut(..pid.len())
+        .map(|name| name.copy_from_slice(pid))
+        .and_then(|()| path.get_mut(pid.len()..pid.len() + STAT.len()))
+        .map(|tail| tail.copy_from_slice(STAT))
+    else {
+        return Ok(None);
+    };
     // SAFETY: `path` is NUL-terminated within its length.
     let file = unsafe {
         libc::openat(
@@ -469,14 +675,25 @@ fn parent_of(proc_dir: libc::c_int, pid: &[u8]) -> Option<libc::pid_t> {
         )
     };
     if file < 0 {
-        return None;
+        let undelivered = Undelivered::now("open /proc/<pid>/stat");
+        return match undelivered.errno {
+            libc::ENOENT | libc::ESRCH => Ok(None),
+            _ => Err(undelivered),
+        };
     }
     let mut stat = [0u8; 512];
     // SAFETY: read(2) writes at most `stat.len()` bytes into it, and `file`
     // is the descriptor opened above.
     let read = unsafe { libc::read(file, stat.as_mut_ptr().cast(), stat.len()) };
+    let undelivered = (read < 0).then(|| Undelivered::now("read /proc/<pid>/stat"));
     unsafe { libc::close(file) };
-    stat_parent(stat.get(..usize::try_from(read).ok()?)?)
+    match undelivered {
+        Some(undelivered) if undelivered.errno == libc::ESRCH => Ok(None),
+        Some(undelivered) => Err(undelivered),
+        None => Ok(stat
+            .get(..usize::try_from(read).unwrap_or_default())
+            .and_then(stat_parent)),
+    }
 }
 
 /// The parent PID in a `/proc/<pid>/stat` line: the field after the state,
@@ -571,7 +788,7 @@ mod tests {
         let mut childless = Command::new("sleep").arg("60").spawn().unwrap();
         assert_eq!(
             signal_children(childless.id() as libc::pid_t, libc::SIGTERM, |_| false),
-            0
+            Ok(0)
         );
         childless.kill().unwrap();
         childless.wait().unwrap();
@@ -586,13 +803,13 @@ mod tests {
         while children.is_empty() {
             assert!(Instant::now() < deadline, "the shell never started sleep");
             std::thread::sleep(Duration::from_millis(10));
-            for_each_child(parent, |_, child| children.push(child));
+            for_each_child(parent, |child| children.push(child)).unwrap();
         }
         assert_eq!(
             signal_children(parent, libc::SIGTERM, |child| children.contains(&child)),
-            0
+            Ok(0)
         );
-        assert_eq!(signal_children(parent, libc::SIGTERM, |_| false), 1);
+        assert_eq!(signal_children(parent, libc::SIGTERM, |_| false), Ok(1));
         let status = shell.wait().unwrap();
         assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?}");
     }
@@ -696,6 +913,7 @@ mod tests {
         pub const STOP_NOT_RECORDED: libc::c_int = 17;
         pub const THE_REUSED_PID_WAS_SIGNALLED: libc::c_int = 18;
         pub const THE_REUSED_PID_ENDED: libc::c_int = 19;
+        pub const STOP_SWALLOWED: libc::c_int = 20;
 
         /// What an exit says; the process said why on stderr, with errno.
         pub fn describe(code: libc::c_int) -> &'static str {
@@ -724,6 +942,9 @@ mod tests {
                      signalled a process analyze did not start"
                 }
                 THE_REUSED_PID_ENDED => "the process that took the reaped child's PID ended early",
+                STOP_SWALLOWED => {
+                    "the handler returned from a stop it could not pass on, and analyze went on"
+                }
                 _ => "unexpected exit",
             }
         }
@@ -1016,5 +1237,125 @@ mod tests {
         assert!(outer > 0, "fork: {}", std::io::Error::last_os_error());
         let code = exit_code(outer);
         assert_eq!(code, ended::AS_IT_SHOULD, "{}", ended::describe(code));
+    }
+    /// The process holding the handler in
+    /// [`a_stop_the_handler_cannot_pass_on_ends_analyze_by_its_default_action`]:
+    /// it starts a child that dies with it (its parent-death signal, as a
+    /// trial's container init has), tells its PID on `tell`, uses up every
+    /// descriptor it may open, and sends itself SIGTERM. Exiting is the
+    /// regression: the stop was swallowed.
+    fn as_analyze_without_descriptors(says: libc::c_int, tell: libc::c_int) -> libc::c_int {
+        // SAFETY: dup2(2) and close(2) on descriptors this process owns.
+        unsafe {
+            libc::dup2(says, 2);
+            libc::close(says);
+        }
+        let Ok(guard) = StopSignals::install() else {
+            return ended::NO_HANDLER;
+        };
+        if !guard.installed[0] {
+            return ended::NO_HANDLER;
+        }
+        // SAFETY: this process has one thread; the child only pauses.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        if child < 0 || !send(tell, &child.to_ne_bytes()) {
+            return ended::NO_FORK;
+        }
+        // SAFETY: setrlimit(2) reads `limit`; open(2) on a NUL-terminated
+        // literal; raise(3) runs the handler on this thread.
+        unsafe {
+            libc::close(tell);
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+            limit.rlim_cur = limit.rlim_cur.min(64);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            while libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) >= 0 {}
+            libc::raise(libc::SIGTERM);
+        }
+        std::mem::forget(guard);
+        ended::STOP_SWALLOWED
+    }
+
+    /// A stop the handler cannot pass on is never swallowed. With no
+    /// descriptor left, the scan cannot read a `stat` file and so cannot
+    /// tell which process is the child it must signal. Before, the handler
+    /// then found no child and returned: the run went on, and so did
+    /// analyze. Now analyze says on stderr which call failed and dies of the
+    /// signal by its default action, as without the handler, and the child
+    /// dies with it by its parent-death signal.
+    #[test]
+    fn a_stop_the_handler_cannot_pass_on_ends_analyze_by_its_default_action() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        // SAFETY: prctl(2) with integer arguments: the child below, orphaned
+        // when its parent dies, comes to this process to be reaped.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let (Some((said, says)), Some((told, tell))) = (pipe(), pipe()) else {
+            panic!("pipe: {}", std::io::Error::last_os_error());
+        };
+        // SAFETY: the copy's other thread waits for this test and holds no
+        // lock.
+        let analyze = unsafe { libc::fork() };
+        if analyze == 0 {
+            unsafe {
+                libc::close(said);
+                libc::close(told);
+                libc::_exit(as_analyze_without_descriptors(says, tell))
+            }
+        }
+        assert!(analyze > 0, "fork: {}", std::io::Error::last_os_error());
+        // SAFETY: closes this process's copies of the ends the child uses.
+        unsafe {
+            libc::close(says);
+            libc::close(tell);
+        }
+        let mut raw = 0;
+        // SAFETY: `raw` outlives the call; `analyze` is this process's child.
+        assert_eq!(unsafe { libc::waitpid(analyze, &mut raw, 0) }, analyze);
+        let mut stderr = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            // SAFETY: read(2) writes at most `chunk.len()` bytes into it.
+            let got = unsafe { libc::read(said, chunk.as_mut_ptr().cast(), chunk.len()) };
+            let Some(got) = usize::try_from(got).ok().filter(|&got| got > 0) else {
+                break;
+            };
+            stderr.extend_from_slice(&chunk[..got]);
+        }
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(
+            libc::WIFSIGNALED(raw) && libc::WTERMSIG(raw) == libc::SIGTERM,
+            "analyze should die of SIGTERM; status {raw:#x} ({}), stderr: {stderr}",
+            if libc::WIFEXITED(raw) {
+                ended::describe(libc::WEXITSTATUS(raw))
+            } else {
+                "killed"
+            }
+        );
+        assert!(
+            stderr.contains(
+                "hermit analyze: could not pass signal 15 on to the run it started (open \
+                 /proc/<pid>/stat failed with errno 24)"
+            ),
+            "{stderr}"
+        );
+        let mut child = [0u8; 4];
+        assert!(receive(told, &mut child), "no child PID");
+        let child = libc::pid_t::from_ne_bytes(child);
+        // SAFETY: the orphaned child is this process's to reap.
+        assert_eq!(unsafe { libc::waitpid(child, &mut raw, 0) }, child);
+        assert!(
+            libc::WIFSIGNALED(raw) && libc::WTERMSIG(raw) == libc::SIGKILL,
+            "the child should die with analyze; status {raw:#x}"
+        );
     }
 }
