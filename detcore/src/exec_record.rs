@@ -755,7 +755,7 @@ pub fn program_interpreter(path: &Path) -> Result<Option<PathBuf>, &'static str>
         }
         let field = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
         let size = field(32);
-        if size == 0 || size > crate::page::page_size() as u64 {
+        if size == 0 || size > crate::page::page_size() {
             return Err("a PT_INTERP that is empty or larger than a page");
         }
         let mut name = vec![0_u8; size as usize];
