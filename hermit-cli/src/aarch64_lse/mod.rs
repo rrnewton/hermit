@@ -22,17 +22,20 @@
 //! loads Detcore as a Reverie tool and is not a backend.
 //!
 //! [`insn`] holds the decoder and the encoders; [`rewrite`] holds the idioms
-//! and the in-place replacement; [`elf`] applies them to the executable
-//! segments of an ELF file.
+//! and the in-place replacement; [`elf`] applies them to the code of an ELF
+//! file's executable sections, which [`mapping`] tells from the data those
+//! sections can also hold.
 
 pub mod elf;
 pub mod insn;
+pub mod mapping;
 pub mod rewrite;
 
 /// Bumped whenever the rewrite's output for the same input can change. It is
 /// part of the cache key, so a cached artifact from an older rewriter is
-/// never reused.
-pub const REWRITE_FORMAT_VERSION: u32 = 2;
+/// never reused. 3: only code is rewritten, as [`mapping`] tells it from
+/// data.
+pub const REWRITE_FORMAT_VERSION: u32 = 3;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///
