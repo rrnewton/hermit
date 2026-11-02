@@ -12595,7 +12595,8 @@ impl RunOpts {
                 );
             }
             self.refuse_program_under_dev_shm(requested)?;
-            return validate_executable(requested, requested, None);
+            validate_executable(requested, requested, None)?;
+            return Ok((requested.to_path_buf(), requested.to_path_buf(), None));
         }
 
         // ⚠️ SAME FAULT AS THE ABSOLUTE-PATH BRANCH ABOVE, SO THE SAME CODE.

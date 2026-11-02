@@ -196,7 +196,6 @@ impl ExecRecord {
     }
 }
 
-
 /// What decides where Linux starts a process's program break after it execs
 /// an ELF image (`load_elf_binary`, fs/binfmt_elf.c), from the image's file
 /// header and program headers.
