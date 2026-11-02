@@ -7275,7 +7275,16 @@ sys.exit(37)
         // and the retired base producers stay retired (104 full nodes).
         // (103 full nodes), and 102 with privileged-test.deadline_slice_cap_kvm
         // (105 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 103);
+        // The OFF cohort and explicit native ON control both remain beside
+        // the Buck cells: two additive required nodes over main's 102.
+        let selected = buck_e2e_selection(&committed).unwrap();
+        assert_eq!(selected.steps.len(), 104);
+        for required in [
+            "test.in_guest_trap_no_liteinst",
+            "test.in_guest_trap_native_liteinst_on",
+        ] {
+            assert!(selected.steps.iter().any(|step| step.tag() == required));
+        }
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

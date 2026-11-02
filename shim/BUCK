@@ -103,6 +103,15 @@ system_cxx_toolchain(
     visibility = ["PUBLIC"],
 )
 
+# The bundled prelude also names this variant for C++ rules without default
+# dependencies, including the alternate branch visited by unconfigured queries.
+# Our system toolchain adds no default dependencies, so both names use it.
+alias(
+    name = "cxx_no_default_deps",
+    actual = ":cxx",
+    visibility = ["PUBLIC"],
+)
+
 system_genrule_toolchain(
     name = "genrule",
     visibility = ["PUBLIC"],

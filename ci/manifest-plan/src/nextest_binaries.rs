@@ -2480,10 +2480,19 @@ mod tests {
         let expected = args(
             "--workspace --all-targets --features hermit-run/exec-stop-launcher,hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/liteinst,hermit-run/mm-cancellation-test-support,hermit-run/native-exec,hermit-run/third-party-backends",
         );
-        for (profile, count) in [("full", 21), ("hosted-portable", 15)] {
+        let native_on = args(
+            "-p hermit-run --features liteinst,native-exec,exec-stop-launcher,mm-cancellation-test-support --bins --test cli",
+        );
+        for (profile, count) in [("full", 22), ("hosted-portable", 15)] {
             let logical = config_selections(&graph, profile).unwrap();
             let physical = compilation_selections(&graph, profile).unwrap();
             assert_eq!(logical.len(), count);
+            // The additive native ON control contributes one full record;
+            // shared compilation must not add its logical key to hosted.
+            assert_eq!(
+                logical.contains_key(&selection_key(&native_on)),
+                profile == "full",
+            );
             assert_eq!(unified_selection(&physical).unwrap(), expected);
             let plan = preparation_listings(&graph, profile).unwrap();
             assert_eq!(plan.len(), 1);
