@@ -20734,9 +20734,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // SCM_RIGHTS receipt refusal, hugetlbfs view refusal and unexchangeable
         // robust word refusal tests, N4's smaps test and PRCTL phase 2's
         // parent-death test: 126. And package K slice K10's
-        // run_kvm_the_callers_own_proc_directories_answer_as_linux: 127, matching
-        // the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 127usize),
+        // run_kvm_the_callers_own_proc_directories_answer_as_linux: 127. And R1108
+        // (https://github.com/rrnewton/reverie/issues/1108) retires the default
+        // rustc link refusal and lists the shared file view beside a second
+        // thread, the exited-threads fork test and the fork refusal beside a live
+        // thread: 129, matching the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 129usize),
     ] {
         let step = privileged
             .steps
