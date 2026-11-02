@@ -13136,8 +13136,19 @@ impl RunOpts {
                 report.refused,
                 report.skipped_segments,
             );
-            for (addr, why) in &report.refused_examples {
+            // The first few, as examples; the listing names every one.
+            const LOGGED: usize = 16;
+            for (addr, why) in report.refused_sites.iter().take(LOGGED) {
                 tracing::info!("exclusive loop left alone at {addr:#x}: {why}");
+            }
+            if let Some(more) = report.refused_sites.len().checked_sub(LOGGED)
+                && more != 0
+            {
+                tracing::info!(
+                    "{more} more exclusive loops left alone in {}; `hermit rewrite-exclusives \
+                     --list-refusals` lists every one",
+                    guest_path.display()
+                );
             }
             if report.patched_total() != 0 {
                 self.validate_executable_overlay_source_visibility(&output)?;

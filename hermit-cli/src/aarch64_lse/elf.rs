@@ -70,8 +70,11 @@ pub struct FileReport {
     pub patched: BTreeMap<&'static str, usize>,
     /// Sequences left alone, by reason.
     pub refused: BTreeMap<&'static str, usize>,
-    /// Addresses of the first few refusals, for reporting.
-    pub refused_examples: Vec<(u64, String)>,
+    /// Every sequence left alone, by address, with the reason, in the order
+    /// the sections were planned: all of them, so that a listing of them
+    /// (`hermit rewrite-exclusives --list-refusals`) is complete. A run logs
+    /// only the first few.
+    pub refused_sites: Vec<(u64, String)>,
     /// Executable sections skipped entirely, with the reason.
     pub skipped_segments: Vec<String>,
 }
@@ -371,11 +374,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                 .refused
                 .entry(refusal_name(&refused.reason))
                 .or_default() += 1;
-            if report.refused_examples.len() < 16 {
-                report
-                    .refused_examples
-                    .push((refused.addr, refusal_detail(&refused.reason)));
-            }
+            report
+                .refused_sites
+                .push((refused.addr, refusal_detail(&refused.reason)));
         }
         rewrite::apply(&mut words, vaddr, &plan);
         let start = offset as usize;
@@ -833,6 +834,29 @@ mod tests {
         );
     }
 
+    /// Every refused sequence is listed, not only the first sixteen: 17
+    /// lone store-exclusives give 17 sites, in address order, which is what
+    /// `--list-refusals` prints.
+    #[test]
+    fn every_refused_loop_is_listed() {
+        // stlxr w9, w8, [x0] seventeen times, then ret.
+        let mut words = vec![0x8809_fc08_u32; 17];
+        words.push(0xd65f_03c0);
+        let image = elf_image(&words, Some(&[(1, 0, true)]));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image);
+        assert_eq!(report.refused_total(), 17, "{report:?}");
+        assert_eq!(
+            report
+                .refused_sites
+                .iter()
+                .map(|(addr, _)| *addr)
+                .collect::<Vec<_>>(),
+            (0..17).map(|i| 0x100 + 4 * i).collect::<Vec<u64>>(),
+            "{report:?}"
+        );
+    }
+
     /// A constant table in `.text` whose words form a canonical loop is
     /// left as it is when the mapping symbols mark it data, and only the
     /// code's exclusive instructions are counted. Without the `$d` mark the
@@ -881,7 +905,7 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(
-            report.refused_examples,
+            report.refused_sites,
             vec![(0x10c, "not-a-canonical-loop".into())]
         );
         // Data from the stlxr (word 3) on: the store is not an instruction.
@@ -986,7 +1010,7 @@ mod tests {
             "{report:?}"
         );
         assert_eq!(
-            report.refused_examples,
+            report.refused_sites,
             vec![(0x124, "literal-inside-the-sequence".into())]
         );
     }
