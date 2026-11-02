@@ -20857,8 +20857,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // And slice 2b-4's two other-process links tests: 139. And slice
         // 2b-5's three other-process descriptors tests: 142. And SIGSHARE S4's
         // run_kvm_a_child_exit_sigchld_reaches_a_one_thread_parent_as_on_linux:
-        // 143, matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 143usize),
+        // 143. And the sixteen SIGALRM receiver tests of 4929 slice 2
+        // (https://github.com/rrnewton/hermit/issues/4929; its review rounds
+        // 1 to 7 added 4, 2, 2, 3, 2, 2 and 1): 159, matching the DAG pin in
+        // validation_dag_static.
+        ("privileged-only-test.cli_kvm", 159usize),
     ] {
         let step = privileged
             .steps
