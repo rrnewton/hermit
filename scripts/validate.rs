@@ -20733,8 +20733,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // test: 120. And the KVM default rustc link refusal, overlapping
         // SCM_RIGHTS receipt refusal, hugetlbfs view refusal and unexchangeable
         // robust word refusal tests, N4's smaps test and PRCTL phase 2's
-        // parent-death test: 126, matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 126usize),
+        // parent-death test: 126. And package K slice K10's
+        // run_kvm_the_callers_own_proc_directories_answer_as_linux: 127, matching
+        // the DAG pin in validation_dag_static.
+        ("privileged-only-test.cli_kvm", 127usize),
     ] {
         let step = privileged
             .steps
