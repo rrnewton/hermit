@@ -1977,6 +1977,30 @@ fn compare_two_runs_with_unsupported_scan(
                 left: summary.compared_left,
                 right: summary.compared_right,
             });
+            // A comparison that compared zero messages on BOTH sides is no
+            // evidence of parity (issue 5064: --log-file misrouted the INFO
+            // stream, both captured logs compared 0/0, and the run reported
+            // "verdict matched" and exited 0). Refuse it through the same
+            // no-result vocabulary as any other declined comparison; an
+            // observed output/status divergence still outranks it below.
+            // The DBT evidence-transport envelope is the one designed
+            // exception: its logs carry transport evidence and zero Detcore
+            // records by construction, and its report already discloses
+            // non-parity (bitwise_parity: false), so it never claimed the
+            // parity this refusal protects.
+            if summary.compared_left == 0
+                && summary.compared_right == 0
+                && comparison_refusal_reason.is_none()
+                && options.record_envelope.policy() != RecordEnvelopePolicy::DbtEvidenceTransportV1
+            {
+                failed = true;
+                comparison_refusal_reason = Some(format!(
+                    "the log comparison compared 0 messages on both sides \
+                     ({label1} and {label2}), so it provides no evidence of \
+                     parity; check that both logs captured the INFO stream \
+                     (for example, that --log-file did not route it elsewhere)"
+                ));
+            }
             // A recvmsg whose buffers could not be observed after the call is
             // logged as an `unobserved` buffer-digest record and compared like
             // any other; every verification path reports how many there were,
@@ -3697,7 +3721,7 @@ mod tests {
     fn identical_outputs_verify_successfully() {
         let left = output(0, b"hello\n", b"");
         let right = left.clone();
-        let (log1, log2) = empty_logs();
+        let (log1, log2) = logs_with_identical_detlog();
 
         let outcome = compare(&left, log1, &right, log2).unwrap();
         assert_eq!(outcome.verdict, Verdict::Matched);
@@ -3721,7 +3745,7 @@ mod tests {
     fn nonzero_exit_with_matching_outputs_reports_verified() {
         let left = output(3, b"hello\n", b"oops\n");
         let right = left.clone();
-        let (log1, log2) = empty_logs();
+        let (log1, log2) = logs_with_identical_detlog();
 
         let outcome = compare(&left, log1, &right, log2).unwrap();
         assert_eq!(outcome.verdict, Verdict::Matched);
@@ -3829,6 +3853,41 @@ mod tests {
         // The verdict records that the log stream was NOT compared, so no
         // consumer can mistake this for a bitwise log-parity result.
         assert!(!outcome.comparison.compare_logs);
+    }
+
+    // Issue 5064: a log comparison that compared zero messages on both
+    // sides (for example --log-file misrouting the INFO stream elsewhere)
+    // is no evidence of parity, not a match. It must surface as a
+    // no-result with the refusal vocabulary, and exit nonzero.
+    #[test]
+    fn comparing_zero_log_messages_is_a_no_result_not_a_match() {
+        let left = output(0, b"console", b"");
+        let right = output(0, b"console", b"");
+
+        for strictness in [
+            LogCompareStrictness::Stripped,
+            LogCompareStrictness::Canonical,
+        ] {
+            let (left_log, right_log) = empty_logs();
+            let outcome = compare_with(&left, left_log, &right, right_log, strictness).unwrap();
+            assert_eq!(
+                outcome.verdict,
+                Verdict::NoResult,
+                "{strictness:?} compared 0/0 messages and must not report a match"
+            );
+            assert!(!outcome.verified());
+            assert_eq!(
+                outcome.compared_log_messages,
+                Some(ComparedLogCounts { left: 0, right: 0 })
+            );
+            match &outcome.no_result_reason {
+                Some(NoResultReason::ComparisonRefused { detail }) => {
+                    assert!(detail.contains("0"), "{detail}");
+                }
+                other => panic!("expected a comparison refusal, got {other:?}"),
+            }
+            assert!(outcome.into_exit_status().is_err());
+        }
     }
 
     #[test]
@@ -4861,24 +4920,30 @@ mod tests {
     /// returns "no difference" for two empty selections, so configuration
     /// strictness alone would hand back a green over no work at all.
     #[test]
-    fn empty_log_comparison_matches_but_is_never_parity() {
+    fn empty_log_comparison_is_a_no_result_and_never_parity() {
         let out = output(0, b"hello\n", b"");
         let (log1, log2) = empty_logs();
         let outcome =
             compare_with(&out, log1, &out, log2, LogCompareStrictness::Canonical).unwrap();
 
-        // The verdict itself is legitimately Matched: stdout, stderr and exit
-        // status all agree. Only the PARITY claim is refused.
-        assert_eq!(outcome.verdict, Verdict::Matched);
+        // Zero compared messages is no evidence (issue 5064): even though
+        // stdout, stderr and exit status all agree, the verdict itself is a
+        // no-result now, not a match. Before, this reported Matched and
+        // exited 0 while only the report's parity bit was refused.
+        assert_eq!(outcome.verdict, Verdict::NoResult);
         assert_eq!(
             outcome.compared_log_messages,
             Some(ComparedLogCounts { left: 0, right: 0 })
         );
+        assert!(matches!(
+            outcome.no_result_reason,
+            Some(NoResultReason::ComparisonRefused { .. })
+        ));
         // The spec still reports a fully-qualifying policy...
         assert!(outcome.comparison.is_bitwise_parity());
         // ...and that is exactly why the count is load-bearing.
         let report = verification_report(&outcome);
-        assert!(report.verified);
+        assert!(!report.verified);
         assert!(
             !report.bitwise_parity,
             "zero compared log messages must never certify bitwise parity"
@@ -5147,7 +5212,7 @@ mod tests {
         }
 
         let file = NamedTempFile::new().unwrap();
-        let (log1, log2) = empty_logs();
+        let (log1, log2) = logs_with_identical_detlog();
         let outcome = compare(&same, log1, &output(0, b"goodbye\n", b""), log2).unwrap();
         assert_eq!(outcome.verdict, Verdict::Diverged);
         assert_eq!(outcome.refused_log_comparison, None);
