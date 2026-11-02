@@ -8312,8 +8312,10 @@ pub enum SignalScope {
 /// landed 46). 48 adds `WithCpuTime` and `RecordExitCode` (package K item
 /// 2b slice 2b-1, allocated 39, renumbered 41 at its rebase onto 40, 42 at
 /// its rebase onto 41, 46 at its rebase onto 45, then mechanically to 48
-/// at its rebase onto 47) and is the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 48;
+/// at its rebase onto 47). 49 adds `TraceSchedEventResponse::backstop`
+/// (https://github.com/rrnewton/hermit/pull/4759; allocated 25, assigned
+/// 42, renumbered to 49 on main's 48) and is the current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 49;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

@@ -334,6 +334,16 @@ mod tests {
         // own; domain 6 on its old base, moved to 7 because main's 41 took
         // domain 6 for `HostFileIdentity`. Digest measured at this head.
         (48, "e40e244635167e09", "f013e36743d8d9e6"),
+        // Adds `TraceSchedEventResponse::backstop`, the replay backstop of a
+        // schedule replay of a record whose slices ran without the
+        // `--max-timeslice` bound, which `GlobalResponse::TraceSchedEvent`
+        // carries. The reply's fields are digested as `TRACE_REPLY_WIRE`
+        // items, so the field changes the digest in domain 5
+        // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
+        // 25 on its own base after main's 24, assigned 42 at its rebase
+        // onto 41, renumbered to 49 at its rebase onto main's 48, skipping
+        // reserved revisions; digest measured at this head).
+        (49, "0000000000000000", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -774,6 +784,27 @@ mod tests {
                 host_input,
                 task_stat
             ),
+            digest
+        );
+
+        // The reply this change extends is covered the same way: a field
+        // added to `TraceSchedEventResponse`, or its backstop removed,
+        // changes the digest (domain 5); the positional response a runtime
+        // decodes changes with it.
+        let nested_added = source.replacen(
+            "pub struct TraceSchedEventResponse {\n",
+            "pub struct TraceSchedEventResponse {\n    added: bool,\n",
+            1,
+        );
+        assert_ne!(nested_added, source);
+        assert_ne!(
+            definition_digest(&nested_added, payload, schedule, replayer),
+            digest
+        );
+        let nested_removed = source.replacen("    backstop: Option<LogicalTime>,\n", "", 1);
+        assert_ne!(nested_removed, source);
+        assert_ne!(
+            definition_digest(&nested_removed, payload, schedule, replayer),
             digest
         );
 
