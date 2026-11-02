@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-reverie-liteinst-preload = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "e520999c018a22374b3a46cebbddfb9aba485e53", default-features = false }
+reverie-liteinst-preload = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "1c784f51b15d02455d4511c891fd56821f92c6d4", default-features = false }
 
 [features]
 allocator-fixture = ["reverie-liteinst-preload/allocator-fixture"]
