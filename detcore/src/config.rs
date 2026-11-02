@@ -88,8 +88,11 @@ mod tests {
 
     /// Revisions reserved for a change that is not on this base yet, which
     /// `GLOBAL_RPC_REVISIONS` therefore skips: 30 (PR #4728, returned for
-    /// a clean rebase). Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[30];
+    /// a clean rebase) and 32 to 36, assigned to changes pending elsewhere
+    /// (`ignored/drain-20261103/rpc-revisions.tsv` in the dev-hermit
+    /// parent), which 4759's 37 skips. Remove an entry when its change
+    /// lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[30, 32, 33, 34, 35, 36];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -240,6 +243,15 @@ mod tests {
         // this rebase onto main's pidfd revision 27, skipping reserved
         // 30 (4728); digest measured at this head).
         (31, "b4bbaec490287ee5", "f013e36743d8d9e6"),
+        // Adds `TraceSchedEventResponse::backstop`, the replay backstop of a
+        // schedule replay of a record whose slices ran without the
+        // `--max-timeslice` bound, which `GlobalResponse::TraceSchedEvent`
+        // carries; from this revision the definition digest also covers
+        // `TraceSchedEventResponse` (`NESTED_PAYLOADS`)
+        // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
+        // 25 on its own base after main's 24, assigned 37, skipping 32 to 36
+        // reserved for pending changes; digest measured at this head).
+        (37, "30b2f93eba447f40", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -285,10 +297,23 @@ mod tests {
         code
     }
 
+    /// The payload types defined in `tool_global.rs` that a variant of
+    /// `GlobalRequest` or `GlobalResponse` carries and whose own fields the
+    /// definition digest covers, by the line that declares each. Positional
+    /// bincode encodes their fields in place, so a field added to one changes
+    /// the wire as a field added to a variant does. Revision 37 added the
+    /// first, `TraceSchedEventResponse` (`GlobalResponse::TraceSchedEvent`);
+    /// earlier digests do not cover them. They are digested in domain 6, apart
+    /// from main's StoreExclusive payload types in domain 3
+    /// (`STORE_EXCLUSIVE_PAYLOAD`). A payload type not listed here still
+    /// needs its revision appended by hand when it changes
+    /// (`GLOBAL_RPC_REVISION`), and joins this list then.
+    const NESTED_PAYLOADS: &[&str] = &["pub struct TraceSchedEventResponse {"];
+
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
-    /// `source`, and of the StoreExclusive payload's types in `payload`:
-    /// their variants, fields, payload types, order and attributes, not
-    /// their documentation.
+    /// `source`, of the StoreExclusive payload's types in `payload`, and of
+    /// the payload types in `NESTED_PAYLOADS`: their variants and fields,
+    /// payload types, order and attributes, not their documentation.
     fn definition_digest(source: &str, payload: &str) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
@@ -297,11 +322,17 @@ mod tests {
             .map(|header| nested_definition(payload, header).join("\n"))
             .collect::<Vec<_>>()
             .join("\n");
-        fnv_domains(&[
+        let nested: Vec<String> = NESTED_PAYLOADS
+            .iter()
+            .map(|header| definition(source, header).join("\n"))
+            .collect();
+        let mut parts = vec![
             (0, request.as_bytes()),
             (1, response.as_bytes()),
             (3, payload.as_bytes()),
-        ])
+        ];
+        parts.extend(nested.iter().map(|code| (6, code.as_bytes())));
+        fnv_domains(&parts)
     }
 
     fn resources_definition_digest(source: &str) -> String {
@@ -392,6 +423,18 @@ mod tests {
         );
         assert_ne!(documented, payload);
         assert_eq!(definition_digest(source, &documented), digest);
+        // A field added to, or removed from, a nested payload changes the
+        // digest too: the positional response a runtime decodes changes.
+        let nested_added = source.replacen(
+            "pub struct TraceSchedEventResponse {\n",
+            "pub struct TraceSchedEventResponse {\n    added: bool,\n",
+            1,
+        );
+        assert_ne!(nested_added, source);
+        assert_ne!(definition_digest(&nested_added, payload), digest);
+        let nested_removed = source.replacen("    backstop: Option<LogicalTime>,\n", "", 1);
+        assert_ne!(nested_removed, source);
+        assert_ne!(definition_digest(&nested_removed, payload), digest);
 
         let documented = resources.replacen(
             "pub struct Resources {\n",
