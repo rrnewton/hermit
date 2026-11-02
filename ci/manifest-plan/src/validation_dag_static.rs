@@ -3248,7 +3248,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And io::tests::msg_len_meets_only_control_buffers_that_share_its_bytes: 3385 + 1 = 3386.
     // And io::tests::timestamps_are_canonicalized_only_in_the_control_bytes_written:
     // 3386 + 1 = 3387.
-    ("test.detcore_unit", 3387),
+    // And
+    // scm_rights::tests::a_batch_entry_keeps_its_control_length_and_bytes_unless_a_later_write_lands_on_them:
+    // 3387 + 1 = 3388.
+    ("test.detcore_unit", 3388),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4618,7 +4621,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // And an_scm_rights_receipt_over_its_own_header_is_a_named_refusal: 787 + 1 = 788.
     // And an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal: 788 + 1 = 789.
-    ("test.cli", 789),
+    // And a_recvmmsg_entry_whose_control_length_a_later_entry_overwrote_is_a_named_refusal:
+    // 789 + 1 = 790.
+    ("test.cli", 790),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5259,7 +5264,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 706 + 1 = 707.
     // And the same an_scm_rights_receipt_after_an_unread_sendmmsg_is_a_named_refusal, not excluded:
     // 707 + 1 = 708.
-    ("test.cli_on_host", 708),
+    // And the same
+    // a_recvmmsg_entry_whose_control_length_a_later_entry_overwrote_is_a_named_refusal, not
+    // excluded: 708 + 1 = 709.
+    ("test.cli_on_host", 709),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5823,7 +5831,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same receipt unit test: 3384 + 1 = 3385.
     // And the same sendmmsg msg_len unit test: 3385 + 1 = 3386.
     // And the same written-control-extent unit test: 3386 + 1 = 3387.
-    ("test.detcore_unit_on_host", 3387),
+    // And the same batch control read-back unit test: 3387 + 1 = 3388.
+    ("test.detcore_unit_on_host", 3388),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
