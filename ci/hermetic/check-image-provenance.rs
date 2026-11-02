@@ -36,27 +36,29 @@ use sha2::Sha256;
 const PROVENANCE: &str = "ci/hermetic/image.provenance.json";
 const PIN: &str = "ci/hermetic/image.digest";
 const METHOD: &str = "two-clean-isolated-nix-stores-v1";
-const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:786a9fd2a7ad03dc7c58b385ae9e64c8c1628dc5a0815b25ebb13b1aa9aaa7da";
+const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:7facbb1c720365215f215030c6e1c652628db55ddabbfddad4b5c3725f19b17c";
 const SUPERSEDED_ARCHIVE_SHA256: &str =
-    "01a1fab0c894e28c4cafccd5cc707895abd7a4375c4751c4aedf9a4c35b7aad2";
-/// The replaced 786a9fd2 root predates the deterministic-build fixes; the rationale must name the property
-/// this repin repairs (the pin is now the reproducible isolated build).
+    "92d3399bf185179c7b56544d636a8280c2e9938ab8c71c7bbfcdb8fe72c773e8";
+/// The replaced 7facbb1c root already carries the reproducible-build fixes.
+/// This repin retains them while supplying the strict native fixture inputs.
 const RATIONALE_MARKER: &str = "reproducible";
 /// Both isolated builds recorded `nix --version` before building.
-const RECORDED_NIX_VERSION: &str = "nix (Nix) 2.35.2";
+const RECORDED_NIX_VERSION: &str = "nix (Nix) 2.35.1";
 const INPUT_PATHS: [&str; 4] = [
     "ci/hermetic/build-image.sh",
     "ci/hermetic/flake.lock",
     "ci/hermetic/flake.nix",
     "ci/hermetic/guest-paths.txt",
 ];
-const EVIDENCE_LIMITATIONS: [&str; 6] = [
-    "Each service ran under systemd-run with only PATH and NIX_SSL_CERT_FILE set explicitly; fetches went through the host forward proxy (with-proxy). Only variable names were recorded, not their values.",
-    "Each build substituted first from a file binary cache copied from the build host's default Nix store with the three unsigned realized inputs and the image output itself removed, and second from cache.nixos.org under its trusted key for paths the host store no longer held; the removed realized inputs (rust-script, cargo-nextest and coreutils) were rebuilt in each store. Substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt.",
-    "Both builds forced the Nix sandbox on (--option sandbox true), so builders ran as unprivileged nixbld users with a fixed build directory; no host shell or host path is an image input. This is the issue-5031 fix the previous receipt could not claim (its builds ran unsandboxed).",
+const EVIDENCE_LIMITATIONS: [&str; 8] = [
+    "Each build ran as a bounded root systemd service with its own Nix store, build directory and temporary directory. Fetches used trusted Nix substituters through the host network/proxy configuration; this receipt does not authenticate the complete process environment.",
+    "Each build imported trusted transitive dependencies from a file cache and cache.nixos.org with signature or content-addressed trust. The four custom realized outputs (rust-script, cargo-nextest, coreutils and native-exec-coreutils) and image output were absent after import; all four custom outputs were rebuilt in each store. Substituted dependencies were not rebuilt from source.",
+    "Both builds forced Nix sandbox=true and sandbox-fallback=false, with require-sigs=true and the retained deterministic Rust settings. These preserve the reproducible-build fixes described in https://github.com/rrnewton/hermit/issues/5031; this same-host pair does not establish cross-host reproducibility.",
     "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
-    "The superseded 786a9fd2 archive was not rebuilt for this receipt; its 01a1fab0 SHA-256 is carried from the prior receipt that produced the replaced pin.",
+    "The superseded 7facbb1c archive was not rebuilt for this receipt; its 92d3399b SHA-256 is carried from the prior receipt that produced the replaced pin.",
     "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive.",
+    "The initial /data build was interrupted for the disk emergency and has no image success credit. The initial Skopeo preserve-digests representation-conversion refusal remains failed; successful inspection hashes the original archive members and raw loaded objects without conversion.",
+    "Configured memory.max remained 8589934592 bytes with swap disabled. Actual terminal memory peaks were 8589938688 bytes for A and 8589934592 for B, with zero recorded OOM kills; neither measured observation was clamped to the configured limit.",
 ];
 
 struct ExpectedRun {
@@ -70,20 +72,20 @@ struct ExpectedRun {
 
 const EXPECTED_RUNS: [ExpectedRun; 2] = [
     ExpectedRun {
-        run_id: "hermetic-repin4-a.service",
-        source_snapshot_identity: "src@48:5365387181",
-        nix_store_identity: "nix-root/nix@48:5365390644",
-        podman_store_identity: "repin4-a/podman-data",
-        memory_peak_bytes: 8_589_934_592,
-        cpu_nanoseconds: 1_318_354_494_000,
+        run_id: "inguest-image-image-a-restart-20261102-174739.service",
+        source_snapshot_identity: "run-a/src@48:5303814081",
+        nix_store_identity: "run-a/nix-root/nix@33:133255669",
+        podman_store_identity: "run-a/podman-data@33:135067324",
+        memory_peak_bytes: 8_589_938_688,
+        cpu_nanoseconds: 2_350_523_434_000,
     },
     ExpectedRun {
-        run_id: "hermetic-repin4-b.service",
-        source_snapshot_identity: "src@48:5366994846",
-        nix_store_identity: "nix-root/nix@48:5366999159",
-        podman_store_identity: "repin4-b/podman-data",
+        run_id: "inguest-image-image-b-20261102-181538.service",
+        source_snapshot_identity: "run-b/src@48:5303817421",
+        nix_store_identity: "run-b/nix-root/nix@33:135571773",
+        podman_store_identity: "run-b/podman-data@33:137403514",
         memory_peak_bytes: 8_589_934_592,
-        cpu_nanoseconds: 1_453_587_969_000,
+        cpu_nanoseconds: 2_035_350_303_000,
     },
 ];
 
@@ -357,7 +359,12 @@ fn validate_locked_inputs(value: &Value) -> Result<(), String> {
 fn validate_realized_inputs(value: &Value) -> Result<(), String> {
     validate_named_rows(
         value,
-        &["cargo-nextest", "coreutils", "rust-script"],
+        &[
+            "cargo-nextest",
+            "coreutils",
+            "native-exec-coreutils",
+            "rust-script",
+        ],
         "nix.realized_inputs",
     )?;
     for (index, row) in array(value, "nix.realized_inputs")?.iter().enumerate() {
@@ -507,13 +514,13 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     let new = string(repin, "replacement_reference", "repin")?;
     if old != SUPERSEDED_REFERENCE {
         return Err(format!(
-            "repin.superseded_reference must retain the replaced 786a9fd2 reference {SUPERSEDED_REFERENCE:?}"
+            "repin.superseded_reference must retain the replaced 7facbb1c reference {SUPERSEDED_REFERENCE:?}"
         ));
     }
     let old_archive = string(repin, "superseded_archive_sha256", "repin")?;
     if old_archive != SUPERSEDED_ARCHIVE_SHA256 {
         return Err(format!(
-            "repin.superseded_archive_sha256 must retain the 786a9fd2 build's 01a1fab0 archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
+            "repin.superseded_archive_sha256 must retain the 7facbb1c build's 92d3399b archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
         ));
     }
     if old == new || !string(repin, "rationale", "repin")?.contains(RATIONALE_MARKER) {
@@ -955,7 +962,7 @@ mod tests {
         assert!(
             validate_semantics(&reference)
                 .unwrap_err()
-                .contains("must retain the replaced 786a9fd2 reference")
+                .contains("must retain the replaced 7facbb1c reference")
         );
 
         let mut archive = record();
@@ -963,7 +970,48 @@ mod tests {
         assert!(
             validate_semantics(&archive)
                 .unwrap_err()
-                .contains("must retain the 786a9fd2 build's 01a1fab0 archive SHA-256")
+                .contains("must retain the 7facbb1c build's 92d3399b archive SHA-256")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_native_fixture_or_retained_rebuild_input() {
+        for name in [
+            "cargo-nextest",
+            "coreutils",
+            "native-exec-coreutils",
+            "rust-script",
+        ] {
+            let mut missing = record();
+            mutate(&mut missing, "/nix/realized_inputs")
+                .as_array_mut()
+                .unwrap()
+                .retain(|row| row["name"] != name);
+            assert!(validate_semantics(&missing).is_err(), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn rejects_clamped_measured_memory_peak() {
+        let mut clamped = record();
+        let configured = clamped
+            .pointer("/runs/0/resource_bound/memory_max_bytes")
+            .unwrap()
+            .clone();
+        assert_ne!(
+            clamped
+                .pointer("/runs/0/result/last_observed_memory_peak_bytes")
+                .unwrap(),
+            &configured
+        );
+        *mutate(
+            &mut clamped,
+            "/runs/0/result/last_observed_memory_peak_bytes",
+        ) = configured;
+        assert!(
+            validate_semantics(&clamped)
+                .unwrap_err()
+                .contains("exact successful resource result")
         );
     }
 
