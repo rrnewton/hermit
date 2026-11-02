@@ -5234,6 +5234,65 @@ mod tests {
         assert_eq!(
             slice_end_events(&alone, &without, [Some(&seven), Some(&five)]),
             None
+    /// Prefix outcomes need not be monotone. A guest whose thread B stores 2
+    /// twice and whose thread A stores 1 once, printing the final value, can
+    /// meet a target of "2" with none and all of the schedule replayed, yet
+    /// miss it at a cut between B's stores. The endpoint trials of such a
+    /// schedule try only the empty prefix, so when it meets the target at
+    /// every continuation the error states that observation (there is no miss
+    /// to bisect against) and claims nothing about the prefixes no trial ran.
+    /// Where the endpoints differ, interior flips do not matter: the search
+    /// still ends on an adjacent pair whose outcomes differ.
+    #[test]
+    fn an_empty_prefix_that_meets_the_target_claims_nothing_about_longer_ones() {
+        let ns = |nanos: u64| NonZeroU64::new(nanos);
+        let candidates = [ns(1_000), ns(200_000_000)];
+        let len = 50;
+        // Met with 0 and with all 50 events replayed, missed for 20 to 29.
+        let interior_flip = |prefix: usize| !(20..30).contains(&prefix);
+        let mut trials = Vec::new();
+        let error = choose_continuation(&candidates, len, |prefix, timeslice| {
+            trials.push((prefix, timeslice));
+            Ok(interior_flip(prefix))
+        })
+        .unwrap_err();
+        assert_eq!(
+            trials,
+            [(0, ns(1_000)), (0, ns(200_000_000))],
+            "only the empty prefix runs at each continuation"
+        );
+        let message = error.to_string();
+        for claim in ["decides the outcome", "does not depend on a chaos decision"] {
+            assert!(
+                !message.contains(claim),
+                "one trial per continuation cannot establish {claim:?}: {message}"
+            );
+        }
+        for observed in [
+            "no continuation gives the prefix search a miss to bisect against",
+            "replaying none of the target schedule and then scheduling without chaos, the \
+             scheduler alone already meets the target criteria at a 1000 ns timeslice and at a \
+             200000000 ns timeslice",
+            "a longer prefix may still miss the target",
+            "prefix_round_001.repro",
+            "pass --continuation-timeslice",
+            "--run2-seed",
+        ] {
+            assert!(message.contains(observed), "no {observed:?}: {message}");
+        }
+
+        // Missed with none replayed, met with all; flips inside (met for 10 to
+        // 19, missed for 20 to 29). The search ends at one of the flips.
+        let flips = |prefix: usize| prefix >= 10 && !(20..30).contains(&prefix);
+        assert_eq!(
+            choose_continuation(&candidates, len, |prefix, _| Ok(flips(prefix))).unwrap(),
+            ns(1_000)
+        );
+        let passing = search_prefix_boundary(len, |prefix| Ok(flips(prefix))).unwrap();
+        assert!(
+            !flips(passing) && flips(passing + 1),
+            "prefixes of {passing} and {} events",
+            passing + 1
         );
     }
 
