@@ -7982,9 +7982,11 @@ pub enum SignalScope {
 /// Detcore and a coordinator built at different revisions refuse each other
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
-/// fails until it does). That test digests the two enums' bodies and
-/// `Resources`, and refuses a revision whose digests did not change, so no
-/// revision can be appended by hand. A change to another payload type defined
+/// fails until it does). That test digests the two enums' bodies,
+/// `Resources`, the StoreExclusive payload's types, and the nested payload
+/// types it lists (from revision 37, `TraceSchedEventResponse`), and refuses
+/// a revision whose digests did not change, so no revision can be appended
+/// by hand. A change to another payload type defined
 /// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
 /// is on the wire without changing the digest, so it must either keep every
 /// encoding a peer built before it can send or receive (an enum variant
@@ -7999,9 +8001,11 @@ pub enum SignalScope {
 /// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair. 27 is pidfd's `PidfdSelfQualificationRefusal`;
-// 29 is PR 4884's `StoreExclusive` retype, and this change's `PostCrash`
-// pair is 31 (30 is reserved for 4728).
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 31;
+// 29 is PR 4884's `StoreExclusive` retype, and the `PostCrash` pair is 31
+// (30 is reserved for 4728). 37 adds `TraceSchedEventResponse::backstop`
+// (PR #4759, allocated 25 on its own base, assigned 37, skipping 32 to 36
+// reserved for pending changes).
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 37;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
