@@ -1908,7 +1908,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // rundata::tests::a_continuation_timeslice_that_would_change_the_prefix_is_refused: 1293.
     // Recount at 3cb2f62f64de85ee7e9a7deabb9802dc9ee250b8: 1328 active names.
     // Includes 29 inherited additions missed by the old pin and six fix regressions.
-    ("test.hermit_unit", 1328),
+    // Recount at a7ecd1755834d559c82c6ee633bf4e6eeef6ee3f: ten timing-report
+    // tests and three review regressions retain all 1328 prior names: 1341.
+    ("test.hermit_unit", 1341),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5974,7 +5976,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three continuation-timeslice tests: 1287.
     // The same 35 additions, measured with this host selection at
     // 3cb2f62f64de85ee7e9a7deabb9802dc9ee250b8: 1322 active names.
-    ("test.hermit_unit_on_host", 1322),
+    // The same thirteen additions, measured with this host selection at
+    // a7ecd1755834d559c82c6ee633bf4e6eeef6ee3f: 1335 active names.
+    ("test.hermit_unit_on_host", 1335),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
