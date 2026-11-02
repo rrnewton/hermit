@@ -95,8 +95,10 @@ mod tests {
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
     /// https://github.com/rrnewton/hermit/pull/4867's, 32 is the stopless
     /// layout on top of 31's, 40 is the `CpuClockProcess` pair allocated
-    /// to https://github.com/rrnewton/hermit/pull/4885, and 41, package K
-    /// item 2b slice 2b-1's, is the current revision. A change that lands
+    /// to https://github.com/rrnewton/hermit/pull/4885, 41 is package K
+    /// item 2b slice 2b-1's, and 42,
+    /// https://github.com/rrnewton/hermit/pull/4759's replay-backstop row,
+    /// is the current revision. A change that lands
     /// below the last row removes its entry, with its row. One that lands
     /// after a higher revision (any of 33 to 38 after 41) appends its row
     /// above the last instead and leaves its old number here, reserved as
@@ -286,6 +288,16 @@ mod tests {
         // `ThreadDeregistration`, `CpuPublication`, `TaskCpuTimes`), as row
         // 32 extended it to its own. Digest measured at this head.
         (41, "604a16eb9b7bfd1a", "f013e36743d8d9e6"),
+        // Adds `TraceSchedEventResponse::backstop`, the replay backstop of a
+        // schedule replay of a record whose slices ran without the
+        // `--max-timeslice` bound, which `GlobalResponse::TraceSchedEvent`
+        // carries. The reply's fields are digested as `TRACE_REPLY_WIRE`
+        // items, so the field changes the digest in domain 5
+        // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
+        // 25 on its own base after main's 24, assigned 42 at its rebase
+        // onto 41, skipping 33 to 39 reserved for pending changes; digest
+        // measured at this head).
+        (42, "0000000000000000", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -637,6 +649,27 @@ mod tests {
         assert_ne!(documented, source);
         assert_eq!(
             definition_digest(&documented, payload, schedule, replayer, task_stat),
+            digest
+        );
+
+        // The reply this change extends is covered the same way: a field
+        // added to `TraceSchedEventResponse`, or its backstop removed,
+        // changes the digest (domain 5); the positional response a runtime
+        // decodes changes with it.
+        let nested_added = source.replacen(
+            "pub struct TraceSchedEventResponse {\n",
+            "pub struct TraceSchedEventResponse {\n    added: bool,\n",
+            1,
+        );
+        assert_ne!(nested_added, source);
+        assert_ne!(
+            definition_digest(&nested_added, payload, schedule, replayer),
+            digest
+        );
+        let nested_removed = source.replacen("    backstop: Option<LogicalTime>,\n", "", 1);
+        assert_ne!(nested_removed, source);
+        assert_ne!(
+            definition_digest(&nested_removed, payload, schedule, replayer),
             digest
         );
 
