@@ -912,8 +912,8 @@ fn analyze_continues_prefixes_at_a_coarser_timeslice() {
 }
 
 /// The same race with `--continuation-timeslice=100000`: there is no other
-/// continuation to try, so analyze fails, saying that the outcome does not
-/// depend on a chaos decision and what to run or pass instead.
+/// continuation to try, so analyze fails, saying what its empty-prefix trial
+/// observed (no miss to bisect against) and what to run or pass instead.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_explains_a_target_the_scheduler_meets_alone() {
@@ -926,8 +926,10 @@ fn analyze_explains_a_target_the_scheduler_meets_alone() {
     let combined = combined_output(&output);
     assert!(!output.status.success(), "{label}\n{combined}");
     for expected in [
-        "no event of the target schedule decides the outcome: without chaos, the scheduler alone \
-         already meets the target criteria at a 100000 ns timeslice",
+        "no continuation gives the prefix search a miss to bisect against: replaying none of the \
+         target schedule and then scheduling without chaos, the scheduler alone already meets \
+         the target criteria at a 100000 ns timeslice",
+        "a longer prefix may still miss the target",
         "prefix_round_001.repro",
         "pass --continuation-timeslice",
         "--run2-seed",
