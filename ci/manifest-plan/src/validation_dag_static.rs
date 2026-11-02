@@ -1991,7 +1991,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // rewrite refused for an image run, under `hermit run` and `hermit oci
     // run`, and the trial-preparation key): 1258, listed with this node's
     // selection and `--skip` patterns.
-    ("test.hermit_unit", 1258),
+    // And three for taking what a stripped file's code addresses as data
+    // for data (the table after a call that does not return, and
+    // aarch64_lse::mapping's two units): 1261, listed.
+    ("test.hermit_unit", 1261),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6252,7 +6255,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // And the same fifteen store-exclusive rewrite tests as test.hermit_unit: 1230.
     // And the same twenty-two review tests: 1252, listed.
-    ("test.hermit_unit_on_host", 1252),
+    // And the same three addressed-data units: 1255, listed.
+    ("test.hermit_unit_on_host", 1255),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
