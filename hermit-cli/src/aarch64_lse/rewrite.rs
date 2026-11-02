@@ -93,6 +93,10 @@ pub enum Refusal {
     /// A relocation points into the sequence, so the loader writes those
     /// bytes itself, for the instruction that used to be there.
     Relocated,
+    /// An `LDR` (literal) or `ADR` in the image's code reaches the
+    /// sequence's bytes, so they may be a literal pool, which is data
+    /// however its words decode.
+    LiteralInsideSequence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
