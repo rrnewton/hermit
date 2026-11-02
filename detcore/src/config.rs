@@ -229,6 +229,15 @@ mod tests {
         // its rebase onto main's pidfd revision 27; digest measured at this
         // head).
         (28, "a23bc7a0c1215843", "f013e36743d8d9e6"),
+        // Adds `TraceSchedEventResponse::backstop`, the replay backstop of a
+        // schedule replay of a record whose slices ran without the
+        // `--max-timeslice` bound, which `GlobalResponse::TraceSchedEvent`
+        // carries; from this revision the definition digest also covers
+        // `TraceSchedEventResponse` (`NESTED_PAYLOADS`)
+        // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
+        // 25 on its own base after main's 24, renumbered to 29 at its rebase
+        // onto main's 28; digest measured at this head).
+        (29, "9116f166c618cf5a", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -274,10 +283,23 @@ mod tests {
         code
     }
 
+    /// The payload types defined in `tool_global.rs` that a variant of
+    /// `GlobalRequest` or `GlobalResponse` carries and whose own fields the
+    /// definition digest covers, by the line that declares each. Positional
+    /// bincode encodes their fields in place, so a field added to one changes
+    /// the wire as a field added to a variant does. Revision 29 added the
+    /// first, `TraceSchedEventResponse` (`GlobalResponse::TraceSchedEvent`);
+    /// earlier digests do not cover them. They are digested in domain 6, apart
+    /// from main's StoreExclusive payload types in domain 3
+    /// (`STORE_EXCLUSIVE_PAYLOAD`). A payload type not listed here still
+    /// needs its revision appended by hand when it changes
+    /// (`GLOBAL_RPC_REVISION`), and joins this list then.
+    const NESTED_PAYLOADS: &[&str] = &["pub struct TraceSchedEventResponse {"];
+
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
-    /// `source`, and of the StoreExclusive payload's types in `payload`:
-    /// their variants, fields, payload types, order and attributes, not
-    /// their documentation.
+    /// `source`, of the StoreExclusive payload's types in `payload`, and of
+    /// the payload types in `NESTED_PAYLOADS`: their variants and fields,
+    /// payload types, order and attributes, not their documentation.
     fn definition_digest(source: &str, payload: &str) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
@@ -286,11 +308,17 @@ mod tests {
             .map(|header| nested_definition(payload, header).join("\n"))
             .collect::<Vec<_>>()
             .join("\n");
-        fnv_domains(&[
+        let nested: Vec<String> = NESTED_PAYLOADS
+            .iter()
+            .map(|header| definition(source, header).join("\n"))
+            .collect();
+        let mut parts = vec![
             (0, request.as_bytes()),
             (1, response.as_bytes()),
             (3, payload.as_bytes()),
-        ])
+        ];
+        parts.extend(nested.iter().map(|code| (6, code.as_bytes())));
+        fnv_domains(&parts)
     }
 
     fn resources_definition_digest(source: &str) -> String {
@@ -381,6 +409,18 @@ mod tests {
         );
         assert_ne!(documented, payload);
         assert_eq!(definition_digest(source, &documented), digest);
+        // A field added to, or removed from, a nested payload changes the
+        // digest too: the positional response a runtime decodes changes.
+        let nested_added = source.replacen(
+            "pub struct TraceSchedEventResponse {\n",
+            "pub struct TraceSchedEventResponse {\n    added: bool,\n",
+            1,
+        );
+        assert_ne!(nested_added, source);
+        assert_ne!(definition_digest(&nested_added, payload), digest);
+        let nested_removed = source.replacen("    backstop: Option<LogicalTime>,\n", "", 1);
+        assert_ne!(nested_removed, source);
+        assert_ne!(definition_digest(&nested_removed, payload), digest);
 
         let documented = resources.replacen(
             "pub struct Resources {\n",
