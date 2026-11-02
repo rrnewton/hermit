@@ -1609,6 +1609,70 @@ async fn internal_pipe_poll_authority_depends_on_revocable_guest_held_provenance
     }
 }
 
+/// A pipe retry whose descriptor slot a sibling replaces mid-wait must not
+/// keep claiming guest-only poll authority for the replacement: the generic
+/// retry loop refreshes its classification from the current slot, so the
+/// entry identity has to be captured even though a plain pipe's readiness
+/// does not rest on the guest-held marks (`single_fd_poll_readiness`
+/// returns `relies_on_guest_held_marks = false` for it).
+#[tokio::test]
+async fn a_pipe_read_retry_loses_guest_only_authority_when_a_sibling_replaces_the_slot() {
+    let _seam = script(proc_state(0, 0, 0));
+    let mut guest = turn_guest(true, Some(0));
+    let fd = crate::fd::DetFd::new(
+        8,
+        nix::fcntl::OFlag::O_RDWR,
+        crate::fd::FdType::Pipe,
+        crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 700),
+    );
+    fd.set_physically_nonblocking();
+    fd.set_guest_held();
+    guest
+        .thread
+        .file_metadata
+        .lock()
+        .unwrap()
+        .file_handles
+        .insert(8, fd);
+    let replacement = crate::fd::DetFd::new(
+        8,
+        nix::fcntl::OFlag::O_RDWR,
+        crate::fd::FdType::Pipe,
+        crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 701),
+    );
+    replacement.set_physically_nonblocking();
+    replacement.set_guest_held();
+    *guest.replace_poll_fd.lock().unwrap() = Some((8, replacement));
+    guest.read_results = VecDeque::from([Err(Errno::EAGAIN), Err(Errno::EAGAIN), Ok(1)]);
+    let tool = tool(&guest);
+    let buffer = Box::leak(Box::new([0u8; 8])).as_mut_ptr() as usize;
+    let result = tool
+        .execute_nonblockable_fd_syscall(
+            &mut guest,
+            reverie::syscalls::Read::new()
+                .with_fd(8)
+                .with_buf(AddrMut::from_raw(buffer))
+                .with_len(1),
+        )
+        .await;
+    assert_eq!(result.unwrap(), 1);
+    let requests: Vec<_> = guest
+        .requests()
+        .into_iter()
+        .filter(|r| r.resources.contains_key(&ResourceID::InternalIOPolling))
+        .collect();
+    assert!(requests.len() >= 3, "{requests:?}");
+    let last = requests.last().unwrap();
+    assert!(
+        !last.polls_guest_state_only,
+        "a replaced slot must not prove guest-only readiness: {requests:?}"
+    );
+    assert!(
+        !last.relies_on_guest_held_marks,
+        "a replaced slot must not claim guest-held marks: {requests:?}"
+    );
+}
+
 /// Binary record/replay keeps the prior internal-FD classification used by
 /// FIFO opens, but never reads the new guest-held marks. This exercises the
 /// shared production refresh and direct poll-array classifier with a real

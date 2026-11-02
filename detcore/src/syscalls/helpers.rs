@@ -1720,18 +1720,26 @@ impl GuestHeldPollProof {
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
-        let targets = resources
-            .relies_on_guest_held_marks
+        let claimed_marks = resources.relies_on_guest_held_marks;
+        // A plain pipe's readiness does not rest on the guest-held marks
+        // (`single_fd_poll_readiness` returns `relies_on_guest_held_marks =
+        // false` for it), so its producer claims no proof, yet the retry
+        // loops refresh both flags from the current slot before every
+        // request. Capture the entry identity anyway, so a sibling that
+        // replaces the slot mid-wait cannot lend the replacement an
+        // uncaptured guest-only proof. Record/replay is exempt: it retains
+        // its entry classification and never reads the marks.
+        let targets = (claimed_marks || !guest.config().recordreplay_modes)
             .then(|| Self::read_targets(guest, call))
             .flatten();
         // No proof needed (for example a named FIFO) differs from a failed
         // capture of a proof the caller claimed. Unknown must clear the latter
         // before its very first request is published.
-        if resources.relies_on_guest_held_marks && targets.is_none() {
+        if claimed_marks && targets.is_none() {
             Self::clear(resources);
         }
         Self {
-            claimed: resources.relies_on_guest_held_marks,
+            claimed: claimed_marks || targets.is_some(),
             call,
             targets,
         }
