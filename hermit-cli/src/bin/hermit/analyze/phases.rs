@@ -437,6 +437,12 @@ fn timing_decision_header(
         without.branches,
         then(without, "stack2"),
     );
+    header.push_str(&format!(
+        "Replaying the first {decision} events and then scheduling without chaos \
+         {} does not meet the target criteria; replaying event #{decision} too ({event}) does \
+         ({criteria}).\n",
+        describe_continuation(continuation),
+    ));
     if let Some([with_end, without_end]) = slice_ends {
         header.push_str(&format!(
             "The thread that runs next has the same stack in both continuations (often a \
@@ -1350,23 +1356,33 @@ impl AnalyzeOpts {
             [critical[0].1.as_ref(), critical[1].1.as_ref()],
         );
         if let Some(ends) = slice_ends {
-            let stack_at = |runname: &str, variant: &PreemptionRecord, end: usize| {
+            let stack_at = |runname: &str,
+                            variant: &PreemptionRecord,
+                            end: usize,
+                            expected: bool|
+             -> anyhow::Result<Option<PrettyBacktrace>> {
                 if end == decision {
-                    // A slice of one event ends where it starts.
-                    Ok((true, deciding.clone()))
+                    // A slice of one event ends where it starts. Reuse the
+                    // captured deciding stack; no new replay has an outcome
+                    // to compare with the search.
+                    Ok(deciding.clone())
                 } else {
-                    stack(runname, variant, end + 1, end)
+                    let (observed, captured) = stack(runname, variant, end + 1, end)?;
+                    require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
+                    Ok(captured)
                 }
             };
-            let (_, with_end) = stack_at(
+            let with_end = stack_at(
                 "final_target_slice_end_for_stacktraces",
                 &with_record,
                 ends[0],
+                true,
             )?;
-            let (_, without_end) = stack_at(
+            let without_end = stack_at(
                 "final_baseline_slice_end_for_stacktraces",
                 &without_record,
                 ends[1],
+                false,
             )?;
             match (with_end, without_end) {
                 (Some(with_end), Some(without_end)) => {
@@ -2717,6 +2733,306 @@ mod tests {
         }
     }
 
+    fn timing_report_stack(thread: i32, ip: u64) -> PrettyBacktrace {
+        serde_json::from_value(serde_json::json!({
+            "thread_id": thread,
+            "thread_name": null,
+            "frames": [{
+                "frame": { "ip": ip, "is_signal": false },
+                "symbol": null,
+                "locations": []
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// Equal next-thread stacks take the slice-end report path. Every replay
+    /// on that path must repeat its searched outcome, even without a stack.
+    #[test]
+    fn timing_reports_require_both_slice_end_replays_to_repeat_the_search() {
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let with = events(&[5, 3, 3, 3, 7, 5]);
+        let without = events(&[5, 3, 3, 5, 7]);
+        let record = PreemptionRecord::from_sched_events(with.clone());
+        let deciding = Some(timing_report_stack(3, 0x20));
+        for (target_met, baseline_met, captured, contradicted) in [
+            (true, false, true, None),
+            (
+                false,
+                false,
+                true,
+                Some("final_target_slice_end_for_stacktraces"),
+            ),
+            (
+                true,
+                true,
+                true,
+                Some("final_baseline_slice_end_for_stacktraces"),
+            ),
+            (
+                false,
+                true,
+                true,
+                Some("final_target_slice_end_for_stacktraces"),
+            ),
+            (
+                false,
+                false,
+                false,
+                Some("final_target_slice_end_for_stacktraces"),
+            ),
+            (
+                true,
+                true,
+                false,
+                Some("final_baseline_slice_end_for_stacktraces"),
+            ),
+            (true, false, false, None),
+        ] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let result = options.report_timing_decision_with(
+                &record,
+                1,
+                NonZeroU64::new(200_000_000),
+                (true, &deciding),
+                (&without, Path::new("final_baseline_schedule.preempts")),
+                (
+                    |seen, len| {
+                        assert_eq!(seen, &record);
+                        assert_eq!(len, 2);
+                        Ok((
+                            CompletedScheduleTrial {
+                                target_met: true,
+                                schedule: with.clone(),
+                            },
+                            PathBuf::from("final_target_schedule.preempts"),
+                        ))
+                    },
+                    |runname, variant, len, position| {
+                        calls.borrow_mut().push(runname.to_owned());
+                        let (expected_schedule, expected_position, met, stack) = match runname {
+                            "final_target_next_for_stacktraces" => {
+                                (&with, 4, true, Some(timing_report_stack(7, 0x10)))
+                            }
+                            "final_baseline_next_for_stacktraces" => {
+                                (&without, 3, false, Some(timing_report_stack(5, 0x10)))
+                            }
+                            "final_target_slice_end_for_stacktraces" => (
+                                &with,
+                                3,
+                                target_met,
+                                captured.then(|| timing_report_stack(3, 0x30)),
+                            ),
+                            "final_baseline_slice_end_for_stacktraces" => (
+                                &without,
+                                2,
+                                baseline_met,
+                                captured.then(|| timing_report_stack(3, 0x40)),
+                            ),
+                            other => panic!("unexpected replay {other}"),
+                        };
+                        assert_eq!(variant.schedevents(), expected_schedule);
+                        assert_eq!(position, expected_position);
+                        assert_eq!(len, expected_position + 1);
+                        Ok((met, stack))
+                    },
+                ),
+            );
+            match contradicted {
+                Some(replay) => {
+                    let error = result
+                        .expect_err("a contradictory slice-end replay cannot certify the decision")
+                        .to_string();
+                    assert!(
+                        error.contains(&format!("{replay} observed the opposite")),
+                        "{error}"
+                    );
+                    assert!(
+                        error.contains("no opposite-outcome pair was established"),
+                        "{error}"
+                    );
+                    assert!(calls.borrow().iter().any(|name| name == replay));
+                }
+                None => {
+                    let report = result
+                        .unwrap()
+                        .expect("a repeated pair certifies the decision");
+                    assert_eq!(calls.borrow().len(), 4);
+                    if captured {
+                        assert_eq!(report.critical_event1.event_index, 3);
+                        assert_eq!(report.critical_event2.event_index, 2);
+                        assert!(same_frames(
+                            report.critical_event1.stack.as_ref().unwrap(),
+                            &timing_report_stack(3, 0x30)
+                        ));
+                        assert!(same_frames(
+                            report.critical_event2.stack.as_ref().unwrap(),
+                            &timing_report_stack(3, 0x40)
+                        ));
+                    } else {
+                        assert_eq!(report.critical_event1.event_index, 4);
+                        assert_eq!(report.critical_event2.event_index, 3);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A one-event slice reuses the already-captured deciding stack. There
+    /// is no new slice-end replay whose outcome could be true or false.
+    #[test]
+    fn timing_reports_reuse_single_event_stacks_without_inventing_an_outcome() {
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        for target_is_short in [false, true] {
+            let (with, without, ends) = if target_is_short {
+                (events(&[5, 3, 7, 5]), events(&[5, 3, 3, 5, 7]), [1, 2])
+            } else {
+                (events(&[5, 3, 3, 3, 7, 5]), events(&[5, 3, 5, 7]), [3, 1])
+            };
+            let record = PreemptionRecord::from_sched_events(with.clone());
+            let deciding = Some(timing_report_stack(3, 0x20));
+            let calls = std::cell::RefCell::new(Vec::new());
+            let report = options
+                .report_timing_decision_with(
+                    &record,
+                    1,
+                    NonZeroU64::new(200_000_000),
+                    (true, &deciding),
+                    (&without, Path::new("final_baseline_schedule.preempts")),
+                    (
+                        |_, _| {
+                            Ok((
+                                CompletedScheduleTrial {
+                                    target_met: true,
+                                    schedule: with.clone(),
+                                },
+                                PathBuf::from("final_target_schedule.preempts"),
+                            ))
+                        },
+                        |runname, _, len, position| {
+                            calls.borrow_mut().push(runname.to_owned());
+                            match runname {
+                                "final_target_next_for_stacktraces" => {
+                                    assert_eq!((len, position), (ends[0] + 2, ends[0] + 1));
+                                    Ok((true, Some(timing_report_stack(7, 0x10))))
+                                }
+                                "final_baseline_next_for_stacktraces" => {
+                                    assert_eq!((len, position), (ends[1] + 2, ends[1] + 1));
+                                    Ok((false, Some(timing_report_stack(5, 0x10))))
+                                }
+                                "final_target_slice_end_for_stacktraces" => {
+                                    assert!(!target_is_short, "the target stack is reused");
+                                    assert_eq!((len, position), (4, 3));
+                                    Ok((true, Some(timing_report_stack(3, 0x30))))
+                                }
+                                "final_baseline_slice_end_for_stacktraces" => {
+                                    assert!(target_is_short, "the baseline stack is reused");
+                                    assert_eq!((len, position), (3, 2));
+                                    Ok((false, Some(timing_report_stack(3, 0x40))))
+                                }
+                                other => panic!("unexpected replay {other}"),
+                            }
+                        },
+                    ),
+                )
+                .unwrap()
+                .expect("reusing a stack must not fabricate a contradictory replay");
+            assert_eq!(
+                calls.borrow().len(),
+                3,
+                "two next-thread and one slice-end replay"
+            );
+            assert_eq!(report.critical_event1.event_index, ends[0]);
+            assert_eq!(report.critical_event2.event_index, ends[1]);
+            let reused = if target_is_short {
+                &report.critical_event1.stack
+            } else {
+                &report.critical_event2.stack
+            };
+            assert!(same_frames(
+                reused.as_ref().unwrap(),
+                deciding.as_ref().unwrap()
+            ));
+        }
+    }
+
+    /// The timing report creates another prefix continuation after the
+    /// search. Its real run configuration must retain the selected maximum
+    /// through launch validation instead of restoring range/seed defaults.
+    #[test]
+    fn timing_report_continuations_keep_the_selected_maximum_at_validation() {
+        let chosen = NonZeroU64::new(500_000_000);
+        for (selection, recorded) in [
+            (&["--max-timeslice=4321"][..], Some(4321)),
+            (&["--chaos-timeslice-range=1000..5000000"][..], None),
+            (&["--chaos-seeded-timeslice"][..], None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut args = vec!["analyze", "--prefix-search", "--", "--chaos", "--seed=7"];
+            args.extend_from_slice(selection);
+            args.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(args).unwrap();
+            options.tmp_dir = Some(dir.path().to_path_buf());
+            let with = events(&[5, 3, 3, 3, 7, 5]);
+            let without = events(&[5, 3, 3, 5, 7]);
+            let record =
+                PreemptionRecord::from_sched_events(with.clone()).with_chaos_timeslice(recorded);
+            let report = options
+                .report_timing_decision_with(
+                    &record,
+                    1,
+                    chosen,
+                    (true, &None),
+                    (&without, Path::new("final_baseline_schedule.preempts")),
+                    (
+                        |target, len| {
+                            options.prefix_continuation(
+                                "final_target_schedule",
+                                target,
+                                len,
+                                chosen,
+                                |run| {
+                                    let written = PreemptionReader::try_new(run.sched_path_in())?
+                                        .into_inner();
+                                    for _ in 0..2 {
+                                        run.runopts.validate_args_with_perf_support(true)?;
+                                        assert_eq!(
+                                            run.runopts.det_opts.det_config.max_timeslice,
+                                            chosen
+                                        );
+                                        assert!(!run.runopts.det_opts.det_config.chaos);
+                                    }
+                                    assert_eq!(
+                                        written.chaos_timeslice(),
+                                        chosen.map(NonZeroU64::get)
+                                    );
+                                    run.complete_for_test(true, &with)?;
+                                    Ok(true)
+                                },
+                            )
+                        },
+                        |runname, _, _, _| match runname {
+                            "final_target_next_for_stacktraces" => Ok((true, None)),
+                            "final_baseline_next_for_stacktraces" => Ok((false, None)),
+                            other => panic!("unexpected replay {other}"),
+                        },
+                    ),
+                )
+                .unwrap()
+                .expect("the report preserves its tested continuation");
+            assert!(
+                report.header.contains("500000000 ns timeslice"),
+                "{}",
+                report.header
+            );
+            assert_eq!(
+                record.chaos_timeslice(),
+                recorded,
+                "the source record is unchanged"
+            );
+        }
+    }
+
     /// Capturing both stacks is not proof that the candidate completed. This
     /// drives the stack-trace replay used by production reporting
     /// ([`AnalyzeOpts::replay_for_stacks`]), whose completed outcome the
@@ -4038,6 +4354,7 @@ mod tests {
             None,
         );
         for expected in [
+            "Replaying the first 1 events and then scheduling without chaos at a 200000000 ns timeslice does not meet the target criteria; replaying event #1 too",
             "it is a timing decision: with or without it, the scheduler runs thread 3 there",
             "thread 3 runs 3 events (30 retired conditional branches) from event #1 on, then thread 7 runs at event #4 (stack1), and the run meets the target criteria (matching stderr)",
             "Without it, scheduling without chaos at a 200000000 ns timeslice, thread 3 runs 2 events (20 retired conditional branches), then thread 5 runs at event #3 (stack2), and the run does not",
@@ -4057,6 +4374,7 @@ mod tests {
             Some([3, 2]),
         );
         for expected in [
+            "Replaying the first 1 events and then scheduling without chaos at a 200000000 ns timeslice does not meet the target criteria; replaying event #1 too",
             "from event #1 on, then thread 7 runs at event #4, and the run meets",
             "then thread 5 runs at event #3, and the run does not",
             "so stack1 and stack2 show where thread 3 is when its slice ends instead: at event #3 with the event, at event #2 without it.",
