@@ -12565,7 +12565,7 @@ impl RunOpts {
                 }
             }
             if let Some((_, host)) = best {
-                return validate_executable(&host, &guest_abs, None);
+                return Ok((host, guest_abs, None));
             }
             // Resolve chroot-aware: images (nixos/nix especially) expose
             // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that
@@ -12577,7 +12577,7 @@ impl RunOpts {
 
         if self.selected_backend() == Backend::E9patch {
             let (_, host) = self.resolve_guest_and_host_program()?;
-            return Ok((host, self.program.clone(), None));
+            return Ok((host, self.program_path().to_path_buf(), None));
         }
 
         let command = self.guest_command()?;
@@ -14968,7 +14968,9 @@ impl RunOpts {
         // choosing another base.
         if self.pid_base.is_none()
             && let Some(base) = self.det_opts.det_config.guest_ids.base()
+        {
             config.run.insert(PID_BASE_KEY.to_owned(), base.into());
+        }
         // The profile auto resolved to, given or not: loading the config
         // (`--config`, or `--from` a manifest) runs that profile and never
         // derives one again.
