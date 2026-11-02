@@ -225,21 +225,13 @@ class GuestPreloadGateTest(unittest.TestCase):
 
 # The shipped guest preloads and the label each script's gate gives them.
 GUEST_PRELOADS = {
-    "libdetcore_sabre.so": "SaBRe plugin",
     "libdetcore_liteinst.so": "In-guest LiteInst runtime",
     "libreverie_liteinst.so": "LiteInst preload",
 }
 # Every file the scripts require in a complete bundle's rsrcs/.
 BUNDLE_RESOURCES = (
-    "libdetcore_dbt.so",
-    "libdetcore_sabre.so",
     "libdetcore_liteinst.so",
-    "libreverie_dbt_client.so",
     "libreverie_liteinst.so",
-    "dynamorio/bin64/drrun",
-    "sabre",
-    "e9patch",
-    "e9tool",
 )
 
 
@@ -295,7 +287,7 @@ class GuestPreloadCallSiteTest(unittest.TestCase):
                 path.write_text(f"#!/bin/sh\n# {name} {resource}\nexit 0\n")
             path.chmod(0o700)
         from test_packaged_detcore import fixture_receipt
-        fixture_receipt(install, "1" * 40)
+        fixture_receipt(install, "1" * 40, core=True)
         return install
 
     def publish(self, name: str, install: Path) -> subprocess.CompletedProcess[str]:

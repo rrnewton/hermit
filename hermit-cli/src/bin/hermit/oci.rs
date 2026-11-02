@@ -24,10 +24,10 @@ use clap::Parser;
 use hermit::Error;
 use hermit::ExitStatus;
 
-use crate::global_opts::GlobalOpts;
-use crate::podman_store::PodmanStore;
-use crate::podman_store::ResolvedImage;
-use crate::run::RunOpts;
+use crate::app::global_opts::GlobalOpts;
+use crate::app::podman_store::PodmanStore;
+use crate::app::podman_store::ResolvedImage;
+use crate::app::run::RunOpts;
 
 #[derive(Debug, Parser)]
 pub struct OciOpts {
@@ -223,8 +223,8 @@ impl PruneOpts {
             .iter()
             .map(|image| image.id.clone())
             .collect();
-        let live = crate::image::live_cache_keys(&live_refs)?;
-        let Some(base) = crate::image::cache_base()? else {
+        let live = crate::app::image::live_cache_keys(&live_refs)?;
+        let Some(base) = crate::app::image::cache_base()? else {
             println!("No OCI rootfs cache to prune.");
             return Ok(ExitStatus::SUCCESS);
         };
@@ -447,12 +447,14 @@ mod tests {
             ];
             argv.extend(maximum);
             argv.extend(["--", "/nonexistent-oci-preemption-guest"]);
-            let matches = crate::Args::command().try_get_matches_from(argv).unwrap();
-            let args = crate::args_from_matches_with_clock(&matches, || {
+            let matches = crate::app::Args::command()
+                .try_get_matches_from(argv)
+                .unwrap();
+            let args = crate::app::args_from_matches_with_clock(&matches, || {
                 panic!("an explicit epoch must not sample the host clock")
             })
             .unwrap();
-            let crate::Subcommand::Oci(oci) = args.command else {
+            let crate::app::Subcommand::Oci(oci) = args.command else {
                 panic!("expected oci subcommand");
             };
             let OciSubcommand::Run(mut options) = oci.command else {
@@ -468,7 +470,7 @@ mod tests {
                 let message = format!("{error:#}");
                 assert!(
                     error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
                         .is_some(),
                     "{message}"
                 );
