@@ -26,7 +26,9 @@
 //! and a constant table has no FDE. An FDE covers its whole function, so a
 //! table or literal pool placed inside the function is inside it too: under
 //! that evidence alone, code is what control reaches from the functions'
-//! entries ([`reachable_code`]), and a sequence a literal load reaches is
+//! entries ([`reachable_code`]), less what the code addresses as data, up
+//! to the next instruction a branch reaches ([`data_extents`]), since a
+//! call is taken to return; and a sequence a literal load reaches is
 //! refused in any case ([`literal_targets`]). Bytes neither marks are not
 //! known to be code.
 //!
@@ -180,7 +182,9 @@ impl CodeEvidence {
 /// whole function, including a constant table the function branches over or
 /// keeps after its return, and those bytes are not reached. Code reached
 /// only through a jump table or an exception landing pad is not either, and
-/// is left alone with them.
+/// is left alone with them. A call is taken to return, so bytes after a call
+/// that does not are reached too; [`data_extents`] takes back the ones the
+/// code addresses as data.
 pub fn reachable_code(
     words: &[u32],
     base: u64,
@@ -548,6 +552,157 @@ pub fn literal_targets(words: &[u32], base: u64) -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// Where `words` (at `base`) address bytes as data, or may: the target of
+/// each `LDR` (literal) and `ADR`, and of each `ADRP` with the `ADD`
+/// (immediate) or unsigned-offset load or store that completes it, the first
+/// of the eight instructions after it that takes the `ADRP`'s register as
+/// its base. An `ADRP` that none of those completes gives its page, the
+/// lowest address it can be completing. Each is where a table may start:
+/// how far it runs is not in the instruction ([`data_extents`]).
+pub fn addressed_starts(words: &[u32], base: u64) -> Vec<u64> {
+    // How far after an `ADRP` its completing instruction is looked for.
+    const PAIRING_WINDOW: usize = 8;
+    let mut starts = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let pc = base.wrapping_add(4 * index as u64);
+        if word & 0x3B00_0000 == 0x1800_0000 && word >> 30 != 0b11 {
+            // LDR (literal), not PRFM: its target is its literal's start.
+            let offset = ((((word >> 5) & 0x7_FFFF) << 13) as i32 >> 11) as i64;
+            starts.push(pc.wrapping_add(offset as u64));
+        } else if word & 0x9F00_0000 == 0x1000_0000 {
+            // ADR: immlo (30:29), immhi (23:5).
+            let imm = ((word >> 5) & 0x7_FFFF) << 2 | ((word >> 29) & 0b11);
+            let offset = ((imm << 11) as i32 >> 11) as i64;
+            starts.push(pc.wrapping_add(offset as u64));
+        } else if word & 0x9F00_0000 == 0x9000_0000 {
+            // ADRP: the 4 KiB page of `pc`, plus immhi:immlo pages.
+            let imm = ((word >> 5) & 0x7_FFFF) << 2 | ((word >> 29) & 0b11);
+            let pages = ((imm << 11) as i32 >> 11) as i64;
+            let page = (pc & !0xFFF).wrapping_add((pages << 12) as u64);
+            let register = word & 0x1F;
+            let completed = words[index + 1..]
+                .iter()
+                .take(PAIRING_WINDOW)
+                .find_map(|next| page_offset(*next, register));
+            starts.push(page.wrapping_add(completed.unwrap_or(0)));
+        }
+    }
+    starts
+}
+
+/// The offset into an `ADRP`'s page that `word` adds, if it is an `ADD`
+/// (immediate, 64-bit) or an unsigned-offset load or store whose base is
+/// `register`.
+fn page_offset(word: u32, register: u32) -> Option<u64> {
+    if (word >> 5) & 0x1F != register {
+        return None;
+    }
+    if word & 0xFF80_0000 == 0x9100_0000 {
+        // ADD Xd, Xn, #imm12 {, LSL #12}: sh (22), imm12 (21:10).
+        let imm = u64::from((word >> 10) & 0xFFF);
+        return Some(if (word >> 22) & 1 == 1 {
+            imm << 12
+        } else {
+            imm
+        });
+    }
+    if word & 0x3B00_0000 == 0x3900_0000 {
+        // LDR/STR (unsigned immediate): size (31:30), V (26), opc (23:22),
+        // imm12 (21:10), scaled by the access size; a 128-bit SIMD access
+        // is size 00 with opc 1x.
+        let size = word >> 30;
+        let scale = if (word >> 26) & 1 == 1 && size == 0 && (word >> 23) & 1 == 1 {
+            4
+        } else {
+            size
+        };
+        return Some(u64::from((word >> 10) & 0xFFF) << scale);
+    }
+    None
+}
+
+/// Every direct branch of `words` (at `base`), as (its address, its target).
+pub fn direct_branches(words: &[u32], base: u64) -> Vec<(u64, u64)> {
+    words
+        .iter()
+        .enumerate()
+        .filter_map(|(index, word)| {
+            let pc = base.wrapping_add(4 * index as u64);
+            Some((pc, flow(*word, pc).1?))
+        })
+        .collect()
+}
+
+/// The bytes a function may hold as data, where only the unwind table tells
+/// code from data: from each address the code addresses as data
+/// (`starts`, [`addressed_starts`]) inside a function (`functions`, the
+/// FDEs' ranges, sorted) to the next instruction a branch reaches
+/// (`branches`, as [`direct_branches`] gives them), or the function's end.
+/// Control does not run into a table, so the code after one is reached by a
+/// branch, and only a branch that is not itself inside a table counts: a
+/// table word can decode as one. An address at a function's entry is a
+/// pointer to the function, not data. The ranges come back sorted and
+/// merged.
+pub fn data_extents(
+    starts: &[u64],
+    functions: &[(u64, u64)],
+    branches: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
+    let mut extents: Vec<(u64, u64)> = starts
+        .iter()
+        .filter_map(|start| {
+            let after = functions.partition_point(|(entry, _)| entry <= start);
+            let (_, end) = functions[..after]
+                .iter()
+                .rev()
+                .find(|(entry, end)| entry < start && start < end)?;
+            Some((*start, *end))
+        })
+        .collect();
+    extents.sort_unstable();
+    extents.dedup();
+    // Each extent ends at the first target past its start of a branch
+    // outside every extent. Extents only shrink, and a branch they no
+    // longer hold can only shrink them further, so this ends.
+    loop {
+        let merged = merge(extents.clone());
+        let inside = |addr: u64| {
+            let after = merged.partition_point(|(start, _)| *start <= addr);
+            after.checked_sub(1).is_some_and(|i| addr < merged[i].1)
+        };
+        let mut targets: Vec<u64> = branches
+            .iter()
+            .filter(|(at, _)| !inside(*at))
+            .map(|(_, target)| *target)
+            .collect();
+        targets.sort_unstable();
+        let mut changed = false;
+        for (start, end) in &mut extents {
+            let next = targets.partition_point(|target| *target <= *start);
+            if let Some(target) = targets.get(next).filter(|target| **target < *end) {
+                *end = *target;
+                changed = true;
+            }
+        }
+        if !changed {
+            return merged;
+        }
+    }
+}
+
+/// `spans` sorted and with overlapping or touching ones joined.
+fn merge(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    spans.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in spans {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
 /// One mapping symbol: where in which section code or data starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappingSymbol {
@@ -836,6 +991,66 @@ pub(crate) mod tests {
                 (0x1028, 0x102c),
                 (0x1021, 0x1025),
             ]
+        );
+    }
+
+    #[test]
+    fn an_adr_or_an_adrp_pair_names_where_data_may_start() {
+        let words = [
+            0x1000_0080, // adr x0, #+0x10
+            0x5800_0101, // ldr x1, #+0x20
+            0x9000_0001, // adrp x1, 0x1000 (the page of 0x1008)
+            0x9105_d021, // add x1, x1, #0x174
+            0x9000_0002, // adrp x2, 0x1000, completed by a scaled load
+            0xf944_0c43, // ldr x3, [x2, #0x818]
+            0x9000_0004, // adrp x4, 0x1000, never completed
+            0xd503_201f, // nop
+        ];
+        assert_eq!(
+            addressed_starts(&words, 0x1000),
+            vec![0x1010, 0x1024, 0x1174, 0x1818, 0x1000]
+        );
+        // The completing instruction must take the ADRP's own register, and
+        // is looked for in the eight instructions after it.
+        let other = [0x9000_0001, 0x9105_d042]; // adrp x1; add x2, x2, #0x174
+        assert_eq!(addressed_starts(&other, 0x1000), vec![0x1000]);
+        let far: Vec<u32> = std::iter::once(0x9000_0001)
+            .chain(std::iter::repeat_n(0xd503_201f, 8))
+            .chain(std::iter::once(0x9105_d021))
+            .collect();
+        assert_eq!(addressed_starts(&far, 0x1000), vec![0x1000]);
+    }
+
+    #[test]
+    fn data_runs_from_where_it_is_addressed_to_the_next_branch_target() {
+        let functions = [(0x100, 0x180), (0x200, 0x240)];
+        // 0x140 is addressed inside the first function: data from there to
+        // the branch target 0x160, which is code again.
+        let branches = [(0x108, 0x160)];
+        assert_eq!(
+            data_extents(&[0x140], &functions, &branches),
+            vec![(0x140, 0x160)]
+        );
+        // With no branch past it, the data runs to the function's end.
+        assert_eq!(
+            data_extents(&[0x140], &functions, &[]),
+            vec![(0x140, 0x180)]
+        );
+        // A branch from inside an extent is not evidence: a table word can
+        // decode as one. Here the only branch to 0x160 is at 0x150, in the
+        // data, so the extent still runs to the end.
+        assert_eq!(
+            data_extents(&[0x140], &functions, &[(0x150, 0x160)]),
+            vec![(0x140, 0x180)]
+        );
+        // A function's entry is a pointer to it, not data; an address in no
+        // function (a global) says nothing.
+        assert_eq!(data_extents(&[0x100, 0x2000], &functions, &[]), vec![]);
+        // Overlapping extents are merged, and each ends at its own next
+        // target.
+        assert_eq!(
+            data_extents(&[0x140, 0x148, 0x220], &functions, &[(0x108, 0x150)]),
+            vec![(0x140, 0x150), (0x220, 0x240)]
         );
     }
 

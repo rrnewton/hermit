@@ -23,19 +23,37 @@
 //! began. A file with no section headers is left alone and reported, because
 //! nothing in it can be told apart from data.
 //!
-//! Within those sections, only code is rewritten ([`super::mapping`]): the
-//! ranges the file's mapping symbols mark `$x`, or, in a section without
-//! mapping symbols (every section of a stripped file), what control reaches
-//! from the entries of the functions its unwind table's FDEs describe. An
+//! Within those sections, only code is rewritten ([`super::mapping`]). An
 //! executable section can hold data too (a literal pool, or OpenSSL's
 //! constant tables in `.text`), and a table whose words happened to form a
-//! canonical loop would otherwise be rewritten, corrupting it. A sequence an
-//! `LDR` (literal) or `ADR` in the code reaches is refused as well, whatever
-//! the evidence, since those bytes may be a literal pool. A file with
-//! neither mapping symbols nor an unwind table is left alone and reported:
-//! bytes not known to be code are never taken for it. The branch analysis
-//! still reads every word of every executable section, so a word that might
-//! branch into a sequence still refuses it.
+//! canonical loop would otherwise be rewritten, corrupting it. What is taken
+//! for code depends on what the file says, section by section:
+//!
+//! - Mapping symbols: exactly the ranges they mark `$x`. The AArch64 ELF ABI
+//!   has an assembler mark data `$d`, so data marked as the ABI says is never
+//!   taken for code.
+//! - The unwind table alone (a section without mapping symbols, as in every
+//!   stripped file): what control reaches from the entries of the functions
+//!   its FDEs describe, following direct branches and taking every call to
+//!   return. An FDE covers its whole function, so a table the function
+//!   branches over, or keeps after a return, is not reached. A table after a
+//!   call that does not return is reached that way, so whatever the code
+//!   addresses as data (an `LDR` (literal), `ADR` or `ADRP` target) is taken
+//!   for data from there to the next instruction a branch reaches, or the
+//!   function's end, and no sequence over it is rewritten
+//!   (`addressed-data-inside-the-sequence`). What is still taken for code
+//!   wrongly is only data after a call that does not return which no
+//!   instruction of the file addresses: a pointer stored outside the code (a
+//!   relocation or a symbol) or an address computed from an unrelated base
+//!   would be needed to read it.
+//! - Neither: nothing. Such a section is left alone and reported, and so is
+//!   a whole file with neither mapping symbols nor an unwind table.
+//!
+//! Under any evidence, a sequence an `LDR` (literal) or `ADR` in the code
+//! reaches is refused (`literal-inside-the-sequence`): an object linked
+//! without mapping symbols after one with them inherits the earlier `$x`
+//! range. The branch analysis still reads every word of every executable
+//! section, so a word that might branch into a sequence still refuses it.
 //!
 //! A section in a segment that is both writable and executable is refused
 //! too: writable text is either a loader quirk or a runtime that rewrites
@@ -116,6 +134,7 @@ fn refusal_name(reason: &Refusal) -> &'static str {
         Refusal::BranchOutOfRange => "branch-out-of-range",
         Refusal::Relocated => "relocation-inside-the-sequence",
         Refusal::LiteralInsideSequence => "literal-inside-the-sequence",
+        Refusal::AddressedData => "addressed-data-inside-the-sequence",
     }
 }
 
@@ -143,7 +162,7 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     // is where the parsed ELF lives.
     let relocated: Vec<(u64, u64)>;
     let mut relr_unreadable = false;
-    let sections = {
+    let (sections, functions) = {
         let elf = Elf::parse(bytes)?;
         if elf.header.e_machine != header::EM_AARCH64 {
             return Ok(None);
@@ -206,7 +225,8 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                  so code cannot be told from data in its executable sections",
             );
         }
-        elf.section_headers
+        let sections = elf
+            .section_headers
             .iter()
             .enumerate()
             .filter(|(_, sh)| {
@@ -258,7 +278,8 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                     unknown,
                 }
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (sections, evidence.unwind.unwrap_or_default())
     };
     // A direct branch in one executable section can target a sequence in
     // another, so collect each section's targets before planning any. A
@@ -285,6 +306,36 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
         })
         .collect();
     literals.sort_unstable();
+    // Where only the unwind table tells code from data, the reachability
+    // above takes every call to return, so a table placed after a call that
+    // does not would pass for code. Whatever the code addresses as data is
+    // taken for data from there to the next instruction a branch reaches
+    // (`mapping::data_extents`), and no sequence over it is rewritten.
+    let extents = {
+        let mut starts = Vec::new();
+        let mut branches = Vec::new();
+        for section in &sections {
+            let Some(words) = &section.words else {
+                continue;
+            };
+            for (start, end) in &section.code {
+                let first = ((start - section.vaddr) / 4) as usize;
+                let last = (((end - section.vaddr) / 4) as usize).min(words.len());
+                starts.extend(mapping::addressed_starts(&words[first..last], *start));
+                branches.extend(mapping::direct_branches(&words[first..last], *start));
+            }
+        }
+        let unwind_only = |addr: &u64| {
+            sections.iter().any(|section| {
+                section.evidence == Some(mapping::Evidence::UnwindTable)
+                    && section.words.as_ref().is_some_and(|words| {
+                        (section.vaddr..section.vaddr + 4 * words.len() as u64).contains(addr)
+                    })
+            })
+        };
+        starts.retain(unwind_only);
+        mapping::data_extents(&starts, &functions, &branches)
+    };
     let mut report = FileReport::default();
     if relr_unreadable {
         report
@@ -340,6 +391,7 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
         let mut plan = rewrite::plan_with_external_targets(&words, vaddr, &external_targets);
         restrict_to_code(&mut plan, &words, vaddr, &code);
         refuse_literals(&mut plan, &literals);
+        refuse_overlapping(&mut plan, &extents, Refusal::AddressedData);
         if unknown != 0 {
             report.skipped_segments.push(format!(
                 "executable section at {vaddr:#x}: {unknown} exclusive instructions in bytes not \
@@ -476,6 +528,27 @@ fn refuse_literals(plan: &mut rewrite::Report, targets: &[(u64, u64)]) {
             plan.refused.push(rewrite::RefusedSite {
                 addr: site.addr,
                 reason: Refusal::LiteralInsideSequence,
+            });
+        } else {
+            plan.patched.push(site);
+        }
+    }
+}
+
+/// Refuse, for `reason`, each rewrite whose sequence overlaps one of
+/// `ranges` (sorted, disjoint).
+fn refuse_overlapping(plan: &mut rewrite::Report, ranges: &[(u64, u64)], reason: Refusal) {
+    let patched = std::mem::take(&mut plan.patched);
+    for site in patched {
+        let end = site.addr + 4 * site.words.len() as u64;
+        let after = ranges.partition_point(|(start, _)| *start < end);
+        if after
+            .checked_sub(1)
+            .is_some_and(|i| site.addr < ranges[i].1)
+        {
+            plan.refused.push(rewrite::RefusedSite {
+                addr: site.addr,
+                reason: reason.clone(),
             });
         } else {
             plan.patched.push(site);
@@ -1047,6 +1120,66 @@ mod tests {
         // reachability is what refuses them.
         let marked = elf_image(&words, Some(&[(1, 0, true)]));
         assert_eq!(rewritten(&marked).1.patched_total(), 1);
+    }
+
+    /// Under the unwind table alone, a call is taken to return, so a table
+    /// placed after a call that does not return is reached as code. What the
+    /// code addresses as data is taken for data from there to the next
+    /// instruction a branch reaches, so a table whose words form a loop is
+    /// refused, addressed either by `ADRP`+`ADD` or by `ADR`, and the same
+    /// words marked `$x` are still rewritten.
+    #[test]
+    fn a_table_after_a_call_that_does_not_return_is_not_rewritten() {
+        // <address the table at word 3>; bl <word 9>, which traps; a header
+        // word; the loop; ret; brk.
+        let table = [
+            0x1234_5678, // the header the code loads
+            0x885f_fc08, // ldaxr w8, [x0]
+            0x1100_0508, // add w8, w8, #1
+            0x8809_fc08, // stlxr w9, w8, [x0]
+            0x35ff_ffa9, // cbnz w9, <ldaxr>
+        ];
+        let mut words = [0u32; 10];
+        words[2] = 0x9400_0007; // bl <word 9>
+        words[3..8].copy_from_slice(&table);
+        words[8] = 0xd65f_03c0; // ret
+        words[9] = 0xd420_0000; // brk
+        let addressings = [
+            // adrp x1, 0x0; add x1, x1, #0x10c (the table at word 3).
+            ([0x9000_0001, 0x9104_3021], "ADRP+ADD"),
+            // adr x1, <word 3>; ldr w3, [x1, #4] (the loop's first word).
+            ([0x1000_0061, 0xb940_0423], "ADR"),
+        ];
+        for (addressing, how) in addressings {
+            let mut words = words;
+            words[..2].copy_from_slice(&addressing);
+            assert_eq!(
+                mapping::addressed_starts(&words[..3], 0x100),
+                vec![0x10c],
+                "{how} addresses the table"
+            );
+            let image = elf_image_with(&words, None, Some(&[(0, 9), (9, 10)]));
+            let (bytes, report) = rewritten(&image);
+            assert_eq!(bytes, image, "{how}: the table is untouched");
+            assert_eq!(report.patched_total(), 0, "{how}: {report:?}");
+            assert_eq!(
+                report.refused,
+                BTreeMap::from([("addressed-data-inside-the-sequence", 1)]),
+                "{how}: {report:?}"
+            );
+            // Marked as code, the same words are rewritten: only the unwind
+            // table's weaker evidence needs this.
+            let marked = elf_image(&words, Some(&[(1, 0, true)]));
+            assert_eq!(rewritten(&marked).1.patched_total(), 1, "{how}");
+        }
+        // A table the code does not address at all is still reached through
+        // the call, which is the limit stated in this module's
+        // documentation.
+        let mut unaddressed = words;
+        unaddressed[0] = 0xd503_201f;
+        unaddressed[1] = 0xd503_201f;
+        let image = elf_image_with(&unaddressed, None, Some(&[(0, 9), (9, 10)]));
+        assert_eq!(rewritten(&image).1.patched_total(), 1);
     }
 
     /// A relocatable object's FDE starts are relocations to fill, so its
