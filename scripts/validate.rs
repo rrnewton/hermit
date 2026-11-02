@@ -20008,11 +20008,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .map_err(|e| format!("retry bounds: cannot read manifest defaults: {e}"))?;
     if !manifest_defaults
         .lines()
-        .any(|line| line == "timeout_seconds: 57")
+        .any(|line| line == format!("timeout_seconds: {DEFAULT_TEST_WALL_TIMEOUT_SECONDS}"))
     {
         return Err(
-            "retry bounds: the owner-ruled 57-second wall default is absent from manifest defaults"
-                .into(),
+            "retry bounds: the canonical wall default is absent from manifest defaults".into(),
         );
     }
     let base_nextest_caps = parse_nextest_timeout_caps(&nextest)?;
