@@ -1066,7 +1066,7 @@ pub struct RunLatches {
     /// Under DBT it comes from the run's evidence instead
     /// (`backends::dbt_run_latches`), since the latch is in the guest.
     pub determinism_loss: Option<String>,
-    /// The first write or flush error of the run's log ([`SharedLog::failure`]).
+    /// The first write or flush error of the run's log (`SharedLog::failure`).
     pub log_sink_failure: Option<String>,
 }
 
@@ -2062,7 +2062,7 @@ pub struct RunOpts {
     /// verification: taken once by `run --verify`, or the object the holder
     /// sealed as [`LD_SO_CACHE_ROLE`] for `--verify-run`. `None` reads the
     /// host's cache at container setup
-    /// (https://github.com/rrnewton/hermit/issues/4693).
+    /// (<https://github.com/rrnewton/hermit/issues/4693>).
     #[clap(skip)]
     ld_so_cache_snapshot: Option<super::container::LdSoCacheSnapshot>,
     /// Exact original package for both verification runs: inherited from the
@@ -2156,7 +2156,7 @@ pub struct RunOpts {
     /// input from the host (an epoch from the host clock, a seed from `--seed-from=SystemRandom`)
     /// writes such a manifest under the data directory (`HERMIT_DATA_DIR`, else
     /// `~/.cache/hermit`) and names it in a diagnostic
-    /// (https://github.com/rrnewton/hermit/issues/4271). Like a run config, a manifest does not
+    /// (<https://github.com/rrnewton/hermit/issues/4271>). Like a run config, a manifest does not
     /// hold the host environment `--base-env=host` passes through, the files the guest reads, or
     /// the working directory (relative paths resolve against this one), and it leaves out output
     /// destinations such as `--log-file`.

@@ -7,7 +7,7 @@
  */
 
 //! Run manifests: the "tiny recording" a `hermit run` leaves when it draws an
-//! input from the host (https://github.com/rrnewton/hermit/issues/4271).
+//! input from the host (<https://github.com/rrnewton/hermit/issues/4271>).
 //!
 //! A run whose every input is given by its options is reproducible from its
 //! command line. A run that takes its virtual-time epoch from the host clock,

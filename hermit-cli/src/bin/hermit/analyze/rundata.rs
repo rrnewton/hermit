@@ -748,7 +748,7 @@ impl RunData {
     /// A trial without `--workdir` gives its guest Hermit's working
     /// directory, which is analyze's own; a run of the bare command from
     /// another directory would start its guest there instead
-    /// (https://github.com/rrnewton/hermit/issues/4812). The `cd` keeps that
+    /// (<https://github.com/rrnewton/hermit/issues/4812>). The `cd` keeps that
     /// inherited directory rather than passing it as `--workdir`, which
     /// would name a different one: `--workdir` resolves after the guest's
     /// mounts, so a directory under the guest's private `/tmp` does not
@@ -918,7 +918,7 @@ impl AnalyzeOpts {
     /// `bisect` make the check here, before any workspace or trial exists.
     /// Without it a trial on a miscounting counter can disagree with another
     /// for a hardware reason and be reported as a race
-    /// (https://github.com/rrnewton/hermit/issues/3810). Unlike `run`, a trial
+    /// (<https://github.com/rrnewton/hermit/issues/3810>). Unlike `run`, a trial
     /// with `--namespace-only` is not exempt: trials never reach the
     /// namespace-only launcher, so they still run on ptrace.
     pub fn refuse_strict_with_inexact_branch_counter(&self) -> anyhow::Result<()> {
@@ -983,7 +983,7 @@ impl AnalyzeOpts {
     ///
     /// A network trace that the run arguments replay (`--replay-networking`)
     /// is reconciled with them: its inputs are released at absolute virtual
-    /// times too (https://github.com/rrnewton/hermit/issues/3875).
+    /// times too (<https://github.com/rrnewton/hermit/issues/3875>).
     ///
     /// Records stored under two different epochs, or an explicit epoch
     /// (`--epoch` or `HERMIT_EPOCH`) that differs from theirs, are refused
@@ -1299,7 +1299,7 @@ impl AnalyzeOpts {
 
     /// Refuse, before any trial, recordings made under another
     /// `--pipe-wake-latency` than the trials' own, including a different
-    /// latency (https://github.com/rrnewton/hermit/issues/4380). Trials start
+    /// latency (<https://github.com/rrnewton/hermit/issues/4380>). Trials start
     /// through `RunOpts::run`, which skips `hermit run`'s own check, so the
     /// check is made here, as `adopt_recorded_epoch` makes the epoch's. The
     /// run arguments name no record to replay: `refuse_outputs_trials_overwrite`

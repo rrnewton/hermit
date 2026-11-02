@@ -212,7 +212,7 @@ pub struct StartOpts {
     /// fails Reverie's performance-counter validation, as `hermit run --strict` does: the
     /// ptrace record runtime reads its virtual clock and preemption points from that
     /// counter, so a replay could diverge from its recording for a hardware reason
-    /// (https://github.com/rrnewton/hermit/issues/3810). That refusal is the flag's only
+    /// (<https://github.com/rrnewton/hermit/issues/3810>). That refusal is the flag's only
     /// effect. Recording does NOT run under `run --strict`'s configuration: see
     /// `hermit_cli::metadata::record_or_replay_config`, which deliberately sets
     /// `virtualize_time: false`, `deterministic_io: false`, `passthru_opt: true` and

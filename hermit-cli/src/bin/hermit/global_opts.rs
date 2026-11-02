@@ -56,7 +56,7 @@ pub(crate) const CONTROLLER_TARGET: &str = "hermit::controller";
 /// gdbserver's port is bound in the host's network namespace, where a host gdb
 /// client reaches it. The DBT backend does not apply `--network` yet:
 /// its guest sees the host network
-/// (https://github.com/rrnewton/hermit/issues/3543).
+/// (<https://github.com/rrnewton/hermit/issues/3543>).
 ///
 /// In record mode, the guest's system call results are saved so that
 /// `hermit replay` can reproduce the execution. Recordings are stored in
