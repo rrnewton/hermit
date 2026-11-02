@@ -3270,8 +3270,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its third round adds three in procfs::locks (a grant waits once for the
     // exited holders it conflicts with, a re-blocking retry that wakes
     // requests says so, a waited grant a mapping alone keeps is refused):
-    // 3418 + 3 = 3421, listed.
-    ("test.detcore_unit", 3421),
+    // 3418 + 3 = 3421, listed. Its fourth round adds two (in procfs::locks, a
+    // waited grant that no mirror follows leaves the exited holders; in
+    // syscalls::files::flock_model, only Linux's early answers change no
+    // lock): 3421 + 2 = 3423, listed.
+    ("test.detcore_unit", 3423),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5876,8 +5879,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two N2 detcore units: 3388 + 2 = 3390.
     // The same seventeen flock-model units: 3390 + 17 = 3407.
     // And the review's six: 3407 + 6 = 3413, and its second half's five:
-    // 3413 + 5 = 3418, and its third round's three: 3418 + 3 = 3421.
-    ("test.detcore_unit_on_host", 3421),
+    // 3413 + 5 = 3418, and its third round's three: 3418 + 3 = 3421, and its
+    // fourth round's two: 3421 + 2 = 3423.
+    ("test.detcore_unit_on_host", 3423),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
