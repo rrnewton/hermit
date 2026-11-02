@@ -112,7 +112,9 @@ impl Callback {
         {
             return Err(io::Error::from_raw_os_error(libc::EPROTO));
         }
-        let current = table.current.ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?;
+        let current = table
+            .current
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?;
         if unsafe { current(self.context) } != 1 {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
@@ -168,13 +170,19 @@ impl Callback {
     pub(super) unsafe fn copy_auxv(&self) -> io::Result<Vec<(libc::c_ulong, libc::c_ulong)>> {
         self.validate(self.identity)?;
         if self.auxv_count == 0 {
-            let reader = self.validate(self.identity)?.read_memory
+            let reader = self
+                .validate(self.identity)?
+                .read_memory
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?;
             return super::auxv::read(reader);
         }
         // Copy scalar C pairs rather than asserting the layout of Rust tuples.
-        Ok(unsafe { std::slice::from_raw_parts(self.auxv, self.auxv_count) }
-            .iter().map(|pair| (pair[0], pair[1])).collect())
+        Ok(
+            unsafe { std::slice::from_raw_parts(self.auxv, self.auxv_count) }
+                .iter()
+                .map(|pair| (pair[0], pair[1]))
+                .collect(),
+        )
     }
 }
 
@@ -184,8 +192,12 @@ impl Mechanisms {
             return Err(io::Error::from_raw_os_error(libc::EPROTO));
         }
         Ok(NativeServiceTable {
-            read_registers: self.read_registers.ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?,
-            write_registers: self.write_registers.ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?,
+            read_registers: self
+                .read_registers
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?,
+            write_registers: self
+                .write_registers
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EPROTO))?,
             compare_exchange_u32: self.compare_exchange_u32,
             controller_capture: self.controller_capture,
             private_memory: self.private_memory,
@@ -213,8 +225,15 @@ pub struct Answer {
 impl Default for Answer {
     fn default() -> Self {
         Self {
-            action: 0, reserved: 0, value: 0, number: 0, arguments: [0; 6],
-            registers: [0; 4], signal: 0, signal_info_changed: 0, signal_info: [0; 128],
+            action: 0,
+            reserved: 0,
+            value: 0,
+            number: 0,
+            arguments: [0; 6],
+            registers: [0; 4],
+            signal: 0,
+            signal_info_changed: 0,
+            signal_info: [0; 128],
         }
     }
 }

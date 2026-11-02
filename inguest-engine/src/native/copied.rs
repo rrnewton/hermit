@@ -9,10 +9,13 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::mem::ManuallyDrop;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use detcore::{Detcore, GlobalState};
+use detcore::Detcore;
+use detcore::GlobalState;
 use reverie::Pid;
 use reverie::syscalls::CloneFlags;
 use reverie_inguest::guest::host::native_state::CopiedNativeParent;
@@ -20,7 +23,9 @@ use reverie_inguest::guest::native_rpc::NativeRpc;
 
 use super::abi::Callback;
 use super::entry::status;
-use super::owner::{self, Host, Thread};
+use super::owner::Host;
+use super::owner::Thread;
+use super::owner::{self};
 
 /// Actual native birth transaction, borrowed across its unchanged post body.
 /// These scalar facts are not the affine Rust transfer authority.
@@ -53,11 +58,16 @@ struct Transfer {
 /// `output` is a unique null replacement-locator slot in the real C owner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hermit_engine_native_copied_post_v1(
-    opaque: *mut c_void, callback: *const Callback, facts: *const CopyPost,
+    opaque: *mut c_void,
+    callback: *const Callback,
+    facts: *const CopyPost,
     output: *mut *mut c_void,
 ) -> i32 {
     status((|| {
-        if opaque.is_null() || callback.is_null() || facts.is_null() || output.is_null()
+        if opaque.is_null()
+            || callback.is_null()
+            || facts.is_null()
+            || output.is_null()
             || unsafe { !output.read().is_null() }
         {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -65,24 +75,35 @@ pub unsafe extern "C" fn hermit_engine_native_copied_post_v1(
         let callback = unsafe { &*callback };
         let facts = unsafe { facts.read() };
         let flags = CloneFlags::from_bits_truncate(facts.flags);
-        let prohibited = CloneFlags::CLONE_VM | CloneFlags::CLONE_VFORK
-            | CloneFlags::CLONE_THREAD | CloneFlags::CLONE_FILES;
-        if facts.result != 0 || flags.intersects(prohibited)
-            || !matches!(facts.number, libc::SYS_fork | libc::SYS_clone | libc::SYS_clone3)
+        let prohibited = CloneFlags::CLONE_VM
+            | CloneFlags::CLONE_VFORK
+            | CloneFlags::CLONE_THREAD
+            | CloneFlags::CLONE_FILES;
+        if facts.result != 0
+            || flags.intersects(prohibited)
+            || !matches!(
+                facts.number,
+                libc::SYS_fork | libc::SYS_clone | libc::SYS_clone3
+            )
         {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
         let thread = unsafe { &*opaque.cast::<Thread>() };
         let mut entry = unsafe { thread.enter_copied(callback)? };
         let inherited = unsafe { owner::inherited(callback, thread.scalar_identity())? };
-        let original = entry.state().pending.as_ref()
+        let original = entry
+            .state()
+            .pending
+            .as_ref()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
         let (number, arguments) = original.operation();
         if number != facts.number || (number == libc::SYS_clone && arguments[0] != facts.flags) {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
         let ordinal = inherited.next_child_ordinal.load(Ordering::SeqCst);
-        if ordinal == 0 { return Err(io::Error::from_raw_os_error(libc::ESTALE)); }
+        if ordinal == 0 {
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
+        }
         let identity = callback.identity;
         let native_identity = unsafe { identity.admitted()? };
         let table = callback.validate(identity)?.selected()?;
@@ -90,45 +111,62 @@ pub unsafe extern "C" fn hermit_engine_native_copied_post_v1(
         let services = unsafe { callback.select(&table, &auxv)? };
         let rebound = unsafe {
             inherited.host.rebind_copied_native_process(
-                &mut entry.state_mut().pending, &services, &inherited.rpc,
+                &mut entry.state_mut().pending,
+                &services,
+                &inherited.rpc,
                 super::bootstrap::fresh_runtime(),
             )?
         };
         // All pre-transfer refusals left the original Deferred present. From
         // this point a fatal failure must retain, not drop, its real Record.
         let mut retained = ManuallyDrop::new(Transfer {
-            host: rebound.host, rpc: rebound.rpc, parent: Some(rebound.parent),
+            host: rebound.host,
+            rpc: rebound.rpc,
+            parent: Some(rebound.parent),
         });
         let transfer = &mut *retained;
         let parent = unsafe {
             transfer.host.complete_copied_native_post(
-                &services, &transfer.rpc, &mut transfer.parent,
+                &services,
+                &transfer.rpc,
+                &mut transfer.parent,
             )?
         };
         let transfer = ManuallyDrop::into_inner(retained);
         let created = Box::into_raw(Box::new(Thread::copied(
-            identity, native_identity, parent, flags,
+            identity,
+            native_identity,
+            parent,
+            flags,
         )));
         // Preserve the Runtime's actual inherited ordinal value. The later
         // actual initializer alone increments it for the unchanged RNG pack;
         // a copied process never resets it to a fresh-image value of one.
         let engine = owner::Engine {
-            host: transfer.host, rpc: transfer.rpc,
+            host: transfer.host,
+            rpc: transfer.rpc,
             config: Arc::clone(&inherited.config),
             root: Pid::from_raw(identity.tool_pid),
-            physical_owner: identity.physical_pid, image: identity.image,
+            physical_owner: identity.physical_pid,
+            image: identity.image,
             pending_parents: Mutex::new(HashMap::new()),
             next_child_ordinal: AtomicU64::new(ordinal),
         };
         // Failure retains both new allocations and the original Record for
         // the fatal process exit. It never destroys an inherited Engine.
-        unsafe { owner::publish_copied(inherited, engine)?; }
+        unsafe {
+            owner::publish_copied(inherited, engine)?;
+        }
         entry.state_mut().retired = true;
         drop(entry);
         // rebind moved the original Deferred/Record; this old locator now
         // holds no state, scratch or copied-parent destructor to release.
-        unsafe { drop(Box::from_raw(opaque.cast::<Thread>())); }
-        unsafe { output.write(created.cast()); }
+        unsafe {
+            drop(Box::from_raw(opaque.cast::<Thread>()));
+        }
+        unsafe {
+            output.write(created.cast());
+        }
         Ok(())
     })())
 }
@@ -139,7 +177,8 @@ pub unsafe extern "C" fn hermit_engine_native_copied_post_v1(
 /// be replaced by an arbitrary syscall callback or a request to create a Tool.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hermit_engine_native_initialize_copied_thread_v1(
-    opaque: *mut c_void, callback: *const Callback,
+    opaque: *mut c_void,
+    callback: *const Callback,
 ) -> i32 {
     status((|| {
         if opaque.is_null() || callback.is_null() {
@@ -149,7 +188,8 @@ pub unsafe extern "C" fn hermit_engine_native_initialize_copied_thread_v1(
         let thread = unsafe { &*opaque.cast::<Thread>() };
         let mut entry = thread.enter(callback)?;
         let engine = owner::installed()?;
-        if entry.state().handle.is_some() || entry.state().pending.is_some()
+        if entry.state().handle.is_some()
+            || entry.state().pending.is_some()
             || engine.physical_owner != callback.identity.physical_pid
             || engine.root.as_raw() != callback.identity.tool_pid
             || callback.identity.physical_pid != callback.identity.physical_tid
@@ -159,12 +199,20 @@ pub unsafe extern "C" fn hermit_engine_native_initialize_copied_thread_v1(
         let table = callback.validate(callback.identity)?.selected()?;
         let auxv = unsafe { callback.copy_auxv()? };
         let services = unsafe { callback.select(&table, &auxv)? };
-        let parent = entry.state_mut().copied.take()
+        let parent = entry
+            .state_mut()
+            .copied
+            .take()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
         let result = unsafe {
             engine.host.initialize_postcompleted_copied_native_thread(
-                &services, &engine.rpc, parent.parent,
-                |original| { original.clone_flags = Some(parent.flags); Ok(()) },
+                &services,
+                &engine.rpc,
+                parent.parent,
+                |original| {
+                    original.clone_flags = Some(parent.flags);
+                    Ok(())
+                },
                 |state, original| {
                     super::lifecycle::project(state, callback.identity);
                     state.reset_copied_open_file_locks();
@@ -180,7 +228,10 @@ pub unsafe extern "C" fn hermit_engine_native_initialize_copied_thread_v1(
         };
         let handle = match result {
             Ok(handle) => handle,
-            Err(error) => { entry.fail(); return Err(error); }
+            Err(error) => {
+                entry.fail();
+                return Err(error);
+            }
         };
         entry.state_mut().handle = Some(handle);
         drop(entry);

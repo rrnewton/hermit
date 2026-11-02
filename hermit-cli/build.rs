@@ -59,6 +59,10 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(fbcode_build)");
     println!("cargo:rustc-check-cfg=cfg(hermit_registry_build)");
     println!("cargo:rustc-check-cfg=cfg(hermit_e9patch_sources_excluded)");
+    // Shared CLI tests still name the external application backends' former
+    // features to skip their cases. Core never enables them, so those branches
+    // compile out; check-cfg must still accept the names.
+    println!("cargo:rustc-check-cfg=cfg(feature, values(\"dbt\", \"sabre\", \"e9patch\"))");
 
     // Backend features do not identify a package: a core source build may
     // declare none of the third-party backends. Registry projections set their

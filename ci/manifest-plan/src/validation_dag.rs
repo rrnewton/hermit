@@ -7294,7 +7294,11 @@ sys.exit(37)
         // nodes), and 101 with the two syscall conformance nodes (104), and
         // 99 again since that check runs in Reverie's own validate and CI
         // (102 full nodes), and 100 with build.liteinst_runtime_in_pinned_root
-        // (103 full nodes).
+        // (103 full nodes), and 103 since e2e.manifest_compat moved into the
+        // pinned root on compatprep.fixtures_in_pinned_root (106 full nodes),
+        // and 101 since the host fixtures route through build.host_hermit_link
+        // and the retired base producers stay retired (104 full nodes), and
+        // 102 with privileged-test.deadline_slice_cap_kvm (105 full nodes).
         // The Buck profile composes the full profile with Cargo owners replaced,
         // rather than selecting the Buck label alone.
         let original_full =
@@ -7307,7 +7311,7 @@ sys.exit(37)
             .cloned()
             .chain(original_buck)
             .collect::<BTreeSet<_>>();
-        assert_eq!(original.len(), 100);
+        assert_eq!(original.len(), 102);
         let expected = original
             .into_iter()
             .filter(|tag| crate::dag_source_ownership::is_core(tag))

@@ -121,6 +121,8 @@ sha2 = "0.10.9"
 syn = { version = "2.0.119", features = ["full", "visit"] }
 # Exercise the actual build-script manifest parser in explicit_build_identity.
 toml = "0.8.23"
+# version_provenance includes build.rs, whose compatibility stamp hashes with it.
+sha1_smol = "1.0.1"
 
 # Always selected with the existing backend feature; fixture exports are a
 # separate producer input, never an exemption from required execution.

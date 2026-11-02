@@ -7537,7 +7537,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn virtual_timeout_with_debugger_is_refused_at_both_raw_library_dispatches() {
         for (gdbserver, bounded) in [(false, false), (true, false), (false, true), (true, true)] {

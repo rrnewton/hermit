@@ -381,7 +381,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends,kvm-execution-tests",
+            "liteinst,kvm-execution-tests",
             "--test",
             "deadline_slice_cap",
         ]),

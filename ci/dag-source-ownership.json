@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "origin_sha256": "6490ce73707e7f39790917b6f5fa06a17b8d424a95bcb4c6690a4ad2e96580a9",
+  "origin_sha256": "aa98253ff80c79cf970c9a0cfd4d7a3f71b04884164da425e15adccd2defdf3a",
   "nodes": {
     "pre.submodules": {
       "owner": "core",
@@ -407,13 +407,15 @@
         "portable"
       ],
       "deps": [
-        "build.host_hermit_link",
-        "build.rust_scripts",
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
         "check.dbt_runtime_abi",
-        "compatprep.fixtures",
+        "compatprep.fixtures_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
-        "setup.manifest_plan"
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
       ]
     },
     "portablecompat.manifest_compat": {
@@ -1248,6 +1250,20 @@
       ]
     },
     "privileged-test.cli_kvm": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "kvm"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-test.deadline_slice_cap_kvm": {
       "owner": "core",
       "labels": [
         "full",
@@ -2450,17 +2466,12 @@
     },
     "compatprep.fixtures": {
       "owner": "core",
-      "labels": [
-        "full",
-        "portable"
-      ],
+      "labels": [],
       "deps": [
         "build.host_hermit_link",
         "doc.doctests",
         "doc.rustdoc",
-        "gate.manifest",
         "lint.clippy",
-        "pre.reverie_pin",
         "test.detcore_unit",
         "test.hermit_unit",
         "test.regular_crates",
@@ -4825,6 +4836,19 @@
       "deps": [
         "build.rust_scripts_in_pinned_root",
         "gate.manifest",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "compatprep.fixtures_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
         "setup.pinned_root_fetch"
       ]
     },

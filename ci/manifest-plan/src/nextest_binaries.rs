@@ -435,12 +435,12 @@ fn project_at(root: &Path, path: &Path) -> Result<PreparedProject, String> {
     if !path.is_absolute() || path.canonicalize().map_err(|e| e.to_string())? != path {
         return Err("prepared project descriptor must be an explicit canonical file".into());
     }
-    let descriptor = file_identity(&path, false)?;
+    let descriptor = file_identity(path, false)?;
     if descriptor.size > 65536 {
         return Err("prepared project descriptor exceeds its size bound".into());
     }
     let decoded: ProjectDescriptor =
-        serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     if decoded.schema != 1
         || decoded.repository != root

@@ -9955,9 +9955,7 @@ fn retained_path_evidence_error(result: &CellResult) -> Option<String> {
 pub(crate) fn summarize_sabre_path_evidence(
     attempts: &[AttemptResult],
 ) -> Result<Option<JsonValue>, String> {
-    let is_sabre = attempts
-        .iter()
-        .any(|attempt| attempt_selects_sabre(attempt));
+    let is_sabre = attempts.iter().any(attempt_selects_sabre);
     if !is_sabre {
         return Ok(None);
     }

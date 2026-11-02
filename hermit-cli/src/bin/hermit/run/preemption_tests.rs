@@ -72,7 +72,7 @@ fn parse_raw_for(argv: Vec<OsString>, application: Option<Case>) -> RunOpts {
     run.backend = args.global.backend;
     if let Some(Case::Application(name, capabilities)) = application {
         run.select_application_backend(name).unwrap();
-        run = Box::new(run.with_adapter_capabilities(capabilities));
+        *run = run.with_adapter_capabilities(capabilities);
     }
     *run
 }

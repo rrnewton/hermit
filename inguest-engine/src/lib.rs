@@ -58,7 +58,9 @@ pub unsafe extern "C" fn hermit_engine_install_loader_state_v1(
     if INSTALLATION.load(Ordering::Acquire) != 0 {
         return -libc::EPROTO;
     }
-    let Some(callback) = callback else { return -libc::EINVAL; };
+    let Some(callback) = callback else {
+        return -libc::EINVAL;
+    };
     // SAFETY: the genuine loader's symbol negotiation supplies this function.
     match unsafe { loader_state::install(callback) } {
         Ok(()) => 0,
@@ -122,7 +124,10 @@ core::arch::global_asm!(
 );
 
 fn begin_installation() {
-    if INSTALLATION.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if INSTALLATION
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         install::fail("the common engine was initialized more than once");
     }
 }
@@ -194,7 +199,13 @@ unsafe extern "C" {
     // Exact pinned reverie-inguest assembly ABI: seven SysV scalar arguments.
     // This hidden gate is the existing filter's trusted syscall instruction.
     fn reverie_inguest_trusted_syscall(
-        number: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
+        number: u64,
+        a0: u64,
+        a1: u64,
+        a2: u64,
+        a3: u64,
+        a4: u64,
+        a5: u64,
     ) -> i64;
 }
 
@@ -207,7 +218,13 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 pub unsafe extern "C" fn hermit_engine_raw_syscall_v1(
-    _number: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64,
+    _number: u64,
+    _a0: u64,
+    _a1: u64,
+    _a2: u64,
+    _a3: u64,
+    _a4: u64,
+    _a5: u64,
 ) -> i64 {
     core::arch::naked_asm!("jmp {gate}", gate = sym reverie_inguest_trusted_syscall);
 }

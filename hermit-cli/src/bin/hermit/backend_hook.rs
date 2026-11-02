@@ -1133,6 +1133,7 @@ impl VerificationCapture<'_> {
                 output,
                 skid_overshoots,
                 latches,
+                terminal_outcome: None,
                 pending,
             },
             guards,
@@ -1273,6 +1274,13 @@ impl EvidenceRequirement {
     }
 }
 
+/// The common nonwaiting diagnostic channel for a physical adapter's existing
+/// preparation banner. This does not select a log filter, writer or verdict.
+/// The original macro keeps the current invocation's log-cap policy.
+pub fn controller_diagnostic(message: std::fmt::Arguments<'_>) {
+    super::tracing::diagnostic_eprintln!("{message}");
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1371,6 +1379,7 @@ mod tests {
                         .then(|| "synthetic latch".to_owned()),
                     log_sink_failure: None,
                 },
+                terminal_outcome: None,
                 pending: (capture.run, session.count),
             }))
         }
@@ -2166,11 +2175,4 @@ mod tests {
             );
         }
     }
-}
-
-/// The common nonwaiting diagnostic channel for a physical adapter's existing
-/// preparation banner. This does not select a log filter, writer or verdict.
-/// The original macro keeps the current invocation's log-cap policy.
-pub fn controller_diagnostic(message: std::fmt::Arguments<'_>) {
-    super::tracing::diagnostic_eprintln!("{message}");
 }

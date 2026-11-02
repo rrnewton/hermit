@@ -26,7 +26,10 @@ struct Line {
 
 impl Line {
     const fn new() -> Self {
-        Self { bytes: [0; 192], length: 0 }
+        Self {
+            bytes: [0; 192],
+            length: 0,
+        }
     }
 
     fn emit(&self) {
@@ -35,15 +38,24 @@ impl Line {
         let mut at = 0;
         while at < self.length {
             let written = unsafe {
-                reverie_inguest::trap::raw_syscall6(libc::SYS_write, [
-                    2,
-                    self.bytes[at..self.length].as_ptr() as u64,
-                    (self.length - at) as u64,
-                    0, 0, 0,
-                ])
+                reverie_inguest::trap::raw_syscall6(
+                    libc::SYS_write,
+                    [
+                        2,
+                        self.bytes[at..self.length].as_ptr() as u64,
+                        (self.length - at) as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                )
             };
-            if written == -(libc::EINTR as i64) { continue; }
-            if written <= 0 { return; }
+            if written == -(libc::EINTR as i64) {
+                continue;
+            }
+            if written <= 0 {
+                return;
+            }
             at += written as usize;
         }
     }
@@ -51,8 +63,14 @@ impl Line {
 
 impl core::fmt::Write for Line {
     fn write_str(&mut self, value: &str) -> core::fmt::Result {
-        let end = self.length.checked_add(value.len()).ok_or(core::fmt::Error)?;
-        let destination = self.bytes.get_mut(self.length..end).ok_or(core::fmt::Error)?;
+        let end = self
+            .length
+            .checked_add(value.len())
+            .ok_or(core::fmt::Error)?;
+        let destination = self
+            .bytes
+            .get_mut(self.length..end)
+            .ok_or(core::fmt::Error)?;
         destination.copy_from_slice(value.as_bytes());
         self.length = end;
         Ok(())
@@ -69,38 +87,47 @@ fn tool_entry(entry: Entry) {
     if entry.number == libc::SYS_brk as u64 {
         if BRK_RECORDS.fetch_add(1, Ordering::Relaxed) < MAX_RECORDS {
             let mut line = Line::new();
-            if writeln!(line,
+            if writeln!(
+                line,
                 "ENGINE_BRK_ENTRY_V1 pid={} tid={} dettid={} ip={:#x} address={:#x}",
-                entry.pid, entry.tid, entry.dettid, entry.instruction_pointer,
-                entry.arguments[0],
-            ).is_ok() {
+                entry.pid, entry.tid, entry.dettid, entry.instruction_pointer, entry.arguments[0],
+            )
+            .is_ok()
+            {
                 line.emit();
             }
         }
         return;
     }
-    if entry.number != libc::SYS_getpid as u64 ||
-        TOOL_RECORDS.fetch_add(1, Ordering::Relaxed) >= MAX_RECORDS {
+    if entry.number != libc::SYS_getpid as u64
+        || TOOL_RECORDS.fetch_add(1, Ordering::Relaxed) >= MAX_RECORDS
+    {
         return;
     }
     let mut line = Line::new();
-    if writeln!(line,
+    if writeln!(
+        line,
         "ENGINE_TOOL_ENTRY_V1 pid={} tid={} dettid={} nr={} ip={:#x}",
         entry.pid, entry.tid, entry.dettid, entry.number, entry.instruction_pointer,
-    ).is_ok() {
+    )
+    .is_ok()
+    {
         line.emit();
     }
 }
 
 pub(crate) fn native_route(context: &RegisterContext, number: i64) {
-    if number != libc::SYS_getpid ||
-        ROUTE_RECORDS.fetch_add(1, Ordering::Relaxed) >= MAX_RECORDS {
+    if number != libc::SYS_getpid || ROUTE_RECORDS.fetch_add(1, Ordering::Relaxed) >= MAX_RECORDS {
         return;
     }
     let mut line = Line::new();
-    if writeln!(line, "ENGINE_NATIVE_ROUTE_V1 nr={} ip={:#x}",
+    if writeln!(
+        line,
+        "ENGINE_NATIVE_ROUTE_V1 nr={} ip={:#x}",
         number, context.instruction_pointer,
-    ).is_ok() {
+    )
+    .is_ok()
+    {
         line.emit();
     }
 }

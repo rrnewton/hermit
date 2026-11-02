@@ -16,7 +16,7 @@ fn run() -> Result<(), String> {
     }
     let mut held = Vec::new();
     let mut names = std::collections::BTreeSet::new();
-    for entry in args[2..].chunks_exact(5) {
+    for entry in args[2..].as_chunks::<5>().0 {
         if entry[0] != "--entry" || !names.insert(entry[1].clone()) {
             return Err("unknown or duplicate catalog entry".into());
         }

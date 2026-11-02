@@ -5,7 +5,8 @@
 //! engine DSO, allocator/TLS owner, ToolHost or native admission mechanism.
 
 use reverie::Tid;
-use reverie::syscalls::{CloneFlags, Errno};
+use reverie::syscalls::CloneFlags;
+use reverie::syscalls::Errno;
 
 pub(super) const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 pub(super) const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
@@ -216,7 +217,6 @@ pub(super) fn process_child_registration(
     }
     Some((Tid::from_raw(virtual_child_tid), flags, exit_signal))
 }
-
 
 #[cfg(test)]
 mod tests {

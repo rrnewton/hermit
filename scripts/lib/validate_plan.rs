@@ -573,17 +573,6 @@ pub fn partition_host_inapplicable(
     Ok((keep, withheld))
 }
 
-/// Build the compatibility-corpus nodes for one mode.
-///
-/// One DAG node PER PROBE. That is a deliberate change from the bash, which ran
-/// all ~191 probes serially inside a single gate:
-///   * each probe now gets its own wall + CPU + memory box, so one runaway row
-///     cannot consume the whole gate's budget;
-///   * each probe's verdict is a TYPED `StepOutcome`, so the summary table is
-///     built from structured results instead of a scraped TSV; and
-///   * the corpus becomes parallel, which is where a large part of the wall-clock
-///     win in this profile is expected to come from.
-
 /// DAG tags are `group.job`, so a job containing `.` would produce an ambiguous
 /// tag. Corpus labels are shell-command names (`c++filt`, `wc-lines`), none of
 /// which contain a dot today, but the mapping is applied rather than assumed.

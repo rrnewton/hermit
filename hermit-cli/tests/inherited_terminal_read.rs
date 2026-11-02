@@ -284,21 +284,11 @@ fn run_guest(backend: Backend, mode: &str, prefix: &str, guest_source: &str) {
         )
         .as_bytes()
     );
-    if matches!(backend, Backend::Dbt) {
-        assert!(
-            err.bytes
-                .windows(b"DETLOG".len())
-                .any(|window| window == b"DETLOG"),
-            "real Detcore log absent; evidence={}",
-            root.display()
-        );
-    } else {
-        assert!(
-            err.bytes.is_empty(),
-            "native stderr: {}",
-            String::from_utf8_lossy(&err.bytes)
-        );
-    }
+    assert!(
+        err.bytes.is_empty(),
+        "native stderr: {}",
+        String::from_utf8_lossy(&err.bytes)
+    );
 }
 
 #[test]

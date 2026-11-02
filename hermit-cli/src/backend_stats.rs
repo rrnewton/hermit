@@ -70,7 +70,12 @@ pub(crate) fn report<S>(
 where
     S: BackendStatsSource,
 {
-    report_with_names(selected_backend.as_str(), selected_backend.runtime_name(), request, source)
+    report_with_names(
+        selected_backend.as_str(),
+        selected_backend.runtime_name(),
+        request,
+        source,
+    )
 }
 
 /// The same reporting owner for a statically selected physical extension.

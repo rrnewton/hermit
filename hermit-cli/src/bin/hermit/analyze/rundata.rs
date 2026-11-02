@@ -1501,7 +1501,8 @@ mod tests {
     /// set end of timeslice" panic (exit 101).
     #[test]
     fn analyze_replays_only_its_edited_preemption_records_as_edited() {
-        let args = crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let args =
+            crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
         let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("not analyze")
         };

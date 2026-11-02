@@ -14,74 +14,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-#[cfg(feature = "third-party-backends")]
-mod cmake_source;
-
-#[cfg(feature = "third-party-backends")]
-const DYNAMORIO_FILES: &[&str] = &[
-    "bin64/drrun",
-    "lib64/release/libdynamorio.so",
-    "lib64/release/libdrpreload.so",
-    "ext/lib64/release/libdrx.so",
-    "ext/lib64/release/libdrmgr.so",
-    "ext/lib64/release/libdrreg.so",
-    "ext/lib64/release/libdrwrap.so",
-];
-
-/// Variables through which a caller names a repository. Git exports GIT_DIR to
-/// `git rebase --exec` steps, and GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE to
-/// hooks, so a release build started from either inherits them, and they
-/// override `git -C` (https://github.com/rrnewton/hermit/issues/3362).
-#[cfg(feature = "third-party-backends")]
-const GIT_REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_PREFIX",
-];
-
-/// A git command for a checkout this script names by path: the hermit source
-/// tree, its e9patch submodule, and the bundled SaBRe source. Each read must
-/// see that checkout and not an inherited one. Under an inherited GIT_DIR these
-/// commands answered for the caller's repository: `rev-parse HEAD` returned the
-/// caller's HEAD, so the pin checks failed, and `submodule update --init` ran
-/// against the caller's repository and failed. Configuration passed through
-/// GIT_CONFIG_COUNT or GIT_CONFIG_PARAMETERS is kept.
-#[cfg(feature = "third-party-backends")]
-fn git() -> Command {
-    let mut command = Command::new("git");
-    for name in GIT_REPOSITORY_LOCATION_VARIABLES {
-        command.env_remove(name);
-    }
-    command
-}
-
 fn run(command: &mut Command, description: &str) {
     eprintln!("hermit-install: {description}: {command:?}");
     let status = command
         .status()
         .unwrap_or_else(|error| panic!("failed to {description}: {error}"));
     assert!(status.success(), "failed to {description}: {status}");
-}
-
-#[cfg(feature = "third-party-backends")]
-fn output(command: &mut Command, description: &str) -> String {
-    let result = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to {description}: {error}"));
-    assert!(
-        result.status.success(),
-        "failed to {description}: {}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    String::from_utf8(result.stdout)
-        .unwrap_or_else(|error| panic!("non-UTF-8 output while trying to {description}: {error}"))
-        .trim()
-        .to_owned()
 }
 
 fn copy_file(source: &Path, destination: &Path) {
@@ -101,200 +39,6 @@ fn copy_file(source: &Path, destination: &Path) {
             destination.display()
         )
     });
-}
-
-#[cfg(feature = "third-party-backends")]
-fn ensure_submodule(
-    repository: &Path,
-    name: &str,
-    relative: &str,
-    marker: &str,
-) -> (PathBuf, String) {
-    let source = repository.join(relative);
-    if !source.join(marker).is_file() {
-        run(
-            git().arg("-C").arg(repository).args([
-                "-c",
-                &format!("submodule.{relative}.update=checkout"),
-                "submodule",
-                "update",
-                "--init",
-                "--checkout",
-                "--depth",
-                "1",
-                "--recursive",
-                "--",
-                relative,
-            ]),
-            &format!("initialize the pinned {name} source"),
-        );
-    }
-
-    let expected = output(
-        git()
-            .arg("-C")
-            .arg(repository)
-            .args(["rev-parse", &format!(":{relative}")]),
-        &format!("read the pinned {name} revision"),
-    );
-    let actual = output(
-        git().arg("-C").arg(&source).args(["rev-parse", "HEAD"]),
-        &format!("read the checked-out {name} revision"),
-    );
-    assert_eq!(
-        actual, expected,
-        "{name} source is not at the pinned revision"
-    );
-    (source, expected)
-}
-
-#[cfg(feature = "third-party-backends")]
-fn stage_sabre(resources: &Path, expected_reverie_revision: &str) {
-    // Reverie's vendor tree includes the frame/bootstrap repairs that are not
-    // in its original third-party/sabre gitlink. Use the loader built by that
-    // same Cargo dependency, including its verified source and build recipe.
-    let source = reverie_sabre::bundled_sabre_source_dir();
-    let revision = output(
-        git().arg("-C").arg(source).args(["rev-parse", "HEAD"]),
-        "read the bundled SaBRe source's Reverie revision",
-    );
-    assert_eq!(
-        revision, expected_reverie_revision,
-        "bundled SaBRe does not match the selected Reverie revision"
-    );
-    copy_file(
-        reverie_sabre::bundled_sabre_path(),
-        &resources.join("sabre"),
-    );
-    // This remains a single revision line for existing diagnostic readers,
-    // but now identifies the Reverie commit carrying the vendor corrections.
-    fs::write(resources.join("sabre.revision"), format!("{revision}\n"))
-        .expect("failed to write SaBRe revision provenance");
-    copy_file(
-        &source.join("REVISION"),
-        &resources.join("sabre.upstream-revision"),
-    );
-}
-
-#[cfg(feature = "third-party-backends")]
-fn build_e9patch(repository: &Path, build_root: &Path, resources: &Path) {
-    let (source, _) = ensure_submodule(repository, "e9patch", "third-party/e9patch", "Makefile");
-    let build = build_root.join("e9patch");
-    if build.exists() {
-        fs::remove_dir_all(&build)
-            .unwrap_or_else(|error| panic!("failed to reset {}: {error}", build.display()));
-    }
-    fs::create_dir_all(&build)
-        .unwrap_or_else(|error| panic!("failed to create {}: {error}", build.display()));
-    run(
-        Command::new("cp")
-            .arg("-a")
-            .arg(source.join("."))
-            .arg(&build),
-        "copy the pinned e9patch source into the target directory",
-    );
-
-    let mut command = Command::new("make");
-    command.arg("-C").arg(&build).arg("release");
-    if let Some(jobs) = env::var_os("NUM_JOBS") {
-        command.arg(format!("--jobs={}", jobs.to_string_lossy()));
-    }
-    run(&mut command, "build e9patch");
-    copy_file(&build.join("e9tool"), &resources.join("e9tool"));
-    copy_file(&build.join("e9patch"), &resources.join("e9patch"));
-}
-
-#[cfg(feature = "third-party-backends")]
-fn copy_third_party_licenses(reverie_root: &Path, install: &Path) {
-    let licenses = install.join("licenses");
-    for name in [
-        "LICENSE",
-        "LICENSE.BSD-3",
-        "LICENSE.GPL-2",
-        "LICENSE.GPL-3",
-        "LICENSE.MIT",
-    ] {
-        copy_file(
-            &reverie_sabre::bundled_sabre_source_dir().join(name),
-            &licenses.join("sabre").join(name),
-        );
-    }
-    // The bundled loader also links Reverie's vendored libelf statically.
-    let libelf = reverie_sabre::bundled_sabre_source_dir()
-        .parent()
-        .expect("bundled SaBRe source has no vendor directory")
-        .join("libelf");
-    for name in ["COPYING", "COPYING-LGPLV3"] {
-        copy_file(
-            &libelf.join(name),
-            &licenses.join("sabre/libelf").join(name),
-        );
-    }
-    copy_file(
-        &reverie_root.join("third-party/dynamorio/License.txt"),
-        &licenses.join("dynamorio/License.txt"),
-    );
-    copy_file(
-        &reverie_root.join("third-party/e9patch/LICENSE"),
-        &licenses.join("e9patch/LICENSE"),
-    );
-}
-
-#[cfg(feature = "third-party-backends")]
-fn copy_dynamorio(resources: &Path) -> PathBuf {
-    let drrun = reverie_dbt::bundled_drrun_path();
-    let root = drrun
-        .parent()
-        .and_then(Path::parent)
-        .expect("bundled drrun path has no DynamoRIO root");
-    for relative in DYNAMORIO_FILES {
-        copy_file(
-            &root.join(relative),
-            &resources.join("dynamorio").join(relative),
-        );
-    }
-    reverie_dbt::bundled_dynamorio_cmake_dir().to_path_buf()
-}
-
-#[cfg(feature = "third-party-backends")]
-fn build_dbt_client(
-    manifest_dir: &Path,
-    build_root: &Path,
-    resources: &Path,
-    dynamorio_cmake: &Path,
-) {
-    let source = reverie_dbt::native_client_source_dir().join("client.c");
-    let (cmake_source, build) =
-        cmake_source::source_and_build_dir(&manifest_dir.join("native-client"), build_root)
-            .expect("failed to resolve the native-client CMake source");
-    run(
-        Command::new("cmake")
-            .arg("-S")
-            .arg(&cmake_source)
-            .arg("-B")
-            .arg(&build)
-            .arg("-DCMAKE_BUILD_TYPE=Release")
-            .arg(format!("-DDynamoRIO_DIR={}", dynamorio_cmake.display()))
-            .arg(format!("-DREVERIE_DBT_NATIVE_SOURCE={}", source.display()))
-            .arg(format!("-DHERMIT_RESOURCE_DIR={}", resources.display())),
-        "configure the relocatable Detcore DBT client",
-    );
-    let mut command = Command::new("cmake");
-    command.arg("--build").arg(&build).args([
-        "--config",
-        "Release",
-        "--target",
-        "reverie_dbt_client",
-        "--parallel",
-    ]);
-    if let Some(jobs) = env::var_os("NUM_JOBS") {
-        command.arg(jobs);
-    }
-    run(&mut command, "build the relocatable Detcore DBT client");
-    assert!(
-        resources.join("libreverie_dbt_client.so").is_file(),
-        "DBT client build did not produce libreverie_dbt_client.so"
-    );
 }
 
 fn replace_symlink(destination: &Path, target: &Path) -> io::Result<()> {
@@ -369,9 +113,7 @@ fn build_liteinst_runtime(
     // `cargo build --release -p hermit-install` -- regenerate exactly the state
     // that was already failing, so following the error message looped instead
     // of resolving.
-    // The default core installer still stages LiteInst with that command.
-    // Full backend staging additionally selects
-    // `--features hermit-install/third-party-backends`.
+    // The core installer stages LiteInst with that command.
     let pin = reverie_pin(repository);
     for staged in [&runtime, &resources.join("libreverie_liteinst.so")] {
         let marker = PathBuf::from(format!("{}.revision", staged.display()));
@@ -386,7 +128,6 @@ fn build_liteinst_runtime(
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=cmake_source.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=reverie-LICENSE");
     println!("cargo:rerun-if-env-changed=HERMIT_INSTALL_FORCE_RESTAGE");
@@ -455,20 +196,6 @@ fn main() {
     println!(
         "cargo:warning=finish LiteInst packaging with target/<profile>/stage-detcore-liteinst --git target (make install-deps does this automatically)"
     );
-    #[cfg(feature = "third-party-backends")]
-    {
-        // Only full installations link the current-profile third-party runtimes.
-        for library in ["libdetcore_dbt.so", "libdetcore_sabre.so"] {
-            replace_symlink(
-                &resources.join(library),
-                &Path::new("../..").join(&profile_dir_name).join(library),
-            )
-            .unwrap_or_else(|error| panic!("failed to link packaged {library}: {error}"));
-        }
-
-        let dynamorio_cmake = copy_dynamorio(&resources);
-        build_dbt_client(&manifest_dir, &build_root, &resources, &dynamorio_cmake);
-    }
 
     let repository = manifest_dir
         .parent()
@@ -482,16 +209,6 @@ fn main() {
         &manifest_dir.join("reverie-LICENSE"),
         &install.join("licenses/LICENSE"),
     );
-    #[cfg(feature = "third-party-backends")]
-    {
-        let reverie_root = reverie_dbt::native_client_source_dir()
-            .parent()
-            .and_then(Path::parent)
-            .expect("reverie-dbt source is not inside the Reverie repository");
-        stage_sabre(&resources, &reverie_pin(repository));
-        build_e9patch(reverie_root, &build_root, &resources);
-        copy_third_party_licenses(reverie_root, &install);
-    }
 
     replace_symlink(
         &install.join("hermit"),
@@ -503,11 +220,7 @@ fn main() {
         "Hermit release staging package. Copy with symlink dereferencing (for example, cp -aL) to create a standalone installation.\n",
     )
     .expect("failed to write install package README");
-    let selected = if cfg!(feature = "third-party-backends") {
-        "third-party-backends\n"
-    } else {
-        "core\n"
-    };
+    let selected = "core\n";
     let previous = match fs::read_to_string(&selection) {
         Ok(previous) => Some(previous),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,

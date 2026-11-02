@@ -80,9 +80,10 @@ mod remove;
 mod replay;
 #[cfg(test)]
 mod replay_departure_classification_tests;
+// The library root owns the shared fixture module; the app is now a module of
+// that library, so it uses the same instance rather than loading it again.
 #[cfg(test)]
-#[path = "../../replay_departure_test_fixture.rs"]
-mod replay_departure_test_fixture;
+use crate::replay_departure_test_fixture;
 mod replay_refusal_note;
 mod run;
 mod run_config;

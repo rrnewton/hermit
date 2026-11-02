@@ -283,6 +283,17 @@ pub fn selector_argv(
 }
 
 #[cfg(test)]
+pub(crate) fn current_test_binding(backend: &str) -> HeldExecutable {
+    measure(
+        backend.into(),
+        backend.into(),
+        std::env::current_exe().unwrap(),
+        "b".repeat(40),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn identity() -> ExecutableIdentity {
@@ -383,15 +394,4 @@ mod tests {
         assert!(read_bindings(Some(Path::new("/definitely/not/a/binding"))).is_err());
         assert!(HeldExecutable::open(identity()).is_err());
     }
-}
-
-#[cfg(test)]
-pub(crate) fn current_test_binding(backend: &str) -> HeldExecutable {
-    measure(
-        backend.into(),
-        backend.into(),
-        std::env::current_exe().unwrap(),
-        "b".repeat(40),
-    )
-    .unwrap()
 }

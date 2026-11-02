@@ -9,10 +9,6 @@
 #[path = "common/exec_posix_timers.rs"]
 mod exec_posix_timers;
 
-#[cfg(feature = "dbt")]
-#[path = "common/dbt_placement_probe.rs"]
-mod dbt_placement_probe;
-
 #[path = "common/fault_sites.rs"]
 mod fault_sites;
 
@@ -297,12 +293,6 @@ static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_DONTWAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_ERRQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FATAL_SIGNAL_FUTEX_WAITERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(feature = "dbt")]
-static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(feature = "dbt")]
-static COPIED_SCHEDULER_QUERY_GUEST: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(feature = "dbt")]
-static COPIED_PRIORITY_QUERY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -6322,12 +6312,6 @@ fn dbt_runs_with_a_resolved_or_explicitly_disabled_maximum() {
     if !dbt_unavailable("dbt_runs_with_a_resolved_or_explicitly_disabled_maximum") {
         assert_timerless_default_and_disabled_maximum_run("dbt");
     }
-}
-
-#[test]
-#[cfg(feature = "sabre")]
-fn sabre_runs_with_a_resolved_or_explicitly_disabled_maximum() {
-    assert_timerless_default_and_disabled_maximum_run("sabre");
 }
 
 #[test]
@@ -25297,32 +25281,6 @@ fn max_log_bytes_exits_promptly_with_a_vmm_guest_and_stderr_a_full_pipe() {
     .assert_exits_promptly_with_full_unread_stderr(|_| {});
 }
 
-/// `--backend=e9patch` (e9patch preprocessing with the ptrace backend) names
-/// its engagement on stderr before the run starts. For a main executable that
-/// is not ELF there is nothing to rewrite, and the tools are never run. Hermit
-/// still requires both to be executable files before it starts, and no
-/// validation node stages e9patch, so the test names `/bin/false` for each:
-/// had hermit run either, the run would fail rather than reach the cap.
-#[test]
-fn max_log_bytes_exits_promptly_with_e9patch_on_a_script_and_stderr_a_full_pipe() {
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let script = noisy_guest_script(directory.path(), "noisy.sh");
-    CappedRun {
-        global: &["--backend=e9patch"],
-        guest: &[&script],
-        prints: Some(
-            ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
-             main_executable=non-ELF; preprocessing=not-applicable",
-        ),
-        ..CappedRun::default()
-    }
-    .assert_exits_promptly_with_full_unread_stderr(|command| {
-        command
-            .env(hermit::e9patch::E9TOOL_ENV, "/bin/false")
-            .env(hermit::e9patch::E9PATCH_BACKEND_ENV, "/bin/false");
-    });
-}
-
 /// A `--happens-before` spec with one anchor at a function the guest does not
 /// have.
 fn unresolvable_happens_before_spec(directory: &Path) -> String {
@@ -38446,7 +38404,7 @@ fn liteinst_in_guest_verify_compares_the_records_the_guest_forwards() {
 
 /// Run 1's retained verify log of `/bin/true` under `backend`, with one fixed
 /// epoch, kept in `logs`.
-#[cfg(any(feature = "liteinst", feature = "dbt"))]
+#[cfg(feature = "liteinst")]
 fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
     let log_dir = logs.to_str().expect("UTF-8 temporary path");
     // `--log info`, as the e2e harness runs every verify cell: at the default
@@ -38489,12 +38447,6 @@ fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
     };
     golden.clone()
 }
-
-/// Under DBT each guest `rdtsc` is answered by Detcore, as under ptrace: the
-/// read is charged and logged ("inbound rdtsc"), and the guest's TSC is
-/// Detcore's virtual clock. Before, the DBT client answered every read from its
-/// own fixed-stride counter, so DBT's run 1 log of `/bin/true` held none of the
-/// 10 rdtsc records ptrace's does.
 
 /// Detcore's syscall outputs respect page protection, as the kernel's own
 /// writes do (https://github.com/rrnewton/reverie/issues/1064, F1):

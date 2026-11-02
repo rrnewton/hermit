@@ -523,13 +523,26 @@ mod tests {
             );
             assert_eq!(serde_json::to_value(&config).unwrap(), before);
             refuse_unsupported_preemption(&config, Backend::Ptrace, true, false).unwrap();
-            refuse_unsupported_preemption(&config, Backend::E9patch, true, false).unwrap();
+            refuse_unsupported_preemption_with_capabilities(
+                &config,
+                "e9patch",
+                reverie::BackendCapabilities::PTRACE,
+                true,
+                false,
+            )
+            .unwrap();
             // The inherited maximum is not a request (`maximum_requested`
             // false), so the stack-trace flag is what a timerless runtime
             // refuses, for its missing timer events.
-            for backend in TIMERLESS {
-                let error =
-                    refuse_unsupported_preemption(&config, backend, false, false).unwrap_err();
+            for (backend, capabilities) in TIMERLESS {
+                let error = refuse_unsupported_preemption_with_capabilities(
+                    &config,
+                    backend,
+                    capabilities,
+                    false,
+                    false,
+                )
+                .unwrap_err();
                 assert_eq!(error.setting, setting, "{backend:?}");
                 assert_eq!(error.missing, MissingCapability::TimerEvents, "{backend:?}");
             }

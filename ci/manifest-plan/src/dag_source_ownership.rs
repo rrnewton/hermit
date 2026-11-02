@@ -23,7 +23,7 @@ struct Node {
     labels: Vec<String>,
     deps: Vec<String>,
 }
-const ORIGIN_SHA256: &str = "6490ce73707e7f39790917b6f5fa06a17b8d424a95bcb4c6690a4ad2e96580a9";
+const ORIGIN_SHA256: &str = "aa98253ff80c79cf970c9a0cfd4d7a3f71b04884164da425e15adccd2defdf3a";
 fn parse_contract(bytes: &[u8]) -> Result<Document, String> {
     if bytes.len() > 1024 * 1024 {
         return Err("source ownership contract exceeds bound".into());

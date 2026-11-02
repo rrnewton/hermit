@@ -61,7 +61,6 @@ use hermit::host_input_change::PatternDifference;
 use hermit::host_input_change::explains_divergence;
 use hermit::host_input_change::find_pattern_difference;
 use hermit::host_input_change::open_position;
-use hermit::host_input_change::open_position_for_path;
 use hermit::host_input_change::read_host_inputs;
 use reverie::process::Bind;
 use reverie::process::Command;
@@ -518,7 +517,6 @@ fn place_host_input_change(
     run1: std::io::Result<HostInputs>,
     run2: std::io::Result<HostInputs>,
     logs: [&Path; 2],
-    backend: Backend,
 ) -> Option<(PatternDifference, [Option<usize>; 2])> {
     let read = |result: std::io::Result<HostInputs>| {
         result
@@ -544,15 +542,9 @@ fn place_host_input_change(
             .ok()
             .and_then(|bytes| {
                 let text = String::from_utf8_lossy(&bytes);
-                open_position(&text, difference.dtid, difference.syscall).or_else(|| {
-                    // Only DBT restarts per-thread syscall numbering across
-                    // images; elsewhere an ambiguous (dtid, syscall) refuses.
-                    (backend == Backend::Dbt)
-                        .then(|| {
-                            open_position_for_path(&text, difference.syscall, &difference.path)
-                        })
-                        .flatten()
-                })
+                // An ambiguous (dtid, syscall) refuses: no core backend
+                // restarts per-thread syscall numbering across images.
+                open_position(&text, difference.dtid, difference.syscall)
             })
     };
     let positions = [place(logs[0], "run 1"), place(logs[1], "run 2")];
@@ -3068,7 +3060,7 @@ fn application_admission_refuses_missing_immutable_capabilities_before_launch() 
     admitted.resolve_preemption_settings().unwrap();
     assert!(admitted.annotated_priority_replay_admission().unwrap());
     assert_eq!(format!("{:#?}", admitted.det_opts.det_config), before);
-    assert_eq!(admitted.program, guest);
+    assert_eq!(admitted.program_path(), guest);
     assert!(
         !guest.exists(),
         "admission must not start the nonexistent guest"
@@ -4700,13 +4692,10 @@ fn passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend() {
 /// its tracer from code it maps; nowhere else is any range guarded.
 #[test]
 fn the_ptrace_runtime_guards_reverie_private_page() {
-    for backend in [Backend::Ptrace] {
-        assert_eq!(
-            untraced_code_range(backend),
-            Some(REVERIE_PTRACE_PRIVATE_PAGE),
-            "{backend:?}"
-        );
-    }
+    assert_eq!(
+        untraced_code_range(Backend::Ptrace),
+        Some(REVERIE_PTRACE_PRIVATE_PAGE)
+    );
     for backend in [Backend::Kvm, Backend::Liteinst, Backend::InGuestTrap] {
         assert_eq!(untraced_code_range(backend), None, "{backend:?}");
     }
@@ -9708,7 +9697,7 @@ impl RunOpts {
     }
 
     pub(super) fn adapter_program(&self) -> &Path {
-        &self.program
+        self.program_path()
     }
 
     pub(super) fn adapter_arguments(&self) -> &[String] {
@@ -11192,7 +11181,7 @@ impl RunOpts {
         // own memory into that table, KVM's describes the VMM, and
         // `--namespace-only` intercepts nothing.
         if self.det_opts.det_config.detlog_anon.is_some()
-            && (self.namespace_only || !matches!(backend, Backend::Ptrace | Backend::E9patch))
+            && (self.namespace_only || !matches!(backend, Backend::Ptrace))
         {
             anyhow::bail!(
                 "--detlog-anon hashes the anonymous mappings in the guest's own /proc/<tid>/maps, \
@@ -13050,7 +13039,7 @@ impl RunOpts {
             } else if self.no_namespace
                 && matches!(
                     backend,
-                    Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::Sabre
+                    Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap
                 )
             {
                 // The guest's tasks are host tasks numbered by the host: unless
@@ -14005,12 +13994,6 @@ impl RunOpts {
         let host_inputs_path = host_inputs_file.as_ref().map(descriptor_path);
         run1_options.host_input_log = host_inputs_path.clone();
         run2_options.host_input_log = host_inputs_path.clone();
-        if self.selected_backend() == Backend::Dbt {
-            // DBT's in-guest global cannot use the host descriptor path; it
-            // writes through its private environment instead (backends.rs).
-            run1_options.record_host_inputs = true;
-            run2_options.record_host_inputs = true;
-        }
         run1_options.fatal_core_run_label = Some("run1");
         run2_options.fatal_core_run_label = Some("run2");
 
@@ -15359,7 +15342,7 @@ impl RunOpts {
             timer_enabled: Some(
                 !self.namespace_only
                     && maximum.is_some()
-                    && self.backend_arms_reverie_ptrace_pmu_timer(),
+                    && self.backend_arms_pmu_preemption_timer(),
             ),
             // Counted by the run itself, which reports it in its summary.
             stopless_slice_ends: None,
@@ -16239,7 +16222,7 @@ impl RunOpts {
         // line; a caller that captures the output (analyze) keeps the output,
         // whose status is the outcome's, with the outcome that says the guest
         // did not exit with it.
-        let result = if capture_output {
+        if capture_output {
             hermit::SchedulerEndedRun::output_of(hermit::run_with_output_backend_timeout(
                 command,
                 config,
@@ -16259,8 +16242,7 @@ impl RunOpts {
                 timeout,
             )
             .map(|status| (status, None, None))
-        };
-        result
+        }
     }
 
     fn run_verify_in_container(
@@ -16640,7 +16622,7 @@ pub(super) fn conclude_verification(
         run1.host_inputs
             .zip(run2.host_inputs)
             .and_then(|(first, second)| {
-                place_host_input_change(first, second, [&log1_path, &log2_path], conclusion.backend)
+                place_host_input_change(first, second, [&log1_path, &log2_path])
             })
     } else {
         None
@@ -17083,6 +17065,7 @@ mod tests {
                                 determinism_loss: loss.map(str::to_owned),
                                 log_sink_failure: None,
                             },
+                            terminal_outcome: None,
                             pending: (),
                         })
                     },
@@ -17189,6 +17172,7 @@ mod tests {
                         },
                         skid_overshoots: 0,
                         latches: super::super::run::RunLatches::default(),
+                        terminal_outcome: None,
                         pending: run,
                     })
                 },
@@ -17598,6 +17582,7 @@ mod tests {
                         },
                         skid_overshoots: 0,
                         latches: RunLatches::default(),
+                        terminal_outcome: None,
                         pending: (),
                     })
                 },
@@ -17620,6 +17605,8 @@ mod tests {
                     skid_overshoots: 0,
                     forwarded_syscalls: (transport == VerificationLogTransport::InGuestSocket)
                         .then_some(1),
+                    guest_deadlock: false,
+                    virtual_timeout_ns: None,
                 }
             );
             assert_eq!(
@@ -17682,6 +17669,7 @@ mod tests {
                                 .then(|| "saved control loss".to_owned()),
                             log_sink_failure: None,
                         },
+                        terminal_outcome: None,
                         pending: (),
                     })
                 },
