@@ -97,6 +97,11 @@ pub enum Refusal {
     /// sequence's bytes, so they may be a literal pool, which is data
     /// however its words decode.
     LiteralInsideSequence,
+    /// Only the unwind table says the sequence is code, and it lies in a
+    /// range the code addresses as data, between the address an `LDR`
+    /// (literal), `ADR` or `ADRP` gives and the next instruction a branch
+    /// reaches: a table placed after a call that does not return.
+    AddressedData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
