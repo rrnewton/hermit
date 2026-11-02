@@ -87,13 +87,13 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips. Nothing is reserved at this
-    /// head: 28 is https://github.com/rrnewton/hermit/pull/4789's, 29 is
-    /// https://github.com/rrnewton/hermit/pull/4884's, 30 is this change's
-    /// (https://github.com/rrnewton/hermit/pull/4728), 31 is
-    /// https://github.com/rrnewton/hermit/pull/4867's, and 32, this
-    /// change's layout on top of 31's, is the current revision.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 36, assigned to changes
+    /// pending elsewhere
+    /// (`ignored/drain-20261103/rpc-revisions.tsv` in the dev-hermit
+    /// parent), which 4759's 37 skips. 28 to 32 have all landed (4789,
+    /// 4884, 4728, 4867 and 4728's combined layout). Remove an entry when
+    /// its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -261,6 +261,15 @@ mod tests {
         // here rather than relabel 31 (revopus1's R1 on this change).
         // Digest measured at this head.
         (32, "e178ac33707f23b5", "f013e36743d8d9e6"),
+        // Adds `TraceSchedEventResponse::backstop`, the replay backstop of a
+        // schedule replay of a record whose slices ran without the
+        // `--max-timeslice` bound, which `GlobalResponse::TraceSchedEvent`
+        // carries. The reply's fields are digested as `TRACE_REPLY_WIRE`
+        // items, so the field changes the digest in domain 5
+        // (https://github.com/rrnewton/hermit/pull/4759, allocated revision
+        // 25 on its own base after main's 24, assigned 37, skipping 33 to 36
+        // reserved for pending changes; digest measured at this head).
+        (37, "0000000000000000", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -548,6 +557,27 @@ mod tests {
         assert_ne!(documented, replayer);
         assert_eq!(
             definition_digest(source, payload, schedule, &documented),
+            digest
+        );
+
+        // The reply this change extends is covered the same way: a field
+        // added to `TraceSchedEventResponse`, or its backstop removed,
+        // changes the digest (domain 5); the positional response a runtime
+        // decodes changes with it.
+        let nested_added = source.replacen(
+            "pub struct TraceSchedEventResponse {\n",
+            "pub struct TraceSchedEventResponse {\n    added: bool,\n",
+            1,
+        );
+        assert_ne!(nested_added, source);
+        assert_ne!(
+            definition_digest(&nested_added, payload, schedule, replayer),
+            digest
+        );
+        let nested_removed = source.replacen("    backstop: Option<LogicalTime>,\n", "", 1);
+        assert_ne!(nested_removed, source);
+        assert_ne!(
+            definition_digest(&nested_removed, payload, schedule, replayer),
             digest
         );
 

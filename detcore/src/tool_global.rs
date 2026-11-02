@@ -7987,9 +7987,11 @@ pub enum SignalScope {
 /// Detcore and a coordinator built at different revisions refuse each other
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
-/// fails until it does). That test digests the two enums' bodies and
-/// `Resources`, and refuses a revision whose digests did not change, so no
-/// revision can be appended by hand. A change to another payload type defined
+/// fails until it does). That test digests the two enums' bodies,
+/// `Resources`, the StoreExclusive payload's types, and the nested payload
+/// types it lists (from revision 37, `TraceSchedEventResponse`), and refuses
+/// a revision whose digests did not change, so no revision can be appended
+/// by hand. A change to another payload type defined
 /// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
 /// is on the wire without changing the digest, so it must either keep every
 /// encoding a peer built before it can send or receive (an enum variant
@@ -8008,9 +8010,11 @@ pub enum SignalScope {
 // pair (both landed in batch D2).
 /// https://github.com/rrnewton/hermit/pull/4728's `SchedEvent::stopless`
 /// and `ReplayedSliceEnd` are revision 30, reserved for this change by the
-/// D2 seal; the combined layout on top of 31 appends revision 32, which is
-/// the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 32;
+/// D2 seal; the combined layout on top of 31 appends revision 32. 37 adds
+/// `TraceSchedEventResponse::backstop` (PR #4759, allocated 25 on its own
+/// base, assigned 37, skipping 33 to 36 reserved for pending changes),
+/// which is the current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 37;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
