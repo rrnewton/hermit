@@ -683,7 +683,7 @@ impl PreemptionRecord {
     /// [`INSTRUCTION_OFFSET_ROWS_FORMAT`] when it holds no instruction offset,
     /// in its rows or its schedule trace
     /// ([`format_without_instruction_offsets`]). A stated format this Hermit
-    /// does not read ([`reads_format`]: an explicit 1, 0, or one newer than
+    /// does not read (`reads_format`: an explicit 1, 0, or one newer than
     /// [`PREEMPTION_RECORD_FORMAT`]) stays as stated, so that reading the
     /// record still refuses it (`validate_format`).
     pub fn with_current_format(self) -> Self {
@@ -1048,7 +1048,7 @@ impl PreemptionRecord {
     /// error.
     ///
     /// The record holds rows alone: no schedule trace and no jump of global
-    /// time, so it states no format ([`Self::state_only_what_rows_hold`]).
+    /// time, so it states no format (`Self::state_only_what_rows_hold`).
     pub fn from_vecs_of(
         bt: &BTreeMap<DetTid, Vec<(LogicalTime, Priority)>>,
         source: &PreemptionRecord,
