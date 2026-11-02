@@ -115,13 +115,37 @@ fn left_in(dir: &Path) -> Vec<PathBuf> {
     }
 }
 
-/// An analysis that has exited left no workspace in `tmp_dir`, whatever its
-/// outcome.
+/// An analysis that has exited left no workspace in `tmp_dir`: one that
+/// finished, or one a stop signal ended.
 fn assert_no_workspace_left(label: &str, tmp_dir: &Path, combined: &str) {
     let left = left_in(tmp_dir);
     assert!(
         left.is_empty(),
         "{label}: analyze left {left:?} in its --tmp-dir\n{combined}"
+    );
+}
+
+/// An analysis that ended with an error kept its one workspace in `tmp_dir`,
+/// said why on the line that names it, and the workspace still holds
+/// `evidence`, files of the trials the error is about.
+fn assert_workspace_kept_after_error(
+    label: &str,
+    tmp_dir: &Path,
+    combined: &str,
+    evidence: &[&str],
+) {
+    let left = left_in(tmp_dir);
+    assert!(
+        left.len() == 1 && evidence.iter().all(|file| left[0].join(file).is_file()),
+        "{label}: analyze kept {left:?} in its --tmp-dir, not one workspace holding \
+         {evidence:?}\n{combined}"
+    );
+    assert!(
+        combined.contains(&format!(
+            ":: Kept the workspace at {} (the error above can name files in it)",
+            left[0].display()
+        )),
+        "{label}: analyze did not say it kept the workspace for the error\n{combined}"
     );
 }
 
@@ -344,7 +368,14 @@ fn run_analyze_expect_baseline_collision(label: &str, guest: &Path, analyze_opts
         combined.contains("baseline run matched target criteria when it should not"),
         "{label}: analyze did not reject indistinguishable endpoints\n{combined}"
     );
-    assert_no_workspace_left(label, &tmp_dir, &combined);
+    // The error is about the baseline run: its reproducer and the output that
+    // met the target stay to be read.
+    assert_workspace_kept_after_error(
+        label,
+        &tmp_dir,
+        &combined,
+        &["run2_baseline.repro", "run2_baseline.stdout"],
+    );
 }
 
 #[test]
@@ -908,7 +939,16 @@ fn analyze_race_then_with(
         .arg(&workloads().race_then)
         .arg(then);
     let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
-    assert_no_workspace_left(&format!("{command:?}"), &tmp_dir, &combined_output(&output));
+    if output.status.success() {
+        assert_no_workspace_left(&format!("{command:?}"), &tmp_dir, &combined_output(&output));
+    } else {
+        assert_workspace_kept_after_error(
+            &format!("{command:?}"),
+            &tmp_dir,
+            &combined_output(&output),
+            &["run1_target.repro"],
+        );
+    }
     let report = fs::read_to_string(&report_file).ok().map(|text| {
         serde_json::from_str(&text).unwrap_or_else(|error| {
             panic!("unreadable report: {error}\n{}", combined_output(&output))
