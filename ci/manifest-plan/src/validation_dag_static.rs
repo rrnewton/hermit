@@ -5218,7 +5218,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same DBT received-inotify case: 696 + 1 = 697.
     // The same K9a-h cli case: 697 + 1 = 698, measured by nextest list.
     // The same K8-d cli case: 698 + 1 = 699, measured by nextest list.
-    ("test.cli_on_host", 699),
+    // The same log-ring cli case as test.cli: 699 + 1 = 700 (carried: the
+    // portable twin executed 781 in the batch-1 validate at 9baea420).
+    ("test.cli_on_host", 700),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6178,7 +6180,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same KVM named-refusal unit: 1323 + 1 = 1324.
     // The same KVM vfork-child refusal unit: 1324 + 1 = 1325, measured by
     // nextest list.
-    ("test.hermit_unit_on_host", 1325),
+    // The same two log-ring run_config units as test.hermit_unit: 1325 + 2
+    // = 1327 (carried: the portable twin executed 1333 in the batch-1
+    // validate at 9baea420).
+    ("test.hermit_unit_on_host", 1327),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
