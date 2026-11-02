@@ -339,19 +339,60 @@ struct Slice {
     next: Option<(usize, DetTid)>,
 }
 
-/// A record that replays `continued`, the schedule a prefix trial of the
-/// first `len` events of `schedule` realized, under the callback checkpoints
-/// of that prefix (a replay records none of its own), unless they no longer
-/// fit its events.
+/// The name [`continued_record`]'s refusal starts with.
+const UNATTACHED_CHECKPOINTS: &str = "HERMIT_CONTINUATION_CHECKPOINTS_UNATTACHED";
+
+/// A record that replays `continued`, the schedule a completed prefix trial
+/// of the first `len` events of `schedule` realized (recorded at
+/// `continued_path`), under the callback checkpoints of that prefix: a replay
+/// records none of its own, but its replayed part ended its slices where the
+/// recording did.
+///
+/// A checkpoint attaches where its thread's event counts add up to the
+/// progress it recorded ([`PreemptionRecord::with_schedule`]). A completed
+/// trial can still have replayed the prefix with other counts (a count-only
+/// mismatch is soft, and a branch counter that miscounts can cause one), and
+/// then a checkpoint has no event endpoint. That is a refusal, before any
+/// replay of the record: replayed without the checkpoints, `continued` need
+/// not end the prefix's slices where the search's trial did, so a stack taken
+/// from it could come from no run the search made. The error names the
+/// recorded continuation, which stays in the workspace for diagnosis.
 fn continued_record(
     schedule: &PreemptionRecord,
     len: usize,
     continued: &[SchedEvent],
-) -> PreemptionRecord {
-    schedule
-        .schedule_prefix(len)
-        .with_schedule(continued.to_vec())
-        .unwrap_or_else(|| PreemptionRecord::from_sched_events(continued.to_vec()))
+    continued_path: &Path,
+) -> anyhow::Result<PreemptionRecord> {
+    let prefix = schedule.schedule_prefix(len);
+    if let Some(record) = prefix.with_schedule(continued.to_vec()) {
+        return Ok(record);
+    }
+    let expected = prefix.schedevents();
+    let drift = expected
+        .iter()
+        .zip(continued)
+        .position(|(expected, ran)| expected != ran)
+        .map_or_else(String::new, |index| {
+            format!(
+                "; its event #{index} is {}, where the prefix has {}",
+                continued[index], expected[index]
+            )
+        });
+    Err(
+        anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            "{UNATTACHED_CHECKPOINTS}: analysis cannot replay the completed continuation recorded \
+             at {} under the callback checkpoints of the target schedule's first {len} events: \
+             they do not attach to its events{drift}. A checkpoint attaches where its thread's \
+             event counts add up to the progress it recorded, so a continuation that replayed \
+             those events with other counts (a soft count mismatch, as on a branch counter that \
+             fails validation) leaves it no event endpoint. Without the checkpoints a replay need \
+             not end the continuation's slices where the search's trial did, so no stack is taken \
+             from one and no opposite-outcome pair was established. The recorded continuation \
+             and its trial files are kept in the workspace; inspect them and stabilize replay \
+             before retrying analysis.",
+            continued_path.display()
+        )),
+    )
 }
 
 /// The run of `thread`'s events in `schedule` from event `from` on.
@@ -1141,7 +1182,7 @@ impl AnalyzeOpts {
             return Ok(report);
         }
         let instead = if continued.len() > decision {
-            let baseline = continued_record(&schedule, decision, &continued);
+            let baseline = continued_record(&schedule, decision, &continued, &continued_path)?;
             let (baseline_met, instead) = stack(
                 "final_baseline_for_stacktraces",
                 &baseline,
@@ -1311,9 +1352,15 @@ impl AnalyzeOpts {
             return Ok(None);
         }
         // Each continuation replays under the checkpoints of the prefix it
-        // continued.
-        let with_record = continued_record(schedule, decision + 1, &target_continued);
-        let without_record = continued_record(schedule, decision, continued);
+        // continued; one they do not attach to ends the analysis before any
+        // stack-trace replay.
+        let with_record = continued_record(
+            schedule,
+            decision + 1,
+            &target_continued,
+            &target_continued_path,
+        )?;
+        let without_record = continued_record(schedule, decision, continued, continued_path)?;
         let next_stack = |runname: &str, variant: &PreemptionRecord, slice: &Slice| match slice.next
         {
             Some((index, _)) => stack(runname, variant, index + 1, index),
@@ -3488,6 +3535,249 @@ mod tests {
             }
             assert_eq!(stacks, expected_stacks);
             assert_eq!(continuations, usize::from(target == Some(true)));
+        }
+    }
+
+    /// A valid record whose callback checkpoints end thread 3's slices at
+    /// progress 10 and 15 and thread 5's at progress 4, with matching history
+    /// rows, over `global`, and a recorded 4321 ns maximum timeslice.
+    fn checkpointed_record(global: &[SchedEvent]) -> PreemptionRecord {
+        let checkpoint = |row: usize, progress: u64, time: u64| {
+            serde_json::json!({
+                "history_index": row,
+                "origin": {
+                    "callback": "PmuTimer", "site": "Prehook", "progress": progress,
+                    "last_op": "Branch", "time": time, "rcbs": progress
+                }
+            })
+        };
+        let record: PreemptionRecord = serde_json::from_value(serde_json::json!({
+            "per_thread": {
+                "3": {
+                    "final_prio": 1000,
+                    "prio_changes": [[100, 1000], [300, 1000]],
+                    "preemption_rcbs": [10, 15]
+                },
+                "5": {"final_prio": 1000, "prio_changes": [[200, 1000]], "preemption_rcbs": [4]}
+            },
+            "global": global,
+            "chaos_timeslice": 4321,
+            "callback_checkpoints": {
+                "3": [checkpoint(0, 10, 100), checkpoint(1, 15, 300)],
+                "5": [checkpoint(0, 4, 200)]
+            }
+        }))
+        .unwrap();
+        record.validate().unwrap();
+        record
+    }
+
+    /// Thread and branch count per event.
+    fn branch_events(events: &[(i32, u32)]) -> Vec<SchedEvent> {
+        events
+            .iter()
+            .map(|&(tid, count)| SchedEvent::branches(detcore::types::DetTid::from_raw(tid), count))
+            .collect()
+    }
+
+    /// The threads a record's callback checkpoints name, and how many each.
+    fn checkpoint_counts(record: &PreemptionRecord) -> Vec<(String, usize)> {
+        let value = serde_json::to_value(record).unwrap();
+        let mut counts: Vec<(String, usize)> = value["callback_checkpoints"]
+            .as_object()
+            .map(|points| {
+                points
+                    .iter()
+                    .map(|(tid, rows)| (tid.clone(), rows.as_array().unwrap().len()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        counts.sort();
+        counts
+    }
+
+    /// Asserts that `result` is the refusal of a continuation (recorded at
+    /// `path`) its prefix's checkpoints do not attach to, naming its first
+    /// event that differs from the prefix.
+    fn assert_unattached_checkpoints<T: std::fmt::Debug>(
+        result: anyhow::Result<T>,
+        path: &str,
+        drift: &str,
+    ) {
+        let error = result.expect_err("a drifted continuation must not be replayed bare");
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        let message = format!("{error:#}");
+        for expected in [
+            UNATTACHED_CHECKPOINTS,
+            path,
+            drift,
+            "no opposite-outcome pair was established",
+            "kept in the workspace",
+        ] {
+            assert!(message.contains(expected), "no {expected:?}: {message}");
+        }
+    }
+
+    /// A completed continuation can replay its prefix with other counts (a
+    /// soft count mismatch) and still repeat the search's outcome. The
+    /// prefix's callback checkpoints then attach to none of its events, so
+    /// the two-thread report refuses it, naming the recorded continuation,
+    /// before the stack-trace replay of the baseline. Before, it replayed the
+    /// bare events instead, without the checkpoints or the rest of the
+    /// record. A continuation that replayed the prefix exactly keeps the
+    /// prefix's checkpoints, histories and metadata.
+    #[test]
+    fn a_prefix_report_refuses_a_continuation_its_checkpoints_do_not_attach_to() {
+        // Thread 3's progress-10 checkpoint is the one the first two events keep.
+        let schedule =
+            checkpointed_record(&branch_events(&[(3, 10), (5, 4), (7, 1), (7, 1), (3, 5)]));
+        // Without event #2 thread 3 runs there instead: the two-thread report.
+        let exact = branch_events(&[(3, 10), (5, 4), (3, 5), (7, 1), (7, 1)]);
+        let drifted = branch_events(&[(3, 11), (5, 4), (3, 4), (7, 1), (7, 1)]);
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        for continued in [&exact, &drifted] {
+            let mut replays = Vec::new();
+            let result = options.phase6_record_prefix_outputs_with(
+                PrefixDecision {
+                    schedule: schedule.clone(),
+                    decision: 2,
+                    continuation: None,
+                },
+                |runname, record, len, position| {
+                    assert_eq!((len, position), (3, 2));
+                    replays.push((runname.to_owned(), record.clone()));
+                    Ok((runname == "final_target_for_stacktraces", None))
+                },
+                |_, len| {
+                    assert_eq!(len, 2);
+                    Ok((
+                        CompletedScheduleTrial {
+                            target_met: false,
+                            schedule: continued.clone(),
+                        },
+                        PathBuf::from("final_baseline_schedule.preempts"),
+                    ))
+                },
+            );
+            if continued == &drifted {
+                assert_unattached_checkpoints(
+                    result,
+                    "final_baseline_schedule.preempts",
+                    "its event #0 is (tid3 cnt=11 Branch), where the prefix has (tid3 cnt=10 \
+                     Branch)",
+                );
+                let names: Vec<&str> = replays.iter().map(|(name, _)| name.as_str()).collect();
+                assert_eq!(names, ["final_target_for_stacktraces"]);
+            } else {
+                assert!(result.unwrap().header.contains("decides the outcome"));
+                let (name, baseline) = &replays[1];
+                assert_eq!(name, "final_baseline_for_stacktraces");
+                assert_eq!(baseline.schedevents(), &exact);
+                assert_eq!(checkpoint_counts(baseline), [("3".to_owned(), 1)]);
+                assert_eq!(baseline.chaos_timeslice(), Some(4321));
+                baseline.validate().unwrap();
+            }
+        }
+    }
+
+    /// The timing report replays both continuations under their prefixes'
+    /// checkpoints, so it refuses either one they do not attach to, before
+    /// any stack-trace replay, although both outcomes repeat the search's:
+    /// the continuation with the deciding event (thread 5's count drifted)
+    /// and the one without it (thread 3's). Exact continuations keep the
+    /// checkpoints each prefix reaches, and the record's metadata.
+    #[test]
+    fn a_timing_report_refuses_continuations_their_checkpoints_do_not_attach_to() {
+        let schedule =
+            checkpointed_record(&branch_events(&[(3, 10), (5, 4), (7, 1), (7, 1), (3, 5)]));
+        // Thread 7 runs at event #2 with and without it: two events with it,
+        // one without.
+        let with = branch_events(&[(3, 10), (5, 4), (7, 1), (7, 1), (3, 5)]);
+        let without = branch_events(&[(3, 10), (5, 4), (7, 1), (3, 5), (7, 1)]);
+        let with_drifted = branch_events(&[(3, 10), (5, 5), (7, 1), (7, 1), (3, 5)]);
+        let without_drifted = branch_events(&[(3, 11), (5, 4), (7, 1), (3, 4), (7, 1)]);
+        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        for (target_continued, continued, refused) in [
+            (&with, &without, None),
+            (
+                &with_drifted,
+                &without,
+                Some((
+                    "final_target_schedule.preempts",
+                    "its event #1 is (tid5 cnt=5 Branch), where the prefix has (tid5 cnt=4 Branch)",
+                )),
+            ),
+            (
+                &with,
+                &without_drifted,
+                Some((
+                    "final_baseline_schedule.preempts",
+                    "its event #0 is (tid3 cnt=11 Branch), where the prefix has (tid3 cnt=10 \
+                     Branch)",
+                )),
+            ),
+        ] {
+            let replays = std::cell::RefCell::new(Vec::new());
+            let result = options.report_timing_decision_with(
+                &schedule,
+                2,
+                None,
+                (true, &None),
+                (continued, Path::new("final_baseline_schedule.preempts")),
+                (
+                    |_, len| {
+                        assert_eq!(len, 3);
+                        Ok((
+                            CompletedScheduleTrial {
+                                target_met: true,
+                                schedule: target_continued.clone(),
+                            },
+                            PathBuf::from("final_target_schedule.preempts"),
+                        ))
+                    },
+                    |runname, record, _, _| {
+                        replays
+                            .borrow_mut()
+                            .push((runname.to_owned(), record.clone()));
+                        Ok((runname == "final_target_next_for_stacktraces", None))
+                    },
+                ),
+            );
+            match refused {
+                Some((path, drift)) => {
+                    assert_unattached_checkpoints(result, path, drift);
+                    assert!(replays.borrow().is_empty(), "no stack-trace replay may run");
+                }
+                None => {
+                    assert!(result.unwrap().is_some());
+                    let replays = replays.into_inner();
+                    let names: Vec<&str> = replays.iter().map(|(name, _)| name.as_str()).collect();
+                    assert_eq!(
+                        names,
+                        [
+                            "final_target_next_for_stacktraces",
+                            "final_baseline_next_for_stacktraces"
+                        ]
+                    );
+                    let [(_, with_record), (_, without_record)] = &replays[..] else {
+                        unreachable!()
+                    };
+                    assert_eq!(with_record.schedevents(), &with);
+                    assert_eq!(without_record.schedevents(), &without);
+                    // The first three events reach both checkpoints thread 3
+                    // and thread 5 end there; the first two only thread 3's,
+                    // as thread 5's slice still runs at their end.
+                    assert_eq!(
+                        checkpoint_counts(with_record),
+                        [("3".to_owned(), 1), ("5".to_owned(), 1)]
+                    );
+                    assert_eq!(checkpoint_counts(without_record), [("3".to_owned(), 1)]);
+                    for record in [with_record, without_record] {
+                        assert_eq!(record.chaos_timeslice(), Some(4321));
+                        record.validate().unwrap();
+                    }
+                }
+            }
         }
     }
 
