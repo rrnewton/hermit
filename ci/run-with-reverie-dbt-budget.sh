@@ -3198,7 +3198,21 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=3df91c9c71bdc5c77571974cbabfca20183a08de
+# CARRY TO a311fbc493a6afebd9755bbee5b61fe77b710374 (2026-11-02): from 3df91c9c71bdc5c77571974cbabfca20183a08de.
+# Interval: Reverie main's 6f780b20 (drops the CLAUDE.md symlink;
+# scripts/check-skill-discovery.rs follows), then the chain's copies of
+# SP3's first two commits: the Linux provider makes AF_UNIX
+# SOCK_SEQPACKET socketpairs as host mechanics, with a provider unit
+# test and a KVM two-writer test (ab3254f6, from 52b8647e), and its
+# shared file views accept MAP_NORESERVE, with a provider unit test
+# (a311fbc4, from 89b10009). No reverie-dbt file is added, removed or
+# changed, and the root Cargo.toml, Cargo.lock and rust-toolchain.toml
+# are unchanged.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=a311fbc493a6afebd9755bbee5b61fe77b710374
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
