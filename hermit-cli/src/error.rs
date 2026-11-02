@@ -715,9 +715,12 @@ mod tests {
                 reverie::Error::Tool(Error::new(crate::SchedulerEndedRun::new(outcome, None)));
             assert_eq!(classify_ptrace_primary(&primary), FailureKind::Error);
         }
+    }
+
     /// Detcore's refusal of a self-sentinel pidfd_send_signal whose backend
     /// could not qualify its spelling is a policy refusal, through ptrace's
     /// Tool wrapper and across the container boundary, and keeps its reason.
+    #[test]
     fn an_unqualified_pidfd_self_sentinel_is_a_policy_refusal() {
         let refusal = || detcore::PidfdSelfQualificationRefusal { sentinel: -10001 };
         let primary = reverie::Error::Tool(Error::new(refusal()));
@@ -734,6 +737,7 @@ mod tests {
             serialized.error.contains("self sentinel -10001"),
             "{}",
             serialized.error
+        );
     }
 
     /// An in-guest-trap refusal names that backend and keeps the same class.
