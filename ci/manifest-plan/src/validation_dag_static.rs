@@ -4633,11 +4633,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
-    // Its review fixes add three binder cases that skip the same way (an
-    // exhausted read, a backgrounded read's descriptors, a write+read):
-    // 794 + 3 = 797, by nextest list.
-    // Rebased onto main 77be1fd09: 796 + 3 = 799.
-    ("test.cli", 799),
+    // Its review fixes add three binder cases (an exhausted read, a
+    // backgrounded read's descriptors, a write+read): 794 + 3 = 797. Then
+    // every binder case, the one main counted among them, is ignored as
+    // host-limited (docs/TESTING_ENVIRONMENTS.md), so none is counted:
+    // 797 - 5 = 792, by nextest list.
+    // Rebased onto main 77be1fd09: 796 - 2 = 794.
+    ("test.cli", 794),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5293,9 +5295,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
-    // The same three binder review-fix cases: 713 + 3 = 716.
-    // Rebased onto main 77be1fd09: 715 + 3 = 718.
-    ("test.cli_on_host", 718),
+    // The same three binder review-fix cases: 713 + 3 = 716. The same five
+    // binder cases ignored as host-limited: 716 - 5 = 711.
+    // Rebased onto main 77be1fd09: 715 - 2 = 713.
+    ("test.cli_on_host", 713),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
