@@ -17,6 +17,16 @@
 //! (`container::exit_if_stop_requested`), and every later trial refuses to
 //! start ([`check`]), so analyze unwinds, removes what it created, and then
 //! dies of the same signal (`AnalyzeOpts::main`).
+//!
+//! The kernel runs the handler on any thread of analyze that does not block
+//! the signal (`complete_signal` and `wants_signal`,
+//! <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v6.9#n978>),
+//! and a child can be reaped on another thread while it runs. So the handler
+//! never signals a child by its number, which the kernel can give to another
+//! process once the child is reaped: it signals through a pidfd it checks
+//! ([`signal_children`]). The threads analyze starts itself block the stop
+//! signals from their first instruction ([`spawn_blocking_stop_signals`]),
+//! so the handler runs on the thread that drives the trials.
 
 use std::fmt;
 use std::sync::atomic::AtomicI32;
@@ -124,8 +134,9 @@ impl StopSignals {
     /// signal of a process that is PID 1: the container init of a trial sees
     /// itself as PID 1 too, so the handler could not tell the two apart.
     /// Nothing is installed either when the handler could not find the run's
-    /// container init ([`record_inherited_children`]). Such an analyze dies
-    /// of the signal, or ignores it, as before.
+    /// container init ([`record_inherited_children`]), or could not signal it
+    /// safely: on a kernel that opens no pidfds ([`opens_pidfds`]). Such an
+    /// analyze dies of the signal, or ignores it, as before.
     ///
     /// Call it while analyze runs no other thread: the query and the install
     /// are two steps.
@@ -142,7 +153,7 @@ impl StopSignals {
         }
         // Before any disposition changes: a handler that recorded a stop but
         // could not end the run in progress would leave that run going.
-        if !record_inherited_children(pid) {
+        if !opens_pidfds(pid) || !record_inherited_children(pid) {
             return Ok(guard);
         }
         HOLDER.store(pid, Ordering::Relaxed);
@@ -211,7 +222,7 @@ fn record_inherited_children(pid: libc::pid_t) -> bool {
     }
     let mut recorded = 0;
     let mut fits = true;
-    for_each_child(pid, |child| match INHERITED.get(recorded) {
+    for_each_child(pid, |_, child| match INHERITED.get(recorded) {
         Some(slot) => {
             slot.store(child, Ordering::Relaxed);
             recorded += 1;
@@ -236,25 +247,139 @@ fn current_action(signal: libc::c_int) -> anyhow::Result<libc::sigaction> {
 /// Send `signal` to every child of `parent` that `skip` does not name;
 /// returns how many it reached. Async-signal-safe, as [`for_each_child`].
 ///
-/// Analyze reaps its children on its one thread, which the handler
-/// interrupts, so a child found here cannot be reaped, and its PID reused,
-/// before the signal is sent.
+/// The handler can run on any thread that does not block the signal, and a
+/// child found here can be reaped meanwhile on another thread, and its PID
+/// given to a process analyze did not start. So each child is signalled
+/// through a pidfd ([`signal_child`]), never by its number.
 pub(super) fn signal_children(
     parent: libc::pid_t,
     signal: libc::c_int,
     skip: impl Fn(libc::pid_t) -> bool,
 ) -> usize {
     let mut reached = 0;
-    for_each_child(parent, |child| {
-        // SAFETY: kill(2) has no memory arguments.
-        if !skip(child) && unsafe { libc::kill(child, signal) } == 0 {
+    for_each_child(parent, |proc_dir, child| {
+        if skip(child) {
+            return;
+        }
+        #[cfg(test)]
+        tests::in_the_window(child);
+        if signal_child(proc_dir, parent, child, signal) {
             reached += 1;
         }
     });
     reached
 }
 
-/// Call `visit` with the PID of every child of `parent`.
+/// Send `signal` to `pid` through a pidfd if `pid` is a child of `parent`;
+/// returns whether a process received it. Async-signal-safe: system calls on
+/// stack buffers.
+///
+/// A pidfd names the process that held `pid` when it was opened, and a signal
+/// sent through it reaches that process or, once it is reaped, none: the
+/// kernel looks the process up by the pidfd's `struct pid`, never by number
+/// (`pidfd_open`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/pid.c?h=v6.9#n629>;
+/// `pidfd_send_signal` and `kill_pid_info_type`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v6.9#n1483>).
+/// The parent is read again after the pidfd is open. If it still names
+/// `parent`, the pidfd's process is that child, or it was reaped and `pid`
+/// went to another child of `parent`, and then the signal reaches no one. A
+/// process that is not `parent`'s child at that point is left alone.
+fn signal_child(
+    proc_dir: libc::c_int,
+    parent: libc::pid_t,
+    pid: libc::pid_t,
+    signal: libc::c_int,
+) -> bool {
+    let mut digits = [0u8; 10];
+    let Some(name) = pid_digits(pid, &mut digits) else {
+        return false;
+    };
+    // SAFETY: pidfd_open(2) has no memory arguments.
+    let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let Some(pidfd) = libc::c_int::try_from(opened).ok().filter(|&fd| fd >= 0) else {
+        return false;
+    };
+    let reached = parent_of(proc_dir, name) == Some(parent)
+        // SAFETY: pidfd_send_signal(2) with no siginfo; `pidfd` is open.
+        && unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } == 0;
+    // SAFETY: `pidfd` is the descriptor opened above.
+    unsafe { libc::close(pidfd) };
+    reached
+}
+
+/// `pid` in decimal digits, written into `buffer`.
+fn pid_digits(pid: libc::pid_t, buffer: &mut [u8; 10]) -> Option<&[u8]> {
+    let mut rest = u32::try_from(pid).ok().filter(|&rest| rest > 0)?;
+    let mut start = buffer.len();
+    while rest > 0 {
+        start -= 1;
+        buffer[start] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+    }
+    Some(&buffer[start..])
+}
+
+/// Whether this kernel opens pidfds, which [`signal_child`] needs: Linux
+/// 5.3 and later, unless a seccomp filter refuses the call.
+fn opens_pidfds(pid: libc::pid_t) -> bool {
+    // SAFETY: pidfd_open(2) has no memory arguments.
+    let opened = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    match libc::c_int::try_from(opened) {
+        Ok(pidfd) if pidfd >= 0 => {
+            // SAFETY: `pidfd` was just opened here.
+            unsafe { libc::close(pidfd) };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Spawn `builder`'s thread with SIGTERM, SIGINT and SIGHUP blocked from its
+/// first instruction, so that analyze's stop handler never runs on it. A new
+/// thread starts with its creator's signal mask (`dup_task_struct` copies
+/// it,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.9#n1100>),
+/// so they are blocked on the calling thread around the spawn and its own
+/// mask is restored after.
+pub fn spawn_blocking_stop_signals<F, T>(
+    builder: std::thread::Builder,
+    run: F,
+) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    // SAFETY: sigemptyset(3) and sigaddset(3) write only this local, and
+    // pthread_sigmask(3) reads and writes the two locals it is given.
+    let mut stop: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut before: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut stop);
+        for signal in STOP_SIGNALS {
+            libc::sigaddset(&mut stop, signal);
+        }
+    }
+    let blocked = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &stop, &mut before) };
+    if blocked != 0 {
+        return Err(std::io::Error::from_raw_os_error(blocked));
+    }
+    let spawned = builder.spawn(run);
+    // SAFETY: `before` is the mask pthread_sigmask(3) returned above.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &before, std::ptr::null_mut()) };
+    spawned
+}
+
+/// Call `visit` with the open `/proc` directory and the PID of every child
+/// of `parent`.
 ///
 /// Reverie gives the trial's container init's PID out only once the trial
 /// has ended, so a signal handler finds the init here: the processes whose
@@ -266,7 +391,7 @@ pub(super) fn signal_children(
 ///
 /// Async-signal-safe: system calls on stack buffers, no allocation, no lock,
 /// no panic.
-fn for_each_child(parent: libc::pid_t, mut visit: impl FnMut(libc::pid_t)) {
+fn for_each_child(parent: libc::pid_t, mut visit: impl FnMut(libc::c_int, libc::pid_t)) {
     // SAFETY: open(2) on a NUL-terminated literal.
     let proc_dir = unsafe {
         libc::open(
@@ -310,7 +435,7 @@ fn for_each_child(parent: libc::pid_t, mut visit: impl FnMut(libc::pid_t)) {
             if let Some(pid) = parse_pid(name)
                 && parent_of(proc_dir, name) == Some(parent)
             {
-                visit(pid);
+                visit(proc_dir, pid);
             }
             records = &records[length..];
         }
@@ -379,10 +504,28 @@ fn parse_pid(digits: &[u8]) -> Option<libc::pid_t> {
 mod tests {
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use std::time::Instant;
 
     use super::*;
+
+    /// The function [`in_the_window`] calls, an `fn(libc::pid_t)`, or 0.
+    static WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+    /// Where [`signal_children`] pauses for a test: after it found `child`
+    /// and before it signals it, the window in which another thread can reap
+    /// the child.
+    pub(super) fn in_the_window(child: libc::pid_t) {
+        let hook = WINDOW.load(Ordering::SeqCst);
+        if hook != 0 {
+            // SAFETY: only `as_analyze` stores a value here, and it stores an
+            // `fn(libc::pid_t)`.
+            let hook = unsafe { std::mem::transmute::<usize, fn(libc::pid_t)>(hook) };
+            hook(child);
+        }
+    }
 
     /// The parent field is read after the command name's last closing
     /// parenthesis, whatever the name holds.
@@ -435,7 +578,7 @@ mod tests {
         while children.is_empty() {
             assert!(Instant::now() < deadline, "the shell never started sleep");
             std::thread::sleep(Duration::from_millis(10));
-            for_each_child(parent, |child| children.push(child));
+            for_each_child(parent, |_, child| children.push(child));
         }
         assert_eq!(
             signal_children(parent, libc::SIGTERM, |child| children.contains(&child)),
@@ -529,5 +672,321 @@ mod tests {
         assert_eq!(action(libc::SIGTERM), libc::SIG_DFL);
         assert_eq!(action(libc::SIGHUP), libc::SIG_DFL);
         assert_eq!(action(libc::SIGINT), libc::SIG_IGN);
+    }
+
+    /// How the processes of
+    /// [`a_stop_signal_on_a_helper_thread_never_reaches_a_reused_pid`] end.
+    mod ended {
+        pub const AS_IT_SHOULD: libc::c_int = 0;
+        pub const NO_USER_AND_PID_NAMESPACE: libc::c_int = 10;
+        pub const NO_PROC_OF_ITS_OWN: libc::c_int = 11;
+        pub const NO_FORK: libc::c_int = 12;
+        pub const NO_PIPE: libc::c_int = 13;
+        pub const NO_CHOSEN_PID: libc::c_int = 14;
+        pub const NO_HANDLER: libc::c_int = 15;
+        pub const NOT_IN_THE_WINDOW: libc::c_int = 16;
+        pub const STOP_NOT_RECORDED: libc::c_int = 17;
+        pub const THE_REUSED_PID_WAS_SIGNALLED: libc::c_int = 18;
+        pub const THE_REUSED_PID_ENDED: libc::c_int = 19;
+
+        pub fn describe(code: libc::c_int) -> &'static str {
+            match code {
+                NO_USER_AND_PID_NAMESPACE => {
+                    "unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID) failed"
+                }
+                NO_PROC_OF_ITS_OWN => "could not mount a /proc of the new PID namespace",
+                NO_FORK => "fork failed",
+                NO_PIPE => "pipe failed",
+                NO_CHOSEN_PID => "clone3 with set_tid failed",
+                NO_HANDLER => "StopSignals::install did not install the SIGTERM handler",
+                NOT_IN_THE_WINDOW => "the handler did not stop in the window at the child",
+                STOP_NOT_RECORDED => "the handler did not record the stop",
+                THE_REUSED_PID_WAS_SIGNALLED => {
+                    "the process that took the reaped child's PID died of SIGTERM: the handler \
+                     signalled a process analyze did not start"
+                }
+                THE_REUSED_PID_ENDED => "the process that took the reaped child's PID ended early",
+                _ => "unexpected exit",
+            }
+        }
+    }
+
+    /// The exit status `pid` ends with, or 100 plus the signal that ended it.
+    fn exit_code(pid: libc::pid_t) -> libc::c_int {
+        let mut raw = 0;
+        // SAFETY: `raw` outlives the call.
+        while unsafe { libc::waitpid(pid, &mut raw, 0) } != pid {
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return ended::NO_FORK;
+            }
+        }
+        if libc::WIFEXITED(raw) {
+            libc::WEXITSTATUS(raw)
+        } else {
+            100 + libc::WTERMSIG(raw)
+        }
+    }
+
+    /// A pipe's read and write ends.
+    fn pipe() -> Option<(libc::c_int, libc::c_int)> {
+        let mut ends = [-1; 2];
+        // SAFETY: pipe(2) writes two descriptors into `ends`.
+        (unsafe { libc::pipe(ends.as_mut_ptr()) } == 0).then_some((ends[0], ends[1]))
+    }
+
+    /// Write `bytes` to `fd` whole.
+    fn send(fd: libc::c_int, bytes: &[u8]) -> bool {
+        // SAFETY: write(2) reads `bytes.len()` bytes of `bytes`.
+        let done = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        done == isize::try_from(bytes.len()).unwrap_or(-1)
+    }
+
+    /// Read `bytes.len()` bytes from `fd`, in one read.
+    fn receive(fd: libc::c_int, bytes: &mut [u8]) -> bool {
+        // SAFETY: read(2) writes at most `bytes.len()` bytes into `bytes`.
+        let done = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+        done == isize::try_from(bytes.len()).unwrap_or(-1)
+    }
+
+    /// Where the handler, paused in the window, writes the child it found,
+    /// and where it reads that it may go on.
+    static FOUND: AtomicI32 = AtomicI32::new(-1);
+    static GO_ON: AtomicI32 = AtomicI32::new(-1);
+    static PAUSED: AtomicBool = AtomicBool::new(false);
+
+    /// [`in_the_window`]'s hook in `as_analyze`: the first time, say which
+    /// child the handler found and wait until the main thread lets it go on.
+    /// Async-signal-safe: it runs in the handler.
+    fn pause_in_the_window(child: libc::pid_t) {
+        if PAUSED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut go = [0u8];
+        if send(FOUND.load(Ordering::SeqCst), &child.to_ne_bytes()) {
+            receive(GO_ON.load(Ordering::SeqCst), &mut go);
+        }
+    }
+
+    /// The process that holds the handler, PID 2 of its own namespace: it
+    /// starts a child, has the handler run on a helper thread that blocks no
+    /// signal, and while the handler is paused at that child reaps it, as
+    /// the thread that drives the trials reaps a trial's container init,
+    /// and has its parent give the PID to a process of its own.
+    fn as_analyze(request: libc::c_int, granted: libc::c_int) -> libc::c_int {
+        let Ok(guard) = StopSignals::install() else {
+            return ended::NO_HANDLER;
+        };
+        if !guard.installed[0] {
+            return ended::NO_HANDLER;
+        }
+        // SAFETY: this process has one thread; the child only pauses.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        if child < 0 {
+            return ended::NO_FORK;
+        }
+        let (Some((found, found_by)), Some((go_on_by, go_on))) = (pipe(), pipe()) else {
+            return ended::NO_PIPE;
+        };
+        FOUND.store(found_by, Ordering::SeqCst);
+        GO_ON.store(go_on_by, Ordering::SeqCst);
+        let hook: fn(libc::pid_t) = pause_in_the_window;
+        WINDOW.store(hook as usize, Ordering::SeqCst);
+        let helper = std::thread::spawn(|| {
+            // SAFETY: tgkill(2) to this very thread, which runs the handler
+            // before the call returns.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    libc::getpid(),
+                    libc::gettid(),
+                    libc::SIGTERM,
+                )
+            }
+        });
+        let mut in_window = [0u8; 4];
+        if !receive(found, &mut in_window) || libc::pid_t::from_ne_bytes(in_window) != child {
+            return ended::NOT_IN_THE_WINDOW;
+        }
+        // SAFETY: kill(2) and waitpid(2) on this process's own child.
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        if exit_code(child) != 100 + libc::SIGKILL {
+            return ended::NO_FORK;
+        }
+        let mut given = [0u8];
+        if !send(request, &child.to_ne_bytes()) || !receive(granted, &mut given) {
+            return ended::NO_CHOSEN_PID;
+        }
+        send(go_on, &[1]);
+        let _ = helper.join();
+        WINDOW.store(0, Ordering::SeqCst);
+        if check() != Err(Stopped(reverie::Signal::SIGTERM)) {
+            return ended::STOP_NOT_RECORDED;
+        }
+        drop(guard);
+        ended::AS_IT_SHOULD
+    }
+
+    /// A child of this process with the PID `pid` (clone3's `set_tid`) that
+    /// takes stop signals at their default action, blocks none, says so on
+    /// `ready` and then pauses.
+    fn child_with_pid(pid: libc::pid_t, ready: libc::c_int) -> libc::pid_t {
+        // struct clone_args through set_tid_size (CLONE_ARGS_SIZE_VER1).
+        let set_tid: libc::pid_t = pid;
+        let mut args = [0u64; 10];
+        args[4] = libc::SIGCHLD as u64; // exit_signal
+        args[8] = std::ptr::from_ref(&set_tid) as u64; // set_tid
+        args[9] = 1; // set_tid_size
+        // SAFETY: a fork-like clone3 without CLONE_VM from a process with one
+        // thread; the child calls only async-signal-safe functions.
+        let child = unsafe {
+            libc::syscall(
+                libc::SYS_clone3,
+                args.as_ptr(),
+                std::mem::size_of_val(&args),
+            )
+        };
+        if child == 0 {
+            // SAFETY: an all-zero sigset_t is valid for sigemptyset(3).
+            let mut none: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut none);
+                libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+                for signal in STOP_SIGNALS {
+                    libc::signal(signal, libc::SIG_DFL);
+                }
+            }
+            send(ready, &[1]);
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        libc::pid_t::try_from(child).unwrap_or(-1)
+    }
+
+    /// PID 1 of the new namespace: a /proc of its own for the handler to
+    /// read, the process that holds the handler, and on its request a
+    /// process of its own with the PID it freed. Whether that process
+    /// received SIGTERM decides the exit.
+    fn as_namespace_init() -> libc::c_int {
+        // SAFETY: mount(2) on NUL-terminated literals.
+        let private = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        };
+        let proc = unsafe {
+            libc::mount(
+                c"proc".as_ptr(),
+                c"/proc".as_ptr(),
+                c"proc".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                std::ptr::null(),
+            )
+        };
+        if private != 0 || proc != 0 {
+            return ended::NO_PROC_OF_ITS_OWN;
+        }
+        let (Some((request, request_by)), Some((granted_by, granted)), Some((ready, ready_by))) =
+            (pipe(), pipe(), pipe())
+        else {
+            return ended::NO_PIPE;
+        };
+        // SAFETY: this process has one thread.
+        let analyze = unsafe { libc::fork() };
+        if analyze == 0 {
+            // SAFETY: closes this copy's descriptors of the init's ends.
+            unsafe {
+                libc::close(request);
+                libc::close(granted);
+                libc::close(ready);
+                libc::close(ready_by);
+                libc::_exit(as_analyze(request_by, granted_by))
+            }
+        }
+        // SAFETY: closes the init's copies of the ends it gave away, so that
+        // a read sees the other end close.
+        unsafe {
+            libc::close(request_by);
+            libc::close(granted_by);
+        }
+        if analyze < 0 {
+            return ended::NO_FORK;
+        }
+        let mut freed = [0u8; 4];
+        if !receive(request, &mut freed) {
+            return exit_code(analyze);
+        }
+        let other = child_with_pid(libc::pid_t::from_ne_bytes(freed), ready_by);
+        let mut up = [0u8];
+        if other < 0 || !receive(ready, &mut up) {
+            // SAFETY: kill(2) on this process's own child.
+            unsafe { libc::kill(analyze, libc::SIGKILL) };
+            let _ = exit_code(analyze);
+            return ended::NO_CHOSEN_PID;
+        }
+        send(granted, &[1]);
+        let analyzed = exit_code(analyze);
+        // A SIGTERM the handler sent at its default action already made the
+        // process exit with it (`complete_signal`), and the kernel drops the
+        // SIGKILL sent to a process that is exiting: so the status names the
+        // signal that came first.
+        // SAFETY: kill(2) on this process's own child.
+        unsafe { libc::kill(other, libc::SIGKILL) };
+        match exit_code(other) {
+            code if code == 100 + libc::SIGTERM => ended::THE_REUSED_PID_WAS_SIGNALLED,
+            code if code == 100 + libc::SIGKILL => analyzed,
+            _ => ended::THE_REUSED_PID_ENDED,
+        }
+    }
+
+    /// A stop signal the handler takes on a helper thread, while another
+    /// thread reaps the child it found and the kernel gives the child's PID
+    /// to a process analyze did not start, never reaches that process.
+    ///
+    /// Forced, not timed. In a user, mount and PID namespace of its own, so
+    /// that a PID can be chosen (clone3's `set_tid`), the process holding the
+    /// handler starts a child, and a helper thread that blocks no signal
+    /// sends itself SIGTERM. The handler pauses after finding the child
+    /// ([`in_the_window`]); the main thread reaps the child; the namespace's
+    /// init, which is not analyze, gives the child's PID to a process of its
+    /// own; then the handler goes on. Signalled by number, as before, that
+    /// process died of SIGTERM.
+    #[test]
+    fn a_stop_signal_on_a_helper_thread_never_reaches_a_reused_pid() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        // SAFETY: the copy's other thread waits for this test and holds no
+        // lock.
+        let outer = unsafe { libc::fork() };
+        if outer == 0 {
+            // SAFETY: a forked child of one thread, as a new user namespace
+            // requires.
+            let unshared = unsafe {
+                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID)
+            };
+            let code = if unshared != 0 {
+                ended::NO_USER_AND_PID_NAMESPACE
+            } else {
+                match unsafe { libc::fork() } {
+                    0 => unsafe { libc::_exit(as_namespace_init()) },
+                    init if init > 0 => exit_code(init),
+                    _ => ended::NO_FORK,
+                }
+            };
+            unsafe { libc::_exit(code) }
+        }
+        assert!(outer > 0, "fork: {}", std::io::Error::last_os_error());
+        let code = exit_code(outer);
+        assert_eq!(code, ended::AS_IT_SHOULD, "{}", ended::describe(code));
     }
 }
