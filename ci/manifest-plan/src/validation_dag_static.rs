@@ -3265,7 +3265,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // records: 3246.
     // And record_serde::tests::the_uncapped_slices_mark_round_trips_through_the_record_serde: 3388 + 1 = 3389.
     // Rebased onto main fcd62385f: 3469 + 1 = 3470.
-    ("test.detcore_unit", 3470),
+    // And a_reply_after_another_threads_last_event_carries_no_backstop and
+    // a_backstop_never_outlives_the_replayed_schedule (review of
+    // https://github.com/rrnewton/hermit/pull/4759): 3389 + 2 = 3391.
+    // Rebased onto main fcd62385f: 3470 + 2 = 3472.
+    ("test.detcore_unit", 3472),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5835,7 +5839,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same prefix-record unit: 3246.
     // And the same record-serde round trip: 3388 + 1 = 3389.
     // Rebased onto main fcd62385f: 3469 + 1 = 3470.
-    ("test.detcore_unit_on_host", 3470),
+    // And the same two replay-backstop units: 3389 + 2 = 3391.
+    // Rebased onto main fcd62385f: 3470 + 2 = 3472.
+    ("test.detcore_unit_on_host", 3472),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
