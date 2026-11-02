@@ -8249,7 +8249,8 @@ pub enum SignalScope {
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
 /// fails until it does). That test digests the two enums' bodies,
 /// `Resources`, the StoreExclusive payload's types, the scheduled event
-/// and trace reply `TraceSchedEvent` carries, and the nested
+/// and trace reply `TraceSchedEvent` carries (including its nested
+/// `TraceSchedEventResponse`), and the nested
 /// `HostFileIdentity`, and refuses a revision whose digests did not change, so no
 /// revision can be appended by hand. A change to another payload type defined
 /// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
@@ -8279,8 +8280,11 @@ pub enum SignalScope {
 /// rebase onto 41 skipping reserved 42 to 44. 46 adds `WithCpuTime` and
 /// `RecordExitCode` (package K item 2b slice 2b-1, allocated 39, renumbered
 /// 41 at its rebase onto 40, 42 at its rebase onto 41, then mechanically to
-/// 46 at its rebase onto 45) and is the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 46;
+/// 46 at its rebase onto 45). 47 adds `TraceSchedEventResponse::backstop`
+/// (PR #4759, allocated 25 on its own base, assigned 47 at its rebase
+/// onto 46, skipping 33 to 39 reserved for pending changes), which is the
+/// current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 47;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
