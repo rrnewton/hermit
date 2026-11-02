@@ -1912,7 +1912,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests and three review regressions retain all 1328 prior names: 1341.
     // Recount at 636929f9b3fcd6faeaffe80a16c85365f0187398: four original
     // tests and one minimized-report regression retain all 1341 names: 1346.
-    ("test.hermit_unit", 1346),
+    // Recount at f1cebae12395322aef1d971ca54d1e1769e045d2: the recorded-target
+    // workspace/bound unit retains all 1346 prior names: 1347.
+    ("test.hermit_unit", 1347),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5986,7 +5988,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a7ecd1755834d559c82c6ee633bf4e6eeef6ee3f: 1335 active names.
     // The same five additions, measured with this host selection at
     // 636929f9b3fcd6faeaffe80a16c85365f0187398: 1340 active names.
-    ("test.hermit_unit_on_host", 1340),
+    // The same workspace/bound unit, measured with this host selection at
+    // f1cebae12395322aef1d971ca54d1e1769e045d2: 1341 active names.
+    ("test.hermit_unit_on_host", 1341),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
