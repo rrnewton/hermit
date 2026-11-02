@@ -192,6 +192,11 @@ fn check_continuation(
     len: usize,
     mut trial: impl FnMut(usize) -> anyhow::Result<bool>,
 ) -> anyhow::Result<Continuation> {
+    if len == 0 {
+        bail!(
+            "the target schedule is empty: there is no scheduling event to locate with a prefix search"
+        );
+    }
     if trial(0)? {
         return Ok(Continuation::MeetsTargetAlone);
     }
@@ -871,10 +876,16 @@ impl AnalyzeOpts {
         continuation: MaybeTimeslice,
     ) -> anyhow::Result<RunData> {
         let mut run = RunData::new_baseline(self, runname.to_string())?;
-        run.runopts.det_opts.det_config.chaos = false;
-        run.runopts.det_opts.det_config.max_timeslice = continuation;
+        run.runopts
+            .set_analysis_continuation_timeslice(continuation);
         let path = run.sched_path_in().to_path_buf();
-        self.write_trial_record(target.schedule_prefix(len), &path)?;
+        // This is an edited prefix plus a new continuation, not a full replay
+        // under the target's drawn maximum. Keep the generated record and
+        // the trial's explicit maximum consistent, without changing target.
+        let prefix = target
+            .schedule_prefix(len)
+            .with_chaos_timeslice(continuation.map(NonZeroU64::get));
+        self.write_trial_record(prefix, &path)?;
         Ok(run.with_schedule_replay_from(path))
     }
 
@@ -935,8 +946,13 @@ impl AnalyzeOpts {
             Ok(is_match)
         };
 
+        let run_timeslice = target_record
+            .chaos_timeslice()
+            .and_then(NonZeroU64::new)
+            .or(self.trial_max_timeslice()?);
+        self.refuse_unsound_continuation_for(run_timeslice)?;
         let candidates = match self.continuation_timeslice {
-            ContinuationTimeslice::Auto => continuation_candidates(self.trial_max_timeslice()),
+            ContinuationTimeslice::Auto => continuation_candidates(run_timeslice),
             ContinuationTimeslice::Nanos(nanos) => vec![Some(nanos)],
         };
         let continuation = choose_continuation(&candidates, target.len(), &mut meets_target)?;
@@ -2118,7 +2134,6 @@ impl AnalyzeOpts {
         self.refuse_outputs_trials_overwrite()?;
         self.refuse_unqualified_trial_timeout()?;
         self.refuse_unenforceable_trial_timeout()?;
-        self.refuse_unsound_continuation_timeslice()?;
         self.install_trial_pmu_config()?;
         self.admit_branch_counter(&mut crate::app::tracing::write_stderr_diagnostic)?;
         if let Some(notice) =
@@ -2164,6 +2179,7 @@ impl AnalyzeOpts {
         self.adopt_sleep_registration(run1.as_deref())?;
         // Every trial runs under the timeslice its recordings drew.
         self.adopt_recorded_timeslice(&recordings)?;
+        self.refuse_unsound_continuation_timeslice()?;
         self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
     }
 
@@ -3402,6 +3418,222 @@ mod tests {
         );
         assert_eq!(continuation_candidates(ns(500_000_000)), [ns(500_000_000)]);
         assert_eq!(continuation_candidates(None), [None]);
+    }
+
+    #[test]
+    fn an_empty_target_schedule_is_refused_before_endpoint_trials() {
+        let mut trials = 0;
+        let error = choose_continuation(&[NonZeroU64::new(1000)], 0, |_, _| {
+            trials += 1;
+            Ok(false)
+        })
+        .unwrap_err();
+        assert_eq!(trials, 0, "an empty schedule has no distinct endpoints");
+        assert!(
+            error.to_string().contains("target schedule is empty"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("replay"), "{error}");
+    }
+
+    #[test]
+    fn a_drawn_prefix_applies_its_chosen_continuation_at_launch() {
+        use clap::CommandFactory as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--prefix-search",
+            "--",
+            "--max-timeslice=4321",
+            "/bin/true",
+        ])
+        .unwrap();
+        options.tmp_dir = Some(dir.path().to_path_buf());
+        let target = PreemptionRecord::from_sched_events(vec![SchedEvent::branches(
+            detcore::types::DetTid::from_raw(3),
+            1,
+        )])
+        .with_chaos_timeslice(Some(4321));
+        for nanos in [4321, 200_000_000] {
+            let chosen = NonZeroU64::new(nanos);
+            let mut run = options
+                .prefix_trial("drawn_prefix", &target, 1, chosen)
+                .unwrap();
+            let written = PreemptionReader::try_new(run.sched_path_in())
+                .unwrap()
+                .into_inner();
+            assert_eq!(written.chaos_timeslice(), Some(nanos));
+            assert_eq!(written.schedevents(), target.schedevents());
+            for _ in 0..2 {
+                run.runopts.validate_args_with_perf_support(true).unwrap();
+                assert_eq!(run.runopts.det_opts.det_config.max_timeslice, chosen);
+            }
+            let command = shell_words::split(&format!("hermit run {}", run.runopts)).unwrap();
+            let matches = crate::app::Args::command()
+                .try_get_matches_from(&command)
+                .unwrap();
+            let args = crate::app::args_from_matches_with_clock(&matches, || {
+                panic!("the reproducer must preserve its fixed epoch");
+            })
+            .unwrap();
+            let crate::app::Subcommand::Run(mut replay) = args.command else {
+                panic!("not a run command");
+            };
+            replay.validate_args_with_perf_support(true).unwrap();
+            assert_eq!(replay.det_opts.det_config.max_timeslice, chosen);
+        }
+        assert_eq!(
+            target.chaos_timeslice(),
+            Some(4321),
+            "keep the source record intact"
+        );
+
+        let original = dir.path().join("original.json");
+        target.write_to_disk(&original).unwrap();
+        let replay_arg = format!("--replay-schedule-from={}", original.display());
+        let matches = crate::app::Args::command()
+            .try_get_matches_from([
+                "hermit",
+                "run",
+                "--max-timeslice=200000000",
+                &replay_arg,
+                "/bin/true",
+            ])
+            .unwrap();
+        let args =
+            crate::app::args_from_matches_with_clock(&matches, || std::time::UNIX_EPOCH).unwrap();
+        let crate::app::Subcommand::Run(mut mismatched) = args.command else {
+            panic!("not a run command");
+        };
+        let error = mismatched
+            .validate_args_with_perf_support(true)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("pass --max-timeslice=4321"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn prefix_candidates_use_the_recorded_and_resolved_maximum() {
+        for (recorded, range, expected) in [
+            (Some(4321), None, 4321),
+            (Some(500_000_000), None, 500_000_000),
+            (None, Some("1000..5000000"), 5_000_000),
+            (None, Some("1000..500000000"), 500_000_000),
+        ] {
+            let mut argv = vec!["analyze".to_string(), "--prefix-search".into(), "--".into()];
+            if let Some(range) = range {
+                argv.extend(["--chaos".into(), format!("--chaos-timeslice-range={range}")]);
+            }
+            argv.push("/bin/true".into());
+            let options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let target = PreemptionRecord::from_sched_events(vec![SchedEvent::branches(
+                detcore::types::DetTid::from_raw(3),
+                1,
+            )])
+            .with_chaos_timeslice(recorded);
+            let mut tried = Vec::new();
+            let found = options
+                .phase5_prefix_search_with(&target, |_, len, timeslice| {
+                    tried.push(timeslice);
+                    Ok(len != 0)
+                })
+                .unwrap();
+            assert_eq!(found.continuation, NonZeroU64::new(expected));
+            assert!(
+                tried
+                    .iter()
+                    .all(|timeslice| *timeslice == NonZeroU64::new(expected))
+            );
+        }
+        for (recorded, continuation, admitted) in [
+            (4321, 4321, true),
+            (4321, 4320, false),
+            (500_000_000, 200_000_000, false),
+        ] {
+            let options = AnalyzeOpts::try_parse_from([
+                "analyze".to_owned(),
+                "--prefix-search".into(),
+                format!("--continuation-timeslice={continuation}"),
+                "--".into(),
+                "/bin/true".into(),
+            ])
+            .unwrap();
+            let target = PreemptionRecord::from_sched_events(vec![SchedEvent::branches(
+                detcore::types::DetTid::from_raw(3),
+                1,
+            )])
+            .with_chaos_timeslice(Some(recorded));
+            let mut trials = 0;
+            let found = options.phase5_prefix_search_with(&target, |_, len, timeslice| {
+                trials += 1;
+                assert_eq!(timeslice, NonZeroU64::new(continuation));
+                Ok(len != 0)
+            });
+            if admitted {
+                assert_eq!(found.unwrap().continuation, NonZeroU64::new(continuation));
+                assert!(trials > 0);
+            } else {
+                let error = found
+                    .err()
+                    .expect("an unsound continuation must be refused");
+                assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+                assert_eq!(trials, 0, "refuse before starting a prefix trial");
+            }
+        }
+    }
+
+    #[test]
+    fn continuation_admission_follows_recorded_timeslice_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("drawn.json");
+        for (recorded, continuation, admitted) in [
+            (4321, 4321, true),
+            (4321, 4320, false),
+            (500_000_000, 500_000_000, true),
+            (500_000_000, 200_000_000, false),
+        ] {
+            PreemptionRecord::from_sched_events(Vec::new())
+                .with_chaos_timeslice(Some(recorded))
+                .write_to_disk(&record)
+                .unwrap();
+            let args = crate::app::Args::try_parse_from([
+                "hermit".to_owned(),
+                "analyze".into(),
+                "--prefix-search".into(),
+                format!("--run1-preemptions={}", record.display()),
+                format!("--continuation-timeslice={continuation}"),
+                "--".into(),
+                "/bin/true".into(),
+            ])
+            .unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
+                panic!("not analyze");
+            };
+            let prepared = options.prepare(&args.global);
+            if admitted {
+                prepared.unwrap();
+                assert_eq!(
+                    options.trial_max_timeslice().unwrap(),
+                    NonZeroU64::new(recorded)
+                );
+            } else {
+                let error = prepared.unwrap_err();
+                assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+                assert!(
+                    format!("{error:#}").contains(&format!(
+                        "shorter than the run's --max-timeslice={recorded}"
+                    )),
+                    "{error:#}"
+                );
+            }
+            assert!(
+                options.tmp_dir.is_none(),
+                "preflight must not create a workspace"
+            );
+        }
     }
 
     /// The search continues at the first timeslice whose endpoint trials

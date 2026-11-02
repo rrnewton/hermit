@@ -1190,10 +1190,19 @@ impl AnalyzeOpts {
     /// schedule does not end, or one for a run without PMU timeslices, whose
     /// clock it would change.
     pub fn refuse_unsound_continuation_timeslice(&self) -> anyhow::Result<()> {
+        self.refuse_unsound_continuation_for(self.trial_max_timeslice()?)
+    }
+
+    /// Recheck against the target record once it is available, before any
+    /// prefix trial can apply an explicitly selected continuation.
+    pub(super) fn refuse_unsound_continuation_for(
+        &self,
+        run: detcore_model::config::MaybeTimeslice,
+    ) -> anyhow::Result<()> {
         let ContinuationTimeslice::Nanos(nanos) = self.continuation_timeslice else {
             return Ok(());
         };
-        let reason = match self.trial_max_timeslice() {
+        let reason = match run {
             None => "the run arguments disable PMU timeslices, and a continuation timeslice \
                      would turn them on for the replayed prefix too"
                 .to_owned(),
@@ -1212,13 +1221,11 @@ impl AnalyzeOpts {
         )
     }
 
-    /// The trials' `--max-timeslice`, from their run arguments (`None` for
-    /// disabled).
-    pub fn trial_max_timeslice(&self) -> detcore_model::config::MaybeTimeslice {
-        RunData::get_raw_runopts(self)
-            .det_opts
-            .det_config
-            .max_timeslice
+    /// The non-chaos replay trials' effective maximum, after recorded-value
+    /// adoption and the same range/seed resolution used at launch (`None`
+    /// for disabled).
+    pub fn trial_max_timeslice(&self) -> anyhow::Result<detcore_model::config::MaybeTimeslice> {
+        RunData::get_raw_runopts(self).analysis_replay_max_timeslice()
     }
 
     /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
@@ -3524,6 +3531,57 @@ mod tests {
             Some(Duration::from_secs(100))
         );
         assert_eq!(later.runopts.run_timeout(), Some(Duration::from_secs(200)));
+    }
+
+    #[test]
+    fn continuation_admission_uses_the_resolved_range_maximum() {
+        for (range, continuation, admitted) in [
+            ("1000..5000000", 5_000_000, true),
+            ("1000..5000000", 4_999_999, false),
+            ("1000..500000000", 500_000_000, true),
+            ("1000..500000000", 200_000_000, false),
+        ] {
+            let options = AnalyzeOpts::try_parse_from([
+                "analyze".to_owned(),
+                "--prefix-search".into(),
+                format!("--continuation-timeslice={continuation}"),
+                "--".into(),
+                "--chaos".into(),
+                format!("--chaos-timeslice-range={range}"),
+                "/bin/true".into(),
+            ])
+            .unwrap();
+            let result = options.refuse_unsound_continuation_timeslice();
+            if admitted {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
+                        .is_some(),
+                    "{error:#}"
+                );
+                assert!(
+                    format!("{error:#}").contains("shorter than the run's --max-timeslice="),
+                    "{error:#}"
+                );
+            }
+        }
+        let seeded = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--prefix-search",
+            "--",
+            "--chaos",
+            "--chaos-seeded-timeslice",
+            "--seed=7",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(
+            seeded.trial_max_timeslice().unwrap(),
+            Some(hermit::chaos_timeslice::DEFAULT_MAX_TIMESLICE)
+        );
     }
 
     /// A `--continuation-timeslice` shorter than the run's `--max-timeslice`,
