@@ -1721,7 +1721,8 @@ pub struct RunOpts {
     /// is bind-mounted over the original path, and anything that is not a
     /// fully decoded canonical loop is left alone and reported. Incompatible
     /// with `--no-namespace`, whose guest has no mount namespace to carry the
-    /// overlay.
+    /// overlay, and with `--image` (and `hermit oci run`), whose guest loads
+    /// the files of the image's rootfs, which the overlay does not reach.
     #[clap(long)]
     pub(crate) rewrite_exclusives: bool,
 
@@ -3394,6 +3395,35 @@ fn the_exclusive_rewrite_is_retained_in_reproducers() {
         rendered.contains(" --rewrite-exclusives-also='/lib/a space.so'"),
         "a path with a space must come back shell-quoted: {rendered}"
     );
+}
+
+/// An OCI image run does not mount the rewritten copies, so the rewrite is
+/// refused in argument validation, by name, before the image is resolved;
+/// without the rewrite the same image run is not refused for it.
+#[test]
+fn the_exclusive_rewrite_is_refused_for_an_image_run() {
+    let refusal = "a guest run from an OCI image (--image, hermit oci run)";
+    let mut image = run_opts_for(&[
+        "hermit",
+        "run",
+        "--image=example.invalid/guest",
+        "--rewrite-exclusives",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    let error = image.validate_args_with_perf_support(true).unwrap_err();
+    assert!(format!("{error:#}").contains(refusal), "{error:#}");
+
+    let mut plain = run_opts_for(&[
+        "hermit",
+        "run",
+        "--image=example.invalid/guest",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    if let Err(error) = plain.validate_args_with_perf_support(true) {
+        assert!(!format!("{error:#}").contains(refusal), "{error:#}");
+    }
 }
 
 #[test]
@@ -11248,6 +11278,10 @@ impl RunOpts {
         // Callers other than `main` (analyze, oci, tests) reach validation
         // without `dispatch_before_validation`; lowering again is a no-op.
         self.lower_strace_only();
+        // Before the image is resolved, which this refusal does not need.
+        if self.image.is_some() {
+            self.refuse_exclusive_rewrite_in_an_image()?;
+        }
         self.resolve_image_default_program()?;
         self.refuse_virtual_timeout_with_debugger()?;
         self.refuse_unready_exec_stop()?;
@@ -12951,6 +12985,24 @@ impl RunOpts {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Refuse `--rewrite-exclusives` for a guest that runs from an OCI image
+    /// (`--image`, and `hermit oci run`, which sets it). The rewritten copies
+    /// are bind-mounted over the host files the guest program resolves to,
+    /// and an image launch builds its own container in the image's
+    /// materialized rootfs, which those mounts do not reach: the guest would
+    /// run its original exclusive loops while the run reported a rewrite.
+    pub(crate) fn refuse_exclusive_rewrite_in_an_image(&self) -> Result<(), Error> {
+        anyhow::ensure!(
+            !self.rewrite_exclusives,
+            "--rewrite-exclusives bind-mounts rewritten copies over the host files the guest \
+             loads, and a guest run from an OCI image (--image, hermit oci run) loads the files \
+             of the image's rootfs, which those mounts do not reach, so it would run its \
+             original exclusive loops; rewrite the files the image holds with `hermit \
+             rewrite-exclusives --output-dir` instead"
+        );
         Ok(())
     }
 
