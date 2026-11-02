@@ -3250,7 +3250,22 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=93d3a168bb713b8fc420f591d91b35325a43d1df
+# CARRY TO a951fd73c8fe66248c4305cd49ae17156657ab9c (2026-11-02): from 93d3a168bb713b8fc420f591d91b35325a43d1df.
+# 93d3a168..a951fd73 is two commits, the chain's copies of PRCTL's
+# 6df1c3d9 and aa851bd0: f614c7c8 (a tool places each exit's orphans
+# where it names and publishes the parent-death signals it decides,
+# through LinuxEmu's process signal control, behind the capabilities
+# places_orphans and publishable_parent_death_signals, the set of
+# signals the backend publishes) and a951fd73 (an unsendable
+# parent-death signal is refused by name as
+# UnsupportedOperation::ParentDeathSignal; Auxv::at_secure). The
+# reverie-dbt tree, the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are unchanged.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=a951fd73c8fe66248c4305cd49ae17156657ab9c
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -9639,6 +9639,12 @@ mod tests {
             // LiteInst runtime never return a stack.
             "provides_guest_backtraces":
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Sabre | Backend::Dbt),
+            // KVM's process signal control moves each exit's orphans where
+            // Detcore names and publishes the parent-death signals Detcore
+            // decides (signals 1 to 31 but SIGCHLD and the four stop
+            // signals); on ptrace the kernel does both itself.
+            "places_orphans": kvm,
+            "publishable_parent_death_signals": if kvm { 0x7fc2_ffff_u64 } else { 0 },
         })
     }
 
