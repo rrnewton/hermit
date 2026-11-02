@@ -5,7 +5,7 @@ import tempfile
 import tomllib
 from pathlib import Path
 SOURCE=Path(__file__).with_name('prepare.py')
-SHA = 'ad4b38c02fddefd46d7a0fe4aa64c6df828955012040bf9098fe4f8f1d24b7cd'
+SHA = '5112a7130dcb0d349504e0c3f9b88f767896337a99f228318be0e71d19d13332'
 class InventoryIdentity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

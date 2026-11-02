@@ -412,7 +412,7 @@ impl Manifest {
         Manifest {
             schema: SCHEMA.to_owned(),
             hermit: Writer {
-                version: crate::version::Version::get().to_owned(),
+                version: crate::app::version::Version::get().to_owned(),
             },
             id: id.to_string(),
             kind,
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn output_destinations_are_left_out() {
         use clap::CommandFactory;
-        let hermit = crate::Args::command();
+        let hermit = crate::app::Args::command();
         let run = hermit.find_subcommand("run").unwrap();
         let longs = |command: &clap::Command| -> Vec<String> {
             command

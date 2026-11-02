@@ -335,7 +335,7 @@ impl GlobalOpts {
         let guard = self.install_tracing_for_backend(backend);
         // A run admitted under --unsafe-ignore-host-seccomp says so in every
         // log it writes, the run-evidence log included, from its first record.
-        if let Some(host) = crate::host_seccomp::unverified() {
+        if let Some(host) = crate::app::host_seccomp::unverified() {
             ::tracing::info!(
                 target: "hermit::host_seccomp",
                 "unverified host seccomp filter: {} (admitted by --unsafe-ignore-host-seccomp)",
@@ -466,13 +466,13 @@ mod tests {
             .arg(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "global_opts::tests::a_log_file_is_written_synchronously_in_its_own_process",
+                "app::global_opts::tests::a_log_file_is_written_synchronously_in_its_own_process",
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",
             ])
             .env(SYNCHRONOUS_LOG_CHILD_ENV, &path)
-            .env_remove(crate::tracing::LOG_MAX_BYTES_ENV)
+            .env_remove(crate::app::tracing::LOG_MAX_BYTES_ENV)
             .env_remove("RUST_LOG")
             .output()
             .unwrap();
