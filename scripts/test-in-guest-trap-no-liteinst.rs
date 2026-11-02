@@ -24,6 +24,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -270,44 +271,78 @@ impl Runner {
         let out_path = directory.join("stdout");
         let err_path = directory.join("stderr");
         let start = Instant::now();
-        let status = thread::scope(|scope| -> Result<ExitStatus> {
+        let (status, refusal, wait_error, capture_errors) = thread::scope(|scope| {
             let out = scope.spawn(|| capture(stdout, &out_path, &overflow));
             let err = scope.spawn(|| capture(stderr, &err_path, &overflow));
             let mut refusal = None;
+            let mut wait_error = None;
             let status = loop {
                 if Instant::now() >= self.deadline || overflow.load(Ordering::Acquire) {
                     refusal = Some("producer deadline or 64-MiB stream limit reached");
                     // SAFETY: only this newly created child process group.
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
-                    break child.wait().map_err(|e| e.to_string())?;
+                    break child.wait().map_err(|e| e.to_string());
                 }
-                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                    // No descendant may retain a pipe after the command exits.
-                    unsafe { libc::kill(-pid, libc::SIGKILL) };
-                    break status;
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        // No descendant may retain a pipe after the command exits.
+                        unsafe { libc::kill(-pid, libc::SIGKILL) };
+                        break Ok(status);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        wait_error = Some(error.to_string());
+                        // Reap the child and close its pipes before joining either
+                        // capture, even if the nonblocking wait failed.
+                        unsafe { libc::kill(-pid, libc::SIGKILL) };
+                        break child.wait().map_err(|e| e.to_string());
+                    }
                 }
                 thread::sleep(Duration::from_millis(100));
             };
-            out.join().map_err(|_| "stdout capture panicked")??;
-            err.join().map_err(|_| "stderr capture panicked")??;
-            require(
-                !overflow.load(Ordering::Acquire),
-                "64-MiB command stream limit reached",
-            )?;
-            if let Some(reason) = refusal {
-                return Err(format!("{label}: {reason}"));
+            let mut capture_errors = Vec::new();
+            for (stream, result) in [("stdout", out.join()), ("stderr", err.join())] {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => capture_errors.push(format!("{stream}: {error}")),
+                    Err(_) => capture_errors.push(format!("{stream} capture panicked")),
+                }
             }
-            Ok(status)
-        })?;
+            (status, refusal, wait_error, capture_errors)
+        });
+        let stream_limit_exceeded = overflow.load(Ordering::Acquire);
         fs::write(
             directory.join("status.json"),
             json!({
-                "success":status.success(), "exit_code":status.code(),
+                "success":status.as_ref().is_ok_and(ExitStatus::success),
+                "exit_code":status.as_ref().ok().and_then(ExitStatus::code),
+                "signal":status.as_ref().ok().and_then(ExitStatusExt::signal),
                 "elapsed_seconds":start.elapsed().as_secs_f64(),
+                "accepted":status.as_ref().is_ok_and(ExitStatus::success)
+                    && refusal.is_none() && wait_error.is_none()
+                    && capture_errors.is_empty() && !stream_limit_exceeded,
+                "wait_error":wait_error.as_ref().or(status.as_ref().err()),
+                "capture_errors":capture_errors,
+                "refusal":refusal,
+                "stream_limit_exceeded":stream_limit_exceeded,
             })
             .to_string(),
         )
         .map_err(|e| e.to_string())?;
+        // Persist the native status and every capture/bound failure before
+        // returning an error; none of those failures makes this run acceptable.
+        let status = status?;
+        if let Some(error) = wait_error {
+            return Err(format!("{label}: child wait failed: {error}"));
+        }
+        require(capture_errors.is_empty(), &capture_errors.join("; "))?;
+        require(
+            !stream_limit_exceeded,
+            "64-MiB command stream limit reached",
+        )?;
+        if let Some(reason) = refusal {
+            return Err(format!("{label}: {reason}"));
+        }
         Ok((status, out_path))
     }
 
@@ -2826,6 +2861,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::ffi::OsStrExt;
+
     use dagrun::TestResult;
 
     use super::*;
@@ -2837,6 +2874,162 @@ mod tests {
             vec![TestResult::new(id.into(), passed, attempts).unwrap()],
         )
         .unwrap()
+    }
+
+    struct RunnerControl(Runner);
+
+    impl RunnerControl {
+        fn new(budget: Duration) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "inguest-off-runner-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&directory).unwrap();
+            Self(Runner {
+                root: directory.clone(),
+                evidence: directory,
+                environment: BTreeMap::new(),
+                deadline: Instant::now() + budget,
+                sequence: 0,
+            })
+        }
+
+        fn status(&self) -> Value {
+            let path = self.0.evidence.join("01-control/status.json");
+            let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert!(value["elapsed_seconds"].as_f64().unwrap() > 0.0);
+            println!("runner child status: {value}");
+            value
+        }
+    }
+
+    impl Drop for RunnerControl {
+        fn drop(&mut self) {
+            // This fresh per-test directory contains only this control's files.
+            fs::remove_dir_all(&self.0.evidence).unwrap();
+        }
+    }
+
+    #[test]
+    fn runner_records_an_ordinary_passing_child_status() {
+        let mut control = RunnerControl::new(Duration::from_secs(5));
+        let mut command = control.0.command("/bin/sh");
+        command.args(["-c", "printf child-out; printf child-err >&2"]);
+        let (native, stdout) = control.0.run("control", &mut command).unwrap();
+        assert!(native.success());
+        assert_eq!(fs::read(stdout).unwrap(), b"child-out");
+        assert_eq!(
+            fs::read(control.0.evidence.join("01-control/stderr")).unwrap(),
+            b"child-err"
+        );
+        let status = control.status();
+        assert_eq!(status["success"], true);
+        assert_eq!(status["accepted"], true);
+        assert_eq!(status["exit_code"], 0);
+        assert!(status["signal"].is_null());
+        assert!(status["wait_error"].is_null());
+        assert_eq!(status["capture_errors"], json!([]));
+        assert!(status["refusal"].is_null());
+        assert_eq!(status["stream_limit_exceeded"], false);
+    }
+
+    #[test]
+    fn runner_retains_the_killed_child_status_on_deadline_refusal() {
+        let mut control = RunnerControl::new(Duration::from_millis(200));
+        let mut command = control.0.command("/bin/sh");
+        command.args(["-c", "sleep 10"]);
+        let error = control.0.run("control", &mut command).unwrap_err();
+        assert!(error.contains("producer deadline"), "{error}");
+        let status = control.status();
+        assert_eq!(status["success"], false);
+        assert_eq!(status["accepted"], false);
+        assert!(status["exit_code"].is_null());
+        assert_eq!(status["signal"], libc::SIGKILL);
+        assert_eq!(status["capture_errors"], json!([]));
+        assert_eq!(status["stream_limit_exceeded"], false);
+        assert_eq!(
+            status["refusal"],
+            "producer deadline or 64-MiB stream limit reached"
+        );
+    }
+
+    #[test]
+    fn runner_retains_the_killed_child_status_on_stream_limit_refusal() {
+        let mut control = RunnerControl::new(Duration::from_secs(5));
+        let mut command = control.0.command("/bin/sh");
+        command.args([
+            "-c",
+            &format!("head -c {} /dev/zero; sleep 10", STREAM_LIMIT + 1),
+        ]);
+        let error = control.0.run("control", &mut command).unwrap_err();
+        assert!(error.contains("64-MiB command stream limit"), "{error}");
+        assert_eq!(
+            fs::metadata(control.0.evidence.join("01-control/stdout"))
+                .unwrap()
+                .len(),
+            STREAM_LIMIT
+        );
+        let status = control.status();
+        assert_eq!(status["success"], false);
+        assert_eq!(status["accepted"], false);
+        assert!(status["exit_code"].is_null());
+        assert_eq!(status["signal"], libc::SIGKILL);
+        assert_eq!(status["capture_errors"], json!([]));
+        assert_eq!(status["stream_limit_exceeded"], true);
+        assert_eq!(
+            status["refusal"],
+            "producer deadline or 64-MiB stream limit reached"
+        );
+    }
+
+    #[test]
+    fn runner_retains_the_native_child_status_on_capture_failure() {
+        let mut control = RunnerControl::new(Duration::from_secs(5));
+        let path = std::ffi::CString::new(
+            control
+                .0
+                .evidence
+                .join("01-control/stdout")
+                .as_os_str()
+                .as_bytes(),
+        )
+        .unwrap();
+        let mut command = control.0.command("/bin/sh");
+        command.args(["-c", "exit 7"]);
+        // SAFETY: open/close are async-signal-safe. The precomputed path is
+        // owned by this test, and spawn waits for exec before starting capture.
+        // Creating stdout here deterministically makes create_new refuse it.
+        unsafe {
+            command.pre_exec(move || {
+                let fd = libc::open(
+                    path.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                );
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                libc::close(fd);
+                Ok(())
+            });
+        }
+        let error = control.0.run("control", &mut command).unwrap_err();
+        assert!(error.starts_with("stdout: "), "{error}");
+        let status = control.status();
+        assert_eq!(status["success"], false);
+        assert_eq!(status["accepted"], false);
+        assert_eq!(status["exit_code"], 7);
+        assert!(status["signal"].is_null());
+        assert!(status["wait_error"].is_null());
+        let errors = status["capture_errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].as_str().unwrap().starts_with("stdout: "));
+        assert!(status["refusal"].is_null());
+        assert_eq!(status["stream_limit_exceeded"], false);
     }
 
     #[test]
