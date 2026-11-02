@@ -24,9 +24,17 @@
 //! and a child can be reaped on another thread while it runs. So the handler
 //! never signals a child by its number, which the kernel can give to another
 //! process once the child is reaped: it signals through a pidfd it checks
-//! ([`signal_children`]). The threads analyze starts itself block the stop
-//! signals from their first instruction ([`spawn_blocking_stop_signals`]),
-//! so the handler runs on the thread that drives the trials.
+//! ([`signal_children`]), which reaches that child or no one.
+//!
+//! The threads that leave the stop signals unblocked are the one that drives
+//! the trials and every thread a trial starts in analyze's process while it
+//! runs, which takes its creator's unblocked mask (`hermit run`'s group-kill
+//! policing thread, `container::police_group_kills`, or a runtime's worker
+//! or blocking-pool thread); the handler is safe on each. Only the memory watchdog's
+//! thread, which analyze starts itself, blocks the stop signals from its
+//! first instruction ([`spawn_blocking_stop_signals`]). Beyond the pidfd, the
+//! handler stores the signal in an atomic ([`check`]) and reads `/proc`,
+//! which reads the same from every thread.
 
 use std::fmt;
 use std::sync::atomic::AtomicI32;
@@ -689,15 +697,25 @@ mod tests {
         pub const THE_REUSED_PID_WAS_SIGNALLED: libc::c_int = 18;
         pub const THE_REUSED_PID_ENDED: libc::c_int = 19;
 
+        /// What an exit says; the process said why on stderr, with errno.
         pub fn describe(code: libc::c_int) -> &'static str {
             match code {
                 NO_USER_AND_PID_NAMESPACE => {
-                    "unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID) failed"
+                    "unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID) failed: this host \
+                     refuses an unprivileged user, mount or PID namespace, which the container \
+                     tests need too"
                 }
-                NO_PROC_OF_ITS_OWN => "could not mount a /proc of the new PID namespace",
+                NO_PROC_OF_ITS_OWN => {
+                    "could not mount a procfs of the new PID namespace in its user namespace, \
+                     as container::tests::the_placeholder_directory_mounts_and_leaves_procfs_mountable \
+                     does"
+                }
                 NO_FORK => "fork failed",
                 NO_PIPE => "pipe failed",
-                NO_CHOSEN_PID => "clone3 with set_tid failed",
+                NO_CHOSEN_PID => {
+                    "clone3 with set_tid failed: it needs Linux 5.5 or later and CAP_SYS_ADMIN \
+                     over the new PID namespace's user namespace"
+                }
                 NO_HANDLER => "StopSignals::install did not install the SIGTERM handler",
                 NOT_IN_THE_WINDOW => "the handler did not stop in the window at the child",
                 STOP_NOT_RECORDED => "the handler did not record the stop",
@@ -893,6 +911,7 @@ mod tests {
             )
         };
         if private != 0 || proc != 0 {
+            eprintln!("mount: {}", std::io::Error::last_os_error());
             return ended::NO_PROC_OF_ITS_OWN;
         }
         let (Some((request, request_by)), Some((granted_by, granted)), Some((ready, ready_by))) =
@@ -927,6 +946,9 @@ mod tests {
         }
         let other = child_with_pid(libc::pid_t::from_ne_bytes(freed), ready_by);
         let mut up = [0u8];
+        if other < 0 {
+            eprintln!("clone3 set_tid: {}", std::io::Error::last_os_error());
+        }
         if other < 0 || !receive(ready, &mut up) {
             // SAFETY: kill(2) on this process's own child.
             unsafe { libc::kill(analyze, libc::SIGKILL) };
@@ -960,6 +982,11 @@ mod tests {
     /// init, which is not analyze, gives the child's PID to a process of its
     /// own; then the handler goes on. Signalled by number, as before, that
     /// process died of SIGTERM.
+    ///
+    /// It needs what the container tests in both `test.hermit_unit` cells
+    /// already need (unprivileged user, mount and PID namespaces, and a
+    /// procfs mounted in them), and clone3's `set_tid` (Linux 5.5). A host
+    /// without one fails it with the capability named, never a pass.
     #[test]
     fn a_stop_signal_on_a_helper_thread_never_reaches_a_reused_pid() {
         if crate::app::test_isolation::rerun_alone() {
@@ -975,6 +1002,7 @@ mod tests {
                 libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID)
             };
             let code = if unshared != 0 {
+                eprintln!("unshare: {}", std::io::Error::last_os_error());
                 ended::NO_USER_AND_PID_NAMESPACE
             } else {
                 match unsafe { libc::fork() } {
