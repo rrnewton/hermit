@@ -459,6 +459,28 @@ for name in "${pass_env[@]}"; do
             extra_mounts+=(--mount "type=bind,source=$v11_image,destination=/run/hermit-mapped-packet-v11.elf,ro=true")
             env_args+=(-e HERMIT_MAPPED_PACKET_V11_IMAGE=/run/hermit-mapped-packet-v11.elf)
             ;;
+        HERMIT_RETAINED_PACKAGE_TEST_INSTALL)
+            # The current initializer control consumes the genuine producer's
+            # paired resources independently of HERMIT_INSTALL_DIR. Transport
+            # only those resources; source/entry qualification remains the
+            # producer's and the unchanged retained consumer's responsibility.
+            retained_install=${!name}
+            retained_resources=$retained_install/rsrcs
+            retained_image=$retained_resources/detcore_private_runtime.elf
+            retained_data=$retained_resources/detcore_private_runtime.package.json
+            if [[ $retained_install != /* || ! -d $retained_install || -L $retained_install ||
+                  ! -d $retained_resources || -L $retained_resources ||
+                  ! -f $retained_image || -L $retained_image ||
+                  ! -f $retained_data || -L $retained_data ||
+                  $retained_install == *','* || $retained_install == *$'\n'* ||
+                  $retained_install == *$'\r'* ]]; then
+                echo "run-in-pinned-root: HERMIT_RETAINED_PACKAGE_TEST_INSTALL must name an absolute install with regular paired resources and no symlink or mount delimiter" >&2
+                exit 2
+            fi
+            extra_mounts+=(--mount "type=bind,source=$retained_image,destination=/run/hermit-retained-package-test/rsrcs/detcore_private_runtime.elf,ro=true")
+            extra_mounts+=(--mount "type=bind,source=$retained_data,destination=/run/hermit-retained-package-test/rsrcs/detcore_private_runtime.package.json,ro=true")
+            env_args+=(-e HERMIT_RETAINED_PACKAGE_TEST_INSTALL=/run/hermit-retained-package-test)
+            ;;
         *) env_args+=(--env "$name") ;;
     esac
 done

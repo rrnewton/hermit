@@ -105,6 +105,7 @@ class CargoCacheMounts(unittest.TestCase):
         command=None,
         caller_affinity=None,
         v11_image=None,
+        retained_package_install=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -125,6 +126,9 @@ class CargoCacheMounts(unittest.TestCase):
         if v11_image is not None:
             env["HERMIT_MAPPED_PACKET_V11_IMAGE"] = str(v11_image)
             forwarded += ["--env", "HERMIT_MAPPED_PACKET_V11_IMAGE"]
+        if retained_package_install is not None:
+            env["HERMIT_RETAINED_PACKAGE_TEST_INSTALL"] = str(retained_package_install)
+            forwarded += ["--env", "HERMIT_RETAINED_PACKAGE_TEST_INSTALL"]
         result = subprocess.run(
             [
                 "bash",
@@ -694,6 +698,78 @@ class CargoCacheMounts(unittest.TestCase):
                 self.assertFalse(any(call[0] == "run" for call in calls))
         self.assertEqual(regular.read_bytes(), b"preserve external bytes")
         self.assertEqual(comma.read_bytes(), b"preserve delimiter bytes")
+
+    def test_explicit_retained_pair_is_mounted_read_only_without_global_install(self):
+        install = self.root / "current private package"
+        resources = install / "rsrcs"
+        resources.mkdir(parents=True)
+        image = resources / "detcore_private_runtime.elf"
+        descriptor = resources / "detcore_private_runtime.package.json"
+        # These bytes test transport only, never initializer qualification.
+        image.write_bytes(b"test-only current pair image")
+        descriptor.write_bytes(b"test-only current pair descriptor")
+        before = [(path.read_bytes(), path.stat()) for path in [image, descriptor]]
+        result, calls = self.invoke(retained_package_install=install)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        for path in [image, descriptor]:
+            self.assertIn(
+                f"type=bind,source={path},destination=/run/hermit-retained-package-test/rsrcs/{path.name},ro=true",
+                argv,
+            )
+        self.assertIn(
+            "HERMIT_RETAINED_PACKAGE_TEST_INSTALL=/run/hermit-retained-package-test", argv
+        )
+        self.assertFalse(any(argument.startswith("HERMIT_INSTALL_DIR=") for argument in argv))
+        for path, (contents, old) in zip([image, descriptor], before):
+            self.assertEqual(path.read_bytes(), contents)
+            current = path.stat()
+            self.assertEqual((current.st_dev, current.st_ino, current.st_size),
+                             (old.st_dev, old.st_ino, old.st_size))
+        self.assertEqual(argv[-2:], ["/not-executed/command", "literal argument"])
+
+    def test_invalid_retained_pair_refuses_before_container_launch(self):
+        def install(name, image=True, descriptor=True):
+            path = self.root / name
+            resources = path / "rsrcs"
+            resources.mkdir(parents=True)
+            if image:
+                (resources / "detcore_private_runtime.elf").write_bytes(b"original image")
+            if descriptor:
+                (resources / "detcore_private_runtime.package.json").write_bytes(b"original descriptor")
+            return path
+
+        valid = install("actual retained pair")
+        install_link = self.root / "install symlink"
+        install_link.symlink_to(valid, target_is_directory=True)
+        resources_link = self.root / "resources symlink"
+        resources_link.mkdir()
+        (resources_link / "rsrcs").symlink_to(valid / "rsrcs", target_is_directory=True)
+        image_link = install("image symlink", image=False)
+        (image_link / "rsrcs/detcore_private_runtime.elf").symlink_to(
+            valid / "rsrcs/detcore_private_runtime.elf"
+        )
+        descriptor_link = install("descriptor symlink", descriptor=False)
+        (descriptor_link / "rsrcs/detcore_private_runtime.package.json").symlink_to(
+            valid / "rsrcs/detcore_private_runtime.package.json"
+        )
+        fifo = install("image fifo", image=False)
+        os.mkfifo(fifo / "rsrcs/detcore_private_runtime.elf")
+        comma = install("install,with-delimiter")
+        invalid = ["relative-install", self.root / "missing-install", self.root,
+                   install_link, resources_link, install("missing image", image=False),
+                   install("missing descriptor", descriptor=False), image_link,
+                   descriptor_link, fifo, comma]
+        for path in invalid:
+            with self.subTest(install=path):
+                self.capture.unlink(missing_ok=True)
+                result, calls = self.invoke(retained_package_install=path)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("HERMIT_RETAINED_PACKAGE_TEST_INSTALL", result.stderr)
+                self.assertFalse(any(call[0] == "run" for call in calls))
+        self.assertEqual((valid / "rsrcs/detcore_private_runtime.elf").read_bytes(), b"original image")
+        self.assertEqual((valid / "rsrcs/detcore_private_runtime.package.json").read_bytes(), b"original descriptor")
 
     def test_relocates_real_nested_submodule_configs_without_changing_host_metadata(
         self,

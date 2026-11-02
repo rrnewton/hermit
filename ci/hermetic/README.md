@@ -199,6 +199,17 @@ rustup proxies do not cross that boundary. `VALIDATE_RUN_STATE` and structured
 result paths are mounted explicitly so the original producers and consumers
 refer to the same evidence without sharing unrelated output ownership.
 
+The mapped initializer controls have two separate explicit inputs. Set
+`HERMIT_MAPPED_PACKET_V11_IMAGE` to the retained historical V11 file for its
+three fixed identity controls. Set `HERMIT_RETAINED_PACKAGE_TEST_INSTALL` to
+an actual current-source private package installation for the fourth control;
+the maintained private producer publishes its two resources under `rsrcs/`.
+The wrapper mounts only those named files read-only and rewrites each input
+to its fixed container path. It leaves `HERMIT_INSTALL_DIR` independent.
+Transport does not qualify an initializer: the current package still requires
+the real producer's source and output close, and the unchanged consumers retain
+their byte, identity, ABI and cleanup checks. Missing inputs remain failures.
+
 ## The network boundary — what is and is not claimed
 
 This is the claim to read carefully, because it is easy to overstate and the

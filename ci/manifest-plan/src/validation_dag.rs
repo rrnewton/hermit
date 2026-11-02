@@ -656,6 +656,10 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     // The wrapper mounts this explicit historical fixture read-only; the
     // retained map/cancel tests still enforce its fixed complete identity.
     "HERMIT_MAPPED_PACKET_V11_IMAGE",
+    // A separate actual current-source private pair for the initializer-only
+    // control. The wrapper mounts its two resources read-only; it does not
+    // replace the producer's source close or the retained consumer's checks.
+    "HERMIT_RETAINED_PACKAGE_TEST_INSTALL",
     crate::parity::PARITY_POST_PASS_ENV,
     crate::parity::PARITY_SELECT_ENV,
     crate::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
