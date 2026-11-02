@@ -359,15 +359,29 @@ mod tests {
         let _watchdog = MemoryBudget::Bytes(u64::MAX)
             .enforce("hermit analyze")
             .unwrap();
-        let watchdogs: Vec<String> = std::fs::read_dir("/proc/self/task")
-            .unwrap()
-            .filter_map(|task| {
-                let task = task.unwrap().path();
-                let comm = std::fs::read_to_string(task.join("comm")).ok()?;
-                (comm.trim_end() == WATCHDOG_THREAD)
-                    .then(|| std::fs::read_to_string(task.join("status")).unwrap())
-            })
-            .collect();
+        // The thread names itself as it starts, after the kernel gave it its
+        // mask at creation: once the name shows, the mask is the one to read.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let watchdogs: Vec<String> = loop {
+            let found: Vec<String> = std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(|task| {
+                    let task = task.ok()?.path();
+                    let comm = std::fs::read_to_string(task.join("comm")).ok()?;
+                    (comm.trim_end() == WATCHDOG_THREAD)
+                        .then(|| std::fs::read_to_string(task.join("status")).ok())
+                        .flatten()
+                })
+                .collect();
+            if !found.is_empty() {
+                break found;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watchdog thread never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert_eq!(watchdogs.len(), 1, "{watchdogs:?}");
         assert_eq!(
             stop_signals_blocked(&watchdogs[0]),

@@ -285,9 +285,10 @@ pub struct AnalyzeOpts {
     /// default actions, which Linux discards for a namespace's init. Neither does it handle
     /// them, so that they kill it at once as before, when /proc is not its own PID namespace's
     /// (analyze started by another process inside `unshare -pf` without --mount-proc), when
-    /// it inherited more than 64 children, or on a kernel that opens no pidfds (Linux before
-    /// 5.3, or a seccomp filter that refuses pidfd_open), through which alone it signals the
-    /// run.
+    /// it inherited more than 64 children, or where it cannot open, signal through or wait on
+    /// a pidfd (Linux before 5.4, or a seccomp filter), through which alone it signals the run.
+    /// A stop it cannot pass on to the run (no file descriptor left) makes it die of the
+    /// signal as without its handler, saying why; the run dies with it and the workspace stays.
     #[clap(long)]
     pub keep_tmp: bool,
 

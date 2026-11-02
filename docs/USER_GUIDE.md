@@ -886,11 +886,15 @@ the default actions, which Linux discards for a namespace's init. Analyze also
 leaves the stop signals to kill it at once, as before, when `/proc` is not its
 own PID namespace's (analyze started by another process inside `unshare -pf`
 without `--mount-proc`) or when it inherited more than 64 children, since it
-could not then find the run to stop, and on a kernel that opens no pidfds
-(Linux before 5.3, or a seccomp filter that refuses `pidfd_open`), since it
-signals the run only through a pidfd: a process ID it found can be reaped and
-given to another process before the signal goes out. `hermit
-bisect` keeps its workspace and names it when it exits.
+could not then find the run to stop, and where it cannot open a pidfd, send
+a signal through one or wait on one (Linux before 5.4, or a seccomp filter
+that refuses `pidfd_open`, `pidfd_send_signal` or `waitid`), since it signals
+the run only through a pidfd: a process ID it found can be reaped and given to
+another process before the signal goes out. A stop it cannot pass on to the
+run (no file descriptor left to read `/proc`, or a pidfd call that fails) is
+not lost either: analyze says which call failed and dies of the signal as it
+would without its handler, the run dies with it, and the workspace stays.
+`hermit bisect` keeps its workspace and names it when it exits.
 
 A replayed or spliced schedule can leave the guest spinning or waiting indefinitely.
 `--trial-timeout=SECONDS|auto|off` bounds runs after the initial target attempt.
