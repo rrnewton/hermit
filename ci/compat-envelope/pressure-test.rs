@@ -15096,6 +15096,7 @@ fn fixture_host_capabilities() -> BTreeMap<HostCapability, CapabilityVerdict> {
 
 fn fixture_attempt(outcome: &str, status: i32) -> AttemptResult {
     AttemptResult {
+        command_binding: None,
         index: "1".into(),
         outcome: outcome.into(),
         error_kind: None,
@@ -23259,6 +23260,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         hermit_sha: sample_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         binary_sha256: None,
+        comparator_binary_sha256: None,
         binary_build_sha: None,
         test_sha256: "fixture-test-sha256".into(),
         test: sample_a.test.clone(),
@@ -26470,6 +26472,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         hermit_sha: repeated_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         binary_sha256: None,
+        comparator_binary_sha256: None,
         binary_build_sha: None,
         test_sha256: "fixture-test-sha256".into(),
         test: green_id.test.clone(),
