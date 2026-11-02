@@ -3186,7 +3186,7 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-# CARRY TO 3df91c9c71bdc5c77571974cbabfca20183a08de (2026-11-01): from a7e7587c3b5167c8a48e262b8871bfb9aef72fc4.
+# CARRY TO 6f780b200bde456080ece65a4959ce13d9b377d8 (2026-11-01): from a7e7587c3b5167c8a48e262b8871bfb9aef72fc4.
 # Interval: LinuxEmu no longer renders /proc/locks or any fdinfo of its own;
 # its fdinfo opener, the path classification and stat answers for fdinfo
 # spellings, /proc/locks with its /proc/self/../locks spelling, and their
@@ -3198,7 +3198,7 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=3df91c9c71bdc5c77571974cbabfca20183a08de
+expected_pin=6f780b200bde456080ece65a4959ce13d9b377d8
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
