@@ -1942,7 +1942,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the batched round's targeted rerun at the merged head (the six
     // forced-gate rows fail only for want of a locally built liteinst
     // runtime, which the validate builds; they pass there).
-    ("test.hermit_unit", 1329),
+    ("test.hermit_unit", 1331),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4557,7 +4557,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // passing.
     // N3 adds twelve cli cases, measured at its base (763 + 12 = 775 in
     // its tight loop): 764 + 12 = 776.
-    ("test.cli", 776),
+    ("test.cli", 777),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
