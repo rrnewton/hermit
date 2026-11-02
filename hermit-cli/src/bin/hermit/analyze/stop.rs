@@ -72,8 +72,9 @@ static INHERITED: [AtomicI32; INHERITED_CAPACITY] =
     [const { AtomicI32::new(0) }; INHERITED_CAPACITY];
 
 /// The `/proc` directory the handler scans, opened when it is installed and
-/// kept for the life of the process, so a scan needs no descriptor for it;
-/// -1 until then.
+/// kept for the life of the process, deliberately: a scan then needs no
+/// descriptor for it, and no handler still scanning on another thread can
+/// find it closed; -1 until then.
 static PROC_DIR: AtomicI32 = AtomicI32::new(-1);
 
 /// Set while a handler scans `/proc` through [`PROC_DIR`], whose offset
@@ -482,23 +483,34 @@ fn is_child(
         let proc_dir = proc_dir().ok_or_else(|| Undelivered::now("open /proc"))?;
         return Ok(parent_of(proc_dir, name)? == Some(parent));
     }
-    // SAFETY: an all-zero siginfo_t is a valid out-parameter for waitid(2).
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let waited = unsafe {
-        libc::waitid(
-            libc::P_PIDFD,
-            pidfd as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
-        )
-    };
-    if waited == 0 {
+    if waitid_pidfd(pidfd) == 0 {
         return Ok(true);
     }
     let undelivered = Undelivered::now("waitid");
     match undelivered.errno {
         libc::ECHILD => Ok(false),
         _ => Err(undelivered),
+    }
+}
+
+/// `waitid(P_PIDFD, pidfd, WEXITED | WNOHANG | WNOWAIT | __WALL)`: 0 if
+/// `pidfd` names a child of the calling process, running or exited and not
+/// yet reaped (reaping nothing), else -1 with errno set (ECHILD for any
+/// other process). Made as the raw system call rather than through the C
+/// library's wrapper, which POSIX does not list as async-signal-safe.
+fn waitid_pidfd(pidfd: libc::c_int) -> libc::c_long {
+    // SAFETY: an all-zero siginfo_t is a valid out-parameter; waitid(2)
+    // writes only `info`, and a null rusage asks for none.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::syscall(
+            libc::SYS_waitid,
+            libc::P_PIDFD,
+            pidfd,
+            &mut info as *mut libc::siginfo_t,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+            std::ptr::null_mut::<libc::rusage>(),
+        )
     }
 }
 
@@ -537,14 +549,7 @@ fn usable_pidfds(pid: libc::pid_t) -> bool {
             std::ptr::null::<libc::siginfo_t>(),
             0,
         ) == 0;
-        let mut info: libc::siginfo_t = std::mem::zeroed();
-        let waits = libc::waitid(
-            libc::P_PIDFD,
-            pidfd as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
-        ) == -1
-            && *libc::__errno_location() == libc::ECHILD;
+        let waits = waitid_pidfd(pidfd) == -1 && *libc::__errno_location() == libc::ECHILD;
         libc::close(pidfd);
         sends && waits
     }
