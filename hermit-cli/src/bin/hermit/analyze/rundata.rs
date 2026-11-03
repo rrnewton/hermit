@@ -1595,7 +1595,7 @@ impl AnalyzeOpts {
     /// from both replays each event as it was recorded. The default baseline,
     /// a run without chaos, never has any. (A `--run1-preemptions` analysis
     /// panics before its search on this base whatever it holds,
-    /// https://github.com/rrnewton/hermit/issues/4832.)
+    /// <https://github.com/rrnewton/hermit/issues/4832>.)
     ///
     /// Notes whether the analysis replays offsets
     /// (`replays_instruction_offsets`): its schedule replays then run without
@@ -1649,7 +1649,7 @@ impl AnalyzeOpts {
                 RecordedOffsets::Malformed => anyhow::bail!(
                     "{option} {}: {}",
                     path.display(),
-                    crate::run::malformed_offsets()
+                    crate::app::run::malformed_offsets()
                 ),
                 RecordedOffsets::Recorded => sources.push(format!("{option} {}", path.display())),
             }
@@ -1686,7 +1686,7 @@ impl AnalyzeOpts {
         // The trials' replays, which run without chaos.
         let mut replay = trial.det_opts.det_config.clone();
         replay.chaos = false;
-        if let Some(why) = crate::run::instruction_offset_replay_refusal(
+        if let Some(why) = crate::app::run::instruction_offset_replay_refusal(
             RecordedOffsets::Recorded,
             true,
             cfg!(target_arch = "aarch64"),
@@ -1736,7 +1736,7 @@ impl AnalyzeOpts {
         for (option, path) in
             Self::recordings_with_run_arguments(recordings, &trial.det_opts.det_config)
         {
-            crate::run::refuse_unread_record_format_of(option, path)?;
+            crate::app::run::refuse_unread_record_format_of(option, path)?;
         }
         Ok(())
     }
@@ -1936,8 +1936,8 @@ mod tests {
             assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
 
             let args =
-                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+                crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("not analyze")
             };
             options.apply_global(&args.global);
@@ -2026,8 +2026,9 @@ mod tests {
         assert_eq!(restated.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         restated.validate().unwrap();
 
-        let args = crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let args =
+            crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("not analyze")
         };
         options.apply_global(&args.global);
@@ -2057,7 +2058,7 @@ mod tests {
             let trial = RunData::get_raw_runopts(&options);
             let mut replay = trial.det_opts.det_config.clone();
             replay.chaos = false;
-            let guard = crate::run::instruction_offset_replay_refusal(
+            let guard = crate::app::run::instruction_offset_replay_refusal(
                 recorded,
                 true,
                 false,
@@ -2080,7 +2081,7 @@ mod tests {
                 let error = check.unwrap_err();
                 assert!(
                     error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
                         .is_some(),
                     "{what}: {error:#}"
                 );
@@ -2148,8 +2149,8 @@ mod tests {
             (&legacy, RecordedOffsets::RowsOnly),
         ] {
             let args =
-                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+                crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("not analyze")
             };
             options.apply_global(&args.global);
@@ -2169,7 +2170,7 @@ mod tests {
                 let trial = RunData::get_raw_runopts(&options);
                 let mut replay = trial.det_opts.det_config.clone();
                 replay.chaos = false;
-                let guard = crate::run::instruction_offset_replay_refusal(
+                let guard = crate::app::run::instruction_offset_replay_refusal(
                     recorded,
                     true,
                     false,
@@ -2186,7 +2187,7 @@ mod tests {
                     let error = check.unwrap_err();
                     assert!(
                         error
-                            .downcast_ref::<crate::container::PolicyRefusal>()
+                            .downcast_ref::<crate::app::container::PolicyRefusal>()
                             .is_some(),
                         "prefix of {len}: {error:#}"
                     );
@@ -2197,7 +2198,7 @@ mod tests {
 
     /// A whole-schedule trial of a recording with instruction offsets takes
     /// its jumps from that recording: the trial cache tells recordings apart
-    /// by their events' offsets too (`crate::time_skip_carry`), so S in format
+    /// by their events' offsets too (`crate::app::time_skip_carry`), so S in format
     /// 3 (the format below the offsets format) and T in `INSTRUCTION_OFFSET_FORMAT`
     /// with an offset, over the same branches and with
     /// other jumps, never lend each other their jumps, written and read back,
@@ -2237,8 +2238,8 @@ mod tests {
         let output = directory.path().join("trial.json");
         for order in [[&s, &t], [&t, &s]] {
             let args =
-                crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+                crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("not analyze")
             };
             options.apply_global(&args.global);

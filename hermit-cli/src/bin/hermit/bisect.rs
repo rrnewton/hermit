@@ -351,7 +351,7 @@ mod tests {
         fs::write(&good_path, good.to_string()).unwrap();
         fs::write(&bad_path, bad.to_string()).unwrap();
         let prepare = |bad_path: &Path| {
-            let args = crate::Args::try_parse_from([
+            let args = crate::app::Args::try_parse_from([
                 "hermit".to_owned(),
                 "bisect".to_owned(),
                 format!("--good={}", good_path.display()),
@@ -363,7 +363,7 @@ mod tests {
                 "/bin/true".to_owned(),
             ])
             .unwrap();
-            let crate::Subcommand::Bisect(options) = args.command else {
+            let crate::app::Subcommand::Bisect(options) = args.command else {
                 panic!("expected bisect")
             };
             options.prepare(&args.global)
@@ -372,9 +372,9 @@ mod tests {
         assert!(analyzer.replays_instruction_offsets);
         assert_eq!(bad_events[0].instruction_offset, Some(offset));
         analyzer.tmp_dir = Some(dir.path().to_path_buf());
-        let raw = crate::analyze::rundata::RunData::get_raw_runopts(&analyzer);
+        let raw = crate::app::analyze::rundata::RunData::get_raw_runopts(&analyzer);
         assert!(raw.det_opts.det_config.chaos);
-        let trial = crate::analyze::rundata::RunData::new(&analyzer, "trial".to_owned(), raw)
+        let trial = crate::app::analyze::rundata::RunData::new(&analyzer, "trial".to_owned(), raw)
             .with_schedule_replay_from(bad_path.clone())
             .into_runopts();
         assert!(!trial.det_opts.det_config.chaos);
