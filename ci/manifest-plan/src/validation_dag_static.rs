@@ -1223,8 +1223,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // The retry stack adds three: 1929 + 3 = 1932, re-measured 2026-10-31.
-    // And manifest-plan's the_pmu_analyze_node_runs_the_ignored_analyze_integrations: 1933.
-    ("test.regular_crates", 1933),
+    // And detcore-model's access_trace::tests::an_open_note_reads_with_or_without_its_kind: 1933.
+    // And manifest-plan's the_pmu_analyze_node_runs_the_ignored_analyze_integrations: 1934.
+    ("test.regular_crates", 1934),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4630,7 +4631,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And access_trace::a_trace_names_the_settings_that_leave_descriptors_untyped: 747.
     // And access_trace's a_futex_ping_pong_yields_alternating_wake_edges and
     // signal_child_exit_and_join_edges_name_their_events: 747 + 2 = 749.
-    ("test.cli", 749),
+    // And access_trace::an_open_note_names_the_opened_files_path_and_kind: 750.
+    ("test.cli", 750),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5206,11 +5208,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same pipe-records test, not excluded: 665.
     // And the same untyped-descriptor header test, not excluded: 666.
     // And the same two synchronization edge tests, not excluded: 666 + 2 = 668.
-    ("test.cli_on_host", 668),
+    // And the same open-note test, not excluded: 669.
+    ("test.cli_on_host", 669),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
-    // And the same PMU analyze node unit: 1919.
-    ("test.regular_crates_on_host", 1919),
+    // And the same open-note unit: 1919.
+    // And the same PMU analyze node unit: 1920.
+    ("test.regular_crates_on_host", 1920),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6382,7 +6386,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // The retry stack: the same three added cases: 1932 - 14 = 1918.
     // And the same PMU analyze node unit: 1919.
-    ("test.regular_crates_on_host", 1919),
+    // And the same open-note unit: 1920.
+    ("test.regular_crates_on_host", 1920),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
