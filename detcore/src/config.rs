@@ -221,7 +221,7 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4885; revision 20 at its base,
         // renumbered to 27 after main's 26 at the drain rebase; digests measured
         // at this head).
-        (27, "956e7e45a14ae3e9", "f013e36743d8d9e6"),
+        (27, "accc0f2bf315aeb0", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
