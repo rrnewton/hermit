@@ -1975,7 +1975,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And analyze::races::tests::a_channel_the_trace_does_not_create_gives_no_edge: 1399.
     // And analyze::races::tests::{a_pipe_a_tee_reads_or_a_vmsplice_fills_gives_no_edge,
     // a_sigkill_through_tgkill_ends_the_whole_thread_group}: 1401.
-    ("test.hermit_unit", 1401),
+    // And analyze::races::tests::{a_packet_pipe_gives_no_edge,
+    // a_pipe_write_larger_than_pipe_buf_gives_no_edge,
+    // a_sigkill_through_tgkill_reaches_a_group_member_that_made_no_call}: 1404.
+    ("test.hermit_unit", 1404),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4562,7 +4565,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
     // The retry stack adds one cli case: 744 + 1 = 745.
-    ("test.cli", 745),
+    // And access_trace::the_trace_shows_what_leaves_a_pipes_data_edges_out: 746.
+    ("test.cli", 746),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5135,7 +5139,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
     // The same retry-stack cli case: 663 + 1 = 664.
-    ("test.cli_on_host", 664),
+    // And the same pipe-records test, not excluded: 665.
+    ("test.cli_on_host", 665),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
     // And the same PMU analyze node unit: 1919.
@@ -6063,7 +6068,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same wait-ranking test: 1392.
     // And the same uncreated-channel test: 1393.
     // And the same tee/vmsplice and tgkill tests: 1395.
-    ("test.hermit_unit_on_host", 1395),
+    // And the same packet-pipe, large-write and silent-member tests: 1398.
+    ("test.hermit_unit_on_host", 1398),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
