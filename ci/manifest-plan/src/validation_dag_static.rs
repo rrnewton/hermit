@@ -1270,7 +1270,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fbf9d5f0c: 1946 + 5 = 1951.
     // Rebased onto main c1f3085da: 1950 + 5 = 1955.
     // Rebased onto main fcd62385f: 1951 + 5 = 1956.
-    ("test.regular_crates", 1956),
+    // And detcore-model's
+    // schedule::sched_event_tests::a_rip_cannot_be_set_on_a_slice_end_taken_without_a_stop
+    // (the same pull request's review): 1951 + 1 = 1952.
+    // Rebased onto main c1f3085da: 1955 + 1 = 1956.
+    // Rebased onto main fcd62385f: 1956 + 1 = 1957.
+    ("test.regular_crates", 1957),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3295,7 +3300,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fbf9d5f0c: 3444 + 2 = 3446.
     // Rebased onto main c1f3085da: 3469 + 2 = 3471.
     // Rebased onto main fcd62385f: 3470 + 2 = 3472.
-    ("test.detcore_unit", 3472),
+    // And preemptions::tests::contradictory_stopless_marks_are_refused_where_records_are_built_written_and_read
+    // and boundary_recording's a_stopless_mark_is_rejected_on_new_format_read
+    // (the same pull request's review): 3446 + 2 = 3448.
+    // Rebased onto main c1f3085da: 3471 + 2 = 3473.
+    // Rebased onto main fcd62385f: 3472 + 2 = 3474.
+    ("test.detcore_unit", 3474),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5318,7 +5328,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fbf9d5f0c: 1932 + 5 = 1937.
     // Rebased onto main c1f3085da: 1936 + 5 = 1941.
     // Rebased onto main fcd62385f: 1937 + 5 = 1942.
-    ("test.regular_crates_on_host", 1942),
+    // And the same detcore-model builder unit: 1937 + 1 = 1938.
+    // Rebased onto main c1f3085da: 1941 + 1 = 1942.
+    // Rebased onto main fcd62385f: 1942 + 1 = 1943.
+    ("test.regular_crates_on_host", 1943),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5876,7 +5889,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fbf9d5f0c: 3444 + 2 = 3446.
     // Rebased onto main c1f3085da: 3469 + 2 = 3471.
     // Rebased onto main fcd62385f: 3470 + 2 = 3472.
-    ("test.detcore_unit_on_host", 3472),
+    // And the same two stopless-mark refusal units: 3446 + 2 = 3448.
+    // Rebased onto main c1f3085da: 3471 + 2 = 3473.
+    // Rebased onto main fcd62385f: 3472 + 2 = 3474.
+    ("test.detcore_unit_on_host", 3474),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6550,7 +6566,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fbf9d5f0c: 1932 + 5 = 1937.
     // Rebased onto main c1f3085da: 1936 + 5 = 1941.
     // Rebased onto main fcd62385f: 1937 + 5 = 1942.
-    ("test.regular_crates_on_host", 1942),
+    // And the same detcore-model builder unit: 1937 + 1 = 1938.
+    // Rebased onto main c1f3085da: 1941 + 1 = 1942.
+    // Rebased onto main fcd62385f: 1942 + 1 = 1943.
+    ("test.regular_crates_on_host", 1943),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
