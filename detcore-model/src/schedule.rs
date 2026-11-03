@@ -111,8 +111,65 @@ impl SchedEvent {
     }
 
     /// Set the end_rip field.  The instruction pointer after the event completed.
+    /// An end taken without a stop (`stopless`) has none
+    /// ([`Self::stopless_mark_refusal`]).
     pub fn with_end_rip(mut self, end_rip: InstructionPointer) -> Self {
+        assert!(
+            !self.stopless,
+            "a slice end without a stop has no RIP: {self:?}"
+        );
         self.end_rip = Some(end_rip);
+        self
+    }
+
+    /// Why this event's `stopless` mark contradicts the rest of it, if it
+    /// does: only the branches up to a timeslice end are marked, and an end
+    /// taken without a stop has no `end_rip`, since the guest was not stopped
+    /// there. The builders refuse both (`taken_without_stop`,
+    /// `with_end_rip`), and so do the record writer and reader, so that no
+    /// record says an end was taken without a stop while it holds the RIP a
+    /// stop read.
+    pub fn stopless_mark_refusal(&self) -> Option<&'static str> {
+        if !self.stopless {
+            None
+        } else if self.op != Op::Branch {
+            Some("only the branches up to a timeslice end may be marked `stopless`")
+        } else if self.end_rip.is_some() {
+            Some(
+                "a timeslice end marked `stopless` has no end RIP: the guest was not stopped there",
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Whether the two events are the same operation by the same thread at
+    /// the same instruction pointers, whichever way each run took a timeslice
+    /// end there: a stop reads the `end_rip` that an end taken without one
+    /// (`stopless`) does not have. Counts and times are not compared. Not
+    /// transitive (two stops at different RIPs are each the same kind as the
+    /// end without one), so it compares two events and cannot key a hash.
+    pub fn same_kind(&self, other: &SchedEvent) -> bool {
+        let rips_known = !(self.stopless || other.stopless);
+        (self.dettid, self.op, self.start_rip) == (other.dettid, other.op, other.start_rip)
+            && (!rips_known || self.end_rip == other.end_rip)
+    }
+
+    /// [`SchedEvent::same_kind`], with the same count and time too: the same
+    /// guest operations, however each run took a timeslice end there.
+    pub fn same_operations(&self, other: &SchedEvent) -> bool {
+        self.same_kind(other) && (self.count, self.end_time) == (other.count, other.end_time)
+    }
+
+    /// Mark these branches as ending at a timeslice end taken without a stop
+    /// (`stopless`): they have no `end_rip`.
+    pub fn taken_without_stop(mut self) -> Self {
+        assert_eq!(self.op, Op::Branch, "only branches end at a timeslice end");
+        assert!(
+            self.end_rip.is_none(),
+            "a slice end without a stop has no RIP"
+        );
+        self.stopless = true;
         self
     }
 }
@@ -243,6 +300,108 @@ impl FromStr for SigWrapper {
 impl From<Signal> for SigWrapper {
     fn from(signal: Signal) -> Self {
         Self(signal as i32)
+    }
+}
+
+#[cfg(test)]
+mod sched_event_tests {
+    use super::*;
+
+    fn event(stopless: bool) -> SchedEvent {
+        SchedEvent {
+            end_time: Some(LogicalTime::from_nanos(1_250)),
+            stopless,
+            ..SchedEvent::branches(DetTid::from_raw(3), 100)
+        }
+    }
+
+    /// A record without slice ends taken without a stop is written exactly as
+    /// before the field existed, and a record written before then reads as
+    /// one whose every slice end had its stop.
+    #[test]
+    fn json_leaves_out_a_false_stopless_and_reads_its_absence_as_false() {
+        let before = r#"{"dettid":3,"op":"Branch","count":100,"start_rip":null,"end_rip":null,"end_time":1250}"#;
+        assert_eq!(serde_json::to_string(&event(false)).unwrap(), before);
+        assert_eq!(
+            serde_json::from_str::<SchedEvent>(before).unwrap(),
+            event(false)
+        );
+        let stopless = serde_json::to_string(&event(true)).unwrap();
+        assert_eq!(
+            stopless,
+            r#"{"dettid":3,"op":"Branch","count":100,"start_rip":null,"end_rip":null,"end_time":1250,"stopless":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SchedEvent>(&stopless).unwrap(),
+            event(true)
+        );
+    }
+
+    /// The RPC's encoding is positional: the field is written whatever its
+    /// value, and both values come back.
+    #[test]
+    fn a_binary_encoding_keeps_stopless_in_place() {
+        for stopless in [false, true] {
+            let pair = (event(stopless), 7u32);
+            let wire = bincode::serde::encode_to_vec(&pair, bincode::config::legacy()).unwrap();
+            let (back, _): ((SchedEvent, u32), usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(back, pair);
+        }
+    }
+
+    /// A stop and a stopless end at the same branch count are the same
+    /// operations; any other difference is not.
+    #[test]
+    fn same_operations_ignores_only_how_a_slice_end_was_taken() {
+        let stopped = SchedEvent {
+            end_rip: InstructionPointer::new(0x1000),
+            ..event(false)
+        };
+        assert!(stopped.same_operations(&event(true)));
+        assert!(event(true).same_operations(&stopped));
+        assert!(stopped.same_operations(&stopped.clone()));
+        let elsewhere = SchedEvent {
+            end_rip: InstructionPointer::new(0x2000),
+            ..stopped.clone()
+        };
+        assert!(!stopped.same_operations(&elsewhere));
+        let later = SchedEvent {
+            count: 101,
+            ..event(true)
+        };
+        assert!(!stopped.same_operations(&later));
+    }
+
+    #[test]
+    fn debug_shows_stopless_only_when_set() {
+        let plain = format!("{:?}", event(false));
+        assert_eq!(
+            plain,
+            "SchedEvent { dettid: DetPid(3), op: Branch, count: 100, start_rip: None, end_rip: None, end_time: Some(LogicalTime(1250)) }"
+        );
+        assert_eq!(
+            format!("{:?}", event(true)),
+            plain.replace(" }", ", stopless: true }")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a slice end without a stop has no RIP")]
+    fn a_slice_end_without_a_stop_has_no_rip() {
+        let _ = SchedEvent::branches(DetTid::from_raw(3), 1)
+            .with_end_rip(InstructionPointer::new(0x1000).unwrap())
+            .taken_without_stop();
+    }
+
+    /// Nor can a RIP be set on an end already marked as taken without a stop,
+    /// in the other order.
+    #[test]
+    #[should_panic(expected = "a slice end without a stop has no RIP")]
+    fn a_rip_cannot_be_set_on_a_slice_end_taken_without_a_stop() {
+        let _ = SchedEvent::branches(DetTid::from_raw(3), 1)
+            .taken_without_stop()
+            .with_end_rip(InstructionPointer::new(0x1000).unwrap());
     }
 }
 
