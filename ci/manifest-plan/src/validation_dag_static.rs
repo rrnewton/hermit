@@ -3301,7 +3301,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (wake unit + deferred-SIGCHLD negative arm).
     // PR 4796: six detcore units (watch arming, scheduler watch
     // summary, access-trace watch, fingerprint layout): 3524 + 6 = 3530.
-    ("test.detcore_unit", 3530),
+    // Its F1 fix adds one (a thread with only hits after arming): 3531.
+    ("test.detcore_unit", 3531),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5959,8 +5960,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
-    // PR 4796: the same six units (same growth as test.detcore_unit).
-    ("test.detcore_unit_on_host", 3530),
+    // PR 4796: the same seven units (same growth as test.detcore_unit).
+    ("test.detcore_unit_on_host", 3531),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
