@@ -2492,7 +2492,7 @@ impl AnalyzeOpts {
         if !self.target_exit_code.is_match(out.status) {
             misses.push(format!(
                 "  Exit code {} is not what we're looking for.",
-                crate::analyze::types::run_exit_code(out.status)
+                crate::app::analyze::types::run_exit_code(out.status)
             ));
         }
         misses
@@ -3691,94 +3691,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
-=======
-    /// `--minimize`'s baseline knock-out removes a real intervention each
-    /// time: the latest priority change, then whole threads, never a thread
-    /// left at the default priority (which would change nothing), and gives
-    /// up when none is left. Before, the records later knock-outs start
-    /// from (recorded runs) named every thread, and once no priority change
-    /// was left a knock-out could remove one of those, changing nothing.
-    #[test]
-    fn the_baseline_knock_out_removes_a_real_intervention_until_none_is_left() {
-        use std::collections::BTreeMap;
-
-        use detcore::types::LogicalTime;
-        let at = LogicalTime::from_nanos;
-        let record = PreemptionRecord::from_vecs(&BTreeMap::from([
-            (DetTid::from_raw(3), vec![(at(0), 4923), (at(500), 1200)]),
-            (DetTid::from_raw(5), vec![(at(0), 352)]),
-            (DetTid::from_raw(9), vec![]),
-        ]));
-        let threads = |record: &PreemptionRecord| -> Vec<u32> {
-            record
-                .extract_all()
-                .keys()
-                .map(|tid| tid.as_raw() as u32)
-                .collect()
-        };
-        let first = knock_out_latest(&record).unwrap();
-        assert_eq!(threads(&first), [3, 5], "thread 9 had nothing to knock out");
-        assert_ne!(
-            first,
-            record.without_default_threads(),
-            "the knock-out changed the record"
-        );
-        let mut knocked = first;
-        let mut steps = 1;
-        while let Some(next) = knock_out_latest(&knocked) {
-            assert!(!threads(&next).contains(&9));
-            knocked = next;
-            steps += 1;
-            assert!(steps < 10, "the knock-outs do not end");
-        }
-        assert_eq!(
-            threads(&knocked.without_default_threads()),
-            Vec::<u32>::new()
-        );
-    }
-
-    /// `--minimize`'s baseline search knocks out one more intervention of the
-    /// record it last replayed each time, until a replay misses the target or
-    /// none is left; it never starts again from a run's own recording, which
-    /// holds more priority changes than it replayed. Before, a target whose
-    /// replays kept meeting the target knocked out chaos's own changes
-    /// without end.
-    #[test]
-    fn the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses() {
-        use std::collections::BTreeMap;
-
-        use detcore::types::LogicalTime;
-        let at = LogicalTime::from_nanos;
-        let record = PreemptionRecord::from_vecs(&BTreeMap::from([
-            (DetTid::from_raw(3), vec![(at(0), 4923), (at(500), 1200)]),
-            (DetTid::from_raw(5), vec![(at(0), 352)]),
-        ]));
-        let mut replayed = Vec::new();
-        let missed = knock_out_until_missed(record.clone(), |attempt, knocked_out| {
-            replayed.push(knocked_out.clone());
-            Ok((attempt == 2).then_some(attempt))
-        })
-        .unwrap();
-        assert_eq!(missed, 2);
-        assert_eq!(replayed[0], knock_out_latest(&record).unwrap());
-        assert_eq!(replayed[1], knock_out_latest(&replayed[0]).unwrap());
-
-        let mut attempts = 0;
-        let error = knock_out_until_missed(record, |_, _| {
-            attempts += 1;
-            Ok(None::<()>)
-        })
-        .unwrap_err();
-        assert!(
-            error.downcast_ref::<NothingToKnockOut>().is_some(),
-            "{error:#}"
-        );
-        assert!(
-            attempts == 3,
-            "{attempts} knock-outs for three interventions"
-        );
-    }
 
     /// `--target-exit-code` compares the code `hermit run` exits with: the
     /// guest's own, or 128 plus the signal number. Before, it compared the
@@ -3820,7 +3732,6 @@ mod tests {
         assert_eq!(missed, ["  Exit code 121 is not what we're looking for."]);
     }
 
->>>>>>> a3419f4e8bf (analyze: compare --target-exit-code with the code hermit run exits with)
     /// A report written before the deciding event was reported still reads.
     #[test]
     fn a_report_without_a_deciding_event_reads() {
