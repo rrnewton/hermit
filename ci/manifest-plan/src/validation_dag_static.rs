@@ -3393,7 +3393,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main e8e0f9a1c: 209 + 4 = 213.
     // And a file without a copy refused through an outside hard link: 213.
     // Rebased onto main e8e0f9a1c: 213 + 1 = 214.
-    ("test.detcore_misc", 214),
+    // And property_snapshot's two readable-open refusals
+    // (https://github.com/rrnewton/hermit/pull/4791): 213 + 2 = 215.
+    // Rebased onto main e8e0f9a1c: 214 + 2 = 216.
+    ("test.detcore_misc", 216),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5470,7 +5473,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main e8e0f9a1c: 209 + 4 = 213.
     // And the uncopied-file alias refusal: 213.
     // Rebased onto main e8e0f9a1c: 213 + 1 = 214.
-    ("test.detcore_misc_on_host", 214),
+    // And the same two readable-open refusals: 213 + 2 = 215.
+    // Rebased onto main e8e0f9a1c: 214 + 2 = 216.
+    ("test.detcore_misc_on_host", 216),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
