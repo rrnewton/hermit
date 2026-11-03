@@ -2027,7 +2027,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And analyze::races::tests::{a_packet_pipe_gives_no_edge,
     // a_pipe_write_larger_than_pipe_buf_gives_no_edge,
     // a_sigkill_through_tgkill_reaches_a_group_member_that_made_no_call}: 1294.
-    ("test.hermit_unit", 1294),
+    // And analyze::races::tests::a_pipe_with_a_descriptor_from_an_unfollowed_route_gives_no_edge: 1295.
+    ("test.hermit_unit", 1295),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6345,7 +6346,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same uncreated-channel test: 1283.
     // And the same tee/vmsplice and tgkill tests: 1285.
     // And the same packet-pipe, large-write and silent-member tests: 1288.
-    ("test.hermit_unit_on_host", 1288),
+    // And the same unfollowed-route test: 1289.
+    ("test.hermit_unit_on_host", 1289),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
