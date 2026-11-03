@@ -1217,6 +1217,47 @@ mod tests {
         );
     }
 
+    /// Only a local, untyped symbol is a mapping symbol: an ordinary global
+    /// label named `$x…` inside a `$d` constant table does not start a code
+    /// range there, so the table keeps its bytes. A real local `$x` there
+    /// does, which is the control.
+    #[test]
+    fn a_global_symbol_named_like_a_mapping_symbol_does_not_split_a_table() {
+        // Code at 0x100, then the same words as a `$d` table at 0x118,
+        // with a third mark at 0x11c, inside the table.
+        let words: Vec<u32> = LOOP.iter().chain(LOOP.iter()).copied().collect();
+        let inside = 0x100 + 4 * 7;
+        let split = elf_image(&words, Some(&[(1, 0, true), (1, 6, false), (1, 7, true)]));
+        let (bytes, report) = rewritten(&split);
+        assert_eq!(
+            report.patched_total(),
+            2,
+            "a local $x inside the table makes its loop code: {report:?}"
+        );
+        assert_ne!(bytes[0x11c..0x130], split[0x11c..0x130]);
+
+        // The same file with that symbol's binding changed to STB_GLOBAL:
+        // an ordinary label, so the `$d` range runs on.
+        let local = mapping::tests::symbol(1, 0, 1, inside);
+        let at = split
+            .windows(local.len())
+            .position(|window| window == local)
+            .expect("the mark is in the symbol table");
+        let mut global = split.clone();
+        global[at..at + local.len()].copy_from_slice(&mapping::tests::symbol(1, 0x10, 1, inside));
+        let (bytes, report) = rewritten(&global);
+        assert_eq!(
+            report.patched_total(),
+            1,
+            "a global $x does not split the table: {report:?}"
+        );
+        assert_eq!(
+            bytes[0x118..0x130],
+            global[0x118..0x130],
+            "the table keeps its bytes"
+        );
+    }
+
     /// A relocatable object's FDE starts are relocations to fill, so its
     /// unwind table is no evidence.
     #[test]
