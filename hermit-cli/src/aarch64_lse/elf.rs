@@ -41,14 +41,17 @@
 //!   addresses as data (an `LDR` (literal), `ADR` or `ADRP` target) is taken
 //!   for data from there to the next instruction a branch reaches, or the
 //!   function's end, and no sequence over it is rewritten
-//!   (`addressed-data-inside-the-sequence`). Two things are still taken for
-//!   code wrongly. Data after a call that does not return which no
-//!   instruction of the file addresses: a pointer stored outside the code (a
-//!   relocation or a symbol) or an address computed from an unrelated base
-//!   would be needed to read it. And the rest of a table whose first word a
-//!   branch could reach: a data word before the field the code addresses can
-//!   decode as a branch into the table, and the next such target ends the
-//!   data, so the words after it are read as code again.
+//!   (`addressed-data-inside-the-sequence`). A pointer the image stores to
+//!   such a table counts as well: a dynamic
+//!   relocation's address, a plain word of a loaded, non-executable section
+//!   in an executable with fixed addresses, or a symbol naming data in an
+//!   executable section. Two things are still taken for code wrongly. Data
+//!   neither the code addresses nor a stored pointer names, which would
+//!   need an address computed from an unrelated base to read. And the rest
+//!   of a table whose first word a branch could reach: a data word before
+//!   the field the code addresses can decode as a branch into the table,
+//!   and the next such target ends the data, so the words after it are read
+//!   as code again.
 //! - Neither: nothing. Such a section is left alone and reported, and so is
 //!   a whole file with neither mapping symbols nor an unwind table.
 //!
@@ -164,6 +167,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     // The byte ranges relocations cover, filled inside the block below, which
     // is where the parsed ELF lives.
     let relocated: Vec<(u64, u64)>;
+    // Addresses a pointer stored somewhere in the image holds, which the
+    // code can load and read as data ([`stored_pointers`]).
+    let pointers: Vec<u64>;
     let mut relr_unreadable = false;
     let (sections, functions) = {
         let elf = Elf::parse(bytes)?;
@@ -282,7 +288,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                 }
             })
             .collect::<Vec<_>>();
-        (sections, evidence.unwind.unwrap_or_default())
+        let unwind = evidence.unwind.unwrap_or_default();
+        pointers = stored_pointers(bytes, &elf, &unwind);
+        (sections, unwind)
     };
     // A direct branch in one executable section can target a sequence in
     // another, so collect each section's targets before planning any. A
@@ -336,6 +344,7 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                     })
             })
         };
+        starts.extend(pointers.iter().copied());
         starts.retain(unwind_only);
         mapping::data_extents(&starts, &functions, &branches)
     };
@@ -488,6 +497,139 @@ fn is_exclusive(word: u32) -> bool {
         insn::decode(word),
         insn::Insn::LoadExcl { .. } | insn::Insn::StoreExcl { .. } | insn::Insn::ExclPair
     )
+}
+
+/// The addresses pointers stored in the image hold that fall strictly
+/// inside one of `functions`: where a table is, when the code reads it
+/// through a pointer rather than addressing it itself (an argument, a
+/// global, a vtable). A function's own entry is a pointer to the function
+/// and says nothing.
+///
+/// Three places hold such a pointer, and each is read only where it is
+/// unambiguous:
+///
+/// - a dynamic relocation that the loader fills with an address: the addend
+///   of `R_AARCH64_RELATIVE`, the symbol's value plus the addend for
+///   `R_AARCH64_ABS64`, and, for the packed relative relocations
+///   (`SHT_RELR`), the link-time address the image already stores at the
+///   place each one names;
+/// - in an executable with fixed addresses (`ET_EXEC`), whose pointers need
+///   no relocation, every aligned 64-bit word of a section that is loaded
+///   and not executable;
+/// - a symbol that names data in an executable section (`STT_OBJECT`), in
+///   either symbol table.
+///
+/// What this cannot see is an address the code computes from an unrelated
+/// base, which no stored pointer and no instruction of the file names.
+fn stored_pointers(bytes: &[u8], elf: &Elf<'_>, functions: &[(u64, u64)]) -> Vec<u64> {
+    const R_AARCH64_ABS64: u32 = 257;
+    const R_AARCH64_RELATIVE: u32 = 1027;
+    const SHT_RELR: u32 = 19;
+    const STT_OBJECT: u8 = 1;
+    let inside = |addr: u64| {
+        let after = functions.partition_point(|(entry, _)| *entry <= addr);
+        after
+            .checked_sub(1)
+            .is_some_and(|i| functions[i].0 < addr && addr < functions[i].1)
+    };
+    let word_at = |addr: u64| -> Option<u64> {
+        // The file offset of an address, through the section that holds it.
+        let sh = elf.section_headers.iter().find(|sh| {
+            sh.sh_addr != 0
+                && sh.sh_type != section_header::SHT_NOBITS
+                && (sh.sh_addr..sh.sh_addr.saturating_add(sh.sh_size)).contains(&addr)
+        })?;
+        let at = usize::try_from(sh.sh_offset + (addr - sh.sh_addr)).ok()?;
+        bytes
+            .get(at..at.checked_add(8)?)
+            .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
+    };
+    let mut pointers = Vec::new();
+    let symbol_value = |index: usize| elf.dynsyms.get(index).map(|symbol| symbol.st_value);
+    for reloc in elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .chain(elf.pltrelocs.iter())
+    {
+        let addend = reloc.r_addend.unwrap_or(0) as u64;
+        match reloc.r_type {
+            R_AARCH64_RELATIVE => pointers.push(addend),
+            R_AARCH64_ABS64 => {
+                if let Some(value) = symbol_value(reloc.r_sym) {
+                    pointers.push(value.wrapping_add(addend));
+                }
+            }
+            _ => {}
+        }
+    }
+    for sh in elf
+        .section_headers
+        .iter()
+        .filter(|sh| sh.sh_type == SHT_RELR && sh.sh_size != 0)
+    {
+        let start = sh.sh_offset as usize;
+        let Some(end) = sh
+            .sh_offset
+            .checked_add(sh.sh_size)
+            .and_then(|end| usize::try_from(end).ok())
+            .filter(|end| *end <= bytes.len())
+        else {
+            continue;
+        };
+        // Each place a packed relocation names already holds the
+        // link-time address the loader will adjust.
+        pointers.extend(
+            decode_relr(&bytes[start..end])
+                .into_iter()
+                .filter_map(|(at, _)| word_at(at)),
+        );
+    }
+    if elf.header.e_type == goblin::elf::header::ET_EXEC {
+        for sh in elf.section_headers.iter().filter(|sh| {
+            sh.sh_type != section_header::SHT_NOBITS
+                && sh.sh_flags & u64::from(section_header::SHF_ALLOC) != 0
+                && sh.sh_flags & u64::from(section_header::SHF_EXECINSTR) == 0
+                && sh.sh_addr.is_multiple_of(8)
+        }) {
+            let start = sh.sh_offset as usize;
+            let Some(section) = usize::try_from(sh.sh_size)
+                .ok()
+                .and_then(|size| bytes.get(start..start.checked_add(size)?))
+            else {
+                continue;
+            };
+            pointers.extend(
+                section
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|word| u64::from_le_bytes(*word)),
+            );
+        }
+    }
+    let executable: Vec<(u64, u64)> = elf
+        .section_headers
+        .iter()
+        .filter(|sh| sh.sh_flags & u64::from(section_header::SHF_EXECINSTR) != 0)
+        .map(|sh| (sh.sh_addr, sh.sh_addr.saturating_add(sh.sh_size)))
+        .collect();
+    pointers.extend(
+        elf.dynsyms
+            .iter()
+            .chain(elf.syms.iter())
+            .filter(|symbol| symbol.st_info & 0xf == STT_OBJECT)
+            .map(|symbol| symbol.st_value)
+            .filter(|value| {
+                executable
+                    .iter()
+                    .any(|(start, end)| (*start..*end).contains(value))
+            }),
+    );
+    pointers.retain(|address| inside(*address));
+    pointers.sort_unstable();
+    pointers.dedup();
+    pointers
 }
 
 /// What tells an ELF image's code from its data ([`mapping::CodeEvidence`]):
@@ -711,6 +853,18 @@ mod tests {
         marks: Option<&[(u16, usize, bool)]>,
         functions: Option<&[(usize, usize)]>,
     ) -> Vec<u8> {
+        elf_image_full(words, marks, functions, &[])
+    }
+
+    /// [`elf_image_with`] plus, when `pointers` is not empty, a loaded,
+    /// non-executable `.data` section holding the address of each named
+    /// word of `.text`, as a program stores a pointer to a table.
+    fn elf_image_full(
+        words: &[u32],
+        marks: Option<&[(u16, usize, bool)]>,
+        functions: Option<&[(usize, usize)]>,
+        pointers: &[usize],
+    ) -> Vec<u8> {
         const TEXT: usize = 0x100;
         let text_len = 4 * words.len();
         let shstrtab = b"\0.text\0.shstrtab\0.symtab\0.strtab\0.eh_frame\0";
@@ -736,8 +890,13 @@ mod tests {
             mapping::tests::eh_frame(eh_frame_at as u64, &functions)
         });
         let eh_frame_len = eh_frame.as_ref().map_or(0, Vec::len);
-        let sections = 3 + if marks.is_some() { 2 } else { 0 } + usize::from(eh_frame.is_some());
-        let shoff = (eh_frame_at + eh_frame_len).next_multiple_of(8);
+        let data_at = (eh_frame_at + eh_frame_len).next_multiple_of(8);
+        let data_len = 8 * pointers.len();
+        let sections = 3
+            + if marks.is_some() { 2 } else { 0 }
+            + usize::from(eh_frame.is_some())
+            + usize::from(!pointers.is_empty());
+        let shoff = (data_at + data_len).next_multiple_of(8);
         let total = shoff + sections * 64;
         let mut bytes = vec![0u8; total];
         let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
@@ -773,6 +932,13 @@ mod tests {
         if let Some(eh_frame) = &eh_frame {
             put(&mut bytes, eh_frame_at, eh_frame);
         }
+        for (i, word) in pointers.iter().enumerate() {
+            put(
+                &mut bytes,
+                data_at + 8 * i,
+                &((TEXT + 4 * word) as u64).to_le_bytes(),
+            );
+        }
         // Section headers: null, .text (PROGBITS, ALLOC | EXECINSTR),
         // .shstrtab, and with marks .symtab (linked to 4) and .strtab.
         let header = |bytes: &mut Vec<u8>, index: usize, fields: [u64; 8]| {
@@ -807,6 +973,14 @@ mod tests {
         if eh_frame.is_some() {
             // .eh_frame: PROGBITS, ALLOC, mapped at its file offset.
             let (at, len) = (eh_frame_at as u64, eh_frame_len as u64);
+            let index = sections - 1 - usize::from(!pointers.is_empty());
+            header(&mut bytes, index, [33, 1, 2, at, at, len, 0, 0]);
+        }
+        if !pointers.is_empty() {
+            // The pointers' section: PROGBITS, ALLOC, not executable,
+            // mapped at its file offset. It borrows `.eh_frame`'s name,
+            // which nothing here reads.
+            let (at, len) = (data_at as u64, data_len as u64);
             header(&mut bytes, sections - 1, [33, 1, 2, at, at, len, 0, 0]);
         }
         bytes
@@ -1256,6 +1430,46 @@ mod tests {
             global[0x118..0x130],
             "the table keeps its bytes"
         );
+    }
+
+    /// A table the code reaches only through a pointer stored elsewhere: no
+    /// instruction of the file addresses it, so only the pointer says where
+    /// the data is. In an executable with fixed addresses that pointer is a
+    /// plain word of a loaded, non-executable section.
+    #[test]
+    fn a_table_a_stored_pointer_names_is_not_rewritten() {
+        // ldr w1, [x0]; mov w2, #0; cbz w2, <word 8>; the loop-shaped
+        // table; ret; brk. Nothing addresses the table.
+        let mut words = [0u32; 10];
+        words[0] = 0xb940_0001; // ldr w1, [x0]: through the argument
+        words[1] = 0x5280_0002; // mov w2, #0
+        words[2] = 0x3400_00c2; // cbz w2, <word 8>: always taken, but not
+        words[3..7].copy_from_slice(&[0x885f_fc08, 0x1100_0508, 0x8809_fc08, 0x35ff_ffa9]);
+        words[7] = 0xd503_201f; // nop
+        words[8] = 0xd65f_03c0; // ret
+        words[9] = 0xd420_0000; // brk
+        let functions = [(0, 9), (9, 10)];
+        // Without the pointer the table is taken for code, which is the
+        // limit this test's fixture otherwise shares with the others.
+        let bare = elf_image_with(&words, None, Some(&functions));
+        assert_eq!(rewritten(&bare).1.patched_total(), 1);
+
+        // An ET_EXEC image storing the table's address in its data.
+        let mut image = elf_image_full(&words, None, Some(&functions), &[3]);
+        image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("addressed-data-inside-the-sequence", 1)]),
+            "{report:?}"
+        );
+
+        // A stored pointer to a function's entry is a pointer to the
+        // function, not to data.
+        let mut entry = elf_image_full(&words, None, Some(&functions), &[0]);
+        entry[16..18].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(rewritten(&entry).1.patched_total(), 1);
     }
 
     /// A relocatable object's FDE starts are relocations to fill, so its
