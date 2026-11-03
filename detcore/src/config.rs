@@ -87,9 +87,9 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
-    /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
-    /// with its row. Remove an entry when its change lands, with its row.
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 28 for the pending 4789
+    /// change, which 4884's 29 skips. Remove an entry when its change
+    /// lands, with its row.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[28];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
@@ -228,7 +228,7 @@ mod tests {
         // run tally and reporting; renumbered to 29 at its rebase onto
         // main's 27, skipping 28 reserved for the pending 4789 change;
         // digest measured at this head).
-        (29, "05a9f7a4ca16cde1", "f013e36743d8d9e6"),
+        (29, "5980911bfa1c92db", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
