@@ -234,14 +234,15 @@ fn shared_mapping_under(
 /// records: none for a mapping that is not `MAP_SHARED` (`captured` is
 /// `None`), the captured identity for one that is. A `MAP_SHARED` mapping
 /// whose identity could not be captured is recorded without one, and the
-/// recording is marked as one replay refuses, with the reason
-/// (`detcore::detlog::record_replay_refusal`): replay would otherwise map it
-/// as a separate copy, which shares no memory with the file's other
-/// mappings, and the replay would diverge silently wherever the guest relies
-/// on that sharing.
+/// recording is marked as one replay refuses: `refuse` gets the reason, and
+/// the recorder passes `detcore::detlog::record_replay_refusal`. Replay would
+/// otherwise map it as a separate copy, which shares no memory with the
+/// file's other mappings, and the replay would diverge silently wherever the
+/// guest relies on that sharing.
 fn recorded_shared(
     fd: i32,
     captured: Option<Result<SharedMapping, String>>,
+    refuse: impl FnOnce(&str),
 ) -> Option<SharedMapping> {
     match captured? {
         Ok(shared) => Some(shared),
@@ -252,7 +253,7 @@ fn recorded_shared(
                  mappings"
             );
             tracing::error!("{reason}");
-            detcore::detlog::record_replay_refusal(&reason);
+            refuse(&reason);
             None
         }
     }
@@ -321,7 +322,7 @@ impl Recorder {
                     Ok(SyscallEvent::Mmap(MmapEvent {
                         addr: addr.as_raw(),
                         buf,
-                        shared: recorded_shared(fd, shared),
+                        shared: recorded_shared(fd, shared, detcore::detlog::record_replay_refusal),
                     }))
                 }
                 Err(errno) => Err(errno),
@@ -460,6 +461,9 @@ mod tests {
     /// refuses, naming the descriptor and the failure: replay would map it as
     /// a separate copy. A captured identity is recorded as is, and a mapping
     /// that is not `MAP_SHARED` records none; neither marks the recording.
+    /// The refusal goes to a local sink rather than the process-wide one
+    /// (`detcore::detlog::record_replay_refusal`, whose first reason wins), so
+    /// the case leaves that store alone for the other tests in the process.
     #[test]
     fn a_shared_mapping_without_its_identity_leaves_a_recording_replay_refuses() {
         let shared = SharedMapping {
@@ -468,19 +472,24 @@ mod tests {
             offset: 0,
             access: libc::O_RDWR,
         };
-        assert_eq!(recorded_shared(3, None), None);
-        assert_eq!(recorded_shared(3, Some(Ok(shared))), Some(shared));
-        assert_eq!(detcore::detlog::replay_refusal(), None);
+        let refusals = std::cell::RefCell::new(Vec::new());
+        let refuse = |reason: &str| refusals.borrow_mut().push(reason.to_owned());
+        assert_eq!(recorded_shared(3, None, refuse), None);
+        assert_eq!(recorded_shared(3, Some(Ok(shared)), refuse), Some(shared));
+        assert!(refusals.borrow().is_empty(), "{:?}", refusals.borrow());
         assert_eq!(
             recorded_shared(
                 3,
                 Some(Err(
                     "/proc/7/fdinfo/3: Too many open files (os error 24)".to_owned()
-                ))
+                )),
+                refuse,
             ),
             None
         );
-        let refusal = detcore::detlog::replay_refusal().expect("no replay refusal recorded");
+        let refusals = refusals.into_inner();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        let refusal = &refusals[0];
         assert!(
             refusal.contains("MAP_SHARED mapping of descriptor 3")
                 && refusal.contains("Too many open files"),
