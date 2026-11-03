@@ -7992,8 +7992,9 @@ pub enum SignalScope {
 /// Detcore and a coordinator built at different revisions refuse each other
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
-/// fails until it does). That test digests the two enums' bodies and
-/// `Resources`, and refuses a revision whose digests did not change, so no
+/// fails until it does). That test digests the two enums' bodies,
+/// `Resources`, the StoreExclusive payload's types and the nested
+/// `HostFileIdentity`, and refuses a revision whose digests did not change, so no
 /// revision can be appended by hand. A change to another payload type defined
 /// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
 /// is on the wire without changing the digest, so it must either keep every
@@ -8013,9 +8014,12 @@ pub enum SignalScope {
 // pair (both landed in batch D2).
 /// https://github.com/rrnewton/hermit/pull/4728's `SchedEvent::stopless`
 /// and `ReplayedSliceEnd` are revision 30, reserved for this change by the
-/// D2 seal; the combined layout on top of 31 appends revision 32, which is
-/// the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 32;
+/// D2 seal; the combined layout on top of 31 appends revision 32.
+/// 36 appends `HostFileIdentity::content` (PR #4791) on top of 32,
+/// skipping 33 to 35 reserved for pending changes
+/// (`ignored/drain-20261103/rpc-revisions.tsv` in the dev-hermit parent),
+/// and is the current revision.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 36;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
