@@ -6407,7 +6407,7 @@ sys.exit(37)
     }
 
     /// The PMU analyze node retains exactly the six other ignored integrations
-    /// plus the race finder's two, while hello-race pinpointing is excluded
+    /// plus the race finder's two and the verdict change's two, while hello-race pinpointing is excluded
     /// for its tracked failure.
     #[test]
     fn the_pmu_analyze_node_runs_the_ignored_analyze_integrations() {
@@ -6422,6 +6422,9 @@ sys.exit(37)
             // The race finder's.
             "analyze_checks_the_race_candidates_and_says_what_each_edit_moved",
             "analyze_names_the_close_racing_the_reused_descriptor",
+            // The verdict change's.
+            "bisect_exits_2_when_its_good_schedule_meets_the_target",
+            "analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule",
         ];
         for case in cases {
             assert!(
@@ -6457,7 +6460,7 @@ sys.exit(37)
                 format!("{expected_filter}' -- --ignored"),
                 "{origin}"
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "8", "{origin}");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "10", "{origin}");
             assert!(
                 !step.cmd.contains("test(=analyze_hello_race)"),
                 "{origin}: excluded hello-race must not run"
