@@ -1006,14 +1006,9 @@ pub(crate) mod native {
                 .unwrap()
                 .starts_with(fs::canonicalize(&nested).unwrap())
         );
-        let sources = if liteinst {
-            sources
-        } else {
-            let build_command = runner.commands.last().unwrap();
-            sources
-                .with_current_build(build_command, &runtime_path, &nested)
-                .unwrap_or_else(|error| panic!("actual native compiler evidence refused: {error}"))
-        };
+        // Main's Reverie pin has no current-build rebinding factory: the
+        // resolved verified sources above are themselves the qualification
+        // context for both the LiteInst and trap-only builds, as on main.
         sources.verify_unchanged(&mut runner).unwrap();
         let qualification = qualifier::qualify_detcore_native_entry_with_sources(
             &runtime_path,

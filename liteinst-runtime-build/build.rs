@@ -296,20 +296,9 @@ fn main() {
         .expect("failed to read retained runtime Cargo diagnostics");
     qualifier::write_new(&evidence.join("cargo-build.stderr"), &build_stderr)
         .expect("failed to retain runtime Cargo diagnostics");
-    let compiled_sources = if !liteinst && !allocator_fixture {
-        // Only this measured mode has no compiled installation-scope callers.
-        // Enabled and diagnostic leaves retain their complete TLS proof.
-        compiled_sources
-            .with_standalone_current_build(
-                &build_command,
-                &candidate,
-                &nested_target,
-                &mut build_runner,
-            )
-            .unwrap_or_else(|error| panic!("actual standalone compiler evidence refused: {error}"))
-    } else {
-        compiled_sources
-    };
+    // Main's Reverie pin has no current-build rebinding factory: the
+    // resolved verified sources above are themselves the qualification
+    // context for both the LiteInst and trap-only builds, as on main.
     let mut runner = qualifier::Runner::new(
         evidence.join("logs"),
         Duration::from_secs(60),
