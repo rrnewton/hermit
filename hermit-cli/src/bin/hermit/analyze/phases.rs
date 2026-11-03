@@ -1313,23 +1313,24 @@ impl AnalyzeOpts {
     /// continuation of a record's first `len` events and `stack` each
     /// stack-trace replay (its name, record, length and the event to take
     /// the stack at), both giving completed outcomes or ending the analysis.
-    fn report_timing_decision_with(
+    fn report_timing_decision_with<C, S>(
         &self,
         schedule: &PreemptionRecord,
         decision: usize,
         continuation: MaybeTimeslice,
         (target_met, deciding): (bool, &Option<PrettyBacktrace>),
         (continued, continued_path): (&[SchedEvent], &Path),
-        (continue_target, stack): (
-            impl FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
-            impl Fn(
-                &str,
-                &PreemptionRecord,
-                usize,
-                usize,
-            ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
-        ),
-    ) -> anyhow::Result<Option<Report>> {
+        (continue_target, stack): (C, S),
+    ) -> anyhow::Result<Option<Report>>
+    where
+        C: FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
+        S: Fn(
+            &str,
+            &PreemptionRecord,
+            usize,
+            usize,
+        ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
+    {
         let events = schedule.schedevents();
         let thread = events[decision].dettid;
         let (target_completed, target_continued_path) = continue_target(schedule, decision + 1)?;
