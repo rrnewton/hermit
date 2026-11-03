@@ -1,7 +1,9 @@
 #!/usr/bin/env -S rust-script --force
 //! Build both genuine diagnostic leaves and separate M1/M2/constructor guests.
 //! The official DAG owns CPU/memory/cgroup limits. This producer owns a shared
-//! 900-second child deadline, process groups and 64-MiB command stream caps.
+//! 900-second wall backstop, a 900 CPU-second per-command work bound (so load
+//! stretches wall without killing progressing builds), process groups and
+//! 64-MiB command stream caps.
 //! It does not run guests or replace the normal prepared Hermit/resource tree.
 //! ```cargo
 //! [dependencies]
@@ -214,9 +216,16 @@ fn build_leaf(
     let name = if standalone { "standalone" } else { "detcore" };
     let own = bundle.join(name);
     fs::create_dir(&own).map_err(|e| e.to_string())?;
-    let mut runner = Runner::new(
+    let mut runner = Runner::new_with_cpu_budget(
         own.join("logs"),
         deadline.saturating_duration_since(Instant::now()),
+        // Measured at Hermit 77f16745 on this host class: the whole producer
+        // (both leaves) takes about 839 CPU-s (807 user + 32 sys) in 169 s
+        // of wall solo, so the largest single cargo command stays well
+        // under this per-command CPU bound. Under validate load the wall
+        // stretches while CPU does not, which is exactly the failure this
+        // replaces; the shared 900 s wall remains only as a hang backstop.
+        Some(Duration::from_secs(900)),
         64 * 1024 * 1024,
     )?;
     let manifest = if standalone {
@@ -580,9 +589,10 @@ fn produce(root: &Path) -> Result<()> {
     let bundle = parent.join(generation);
     fs::create_dir(&bundle).map_err(|e| e.to_string())?;
     let bundle = fs::canonicalize(bundle).map_err(|e| e.to_string())?;
-    let mut runner = Runner::new(
+    let mut runner = Runner::new_with_cpu_budget(
         bundle.join("logs"),
         Duration::from_secs(900),
+        Some(Duration::from_secs(900)),
         64 * 1024 * 1024,
     )?;
     let oracles = BTreeMap::from([
