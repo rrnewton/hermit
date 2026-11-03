@@ -3268,7 +3268,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And cpu_clock::handler_tests'
     // timer_settime_on_a_timer_whose_thread_exited_is_esrch: 3384 + 6 = 3390, listed.
     // Rebased onto main fcd62385f: 3465 + 6 = 3471.
-    ("test.detcore_unit", 3471),
+    // Drain 4885 recount: detcore lib measured 3564 on main 2baafbdf,
+    // 3571 at this head (+6 for the CPU-clock change, +1 for the
+    // timer-incarnation reuse regression): 3465 + 7 = 3472, listed.
+    ("test.detcore_unit", 3472),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5878,7 +5881,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five CPU-clock fix-forward units: 3247, listed.
     // And the same timer_settime ESRCH unit: 3384 + 6 = 3390, listed.
     // Rebased onto main fcd62385f: 3465 + 6 = 3471.
-    ("test.detcore_unit_on_host", 3471),
+    // Drain 4885 recount: detcore lib measured 3564 on main 2baafbdf,
+    // 3571 at this head (+6 for the CPU-clock change, +1 for the
+    // timer-incarnation reuse regression): 3465 + 7 = 3472, listed.
+    ("test.detcore_unit_on_host", 3472),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
