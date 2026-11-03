@@ -43,6 +43,15 @@ impl StraceOpts {
                 A::NAME
             );
         }
+        // An executable without a tracer refuses the command itself, so
+        // `--max-log-bytes` neither changes that refusal nor is refused for a
+        // runner that does not exist. Both checks are static facts.
+        if !A::SUPPORTS_STRACE {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "executable-selected backend `{}` does not support syscall tracing",
+                A::NAME
+            )));
+        }
         // This physical tracer does not use the core's charged writers or
         // container owner. Refuse the cap before any adapter/artifact work.
         if global.max_log_bytes.is_some() {
@@ -52,12 +61,6 @@ impl StraceOpts {
                  is a plain child with no PID namespace, parent-death signal or ptrace \
                  attachment binding it, so the cap could neither count the trace nor \
                  stop the guest; drop --max-log-bytes",
-                A::NAME
-            )));
-        }
-        if !A::SUPPORTS_STRACE {
-            return Err(Error::new(PolicyRefusal).context(format!(
-                "executable-selected backend `{}` does not support syscall tracing",
                 A::NAME
             )));
         }

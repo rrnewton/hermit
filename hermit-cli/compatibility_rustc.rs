@@ -1938,29 +1938,44 @@ mod tests {
             serde_json::from_value::<Invocation>(missing).is_err(),
             "old capture fields cannot be retrofitted"
         );
-        let mut wrong_unit = Graph::read(&input).unwrap();
-        let unit = &mut wrong_unit.units.get_mut("macro").unwrap()[0];
-        let old_key = unit.key().unwrap();
-        unit.kind = vec!["lib".to_owned()];
-        unit.crate_types = vec!["lib".to_owned()];
-        let key = unit.key().unwrap();
-        let locators = wrong_unit
-            .source_locators
-            .remove(&("macro".to_owned(), old_key))
-            .unwrap();
-        wrong_unit
-            .source_locators
-            .insert(("macro".to_owned(), key), locators);
-        for (owner, artifact) in wrong_unit.artifacts.values_mut() {
-            if owner == "macro" {
-                artifact.kind = vec!["lib".to_owned()];
-                artifact.crate_types = vec!["lib".to_owned()];
+        // The fixture's Cargo unit, with its target kind and crate types replaced.
+        let retyped_unit = |kind: &str, crate_type: &str| {
+            let mut graph = Graph::read(&input).unwrap();
+            let unit = &mut graph.units.get_mut("macro").unwrap()[0];
+            let old_key = unit.key().unwrap();
+            unit.kind = vec![kind.to_owned()];
+            unit.crate_types = vec![crate_type.to_owned()];
+            let key = unit.key().unwrap();
+            let locators = graph
+                .source_locators
+                .remove(&("macro".to_owned(), old_key))
+                .unwrap();
+            graph
+                .source_locators
+                .insert(("macro".to_owned(), key), locators);
+            for (owner, artifact) in graph.artifacts.values_mut() {
+                if owner == "macro" {
+                    artifact.kind = vec![kind.to_owned()];
+                    artifact.crate_types = vec![crate_type.to_owned()];
+                }
             }
-        }
+            graph
+        };
+        // A library compilation with an implicit proc_macro extern is refused
+        // by the sysroot shape check, before any Cargo unit is matched.
+        let wrong_unit = retyped_unit("lib", "lib");
         let mut wrong_command = command.clone();
         wrong_command.argv[4] = b"lib".to_vec();
         assert!(
             for_invocation(&wrong_unit, &bundle, &wrong_command)
+                .unwrap_err()
+                .contains("not one host proc-macro compilation")
+        );
+        // A proc-macro compilation whose matching Cargo unit is not a
+        // proc-macro target reaches the unit check itself.
+        let wrong_kind = retyped_unit("lib", "proc-macro");
+        assert!(
+            for_invocation(&wrong_kind, &bundle, &command)
                 .unwrap_err()
                 .contains("actual Cargo proc-macro")
         );

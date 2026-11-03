@@ -58,7 +58,6 @@ pub fn registry_build_in(crate_dir: &std::path::Path) -> Result<bool, String> {
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(fbcode_build)");
     println!("cargo:rustc-check-cfg=cfg(hermit_registry_build)");
-    println!("cargo:rustc-check-cfg=cfg(hermit_e9patch_sources_excluded)");
     // Shared CLI tests still name the external application backends' former
     // features to skip their cases. Core never enables them, so those branches
     // compile out; check-cfg must still accept the names.

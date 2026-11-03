@@ -5499,22 +5499,40 @@ fn analyze_rejects_backend_in_its_run_arguments() {
     }
 }
 
-#[test]
-fn run_rejects_unknown_backends_during_argument_parsing() {
-    let args = ["--backend", "unknown", "run", "--", "/bin/true"];
-    let output = hermit(&args);
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = stderr(&output);
-    assert!(
-        stderr.contains("invalid value 'unknown'"),
-        "unexpected error:\n{stderr}"
+/// The core executable's `--backend` accepts only its built-in backends. Any
+/// other name, including those of the DBT, SaBRe and e9patch extensions that
+/// left core, is an executable-selected backend, and this executable refuses it
+/// at its dispatch boundary, before the run is parsed: it never substitutes a
+/// built-in backend and never starts the guest. The exact cause after the
+/// shared prefix depends on the environment (an inherited `LD_*` override, or a
+/// build that measured no extension compatibility), so the shared prefix is
+/// what the test pins, together with the hermit-refusal status.
+fn assert_non_core_backend_refused_at_dispatch(args: &[&str]) {
+    let output = hermit(args);
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Hermit,
+        &["Executable dispatch refused; no backend was substituted"],
     );
-    for backend in ["ptrace", "dbt", "kvm"] {
-        assert!(
-            stderr.contains(backend),
-            "missing {backend:?} in:\n{stderr}"
-        );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(NON_CORE_BACKEND_GUEST_MARKER),
+        "{args:?}: the guest ran"
+    );
+}
+
+const NON_CORE_BACKEND_GUEST_MARKER: &str = "non-core-backend-guest-must-not-start";
+
+#[test]
+fn run_refuses_non_core_backends_at_dispatch() {
+    for backend in ["unknown", "dbt", "sabre", "e9patch"] {
+        assert_non_core_backend_refused_at_dispatch(&[
+            "--backend",
+            backend,
+            "run",
+            "--",
+            "/bin/echo",
+            NON_CORE_BACKEND_GUEST_MARKER,
+        ]);
     }
 }
 
@@ -5984,13 +6002,14 @@ fn run_dbt_executes_integrated_backend() {
     assert_success(&output, &args);
 }
 
-/// Only the ptrace backend serves gdb. The KVM, DBT and SaBRe backends used to
-/// take `--gdbserver` and run the guest without a gdbserver, `--strict` runs
+/// Only the ptrace backend serves gdb. The KVM backend used to take
+/// `--gdbserver` and run the guest without a gdbserver, `--strict` runs
 /// included, so the debugger waited on a port nothing served; now the run is
 /// refused before anything starts, naming the remedy, and so is
 /// `--namespace-only`, which runs no tracer. A backend that cannot even start
 /// on this host is refused the same way: the refusal comes before any backend
-/// is probed.
+/// is probed. (The DBT and SaBRe cases left core with those backends; the
+/// in-guest LiteInst backends refuse `--gdbserver` on their own.)
 #[test]
 fn backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest() {
     let _guard = hermit_run_guard();
@@ -6005,20 +6024,19 @@ fn backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest() {
             .expect("failed to read the taken address")
     );
     let mut cases: Vec<(Vec<&str>, &str, String)> = Vec::new();
-    for backend in ["kvm", "dbt", "sabre"] {
-        for (options, option) in [
-            (&["--gdbserver"][..], "--gdbserver"),
-            (&strict[..], "--gdbserver"),
-            (&[dap_listen.as_str()][..], "--dap-listen"),
-        ] {
-            let mut args = vec!["--backend", backend, "run"];
-            args.extend_from_slice(options);
-            cases.push((
-                args,
-                option,
-                format!("the {backend} backend has none, so no debugger could attach; run it with the ptrace backend: drop --backend={backend}"),
-            ));
-        }
+    let backend = "kvm";
+    for (options, option) in [
+        (&["--gdbserver"][..], "--gdbserver"),
+        (&strict[..], "--gdbserver"),
+        (&[dap_listen.as_str()][..], "--dap-listen"),
+    ] {
+        let mut args = vec!["--backend", backend, "run"];
+        args.extend_from_slice(options);
+        cases.push((
+            args,
+            option,
+            format!("the {backend} backend has none, so no debugger could attach; run it with the ptrace backend: drop --backend={backend}"),
+        ));
     }
     cases.push((
         vec!["run", "--namespace-only", "--gdbserver"],
@@ -6058,8 +6076,9 @@ fn backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest() {
 #[test]
 fn timerless_backends_refuse_explicit_preemption_before_starting_the_guest() {
     let _guard = hermit_run_guard();
-    // KVM left the timerless set with Reverie 9443a6b2.
-    for backend in ["dbt", "sabre", "liteinst", "in-guest-trap"] {
+    // KVM left the timerless set with Reverie 9443a6b2; DBT and SaBRe left
+    // core.
+    for backend in ["liteinst", "in-guest-trap"] {
         for requested in [
             vec!["--max-timeslice=200000000"],
             vec!["--preemption-timeout=1000"],
@@ -19970,7 +19989,7 @@ fn run_kvm_reports_the_launcher_s_supplementary_groups() {
 
 #[test]
 fn namespace_only_rejects_every_explicit_backend() {
-    for backend in ["ptrace", "dbt", "kvm"] {
+    for backend in ["ptrace", "liteinst", "in-guest-trap", "kvm"] {
         let args = [
             "--backend",
             backend,
@@ -20261,31 +20280,6 @@ fn backend_accepted_in_global_position() {
 }
 
 #[test]
-fn sabre_backend_validation_honors_command_scope() {
-    let non_run = hermit(&["--backend", "sabre", "record", "list"]);
-    assert_hermit_refusal_contains(
-        &non_run,
-        Refusal::Hermit,
-        &["SaBRe backend", "only through", "strace"],
-    );
-
-    let log = hermit(&[
-        "--backend",
-        "sabre",
-        "--log",
-        "info",
-        "strace",
-        "--",
-        "/bin/true",
-    ]);
-    assert_hermit_refusal_contains(
-        &log,
-        Refusal::Hermit,
-        &["does not support --log or --log-file"],
-    );
-}
-
-#[test]
 fn sabre_rpc_socket_is_hidden_from_proc_environ() {
     let hermit_binary = Path::new(env!("CARGO_BIN_EXE_hermit"));
     let executable_dir = hermit_binary.parent().unwrap();
@@ -20396,14 +20390,15 @@ fn sabre_rpc_socket_ignores_host_tmpdir_hidden_by_container_tmp() {
 
 #[test]
 fn global_position_rejects_unknown_backends() {
-    let args = ["--backend", "unknown", "run", "--", "/bin/true"];
-    let output = hermit(&args);
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = stderr(&output);
-    assert!(
-        stderr.contains("invalid value 'unknown'"),
-        "unexpected error:\n{stderr}"
-    );
+    for backend in ["--backend=unknown", "--backend=dbt"] {
+        assert_non_core_backend_refused_at_dispatch(&[
+            backend,
+            "run",
+            "--",
+            "/bin/echo",
+            NON_CORE_BACKEND_GUEST_MARKER,
+        ]);
+    }
 }
 
 #[test]
@@ -29710,25 +29705,23 @@ fn max_log_bytes_verify_exits_promptly_when_stderr_fills_after_run1() {
 /// the flag instead, with 122 (round-2 review of
 /// https://github.com/rrnewton/hermit/pull/3686, finding 2). LiteInst, which
 /// runs only in-guest, under `--no-namespace` spawns a guest that is not traced
-/// and that no PID namespace contains, DBT is refused in every namespace mode until the cap
-/// is tested ending a run in its container, and KVM's host processes under `--no-namespace` are not
-/// shown to die with hermit. SaBRe under `--no-namespace` hands its guest to the
-/// supervisor worker stopped and untraced, before `PTRACE_O_EXITKILL` binds it
-/// (round-3 review of the same pull request, finding 2). The refusal comes
-/// before backend availability and before any SaBRe artifact is resolved, so it
-/// holds in builds where none of these backends is available. `analyze` and `bisect` trials skip
+/// and that no PID namespace contains, and KVM's host processes under
+/// `--no-namespace` are not shown to die with hermit. (The DBT and SaBRe cases
+/// left core with those backends.) The refusal comes before backend
+/// availability, so it holds in builds where none of these backends is
+/// available. `analyze` and `bisect` trials skip
 /// `run`'s own check, so both refuse `--no-namespace` before any trial, with
 /// KVM and with the default ptrace backend, and bisect before it reads its
-/// schedules (the paths below do not exist). ptrace and e9patch under
-/// `--no-namespace` are refused too (round-4c review, finding 1); their cases,
-/// with the guest's marker and the run without the flag, are in
+/// schedules (the paths below do not exist). ptrace under `--no-namespace` is
+/// refused too (round-4c review, finding 1); its cases, with the guest's
+/// marker and the run without the flag, are in
 /// `max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime`.
 #[test]
 fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
     let _lock = hermit_run_guard();
     /// Arguments and the configuration the refusal must name.
     type Case<'a> = (&'a [&'a str], &'a str);
-    let cases: [Case; 9] = [
+    let cases: [Case; 7] = [
         (
             &[
                 "--max-log-bytes=64K",
@@ -29744,16 +29737,6 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
         (
             &[
                 "--max-log-bytes=64K",
-                "--backend=dbt",
-                "run",
-                "--",
-                "/bin/true",
-            ],
-            "--backend=dbt",
-        ),
-        (
-            &[
-                "--max-log-bytes=64K",
                 "--backend=kvm",
                 "run",
                 "--no-namespace",
@@ -29761,17 +29744,6 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
                 "/bin/true",
             ],
             "--backend=kvm and --no-namespace",
-        ),
-        (
-            &[
-                "--max-log-bytes=64K",
-                "--backend=sabre",
-                "run",
-                "--no-namespace",
-                "--",
-                "/bin/true",
-            ],
-            "--backend=sabre and --no-namespace",
         ),
         (
             &[
@@ -29865,12 +29837,12 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
 /// clone, so under `--no-namespace` the guest is bound to nothing in between.
 /// A charged write can cross the cap there (the outer process's asynchronous
 /// file appender draining a queued record), and exiting 123 would leave the
-/// guest running. So ptrace, and e9patch, whose guest runs on the ptrace
-/// runtime, refuse the flag under `--no-namespace` with 122, with or without
-/// `--log-file`, before the guest exists: the marker it would print is absent.
-/// Without the flag the same command is not refused: ptrace runs the guest,
-/// which prints its marker, and e9patch fails as it always has under
-/// `--no-namespace`, without naming the flag.
+/// guest running. So ptrace, the default or named explicitly, refuses the flag
+/// under `--no-namespace` with 122, with or without `--log-file`, before the
+/// guest exists: the marker it would print is absent. Without the flag the same
+/// command is not refused: ptrace runs the guest, which prints its marker.
+/// (The e9patch case, whose guest also runs on the ptrace runtime, left core
+/// with the e9patch preprocessing.)
 #[test]
 fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
     let _lock = hermit_run_guard();
@@ -29879,7 +29851,7 @@ fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
     let log = directory.path().join("hermit.log");
     let log = log.to_str().unwrap();
     let guest = ["--", "/bin/sh", "-c", "echo hermit-3686-guest-ran"];
-    for backend in [None, Some("--backend=e9patch")] {
+    for backend in [None, Some("--backend=ptrace")] {
         for log_file in [None, Some(log)] {
             let mut without_flag: Vec<&str> = Vec::new();
             without_flag.extend(backend);
@@ -29925,74 +29897,33 @@ fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
                 "{without_flag:?}: {output:?}"
             );
             assert!(!err.contains("--max-log-bytes"), "{without_flag:?}: {err}");
-            if backend.is_none() {
-                assert_eq!(
-                    output.status.code(),
-                    Some(0),
-                    "{without_flag:?}: {output:?}"
-                );
-                assert!(out.contains(MARKER), "{without_flag:?}: {out} {err}");
-            }
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{without_flag:?}: {output:?}"
+            );
+            assert!(out.contains(MARKER), "{without_flag:?}: {out} {err}");
         }
     }
 }
 
-/// `hermit --backend=sabre strace` does not go through `run`. It launches the
-/// SaBRe runner as a plain child of hermit, which no PID namespace,
-/// parent-death signal or ptrace attachment binds to hermit, and the trace
-/// reaches the inherited stderr without passing through hermit's charged
-/// writers. The cap could neither count that trace nor stop the guest, so
-/// hermit refuses the flag there with 122 (round-3 review of
-/// https://github.com/rrnewton/hermit/pull/3686, finding 6). The refusal comes
-/// before any SaBRe artifact is resolved: the HERMIT_SABRE_* variables are
-/// removed below, and resolving them first would fail with "the sabre backend
-/// needs HERMIT_SABRE_RUNNER" instead, in builds with and without SaBRe.
-///
-/// strace on any other backend is not refused. The M1 strace command runs only
-/// on SaBRe, so there it fails exactly as it does without the flag, by asking
-/// for `--backend sabre`, with the same status and the same stderr.
+/// The core executable has no syscall tracer: `strace` is a command of an
+/// executable-selected backend whose adapter supplies one, and only there can
+/// `--max-log-bytes` be unenforceable (the SaBRe case left core with that
+/// backend). So strace on a core backend is not refused for the cap: it fails
+/// exactly as it does without the flag, with the same status and the same
+/// stderr, by saying that this executable does not support syscall tracing.
 #[test]
-fn max_log_bytes_is_refused_for_sabre_strace_and_leaves_other_strace_alone() {
+fn max_log_bytes_leaves_core_strace_alone() {
     let strace = |args: &[&str]| {
         hermit_test::hermit_output(
             "hermit run",
             hermit_command(args)
                 .env_remove("HERMIT_LOG")
                 .env_remove("HERMIT_LOG_FILE")
-                .env_remove("HERMIT_SABRE_RUNNER")
-                .env_remove("HERMIT_SABRE_BINARY")
-                .env_remove("HERMIT_SABRE_PLUGIN")
                 .stdin(Stdio::null()),
         )
     };
-    let args = [
-        "--max-log-bytes=1M",
-        "--backend=sabre",
-        "strace",
-        "/bin/true",
-    ];
-    let refused = strace(&args);
-    let text = stderr(&refused);
-    assert_eq!(
-        refused.status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "{args:?}: {refused:?}"
-    );
-    assert!(
-        text.contains(
-            "--max-log-bytes cannot be enforced with strace --backend=sabre: the SaBRe \
-             runner's trace output does not pass through hermit's charged writers, and the \
-             runner is a plain child of hermit with no PID namespace, parent-death signal or \
-             ptrace attachment binding it, so the cap could neither count the trace nor stop \
-             the guest; drop --max-log-bytes"
-        ),
-        "{args:?}: {text}"
-    );
-    assert!(
-        text.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
-        "{args:?}: {text}"
-    );
-
     for backend in [None, Some("--backend=ptrace")] {
         let plain: Vec<&str> = backend.into_iter().chain(["strace", "/bin/true"]).collect();
         let capped: Vec<&str> = ["--max-log-bytes=1M"]
@@ -30001,18 +29932,24 @@ fn max_log_bytes_is_refused_for_sabre_strace_and_leaves_other_strace_alone() {
             .collect();
         let without = strace(&plain);
         let with = strace(&capped);
-        assert_ne!(
-            with.status.code(),
-            Some(HERMIT_POLICY_REFUSAL_EXIT),
-            "{capped:?}: {with:?}"
-        );
         assert_eq!(
             (with.status.code(), stderr(&with)),
             (without.status.code(), stderr(&without)),
             "{capped:?} must fail exactly as {plain:?} does"
         );
+        assert_eq!(
+            with.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{capped:?}: {with:?}"
+        );
         assert!(
-            stderr(&with).contains("the M1 strace command requires `--backend sabre`"),
+            !stderr(&with).contains("--max-log-bytes"),
+            "{capped:?}: the cap was refused: {}",
+            stderr(&with)
+        );
+        assert!(
+            stderr(&with)
+                .contains("executable-selected backend `core` does not support syscall tracing"),
             "{capped:?}: {}",
             stderr(&with)
         );
@@ -37878,52 +37815,48 @@ fn a_malformed_finalize_budget_is_refused() {
 /// own deadline, not hermit's. All five run correctly WITHOUT the flag, so it is
 /// the bound that fails, not the backend.
 ///
-/// ⚠️ `dbt` IS THE LOAD-BEARING CASE. The `RunOpts::main` DBT arm returns
-/// `run_dbt(..)` and never reaches `RunOpts::run`, so the first version of this
-/// check -- placed in `run()` -- covered every backend EXCEPT the one furthest
-/// from working, and dbt still accepted the flag and ran unbounded. Same shape
-/// as the `--namespace-only` second launch path. Move the check back into
-/// `run()` and this cell fails on dbt while the others still pass.
+/// The sabre and dbt cases left core with those backends; the core backend
+/// whose bound is unqualified is kvm. In-guest LiteInst refuses `--timeout`
+/// earlier, by its own name (`run_timeout_refusal_does_not_depend_on_backend_availability`).
 #[test]
 fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    for backend in ["sabre", "dbt", "kvm"] {
-        let output = hermit_test::hermit_output(
-            "hermit run",
-            hermit_command(&[
-                "--backend",
-                backend,
-                "run",
-                "--timeout",
-                "3",
-                "--",
-                "/bin/echo",
-                "unreachable",
-            ])
-            .stdin(Stdio::null()),
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let backend = "kvm";
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&[
+            "--backend",
+            backend,
+            "run",
+            "--timeout",
+            "3",
+            "--",
+            "/bin/echo",
+            "unreachable",
+        ])
+        .stdin(Stdio::null()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
-        // EXIT-CLASS: hermit
-        assert_eq!(
-            output.status.code(),
-            Some(122),
-            "`--timeout` on `{backend}` must REFUSE (122), not accept a bound it \
-             cannot enforce. Got {:?}. stderr:\n{stderr}",
-            output.status
-        );
-        assert!(
-            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
-            "a refusal is hermit working, and must not be reported as a failure. \
-             backend={backend} stderr:\n{stderr}"
-        );
-        assert!(
-            stderr.contains("not qualified"),
-            "the refusal must say the bound is unqualified on this backend, and \
-             point somewhere. backend={backend} stderr:\n{stderr}"
-        );
-    }
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(122),
+        "`--timeout` on `{backend}` must REFUSE (122), not accept a bound it \
+         cannot enforce. Got {:?}. stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "a refusal is hermit working, and must not be reported as a failure. \
+         backend={backend} stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not qualified"),
+        "the refusal must say the bound is unqualified on this backend, and \
+         point somewhere. backend={backend} stderr:\n{stderr}"
+    );
 }
 
 /// In-guest LiteInst (https://github.com/rrnewton/hermit/issues/3520) cannot
@@ -40907,21 +40840,24 @@ fn liteinst_in_guest_signals_during_a_blocking_wait4_match_ptrace() {
 /// `--timeout` qualification is a static policy fact, so an UNAVAILABLE
 /// backend must get the same refusal as an available one
 /// (https://github.com/rrnewton/hermit/issues/3418). Before the fix the run
-/// path probed availability first, so a build without the `sabre` feature
+/// path probed availability first, so a build without the backend's feature
 /// answered `class=backend-unavailable` (125) where every other build refused
 /// (122).
 ///
-/// Pointing SaBRe's loader override at a missing file makes the backend
-/// unavailable in EVERY build -- without the feature it is not compiled, with
-/// it there is no loader -- so this case holds whichever features the test
-/// binary was built with. The control run without `--timeout` proves the
-/// premise: the same invocation really does report the backend unavailable.
+/// In-guest LiteInst refuses an unqualified `--timeout` by name. Pointing its
+/// in-guest runtime override at a missing file makes the backend unavailable in
+/// EVERY build -- without the `liteinst` feature it is not compiled, with it
+/// there is no runtime -- so this case holds whichever features the test binary
+/// was built with. `--max-timeslice=disabled` keeps LiteInst's timer refusal
+/// out of the way. The control run without `--timeout` proves the premise: the
+/// same invocation really does report the backend unavailable. (The case this
+/// test first used, SaBRe with a missing loader, left core with that backend.)
 #[test]
 fn run_timeout_refusal_does_not_depend_on_backend_availability() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let missing_loader = "/nonexistent/hermit-cli-test/sabre";
+    let missing_runtime = "/nonexistent/hermit-cli-test/libdetcore_liteinst.so";
     let run = |timeout: bool| {
-        let mut args = vec!["--backend", "sabre", "run"];
+        let mut args = vec!["--backend", "liteinst", "run", "--max-timeslice=disabled"];
         if timeout {
             args.extend(["--timeout", "3"]);
         }
@@ -40929,7 +40865,7 @@ fn run_timeout_refusal_does_not_depend_on_backend_availability() {
         let output = hermit_test::hermit_output(
             "hermit run",
             hermit_command(&args)
-                .env("HERMIT_SABRE_BINARY", missing_loader)
+                .env(hermit::LITEINST_TOOL_RUNTIME_ENV, missing_runtime)
                 .stdin(Stdio::null()),
         );
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -40941,11 +40877,12 @@ fn run_timeout_refusal_does_not_depend_on_backend_availability() {
     assert_eq!(
         control.status.code(),
         Some(125),
-        "control: without --timeout the sabre backend must be unavailable here. \
+        "control: without --timeout the liteinst backend must be unavailable here. \
          stderr:\n{control_stderr}"
     );
     assert!(
-        control_stderr.contains("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre"),
+        control_stderr
+            .contains("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=liteinst"),
         "control: {control_stderr}"
     );
 
@@ -40960,7 +40897,10 @@ fn run_timeout_refusal_does_not_depend_on_backend_availability() {
         stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
         "{stderr}"
     );
-    assert!(stderr.contains("not qualified"), "{stderr}");
+    assert!(
+        stderr.contains("--timeout has not been qualified for the in-guest runtime"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("backend-unavailable"), "{stderr}");
     assert!(
         refused.stdout.is_empty(),
@@ -41238,73 +41178,12 @@ fn run_kvm_timerfd_virtual_masked_waits_is_refused_by_name() {
     );
 }
 
-// DBT keeps timerfds on virtual time too: its runtime promotes them before a
-// native fork or exec (`promotes_open_files_before_native_lifecycle`). The
-// modes below reach L2 there. abstime, waits, epoll-pwait2 and exec fail on
-// DBT exactly as on ptrace with `--max-timeslice=disabled`: without a
-// preemption timer each syscall advances the virtual clock by milliseconds,
-// so the guest's "5 ms before the deadline" checks see the deadline pass.
-// For the same reason epollet reports its three timers in another order
-// (0 1 2, as ptrace without a timer does, against 1 2 0 with one).
-#[test]
-fn run_dbt_timerfd_virtual_catchup() {
-    timerfd_virtual_time::verify("dbt", "catchup", timerfd_virtual_time::CATCHUP);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_nonblock() {
-    timerfd_virtual_time::verify("dbt", "nonblock", timerfd_virtual_time::NONBLOCK);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_zero_timeout() {
-    timerfd_virtual_time::verify("dbt", "zero-timeout", timerfd_virtual_time::ZERO_TIMEOUT);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_masked_ppoll_expired() {
-    timerfd_virtual_time::verify(
-        "dbt",
-        "masked-ppoll-expired",
-        timerfd_virtual_time::MASKED_PPOLL_EXPIRED,
-    );
-}
-
-/// The forked child and its parent share one timer: the model was promoted
-/// before the native fork.
-#[test]
-fn run_dbt_timerfd_virtual_dup_fork() {
-    timerfd_virtual_time::verify("dbt", "dup-fork", timerfd_virtual_time::DUP_FORK);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_readv() {
-    timerfd_virtual_time::verify("dbt", "readv", timerfd_virtual_time::READV);
-}
-
-#[test]
-fn run_dbt_timerfd_virtual_sigchld_storm() {
-    timerfd_virtual_time::verify("dbt", "sigchld-storm", timerfd_virtual_time::SIGCHLD_STORM);
-}
-
-/// As on KVM, a masked wait that may wait would wait in the host: refused by
-/// name.
-#[test]
-fn run_dbt_timerfd_virtual_masked_waits_is_refused_by_name() {
-    timerfd_virtual_time::refused(
-        "dbt",
-        "masked-waits",
-        None,
-        "epoll_pwait with a signal mask would wait in the host",
-    );
-}
-
 // In-guest LiteInst keeps timerfds on virtual time too: it performs every
 // fork, process-copying clone and exec only from Detcore's handler for that
 // call, which promotes the description first
 // (`promotes_open_files_before_native_lifecycle`). LiteInst runs without
-// time slices (it cannot deliver a preemption timer yet), so, as on DBT,
-// abstime, waits and epoll-pwait2 fail exactly as on ptrace with
+// time slices (it cannot deliver a preemption timer yet), so abstime, waits
+// and epoll-pwait2 fail exactly as on ptrace with
 // `--max-timeslice=disabled`, and epollet reports its timers in that
 // configuration's order. exec is refused by LiteInst itself (the in-guest
 // backend does not forward execve yet).
@@ -51339,7 +51218,13 @@ fn cpu_profile_v3_refuses_backends_and_flags_it_cannot_qualify() {
     let guest = cpuid_profile_v3_guest().to_str().unwrap().to_owned();
     let cases: [(&[&str], &[&str], &str); 5] = [
         (&["--backend=kvm"], &[], "--backend=kvm"),
-        (&["--backend=dbt"], &[], "carries no CPU profile"),
+        // --max-timeslice=disabled: in-guest LiteInst's own timer refusal
+        // would otherwise come first.
+        (
+            &["--backend=liteinst"],
+            &["--max-timeslice=disabled"],
+            "--backend=liteinst: this backend does not trap CPUID",
+        ),
         (&[], &["--gdbserver"], "--gdbserver"),
         (&[], &["--no-virtualize-cpuid"], "does not virtualize CPUID"),
         (
