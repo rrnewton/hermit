@@ -7926,9 +7926,9 @@ pub enum SignalScope {
 /// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair.
-// 28 appends the `CpuClockProcess` pair (drain of PR 4885) after the
-// pidfd pair's 27.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 28;
+// 32 appends the `CpuClockProcess` pair (drain of PR 4885) after the
+// pidfd pair's 27 (28-31 are allocated to other drain changes in flight).
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 32;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

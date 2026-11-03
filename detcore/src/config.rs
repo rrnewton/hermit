@@ -87,10 +87,11 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
-    /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
-    /// with its row. Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 28-31, allocated to drain
+    /// changes in flight (ignored/drain-20261103/rpc-revisions.tsv: 4789,
+    /// 4884, 4728, 4867) ahead of this change's 32. Remove an entry when
+    /// its change lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[28, 29, 30, 31];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -225,9 +226,9 @@ mod tests {
         (27, "74ceb8dd663f2297", "f013e36743d8d9e6"),
         // Adds `GlobalRequest::CpuClockProcess` and `GlobalResponse::CpuClockProcess`
         // (https://github.com/rrnewton/hermit/pull/4885; revision 20 at its base,
-        // renumbered to 28 after main's 27 at the drain rebase; digests measured
+        // renumbered to 32 after main's 27 at the drain rebase (28-31 allocated elsewhere); digests measured
         // at this head).
-        (28, "27ebbcc7edd053c2", "f013e36743d8d9e6"),
+        (32, "27ebbcc7edd053c2", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
