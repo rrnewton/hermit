@@ -1990,7 +1990,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main ffe313b16: 1212 + 1 = 1213.
     // Rebased onto main fbf9d5f0c: 1213 + 1 = 1214.
     // Rebased onto main c1f3085da: 1221 + 1 = 1222.
-    ("test.hermit_unit", 1222),
+    // And schedule_search::tests::known_end_rips_that_differ_are_not_aligned_as_equal
+    // (the same pull request's review): 1336 + 1 = 1337.
+    // Rebased onto main e8e0f9a1c: 1349 + 1 = 1350.
+    // Rebased onto main ffe313b16: 1213 + 1 = 1214.
+    // Rebased onto main fbf9d5f0c: 1214 + 1 = 1215.
+    // Rebased onto main c1f3085da: 1222 + 1 = 1223.
+    ("test.hermit_unit", 1223),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6275,7 +6281,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main ffe313b16: 1206 + 1 = 1207.
     // Rebased onto main fbf9d5f0c: 1207 + 1 = 1208.
     // Rebased onto main c1f3085da: 1215 + 1 = 1216.
-    ("test.hermit_unit_on_host", 1216),
+    // And the same known-RIP unit: 1330 + 1 = 1331.
+    // Rebased onto main e8e0f9a1c: 1343 + 1 = 1344.
+    // Rebased onto main ffe313b16: 1207 + 1 = 1208.
+    // Rebased onto main fbf9d5f0c: 1208 + 1 = 1209.
+    // Rebased onto main c1f3085da: 1216 + 1 = 1217.
+    ("test.hermit_unit_on_host", 1217),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
