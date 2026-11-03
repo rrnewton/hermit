@@ -1262,7 +1262,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // Full validate at 85b8cec25a executed 1973, all passed, against the
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
-    ("test.regular_crates", 1973),
+    // The first-party core split (ee51613d) removed the DynamoRIO/SaBRe
+    // crates from this workspace selection: re-measured with the compiled
+    // inventory at ee51613d (cargo nextest list, identical selection):
+    // 1967 listed, 24 ignored, 1943 will-run. 1973 - 30 = 1943.
+    ("test.regular_crates", 1943),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1972,7 +1976,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // against the 1341 the old pin expected; both new units PASS).
     // The split retains nine additional core identities: 1335 + 9 = 1344.
     // Composed source count; re-measure with the compiled inventory.
-    ("test.hermit_unit", 1344),
+    // Re-measured at ee51613d (cargo nextest list, the node's exact
+    // selection and skip arguments): 1214 listed, 1 ignored, 1213 will-run,
+    // less the node's 5 skip-matched tests = 1208 executed. The composed
+    // 1344 overstates the post-split population by 136.
+    ("test.hermit_unit", 1208),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5261,7 +5269,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusions are present exactly once: 1971 - 14 = 1957, by nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    // Post-split re-measure (ee51613d): local will-run 1943, and all
+    // fourteen hosted exclusions are present exactly once: 1943 - 14 = 1929.
+    ("test.regular_crates_on_host", 1929),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6222,7 +6232,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Composed source count; re-measure with the compiled inventory.
-    ("test.hermit_unit_on_host", 1338),
+    // Re-measured at ee51613d: the test.hermit_unit executed population
+    // (1208) less this node's 6 hosted exclusion filters = 1202.
+    ("test.hermit_unit_on_host", 1202),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6460,7 +6472,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    // Post-split re-measure (ee51613d): 1943 - 14 = 1929.
+    ("test.regular_crates_on_host", 1929),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
