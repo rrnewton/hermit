@@ -3404,7 +3404,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And property_snapshot's two readable-open refusals
     // (https://github.com/rrnewton/hermit/pull/4791): 213 + 2 = 215.
     // Rebased onto main e8e0f9a1c: 214 + 2 = 216.
-    ("test.detcore_misc", 216),
+    // And property_snapshot::an_access_mode_3_open_of_a_copied_property_file_runs_as_natively
+    // (the same pull request's review): 215 + 1 = 216.
+    // Rebased onto main e8e0f9a1c: 216 + 1 = 217.
+    ("test.detcore_misc", 217),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5434,7 +5437,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main e8e0f9a1c: 213 + 1 = 214.
     // And the same two readable-open refusals: 213 + 2 = 215.
     // Rebased onto main e8e0f9a1c: 214 + 2 = 216.
-    ("test.detcore_misc_on_host", 216),
+    // And the same access-mode-3 case: 215 + 1 = 216.
+    // Rebased onto main e8e0f9a1c: 216 + 1 = 217.
+    ("test.detcore_misc_on_host", 217),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
