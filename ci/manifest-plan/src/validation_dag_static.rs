@@ -1226,8 +1226,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // The retry stack adds three: 1929 + 3 = 1932, re-measured 2026-10-31.
-    // And detcore-model's access_trace::tests::an_open_note_reads_with_or_without_its_kind: 1933.
-    // And manifest-plan's the_pmu_analyze_node_runs_the_ignored_analyze_integrations: 1934.
+    // And manifest-plan's the_pmu_analyze_node_runs_the_ignored_analyze_integrations: 1933.
+    // And detcore-model's access_trace::tests::an_open_note_reads_with_or_without_its_kind: 1934.
     ("test.regular_crates", 1934),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
@@ -5215,8 +5215,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.cli_on_host", 669),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
-    // And the same open-note unit: 1919.
-    // And the same PMU analyze node unit: 1920.
+    // And the same PMU analyze node unit: 1919.
+    // And the same open-note unit: 1920.
     ("test.regular_crates_on_host", 1920),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
