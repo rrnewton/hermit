@@ -288,7 +288,8 @@ pub struct AnalyzeOpts {
     /// it inherited more than 64 children, or where it cannot open, signal through or wait on
     /// a pidfd (Linux before 5.4, or a seccomp filter), through which alone it signals the run.
     /// A stop it cannot pass on to the run (no file descriptor left) makes it die of the
-    /// signal as without its handler, saying why; the run dies with it and the workspace stays.
+    /// signal as without its handler, saying why; the run dies with it, and the workspace and
+    /// the running trial's private temporary directory stay.
     #[clap(long)]
     pub keep_tmp: bool,
 
