@@ -35,6 +35,7 @@ use tracing::metadata::LevelFilter;
 
 use crate::app::analyze::consts::*;
 use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::TRIAL_LOG_FACTOR;
 use crate::app::analyze::types::TRIAL_LOG_FLOOR;
 use crate::app::analyze::types::TRIAL_TIMEOUT_FACTOR;
@@ -43,7 +44,6 @@ use crate::app::analyze::types::TrialTimeout;
 use crate::app::container::RunTimeoutMarker;
 use crate::app::global_opts::GlobalOpts;
 use crate::app::run::RunOpts;
-use crate::app::analyze::types::ContinuationTimeslice;
 
 /// A single run plus the results of the run, either in memory or on disk.
 pub struct RunData {
@@ -1835,7 +1835,7 @@ mod tests {
         let read = || PreemptionReader::try_new(&output).unwrap().into_inner();
 
         options
-            .write_trial_schedule(events.clone(), &output)
+            .write_trial_schedule_from(events.clone(), &[], &output)
             .unwrap();
         let spliced = read();
         assert_eq!(spliced.format_version(), Some(BACKGROUND_STARTS_FORMAT - 1));
@@ -1903,7 +1903,7 @@ mod tests {
             &PreemptionRecord::from_sched_events(events.clone()).with_format(Some(newer)),
         );
         let refusal = options
-            .write_trial_schedule(events.clone(), &output)
+            .write_trial_schedule_from(events.clone(), &[], &output)
             .unwrap_err();
         assert!(
             format!("{refusal:#}").contains(&format!("record format Some({newer})")),

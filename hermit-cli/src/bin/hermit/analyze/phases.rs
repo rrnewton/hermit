@@ -35,6 +35,7 @@ use reverie::process::Output;
 use crate::app::analyze::consts::*;
 use crate::app::analyze::rundata::RunData;
 use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
@@ -49,7 +50,6 @@ use crate::app::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
 use crate::app::schedule_search::NoSingleSwap;
 use crate::app::schedule_search::TrialOutcome;
 use crate::app::schedule_search::search_for_critical_schedule;
-use crate::app::analyze::types::ContinuationTimeslice;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -1291,23 +1291,24 @@ impl AnalyzeOpts {
     /// continuation of a record's first `len` events and `stack` each
     /// stack-trace replay (its name, record, length and the event to take
     /// the stack at), both giving completed outcomes or ending the analysis.
-    fn report_timing_decision_with(
+    fn report_timing_decision_with<C, S>(
         &self,
         schedule: &PreemptionRecord,
         decision: usize,
         continuation: MaybeTimeslice,
         (target_met, deciding): (bool, &Option<PrettyBacktrace>),
         (continued, continued_path): (&[SchedEvent], &Path),
-        (continue_target, stack): (
-            impl FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
-            impl Fn(
-                &str,
-                &PreemptionRecord,
-                usize,
-                usize,
-            ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
-        ),
-    ) -> anyhow::Result<Option<Report>> {
+        (continue_target, stack): (C, S),
+    ) -> anyhow::Result<Option<Report>>
+    where
+        C: FnOnce(&PreemptionRecord, usize) -> anyhow::Result<(CompletedScheduleTrial, PathBuf)>,
+        S: Fn(
+            &str,
+            &PreemptionRecord,
+            usize,
+            usize,
+        ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)>,
+    {
         let events = schedule.schedevents();
         let thread = events[decision].dettid;
         let (target_completed, target_continued_path) = continue_target(schedule, decision + 1)?;
@@ -4452,8 +4453,10 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing, &[]);
+            options
+                .write_trial_schedule_from(Vec::new(), &[], &trial)
+                .unwrap();
             [failing, passing, trial].map(|path| {
                 detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(&path)
                     .unwrap()
