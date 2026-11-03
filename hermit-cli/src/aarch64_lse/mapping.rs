@@ -226,10 +226,12 @@ pub fn returning_functions(
 /// instruction it reaches is a `RET X30`, or a direct branch out of it (a
 /// tail call) goes to a function that `returns` says comes back. A `RET`
 /// through another register is not a return to this function's caller, and
-/// an `SVC` proves nothing past it, since what the kernel does with it is
-/// not in the file. What this does not check is a write to `X30` before a
-/// `RET X30`, so a function that returns somewhere else through a changed
-/// link register is taken to return to its caller. A function
+/// an `SVC` proves nothing past it, whatever its immediate, since what the
+/// kernel does with it is not in the file. What this does not check is a
+/// write to `X30` before a `RET X30`, so a function that returns somewhere
+/// else through a changed link register is taken to return to its caller,
+/// and an unresolved `BLR`, whose callee is unknown, is taken to come
+/// back. A function
 /// whose entry is outside `words` is taken to return, which is the
 /// ordinary case for a call out of the section. A function whose every path ends in
 /// a trap or in a syscall that does not come back (an exit or abort
@@ -240,12 +242,13 @@ pub fn can_return(
     function: (u64, u64),
     returns: &dyn Fn(u64) -> bool,
 ) -> bool {
-    // `RET X30`: a return through another register is not a return to
-    // this function's caller.
-    const RET_X30: u32 = 0xD65F_03C0;
-    // `SVC #0`: what the kernel does with it is not in the file, so
-    // nothing past it is proof of anything.
-    const SVC: u32 = 0xD400_0001;
+    // `RET X30`, and its authenticated forms `RETAA` and `RETAB`: a
+    // return through another register is not a return to this function's
+    // caller.
+    const RET_X30: [u32; 3] = [0xD65F_03C0, 0xD65F_0BFF, 0xD65F_0FFF];
+    // `SVC #imm`: Linux ignores the immediate, and what the kernel does
+    // with the call is not in the file, so nothing past it is proof.
+    let is_svc = |word: u32| word & 0xFFE0_001F == 0xD400_0001;
     let (entry, end) = function;
     let index = |addr: u64| -> Option<usize> {
         (entry..end)
@@ -263,10 +266,10 @@ pub fn can_return(
     while let Some(mut at) = pending.pop() {
         while !seen[at - first] {
             seen[at - first] = true;
-            if words[at] == RET_X30 {
+            if RET_X30.contains(&words[at]) {
                 return true;
             }
-            if words[at] == SVC {
+            if is_svc(words[at]) {
                 break;
             }
             let pc = base + 4 * at as u64;
@@ -733,13 +736,13 @@ pub fn addressed_starts(words: &[u32], base: u64) -> Addressed {
                         continue;
                     }
                 }
+                // A write that does not carry the base ends the
+                // pairing. What the code addresses through the register
+                // afterwards is then unknown; taking the whole page for
+                // data there costs about half of a stripped library's
+                // rewrites (measured), so it is left as a limit this
+                // module's documentation states.
                 if writes(*next, register) {
-                    // The base is gone and what it becomes is not in
-                    // this window, so anything the code addresses
-                    // through it afterwards is unknown.
-                    if completions != 0 {
-                        unresolved.push(page);
-                    }
                     break;
                 }
             }
