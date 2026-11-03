@@ -3249,7 +3249,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (review of https://github.com/rrnewton/hermit/pull/4627): 3387 + 2 = 3389.
     // And a_fenced_sigchld_that_a_shared_signalfd_or_a_flush_may_take_leaves_no_bound
     // (the same review): 3389 + 1 = 3390.
-    ("test.detcore_unit", 3390),
+    // And a_sigchld_delivery_filed_before_the_mark_leaves_it_for_the_fenced_copy
+    // (its second review): 3390 + 1 = 3391.
+    ("test.detcore_unit", 3391),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5809,7 +5811,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three bounded SIGCHLD-deferral units: 3384 + 3 = 3387, listed.
     // And the same two fenced-SIGCHLD units: 3387 + 2 = 3389.
     // And the same shared-signalfd and flush unit: 3389 + 1 = 3390.
-    ("test.detcore_unit_on_host", 3390),
+    // And the same filed-before-the-mark unit: 3390 + 1 = 3391.
+    ("test.detcore_unit_on_host", 3391),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
