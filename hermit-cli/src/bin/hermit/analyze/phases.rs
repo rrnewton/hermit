@@ -1458,23 +1458,33 @@ impl AnalyzeOpts {
             [critical[0].1.as_ref(), critical[1].1.as_ref()],
         );
         if let Some(ends) = slice_ends {
-            let stack_at = |runname: &str, variant: &PreemptionRecord, end: usize| {
+            let stack_at = |runname: &str,
+                            variant: &PreemptionRecord,
+                            end: usize,
+                            expected: bool|
+             -> anyhow::Result<Option<PrettyBacktrace>> {
                 if end == decision {
-                    // A slice of one event ends where it starts.
-                    Ok((true, deciding.clone()))
+                    // A slice of one event ends where it starts. Reuse the
+                    // captured deciding stack; no new replay has an outcome
+                    // to compare with the search.
+                    Ok(deciding.clone())
                 } else {
-                    stack(runname, variant, end + 1, end)
+                    let (observed, captured) = stack(runname, variant, end + 1, end)?;
+                    require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
+                    Ok(captured)
                 }
             };
-            let (_, with_end) = stack_at(
+            let with_end = stack_at(
                 "final_target_slice_end_for_stacktraces",
                 &with_record,
                 ends[0],
+                true,
             )?;
-            let (_, without_end) = stack_at(
+            let without_end = stack_at(
                 "final_baseline_slice_end_for_stacktraces",
                 &without_record,
                 ends[1],
+                false,
             )?;
             match (with_end, without_end) {
                 (Some(with_end), Some(without_end)) => {
@@ -4417,6 +4427,19 @@ mod tests {
             target, record,
             "the report starts from the record that met the target"
         );
+    fn timing_report_stack(thread: i32, ip: u64) -> PrettyBacktrace {
+        serde_json::from_value(serde_json::json!({
+            "thread_id": thread,
+            "thread_name": null,
+            "frames": [{
+                "frame": { "ip": ip, "is_signal": false },
+                "symbol": null,
+                "locations": []
+            }]
+        }))
+        .unwrap()
+    }
+
         let deciding = Some(timing_report_stack(3, 0x20));
         for (target_met, baseline_met, contradicted) in [
             (true, false, None),
