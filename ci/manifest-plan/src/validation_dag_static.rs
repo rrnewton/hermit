@@ -1989,7 +1989,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // kill_against_a_futex_return_is_a_lifetime_conflict,
     // pipe_bytes_order_the_write_before_the_read,
     // futex_wake_edge_orders_a_pair_on_another_resource,
-    // timed_waits_whose_returns_flip_make_a_timing_pair,
+    // timed_waits_tied_to_no_difference_are_candidates,
     // a_cut_short_trace_marks_the_window_truncated, none_found_says_why,
     // also_reordered_lists_three_and_counts_the_rest,
     // failed_calls_stay_out_of_the_fd_history,
@@ -2022,7 +2022,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And analyze::races::tests::
     // a_nearer_wait_of_similar_length_ranks_before_a_long_nap: 1288.
     // And analyze::races::tests::a_channel_the_trace_does_not_create_gives_no_edge: 1289.
-    ("test.hermit_unit", 1289),
+    // And analyze::races::tests::{a_pipe_a_tee_reads_or_a_vmsplice_fills_gives_no_edge,
+    // a_sigkill_through_tgkill_ends_the_whole_thread_group}: 1291.
+    ("test.hermit_unit", 1291),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6336,7 +6338,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two change-of-course timing tests: 1281.
     // And the same wait-ranking test: 1282.
     // And the same uncreated-channel test: 1283.
-    ("test.hermit_unit_on_host", 1283),
+    // And the same tee/vmsplice and tgkill tests: 1285.
+    ("test.hermit_unit_on_host", 1285),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
