@@ -232,7 +232,7 @@ mod tests {
         // its `Serialize`) and the reply's fields (domain 5). #4780 defines
         // domain 4 for the same event; whichever of the two lands second merges
         // the item lists and records the next revision.
-        (30, "cc045ad597b403b8", "f013e36743d8d9e6"),
+        (30, "1ad04313060b8cdf", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

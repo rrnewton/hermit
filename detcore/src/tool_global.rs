@@ -7948,7 +7948,7 @@ pub enum SignalScope {
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair.
 pub(crate) const GLOBAL_RPC_REVISION: u32 = 30;
-/// PR #4728's `SchedEvent::stopless` and `ReplayedSliceEnd` append revision 30 above 27 (28, 29 and 31 are reserved).
+// PR #4728's `SchedEvent::stopless` and `ReplayedSliceEnd` append revision 30 above 27 (28, 29 and 31 are reserved).
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
