@@ -235,7 +235,7 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4867; renumbered to 31 at
         // this rebase onto main's pidfd revision 27, skipping reserved
         // 28 (4789) and 30 (4728); digest measured at this head).
-        (31, "ce0342df1c3c384d", "f013e36743d8d9e6"),
+        (31, "fa50e9ac112cdf4d", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
