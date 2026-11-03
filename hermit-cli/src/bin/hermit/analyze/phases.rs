@@ -1698,7 +1698,7 @@ impl AnalyzeOpts {
     /// continuation of a record's first `len` events and `stack` each
     /// stack-trace replay (its name, record, length and the event to take
     /// the stack at), both giving completed outcomes or ending the analysis.
-    fn report_timing_decision_with<CT, S>(
+    fn report_timing_decision_with<ContinueTarget, Stack>(
         &self,
         schedule: &PreemptionRecord,
         decision: usize,
@@ -1709,18 +1709,16 @@ impl AnalyzeOpts {
             &Path,
             &mut Option<TracedReplay>,
         ),
-        (continue_target, stack): (CT, S),
+        (continue_target, stack): (ContinueTarget, Stack),
     ) -> anyhow::Result<Option<Report>>
     where
-        CT: FnOnce(
-            &PreemptionRecord,
-            usize,
-        ) -> anyhow::Result<(
-            CompletedScheduleTrial,
-            PathBuf,
-            Option<TracedReplay>,
-        )>,
-        S: Fn(
+        ContinueTarget:
+            FnOnce(
+                &PreemptionRecord,
+                usize,
+            )
+                -> anyhow::Result<(CompletedScheduleTrial, PathBuf, Option<TracedReplay>)>,
+        Stack: Fn(
             &str,
             &PreemptionRecord,
             usize,
@@ -6489,6 +6487,9 @@ mod tests {
         assert_eq!(
             slice_end_events(&alone, &without, [Some(&seven), Some(&five)]),
             None
+        );
+    }
+
     /// Prefix outcomes need not be monotone. A guest whose thread B stores 2
     /// twice and whose thread A stores 1 once, printing the final value, can
     /// meet a target of "2" with none and all of the schedule replayed, yet
