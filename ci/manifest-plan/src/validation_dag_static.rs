@@ -1269,7 +1269,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1944 + 2 = 1946 (Train 5 delta +2).
-    ("test.regular_crates", 1951),
+    // PR #4741: manifest-plan's the_pmu_analyze_node_runs_the_ignored_analyze_integrations
+    // and detcore-model's access_trace::tests::an_open_note_reads_with_or_without_its_kind
+    // are already counted on this base except one net unit: 1951 + 1 = 1952.
+    ("test.regular_crates", 1952),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5314,7 +5317,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    // PR #4741: the same one net unit: 1937 + 1 = 1938.
+    ("test.regular_crates_on_host", 1938),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
