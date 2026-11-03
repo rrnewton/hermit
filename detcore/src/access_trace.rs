@@ -1161,16 +1161,19 @@ impl std::fmt::Debug for AccessTraceWriter {
 }
 
 impl AccessTraceWriter {
-    /// Create the trace at `path` and write its header.
+    /// Create the trace at `path` and write its header, which names
+    /// `untyped_descriptors`, the run's settings that can leave a descriptor
+    /// without its file type (`Config::untyped_descriptor_settings`).
     pub fn create(
         path: &Path,
         from: EventIndex,
+        untyped_descriptors: Vec<String>,
         max_records: Option<u64>,
         max_bytes: Option<u64>,
     ) -> io::Result<Self> {
-        let mut writer = Self::new(
+        let mut writer = Self::with_header(
             Box::new(BufWriter::with_capacity(1 << 20, File::create(path)?)),
-            from,
+            TraceHeader::new(from).with_untyped_descriptors(untyped_descriptors),
             max_records,
             max_bytes,
         )?;
@@ -1178,14 +1181,33 @@ impl AccessTraceWriter {
         Ok(writer)
     }
 
+<<<<<<< HEAD
     /// Write the header of a trace to `out`.
     pub(crate) fn new(
         mut out: Box<dyn Write + Send>,
+=======
+    /// Write the header of a trace to `out`, of a run that records every
+    /// descriptor's type.
+    #[cfg(test)]
+    fn new(
+        out: Box<dyn Write + Send>,
+>>>>>>> 775e8af8723 (Give no pipe edge in a trace recorded without descriptor types, and name the setting in its header)
         from: EventIndex,
         max_records: Option<u64>,
         max_bytes: Option<u64>,
     ) -> io::Result<Self> {
-        let header = TraceRecord::Header(TraceHeader::new(from)).to_line()?;
+        Self::with_header(out, TraceHeader::new(from), max_records, max_bytes)
+    }
+
+    /// Write `header` to `out`.
+    fn with_header(
+        mut out: Box<dyn Write + Send>,
+        header: TraceHeader,
+        max_records: Option<u64>,
+        max_bytes: Option<u64>,
+    ) -> io::Result<Self> {
+        let from = header.from;
+        let header = TraceRecord::Header(header).to_line()?;
         out.write_all(&header)?;
         Ok(AccessTraceWriter {
             out: Some(out),
