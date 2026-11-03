@@ -2365,7 +2365,8 @@ impl GlobalTool for GlobalState {
         // request answered without either carries no mark.
         let dtid = DetTid::from_raw(from.as_raw());
         self.sched.lock().unwrap().take_grant(dtid);
-        let (time, response) = if !resumes_from_grant(&gr.2) {
+        let carries_slice_end = resumes_from_grant(&gr.2);
+        let (time, response) = if !carries_slice_end {
             self.dispatch_rpc(from, gr).await
         } else {
             self.sched.lock().unwrap().take_deadline_hint(dtid);
@@ -2385,13 +2386,36 @@ impl GlobalTool for GlobalState {
             }
         };
         let granted = self.sched.lock().unwrap().take_grant(dtid);
-        if granted
+        let response = if granted
             && response != GlobalResponse::ThreadExited
             && response != GlobalResponse::Retired
         {
-            (time, GlobalResponse::Granted(Box::new(response)))
+            GlobalResponse::Granted(Box::new(response))
         } else {
-            (time, response)
+            response
+        };
+        // A read of the existing replay cursor, not another scheduling point.
+        // In particular a same-thread yield and a yield that ran other threads
+        // must both refresh the next boundary before their caller continues.
+        let next_slice_end = if carries_slice_end
+            && response != GlobalResponse::ThreadExited
+            && response != GlobalResponse::Retired
+        {
+            self.sched
+                .lock()
+                .unwrap()
+                .replayer
+                .as_ref()
+                .and_then(|replayer| replayer.slice_end_reply(dtid))
+        } else {
+            None
+        };
+        match next_slice_end {
+            Some(boundary) => (
+                time,
+                GlobalResponse::WithSliceEnd(boundary, Box::new(response)),
+            ),
+            None => (time, response),
         }
     }
 }
@@ -6679,6 +6703,9 @@ pub enum GlobalResponse {
     HostTimedAndPrivateSigchld(u64, u64),
     /// Appended last.
     LockLedgerRefused(()),
+    /// Replay of an explicit-boundary schedule, with the next boundary for
+    /// this thread (if immediately next). Appended to preserve existing tags.
+    WithSliceEnd(Option<SliceEndBoundary>, Box<GlobalResponse>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -7272,6 +7299,10 @@ where
     let mm = guest.thread_state().mm_id;
     let continues_sigreturn = request_continues_sigreturn(&request);
     let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    if let GlobalResponse::WithSliceEnd(boundary, response) = resp.1 {
+        resp.1 = *response;
+        guest.thread_state_mut().replay_slice_end = Some(boundary);
+    }
     // A grant while the request was pending is a hand-off to the scheduler,
     // the one place every hand-off is noted (`ThreadState::note_scheduler_handoff`).
     if let GlobalResponse::Granted(response) = resp.1 {
@@ -18296,3 +18327,6 @@ mod robust_exit_clock_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod slice_end_tests;

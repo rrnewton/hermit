@@ -13,6 +13,7 @@ use detcore_model::collections::ReplayCursor;
 use detcore_model::pid::DetTid;
 use detcore_model::schedule::Op;
 use detcore_model::schedule::SchedEvent;
+use detcore_model::schedule::SliceEndBoundary;
 use detcore_model::schedule::SyscallPhase;
 use detcore_model::time::LogicalTime;
 use tracing::debug;
@@ -39,6 +40,9 @@ pub struct Replayer {
     pub replay_exhausted_panic: bool,
     /// A cached copy of the same (immutable) field in Config.
     pub die_on_desync: bool,
+    /// New recordings explicitly represent slice-end turns. Old recordings
+    /// retain the original inference and do not acquire new events on replay.
+    has_slice_ends: bool,
 }
 
 /// The count of desyncs for a particular thread.
@@ -170,7 +174,17 @@ fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
 impl Replayer {
     /// Allocate a new replayer.
     pub fn new(i: impl IntoIterator<Item = SchedEvent>) -> Replayer {
-        let cursor = ReplayCursor::from_iter(i);
+        let events: Vec<_> = i.into_iter().collect();
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.op, Op::TimesliceEnd(_)) || event.count == 1),
+            "a slice-end event must describe exactly one scheduler request"
+        );
+        let has_slice_ends = events
+            .iter()
+            .any(|event| matches!(event.op, Op::TimesliceEnd(_)));
+        let cursor = ReplayCursor::from_iter(events);
         Replayer {
             cursor,
             desync_counts: BTreeMap::new(),
@@ -178,7 +192,23 @@ impl Replayer {
             replay_exhausted_panic: false,
             traced_event_count: 0,
             events_popped: 0,
+            has_slice_ends,
         }
+    }
+
+    /// `None` selects legacy inference. `Some` identifies an explicit-boundary
+    /// recording and carries its next boundary only to the thread that owns it.
+    /// Read after a grant as well as after a trace event: another thread may
+    /// have consumed events while this thread was waiting for that grant.
+    pub(crate) fn slice_end_reply(&self, thread: DetTid) -> Option<Option<SliceEndBoundary>> {
+        self.has_slice_ends.then(|| match self.cursor.peek() {
+            Some(SchedEvent {
+                dettid,
+                op: Op::TimesliceEnd(boundary),
+                ..
+            }) if *dettid == thread => Some(*boundary),
+            _ => None,
+        })
     }
 
     /// This function look-aheads into following instruction to determine if
@@ -187,6 +217,33 @@ impl Replayer {
     /// usecase for hermit analyze. Returned LogicalTime is RELATIVE to the corresponding thread localtime
     fn resolve_time_to_run(&self, next: &SchedEvent) -> Option<LogicalTime> {
         let cursor = &self.cursor;
+
+        // A Branch sampled at a software check-in has no precise end RIP and
+        // is followed by OtherInstructions. Its slice ends at that check-in,
+        // not at the earlier instruction where the same RCB count was reached.
+        // A precise timer stop instead supplies the Branch RIP. Keep its PMU
+        // target even when the next recorded event belongs to the same thread.
+        if let SchedEvent {
+            op: Op::Branch,
+            count,
+            dettid,
+            end_rip,
+            ..
+        } = next
+        {
+            let marker = match cursor.peek_nth(1) {
+                Some(SchedEvent {
+                    op: Op::OtherInstructions,
+                    dettid: other_tid,
+                    ..
+                }) if other_tid == dettid => cursor.peek_nth(2),
+                event => event,
+            };
+            if matches!(marker, Some(SchedEvent { op: Op::TimesliceEnd(_), dettid: owner, .. }) if owner == dettid)
+            {
+                return end_rip.map(|_| LogicalTime::from_rcbs(*count as u64));
+            }
+        }
 
         if let Some(next_time_slice_in_brances) =
             match (next, cursor.peek_nth(1), cursor.peek_nth(2)) {
@@ -446,14 +503,22 @@ impl Replayer {
         if let Some(next_ev) = self.cursor.peek() {
             let mytid = observed.dettid;
             let time = observed.end_time.expect("timestamps required for now");
-            let is_prehook = matches!(observed.op, Op::Syscall(_, SyscallPhase::Prehook));
+            let is_prehook = matches!(
+                observed.op,
+                Op::Syscall(_, SyscallPhase::Prehook) | Op::TimesliceEnd(_)
+            );
 
             let next_tid = next_ev.dettid;
             // Checking for an optional timeslice in case of RCB
             let timeslice = self.resolve_time_to_run(next_ev);
 
             if next_tid != observed.dettid {
-                if is_prehook {
+                if matches!(observed.op, Op::TimesliceEnd(_)) {
+                    info!(
+                        "[detcore, dtid {}] CONTEXT SWITCH to {} at the recorded slice-end request. Reprioritizing at time {}",
+                        &mytid, next_tid, time
+                    );
+                } else if is_prehook {
                     info!(
                         "[detcore, dtid {}] CONTEXT SWITCH to {} after this syscall blocks.  Reprioritizing at time {}",
                         &mytid, next_tid, time
@@ -589,6 +654,152 @@ mod tests {
             replayer.observe_event(&schedule[0]),
             ReplayAction::Continue(None)
         );
+    }
+
+    fn slice_end(tid: DetTid, boundary: SliceEndBoundary) -> SchedEvent {
+        SchedEvent {
+            dettid: tid,
+            op: Op::TimesliceEnd(boundary),
+            count: 1,
+            start_rip: None,
+            end_rip: std::num::NonZeroUsize::new(SOME_RIP),
+            end_time: Some(LogicalTime::ZERO),
+        }
+    }
+
+    #[test]
+    fn software_slice_end_does_not_invent_a_pmu_stop_at_equal_rcbs() {
+        let mut b = builder::SchedTestBuilder::new();
+        let schedule = strip_times(vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)),
+            b.other(SOME_RIP, tid(3)),
+            slice_end(tid(3), SliceEndBoundary::Prehook),
+            b.other(SOME_RIP, tid(5)),
+        ]);
+        let mut replay = Replayer::new(schedule.clone());
+        assert_eq!(
+            replay.observe_event(&schedule[0]),
+            ReplayAction::Continue(None)
+        );
+        assert_eq!(
+            replay.observe_event(&schedule[1]),
+            ReplayAction::Continue(None)
+        );
+        assert_eq!(replay.slice_end_reply(tid(3)), Some(None));
+        assert_eq!(
+            replay.observe_event(&schedule[2]),
+            ReplayAction::Continue(None)
+        );
+        assert_eq!(
+            replay.slice_end_reply(tid(3)),
+            Some(Some(SliceEndBoundary::Prehook))
+        );
+        assert_eq!(replay.slice_end_reply(tid(5)), Some(None));
+        // The marker's caller will issue the original yield. An immediate
+        // switch here would add a TraceReplay request and charge a second turn.
+        assert_eq!(
+            replay.observe_event(&schedule[3]),
+            ReplayAction::ContextSwitch(false, tid(5), None)
+        );
+        assert_eq!(replay.slice_end_reply(tid(3)), Some(None));
+    }
+
+    #[test]
+    fn precise_timer_slice_end_keeps_its_pmu_target() {
+        let mut b = builder::SchedTestBuilder::new();
+        let schedule = strip_times(vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3))
+                .with_end_rip(std::num::NonZeroUsize::new(SOME_RIP).unwrap()),
+            slice_end(tid(3), SliceEndBoundary::Prehook),
+            b.other(SOME_RIP, tid(3)),
+        ]);
+        let mut replay = Replayer::new(schedule.clone());
+        assert_eq!(
+            replay.observe_event(&schedule[0]),
+            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+        );
+        assert_eq!(
+            replay.observe_event(&schedule[1]),
+            ReplayAction::Continue(None)
+        );
+        assert_eq!(
+            replay.slice_end_reply(tid(3)),
+            Some(Some(SliceEndBoundary::Prehook))
+        );
+    }
+
+    #[test]
+    fn same_thread_posthook_and_adjacent_slice_ends_remain_visible() {
+        let mut b = builder::SchedTestBuilder::new();
+        let marker = slice_end(tid(3), SliceEndBoundary::Posthook);
+        let schedule = strip_times(vec![
+            b.syscall_post(Sysno::write, SOME_RIP, tid(3)),
+            marker.clone(),
+            marker,
+            b.other(SOME_RIP, tid(3)),
+        ]);
+        let mut replay = Replayer::new(schedule.clone());
+        assert_eq!(
+            replay.observe_event(&schedule[0]),
+            ReplayAction::Continue(None)
+        );
+        for marker in &schedule[1..3] {
+            assert_eq!(
+                replay.slice_end_reply(tid(3)),
+                Some(Some(SliceEndBoundary::Posthook))
+            );
+            assert_eq!(replay.observe_event(marker), ReplayAction::Continue(None));
+        }
+        assert_eq!(replay.slice_end_reply(tid(3)), Some(None));
+        assert_eq!(replay.events_popped, 3);
+    }
+
+    #[test]
+    fn slice_end_phase_and_missing_marker_are_hard_mismatches() {
+        let marker = slice_end(tid(3), SliceEndBoundary::Posthook);
+        for wrong in [
+            slice_end(tid(3), SliceEndBoundary::Prehook),
+            SchedEvent {
+                op: Op::OtherInstructions,
+                ..marker.clone()
+            },
+        ] {
+            let mut replay = Replayer::new([marker.clone()]);
+            replay.die_on_desync = true;
+            assert_eq!(
+                replay.observe_event(&wrong),
+                ReplayAction::Stop(StopReason::FatalDesync)
+            );
+            assert_eq!(replay.events_popped, 0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one scheduler request")]
+    fn slice_end_cannot_hide_multiple_turns_in_its_count() {
+        let mut marker = slice_end(tid(3), SliceEndBoundary::Posthook);
+        marker.count = 2;
+        Replayer::new([marker]);
+    }
+
+    #[test]
+    fn legacy_schedule_retains_inference_and_has_no_boundary_reply() {
+        let mut b = builder::SchedTestBuilder::new();
+        let schedule = vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)),
+            b.other(SOME_RIP, tid(3)),
+            b.other(SOME_RIP, tid(5)),
+        ];
+        let mut replay = Replayer::new(schedule.clone());
+        assert_eq!(replay.slice_end_reply(tid(3)), None);
+        assert_eq!(
+            replay.observe_event(&schedule[0]),
+            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+        );
+        assert_eq!(replay.slice_end_reply(tid(3)), None);
     }
 
     #[test]

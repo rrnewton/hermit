@@ -1727,40 +1727,59 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         self.pipe_hand_off_if_due(guest).await;
-        self.end_timeslice_if_needed(guest, boundary).await;
+        self.end_timeslice_if_needed(guest, boundary, SliceEndBoundary::Prehook)
+            .await;
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     /// Yield when accumulated logical time reaches the syscall-boundary target deadline.
-    async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G, boundary: CheckIn) {
+    async fn end_timeslice_if_needed<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        boundary: CheckIn,
+        slice_boundary: SliceEndBoundary,
+    ) {
         let thread_state = guest.thread_state();
+        let recorded_end = thread_state.replay_slice_end.flatten() == Some(slice_boundary);
         // A thread that sent a signal to its own process keeps its turn until
         // it dequeues that signal (`own_signal_turn_hold`).
         if let Some(signal) = thread_state.own_signal_turn_hold {
+            assert!(
+                !recorded_end,
+                "recorded slice end inside own-process signal hold"
+            );
             trace!(
                 "[dtid {}] keeps its turn until it takes signal {}",
                 thread_state.dettid, signal
             );
             return;
         }
-        let Some(slice_end) = thread_state.end_of_timeslice else {
+        let slice_end = thread_state.end_of_timeslice;
+        if slice_end.is_none() && !recorded_end {
             return;
-        };
+        }
         let ends = match boundary {
             CheckIn::Event => thread_state.timeslice_expired(),
             CheckIn::InstructionTrap => thread_state.instruction_trap_ends_timeslice(&self.cfg),
         };
-        if !ends {
+        if !ends && !recorded_end {
             return;
         }
 
-        trace!(
-            "[dtid {}] logical time {} reached timeslice target {}",
-            thread_state.dettid,
-            thread_state.thread_logical_time.as_nanos(),
-            slice_end
-        );
-        self.end_timeslice(guest).await;
+        if recorded_end {
+            trace!(
+                "[dtid {}] replaying recorded slice end at {:?}",
+                thread_state.dettid, slice_boundary
+            );
+        } else {
+            trace!(
+                "[dtid {}] logical time {} reached timeslice target {}",
+                thread_state.dettid,
+                thread_state.thread_logical_time.as_nanos(),
+                slice_end.expect("an expired live slice has a deadline")
+            );
+        }
+        self.end_timeslice(guest, slice_boundary).await;
     }
 
     /// A common hook called at the end of *every* handler, just before returning control
@@ -1792,7 +1811,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
         self.pipe_hand_off_if_due(guest).await;
-        self.end_timeslice_if_needed(guest, boundary).await;
+        self.end_timeslice_if_needed(guest, boundary, SliceEndBoundary::Posthook)
+            .await;
 
         let dettid = guest.thread_state().dettid;
         let mut current_time = guest.thread_state().thread_logical_time.as_nanos();
@@ -1822,7 +1842,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     "posthook [dtid {}] less than one RCB remains before PMU maximum {}; ending slice",
                     dettid, max_timeslice_end
                 );
-                self.end_timeslice(guest).await;
+                self.end_timeslice(guest, SliceEndBoundary::Posthook).await;
                 max_timeslice_end = guest
                     .thread_state()
                     .max_timeslice_end
@@ -1940,24 +1960,51 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Effects
     ///  - ends timeslice (mutating thread stats and both deadlines)
     ///  - priority change / yield RPC
-    async fn end_timeslice<G: Guest<Self>>(&self, guest: &mut G) {
-        self.end_timeslice_with_sched_yield(guest, false).await;
+    async fn end_timeslice<G: Guest<Self>>(&self, guest: &mut G, boundary: SliceEndBoundary) {
+        self.end_timeslice_with_sched_yield(guest, false, boundary)
+            .await;
     }
 
     async fn end_timeslice_for_sched_yield<G: Guest<Self>>(&self, guest: &mut G) {
-        self.end_timeslice_with_sched_yield(guest, true).await;
+        self.end_timeslice_with_sched_yield(guest, true, SliceEndBoundary::SchedYield)
+            .await;
     }
 
     async fn end_timeslice_with_sched_yield<G: Guest<Self>>(
         &self,
         guest: &mut G,
         mut explicit_sched_yield: bool,
+        boundary: SliceEndBoundary,
     ) {
         let chaos = guest.config().chaos;
         loop {
             let thread_state = guest.thread_state();
             let dettid = thread_state.dettid;
             let end_time = thread_state.thread_logical_time.as_nanos();
+            // Record the actual boundary before the existing request commits
+            // one turn. Legacy schedules do not gain new events on replay.
+            if self.cfg.should_trace_schedevent()
+                && (self.cfg.replay_schedule_from.is_none()
+                    || thread_state.replay_slice_end.is_some())
+            {
+                if let Some(expected) = thread_state.replay_slice_end.flatten() {
+                    assert_eq!(
+                        expected, boundary,
+                        "slice ended at the wrong replay boundary"
+                    );
+                }
+                let event = SchedEvent {
+                    dettid,
+                    op: Op::TimesliceEnd(boundary),
+                    count: 1,
+                    start_rip: None,
+                    end_rip: None,
+                    end_time: None,
+                }
+                .with_dettime(&thread_state.thread_logical_time);
+                trace_schedevent(guest, event, true).await;
+            }
+            let thread_state = guest.thread_state();
             info!(
                 "[detcore, dtid {}] ending timeslice T{}. {} syscalls and {} signals this timeslice.",
                 dettid,
@@ -1985,7 +2032,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // conditional branch. Exact-RCB replay represents those as
             // adjacent zero-RCB slices, which must be consumed before the
             // guest resumes.
-            if !guest.thread_state().timeslice_expired() {
+            if !guest.thread_state().timeslice_expired()
+                && guest.thread_state().replay_slice_end.flatten() != Some(boundary)
+            {
                 break;
             }
             explicit_sched_yield = false;
@@ -3476,6 +3525,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
+                    replay_slice_end: None,
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(PR-1151)
                     chaos_epoch: tool_local::chaos_epoch_sentinel(),
@@ -3905,7 +3955,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 let ev = with_guest_rip(guest, ev).await;
                 trace_schedevent(guest, ev, false).await;
             }
-            if self.cfg.replay_schedule_from.is_some() {
+            if guest.thread_state().replay_slice_end.flatten()
+                == Some(SliceEndBoundary::TimerWithoutRcbTime)
+            {
+                self.end_timeslice(guest, SliceEndBoundary::TimerWithoutRcbTime)
+                    .await;
+            } else if self.cfg.replay_schedule_from.is_some() {
                 let fallback_deadline = max_timeslice_end
                     + Duration::from_nanos(u64::from(
                         self.cfg
@@ -3923,7 +3978,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 thread_state.last_rcb_timer_is_max = false;
                 thread_state.stats.reset_timeslice();
             } else if guest.thread_state().own_signal_turn_hold.is_none() {
-                self.end_timeslice(guest).await;
+                self.end_timeslice(guest, SliceEndBoundary::TimerWithoutRcbTime)
+                    .await;
             }
         }
         self.post_handler_hook(guest, CheckIn::Event).await;

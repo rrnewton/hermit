@@ -330,6 +330,7 @@ mod sigwrapper_tests {
 ///   instructions.
 /// - SignalReceived: just after the last regular, pre-signal guest instruction, and just before the
 ///   first instruction of the signal handler.
+/// - TimesliceEnd: at the named tool boundary, just before its scheduling request.
 ///
 /// If we view each event as a series of instructions contained between its start/end markers, then
 /// the pattern of instructions for each would be as follows.  Here we use simple regular
@@ -343,6 +344,7 @@ mod sigwrapper_tests {
 /// - Cpuid: "C"
 /// - OtherInstructions: "O*"
 /// - SignalReceived: ""
+/// - TimesliceEnd: ""
 ///
 /// A few observations about the above:
 ///
@@ -379,4 +381,102 @@ pub enum Op {
     /// The point a signal handler is received, just after whatever regular user instruction
     /// preceeded it, and just before the first instruction of the signal handler.
     SignalReceived(SigWrapper),
+
+    /// A timeslice ended at this tool boundary, immediately before its existing
+    /// scheduler request. This contains no guest instruction. Appended so old
+    /// operation tags and JSON spellings remain unchanged.
+    TimesliceEnd(SliceEndBoundary),
+}
+
+/// The tool boundary at which a recorded timeslice ends. RCBs alone cannot
+/// distinguish a syscall's entry, completion, and a PMU stop before its entry.
+#[derive(PartialEq, Debug, Eq, Copy, Clone, Hash, Serialize, Deserialize)]
+pub enum SliceEndBoundary {
+    /// The common pre-handler check-in, after its Branch/OtherInstructions events.
+    Prehook,
+    /// The common post-handler check-in, after the handler's completion event.
+    Posthook,
+    /// The guest explicitly invoked sched_yield.
+    SchedYield,
+    /// A maximum-timer callback under --no-rcb-time, after its clock advance.
+    TimerWithoutRcbTime,
+}
+
+#[cfg(test)]
+mod slice_end_compatibility_tests {
+    use super::*;
+
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    enum LegacyOp {
+        Branch,
+        Rdtsc,
+        Cpuid,
+        Syscall(Sysno, SyscallPhase),
+        OtherInstructions,
+        SignalReceived(SigWrapper),
+    }
+
+    #[test]
+    fn old_operation_json_and_binary_tags_are_byte_identical() {
+        let pairs = [
+            (LegacyOp::Branch, Op::Branch),
+            (LegacyOp::Rdtsc, Op::Rdtsc),
+            (LegacyOp::Cpuid, Op::Cpuid),
+            (
+                LegacyOp::Syscall(Sysno::write, SyscallPhase::Prehook),
+                Op::Syscall(Sysno::write, SyscallPhase::Prehook),
+            ),
+            (
+                LegacyOp::Syscall(Sysno::write, SyscallPhase::Polling),
+                Op::Syscall(Sysno::write, SyscallPhase::Polling),
+            ),
+            (
+                LegacyOp::Syscall(Sysno::write, SyscallPhase::Posthook),
+                Op::Syscall(Sysno::write, SyscallPhase::Posthook),
+            ),
+            (LegacyOp::OtherInstructions, Op::OtherInstructions),
+            (
+                LegacyOp::SignalReceived(SigWrapper(libc::SIGUSR1)),
+                Op::SignalReceived(SigWrapper(libc::SIGUSR1)),
+            ),
+        ];
+        for (old, new) in pairs {
+            let json = serde_json::to_vec(&old).unwrap();
+            assert_eq!(serde_json::to_vec(&new).unwrap(), json);
+            assert_eq!(serde_json::from_slice::<Op>(&json).unwrap(), new);
+            let bytes = bincode::serde::encode_to_vec(&old, bincode::config::legacy()).unwrap();
+            assert_eq!(
+                bincode::serde::encode_to_vec(&new, bincode::config::legacy()).unwrap(),
+                bytes
+            );
+            let (decoded, used): (Op, _) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(decoded, new);
+            assert_eq!(used, bytes.len());
+        }
+    }
+
+    #[test]
+    fn new_boundaries_round_trip_and_old_readers_refuse_them() {
+        for boundary in [
+            SliceEndBoundary::Prehook,
+            SliceEndBoundary::Posthook,
+            SliceEndBoundary::SchedYield,
+            SliceEndBoundary::TimerWithoutRcbTime,
+        ] {
+            let op = Op::TimesliceEnd(boundary);
+            let json = serde_json::to_vec(&op).unwrap();
+            assert_eq!(serde_json::from_slice::<Op>(&json).unwrap(), op);
+            assert!(serde_json::from_slice::<LegacyOp>(&json).is_err());
+            let bytes = bincode::serde::encode_to_vec(&op, bincode::config::legacy()).unwrap();
+            let (decoded, used): (Op, _) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(decoded, op);
+            assert_eq!(used, bytes.len());
+            assert!(
+                bincode::serde::decode_from_slice::<LegacyOp, _>(&bytes, bincode::config::legacy())
+                    .is_err()
+            );
+        }
+    }
 }

@@ -4307,6 +4307,13 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub replay_rcb_end: Option<u64>,
 
+    /// Cursor metadata carried by existing scheduler replies. Outer `None`
+    /// means a legacy schedule (or no schedule replay); the inner value names
+    /// the next explicit slice end owned by this thread. Never inherited by a
+    /// child. An exec cannot carry an unconsumed boundary past its trace event.
+    #[serde(skip)]
+    pub(crate) replay_slice_end: Option<Option<SliceEndBoundary>>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     /// Deterministic chaos epoch this thread was in at its last `next_timeslice`.
@@ -5024,6 +5031,7 @@ impl<T> ThreadState<T> {
             scheduler_grants: 0,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
+            replay_slice_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1151)
             chaos_epoch: chaos_epoch_sentinel(),
