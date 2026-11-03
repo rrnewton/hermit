@@ -1458,6 +1458,13 @@ mod tests {
                 "--rewrite-exclusives-also=/tmp/liblse.so",
             ],
         ),
+        (
+            "rewrite-exclusives-stripped",
+            &[
+                "--rewrite-exclusives",
+                "--rewrite-exclusives-stripped=heuristic",
+            ],
+        ),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
         ("cap-preemption-charge", &["--cap-preemption-charge"]),
         ("virtual-timeout", &["--virtual-timeout=1000"]),

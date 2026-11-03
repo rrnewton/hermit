@@ -1381,10 +1381,10 @@ impl AnalyzeOpts {
     }
 
     /// `record` stamped with the trials' `--pipe-wake-latency`, signal-state
-    /// copy setting, `--expired-wait-charge` and `--sleep-registration`, as
-    /// every record analyze writes must be: a record that omitted one would
-    /// be accepted when replayed under another value
-    /// (<https://github.com/rrnewton/hermit/issues/4380>).
+    /// copy setting, `--expired-wait-charge`, `--sleep-registration` and
+    /// stripped-file rewrite, as every record analyze writes must be: a
+    /// record that omitted one would be accepted, or refused, when replayed
+    /// under another value (<https://github.com/rrnewton/hermit/issues/4380>).
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
         record
             .with_pipe_wake_latency(self.trial_pipe_wake_latency())
@@ -1396,6 +1396,14 @@ impl AnalyzeOpts {
             .with_queued_sleeps_registered_at_first_pass(
                 self.trial_sleep_registration() == SleepRegistration::FirstPass,
             )
+            .with_rewrite_exclusives_stripped_heuristic(self.trial_stripped_rewrite_heuristic())
+    }
+
+    /// Whether the trials rewrite files without mapping symbols by the
+    /// stripped-file heuristic (`--rewrite-exclusives-stripped=heuristic` in
+    /// their run arguments).
+    pub fn trial_stripped_rewrite_heuristic(&self) -> bool {
+        RunData::get_raw_runopts(self).rewrites_stripped_files_by_heuristic()
     }
 
     /// Whether the trials cap preemption charges (`--cap-preemption-charge`
@@ -1482,9 +1490,11 @@ impl AnalyzeOpts {
     /// (`--no-signal-state-copy`), which a record without that field does not
     /// state, so it is accepted under either, and for the trials'
     /// `--expired-wait-charge` ([`Self::adopt_expired_wait_charge`]), which a
-    /// record without that field states as `each`, and for the trials'
+    /// record without that field states as `each`, for the trials'
     /// `--sleep-registration` ([`Self::adopt_sleep_registration`]), which a
-    /// record without that field states as `when-chosen`.
+    /// record without that field states as `when-chosen`, and for the trials'
+    /// `--rewrite-exclusives-stripped`, which a record without that field was
+    /// made without the heuristic.
     pub fn refuse_recordings_under_another_pipe_wake_latency(
         &self,
         recordings: &[(&str, &Path)],
@@ -1554,6 +1564,20 @@ impl AnalyzeOpts {
                 Some(self.trial_sleep_registration()),
                 true,
             ) {
+                return Err(
+                    anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
+                );
+            }
+            let recorded =
+                detcore::preemptions::read_recorded_rewrite_exclusives_stripped_heuristic(path)
+                    .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) =
+                detcore::preemptions::rewrite_exclusives_stripped_heuristic_mismatch(
+                    &format!("{option} {}", path.display()),
+                    recorded,
+                    self.trial_stripped_rewrite_heuristic(),
+                )
+            {
                 return Err(
                     anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
                 );

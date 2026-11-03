@@ -1493,6 +1493,30 @@ mod tests {
     /// the arguments after `start`, one per line.
     const RECORD_CPU_PROFILE_ARGS_IN_CHILD: &str = "HERMIT_TEST_RECORD_CPU_PROFILE_ARGS";
 
+    /// `hermit record start` takes no `--rewrite-exclusives`, so no recording
+    /// is made with the stripped-file heuristic, and nothing that reads a
+    /// recording back (`record start --verify`, `hermit replay`) has to tell
+    /// one apart.
+    #[test]
+    fn record_start_takes_no_exclusive_rewrite() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        for flag in [
+            "--rewrite-exclusives",
+            "--rewrite-exclusives-stripped=heuristic",
+        ] {
+            let parsed = <Cli as clap::Parser>::try_parse_from(["start", flag, "/bin/true"]);
+            assert_eq!(
+                parsed.err().map(|error| error.kind()),
+                Some(clap::error::ErrorKind::UnknownArgument),
+                "{flag}"
+            );
+        }
+    }
+
     /// `record start --cpu-profile` reads HERMIT_CPU_PROFILE exactly as `hermit
     /// run` does: unset is x86-64-v2, the flag wins, and a value that names no
     /// profile is refused. Each parse runs in a child process given exactly

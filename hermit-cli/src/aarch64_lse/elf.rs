@@ -27,13 +27,21 @@
 //! executable section can hold data too (a literal pool, or OpenSSL's
 //! constant tables in `.text`), and a table whose words happened to form a
 //! canonical loop would otherwise be rewritten, corrupting it. What is taken
-//! for code depends on what the file says, section by section:
+//! for code depends on what the file says, section by section, and on the
+//! caller's [`StrippedRewrite`] for sections without mapping symbols:
 //!
 //! - Mapping symbols: exactly the ranges they mark `$x`. The AArch64 ELF ABI
 //!   has an assembler mark data `$d`, so data marked as the ABI says is never
-//!   taken for code.
-//! - The unwind table alone (a section without mapping symbols, as in every
-//!   stripped file): what control reaches from the entries of the functions
+//!   taken for code. This is the only evidence the default
+//!   ([`StrippedRewrite::Refuse`]) accepts, because it is the only one that
+//!   proves where code is.
+//! - No mapping symbols, under the default: nothing. Every exclusive
+//!   sequence in such a section, as in every stripped file, is left alone as
+//!   `no-mapping-symbols`, so the file is left unchanged and named, never
+//!   silently.
+//! - The unwind table alone, under [`StrippedRewrite::Heuristic`]
+//!   (`--rewrite-exclusives-stripped=heuristic`), the stripped-file
+//!   heuristic: what control reaches from the entries of the functions
 //!   its FDEs describe, following direct branches. A call falls through
 //!   only where the callee can be shown to come back: a function here whose
 //!   own body reaches a `RET`, or which tail-calls one that does, worked out
@@ -60,22 +68,31 @@
 //!   the function, not to data, so an address-taken function's body is
 //!   still code.
 //!
-//!   Several things can still be taken for code wrongly, each needing data
-//!   that nothing in the image points at. Data after a call to an imported
-//!   function that never returns and is not among the names this reader
-//!   knows. Data an unresolved `ADRP`'s completion would reach beyond its
-//!   own page (a scaled load reaches 64 KiB, an `ADD` with `LSL #12` reaches
-//!   16 MiB). The rest of a table whose first word a branch could reach: a
-//!   data word before the field the code addresses can decode as a branch
-//!   into the table, and the next such target ends the data. What the code
-//!   addresses through a register after a write that does not carry an
-//!   `ADRP`'s base, since where that register then points is not in the
-//!   window. A function that returns through a changed link register, or
-//!   through an `SVC` the walk cannot follow, taken to return to its
-//!   caller. And a call through a register (`BLR`), whose callee is
-//!   unknown, taken to come back.
-//! - Neither: nothing. Such a section is left alone and reported, and so is
-//!   a whole file with neither mapping symbols nor an unwind table.
+//!   The heuristic's residuals, each data that nothing in the image points
+//!   at, taken for code:
+//!
+//!   - Data after a call to an imported function that never returns and is
+//!     not among the names this reader knows.
+//!   - What the code addresses through a register after a write that does
+//!     not carry an `ADRP`'s base (a lost carried base), since where that
+//!     register then points is not in the window.
+//!   - Data an unresolved `ADRP`'s completion would reach beyond its own
+//!     page (a scaled load reaches 64 KiB, an `ADD` with `LSL #12` reaches
+//!     16 MiB).
+//!   - The rest of a table whose first word a branch could reach: a data
+//!     word before the field the code addresses can decode as a branch into
+//!     the table (a false branch), and the next such target ends the data.
+//!   - A function that returns through a changed link register (`X30`), or
+//!     through an `SVC` the walk cannot follow, taken to return to its
+//!     caller.
+//!   - A call through a register (`BLR`), whose callee is unknown, taken to
+//!     come back.
+//!
+//!   A mistaken classification can corrupt program data: data taken for
+//!   code whose words form a canonical loop is rewritten like one.
+//! - Neither, under the heuristic: nothing. Such a section is left alone
+//!   and reported, and so is a whole file with neither mapping symbols nor
+//!   an unwind table.
 //!
 //! Under any evidence, a sequence an `LDR` (literal) or `ADR` in the code
 //! reaches is refused (`literal-inside-the-sequence`): an object linked
@@ -96,6 +113,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+pub use detcore_model::config::StrippedRewrite;
 use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::program_header;
@@ -139,6 +157,14 @@ impl FileReport {
     pub fn complete(&self) -> bool {
         self.refused_total() == 0 && self.skipped_segments.is_empty()
     }
+    /// The sequences left alone because no mapping symbol marks their
+    /// section (`no-mapping-symbols`), which the default leaves unchanged.
+    pub fn unmarked(&self) -> usize {
+        self.refused
+            .get(refusal_name(&Refusal::NoMappingSymbols))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 fn idiom_name(idiom: Idiom) -> &'static str {
@@ -163,12 +189,17 @@ fn refusal_name(reason: &Refusal) -> &'static str {
         Refusal::Relocated => "relocation-inside-the-sequence",
         Refusal::LiteralInsideSequence => "literal-inside-the-sequence",
         Refusal::AddressedData => "addressed-data-inside-the-sequence",
+        Refusal::NoMappingSymbols => "no-mapping-symbols",
     }
 }
 
 fn refusal_detail(reason: &Refusal) -> String {
     match reason {
         Refusal::Registers(why) => format!("register-constraint: {why}"),
+        Refusal::NoMappingSymbols => "no-mapping-symbols: nothing marks this section's code \
+                                      ($x, $d); --rewrite-exclusives-stripped=heuristic would \
+                                      rewrite it by the stripped-file heuristic"
+            .to_string(),
         other => refusal_name(other).to_string(),
     }
 }
@@ -178,7 +209,15 @@ fn refusal_detail(reason: &Refusal) -> String {
 /// Returns `Ok(None)` when the file is not an aarch64 ELF, which is not an
 /// error: a caller that was handed the wrong file should say so and run the
 /// original.
-pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::error::Error> {
+///
+/// `stripped` decides what happens to an executable section no mapping
+/// symbol marks: under [`StrippedRewrite::Refuse`] its sequences are left
+/// alone as `no-mapping-symbols`; under [`StrippedRewrite::Heuristic`] the
+/// unwind table and the code's control flow decide what is code.
+pub fn rewrite_bytes(
+    bytes: &mut [u8],
+    stripped: StrippedRewrite,
+) -> Result<Option<FileReport>, goblin::error::Error> {
     // A guest that is not an ELF image at all -- a `#!` script, say -- is not
     // an error: it simply has nothing to rewrite. A file that starts like an
     // ELF and then does not parse IS an error, because something is wrong
@@ -252,7 +291,10 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
         let evidence = file_code_evidence(bytes, &elf);
         // Where a call never comes back ([`never_returning_targets`]).
         let never_back = never_returning_targets(bytes, &elf);
-        if evidence.symbols.is_empty() && evidence.unwind.is_none() {
+        if stripped == StrippedRewrite::Heuristic
+            && evidence.symbols.is_empty()
+            && evidence.unwind.is_none()
+        {
             return skip_file(
                 "the file has neither mapping symbols ($x, $d) nor an unwind table (.eh_frame), \
                  so code cannot be told from data in its executable sections",
@@ -285,10 +327,15 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                             .collect()
                     });
                 let held = evidence.classify(index, sh.sh_addr, sh.sh_size);
+                // Only mapping symbols prove where code is; by default a
+                // section they do not mark is not read for code at all.
+                let unproven = stripped == StrippedRewrite::Refuse
+                    && held.evidence != Some(mapping::Evidence::MappingSymbols);
                 // Under the unwind table alone, code is what control can
                 // reach from the functions' entries: a table a function
                 // branches over, or keeps after its return, is not.
                 let (code, unknown) = match (&words, held.evidence) {
+                    _ if unproven => (Vec::new(), vec![(sh.sh_addr, sh.sh_addr + sh.sh_size)]),
                     (Some(words), Some(mapping::Evidence::UnwindTable)) => {
                         let entries = evidence.unwind_entries(sh.sh_addr, sh.sh_size);
                         // Which of those functions can come back, so that a
@@ -326,6 +373,7 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                     writable,
                     words,
                     evidence: held.evidence,
+                    unproven,
                     code,
                     unknown,
                 }
@@ -442,6 +490,7 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             writable,
             words,
             evidence,
+            unproven,
             code,
             unknown,
         } = section;
@@ -461,6 +510,30 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             report.skipped_segments.push(format!(
                 "executable section at {vaddr:#x} is in a writable mapping"
             ));
+            continue;
+        }
+        // Nothing proves this section's code, so nothing in it is rewritten:
+        // each sequence the planner finds is named as left alone for that
+        // reason, whatever else it would have said of it.
+        if unproven {
+            let plan = rewrite::plan_with_external_targets(&words, vaddr, &external_targets);
+            report.exclusive_instructions += plan.exclusive_instructions;
+            let mut sites: Vec<u64> = plan
+                .patched
+                .iter()
+                .map(|site| site.addr)
+                .chain(plan.refused.iter().map(|refused| refused.addr))
+                .collect();
+            sites.sort_unstable();
+            for addr in sites {
+                *report
+                    .refused
+                    .entry(refusal_name(&Refusal::NoMappingSymbols))
+                    .or_default() += 1;
+                report
+                    .refused_sites
+                    .push((addr, refusal_detail(&Refusal::NoMappingSymbols)));
+            }
             continue;
         }
         // Exclusive instructions in bytes neither known code nor marked
@@ -542,6 +615,9 @@ struct Section {
     words: Option<Vec<u32>>,
     /// What its code was found by; `None` when nothing speaks for it.
     evidence: Option<mapping::Evidence>,
+    /// Whether it is left alone because no mapping symbol marks it, under
+    /// [`StrippedRewrite::Refuse`].
+    unproven: bool,
     /// Its code, as sorted, disjoint address ranges.
     code: Vec<(u64, u64)>,
     /// Its bytes neither known code nor marked data, likewise.
@@ -1047,10 +1123,11 @@ pub fn write_rewritten(output: &Path, bytes: &[u8], source: &Path) -> anyhow::Re
 pub fn rewrite_file(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
+    stripped: StrippedRewrite,
 ) -> anyhow::Result<Option<FileReport>> {
     let input = input.as_ref();
     let mut bytes = std::fs::read(input)?;
-    let report = match rewrite_bytes(&mut bytes)? {
+    let report = match rewrite_bytes(&mut bytes, stripped)? {
         Some(report) => report,
         None => return Ok(None),
     };
@@ -1245,13 +1322,88 @@ mod tests {
         );
     }
 
-    /// The image's bytes after [`rewrite_bytes`], with its report.
+    /// The image's bytes after [`rewrite_bytes`] under the stripped-file
+    /// heuristic, which reads every kind of evidence, with its report.
     fn rewritten(image: &[u8]) -> (Vec<u8>, FileReport) {
+        rewritten_with(image, StrippedRewrite::Heuristic)
+    }
+
+    /// The image's bytes after [`rewrite_bytes`] under `stripped`, with its
+    /// report.
+    fn rewritten_with(image: &[u8], stripped: StrippedRewrite) -> (Vec<u8>, FileReport) {
         let mut bytes = image.to_vec();
-        let report = rewrite_bytes(&mut bytes)
+        let report = rewrite_bytes(&mut bytes, stripped)
             .unwrap()
             .expect("an aarch64 ELF image");
         (bytes, report)
+    }
+
+    /// By default a stripped file is left unchanged and named: every sequence
+    /// in a section no mapping symbol marks is left alone as
+    /// `no-mapping-symbols`, listed by address, and the report is incomplete.
+    /// The heuristic rewrites the same image where its unwind table covers
+    /// code.
+    #[test]
+    fn a_stripped_file_is_left_unchanged_and_named_by_default() {
+        let words: Vec<u32> = LOOP.iter().chain(LOOP.iter()).copied().collect();
+        let image = elf_image_with(&words, None, Some(&[(0, 6)]));
+        let (bytes, report) = rewritten_with(&image, StrippedRewrite::Refuse);
+        assert_eq!(bytes, image, "nothing is rewritten");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+        assert_eq!(report.exclusive_instructions, 4, "{report:?}");
+        assert_eq!(report.unmarked(), 2, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("no-mapping-symbols", 2)]),
+            "{report:?}"
+        );
+        assert_eq!(report.refused_sites.len(), 2, "{report:?}");
+        assert!(
+            report.refused_sites.iter().all(|(_, why)| why.starts_with(
+                "no-mapping-symbols: nothing marks this section's code ($x, $d); \
+                 --rewrite-exclusives-stripped=heuristic"
+            )),
+            "{report:?}"
+        );
+        assert!(!report.complete());
+        let (heuristic, report) = rewritten_with(&image, StrippedRewrite::Heuristic);
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        assert_eq!(report.unmarked(), 0, "{report:?}");
+        assert_ne!(heuristic, image);
+    }
+
+    /// A file mapping symbols mark is rewritten by default exactly as the
+    /// heuristic rewrites it: the marks are the evidence both read first.
+    #[test]
+    fn a_marked_file_is_rewritten_by_default() {
+        let words: Vec<u32> = LOOP.iter().chain(LOOP.iter()).copied().collect();
+        for functions in [None, Some(&[(0, 6)][..])] {
+            let marked = elf_image_with(&words, Some(&[(1, 0, true)]), functions);
+            let (bytes, report) = rewritten_with(&marked, StrippedRewrite::Refuse);
+            assert_eq!(report.patched_total(), 2, "{report:?}");
+            assert_eq!(report.unmarked(), 0, "{report:?}");
+            assert!(report.complete(), "{report:?}");
+            assert_eq!(
+                (bytes, report),
+                rewritten_with(&marked, StrippedRewrite::Heuristic)
+            );
+        }
+    }
+
+    /// A file with neither mapping symbols nor an unwind table is named the
+    /// same way by default, sequence by sequence, where the heuristic skips
+    /// it whole; and a section in a file whose only mapping symbol marks
+    /// another section is named too.
+    #[test]
+    fn the_default_names_a_section_nothing_marks_whatever_else_the_file_holds() {
+        for marks in [None, Some(&[(2, 0, true)][..])] {
+            let image = elf_image(&LOOP, marks);
+            let (bytes, report) = rewritten_with(&image, StrippedRewrite::Refuse);
+            assert_eq!(bytes, image);
+            assert_eq!(report.unmarked(), 1, "{report:?}");
+            assert_eq!(report.exclusive_instructions, 2, "{report:?}");
+            assert!(report.skipped_segments.is_empty(), "{report:?}");
+        }
     }
 
     /// A literal pool in `.text` whose words form a canonical retry loop,

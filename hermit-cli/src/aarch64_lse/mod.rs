@@ -35,8 +35,10 @@ pub mod rewrite;
 /// part of the cache key, so a cached artifact from an older rewriter is
 /// never reused. 3: only code is rewritten, as [`mapping`] tells it from
 /// data. 4: a stripped file's code is what control proves, and what the
-/// code or the image addresses as data is not it.
-pub const REWRITE_FORMAT_VERSION: u32 = 4;
+/// code or the image addresses as data is not it. 5: a section no mapping
+/// symbol marks is rewritten only under the stripped-file heuristic
+/// (`StrippedRewrite::Heuristic`), which writes what 4 wrote.
+pub const REWRITE_FORMAT_VERSION: u32 = 5;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///

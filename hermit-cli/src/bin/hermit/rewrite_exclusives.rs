@@ -35,6 +35,20 @@ pub struct RewriteExclusivesOpts {
     /// only their counts by reason are printed.
     #[clap(long)]
     list_refusals: bool,
+
+    /// What to do with a file, or an executable section, that has no ARM
+    /// mapping symbols (`$x`, `$d`), as `hermit run
+    /// --rewrite-exclusives-stripped` does: `refuse` (the default) leaves its
+    /// loops alone as `no-mapping-symbols`; `heuristic` rewrites it by the
+    /// stripped-file heuristic, whose residuals `hermit run --help` lists
+    /// and which can corrupt program data where it takes data for code.
+    #[clap(
+        long,
+        value_enum,
+        value_name = "refuse|heuristic",
+        default_value = "refuse"
+    )]
+    stripped: elf::StrippedRewrite,
 }
 
 impl RewriteExclusivesOpts {
@@ -61,9 +75,9 @@ impl RewriteExclusivesOpts {
                     let name = file.file_name().ok_or_else(|| {
                         Error::msg(format!("{} has no file name", file.display()))
                     })?;
-                    elf::rewrite_file(file, dir.join(name))?
+                    elf::rewrite_file(file, dir.join(name), self.stripped)?
                 }
-                None => elf::rewrite_bytes(&mut std::fs::read(file)?)?,
+                None => elf::rewrite_bytes(&mut std::fs::read(file)?, self.stripped)?,
             };
             let Some(report) = report else {
                 println!("{}: not an aarch64 ELF image", file.display());
@@ -97,5 +111,35 @@ impl RewriteExclusivesOpts {
         // refused, or a section it did not read, so a build check can ask for
         // the property directly instead of parsing the report.
         Ok(ExitStatus::Exited(if incomplete { 1 } else { 0 }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    /// `--stripped` takes the run's values, `refuse` by default.
+    #[test]
+    fn stripped_files_are_refused_unless_the_heuristic_is_asked_for() {
+        let default =
+            RewriteExclusivesOpts::try_parse_from(["rewrite-exclusives", "a.so"]).unwrap();
+        assert_eq!(default.stripped, elf::StrippedRewrite::Refuse);
+        let heuristic = RewriteExclusivesOpts::try_parse_from([
+            "rewrite-exclusives",
+            "--stripped=heuristic",
+            "a.so",
+        ])
+        .unwrap();
+        assert_eq!(heuristic.stripped, elf::StrippedRewrite::Heuristic);
+        assert!(
+            RewriteExclusivesOpts::try_parse_from([
+                "rewrite-exclusives",
+                "--stripped=guess",
+                "a.so"
+            ])
+            .is_err()
+        );
     }
 }

@@ -1719,7 +1719,9 @@ pub struct RunOpts {
     /// of branches. A single atomic instruction cannot retry. This is
     /// preprocessing for the ptrace backend, not a backend: the rewritten copy
     /// is bind-mounted over the original path, and anything that is not a
-    /// fully decoded canonical loop is left alone and reported. Incompatible
+    /// fully decoded canonical loop is left alone and reported. Only what ARM
+    /// mapping symbols mark as code is rewritten unless
+    /// `--rewrite-exclusives-stripped=heuristic` says otherwise. Incompatible
     /// with `--no-namespace`, whose guest has no mount namespace to carry the
     /// overlay, and with `--image` (and `hermit oci run`), whose guest loads
     /// the files of the image's rootfs, which the overlay does not reach.
@@ -1730,6 +1732,39 @@ pub struct RunOpts {
     /// `--rewrite-exclusives`. Repeatable.
     #[clap(long, value_name = "FILE", requires = "rewrite_exclusives")]
     pub(crate) rewrite_exclusives_also: Vec<PathBuf>,
+
+    /// With `--rewrite-exclusives`, what to do with a file that has no ARM
+    /// mapping symbols (`$x`, `$d`), such as every stripped file: nothing in
+    /// it proves which bytes of its executable sections are code.
+    ///
+    /// `refuse`, the default, leaves such a file unchanged and names it: the
+    /// run's diagnostics and its summary list it, and `hermit
+    /// rewrite-exclusives --list-refusals` lists each of its loops as
+    /// `no-mapping-symbols`. Only what mapping symbols mark as code is
+    /// rewritten.
+    ///
+    /// `heuristic` rewrites it by the stripped-file heuristic: code is what
+    /// control reaches from the entries of the functions its unwind table
+    /// describes, less what the code or the image addresses as data. Its
+    /// residuals, where it can take data for code: data after a call to an
+    /// imported function that never returns and whose name it does not know;
+    /// what the code addresses after a write that loses an `ADRP`'s carried
+    /// base; what an unresolved `ADRP`'s completion reaches past its page;
+    /// the tail of a table a false branch (a data word that decodes as one)
+    /// cuts; the bytes after a call to a function that returns through a
+    /// changed `X30` or a syscall; and the bytes after a call through `BLR`,
+    /// whose callee is unknown. A mistaken classification can corrupt program
+    /// data. A run
+    /// under it says so in its summary and in the preemption record it
+    /// writes, and refuses `--verify-json` and `--verify-run`.
+    #[clap(
+        long,
+        value_enum,
+        value_name = "refuse|heuristic",
+        default_value = "refuse",
+        requires = "rewrite_exclusives"
+    )]
+    pub(crate) rewrite_exclusives_stripped: hermit::aarch64_lse::elf::StrippedRewrite,
 
     /// Select guest networking. `local` creates an isolated loopback interface; `host` exposes the
     /// host network and compromises isolation and deterministic reproducibility.
@@ -2237,6 +2272,12 @@ pub struct RunOpts {
     #[clap(skip)]
     exclusive_rewrite_overlays: Vec<ExecutableOverlayMount>,
 
+    /// Runtime-only: the guest path of every file `--rewrite-exclusives` left
+    /// unchanged, wholly or in part, because no mapping symbol marks its
+    /// code, for `Config::rewrite_exclusives_unmarked`.
+    #[clap(skip)]
+    exclusive_rewrite_unmarked: Vec<PathBuf>,
+
     /// Runtime-only: how many of the last `--mount`s and `--bind`s a backend
     /// adapter added to the caller's (`with_dbt_mounts`). They are installed
     /// as a backend's own mounts (`PlannedMount::backend`), which the guest's
@@ -2570,6 +2611,13 @@ impl fmt::Display for RunOpts {
                     f,
                     " --rewrite-exclusives-also={}",
                     shell_words::quote(&also.to_string_lossy())
+                )?;
+            }
+            if self.rewrite_exclusives_stripped != Default::default() {
+                write!(
+                    f,
+                    " --rewrite-exclusives-stripped={}",
+                    self.rewrite_exclusives_stripped.as_str()
                 )?;
             }
         }
@@ -3397,6 +3445,133 @@ fn the_exclusive_rewrite_is_retained_in_reproducers() {
     );
 }
 
+/// `--rewrite-exclusives-stripped` needs `--rewrite-exclusives`; a reproducer
+/// keeps the heuristic, which changes the program the guest runs, and the
+/// run's configuration states it for the summary and the preemption record.
+/// The default is not written.
+#[test]
+fn the_stripped_file_heuristic_is_retained_in_reproducers() {
+    let alone = crate::app::Args::try_parse_from([
+        "hermit",
+        "run",
+        "--rewrite-exclusives-stripped=heuristic",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    assert_eq!(
+        alone.err().map(|error| error.kind()),
+        Some(clap::error::ErrorKind::MissingRequiredArgument)
+    );
+    for (value, heuristic) in [("refuse", false), ("heuristic", true)] {
+        let stripped = format!("--rewrite-exclusives-stripped={value}");
+        let mut options = run_opts_for(&[
+            "hermit",
+            "run",
+            "--rewrite-exclusives",
+            &stripped,
+            "--",
+            "/nonexistent/guest",
+        ]);
+        options.validate_args_with_perf_support(true).unwrap();
+        let rendered = options.to_string();
+        assert_eq!(
+            rendered.contains(" --rewrite-exclusives-stripped=heuristic"),
+            heuristic,
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("--rewrite-exclusives-stripped=refuse"),
+            "{rendered}"
+        );
+        assert_eq!(options.rewrites_stripped_files_by_heuristic(), heuristic);
+        assert_eq!(
+            options
+                .effective_det_config()
+                .rewrite_exclusives_stripped_heuristic,
+            heuristic
+        );
+    }
+}
+
+/// Under the stripped-file heuristic, a verification another tool reads
+/// without this command line is refused before anything runs: neither the
+/// typed report (`--verify-json`) nor the saved run directory that `hermit
+/// log-diff --verify-json` compares (`--verify-run`) would show it. Without
+/// the heuristic, and for `--verify` alone, nothing is refused.
+#[test]
+fn the_stripped_file_heuristic_refuses_verification_exports() {
+    let options = |extra: &[&str]| {
+        let mut argv = vec!["hermit", "run"];
+        argv.extend_from_slice(extra);
+        argv.extend_from_slice(&["--", "/nonexistent/guest"]);
+        run_opts_for(&argv)
+    };
+    let heuristic = [
+        "--rewrite-exclusives",
+        "--rewrite-exclusives-stripped=heuristic",
+    ];
+    for export in [
+        &["--verify", "--verify-json=/nonexistent/report.json"][..],
+        &["--verify-run=/nonexistent/run"][..],
+    ] {
+        let error = options(&[&heuristic[..], export].concat())
+            .refuse_stripped_heuristic_verification_export()
+            .unwrap_err();
+        assert!(error.is::<PolicyRefusal>(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("--rewrite-exclusives-stripped=heuristic"),
+            "{error:#}"
+        );
+        options(&[&["--rewrite-exclusives"][..], export].concat())
+            .refuse_stripped_heuristic_verification_export()
+            .unwrap();
+    }
+    options(&[&heuristic[..], &["--verify"][..]].concat())
+        .refuse_stripped_heuristic_verification_export()
+        .unwrap();
+    // Every preparation refuses it too, before it reads a file or asks
+    // whether the host executes LSE atomics.
+    let error = options(&[&heuristic[..], &["--verify-run=/nonexistent/run"][..]].concat())
+        .prepare_exclusive_rewrite(Backend::Ptrace)
+        .unwrap_err();
+    assert!(error.is::<PolicyRefusal>(), "{error:#}");
+}
+
+/// A replay under the other stripped-file setting is refused by the
+/// record's own mark: the heuristic changes the instructions the guest
+/// retires.
+#[test]
+fn a_replay_under_the_other_stripped_rewrite_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    for recorded in [false, true] {
+        let path = directory.path().join(format!("record-{recorded}.json"));
+        std::fs::write(
+            &path,
+            detcore::preemptions::PreemptionWriter::new(None)
+                .with_rewrite_exclusives_stripped_heuristic(recorded)
+                .into_string(),
+        )
+        .unwrap();
+        let replay = format!("--replay-preemptions-from={}", path.display());
+        for heuristic in [false, true] {
+            let mut argv = vec!["hermit", "run", "--rewrite-exclusives"];
+            if heuristic {
+                argv.push("--rewrite-exclusives-stripped=heuristic");
+            }
+            argv.extend_from_slice(&[&replay, "--", "/nonexistent/guest"]);
+            let result = run_opts_for(&argv).refuse_replay_under_another_stripped_rewrite();
+            assert_eq!(
+                result.is_err(),
+                recorded != heuristic,
+                "recorded {recorded}, replayed {heuristic}"
+            );
+            if let Err(error) = result {
+                assert!(error.is::<PolicyRefusal>(), "{error:#}");
+            }
+        }
+    }
+}
+
 /// Every path that would prepare the rewrite refuses an image run: the
 /// preparation itself, which each of them reaches
 /// (`prepare_exclusive_rewrite`, also through an analyze trial's
@@ -3481,8 +3656,9 @@ fn the_exclusive_rewrite_is_refused_for_an_image_run() {
 }
 
 /// Trials reuse prepared overlays only for the same inputs: another
-/// `--tmp`, `--workdir`, `--image` or guest environment, or a file whose
-/// bytes changed, is another preparation.
+/// `--tmp`, `--workdir`, `--image`, guest environment or
+/// `--rewrite-exclusives-stripped`, or a file whose bytes changed, is another
+/// preparation.
 #[test]
 fn trial_preparations_are_keyed_by_every_input_they_read() {
     let directory = tempfile::tempdir().unwrap();
@@ -3503,6 +3679,7 @@ fn trial_preparations_are_keyed_by_every_input_they_read() {
         "--image=example.invalid/guest",
         "--env=PATH=/elsewhere",
         "--base-env=empty",
+        "--rewrite-exclusives-stripped=heuristic",
     ] {
         assert_ne!(key(&[other]), plain, "{other}");
     }
@@ -9614,6 +9791,74 @@ impl RunOpts {
     /// that leaves the option unset takes the record's rule (a record without
     /// the field registered sleeps when chosen), so it is never refused. As
     /// for the epoch, the record is read before anything is launched.
+    /// Refuses a replay of a record under the other stripped-file rewrite
+    /// setting (`--rewrite-exclusives-stripped`), as
+    /// `refuse_replay_under_another_signal_state_copy` refuses the other copy
+    /// setting: the heuristic changes the instructions the guest retires. The
+    /// record's own mark decides, not this command line's other options.
+    fn refuse_replay_under_another_stripped_rewrite(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded =
+                detcore::preemptions::read_recorded_rewrite_exclusives_stripped_heuristic(path)
+                    .map_err(Error::msg)?;
+            if let Some(refusal) =
+                detcore::preemptions::rewrite_exclusives_stripped_heuristic_mismatch(
+                    &format!("{option} {}", path.display()),
+                    recorded,
+                    self.rewrites_stripped_files_by_heuristic(),
+                )
+            {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this run rewrites files without mapping symbols by the
+    /// stripped-file heuristic (`--rewrite-exclusives-stripped=heuristic`).
+    pub(crate) fn rewrites_stripped_files_by_heuristic(&self) -> bool {
+        self.rewrite_exclusives
+            && self.rewrite_exclusives_stripped
+                == hermit::aarch64_lse::elf::StrippedRewrite::Heuristic
+    }
+
+    /// Refuses `--verify-json` and `--verify-run` under the stripped-file
+    /// heuristic, before anything is launched. Both export a verification
+    /// that another tool reads without this command line (a typed report, a
+    /// saved run directory `hermit log-diff --verify-json` compares), and
+    /// neither carries the heuristic, so it would claim for code the
+    /// heuristic only guessed what it claims for the default's proved code.
+    /// `--verify` itself, whose verdict this run prints beside its own
+    /// summary, stays allowed.
+    fn refuse_stripped_heuristic_verification_export(&self) -> Result<(), Error> {
+        if !self.rewrites_stripped_files_by_heuristic() {
+            return Ok(());
+        }
+        let export = if self.verify_json.is_some() {
+            "--verify-json"
+        } else if self.verify_run.is_some() {
+            "--verify-run"
+        } else {
+            return Ok(());
+        };
+        Err(Error::new(PolicyRefusal).context(format!(
+            "{export} exports a verification another tool reads without this command line, and \
+             it would not show that --rewrite-exclusives-stripped=heuristic chose the code it \
+             rewrote by a heuristic that can take data for code; run without {export}, or \
+             without the heuristic"
+        )))
+    }
+
     fn refuse_replay_under_another_sleep_registration(&self) -> Result<(), Error> {
         if self.namespace_only || self.det_opts.det_config.sleep_registration.is_none() {
             return Ok(());
@@ -10804,6 +11049,7 @@ impl RunOpts {
         // path binds a listener and reads the image's configuration, and
         // the refusal needs neither.
         self.refuse_exclusive_rewrite_in_an_image()?;
+        self.refuse_stripped_heuristic_verification_export()?;
         // Admission must see the actual global backend before any launch.
         match self
             .dispatch_before_validation(global.backend, std::env::var_os(DAP_LISTEN_INNER_ENV))?
@@ -11022,6 +11268,7 @@ impl RunOpts {
         self.refuse_replay_under_another_cap_preemption_charge()?;
         self.refuse_replay_under_other_guest_ids()?;
         self.refuse_replay_under_another_sleep_registration()?;
+        self.refuse_replay_under_another_stripped_rewrite()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -13137,8 +13384,10 @@ impl RunOpts {
     /// `/tmp` or working directory, or a changed file prepares, and checks,
     /// its own.
     pub(crate) fn prepare_trial_preprocessing(&mut self) -> Result<(), Error> {
-        static PREPARED: std::sync::Mutex<Vec<(String, Vec<ExecutableOverlayMount>)>> =
-            std::sync::Mutex::new(Vec::new());
+        /// What one preparation made: the overlays, and the files it left
+        /// unchanged for want of mapping symbols.
+        type Prepared = (String, Vec<ExecutableOverlayMount>, Vec<PathBuf>);
+        static PREPARED: std::sync::Mutex<Vec<Prepared>> = std::sync::Mutex::new(Vec::new());
         if !self.rewrite_exclusives {
             return Ok(());
         }
@@ -13146,20 +13395,27 @@ impl RunOpts {
         let mut prepared = PREPARED
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((_, overlays)) = prepared.iter().find(|(seen, _)| *seen == key) {
+        if let Some((_, overlays, unmarked)) = prepared.iter().find(|(seen, ..)| *seen == key) {
             self.exclusive_rewrite_overlays = overlays.clone();
+            self.exclusive_rewrite_unmarked = unmarked.clone();
             return Ok(());
         }
         self.exclusive_rewrite_overlays.clear();
+        self.exclusive_rewrite_unmarked.clear();
         self.prepare_exclusive_rewrite(self.selected_backend())?;
-        prepared.push((key, self.exclusive_rewrite_overlays.clone()));
+        prepared.push((
+            key,
+            self.exclusive_rewrite_overlays.clone(),
+            self.exclusive_rewrite_unmarked.clone(),
+        ));
         Ok(())
     }
 
     /// What decides the overlays one analysis prepares (see
     /// [`Self::prepare_trial_preprocessing`]): every input the preparation
-    /// reads. The options that place the guest's files: the program, the
-    /// `--rewrite-exclusives-also` files, the backend, the mounts and binds,
+    /// reads. The options that place the guest's files and decide what is
+    /// rewritten: the program, the `--rewrite-exclusives-also` files,
+    /// `--rewrite-exclusives-stripped`, the backend, the mounts and binds,
     /// `--tmp`, `--workdir`, `--image`, the guest environment, and the host's
     /// working directory and `PATH`. And the files those resolve to, as the
     /// preparation resolves them, each with a digest of its bytes and its
@@ -13208,6 +13464,7 @@ impl RunOpts {
                 (
                     &self.program,
                     &self.rewrite_exclusives_also,
+                    self.rewrite_exclusives_stripped,
                     self.selected_backend(),
                 ),
                 (
@@ -13240,6 +13497,7 @@ impl RunOpts {
         // Every preparation, however it was reached, including a library
         // caller that validated nothing.
         self.refuse_exclusive_rewrite_in_an_image()?;
+        self.refuse_stripped_heuristic_verification_export()?;
         anyhow::ensure!(
             backend == Backend::Ptrace,
             "--rewrite-exclusives is preprocessing for the ptrace backend; \
@@ -13251,6 +13509,13 @@ impl RunOpts {
              which this host does not execute (no HWCAP_ATOMICS); the rewritten image would \
              raise SIGILL"
         );
+        if self.rewrites_stripped_files_by_heuristic() {
+            crate::app::tracing::diagnostic_eprintln!(
+                ":: Exclusive-loop rewrite: --rewrite-exclusives-stripped=heuristic rewrites files \
+                 without mapping symbols by the stripped-file heuristic, which can take data for \
+                 code and corrupt it"
+            );
+        }
         let (guest, host) = self.resolve_guest_and_host_program()?;
         let guest = self.resolve_executable_overlay_target(&guest, &host)?;
         let mut files = vec![(guest, host)];
@@ -13295,7 +13560,10 @@ impl RunOpts {
             // cache entry that differs -- an older rewriter's, or anyone
             // else's -- is replaced rather than mounted.
             let mut rewritten = input.clone();
-            let report = hermit::aarch64_lse::elf::rewrite_bytes(&mut rewritten)?;
+            let report = hermit::aarch64_lse::elf::rewrite_bytes(
+                &mut rewritten,
+                self.rewrite_exclusives_stripped,
+            )?;
             // The copy the guest maps must also be executable exactly as the
             // source is: `write_rewritten` gives it the source's
             // permissions, so a cached copy made when the source had another
@@ -13344,6 +13612,19 @@ impl RunOpts {
                      --list-refusals` lists every one",
                     guest_path.display()
                 );
+            }
+            // A file nothing marks is named, never left silently: the run's
+            // summary lists it too (`Config::rewrite_exclusives_unmarked`).
+            if report.unmarked() != 0 {
+                crate::app::tracing::diagnostic_eprintln!(
+                    ":: Exclusive-loop rewrite: {} has no mapping symbols ($x, $d) marking its \
+                     code, so its {} exclusive loop(s) there were left as they are; \
+                     --rewrite-exclusives-stripped=heuristic rewrites them by the stripped-file \
+                     heuristic",
+                    guest_path.display(),
+                    report.unmarked()
+                );
+                self.exclusive_rewrite_unmarked.push(guest_path.clone());
             }
             if report.patched_total() != 0 {
                 self.validate_executable_overlay_source_visibility(&output)?;
@@ -16343,6 +16624,10 @@ impl RunOpts {
             .then(|| untraced_code_range(self.selected_backend()))
             .flatten();
         config.fatal_core_capture = self.fatal_core_capture();
+        // What `--rewrite-exclusives` did with files that have no mapping
+        // symbols, for the run's summary and the preemption record it writes.
+        config.rewrite_exclusives_stripped_heuristic = self.rewrites_stripped_files_by_heuristic();
+        config.rewrite_exclusives_unmarked = self.exclusive_rewrite_unmarked.clone();
         config
     }
 
