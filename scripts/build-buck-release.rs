@@ -18,9 +18,6 @@
  */
 //! Build and shadow-validate the feature-complete Buck release binary.
 
-#[cfg(test)]
-#[path = "lib/reverie_dbt_inventory.rs"]
-mod reverie_dbt_inventory;
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 #[allow(dead_code)]
@@ -102,12 +99,6 @@ const RELEASE_NEEDED_LIBRARIES: [&str; 5] = [
     "libunwind-x86_64.so.8",
 ];
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-const GENERATED_MARKERS: [&str; 3] = [
-    "name = \"reverie-dbt-0.5-materialized-manifest\"",
-    "manifest_dir = \":reverie-dbt-0.5-materialized-manifest\"",
-    "load(\"@shim//build_defs:materialized_manifest.bzl\", \"materialized_manifest\")",
-];
 #[cfg(test)]
 const REQUIRED_RESOURCES: [(&str, bool); 11] = [
     ("rsrcs/libdetcore_dbt.so", false),
@@ -1489,31 +1480,6 @@ fn publish_unwind_buck_input(
         ),
     )?;
     Ok(input)
-}
-
-#[cfg(test)]
-fn verify_generated_buck(text: &str) -> Result<(), String> {
-    for marker in GENERATED_MARKERS {
-        let count = text.match_indices(marker).count();
-        if count != 1 {
-            return Err(format!(
-                "generated Buck graph is stale/partial: marker {marker:?} occurs {count} times; rerun bootstrap/regenerate-rust-deps"
-            ));
-        }
-    }
-    let mapped_files = text
-        .lines()
-        .filter(|line| {
-            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.5.4/")
-        })
-        .count();
-    if mapped_files != reverie_dbt_inventory::REVERIE_DBT_FILES {
-        return Err(format!(
-            "generated reverie-dbt manifest map has {mapped_files} files, expected {}; rerun regeneration and inspect the pin",
-            reverie_dbt_inventory::REVERIE_DBT_FILES
-        ));
-    }
-    Ok(())
 }
 
 fn verify_generated_core_buck(text: &str, aliases: &str) -> Result<(), String> {
@@ -6519,32 +6485,13 @@ mod tests {
 
     #[test]
     fn stale_generated_graph_is_refused() {
-        assert!(verify_generated_buck("# stale\n").is_err());
-    }
-
-    #[test]
-    fn generated_graph_must_map_the_pinned_reverie_dbt_inventory() {
-        let graph = |files: usize| {
-            let mut text = GENERATED_MARKERS.join("\n");
-            for index in 0..files {
-                text.push_str(&format!(
-                    "\n    \"f{index}\": \"vendor/reverie-dbt-0.5.4/f{index}\","
-                ));
-            }
-            text
-        };
-        let pinned = reverie_dbt_inventory::REVERIE_DBT_FILES;
-        assert_eq!(verify_generated_buck(&graph(pinned)), Ok(()));
-        for found in [pinned - 1, pinned + 1] {
-            assert_eq!(
-                verify_generated_buck(&graph(found)),
-                Err(format!(
-                    "generated reverie-dbt manifest map has {found} files, expected {pinned}; \
-                     rerun regeneration and inspect the pin"
-                )),
-                "{found}"
-            );
-        }
+        // A stale or partial graph is refused even when its alias inventory is
+        // valid. (The reverie-dbt manifest-map inventory this test also pinned
+        // left core with DBT in the third-party split.)
+        assert_eq!(
+            verify_generated_core_buck("# stale\n", "liteinst2\n"),
+            Err("generated core Buck graph has no Rust library definitions".into())
+        );
     }
 
     #[test]

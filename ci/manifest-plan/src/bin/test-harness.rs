@@ -8408,7 +8408,10 @@ sys.exit(1 if failed else 0)
         // bucket of the corpus's heavy rows (same issue).
         // (19, 37) until the compat corpus moved into the pinned root:
         // e2e.manifest_compat is pinned now, its _on_host twin stays direct.
-        assert_eq!((pinned, direct), (20, 36));
+        // -1 direct when sabrecompat.manifest_compat left core with the SaBRe
+        // run type for the hermit-3rdparty-patching CI catalog (third-party
+        // split, 2026-11-02).
+        assert_eq!((pinned, direct), (20, 35));
     }
 
     /// The full profile's harness nodes together report each cell of the
@@ -9530,9 +9533,6 @@ sys.exit(1 if failed else 0)
         let shards: serde_json::Value =
             serde_json::from_str(include_str!("../../../portable-shards.json")).unwrap();
         let expected_aliases = [
-            // A hosted twin since the one-build change of 2026-09-30 moved
-            // the local check into the pinned root.
-            "check.dbt_runtime_abi",
             "doc.doctests",
             "doc.rustdoc",
             "lint.clippy",
@@ -9550,7 +9550,6 @@ sys.exit(1 if failed else 0)
             "test.ignored_syscall_regressions",
             "test.envelope_levels",
             "test.rr_suite_contract",
-            "test.sabre_examples",
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -9595,8 +9594,12 @@ sys.exit(1 if failed else 0)
         // the unit shard when it was enrolled (21 to 22). test.liteinst_strict
         // left with its liteinst shard when LiteInst became in-guest only
         // (https://github.com/rrnewton/hermit/issues/3520; 22 to 21).
-        assert_eq!(physical_rows, 21);
-        assert_eq!(resolved.len(), 21);
+        // The two release shards, dbt-runtime-abi (check.dbt_runtime_abi) and
+        // sabre (test.sabre_examples), left core with DBT and SaBRe in the
+        // third-party split (2026-11-02; 21 to 19), and with them their
+        // hosted aliases.
+        assert_eq!(physical_rows, 19);
+        assert_eq!(resolved.len(), 19);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.

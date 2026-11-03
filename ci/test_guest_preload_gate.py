@@ -233,6 +233,10 @@ BUNDLE_RESOURCES = (
     "libdetcore_liteinst.so",
     "libreverie_liteinst.so",
 )
+# Every file the scripts require in a complete core bundle beside rsrcs/
+# (`require_core_resources`); the receipt fixture writes the two rsrcs/
+# provenance files.
+INSTALL_TOP_LEVEL = ("LICENSE", "README.txt", "hermit", "licenses/LICENSE")
 
 
 class GuestPreloadCallSiteTest(unittest.TestCase):
@@ -285,6 +289,12 @@ class GuestPreloadCallSiteTest(unittest.TestCase):
                 shutil.copyfile(self.runpath, path)
             else:
                 path.write_text(f"#!/bin/sh\n# {name} {resource}\nexit 0\n")
+            path.chmod(0o700)
+        # The rest of the exact core inventory the scripts require beside rsrcs/.
+        for top in INSTALL_TOP_LEVEL:
+            path = install / top
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"#!/bin/sh\n# {name} {top}\nexit 0\n")
             path.chmod(0o700)
         from test_packaged_detcore import fixture_receipt
         fixture_receipt(install, "1" * 40, core=True)

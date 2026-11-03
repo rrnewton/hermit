@@ -16202,8 +16202,8 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         let mut invalid = round_trip.clone();
         let expected = match variant {
             0 => {
-                invalid.backend = Some("kvm".into());
-                "does not match --probe-disabled --backend kvm"
+                invalid.backend = Some("liteinst".into());
+                "does not match --probe-disabled --backend liteinst"
             }
             1 => {
                 invalid.probe_disabled = false;

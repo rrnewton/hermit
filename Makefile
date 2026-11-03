@@ -238,7 +238,6 @@ LINT_CHECK_TARGETS := \
     lint-check-record-version-floor \
     lint-check-known-gap-ledgers \
     lint-check-buck-reindeer-features \
-    lint-check-reverie-dbt-buck-inventory \
     lint-check-core-review-protocol \
     lint-check-audit-test-binary-registration-test \
     lint-check-buck-e2e-ingest \
@@ -247,7 +246,7 @@ LINT_CHECK_TARGETS := \
     lint-check-buck-e2e-stage \
     lint-check-buck-e2e-stages \
     lint-check-guest-preload-gate \
-    lint-check-reverie-dbt-budget \
+    lint-check-core-build \
     lint-check-conformance-test-counts \
     lint-check-recount-pins \
     lint-check-no-sve
@@ -387,9 +386,6 @@ lint-check-known-gap-ledgers:
 lint-check-buck-reindeer-features:
 	./scripts/check-buck-reindeer-features.rs
 
-lint-check-reverie-dbt-buck-inventory:
-	./scripts/patch-reverie-dbt-buck.rs --check-inventory
-
 lint-check-core-review-protocol:
 	./scripts/core-review-protocol-lint-test.sh
 
@@ -415,10 +411,9 @@ lint-check-guest-preload-gate:
 	python3 ./ci/test_guest_preload_gate.py
 	python3 ./ci/test_packaged_detcore.py
 
-lint-check-reverie-dbt-budget:
-	./ci/run-with-reverie-dbt-budget-test.sh
+lint-check-core-build:
+	./ci/run-with-core-build-test.sh
 	./ci/retry-on-compiler-crash.sh --self-test
-	./ci/clean-stale-reverie-dbt.sh --self-test
 
 lint-check-conformance-test-counts:
 	./ci/conformance-test-counts.sh --self-test

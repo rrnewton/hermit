@@ -369,7 +369,7 @@ fn test_harness_source_snapshot_flags_redirect_misuse() {
         ),
         (
             vec!["expected-plan", "--format", "json"],
-            "expected-plan accepts only --repo-root DIR and --source-sha SHA",
+            "expected-plan accepts only --repo-root DIR, --source-sha SHA and --execution-owner OWNER",
         ),
         (
             vec!["plan", "--repo-root", "/nonexistent-hermit-root"],

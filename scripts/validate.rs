@@ -19726,7 +19726,11 @@ mod nextest_timeout_tests {
             };
             let all = manifests.select(&baseline).unwrap();
             if !all_run_types {
-                assert_eq!(all.len(), 2600, "the original all-owner population is retained");
+                // 2600 at the split's base (main eafc446e955); 2958 since the
+                // split was replayed onto main d2e8d2c61f3, whose manifests
+                // gained the cells main enabled meanwhile (the expanded plan's
+                // CI cells: 371 added, 12 removed, 318 of the added replay).
+                assert_eq!(all.len(), 2958, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
@@ -23518,7 +23522,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         &parent,
         &checkout,
         commit,
-        "--sabre-compat-only",
+        "--rr-compat-only",
         true,
         false,
     )
@@ -23538,7 +23542,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         &parent,
         &checkout,
         commit,
-        "--sabre-compat-only",
+        "--rr-compat-only",
         true,
         true,
     )
@@ -23551,7 +23555,7 @@ fn product_front_door_bracket() -> Result<(), String> {
         &parent,
         &checkout,
         commit,
-        "--sabre-compat-only",
+        "--rr-compat-only",
         false,
         false,
     )
@@ -23562,6 +23566,16 @@ fn product_front_door_bracket() -> Result<(), String> {
         return Err(format!(
             "missing-launcher refusal printed a false remedy: {unavailable}"
         ));
+    }
+    // The SaBRe and e9patch focused gates left core with the third-party
+    // split: they refuse at parsing, before the front door is consulted, so
+    // the brackets here use the core --rr-compat-only gate instead.
+    for moved in ["--sabre-compat-only", "--e9patch-compat-only"] {
+        if !matches!(parse_argv(&[moved.into()]), Err(2)) {
+            return Err(format!(
+                "{moved} parsed instead of refusing for its third-party owner"
+            ));
+        }
     }
 
     let focused = parse_argv(&[
@@ -23669,7 +23683,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             (
                 "focused-invalid-authority",
                 &[
-                    "--sabre-compat-only",
+                    "--rr-compat-only",
                     SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
                 ],
                 false,
@@ -23680,7 +23694,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             (
                 "nested-marker-invalid-authority",
                 &[
-                    "--sabre-compat-only",
+                    "--rr-compat-only",
                     SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
                 ],
                 true,
@@ -28606,10 +28620,10 @@ fn run_state_path_bracket() -> Result<(), String> {
             }
         }
     }
-    if validation_run_state_path(root, "sabre-compat-only", None, None, true, 41, 99).is_ok() {
+    if validation_run_state_path(root, "rr-compat-only", None, None, true, 41, 99).is_ok() {
         return Err("a nested execution accepted missing outer run state".into());
     }
-    let profiles = ["full", "portable", "quick", "sabre-compat-only"];
+    let profiles = ["full", "portable", "quick", "rr-compat-only"];
     let mut observed = BTreeSet::new();
     for (index, profile) in profiles.iter().enumerate() {
         let path =
@@ -28642,7 +28656,7 @@ fn run_state_path_bracket() -> Result<(), String> {
     }
     let inherited = validation_run_state_path(
         root,
-        "sabre-compat-only",
+        "rr-compat-only",
         None,
         Some(OsStr::new("/repo/target/validation/outer")),
         true,
@@ -28654,7 +28668,7 @@ fn run_state_path_bracket() -> Result<(), String> {
     }
     if validation_run_state_path(
         root,
-        "sabre-compat-only",
+        "rr-compat-only",
         None,
         Some(OsStr::new("/caller/chosen")),
         true,
@@ -34912,20 +34926,38 @@ mod shared_consumer_tests {
             .any(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases"));
         assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
             .unwrap();
+        // Look each binary's table row up by name: main added the
+        // deadline_slice_cap row between cli and hermit_modes.
+        let consumers_of = |table: &[(&str, &[&str])], binary: &str| {
+            let rows: Vec<&[&str]> = table
+                .iter()
+                .filter(|(name, _)| *name == binary)
+                .map(|(_, tags)| *tags)
+                .collect();
+            assert_eq!(rows.len(), 1, "{binary} has one shared-consumer row");
+            expected_shared_integration_consumers(rows[0], true).unwrap()
+        };
         assert_eq!(
-            expected_shared_integration_consumers(EXPECTED_SHARED_INTEGRATION_TESTS[0].1, true)
-                .unwrap(),
+            consumers_of(&EXPECTED_SHARED_INTEGRATION_TESTS, "cli"),
             ["privileged-cpuid.cpu_profile_v3", "privileged-test.cli_kvm",
              "privileged-test.pmu_cli_cases", "test.cli"].map(str::to_string)
         );
         assert_eq!(
-            expected_shared_integration_consumers(EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS[0].1, true)
-                .unwrap(),
+            consumers_of(&EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS, "cli"),
             ["privileged-cpuid.cpu_profile_v3", "test.cli"].map(str::to_string)
         );
         assert_eq!(
-            expected_shared_integration_consumers(EXPECTED_SHARED_INTEGRATION_TESTS[1].1, true)
-                .unwrap(),
+            consumers_of(&EXPECTED_SHARED_INTEGRATION_TESTS, "deadline_slice_cap"),
+            ["privileged-test.deadline_slice_cap_kvm", "test.hermit_integration",
+             "test.hermit_integration_2", "test.hermit_integration_3",
+             "test.pmu_integration_cases", "test.pmu_integration_cases_2"].map(str::to_string)
+        );
+        assert_eq!(
+            consumers_of(&EXPECTED_SHARED_INTEGRATION_TESTS, "hermit_modes"),
+            ["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"].map(str::to_string)
+        );
+        assert_eq!(
+            consumers_of(&EXPECTED_SHARED_INTEGRATION_TOKEN_HOLDERS, "hermit_modes"),
             ["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"].map(str::to_string)
         );
         assert!(expected_shared_integration_consumers(&["test.unknown_shared_consumer"], true).is_err());
