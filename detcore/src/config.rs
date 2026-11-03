@@ -217,6 +217,10 @@ mod tests {
         // the pair became 25 and 26, appended after main's 22 to 24, at their
         // rebase onto batch5a (digests measured at this head, above SP2).
         (26, "b5fc7394708905c9", "f013e36743d8d9e6"),
+        // Retypes the `StoreExclusive` payload definitions the digest covers
+        // in `store_exclusive.rs` (PR 4884's in-memory exclusive-rewrite
+        // run tally and reporting; digests measured at this head).
+        (27, "05a9f7a4ca16cde1", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
