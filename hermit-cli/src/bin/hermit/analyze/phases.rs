@@ -3102,7 +3102,7 @@ mod tests {
             (&failing, offsets_format, true),
             (
                 &passing,
-                u64::from(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT - 1),
+                u64::from(detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1),
                 false,
             ),
             (&trial, offsets_format, true),
@@ -3119,7 +3119,7 @@ mod tests {
         }
 
         // Refused before any trial.
-        // Rows with offsets in format 4, a schedule trace without them: as a
+        // Rows with offsets in format 6, a schedule trace without them: as a
         // Hermit whose schedule traces did not hold offsets wrote it.
         let rows_only = edited("rows-only", &|json| {
             let object = json.as_object_mut().unwrap();
