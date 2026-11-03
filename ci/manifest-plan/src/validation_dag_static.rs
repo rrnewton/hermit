@@ -3259,8 +3259,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its review fixes (an exhausted read buffer, the poll asked only of a
     // lone read, host-timed effects and background receipts refused by
     // name) add seven units: 3465 + 7 = 3472, by nextest list. Recording
-    // the binder determinism loss per run adds one: 3472 + 1 = 3473.
-    ("test.detcore_unit", 3473),
+    // the binder determinism loss per run adds one: 3472 + 1 = 3473. Running
+    // a binder call off the turn alone only while its caller is the run's
+    // one task, with the receipts it records, adds four: 3473 + 4 = 3477.
+    // Pinning that a binder write gives up pair completeness only once
+    // admitted adds one: 3478.
+    ("test.detcore_unit", 3478),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5877,8 +5881,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
     // The same seven review-fix units: 3465 + 7 = 3472. The same per-run
-    // loss unit: 3472 + 1 = 3473.
-    ("test.detcore_unit_on_host", 3473),
+    // loss unit: 3472 + 1 = 3473. The same four one-task units: 3477. The
+    // same admission-order unit: 3478.
+    ("test.detcore_unit_on_host", 3478),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
