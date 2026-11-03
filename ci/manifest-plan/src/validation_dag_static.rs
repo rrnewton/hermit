@@ -1996,7 +1996,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // aarch64_lse::mapping's two units): 1261, listed.
     // And the refusal of an image run at every entry that would prepare the
     // rewrite: 1262, listed.
-    ("test.hermit_unit", 1262),
+    // And two for the `ADRP` pairing's bounds (a write to its register
+    // ends it; an uncompleted one takes the function its page belongs to):
+    // 1264, listed.
+    ("test.hermit_unit", 1264),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6259,7 +6262,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twenty-two review tests: 1252, listed.
     // And the same three addressed-data units: 1255, listed.
     // And the same refusal-at-every-entry unit: 1256, listed.
-    ("test.hermit_unit_on_host", 1256),
+    // And the same two `ADRP` pairing units: 1258, listed.
+    ("test.hermit_unit_on_host", 1258),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

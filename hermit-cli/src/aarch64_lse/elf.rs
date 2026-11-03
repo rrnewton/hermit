@@ -41,11 +41,14 @@
 //!   addresses as data (an `LDR` (literal), `ADR` or `ADRP` target) is taken
 //!   for data from there to the next instruction a branch reaches, or the
 //!   function's end, and no sequence over it is rewritten
-//!   (`addressed-data-inside-the-sequence`). What is still taken for code
-//!   wrongly is only data after a call that does not return which no
+//!   (`addressed-data-inside-the-sequence`). Two things are still taken for
+//!   code wrongly. Data after a call that does not return which no
 //!   instruction of the file addresses: a pointer stored outside the code (a
 //!   relocation or a symbol) or an address computed from an unrelated base
-//!   would be needed to read it.
+//!   would be needed to read it. And the rest of a table whose first word a
+//!   branch could reach: a data word before the field the code addresses can
+//!   decode as a branch into the table, and the next such target ends the
+//!   data, so the words after it are read as code again.
 //! - Neither: nothing. Such a section is left alone and reported, and so is
 //!   a whole file with neither mapping symbols nor an unwind table.
 //!

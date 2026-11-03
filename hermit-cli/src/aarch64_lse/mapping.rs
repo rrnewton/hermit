@@ -556,9 +556,10 @@ pub fn literal_targets(words: &[u32], base: u64) -> Vec<(u64, u64)> {
 /// each `LDR` (literal) and `ADR`, and of each `ADRP` with the `ADD`
 /// (immediate) or unsigned-offset load or store that completes it, the first
 /// of the eight instructions after it that takes the `ADRP`'s register as
-/// its base. An `ADRP` that none of those completes gives its page, the
-/// lowest address it can be completing. Each is where a table may start:
-/// how far it runs is not in the instruction ([`data_extents`]).
+/// its base, and only while nothing has written that register. An `ADRP`
+/// that none of those completes gives its page, the lowest address it can be
+/// completing. Each is where a table may start: how far it runs is not in
+/// the instruction ([`data_extents`]).
 pub fn addressed_starts(words: &[u32], base: u64) -> Vec<u64> {
     // How far after an `ADRP` its completing instruction is looked for.
     const PAIRING_WINDOW: usize = 8;
@@ -580,10 +581,15 @@ pub fn addressed_starts(words: &[u32], base: u64) -> Vec<u64> {
             let pages = ((imm << 11) as i32 >> 11) as i64;
             let page = (pc & !0xFFF).wrapping_add((pages << 12) as u64);
             let register = word & 0x1F;
+            // Up to the instruction that writes the register itself: after
+            // that the page this `ADRP` gave is gone, and a later
+            // instruction with the same base completes another one.
             let completed = words[index + 1..]
                 .iter()
                 .take(PAIRING_WINDOW)
-                .find_map(|next| page_offset(*next, register));
+                .map(|next| (page_offset(*next, register), writes(*next, register)))
+                .take_while(|(offset, written)| offset.is_some() || !written)
+                .find_map(|(offset, _)| offset);
             starts.push(page.wrapping_add(completed.unwrap_or(0)));
         }
     }
@@ -621,6 +627,28 @@ fn page_offset(word: u32, register: u32) -> Option<u64> {
     None
 }
 
+/// Whether `word` writes `register`, as far as the shapes an `ADRP` pairing
+/// must not look past: a `MOV`, an `ADD`/`SUB` or another `ADRP` or `ADR`
+/// into it, or a load into it. An instruction this does not recognise is
+/// taken not to write it, which only widens the pairing, and the pairing's
+/// result is a data address, so a mistaken one costs coverage, never
+/// safety.
+fn writes(word: u32, register: u32) -> bool {
+    if word & 0x1F != register {
+        return false;
+    }
+    // ADR and ADRP; ADD/SUB (immediate and shifted register); MOV (wide
+    // immediate) and ORR (shifted register), which `MOV` register is; and
+    // the loads, whose destination is also bits 4:0.
+    word & 0x1F00_0000 == 0x1000_0000
+        || word & 0x1F00_0000 == 0x1100_0000
+        || word & 0x1F00_0000 == 0x0B00_0000
+        || word & 0x1F80_0000 == 0x1280_0000
+        || word & 0x1F00_0000 == 0x0A00_0000
+        || word & 0x3B00_0000 == 0x3900_0000
+        || word & 0x3B00_0000 == 0x1800_0000
+}
+
 /// Every direct branch of `words` (at `base`), as (its address, its target).
 pub fn direct_branches(words: &[u32], base: u64) -> Vec<(u64, u64)> {
     words
@@ -641,8 +669,13 @@ pub fn direct_branches(words: &[u32], base: u64) -> Vec<(u64, u64)> {
 /// Control does not run into a table, so the code after one is reached by a
 /// branch, and only a branch that is not itself inside a table counts: a
 /// table word can decode as one. An address at a function's entry is a
-/// pointer to the function, not data. The ranges come back sorted and
-/// merged.
+/// pointer to the function, not data. A page-aligned address below a
+/// function and within one page of it is the page an `ADRP` alone gave, and
+/// takes that function whole. The ranges come back sorted and merged.
+/// The page an `ADRP` addresses, and so the furthest a page start can lie
+/// below the function whose data it names.
+const PAGE: u64 = 4096;
+
 pub fn data_extents(
     starts: &[u64],
     functions: &[(u64, u64)],
@@ -651,12 +684,27 @@ pub fn data_extents(
     let mut extents: Vec<(u64, u64)> = starts
         .iter()
         .filter_map(|start| {
+            // A page an `ADRP` alone gives is page-aligned and lies within
+            // one page below the function that holds the code, so take the
+            // data to start where the function does: the whole function is
+            // then data, which is what an address this reader cannot
+            // complete leaves it knowing.
             let after = functions.partition_point(|(entry, _)| entry <= start);
-            let (_, end) = functions[..after]
+            if let Some((_, end)) = functions[..after]
                 .iter()
                 .rev()
-                .find(|(entry, end)| entry < start && start < end)?;
-            Some((*start, *end))
+                .find(|(entry, end)| entry < start && start < end)
+            {
+                return Some((*start, *end));
+            }
+            if !start.is_multiple_of(PAGE) {
+                return None;
+            }
+            functions
+                .iter()
+                .find(|(entry, end)| start < entry && entry < end)
+                .filter(|(entry, _)| start.saturating_add(PAGE) > *entry)
+                .map(|(entry, end)| (*entry, *end))
         })
         .collect();
     extents.sort_unstable();
@@ -1019,6 +1067,42 @@ pub(crate) mod tests {
             .chain(std::iter::once(0x9105_d021))
             .collect();
         assert_eq!(addressed_starts(&far, 0x1000), vec![0x1000]);
+    }
+
+    #[test]
+    fn an_adrp_pairing_ends_where_its_register_is_written() {
+        // adrp x1, 0x1000; mov x1, #0 (the page is gone); add x1, x1, #0x40
+        // completes nothing of the ADRP.
+        let overwritten = [0x9000_0001, 0xd280_0001, 0x9101_0021];
+        assert_eq!(addressed_starts(&overwritten, 0x1000), vec![0x1000]);
+        // The same without the write: the ADD completes it.
+        let paired = [0x9000_0001, 0xd503_201f, 0x9101_0021];
+        assert_eq!(addressed_starts(&paired, 0x1000), vec![0x1040]);
+        // A write to another register says nothing.
+        let other = [0x9000_0001, 0xd280_0002, 0x9101_0021];
+        assert_eq!(addressed_starts(&other, 0x1000), vec![0x1040]);
+        // The completing instruction may be the one that writes the
+        // register, as `ADD Xn, Xn, #imm` and a load through it are.
+        let load = [0x9000_0001, 0xf940_0421];
+        assert_eq!(addressed_starts(&load, 0x1000), vec![0x1008]);
+    }
+
+    #[test]
+    fn an_uncompleted_adrp_takes_the_function_its_page_belongs_to() {
+        // The page is below the function, so the data starts where the
+        // function does rather than being dropped.
+        let functions = [(0x1100, 0x1180)];
+        assert_eq!(
+            data_extents(&[0x1000], &functions, &[]),
+            vec![(0x1100, 0x1180)]
+        );
+        // A page further than one page below belongs to another function,
+        // and an address that is not a page start is not a page.
+        assert_eq!(data_extents(&[0x0000], &functions, &[]), vec![]);
+        assert_eq!(data_extents(&[0x1040], &functions, &[]), vec![]);
+        // An address at an entry that is not a page start is a pointer to
+        // the function.
+        assert_eq!(data_extents(&[0x1100], &functions, &[]), vec![]);
     }
 
     #[test]
