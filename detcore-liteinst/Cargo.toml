@@ -18,6 +18,9 @@ test = false
 doctest = false
 
 [features]
+# Site-patching runtime linked into the preload; off by default so the
+# trap-only preload reports LiteInst unavailable at launch validation.
+liteinst = []
 # Real-runtime allocation regression; never selects a different allocator.
 allocator-fixture = ["reverie-liteinst/allocator-fixture"]
 # Private InitialImage entry; ordinary builds retain the loader constructor.

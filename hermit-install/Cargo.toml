@@ -12,6 +12,9 @@ path = "src/lib.rs"
 [features]
 # Core staging includes the first-party LiteInst runtime.
 default = []
+# Site-patching runtime; off by default so trap-only staging passes
+# --without-liteinst to stage-liteinst-runtime.sh.
+liteinst = []
 
 [dependencies]
 reverie-liteinst-artifact = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "42b59ad872680b7e7815fc7a88ed76ca3a233832", default-features = false }
