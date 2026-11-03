@@ -1980,7 +1980,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Composed on measured main ffe313b1: 1212 + 1 = 1213 (Train 5 delta +1).
     // And run::untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted: 1335 + 1 = 1336, listed.
     // Rebased onto main 77be1fd09: 1239 + 1 = 1240.
-    ("test.hermit_unit", 1240),
+    // And run::untrap_passthrough_syscalls_refuses_preemption_records_by_every_route: 1336 + 1 = 1337.
+    // Rebased onto main 77be1fd09: 1240 + 1 = 1241.
+    ("test.hermit_unit", 1241),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6295,7 +6297,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // And the same --untrap-passthrough-syscalls CLI unit: 1329 + 1 = 1330, listed.
     // Rebased onto main 77be1fd09: 1233 + 1 = 1234.
-    ("test.hermit_unit_on_host", 1234),
+    // And the same preemption-record refusal unit: 1330 + 1 = 1331.
+    // Rebased onto main 77be1fd09: 1234 + 1 = 1235.
+    ("test.hermit_unit_on_host", 1235),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
