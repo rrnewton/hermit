@@ -3251,7 +3251,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
     // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
     // 216dbc929a full validate.
-    ("test.detcore_unit", 3384),
+    // PR #4630 (rebased onto post-split main) adds nine fatal_core units
+    // and three fatal_core_capture integration tests: 3384 + 9 = 3393.
+    ("test.detcore_unit", 3393),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3608,7 +3610,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pin): 293 + 1 = 294, re-measured at this tip.
     // The split moves the copied-child TTY case to its required DynamoRIO
     // owner: 294 - 1 = 293. Composed source count; re-measure.
-    ("test.hermit_integration_2", 293),
+    ("test.hermit_integration_2", 296),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5804,7 +5806,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
-    ("test.detcore_unit_on_host", 3384),
+    ("test.detcore_unit_on_host", 3393),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5935,7 +5937,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains seven package-identity cases in version_provenance
     // and moves the copied-child TTY case to its DynamoRIO owner:
     // 713 + 7 - 1 = 719. Composed source count; re-measure.
-    ("test.hermit_integration_on_host", 719),
+    ("test.hermit_integration_on_host", 722),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
