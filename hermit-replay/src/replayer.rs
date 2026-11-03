@@ -1758,27 +1758,6 @@ impl Replayer {
         path: &Path,
         flags: OFlag,
     ) -> io::Result<bool> {
-        // Kernel-provided directories (procfs, sysfs) exist only in the
-        // guest kernel's view, so there is nothing to create beneath the
-        // replay root. Walking the spelled absolute path in this controller
-        // process resolves `self` (and any recorded tid) to controller-side
-        // identities that do not name the guest's directories, and the walk
-        // failed with ENOENT for `/proc/self/task/<tid>` (issue 5066),
-        // which the caller turned into a panic. Decline materialization:
-        // the caller reserves a virtual descriptor and replay serves the
-        // open and its later operations from the recorded events.
-        if path.is_absolute()
-            && path.components().nth(1).is_some_and(|component| {
-                component.as_os_str() == "proc" || component.as_os_str() == "sys"
-            })
-        {
-            tracing::debug!(
-                ?syscall,
-                ?path,
-                "recorded open directory is kernel-provided; keeping it virtual"
-            );
-            return Ok(false);
-        }
         let root = crate::record_replay_path::open_process_root(guest.pid())?;
         let start = if path.is_absolute() {
             crate::record_replay_path::open_process_root(guest.pid())?
@@ -1809,12 +1788,38 @@ impl Replayer {
             }
             start
         };
-        if flags.contains(OFlag::O_NOFOLLOW) {
-            crate::record_replay_path::ensure_directory_path(&root, &start, path)?;
+        let ensured = if flags.contains(OFlag::O_NOFOLLOW) {
+            crate::record_replay_path::ensure_directory_path(&root, &start, path)
         } else {
-            crate::record_replay_path::ensure_directory_path_follow_final(&root, &start, path)?;
+            crate::record_replay_path::ensure_directory_path_follow_final(&root, &start, path)
+        };
+        match ensured {
+            Ok(()) => Ok(true),
+            // A kernel-provided directory whose spelled path names a
+            // recording-time identity (for example /proc/self/task/<tid>,
+            // issue 5066) does not exist beneath the replay root, and the
+            // walk fails instead of creating anything. Decline
+            // materialization for those paths alone: the caller reserves a
+            // virtual descriptor and replay serves the open from the
+            // recorded events. Materializable kernel-provided directories
+            // (such as /proc/<pid>/fd) keep the materialized path above, so
+            // children opened through them resolve as they did before.
+            Err(error)
+                if path.is_absolute()
+                    && path.components().nth(1).is_some_and(|component| {
+                        component.as_os_str() == "proc" || component.as_os_str() == "sys"
+                    }) =>
+            {
+                tracing::debug!(
+                    ?syscall,
+                    ?path,
+                    %error,
+                    "recorded open directory is kernel-provided and cannot be materialized; keeping it virtual"
+                );
+                Ok(false)
+            }
+            Err(error) => Err(error),
         }
-        Ok(true)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
