@@ -3854,9 +3854,6 @@ mod legacy_backend_json {
         "access_trace_max_bytes",
         "replay_continue_fairly",
         "standard_stream_aliases",
-        "rewrite_exclusives_in_memory",
-        "count_store_exclusives",
-        "rewrite_exclusives_overlay",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -4004,8 +4001,8 @@ mod legacy_backend_json {
                     | "replay_edited_preemptions"
                     | "eager_lone_preemptions"
                     | "replay_continue_fairly"
-                    | "strict_binder",
-                    | "rewrite_exclusives_in_memory",
+                    | "strict_binder"
+                    | "rewrite_exclusives_in_memory"
                     | "count_store_exclusives",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.

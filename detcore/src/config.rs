@@ -217,6 +217,8 @@ mod tests {
         // the pair became 25 and 26, appended after main's 22 to 24, at their
         // rebase onto batch5a (digests measured at this head, above SP2).
         (26, "b5fc7394708905c9", "f013e36743d8d9e6"),
+        // PR #4907's in-memory exclusive-rewrite marker on the global state.
+        (27, "05a9f7a4ca16cde1", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
