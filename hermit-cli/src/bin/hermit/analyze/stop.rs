@@ -41,7 +41,9 @@
 //! but the child having gone) is never swallowed: analyze says so on stderr
 //! and dies of the signal by its default action, as it would without the
 //! handler, and the trial's container init dies with it by its parent-death
-//! signal; only the workspace stays behind ([`signal_children`]).
+//! signal. Such a death unwinds nothing, so the workspace stays behind, and so
+//! does the private temporary directory of the trial that was running
+//! ([`signal_children`], [`die_by_default_action`]).
 
 use std::fmt;
 use std::sync::atomic::AtomicBool;
@@ -138,38 +140,83 @@ extern "C" fn on_stop_signal(signal: libc::c_int) {
     unsafe { *libc::__errno_location() = errno };
 }
 
+/// How long the diagnostic of [`die_by_default_action`] may take before the
+/// signal ends analyze anyway.
+const DIAGNOSTIC_BOUND: libc::timespec = libc::timespec {
+    tv_sec: 1,
+    tv_nsec: 0,
+};
+
 /// End analyze by `signal`'s default action, after saying on stderr that
 /// its handler could not pass the signal on (`undelivered`): the stop is
 /// then what it would be without the handler. The trial's container init
-/// dies with analyze by its parent-death signal, and the workspace stays.
+/// dies with analyze by its parent-death signal. Nothing unwinds, so the
+/// workspace and the running trial's private temporary directory stay.
 /// Async-signal-safe.
+///
+/// Death never waits on the diagnostic. The default action is armed first,
+/// and a timer sends the same signal to the process after
+/// [`DIAGNOSTIC_BOUND`] (`SIGEV_SIGNAL` without `SIGEV_THREAD_ID` is
+/// process-directed, `posix_timer_event`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v6.9#n280>),
+/// before the signal is unblocked on this thread and the diagnostic written:
+/// a write that blocks, on a full pipe whose reader is alive, ends when the
+/// timer's signal kills the process. Without a timer the diagnostic is left
+/// out. Every system call is made directly, with no descriptor opened.
 fn die_by_default_action(signal: libc::c_int, undelivered: Undelivered) -> ! {
     let mut name = [0u8; 10];
     let mut errno = [0u8; 10];
-    for part in [
-        &b"hermit analyze: could not pass signal "[..],
-        pid_digits(signal, &mut name).unwrap_or(b"?"),
-        b" on to the run it started (",
-        undelivered.call.as_bytes(),
-        b" failed with errno ",
-        pid_digits(undelivered.errno, &mut errno).unwrap_or(b"?"),
-        b"), so it dies of the signal as it would without its handler, and leaves its \
-          workspace\n",
-    ] {
-        // SAFETY: write(2) reads `part.len()` bytes of `part`.
-        unsafe { libc::write(2, part.as_ptr().cast(), part.len()) };
-    }
     // SAFETY: sigaction(2), sigemptyset(3), sigaddset(3), pthread_sigmask(3),
-    // raise(3) and _exit(2) are async-signal-safe, and every pointer refers
-    // to a local that outlives the call. An all-zero sigaction is SIG_DFL.
+    // timer_create(2), timer_settime(2), write(2), raise(3) and _exit(2) are
+    // async-signal-safe, and every pointer refers to a local that outlives
+    // the call. An all-zero sigaction is SIG_DFL; the kernel writes its
+    // timer id, an int, into `timer`.
     unsafe {
         let default: libc::sigaction = std::mem::zeroed();
         libc::sigaction(signal, &default, std::ptr::null_mut());
+        let mut event: libc::sigevent = std::mem::zeroed();
+        event.sigev_notify = libc::SIGEV_SIGNAL;
+        event.sigev_signo = signal;
+        let mut timer: libc::c_int = 0;
+        let deadline = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: DIAGNOSTIC_BOUND,
+        };
+        let bounded = libc::syscall(
+            libc::SYS_timer_create,
+            libc::CLOCK_MONOTONIC,
+            &mut event as *mut libc::sigevent,
+            &mut timer as *mut libc::c_int,
+        ) == 0
+            && libc::syscall(
+                libc::SYS_timer_settime,
+                timer,
+                0,
+                &deadline as *const libc::itimerspec,
+                std::ptr::null_mut::<libc::itimerspec>(),
+            ) == 0;
         let mut unblock: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut unblock);
         libc::sigaddset(&mut unblock, signal);
-        libc::raise(signal);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+        if bounded {
+            for part in [
+                &b"hermit analyze: could not pass signal "[..],
+                pid_digits(signal, &mut name).unwrap_or(b"?"),
+                b" on to the run it started (",
+                undelivered.call.as_bytes(),
+                b" failed with errno ",
+                pid_digits(undelivered.errno, &mut errno).unwrap_or(b"?"),
+                b"), so it dies of the signal as it would without its handler, and leaves its \
+                  workspace and the trial's private temporary directory behind\n",
+            ] {
+                libc::write(2, part.as_ptr().cast(), part.len());
+            }
+        }
+        libc::raise(signal);
         libc::_exit(128 + signal)
     }
 }
@@ -1243,13 +1290,18 @@ mod tests {
         let code = exit_code(outer);
         assert_eq!(code, ended::AS_IT_SHOULD, "{}", ended::describe(code));
     }
-    /// The process holding the handler in
-    /// [`a_stop_the_handler_cannot_pass_on_ends_analyze_by_its_default_action`]:
-    /// it starts a child that dies with it (its parent-death signal, as a
-    /// trial's container init has), tells its PID on `tell`, uses up every
-    /// descriptor it may open, and sends itself SIGTERM. Exiting is the
-    /// regression: the stop was swallowed.
-    fn as_analyze_without_descriptors(says: libc::c_int, tell: libc::c_int) -> libc::c_int {
+    /// The process holding the handler in [`stop_without_descriptors`]. It
+    /// starts a child that dies with it (its parent-death signal, as a
+    /// trial's container init has) and waits until the child has armed that
+    /// signal while this process is still its parent, tells the child's PID
+    /// on `tell`, with `full_stderr` fills its stderr pipe so that a write
+    /// there blocks, uses up every descriptor it may open, and sends itself
+    /// SIGTERM. Exiting is the regression: the stop was swallowed.
+    fn as_analyze_without_descriptors(
+        says: libc::c_int,
+        tell: libc::c_int,
+        full_stderr: bool,
+    ) -> libc::c_int {
         // SAFETY: dup2(2) and close(2) on descriptors this process owns.
         unsafe {
             libc::dup2(says, 2);
@@ -1261,23 +1313,47 @@ mod tests {
         if !guard.installed[0] {
             return ended::NO_HANDLER;
         }
-        // SAFETY: this process has one thread; the child only pauses.
+        let Some((armed, arms)) = pipe() else {
+            return ended::NO_FORK;
+        };
+        // SAFETY: getpid(2) has no preconditions; this process has one
+        // thread, and the child only arms its signal, reports and pauses.
+        let parent = unsafe { libc::getpid() };
         let child = unsafe { libc::fork() };
         if child == 0 {
             unsafe {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                libc::close(2);
+                libc::close(tell);
+                libc::close(armed);
+                let ready = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == 0
+                    && libc::getppid() == parent;
+                if !ready || !send(arms, b"A") {
+                    libc::_exit(1);
+                }
                 loop {
                     libc::pause();
                 }
             }
         }
-        if child < 0 || !send(tell, &child.to_ne_bytes()) {
+        // SAFETY: closes this process's copy of the child's end.
+        unsafe { libc::close(arms) };
+        let mut ready = [0u8; 1];
+        if child < 0 || !receive(armed, &mut ready) || !send(tell, &child.to_ne_bytes()) {
             return ended::NO_FORK;
         }
-        // SAFETY: setrlimit(2) reads `limit`; open(2) on a NUL-terminated
-        // literal; raise(3) runs the handler on this thread.
+        // SAFETY: fcntl(2) and write(2) on this process's stderr, a pipe
+        // whose reader is alive; setrlimit(2) reads `limit`; open(2) on a
+        // NUL-terminated literal; raise(3) runs the handler on this thread.
         unsafe {
+            libc::close(armed);
             libc::close(tell);
+            if full_stderr {
+                let flags = libc::fcntl(2, libc::F_GETFL);
+                libc::fcntl(2, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                let chunk = [b'x'; 4096];
+                while libc::write(2, chunk.as_ptr().cast(), chunk.len()) > 0 {}
+                libc::fcntl(2, libc::F_SETFL, flags);
+            }
             let mut limit: libc::rlimit = std::mem::zeroed();
             libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
             limit.rlim_cur = limit.rlim_cur.min(64);
@@ -1287,6 +1363,109 @@ mod tests {
         }
         std::mem::forget(guard);
         ended::STOP_SWALLOWED
+    }
+
+    /// `pid`'s wait status once it ends, if it does within `bound`; else it
+    /// is killed through a pidfd (it is this process's child, not yet
+    /// reaped, so the pidfd names it) and reaped, and `None` returned.
+    fn wait_within(pid: libc::pid_t, bound: Duration) -> Option<libc::c_int> {
+        let deadline = std::time::Instant::now() + bound;
+        let mut raw = 0;
+        loop {
+            // SAFETY: `raw` outlives the call; `pid` is this process's child.
+            let waited = unsafe { libc::waitpid(pid, &mut raw, libc::WNOHANG) };
+            if waited == pid {
+                return Some(raw);
+            }
+            if waited < 0 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: pidfd_open(2) and pidfd_send_signal(2) without siginfo;
+        // close(2) of the pidfd opened here; waitpid(2) reaps the child.
+        unsafe {
+            let pidfd = libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int;
+            if pidfd >= 0 {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+                libc::close(pidfd);
+            }
+            libc::waitpid(pid, &mut raw, 0);
+        }
+        None
+    }
+
+    /// Run [`as_analyze_without_descriptors`] in a process of its own and
+    /// say how it ended (its wait status, `None` if it had to be killed after
+    /// the bound), what it wrote on stderr (read once it and its child have
+    /// ended, so a full pipe stays full until then), and how its child ended.
+    fn stop_without_descriptors(
+        full_stderr: bool,
+    ) -> (Option<libc::c_int>, String, Option<libc::c_int>) {
+        // SAFETY: prctl(2) with integer arguments: the child, orphaned when
+        // its parent dies, comes to this process to be reaped.
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        let (Some((said, says)), Some((told, tell))) = (pipe(), pipe()) else {
+            panic!("pipe: {}", std::io::Error::last_os_error());
+        };
+        // SAFETY: the copy's other thread waits for this test and holds no
+        // lock.
+        let analyze = unsafe { libc::fork() };
+        if analyze == 0 {
+            unsafe {
+                libc::close(said);
+                libc::close(told);
+                libc::_exit(as_analyze_without_descriptors(says, tell, full_stderr))
+            }
+        }
+        assert!(analyze > 0, "fork: {}", std::io::Error::last_os_error());
+        // SAFETY: closes this process's copies of the ends the child uses.
+        unsafe {
+            libc::close(says);
+            libc::close(tell);
+        }
+        let ended = wait_within(analyze, Duration::from_secs(20));
+        let mut child = [0u8; 4];
+        let child = receive(told, &mut child)
+            .then(|| libc::pid_t::from_ne_bytes(child))
+            .and_then(|child| wait_within(child, Duration::from_secs(20)));
+        let mut stderr = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            // SAFETY: read(2) writes at most `chunk.len()` bytes into it.
+            let got = unsafe { libc::read(said, chunk.as_mut_ptr().cast(), chunk.len()) };
+            let Some(got) = usize::try_from(got).ok().filter(|&got| got > 0) else {
+                break;
+            };
+            stderr.extend_from_slice(&chunk[..got]);
+        }
+        // SAFETY: closes the ends this test opened.
+        unsafe {
+            libc::close(said);
+            libc::close(told);
+        }
+        let stderr = String::from_utf8_lossy(&stderr);
+        (ended, stderr.trim_start_matches('x').to_owned(), child)
+    }
+
+    /// Whether `ended` is a death by `signal`, and if not, what it was.
+    fn died_of(ended: Option<libc::c_int>, signal: libc::c_int) -> Result<(), String> {
+        match ended {
+            Some(raw) if libc::WIFSIGNALED(raw) && libc::WTERMSIG(raw) == signal => Ok(()),
+            Some(raw) if libc::WIFEXITED(raw) => Err(format!(
+                "exited {} ({})",
+                libc::WEXITSTATUS(raw),
+                ended::describe(libc::WEXITSTATUS(raw))
+            )),
+            Some(raw) => Err(format!("status {raw:#x}")),
+            None => Err("still alive after the bound, killed".to_owned()),
+        }
     }
 
     /// A stop the handler cannot pass on is never swallowed. With no
@@ -1301,51 +1480,10 @@ mod tests {
         if crate::test_isolation::rerun_alone() {
             return;
         }
-        // SAFETY: prctl(2) with integer arguments: the child below, orphaned
-        // when its parent dies, comes to this process to be reaped.
-        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-        let (Some((said, says)), Some((told, tell))) = (pipe(), pipe()) else {
-            panic!("pipe: {}", std::io::Error::last_os_error());
-        };
-        // SAFETY: the copy's other thread waits for this test and holds no
-        // lock.
-        let analyze = unsafe { libc::fork() };
-        if analyze == 0 {
-            unsafe {
-                libc::close(said);
-                libc::close(told);
-                libc::_exit(as_analyze_without_descriptors(says, tell))
-            }
+        let (ended, stderr, child) = stop_without_descriptors(false);
+        if let Err(how) = died_of(ended, libc::SIGTERM) {
+            panic!("analyze should die of SIGTERM, but {how}; stderr: {stderr}");
         }
-        assert!(analyze > 0, "fork: {}", std::io::Error::last_os_error());
-        // SAFETY: closes this process's copies of the ends the child uses.
-        unsafe {
-            libc::close(says);
-            libc::close(tell);
-        }
-        let mut raw = 0;
-        // SAFETY: `raw` outlives the call; `analyze` is this process's child.
-        assert_eq!(unsafe { libc::waitpid(analyze, &mut raw, 0) }, analyze);
-        let mut stderr = Vec::new();
-        let mut chunk = [0u8; 512];
-        loop {
-            // SAFETY: read(2) writes at most `chunk.len()` bytes into it.
-            let got = unsafe { libc::read(said, chunk.as_mut_ptr().cast(), chunk.len()) };
-            let Some(got) = usize::try_from(got).ok().filter(|&got| got > 0) else {
-                break;
-            };
-            stderr.extend_from_slice(&chunk[..got]);
-        }
-        let stderr = String::from_utf8_lossy(&stderr);
-        assert!(
-            libc::WIFSIGNALED(raw) && libc::WTERMSIG(raw) == libc::SIGTERM,
-            "analyze should die of SIGTERM; status {raw:#x} ({}), stderr: {stderr}",
-            if libc::WIFEXITED(raw) {
-                ended::describe(libc::WEXITSTATUS(raw))
-            } else {
-                "killed"
-            }
-        );
         assert!(
             stderr.contains(
                 "hermit analyze: could not pass signal 15 on to the run it started (open \
@@ -1353,14 +1491,26 @@ mod tests {
             ),
             "{stderr}"
         );
-        let mut child = [0u8; 4];
-        assert!(receive(told, &mut child), "no child PID");
-        let child = libc::pid_t::from_ne_bytes(child);
-        // SAFETY: the orphaned child is this process's to reap.
-        assert_eq!(unsafe { libc::waitpid(child, &mut raw, 0) }, child);
-        assert!(
-            libc::WIFSIGNALED(raw) && libc::WTERMSIG(raw) == libc::SIGKILL,
-            "the child should die with analyze; status {raw:#x}"
-        );
+        if let Err(how) = died_of(child, libc::SIGKILL) {
+            panic!("the child should die with analyze, but {how}");
+        }
+    }
+
+    /// Death does not wait on the diagnostic. With stderr a full pipe whose
+    /// reader is alive, the diagnostic's write blocks; before, the handler
+    /// blocked in it with the stop signals masked, and analyze never died.
+    /// Now the signal ends it within the bound, and the child with it.
+    #[test]
+    fn a_stop_ends_analyze_even_when_its_stderr_is_full() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
+        let (ended, stderr, child) = stop_without_descriptors(true);
+        if let Err(how) = died_of(ended, libc::SIGTERM) {
+            panic!("analyze should die of SIGTERM, but {how}; stderr: {stderr}");
+        }
+        if let Err(how) = died_of(child, libc::SIGKILL) {
+            panic!("the child should die with analyze, but {how}");
+        }
     }
 }
