@@ -2032,7 +2032,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_real_proc_fd_reopen_trace_gives_no_edge}: 1297.
     // And analyze::races::tests::{a_fifo_access_from_a_process_holding_no_end_gives_no_edge,
     // real_fifo_reopen_traces_give_no_edge}: 1299.
-    ("test.hermit_unit", 1299),
+    // And analyze::races::tests::{a_trace_without_descriptor_types_gives_no_pipe_edge,
+    // a_real_trace_recorded_without_metadata_virtualization_gives_no_pipe_edge}: 1301.
+    ("test.hermit_unit", 1301),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4688,7 +4690,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
     // And access_trace::the_trace_shows_what_leaves_a_pipes_data_edges_out: 797.
-    ("test.cli", 797),
+    // And access_trace::a_trace_names_the_settings_that_leave_descriptors_untyped: 798.
+    ("test.cli", 798),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5348,7 +5351,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
     // And the same pipe-records test, not excluded: 716.
-    ("test.cli_on_host", 716),
+    // And the same untyped-descriptor header test, not excluded: 717.
+    ("test.cli_on_host", 717),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6353,7 +6357,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unfollowed-route test: 1289.
     // And the same waited-write and real-reopen tests: 1291.
     // And the same two FIFO-access tests: 1293.
-    ("test.hermit_unit_on_host", 1293),
+    // And the same two untyped-descriptor tests: 1295.
+    ("test.hermit_unit_on_host", 1295),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
