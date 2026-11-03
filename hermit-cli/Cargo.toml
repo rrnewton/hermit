@@ -46,6 +46,9 @@ liteinst = ["dep:reverie-liteinst", "dep:reverie-rpc-transport"]
 native-exec-input-admission = []
 # Explicit native in-guest-trap launch domain; ordinary exec remains unchanged.
 native-exec = ["native-exec-input-admission", "liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"]
+# Trap-only launch domain checked by cfg in the library and tests; declared
+# empty and off by default, like the liteinst declaration it pairs with.
+in-guest-trap = []
 # Hardware qualification selected only by the existing KVM validation nodes.
 kvm-execution-tests = []
 
