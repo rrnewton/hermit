@@ -291,7 +291,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                             .filter(|(entry, _)| entries.contains(entry))
                             .copied()
                             .collect();
-                        let returning = mapping::returning_functions(words, sh.sh_addr, &bounds);
+                        let never = |target: u64| never_back.contains(&target);
+                        let returning =
+                            mapping::returning_functions(words, sh.sh_addr, &bounds, &never);
                         // A call out of this section, to a function no FDE
                         // here describes, is taken to return: the ABI's
                         // ordinary case, unless the image names it as one
@@ -336,6 +338,14 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
         .collect();
     // The bytes every `LDR` (literal) and `ADR` in the image's code reaches,
     // sorted: a sequence among them may be a literal pool.
+    // A literal or `ADR` that names a function's own entry is a pointer
+    // to the function, not to data, so it does not refuse that function's
+    // first sequence.
+    let entry_of = |target: u64| {
+        functions
+            .binary_search_by_key(&target, |(entry, _)| *entry)
+            .is_ok()
+    };
     let mut literals: Vec<(u64, u64)> = sections
         .iter()
         .filter_map(|section| Some((section, section.words.as_ref()?)))
@@ -346,6 +356,7 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                 mapping::literal_targets(&words[first..last.min(words.len())], *start)
             })
         })
+        .filter(|(target, _)| !entry_of(*target))
         .collect();
     literals.sort_unstable();
     // Where only the unwind table tells code from data, the reachability
@@ -366,8 +377,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                 let last = (((end - section.vaddr) / 4) as usize).min(words.len());
                 let addressed = mapping::addressed_starts(&words[first..last], *start);
                 starts.extend(addressed.starts);
-                // An `ADRP` this reader cannot complete names only a page.
-                // Every function that page overlaps may hold the data.
+                // An `ADRP` this reader cannot complete names only a
+                // page, which the reader hands back: every function that
+                // page overlaps may hold the data.
                 pages.extend(addressed.unresolved);
                 branches.extend(mapping::direct_branches(&words[first..last], *start));
             }
@@ -684,6 +696,13 @@ fn never_returning_targets(bytes: &[u8], elf: &Elf<'_>) -> std::collections::Has
             let addressed = mapping::addressed_starts(&words[index..reach], at);
             if addressed.starts.iter().any(|slot| slots.contains(slot)) {
                 targets.insert(at);
+                // With branch target identification the entry starts at a
+                // `BTI c` before the `ADRP`, and that is where a call
+                // lands.
+                const BTI_C: u32 = 0xD503_245F;
+                if index > 0 && words[index - 1] == BTI_C {
+                    targets.insert(at - 4);
+                }
             }
         }
     }
@@ -1723,6 +1742,67 @@ mod tests {
         named[at..at + text.len()].copy_from_slice(&[0u8; 24]);
         let (bytes, report) = rewritten(&named);
         assert_eq!(bytes, named, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
+    }
+
+    /// The names of functions that never return, as the symbol tables
+    /// spell them: the C library's and the C++ runtime's, and Rust's panic
+    /// entry points in both mangling schemes. An ordinary name is not one.
+    #[test]
+    fn the_names_that_never_return_are_recognised() {
+        for name in [
+            "exit",
+            "abort",
+            "__stack_chk_fail",
+            "_Unwind_Resume",
+            "_ZSt9terminatev",
+            "_ZN4core9panicking9panic_fmt17h0123456789abcdefE",
+            "_ZN3std9panicking11begin_panic17hfedcba9876543210E",
+            "_RNvNtCs1234_4core9panicking9panic_fmt",
+            "__rust_start_panic",
+        ] {
+            assert!(never_returns(name), "{name}");
+        }
+        for name in [
+            "exits",
+            "abort_handler",
+            "my_exit",
+            "_ZN4core3fmt5write17h0123456789abcdefE",
+            "main",
+            "",
+        ] {
+            assert!(!never_returns(name), "{name}");
+        }
+    }
+
+    /// A literal or `ADR` that names a function's own entry is a pointer
+    /// to the function, not to data, so the function's first sequence is
+    /// still rewritten. A pointer into its body is data, as before.
+    #[test]
+    fn a_pointer_to_a_functions_entry_does_not_make_it_data() {
+        // worker: the loop; its caller takes its address and calls it.
+        let mut words = [0u32; 9];
+        words[0..4].copy_from_slice(&[0x885f_fc08, 0x1100_0508, 0x8809_fc08, 0x35ff_ffa9]);
+        words[4] = 0xd65f_03c0; // ret
+        words[5] = 0x1000_0001; // adr x1, <word 0>: see below
+        words[6] = 0xd63f_0020; // blr x1
+        words[7] = 0xd65f_03c0; // ret
+        words[8] = 0xd503_201f;
+        // adr x1, 0x100 from 0x114 is -0x14.
+        words[5] = 0x1000_0001 | ((((-0x14i32 >> 2) & 0x7_FFFF) as u32) << 5);
+        let functions = [(0, 5), (5, 8)];
+        let image = elf_image_with(&words, None, Some(&functions));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(report.patched_total(), 1, "{report:?}");
+        assert_ne!(bytes, image);
+
+        // The same `ADR` one word into the function names data, and the
+        // sequence over it is refused.
+        let mut inside = words;
+        inside[5] = 0x1000_0001 | ((((-0x10i32 >> 2) & 0x7_FFFF) as u32) << 5);
+        let image = elf_image_with(&inside, None, Some(&functions));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
         assert_eq!(report.patched_total(), 0, "{report:?}");
     }
 

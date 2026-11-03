@@ -34,8 +34,9 @@ pub mod rewrite;
 /// Bumped whenever the rewrite's output for the same input can change. It is
 /// part of the cache key, so a cached artifact from an older rewriter is
 /// never reused. 3: only code is rewritten, as [`mapping`] tells it from
-/// data.
-pub const REWRITE_FORMAT_VERSION: u32 = 3;
+/// data. 4: a stripped file's code is what control proves, and what the
+/// code or the image addresses as data is not it.
+pub const REWRITE_FORMAT_VERSION: u32 = 4;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///
