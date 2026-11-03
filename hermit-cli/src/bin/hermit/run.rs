@@ -2273,8 +2273,9 @@ pub struct RunOpts {
     exclusive_rewrite_overlays: Vec<ExecutableOverlayMount>,
 
     /// Runtime-only: the guest path of every file `--rewrite-exclusives` left
-    /// unchanged, wholly or in part, because no mapping symbol marks its
-    /// code, for `Config::rewrite_exclusives_unmarked`.
+    /// unchanged, wholly or in part, because no mapping symbol it accepts
+    /// marks its code (none, or one that is neither `$x` nor `$d`), for
+    /// `Config::rewrite_exclusives_unmarked`.
     #[clap(skip)]
     exclusive_rewrite_unmarked: Vec<PathBuf>,
 
@@ -13604,6 +13605,18 @@ impl RunOpts {
                     report.unmarked()
                 );
                 self.exclusive_rewrite_unmarked.push(guest_path.clone());
+            }
+            if report.unsupported() != 0 {
+                crate::app::tracing::diagnostic_eprintln!(
+                    ":: Exclusive-loop rewrite: {} has a mapping symbol other than $x and $d, so \
+                     its {} exclusive loop(s) in the sections it marks were left as they are; \
+                     `hermit rewrite-exclusives --list-refusals` names the symbol",
+                    guest_path.display(),
+                    report.unsupported()
+                );
+                if report.unmarked() == 0 {
+                    self.exclusive_rewrite_unmarked.push(guest_path.clone());
+                }
             }
             if report.patched_total() != 0 {
                 let output = hermit::aarch64_lse::cached_rewrite(

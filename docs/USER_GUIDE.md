@@ -1154,7 +1154,11 @@ retry. It is preprocessing for the ptrace backend, not a backend.
 
 Only mapping symbols prove where code is: the AArch64 ELF ABI has the
 assembler mark every switch between code (`$x`) and data (`$d`), so the
-default rewrites only what they mark as code. A stripped file has none.
+default rewrites only what they mark as code. A stripped file has none. A
+section that holds a mapping symbol of another kind (AArch32's `$a` or `$t`,
+or a `$` name Hermit does not know) is not proved by them and is left
+unchanged under either setting, its loops listed as
+`unsupported-mapping-symbol` with the symbol's name.
 
 The stripped-file heuristic takes for code what control reaches from the
 entries of the functions the unwind table (`.eh_frame`) describes, less what

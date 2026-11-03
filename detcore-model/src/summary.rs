@@ -353,10 +353,11 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclusive_rewrite_stripped_heuristic: bool,
 
-    /// aarch64: the files the run's `--rewrite-exclusives` left unchanged
-    /// because they have no ARM mapping symbols, under the default
-    /// (`--rewrite-exclusives-stripped=refuse`). Shown in the INFO view and
-    /// the full report. Absent when there were none.
+    /// aarch64: the files the run's `--rewrite-exclusives` left unchanged,
+    /// wholly or in part, because no mapping symbol it accepts marks their
+    /// code: none, under the default (`--rewrite-exclusives-stripped=refuse`),
+    /// or one that is neither `$x` nor `$d`. Shown in the INFO view and the
+    /// full report. Absent when there were none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclusive_rewrite_unmarked: Vec<String>,
 }
@@ -704,7 +705,8 @@ impl RunSummary {
         if !exclusive_rewrite_unmarked.is_empty() {
             writeln!(
                 f,
-                "--rewrite-exclusives left {} file(s) without mapping symbols unchanged:",
+                "--rewrite-exclusives left {} file(s) unchanged where no mapping symbol it \
+                 accepts marks their code:",
                 exclusive_rewrite_unmarked.len()
             )?;
             for path in exclusive_rewrite_unmarked {

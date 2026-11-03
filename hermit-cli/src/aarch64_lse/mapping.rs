@@ -58,6 +58,10 @@ const SHN_LORESERVE: u16 = 0xff00;
 pub struct CodeEvidence {
     /// The mapping symbols, sorted as [`mapping_symbols`] returns them.
     pub symbols: Vec<MappingSymbol>,
+    /// The local, untyped symbols named like mapping symbols that are neither
+    /// `$x` nor `$d` ([`unsupported_mapping_symbols`]), as (section index,
+    /// name). A section that has one is not proved by its mapping symbols.
+    pub unsupported: Vec<(usize, String)>,
     /// The address range of each FDE, sorted; `None` without an unwind
     /// table, or with one this reader cannot decode.
     pub unwind: Option<Vec<(u64, u64)>>,
@@ -91,8 +95,14 @@ impl CodeEvidence {
     ) -> Self {
         const ET_EXEC: u16 = 2;
         const ET_DYN: u16 = 3;
-        let symbols = symbol_table(table)
-            .and_then(|(symtab, strtab)| Some(mapping_symbols(&read(symtab)?, &read(strtab)?)))
+        let (symbols, unsupported) = symbol_table(table)
+            .and_then(|(symtab, strtab)| {
+                let (symtab, strtab) = (read(symtab)?, read(strtab)?);
+                Some((
+                    mapping_symbols(&symtab, &strtab),
+                    unsupported_mapping_symbols(&symtab, &strtab),
+                ))
+            })
             .unwrap_or_default();
         let unwind = matches!(e_type, ET_EXEC | ET_DYN)
             .then(|| section_range(table, shstrndx))
@@ -100,7 +110,20 @@ impl CodeEvidence {
             .and_then(&mut read)
             .and_then(|names| section_named(table, &names, b".eh_frame"))
             .and_then(|(range, address)| fde_ranges(&read(range)?, address));
-        CodeEvidence { symbols, unwind }
+        CodeEvidence {
+            symbols,
+            unsupported,
+            unwind,
+        }
+    }
+
+    /// The first mapping symbol section `section` holds that is neither `$x`
+    /// nor `$d`, if any.
+    pub fn unsupported_in(&self, section: usize) -> Option<&str> {
+        self.unsupported
+            .iter()
+            .find(|(marked, _)| *marked == section)
+            .map(|(_, name)| name.as_str())
     }
 
     /// What section `section` (at `address`, `size` bytes long) holds: by its
@@ -965,26 +988,25 @@ pub fn symbol_table(table: &[u8]) -> Option<((u64, u64), (u64, u64))> {
     Some((range(symtab), range(strtab)))
 }
 
-/// The mapping symbols of a symbol table, given the string table it names:
-/// the local, untyped symbols whose names are `$x` or `$d`, sorted by
-/// section and address. Where a `$x` and a `$d` mark the same
-/// address, the `$d` sorts last and so wins: a word that may be data is not
-/// taken for code.
-pub fn mapping_symbols(symtab: &[u8], strtab: &[u8]) -> Vec<MappingSymbol> {
-    let mut symbols: Vec<MappingSymbol> = symtab
+/// The local, untyped symbols of a symbol table that mark a section, given
+/// the string table it names, as (section index, address, name). A mapping
+/// symbol is one of them ("ELF for the Arm 64-bit Architecture", 5.5.4: they
+/// are `STT_NOTYPE` and `STB_LOCAL`, and the `$` names are reserved for local
+/// symbols). A global symbol whose name begins `$x` is an ordinary label:
+/// taking it for a mapping symbol would let one inside a `$d` table start a
+/// code range there.
+fn local_untyped_symbols<'a>(
+    symtab: &'a [u8],
+    strtab: &'a [u8],
+) -> impl Iterator<Item = (usize, u64, &'a [u8])> + 'a {
+    symtab
         .as_chunks::<SYMBOL_SIZE>()
         .0
         .iter()
-        .filter_map(|symbol| {
+        .filter_map(move |symbol| {
             let name =
                 usize::try_from(u32::from_le_bytes(symbol[0..4].try_into().unwrap())).ok()?;
             let section = u16::from_le_bytes(symbol[6..8].try_into().unwrap());
-            // A mapping symbol is local and untyped ("ELF for the Arm
-            // 64-bit Architecture", 5.5.4: they are `STT_NOTYPE` and
-            // `STB_LOCAL`, and the `$` names are reserved for local
-            // symbols). A global symbol whose name begins `$x` is an
-            // ordinary label: taking it for a mapping symbol would let one
-            // inside a `$d` table start a code range there.
             if symbol[4] & 0xf != STT_NOTYPE
                 || symbol[4] >> 4 != STB_LOCAL
                 || section == 0
@@ -994,15 +1016,45 @@ pub fn mapping_symbols(symtab: &[u8], strtab: &[u8]) -> Vec<MappingSymbol> {
             }
             let name = strtab.get(name..)?;
             let name = &name[..name.iter().position(|byte| *byte == 0)?];
+            Some((
+                usize::from(section),
+                u64::from_le_bytes(symbol[8..16].try_into().unwrap()),
+                name,
+            ))
+        })
+}
+
+/// The mapping symbols of a symbol table, given the string table it names:
+/// the local, untyped symbols whose names are `$x` or `$d`, sorted by
+/// section and address. Where a `$x` and a `$d` mark the same
+/// address, the `$d` sorts last and so wins: a word that may be data is not
+/// taken for code.
+pub fn mapping_symbols(symtab: &[u8], strtab: &[u8]) -> Vec<MappingSymbol> {
+    let mut symbols: Vec<MappingSymbol> = local_untyped_symbols(symtab, strtab)
+        .filter_map(|(section, address, name)| {
             Some(MappingSymbol {
-                section: usize::from(section),
-                address: u64::from_le_bytes(symbol[8..16].try_into().unwrap()),
+                section,
+                address,
                 code: mapping_kind(name)?,
             })
         })
         .collect();
     symbols.sort_by_key(|symbol| (symbol.section, symbol.address, !symbol.code));
     symbols
+}
+
+/// The local, untyped symbols named like mapping symbols (a `$` name) that
+/// are neither `$x` nor `$d`, with or without a `.suffix`, as (section index,
+/// name), in table order: AArch32's `$a` and `$t`, and any other `$` name,
+/// such as `$xyz` or `$dx`. They are reserved for mapping symbols, so this
+/// reader cannot say where they put code or data, and a section that has one
+/// is not proved by its mapping symbols: a `$a` after a `$x` would otherwise
+/// leave the code range running through it.
+pub fn unsupported_mapping_symbols(symtab: &[u8], strtab: &[u8]) -> Vec<(usize, String)> {
+    local_untyped_symbols(symtab, strtab)
+        .filter(|(_, _, name)| name.first() == Some(&b'$') && mapping_kind(name).is_none())
+        .map(|(section, _, name)| (section, String::from_utf8_lossy(name).into_owned()))
+        .collect()
 }
 
 /// The code of section `section`, which starts at `address` and is `size`
@@ -1356,6 +1408,7 @@ pub(crate) mod tests {
         };
         let evidence = CodeEvidence {
             symbols: vec![mark(1, 0x140, true), mark(1, 0x180, false)],
+            unsupported: Vec::new(),
             unwind: Some(vec![(0x80, 0x180), (0x400, 0x440)]),
         };
         // Mapping symbols: the bytes before the first mark are unknown, a
@@ -1473,6 +1526,48 @@ pub(crate) mod tests {
         assert_eq!(
             code_spans(&symbols, 2, 0x100, 0x100),
             Some(vec![(0x100, 0x180)])
+        );
+    }
+
+    /// A local, untyped `$` symbol that is neither `$x` nor `$d` (with or
+    /// without a `.suffix`) is collected as unsupported, by section: AArch32's
+    /// `$a` and `$t`, an unknown `$q`, and `$xyz` or `$dx`, which only look
+    /// like `$x` and `$d`. `$x.foo` and `$d.1` are mapping symbols, and a
+    /// global `$a` is an ordinary label.
+    #[test]
+    fn mapping_symbols_this_reader_does_not_know_are_collected() {
+        let strtab = b"\0$x\0$a\0$t\0$q\0$xyz\0$dx\0$x.foo\0$d.1\0main\0";
+        let (x, a, t, q, xyz, dx, xfoo, d1, main) = (1, 4, 7, 10, 13, 18, 22, 29, 34);
+        let symtab = [
+            symbol(0, 0, 0, 0),
+            symbol(x, 0, 2, 0x100),
+            symbol(a, 0, 2, 0x110),
+            symbol(t, 0, 3, 0x200),
+            symbol(q, 0, 4, 0x300),
+            symbol(xyz, 0, 5, 0x400),
+            symbol(dx, 0, 6, 0x500),
+            symbol(xfoo, 0, 7, 0x600),
+            symbol(d1, 0, 7, 0x610),
+            symbol(main, 0, 8, 0x700),
+            symbol(a, 0x10, 9, 0x800), // STB_GLOBAL
+        ]
+        .concat();
+        assert_eq!(
+            unsupported_mapping_symbols(&symtab, strtab),
+            vec![
+                (2, "$a".to_owned()),
+                (3, "$t".to_owned()),
+                (4, "$q".to_owned()),
+                (5, "$xyz".to_owned()),
+                (6, "$dx".to_owned()),
+            ]
+        );
+        assert_eq!(
+            mapping_symbols(&symtab, strtab)
+                .iter()
+                .map(|symbol| symbol.section)
+                .collect::<Vec<_>>(),
+            vec![2, 7, 7]
         );
     }
 

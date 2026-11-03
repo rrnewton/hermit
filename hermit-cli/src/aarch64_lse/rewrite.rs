@@ -106,6 +106,10 @@ pub enum Refusal {
     /// so nothing proves which of its bytes are code, and the default
     /// (`--rewrite-exclusives-stripped=refuse`) leaves it as it is.
     NoMappingSymbols,
+    /// The section holds a mapping symbol, named here, that is neither `$x`
+    /// nor `$d` (AArch32's `$a` or `$t`, or an unknown one), so its mapping
+    /// symbols do not prove where its code is, under either policy.
+    UnsupportedMappingSymbol(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
