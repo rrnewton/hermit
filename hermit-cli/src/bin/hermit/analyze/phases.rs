@@ -3002,6 +3002,68 @@ mod tests {
         }
     }
 
+    /// Every record analyze writes states whether the trials use the
+    /// stripped-file heuristic (`--rewrite-exclusives-stripped=heuristic`), and
+    /// a recording made under the other setting is refused before any trial,
+    /// by the recording's own mark.
+    #[test]
+    fn analyze_stamps_and_checks_the_stripped_rewrite_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |name: &str, heuristic: bool| {
+            let path = record_with_epoch(dir.path(), name, None);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if heuristic {
+                value["rewrite_exclusives_stripped_heuristic"] = serde_json::Value::from(true);
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let prepare = |run1: &Path, run_args: &[&str]| {
+            let run1 = format!("--run1-preemptions={}", run1.display());
+            let mut argv = vec!["hermit", "analyze", run1.as_str(), "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.prepare(&args.global).map(|_| options)
+        };
+        let default = ["--rewrite-exclusives"];
+        let heuristic = [
+            "--rewrite-exclusives",
+            "--rewrite-exclusives-stripped=heuristic",
+        ];
+        let plain = record("stripped-plain", false);
+        let marked = record("stripped-heuristic", true);
+        let written = |options: &AnalyzeOpts| {
+            let trial = dir.path().join("stripped-trial.json");
+            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            detcore::preemptions::read_recorded_rewrite_exclusives_stripped_heuristic(&trial)
+                .unwrap()
+        };
+        let under_default = prepare(&plain, &default).unwrap();
+        assert!(!under_default.trial_stripped_rewrite_heuristic());
+        assert!(!written(&under_default));
+        let under_heuristic = prepare(&marked, &heuristic).unwrap();
+        assert!(under_heuristic.trial_stripped_rewrite_heuristic());
+        assert!(written(&under_heuristic));
+        for (run1, run_args) in [(&marked, &default[..]), (&plain, &heuristic[..])] {
+            let error = prepare(run1, run_args).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains("stripped-file heuristic"),
+                "{error:#}"
+            );
+        }
+    }
+
     /// Runs `test` (this module's test of that name) in two child processes,
     /// once with `HERMIT_EPOCH` unset and once set to [`OTHER`], and returns
     /// `None`. Inside such a child it returns the arm, `"unset"` or `"set"`.

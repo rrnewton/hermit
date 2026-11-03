@@ -242,6 +242,14 @@ pub struct PreemptionRecord {
     /// synthesized in memory; dropped, with the readmissions, by any edit of
     /// the schedule.
     background_starts: Vec<BackgroundStart>,
+    /// Whether the run that produced this record rewrote files without ARM
+    /// mapping symbols by the stripped-file heuristic
+    /// (`Config::rewrite_exclusives_stripped_heuristic`, aarch64), whose
+    /// classification of code is not proved. The guest ran other instructions
+    /// than the default would give it, so a replay under the other setting is
+    /// refused. Written only when on, so absent means off, as for every record
+    /// made before it.
+    rewrite_exclusives_stripped_heuristic: bool,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -411,6 +419,7 @@ impl PreemptionRecord {
             queued_sleeps_registered_at_first_pass: false,
             rejoins: None,
             background_starts: Vec::new(),
+            rewrite_exclusives_stripped_heuristic: false,
         }
     }
 
@@ -481,6 +490,7 @@ impl PreemptionRecord {
             queued_sleeps_registered_at_first_pass,
             rejoins,
             background_starts,
+            rewrite_exclusives_stripped_heuristic,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -574,6 +584,8 @@ impl PreemptionRecord {
             } else {
                 background_starts.clone()
             },
+            // A setting of the recorded run, which a replay must share.
+            rewrite_exclusives_stripped_heuristic: *rewrite_exclusives_stripped_heuristic,
         }
     }
 
@@ -830,6 +842,20 @@ impl PreemptionRecord {
         self
     }
 
+    /// Whether the run this record came from rewrote files without mapping
+    /// symbols by the stripped-file heuristic.
+    pub fn rewrite_exclusives_stripped_heuristic(&self) -> bool {
+        self.rewrite_exclusives_stripped_heuristic
+    }
+
+    /// The same record, stating whether the trials it came from rewrote files
+    /// without mapping symbols by the stripped-file heuristic; analyze stamps
+    /// it on every record it writes, as it stamps the pipe-wake latency.
+    pub fn with_rewrite_exclusives_stripped_heuristic(mut self, on: bool) -> Self {
+        self.rewrite_exclusives_stripped_heuristic = on;
+        self
+    }
+
     /// The same record, stating whether the copy was on in the trials it
     /// came from (`None` for unknown). Every record analyze, minimize or
     /// bisect writes from trials carries it, as it carries the pipe-wake
@@ -963,6 +989,7 @@ impl PreemptionRecord {
             queued_sleeps_registered_at_first_pass: self.queued_sleeps_registered_at_first_pass,
             rejoins: None,
             background_starts: Vec::new(),
+            rewrite_exclusives_stripped_heuristic: self.rewrite_exclusives_stripped_heuristic,
         }
     }
 
@@ -1037,6 +1064,7 @@ impl PreemptionRecord {
             queued_sleeps_registered_at_first_pass: false,
             rejoins: None,
             background_starts: Vec::new(),
+            rewrite_exclusives_stripped_heuristic: false,
         }
     }
 
@@ -2107,6 +2135,52 @@ mod tests {
     }
 
     #[test]
+    fn the_stripped_rewrite_heuristic_round_trips_and_is_compared() {
+        let off = PreemptionWriter::new(None).into_string();
+        assert!(
+            !off.contains("rewrite_exclusives_stripped_heuristic"),
+            "{off}"
+        );
+        let on = PreemptionWriter::new(None)
+            .with_rewrite_exclusives_stripped_heuristic(true)
+            .into_string();
+        assert!(
+            on.contains("\"rewrite_exclusives_stripped_heuristic\":true"),
+            "{on}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&on).unwrap();
+        assert!(back.rewrite_exclusives_stripped_heuristic());
+        assert!(
+            back.clone_preemptions_only()
+                .rewrite_exclusives_stripped_heuristic()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        std::fs::write(&path, &on).unwrap();
+        assert_eq!(
+            read_recorded_rewrite_exclusives_stripped_heuristic(&path),
+            Ok(true)
+        );
+        std::fs::write(&path, &off).unwrap();
+        assert_eq!(
+            read_recorded_rewrite_exclusives_stripped_heuristic(&path),
+            Ok(false)
+        );
+        for (recorded, replay) in [(false, false), (true, true), (true, false), (false, true)] {
+            assert_eq!(
+                rewrite_exclusives_stripped_heuristic_mismatch(
+                    "--replay-schedule-from=x",
+                    recorded,
+                    replay
+                )
+                .is_some(),
+                recorded != replay,
+                "{recorded} replayed with {replay}"
+            );
+        }
+    }
+
+    #[test]
     fn the_signal_state_copy_setting_round_trips_and_is_compared() {
         let unsaid = PreemptionRecord::from_sched_events(Vec::new());
         assert_eq!(unsaid.signal_state_copy(), None);
@@ -2704,6 +2778,30 @@ mod tests {
         }
     }
 
+    /// Whether the recorded run used the stripped-file heuristic is a setting
+    /// a replay of the record must share, so a prefix record keeps it, for
+    /// any length.
+    #[test]
+    fn a_schedule_prefix_keeps_the_stripped_rewrite_heuristic_setting() {
+        let tid = DetTid::from_raw(3);
+        for on in [false, true] {
+            let record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ])
+            .with_rewrite_exclusives_stripped_heuristic(on);
+            for len in [0, 1, 2, 9] {
+                assert_eq!(
+                    record
+                        .schedule_prefix(len)
+                        .rewrite_exclusives_stripped_heuristic(),
+                    on,
+                    "prefix of {len} events"
+                );
+            }
+        }
+    }
+
     /// A replay of a schedule's first events keeps the callback checkpoints
     /// of the slices those events end, for the threads they run, and no later
     /// ones: the slice end at the prefix's own end belongs to the event after
@@ -3173,6 +3271,13 @@ impl PreemptionWriter {
     /// and before the record is flushed.
     pub fn set_host_inputs(&mut self, inputs: HostInputSet) {
         self.inner.host_inputs = Some(inputs);
+    }
+
+    /// Store whether the run rewrote files without mapping symbols by the
+    /// stripped-file heuristic (`Config::rewrite_exclusives_stripped_heuristic`).
+    pub fn with_rewrite_exclusives_stripped_heuristic(mut self, on: bool) -> Self {
+        self.inner.rewrite_exclusives_stripped_heuristic = on;
+        self
     }
 
     /// Store the store-exclusives that failed in the run (aarch64), counted
@@ -3932,6 +4037,47 @@ pub fn guest_ids_mismatch(
         format!(
             "{source} was recorded with guest process IDs {recorded}, and this replay's would be \
              {replay}. The record names every thread by its ID, so the replay cannot follow it."
+        )
+    })
+}
+
+/// Read only whether the run that wrote a preemption record file used the
+/// stripped-file heuristic, as [`read_recorded_epoch`] reads the epoch. A
+/// record without the field was made without it.
+pub fn read_recorded_rewrite_exclusives_stripped_heuristic(path: &Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct RewriteOnly {
+        #[serde(default)]
+        rewrite_exclusives_stripped_heuristic: bool,
+    }
+    Ok(boundary_recording::read_settings::<RewriteOnly>(path)?
+        .rewrite_exclusives_stripped_heuristic)
+}
+
+/// The refusal of a replay that would use the stripped-file heuristic where
+/// the record's run did not, or the other way round, naming the record by
+/// `source` (an option and a path); `None` when they agree.
+pub fn rewrite_exclusives_stripped_heuristic_mismatch(
+    source: &str,
+    recorded: bool,
+    replay: bool,
+) -> Option<String> {
+    let show = |on: bool| {
+        if on {
+            "files without mapping symbols rewritten by the stripped-file heuristic \
+             (--rewrite-exclusives-stripped=heuristic)"
+        } else {
+            "files without mapping symbols left as they are"
+        }
+    };
+    (recorded != replay).then(|| {
+        format!(
+            "{source} was recorded with {} and would be replayed with {}. The heuristic changes \
+             the instructions the guest retires, so the replay cannot reproduce the run. \
+             Replay with {}.",
+            show(recorded),
+            show(replay),
+            show(recorded),
         )
     })
 }

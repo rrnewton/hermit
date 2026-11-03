@@ -82,6 +82,8 @@ struct RawRecord {
     rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     background_starts: Vec<BackgroundStart>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rewrite_exclusives_stripped_heuristic: bool,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
@@ -703,5 +705,25 @@ mod tests {
             assert_eq!(read.replay_departed_at(), marker, "{written}");
             assert_eq!(read, copy, "{written}");
         }
+    }
+
+    /// `rewrite_exclusives_stripped_heuristic` rides in `RawRecord`: a plain record
+    /// written before the envelope reads it back, a plain record written now
+    /// keeps its bytes, and a marked record keeps the setting inside its
+    /// envelope.
+    #[test]
+    fn the_stripped_rewrite_heuristic_survives_the_record_serde() {
+        let old = r#"{"per_thread":{},"global":[],"rewrite_exclusives_stripped_heuristic":true}"#;
+        let record: PreemptionRecord = serde_json::from_str(old).unwrap();
+        assert!(record.rewrite_exclusives_stripped_heuristic());
+        assert_eq!(serde_json::to_string(&record).unwrap(), old);
+        let mut writer =
+            PreemptionWriter::new(None).with_rewrite_exclusives_stripped_heuristic(true);
+        writer.mark_replay_departed(7);
+        let marked = writer.into_string();
+        assert!(marked.contains(ENVELOPE), "{marked}");
+        let back: PreemptionRecord = serde_json::from_str(&marked).unwrap();
+        assert!(back.rewrite_exclusives_stripped_heuristic());
+        assert_eq!(back.replay_departed_at(), Some(7));
     }
 }

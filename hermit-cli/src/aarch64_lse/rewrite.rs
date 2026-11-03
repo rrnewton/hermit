@@ -102,6 +102,10 @@ pub enum Refusal {
     /// (literal), `ADR` or `ADRP` gives and the next instruction a branch
     /// reaches: a table placed after a call that does not return.
     AddressedData,
+    /// No mapping symbol (`$x`, `$d`) marks the section the sequence is in,
+    /// so nothing proves which of its bytes are code, and the default
+    /// (`--rewrite-exclusives-stripped=refuse`) leaves it as it is.
+    NoMappingSymbols,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

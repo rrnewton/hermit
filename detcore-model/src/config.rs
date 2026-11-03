@@ -416,6 +416,24 @@ pub struct Config {
     #[clap(skip)]
     pub launch_image: Option<LaunchImage>,
 
+    /// aarch64: the run's `--rewrite-exclusives` rewrote files that have no
+    /// ARM mapping symbols by the stripped-file heuristic
+    /// (`--rewrite-exclusives-stripped=heuristic`), whose classification of
+    /// code is not proved and can be mistaken. The CLI sets it; the run states
+    /// it in its summary and in the preemption record it writes, and a replay
+    /// under the other setting is refused. Never read from a recording.
+    #[serde(default)]
+    #[clap(skip)]
+    pub rewrite_exclusives_stripped_heuristic: bool,
+
+    /// aarch64: the files the run's `--rewrite-exclusives` left unchanged
+    /// because they have no ARM mapping symbols, under the default
+    /// (`--rewrite-exclusives-stripped=refuse`). The CLI sets it; the run names
+    /// them in its summary.
+    #[serde(default)]
+    #[clap(skip)]
+    pub rewrite_exclusives_unmarked: Vec<std::path::PathBuf>,
+
     /// The seccomp state the guest inherits from the thread that starts it
     /// ([`InheritedSeccomp`]). The caller that starts the guest states it, as
     /// only the caller knows the filters its launch installs, such as those of
@@ -2602,6 +2620,47 @@ impl SleepRegistration {
     }
 }
 
+/// How `hermit run --rewrite-exclusives` treats an aarch64 ELF file that has
+/// no ARM mapping symbols (`$x` and `$d`, the symbols the AArch64 ELF ABI has
+/// an assembler place at every switch between code and data), such as every
+/// stripped file. Without them nothing in the file proves which bytes of an
+/// executable section are code.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum StrippedRewrite {
+    /// Leave the file unchanged and report it by name: every exclusive
+    /// sequence in it is left alone as `no-mapping-symbols`.
+    #[default]
+    Refuse,
+    /// Rewrite it by the stripped-file heuristic: code is what control
+    /// reaches from the entries of the functions the unwind table describes,
+    /// less what the code or the image addresses as data. Its known residuals
+    /// are listed with the rewriter; a mistaken classification can corrupt
+    /// program data.
+    Heuristic,
+}
+
+impl StrippedRewrite {
+    /// The option's value as `--rewrite-exclusives-stripped` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+            Self::Heuristic => "heuristic",
+        }
+    }
+}
+
 #[derive(
     Debug,
     Default,
@@ -3765,7 +3824,11 @@ mod legacy_backend_json {
     /// it is never written and reads as unset.
     /// `sleep_registration` too: the scheduler registers sleeps, not the
     /// runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 48] = [
+    /// `rewrite_exclusives_stripped_heuristic` and `rewrite_exclusives_unmarked`
+    /// came after it as well: the CLI rewrites the files before the run and
+    /// the run's global state reports them, not the runtime, so they are never
+    /// written and read as false and empty.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 50] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3814,6 +3877,8 @@ mod legacy_backend_json {
         "access_trace_max_bytes",
         "replay_continue_fairly",
         "standard_stream_aliases",
+        "rewrite_exclusives_stripped_heuristic",
+        "rewrite_exclusives_unmarked",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3961,8 +4026,14 @@ mod legacy_backend_json {
                     | "replay_edited_preemptions"
                     | "eager_lone_preemptions"
                     | "replay_continue_fairly"
+                    | "rewrite_exclusives_stripped_heuristic"
                     | "strict_binder",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
+                // Empty, as its serde default is.
+                Some("rewrite_exclusives_unmarked") => seed
+                    .deserialize(serde_json::Value::Array(Vec::new()))
+                    .map(Some)
+                    .map_err(<A::Error as de::Error>::custom),
                 // Empty, as its serde default is; and 0, the default.
                 Some("in_guest_reserved_signals" | "access_trace_from") => {
                     seed.deserialize(U64Deserializer::new(0)).map(Some)
@@ -4313,7 +4384,9 @@ mod legacy_backend_json {
                 | "chaos_timeslice"
                 | "guest_ids"
                 | "detlog_anon"
-                | "standard_stream_aliases" => Ok(()),
+                | "standard_stream_aliases"
+                | "rewrite_exclusives_stripped_heuristic"
+                | "rewrite_exclusives_unmarked" => Ok(()),
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5239,7 +5312,9 @@ mod tests {
                 | "chaos_timeslice"
                 | "guest_ids"
                 | "detlog_anon"
-                | "standard_stream_aliases" => {}
+                | "standard_stream_aliases"
+                | "rewrite_exclusives_stripped_heuristic"
+                | "rewrite_exclusives_unmarked" => {}
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5280,11 +5355,12 @@ mod tests {
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes`, `replay_continue_fairly`,
-        // `standard_stream_aliases`, `sleep_registration`, `strict_binder`
+        // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
+        // `rewrite_exclusives_stripped_heuristic`, `rewrite_exclusives_unmarked`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // forty-seven fewer, so thirty-three keys fewer than fields.
+        // forty-nine fewer, so thirty-five keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 33);
+        assert_eq!(fields.len(), keys.len() + 35);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5310,6 +5386,36 @@ mod tests {
             .collect();
         let array = serde_json::to_string(&values).unwrap();
         assert!(!from_legacy_backend_json(&array).unwrap().record_host_inputs);
+    }
+
+    /// The stripped-file rewrite settings never enter the legacy form,
+    /// whatever their values: the legacy string keeps its bytes, and they read
+    /// back as false and empty from both the object and the array form.
+    #[test]
+    fn the_stripped_rewrite_settings_never_enter_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            rewrite_exclusives_stripped_heuristic: true,
+            rewrite_exclusives_unmarked: vec!["/lib64/libstdc++.so.6".into()],
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("rewrite_exclusives"), "{json}");
+        let back = from_legacy_backend_json(&json).unwrap();
+        assert!(!back.rewrite_exclusives_stripped_heuristic);
+        assert!(back.rewrite_exclusives_unmarked.is_empty());
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        let back = from_legacy_backend_json(&array).unwrap();
+        assert!(!back.rewrite_exclusives_stripped_heuristic);
+        assert!(back.rewrite_exclusives_unmarked.is_empty());
     }
 
     /// `process_exits_complete_asynchronously`, added after the legacy form

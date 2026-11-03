@@ -2668,6 +2668,17 @@ impl GlobalState {
         summary.host_id_tasks = self.host_id_tasks.load(SeqCst);
         summary.binder_external_calls =
             Some(crate::syscalls::binder::external_calls()).filter(|calls| *calls > 0);
+        // What the CLI's `--rewrite-exclusives` did with files that have no
+        // mapping symbols (aarch64): rewrote them by the stripped-file
+        // heuristic, or left them unchanged.
+        summary.exclusive_rewrite_stripped_heuristic =
+            self.cfg.rewrite_exclusives_stripped_heuristic;
+        summary.exclusive_rewrite_unmarked = self
+            .cfg
+            .rewrite_exclusives_unmarked
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -14179,6 +14190,44 @@ mod tests {
                     timer_enabled: Some(expected_timer),
                     stopless_slice_ends: None,
                 })
+            );
+        }
+    }
+
+    /// What the CLI's exclusive rewrite did with files that have no mapping
+    /// symbols reaches the run's summary and the preemption record the run
+    /// writes, from the configuration it was handed, and neither says
+    /// anything when the run did neither.
+    #[test]
+    fn the_stripped_rewrite_is_stated_in_the_summary_and_the_record() {
+        let directory = tempfile::tempdir().unwrap();
+        for heuristic in [false, true] {
+            let record = directory.path().join(format!("record-{heuristic}.json"));
+            let unmarked: Vec<std::path::PathBuf> = if heuristic {
+                Vec::new()
+            } else {
+                vec!["/lib64/libstdc++.so.6".into()]
+            };
+            let config = Config {
+                record_preemptions: true,
+                record_preemptions_to: Some(record.clone()),
+                rewrite_exclusives_stripped_heuristic: heuristic,
+                rewrite_exclusives_unmarked: unmarked,
+                ..Config::default()
+            };
+            let summary = GlobalState::for_tests(&config).into_run_summary().unwrap();
+            assert_eq!(summary.exclusive_rewrite_stripped_heuristic, heuristic);
+            assert_eq!(
+                summary.exclusive_rewrite_unmarked,
+                if heuristic {
+                    Vec::<String>::new()
+                } else {
+                    vec!["/lib64/libstdc++.so.6".to_owned()]
+                }
+            );
+            assert_eq!(
+                crate::preemptions::read_recorded_rewrite_exclusives_stripped_heuristic(&record),
+                Ok(heuristic)
             );
         }
     }

@@ -1067,6 +1067,52 @@ time slice; with `--max-timeslice=disabled`, a thread that never reaches an
 intercepted event can starve its peers. No separate fairness flag is needed for
 the default equal-priority policy.
 
+### Exclusive-Loop Rewrite (aarch64)
+
+On aarch64, a load/store-exclusive retry loop (`LDXR`, then `STXR`, then a
+branch back on failure) retries whenever an exception clears the exclusive
+monitor between the two, so the same work can retire a different number of
+branches. `--rewrite-exclusives` rewrites canonical loops in the guest
+executable into single LSE atomic instructions before the run, which cannot
+retry. It is preprocessing for the ptrace backend, not a backend.
+
+| Option | Effect |
+| --- | --- |
+| `--rewrite-exclusives` | Rewrites the loops it can show are code. |
+| `--rewrite-exclusives-also=FILE` | Also rewrites FILE, a shared library the guest loads. Repeatable. |
+| `--rewrite-exclusives-stripped=refuse` | The default. A file, or an executable section, with no ARM mapping symbols (`$x`, `$d`), such as every stripped file, is left unchanged and named: the run's diagnostics and its summary (`exclusive_rewrite_unmarked`) list it, and `hermit rewrite-exclusives --list-refusals FILE` lists each of its loops as `no-mapping-symbols`. |
+| `--rewrite-exclusives-stripped=heuristic` | Rewrites such files by the stripped-file heuristic below. |
+
+Only mapping symbols prove where code is: the AArch64 ELF ABI has the
+assembler mark every switch between code (`$x`) and data (`$d`), so the
+default rewrites only what they mark as code. A stripped file has none.
+
+The stripped-file heuristic takes for code what control reaches from the
+entries of the functions the unwind table (`.eh_frame`) describes, less what
+the code or the image addresses as data. It can take data for code in these
+cases, each data that nothing in the image points at:
+
+- data after a call to an imported function that never returns and whose name
+  Hermit does not know;
+- what the code addresses through a register after a write that does not carry
+  an `ADRP`'s base (a lost carried base);
+- data an unresolved `ADRP`'s completion reaches beyond its own page (a scaled
+  load reaches 64 KiB, an `ADD` with `LSL #12` reaches 16 MiB);
+- the rest of a table whose first word a false branch reaches (a data word
+  before the field the code addresses can decode as a branch into the table);
+- the bytes after a call to a function that returns through a changed link
+  register (`X30`), or through a syscall the walk cannot follow;
+- the bytes after a call through a register (`BLR`), whose callee is unknown.
+
+A mistaken classification can corrupt program data: data taken for code whose
+words form a canonical loop is rewritten like one. A run under the heuristic
+states it in its summary (`exclusive_rewrite_stripped_heuristic`) and in the
+preemption record it writes, and a replay, or an analysis, under the other
+setting is refused. It refuses `--verify-json` and `--verify-run`, whose
+reports would not show it, and `hermit record` takes no `--rewrite-exclusives`.
+`hermit rewrite-exclusives --stripped=heuristic FILE` reports what the
+heuristic would do to a file before anyone runs it.
+
 ### Virtual Inputs
 
 | Option | Effect |

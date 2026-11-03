@@ -5431,8 +5431,9 @@ impl Scheduler {
                 .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_chaos_timeslice(cfg.chaos_timeslice)
                 .with_guest_ids(cfg.guest_ids)
-                .with_queued_sleeps_registered_at_first_pass(
-                    queued_sleeps_registered_at_first_pass,
+                .with_queued_sleeps_registered_at_first_pass(queued_sleeps_registered_at_first_pass)
+                .with_rewrite_exclusives_stripped_heuristic(
+                    cfg.rewrite_exclusives_stripped_heuristic,
                 );
             // A run that follows no record writes the newest format. A replay
             // writes the format of the record it follows, whose rules it ran
@@ -21808,6 +21809,10 @@ impl Scheduler {
                 virtual_timeout_ns,
                 // GlobalState counts binder calls (`syscalls::binder`).
                 binder_external_calls: None,
+                // GlobalState states what the exclusive rewrite did with
+                // files that have no mapping symbols (aarch64).
+                exclusive_rewrite_stripped_heuristic: false,
+                exclusive_rewrite_unmarked: Vec::new(),
             },
             info_reprio_descrip,
         ))
