@@ -996,7 +996,8 @@ mod tests {
             // its DynamoRIO owner: 713 + 7 - 1 = 719.
             // PR 4630's three fatal-core cases grow shard 2: 719 + 3 = 722,
             // measured by the batch3 donor validate at f7ec284e.
-            assert_eq!(population, 722);
+            // And lit's chaos_schedule_replay fixture (+1): 723.
+            assert_eq!(population, 723);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

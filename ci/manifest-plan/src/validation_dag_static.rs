@@ -3256,7 +3256,29 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
-    ("test.detcore_unit", 3465),
+    // And tool_local::timeslice_tests::chaos_schedule_replay_draws_no_slice_end
+    // (a schedule replay under --chaos draws no chaos decision): 3001, listed.
+    // And tool_local::timeslice_tests::a_kept_replay_slice_restarts_only_the_backstop
+    // and preemptions::callback_history::tests::a_later_site_of_the_running_callback_ends_the_slice_later
+    // (a replayed slice end a callback checkpoint marks is one turn): 2814, listed.
+    // And tool_global::tests::legacy_callback_checkpoint_at_the_pmu_epsilon_ends_an_expired_deadline_once
+    // and tool_global::tests::legacy_chaos_replay_ends_an_expired_deadline_as_without_chaos
+    // (the same two fixes through the hooks): 3005, listed.
+    // And tool_local::timeslice_tests::a_schedule_deadline_on_the_backstop_keeps_its_place
+    // (a schedule deadline that falls on the backstop is still the schedule's): 3006, listed.
+    // And preemptions::callback_history::tests::a_timer_stop_before_the_recorded_callback_leaves_the_slice_to_it
+    // and tool_global::tests::a_timer_stop_before_a_recorded_syscall_slice_end_leaves_it_to_the_call
+    // (a timer stop at a recorded system call's slice end leaves it to the call): 3008, listed.
+    // And four units pinning each replayed slice end the schedule installs
+    // and the kept slice's backstop restart (callback_history_tests'
+    // a_replayed_event_deadline_is_the_schedules_and_no_backstop,
+    // a_replayed_slice_end_past_the_maximum_is_the_schedules_and_no_backstop,
+    // a_replayed_checkpoint_that_keeps_the_slice_restarts_its_backstop, and
+    // exec_identity_tests'
+    // an_exec_continuation_resumes_the_schedules_slice_end_not_a_backstop):
+    // 2937, listed.
+    // Rebased onto main fcd62385f: 3465 + 10 = 3475.
+    ("test.detcore_unit", 3475),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3613,7 +3635,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pin): 293 + 1 = 294, re-measured at this tip.
     // The split moves the copied-child TTY case to its required DynamoRIO
     // owner: 294 - 1 = 293. Composed source count; re-measure.
-    ("test.hermit_integration_2", 296),
+    // And lit's chaos_schedule_replay fixture (a --chaos recording replayed
+    // with --die-on-desync): 293, listed.
+    // Rebased onto main fcd62385f: 296 + 1 = 297.
+    ("test.hermit_integration_2", 297),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -4630,7 +4655,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
-    ("test.cli", 794),
+    // And a_schedule_replay_under_chaos_follows_its_recording: 743, listed.
+    // And a_schedule_replay_ends_each_recorded_slice_once: 744, listed.
+    // Each of the two schedule-replay tests split into one test per seed
+    // (seeds 1, 2 and 3), so each fits the 57-second wall bound: 656 + 4 = 748.
+    // Rebased onto main fcd62385f: 794 + 6 = 800.
+    ("test.cli", 800),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5277,7 +5307,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
-    ("test.cli_on_host", 713),
+    // And a_schedule_replay_under_chaos_follows_its_recording: 662, listed.
+    // And a_schedule_replay_ends_each_recorded_slice_once: 663, listed.
+    // And the same per-seed split of the two schedule-replay tests:
+    // 575 + 4 = 667.
+    // Rebased onto main fcd62385f: 713 + 6 = 719.
+    ("test.cli_on_host", 719),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5846,7 +5881,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
-    ("test.detcore_unit_on_host", 3465),
+    // And the same chaos schedule-replay unit: 3001, listed.
+    // And the same two callback-checkpoint replay units: 2814, listed.
+    // And the same two hook-level replay units: 3005, listed.
+    // And the same backstop-coincidence unit: 3006, listed.
+    // And the same two timer-stop-before-a-call units: 3008, listed.
+    // And the same four replayed-slice-end units: 2937, listed.
+    // Rebased onto main fcd62385f: 3465 + 10 = 3475.
+    ("test.detcore_unit_on_host", 3475),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5977,7 +6019,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains seven package-identity cases in version_provenance
     // and moves the copied-child TTY case to its DynamoRIO owner:
     // 713 + 7 - 1 = 719. Composed source count; re-measure.
-    ("test.hermit_integration_on_host", 722),
+    // And the same chaos_schedule_replay lit fixture: 703, listed.
+    // Rebased onto main fcd62385f: 722 + 1 = 723.
+    ("test.hermit_integration_on_host", 723),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
