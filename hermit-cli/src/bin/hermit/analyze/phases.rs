@@ -1284,19 +1284,41 @@ impl AnalyzeOpts {
         target_met: bool,
     ) -> Option<RacingAccesses> {
         let (target, baseline) = (target?, baseline?);
-        let record = continued_record(schedule, len, &target.realized);
+        // `continued_record` refuses a record whose callback checkpoints do
+        // not attach to its events (UNATTACHED_CHECKPOINTS): a replay then
+        // fails with that refusal, never replaying a bare schedule.
+        let record = continued_record(schedule, len, &target.realized, &target.realized_path)
+            .map_err(|error| format!("{error:#}"));
+        // Where each run recorded the schedule a candidate's check edits.
+        let realized = [
+            ("target", target.realized_path.clone()),
+            ("baseline", baseline.realized_path.clone()),
+        ];
         let racing = self.racing_accesses(
             decision,
             target,
             baseline,
             target_met,
-            |runname| self.prefix_trial(runname, &record, record.schedevents().len(), continuation),
+            |runname| {
+                let record = record
+                    .as_ref()
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                self.prefix_trial(runname, record, record.schedevents().len(), continuation)
+            },
             // A candidate's check replays a schedule of the run it checks
             // under the callback checkpoints of that run's prefix, up to where
             // the edit starts, then continues as the search's trials did.
             |runname, role, edited, unchanged, replay| {
-                let edited =
-                    continued_record(schedule, check_prefix_len(len, role, unchanged), edited);
+                let edited_from = realized
+                    .iter()
+                    .find_map(|(side, path)| (*side == role).then_some(path.as_path()))
+                    .unwrap_or_else(|| Path::new(runname));
+                let edited = continued_record(
+                    schedule,
+                    check_prefix_len(len, role, unchanged),
+                    edited,
+                    edited_from,
+                )?;
                 self.prefix_trial(runname, &edited, replay, continuation)
             },
         );
@@ -2442,7 +2464,7 @@ impl AnalyzeOpts {
                             .and_then(|recording| recording.into_legacy("a race candidate's check"))
                             .map_err(|error| anyhow::anyhow!("{error:#}"))?;
                         let edited = candidate_check_record(&recorded, unchanged, edited)?;
-                        self.prefix_trial(runname, &edited, replay, self.trial_max_timeslice())
+                        self.prefix_trial(runname, &edited, replay, self.trial_max_timeslice()?)
                     },
                 ))
             }
@@ -3203,7 +3225,11 @@ mod tests {
                 1,
                 NonZeroU64::new(200_000_000),
                 (true, &deciding),
-                (&without, Path::new("final_baseline_schedule.preempts")),
+                (
+                    &without,
+                    Path::new("final_baseline_schedule.preempts"),
+                    &mut None,
+                ),
                 (
                     |seen, len| {
                         assert_eq!(seen, &record);
@@ -3214,6 +3240,7 @@ mod tests {
                                 schedule: with.clone(),
                             },
                             PathBuf::from("final_target_schedule.preempts"),
+                            None,
                         ))
                     },
                     |runname, variant, len, position| {
@@ -3306,7 +3333,11 @@ mod tests {
                     1,
                     NonZeroU64::new(200_000_000),
                     (true, &deciding),
-                    (&without, Path::new("final_baseline_schedule.preempts")),
+                    (
+                        &without,
+                        Path::new("final_baseline_schedule.preempts"),
+                        &mut None,
+                    ),
                     (
                         |seen, len| {
                             assert_eq!(seen, &record);
@@ -3317,6 +3348,7 @@ mod tests {
                                     schedule: with.clone(),
                                 },
                                 PathBuf::from("final_target_schedule.preempts"),
+                                None,
                             ))
                         },
                         |runname, variant, len, position| {
@@ -3411,19 +3443,20 @@ mod tests {
             1,
             None,
             (true, &deciding),
-            (&baseline.schedule, &baseline_path),
+            (&baseline.schedule, &baseline_path, &mut None),
             (
                 |seen, len| {
                     assert_eq!(seen, &source);
                     assert_eq!(len, 2);
-                    Ok(recorded_continuation_for_test(
+                    let (completed, path) = recorded_continuation_for_test(
                         &options,
                         "single_event_target",
                         seen,
                         len,
                         true,
                         &with,
-                    ))
+                    );
+                    Ok((completed, path, None))
                 },
                 |runname, variant, len, position| {
                     calls.borrow_mut().push(runname.to_owned());
@@ -3607,7 +3640,11 @@ mod tests {
                     1,
                     chosen,
                     (true, &None),
-                    (&without, Path::new("final_baseline_schedule.preempts")),
+                    (
+                        &without,
+                        Path::new("final_baseline_schedule.preempts"),
+                        &mut None,
+                    ),
                     (
                         |target, len| {
                             options.prefix_continuation(
@@ -3615,6 +3652,7 @@ mod tests {
                                 target,
                                 len,
                                 chosen,
+                                None,
                                 |run| {
                                     let written = PreemptionReader::try_new(run.sched_path_in())?
                                         .into_inner();
@@ -4229,8 +4267,8 @@ mod tests {
         met: bool,
         events: &[SchedEvent],
     ) -> (CompletedScheduleTrial, PathBuf) {
-        let (completed, path) = options
-            .prefix_continuation(runname, source, len, None, |run| {
+        let (completed, path, _) = options
+            .prefix_continuation(runname, source, len, None, None, |run| {
                 let input = PreemptionReader::try_new(run.sched_path_in())?.into_inner();
                 input.validate().map_err(anyhow::Error::msg)?;
                 let input = serde_json::to_value(&input).unwrap();
@@ -4281,12 +4319,12 @@ mod tests {
                     decision: 2,
                     continuation: None,
                 },
-                |runname, record, len, position| {
+                |runname, record, len, position, _trace_from| {
                     assert_eq!((len, position), (3, 2));
                     replays.push((runname.to_owned(), record.clone()));
-                    Ok((runname == "final_target_for_stacktraces", None))
+                    Ok((runname == "final_target_for_stacktraces", None, None))
                 },
-                |record, len| {
+                |record, len, _trace| {
                     assert_eq!(len, 2);
                     let (completed, path) = recorded_continuation_for_test(
                         &options,
@@ -4297,7 +4335,7 @@ mod tests {
                         continued,
                     );
                     artifact = Some((path.clone(), std::fs::read(&path)?));
-                    Ok((completed, path))
+                    Ok((completed, path, None))
                 },
             );
             let (path, bytes) = artifact.expect("the baseline continuation was recorded");
@@ -4391,7 +4429,7 @@ mod tests {
                 2,
                 None,
                 (true, &None),
-                (&baseline.schedule, &baseline_path),
+                (&baseline.schedule, &baseline_path, &mut None),
                 (
                     |record, len| {
                         assert_eq!(len, 3);
@@ -4404,7 +4442,7 @@ mod tests {
                             target_continued,
                         );
                         target_artifact = Some((path.clone(), std::fs::read(&path)?));
-                        Ok((completed, path))
+                        Ok((completed, path, None))
                     },
                     |runname, record, _, _| {
                         replays
@@ -5279,6 +5317,7 @@ mod tests {
                 ],
                 left_schedule,
                 ran: [Some(tid(3)), Some(tid(5))],
+                traced: None,
             };
             let target = StackReplay {
                 met_target: true,
@@ -5288,6 +5327,7 @@ mod tests {
                 ],
                 left_schedule: None,
                 ran: [Some(tid(5)), Some(tid(3))],
+                traced: None,
             };
             assert_eq!(
                 merge_stacks(&baseline, &target, 1, [tid(3), tid(5)]),
@@ -5684,7 +5724,11 @@ mod tests {
                 1,
                 NonZeroU64::new(200_000_000),
                 (true, &deciding),
-                (&without, Path::new("final_baseline_schedule.preempts")),
+                (
+                    &without,
+                    Path::new("final_baseline_schedule.preempts"),
+                    &mut None,
+                ),
                 (
                     |seen, len| {
                         assert_eq!(seen, &record);
@@ -5695,6 +5739,7 @@ mod tests {
                                 schedule: with.clone(),
                             },
                             PathBuf::from("final_target_schedule.preempts"),
+                            None,
                         ))
                     },
                     |runname, variant, len, position| {
