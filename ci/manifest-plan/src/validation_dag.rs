@@ -6395,6 +6395,8 @@ sys.exit(37)
             // The verdict change's.
             "bisect_exits_2_when_its_good_schedule_meets_the_target",
             "analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule",
+            // The resume change's.
+            "a_budget_ends_analyze_with_a_partial_report_that_resume_finishes",
         ];
         for case in cases {
             assert!(
@@ -6430,7 +6432,7 @@ sys.exit(37)
                 format!("{expected_filter}' -- --ignored"),
                 "{origin}"
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "10", "{origin}");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "11", "{origin}");
             assert!(
                 !step.cmd.contains("test(=analyze_hello_race)"),
                 "{origin}: excluded hello-race must not run"
