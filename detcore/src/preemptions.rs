@@ -1381,9 +1381,10 @@ impl PreemptionRecord {
     /// state none, as `from_vecs` builds them. Rows that keep one state
     /// [`INSTRUCTION_OFFSET_ROWS_FORMAT`], the mandatory boundary a Hermit
     /// that predates the offsets refuses by name, rather than a format such a
-    /// Hermit reads while it drops them; rows alone in that format follow
-    /// format 1's timing rules ([`Self::timing_format`]), so the rebuilt
-    /// record claims no list of jumps it does not hold. Its rows keep their
+    /// Hermit reads while it drops them, and say they are rows alone
+    /// (`rows_alone`), which in that format follow format 1's timing rules
+    /// ([`Self::timing_format`]), so the rebuilt record claims no list of
+    /// jumps it does not hold. Its rows keep their
     /// exact branch targets and offsets, the rows-only priority plan
     /// (`RecordedOffsets::RowsOnly`) that a preemption replay arms; only a
     /// schedule replay, which has no schedule trace to follow here, refuses it.
@@ -1394,6 +1395,7 @@ impl PreemptionRecord {
             self.format_version = source.format_version;
         } else if self.rows_carry_instruction_offsets() {
             self.format_version = Some(INSTRUCTION_OFFSET_ROWS_FORMAT);
+            self.rows_alone = true;
         }
     }
 
