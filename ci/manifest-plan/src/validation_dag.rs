@@ -6390,6 +6390,9 @@ sys.exit(37)
             "analyze_keeps_its_workspace_after_an_error",
             "analyze_cleans_up_when_a_signal_stops_it",
             "analyze_stops_a_run_whose_init_has_not_armed",
+            // The race finder's.
+            "analyze_checks_the_race_candidates_and_says_what_each_edit_moved",
+            "analyze_names_the_close_racing_the_reused_descriptor",
         ] {
             assert!(
                 source.contains(&format!("fn {case}()")),
