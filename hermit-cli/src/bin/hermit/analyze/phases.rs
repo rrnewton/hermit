@@ -34,12 +34,18 @@ use reverie::process::Output;
 
 use crate::app::analyze::consts::*;
 use crate::app::analyze::rundata::RunData;
+use crate::app::analyze::stop;
+use crate::app::analyze::stop::StopSignals;
+use crate::app::analyze::stop::Stopped;
 use crate::app::analyze::types::AnalyzeOpts;
 use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
 use crate::app::analyze::types::TrialTimeout;
+use crate::app::analyze::workspace::Retention;
+use crate::app::analyze::workspace::Workspace;
+use crate::app::analyze::workspace::note;
 use crate::app::container::RunTimeoutMarker;
 use crate::app::global_opts::GlobalOpts;
 use crate::app::logdiff::LogDiffCLIOpts;
@@ -50,13 +56,6 @@ use crate::app::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
 use crate::app::schedule_search::NoSingleSwap;
 use crate::app::schedule_search::TrialOutcome;
 use crate::app::schedule_search::search_for_critical_schedule;
-use crate::app::analyze::types::ContinuationTimeslice;
-use crate::app::analyze::stop;
-use crate::app::analyze::stop::StopSignals;
-use crate::app::analyze::stop::Stopped;
-use crate::app::analyze::workspace::Retention;
-use crate::app::analyze::workspace::Workspace;
-use crate::app::analyze::workspace::note;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -452,7 +451,7 @@ fn continued_record(
             )
         });
     Err(
-        anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+        anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
             "{UNATTACHED_CHECKPOINTS}: analysis cannot replay the completed continuation recorded \
              at {} under the callback checkpoints of the target schedule's first {len} events: \
              they do not attach to its events{drift}. A checkpoint attaches where its thread's \
@@ -4388,7 +4387,8 @@ mod tests {
         .unwrap();
         let recorded_path = dir.path().join("minimized.preempts");
         record.write_to_disk(&recorded_path).unwrap();
-        let runopts = crate::run::RunOpts::try_parse_from(["hermit-run", "/bin/true"]).unwrap();
+        let runopts =
+            crate::app::run::RunOpts::try_parse_from(["hermit-run", "/bin/true"]).unwrap();
         let mut minimized = RunData::from_minimize_output(
             &options,
             "minimized".to_owned(),
