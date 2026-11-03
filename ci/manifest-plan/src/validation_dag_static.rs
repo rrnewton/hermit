@@ -3290,8 +3290,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (review of https://github.com/rrnewton/hermit/pull/4867): 3402 + 1 = 3403.
     // Rebased onto main ffe313b16: 3413 + 1 = 3414.
     // Rebased onto main fbf9d5f0c: 3457 + 1 = 3458.
-    // Rebased onto main fcd62385f: 3465 + 19 = 3484.
-    ("test.detcore_unit", 3484),
+    // And tool_local's a_switched_thread_draws_no_slice_mean_from_the_chaos_timeslice_range
+    // (the same review): 3403 + 1 = 3404.
+    // Rebased onto main ffe313b16: 3414 + 1 = 3415.
+    // Rebased onto main fbf9d5f0c: 3458 + 1 = 3459.
+    // Rebased onto main fcd62385f: 3465 + 20 = 3485.
+    ("test.detcore_unit", 3485),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5927,8 +5931,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same post-crash admission unit: 3402 + 1 = 3403.
     // Rebased onto main ffe313b16: 3413 + 1 = 3414.
     // Rebased onto main fbf9d5f0c: 3457 + 1 = 3458.
-    // Rebased onto main fcd62385f: 3465 + 19 = 3484.
-    ("test.detcore_unit_on_host", 3484),
+    // And the same switched-range unit: 3403 + 1 = 3404.
+    // Rebased onto main ffe313b16: 3414 + 1 = 3415.
+    // Rebased onto main fbf9d5f0c: 3458 + 1 = 3459.
+    // Rebased onto main fcd62385f: 3465 + 20 = 3485.
+    ("test.detcore_unit_on_host", 3485),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
