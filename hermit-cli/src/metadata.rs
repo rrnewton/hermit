@@ -935,7 +935,19 @@ impl RecordVersion {
 //   read, recorded, to tell whether it is such a file.
 // An older recording that reads any of these is refused here instead of
 // failing mid-replay.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x198);
+// 0x198 -> 0x199 (HIGHEST_SHIPPED+1 at the change's rebase onto main
+// cb9694edf; the lander assigns the final value): CPU clocks answer as Linux
+// does, and replay recomputes every one of these answers: clock_getres of a
+// CPU clock gives the kernel's per-kind resolution instead of a flat value;
+// timer_create and timer_settime on a CPU clock of no live task fail with
+// Linux's errno; an absolute CPU-clock timer whose expiry has passed fires
+// at once; and a CPU-clock sleep that would have to wait is refused by the
+// unsupported-operation policy instead of completing. A recording made
+// before, with any of these calls, would replay with other values, or a
+// refusal where it recorded a completion, and another schedule. It is
+// refused here.
+// https://github.com/rrnewton/hermit/pull/4885
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x199);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -960,7 +972,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x198);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x198;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x199;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
