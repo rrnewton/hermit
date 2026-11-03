@@ -35,6 +35,7 @@ use reverie::process::Output;
 use crate::app::analyze::consts::*;
 use crate::app::analyze::rundata::RunData;
 use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
@@ -49,7 +50,6 @@ use crate::app::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
 use crate::app::schedule_search::NoSingleSwap;
 use crate::app::schedule_search::TrialOutcome;
 use crate::app::schedule_search::search_for_critical_schedule;
-use crate::app::analyze::types::ContinuationTimeslice;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -2573,7 +2573,7 @@ impl AnalyzeOpts {
         if !self.target_exit_code.is_match(out.status) {
             misses.push(format!(
                 "  Exit code {} is not what we're looking for.",
-                crate::analyze::types::run_exit_code(out.status)
+                super::types::run_exit_code(out.status)
             ));
         }
         misses
@@ -3835,14 +3835,14 @@ mod tests {
                 assert_eq!(run.runopts.det_opts.det_config.max_timeslice, chosen);
             }
             let command = shell_words::split(&format!("hermit run {}", run.runopts)).unwrap();
-            let matches = crate::Args::command()
+            let matches = crate::app::Args::command()
                 .try_get_matches_from(&command)
                 .unwrap();
-            let args = crate::args_from_matches_with_clock(&matches, || {
+            let args = crate::app::args_from_matches_with_clock(&matches, || {
                 panic!("the reproducer must preserve its fixed epoch");
             })
             .unwrap();
-            let crate::Subcommand::Run(mut replay) = args.command else {
+            let crate::app::Subcommand::Run(mut replay) = args.command else {
                 panic!("not a run command");
             };
             replay.validate_args_with_perf_support(true).unwrap();
@@ -3857,7 +3857,7 @@ mod tests {
         let original = dir.path().join("original.json");
         target.write_to_disk(&original).unwrap();
         let replay_arg = format!("--replay-schedule-from={}", original.display());
-        let matches = crate::Args::command()
+        let matches = crate::app::Args::command()
             .try_get_matches_from([
                 "hermit",
                 "run",
@@ -3866,8 +3866,9 @@ mod tests {
                 "/bin/true",
             ])
             .unwrap();
-        let args = crate::args_from_matches_with_clock(&matches, || std::time::UNIX_EPOCH).unwrap();
-        let crate::Subcommand::Run(mut mismatched) = args.command else {
+        let args =
+            crate::app::args_from_matches_with_clock(&matches, || std::time::UNIX_EPOCH).unwrap();
+        let crate::app::Subcommand::Run(mut mismatched) = args.command else {
             panic!("not a run command");
         };
         let error = mismatched
@@ -3963,7 +3964,7 @@ mod tests {
                 .with_chaos_timeslice(Some(recorded))
                 .write_to_disk(&record)
                 .unwrap();
-            let args = crate::Args::try_parse_from([
+            let args = crate::app::Args::try_parse_from([
                 "hermit".to_owned(),
                 "analyze".into(),
                 "--prefix-search".into(),
@@ -3973,7 +3974,7 @@ mod tests {
                 "/bin/true".into(),
             ])
             .unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("not analyze");
             };
             let prepared = options.prepare(&args.global);
@@ -4405,7 +4406,8 @@ mod tests {
         .unwrap();
         let recorded_path = dir.path().join("minimized.preempts");
         record.write_to_disk(&recorded_path).unwrap();
-        let runopts = crate::run::RunOpts::try_parse_from(["hermit-run", "/bin/true"]).unwrap();
+        let runopts =
+            crate::app::run::RunOpts::try_parse_from(["hermit-run", "/bin/true"]).unwrap();
         let mut minimized = RunData::from_minimize_output(
             &options,
             "minimized".to_owned(),
