@@ -553,11 +553,12 @@ pub fn literal_targets(words: &[u32], base: u64) -> Vec<(u64, u64)> {
 }
 
 /// Where `words` (at `base`) address bytes as data, or may: the target of
-/// each `LDR` (literal) and `ADR`, and of each `ADRP` with the `ADD`
-/// (immediate) or unsigned-offset load or store that completes it, the first
-/// of the eight instructions after it that takes the `ADRP`'s register as
-/// its base, and only while nothing has written that register. An `ADRP`
-/// that none of those completes gives its page, the lowest address it can be
+/// each `LDR` (literal) and `ADR`, and of each `ADRP` with every `ADD`
+/// (immediate) or unsigned-offset load or store that completes it among the
+/// eight instructions after it, taking the `ADRP`'s register as its base,
+/// up to the instruction that writes that register without completing it,
+/// since the page is gone from there. One `ADRP` can address several tables.
+/// An `ADRP` nothing completes gives its page, the lowest address it can be
 /// completing. Each is where a table may start: how far it runs is not in
 /// the instruction ([`data_extents`]).
 pub fn addressed_starts(words: &[u32], base: u64) -> Vec<u64> {
@@ -581,16 +582,22 @@ pub fn addressed_starts(words: &[u32], base: u64) -> Vec<u64> {
             let pages = ((imm << 11) as i32 >> 11) as i64;
             let page = (pc & !0xFFF).wrapping_add((pages << 12) as u64);
             let register = word & 0x1F;
-            // Up to the instruction that writes the register itself: after
-            // that the page this `ADRP` gave is gone, and a later
-            // instruction with the same base completes another one.
-            let completed = words[index + 1..]
+            // Every completion, up to the instruction that writes the
+            // register itself: after that the page this `ADRP` gave is
+            // gone, and a later instruction with the same base completes
+            // another one.
+            let completions: Vec<u64> = words[index + 1..]
                 .iter()
                 .take(PAIRING_WINDOW)
                 .map(|next| (page_offset(*next, register), writes(*next, register)))
                 .take_while(|(offset, written)| offset.is_some() || !written)
-                .find_map(|(offset, _)| offset);
-            starts.push(page.wrapping_add(completed.unwrap_or(0)));
+                .filter_map(|(offset, _)| offset)
+                .collect();
+            if completions.is_empty() {
+                starts.push(page);
+            } else {
+                starts.extend(completions.iter().map(|offset| page.wrapping_add(*offset)));
+            }
         }
     }
     starts
@@ -709,6 +716,20 @@ pub fn data_extents(
         .collect();
     extents.sort_unstable();
     extents.dedup();
+    // Only a branch whose target lies in an extent can end one, and an
+    // extent only shrinks, so the rest are dropped once: on a large
+    // stripped library this is thousands of branches instead of millions,
+    // round after round, for the same result.
+    let initial = merge(extents.clone());
+    let reaches = |addr: u64| {
+        let after = initial.partition_point(|(start, _)| *start <= addr);
+        after.checked_sub(1).is_some_and(|i| addr < initial[i].1)
+    };
+    let branches: Vec<(u64, u64)> = branches
+        .iter()
+        .filter(|(_, target)| reaches(*target))
+        .copied()
+        .collect();
     // Each extent ends at the first target past its start of a branch
     // outside every extent. Extents only shrink, and a branch they no
     // longer hold can only shrink them further, so this ends.
