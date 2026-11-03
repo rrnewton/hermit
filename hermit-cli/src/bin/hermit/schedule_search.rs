@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::Range;
 
 use anyhow::bail;
@@ -13,7 +15,8 @@ use colored::Colorize;
 use detcore::edit_distance::NeedlemanWunsch;
 use detcore::edit_distance::NeedlemanWunschError;
 use detcore::edit_distance::generate_permutation;
-use detcore::edit_distance::iterable_bubble_sort;
+use detcore::edit_distance::iterable_bubble_sort_from_perm;
+use detcore::types::DetTid;
 use detcore::types::Op;
 use detcore::types::SchedEvent;
 
@@ -226,6 +229,88 @@ where
         passing_schedule,
         critical_event_index,
     })
+}
+
+/// Each Branch event of `schedule` with its thread's total branch count at
+/// its end: the point in the thread's own execution the event ends at, the
+/// same in every run of the same thread.
+fn branch_totals(schedule: &[SchedEvent]) -> Vec<u64> {
+    let mut branches = HashMap::new();
+    schedule
+        .iter()
+        .map(|event| {
+            if event.op != Op::Branch {
+                return 0;
+            }
+            let thread_total: &mut u64 = branches.entry(event.dettid).or_default();
+            *thread_total += u64::from(event.count);
+            *thread_total
+        })
+        .collect()
+}
+
+/// The points (thread, branch total) at which a Branch event of either
+/// schedule ends a timeslice taken without a stop (`SchedEvent::stopless`):
+/// there that run read no `end_rip`, so no RIP can be compared.
+fn stopless_points(schedules: [&[SchedEvent]; 2]) -> HashSet<(DetTid, u64)> {
+    schedules
+        .into_iter()
+        .flat_map(|schedule| {
+            schedule
+                .iter()
+                .zip(branch_totals(schedule))
+                .filter(|(event, _)| event.stopless)
+                .map(|(event, total)| (event.dettid, total))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A schedule's alignment keys: each event with its thread's branch total
+/// at its end (`alignment_keys`).
+type AlignmentKeys = Vec<(SchedEvent, u64)>;
+
+/// What two runs' schedules are aligned on (`generate_permutation`): each
+/// event as recorded, except that a Branch event stands for the branches it
+/// covers, as its thread's total branch count at its end, rather than for how
+/// the run took the timeslice end there. A stop reads an `end_rip` that an
+/// end taken without one (`SchedEvent::stopless`) does not have, and two runs
+/// differ in which ends their thread ran alone at: at a point in `unknown`,
+/// where either run took the end without a stop, the RIP is left out. Two
+/// known RIPs at the same point are compared, so ends at different
+/// instructions stay apart. The total also keeps apart batches of the same
+/// size that the RIP told apart.
+fn alignment_keys(schedule: &[SchedEvent], unknown: &HashSet<(DetTid, u64)>) -> AlignmentKeys {
+    schedule
+        .iter()
+        .zip(branch_totals(schedule))
+        .map(|(event, total)| {
+            let mut key = event.clone();
+            key.stopless = false;
+            if event.op == Op::Branch && unknown.contains(&(event.dettid, total)) {
+                key.end_rip = None;
+            }
+            (key, total)
+        })
+        .collect()
+}
+
+/// The `alignment_keys` of `source` and `target`, each with the RIPs left out
+/// where either took a slice end without a stop.
+fn aligned_keys(source: &[SchedEvent], target: &[SchedEvent]) -> (AlignmentKeys, AlignmentKeys) {
+    let unknown = stopless_points([source, target]);
+    (
+        alignment_keys(source, &unknown),
+        alignment_keys(target, &unknown),
+    )
+}
+
+/// Bubble sort `source` into `target`'s order, matching events by
+/// `aligned_keys`.
+fn align<'a>(source: &'a [SchedEvent], target: &[SchedEvent]) -> BubbleSortIter<'a, SchedEvent> {
+    let (source_keys, target_keys) = aligned_keys(source, target);
+    let permutation = generate_permutation(&source_keys, &target_keys);
+    iterable_bubble_sort_from_perm(source, permutation)
 }
 
 // Return edit distance and swap distance.
@@ -513,7 +598,8 @@ fn print_unmatched_events(
     failing_schedule: &[SchedEvent],
     max_to_print: usize,
 ) {
-    let perm = generate_permutation(passing_schedule, failing_schedule);
+    let (passing_keys, failing_keys) = aligned_keys(passing_schedule, failing_schedule);
+    let perm = generate_permutation(&passing_keys, &failing_keys);
     for ix in perm.unmatched_source_indices.iter().take(max_to_print) {
         eprintln!(
             " :: unmatched source evt #{}: {}",
@@ -1025,13 +1111,90 @@ fn create_schedule_with_critical_pair(
 mod tests {
 
     use detcore::preemptions::PreemptionRecord;
-    use detcore::types::DetTid;
     use detcore::types::LogicalTime;
     use detcore::types::Op;
     use detcore::types::SyscallPhase;
     use reverie::syscalls::Sysno;
 
     use super::*;
+
+    /// Two runs that differ only in which slice ends they took without a
+    /// stop align event for event, and batches of the same size stay apart:
+    /// each stands for its thread's branches up to its end.
+    #[test]
+    fn schedules_align_however_their_slice_ends_were_taken() {
+        let a = DetTid::from_raw(3);
+        let b = DetTid::from_raw(4);
+        let stop = |tid, count, rip| {
+            SchedEvent::branches(tid, count)
+                .with_end_rip(detcore::types::InstructionPointer::new(rip).unwrap())
+        };
+        let stopped = vec![
+            stop(a, 100, 0x10),
+            stop(a, 100, 0x20),
+            SchedEvent::syscall(a, Sysno::write, SyscallPhase::Prehook),
+            stop(b, 100, 0x30),
+        ];
+        let mut taken_alone = stopped.clone();
+        taken_alone[0] = SchedEvent::branches(a, 100).taken_without_stop();
+        taken_alone[1] = SchedEvent::branches(a, 100).taken_without_stop();
+        assert_eq!(just_distance(&stopped, &taken_alone), (0, 0));
+        assert_eq!(
+            get_common_pre_and_postfix(&stopped, &taken_alone, SchedEvent::same_operations)
+                .0
+                .len(),
+            stopped.len()
+        );
+        let swapped = vec![
+            stopped[0].clone(),
+            stopped[3].clone(),
+            stopped[1].clone(),
+            stopped[2].clone(),
+        ];
+        assert_ne!(just_distance(&stopped, &swapped), (0, 0));
+        assert_eq!(
+            just_distance(&taken_alone, &swapped),
+            just_distance(&stopped, &swapped)
+        );
+    }
+
+    /// Two Branch events at the same point of their thread with known but
+    /// different end RIPs are different events: their distance is not zero,
+    /// so a zero-jitter search does not accept a replay that ended a slice at
+    /// another instruction as the requested schedule without checking that
+    /// replays of it agree. Only a RIP the run did not read (a slice end taken
+    /// without a stop) is left out of the comparison.
+    #[test]
+    fn known_end_rips_that_differ_are_not_aligned_as_equal() {
+        let a = DetTid::from_raw(3);
+        let stop = |rip| {
+            SchedEvent::branches(a, 100)
+                .with_end_rip(detcore::types::InstructionPointer::new(rip).unwrap())
+        };
+        let requested = vec![stop(0x401000)];
+        let elsewhere = vec![stop(0x402000)];
+        assert_ne!(just_distance(&requested, &elsewhere), (0, 0));
+        assert_eq!(just_distance(&requested, &requested.clone()), (0, 0));
+        // Either run's stopless end at the same point matches.
+        let taken_alone = vec![SchedEvent::branches(a, 100).taken_without_stop()];
+        assert_eq!(just_distance(&requested, &taken_alone), (0, 0));
+        assert_eq!(just_distance(&taken_alone, &elsewhere), (0, 0));
+
+        // Zero jitter allowed: the replay that ended elsewhere is replayed
+        // again before it classifies the schedule.
+        let mut calls = 0;
+        let mut tester = |_: &[SchedEvent]| -> TrialOutcome {
+            calls += 1;
+            Ok((true, elsewhere.clone()))
+        };
+        let cfg = Config::default();
+        assert_eq!((cfg.max_jitter_editdist, cfg.max_jitter_swapdist), (0, 0));
+        test_and_select_stable_point(&mut tester, &requested, &cfg).unwrap();
+        assert_eq!(
+            calls, 2,
+            "a replay that differs at a known RIP is checked again"
+        );
+    }
 
     #[test]
     fn test_common_pre_and_postfix() {
