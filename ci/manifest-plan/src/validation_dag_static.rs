@@ -3288,7 +3288,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest count.
     // And the three bounded SIGCHLD-deferral units
     // (https://github.com/rrnewton/hermit/issues/4132): 3492 + 3 = 3495, listed.
-    ("test.detcore_unit", 3495),
+    // And a_sigchld_linux_never_sends_or_a_call_may_consume_is_not_fenced and
+    // a_fenced_sigchld_expires_once_a_thread_that_could_take_it_runs_on_without_it
+    // (review of https://github.com/rrnewton/hermit/pull/4627): 3495 + 2 = 3497.
+    ("test.detcore_unit", 3497),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5927,7 +5930,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same three bounded SIGCHLD-deferral units: 3492 + 3 = 3495, listed.
-    ("test.detcore_unit_on_host", 3495),
+    // And the same two fenced-SIGCHLD units: 3495 + 2 = 3497.
+    ("test.detcore_unit_on_host", 3497),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
