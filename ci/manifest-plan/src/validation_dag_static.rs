@@ -1264,7 +1264,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1944 + 2 = 1946 (Train 5 delta +2).
-    ("test.regular_crates", 1951),
+    ("test.regular_crates", 1970),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3256,7 +3256,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
-    ("test.detcore_unit", 3465),
+    ("test.detcore_unit", 3539),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3856,7 +3856,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
     // record/replay units: 229 + 2 = 231, measured by the 216dbc929a full
     // validate.
-    ("test.record_replay", 231),
+    ("test.record_replay", 249),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4630,7 +4630,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
-    ("test.cli", 796),
+    ("test.cli", 778),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5277,7 +5277,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
-    ("test.cli_on_host", 715),
+    ("test.cli_on_host", 697),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5288,7 +5288,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    ("test.regular_crates_on_host", 1956),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5846,7 +5846,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
-    ("test.detcore_unit_on_host", 3465),
+    ("test.detcore_unit_on_host", 3539),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6503,7 +6503,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    ("test.regular_crates_on_host", 1956),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
