@@ -1995,7 +1995,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the root and path-length refusals, stale and held copies) and
     // host_input_change's snapshot-copy unit (PR #4791):
     // 1249 + 12 = 1261.
-    ("test.hermit_unit", 1261),
+    ("test.hermit_unit", 1262),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3282,7 +3282,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main ffe313b16: 3395 + 3 = 3398.
     // Rebased onto main fbf9d5f0c: 3439 + 3 = 3442.
     // Rebased onto main fcd62385f: 3465 + 3 = 3468.
-    ("test.detcore_unit", 3468),
+    ("test.detcore_unit", 3469),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3399,7 +3399,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And property_snapshot::an_access_mode_3_open_of_a_copied_property_file_runs_as_natively
     // (the same pull request's review): 215 + 1 = 216.
     // Rebased onto main e8e0f9a1c: 216 + 1 = 217.
-    ("test.detcore_misc", 217),
+    ("test.detcore_misc", 220),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5480,7 +5480,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main e8e0f9a1c: 214 + 2 = 216.
     // And the same access-mode-3 case: 215 + 1 = 216.
     // Rebased onto main e8e0f9a1c: 216 + 1 = 217.
-    ("test.detcore_misc_on_host", 217),
+    ("test.detcore_misc_on_host", 220),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5923,7 +5923,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main ffe313b16: 3395 + 3 = 3398.
     // Rebased onto main fbf9d5f0c: 3439 + 3 = 3442.
     // Rebased onto main fcd62385f: 3465 + 3 = 3468.
-    ("test.detcore_unit_on_host", 3468),
+    ("test.detcore_unit_on_host", 3469),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6343,7 +6343,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // And the same twelve property snapshot units (PR #4791):
     // 1243 + 12 = 1255.
-    ("test.hermit_unit_on_host", 1255),
+    ("test.hermit_unit_on_host", 1256),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
