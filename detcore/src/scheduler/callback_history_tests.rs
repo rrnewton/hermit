@@ -632,6 +632,35 @@ mod callback_history_scheduler_tests {
         assert!(error.is::<crate::PriorityHistoryRefusal>(), "{error:#}");
     }
 
+    /// A run `--timeout` stopped has an unfinished replay by definition, so
+    /// the recorded callback checkpoints it left do not refuse its partial
+    /// summary: the summary names them. A finished run that left the same
+    /// checkpoints still ends in the refusal. Before, the stopped run was
+    /// refused too, and no partial summary was written.
+    #[test]
+    fn a_stopped_annotated_replay_summarizes_its_unconsumed_checkpoints() {
+        let t = tid(3);
+        let annotated_map = checkpoints(&[(t, 0, 10), (t, 2, 30)]);
+        let mut stopped = annotated();
+        stopped
+            .install_priority_checkpoints(&annotated_map)
+            .unwrap();
+        let (summary, _) = stopped.generate_stopped_run_summary_for_log(None).unwrap();
+        let descrip = summary.desync_descrip.unwrap_or_default();
+        assert!(
+            descrip.contains("INCOMPLETE callback history when the run was stopped")
+                && descrip.contains("HERMIT_CALLBACK_CHECKPOINT_INCOMPLETE")
+                && descrip.contains("dtid 3: 2 unconsumed from row 0"),
+            "{descrip}"
+        );
+        let mut finished = annotated();
+        finished
+            .install_priority_checkpoints(&annotated_map)
+            .unwrap();
+        let error = finished.generate_partial_run_summary(None).unwrap_err();
+        assert!(error.is::<crate::PriorityHistoryRefusal>(), "{error:#}");
+    }
+
     /// An annotated history replays from its first row only at a thread's
     /// birth: a second start of the same thread ID, or a start after its rows
     /// or progress were consumed, is refused by name.
