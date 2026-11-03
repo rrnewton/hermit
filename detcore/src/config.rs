@@ -247,7 +247,7 @@ mod tests {
         // its rebase onto main's 31, skipping 30 and 32-34 (reserved in
         // ignored/drain-20261103/rpc-revisions.tsv); digest measured at
         // this head.
-        (35, "972afd3cae07a4c4", "f013e36743d8d9e6"),
+        (35, "a6e91a991c569e3b", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
