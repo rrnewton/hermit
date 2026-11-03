@@ -1983,7 +1983,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_real_proc_fd_reopen_trace_gives_no_edge}: 1407.
     // And analyze::races::tests::{a_fifo_access_from_a_process_holding_no_end_gives_no_edge,
     // real_fifo_reopen_traces_give_no_edge}: 1409.
-    ("test.hermit_unit", 1409),
+    // And analyze::races::tests::{a_trace_without_descriptor_types_gives_no_pipe_edge,
+    // a_real_trace_recorded_without_metadata_virtualization_gives_no_pipe_edge}: 1411.
+    ("test.hermit_unit", 1411),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4571,7 +4573,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
     // The retry stack adds one cli case: 744 + 1 = 745.
     // And access_trace::the_trace_shows_what_leaves_a_pipes_data_edges_out: 746.
-    ("test.cli", 746),
+    // And access_trace::a_trace_names_the_settings_that_leave_descriptors_untyped: 747.
+    ("test.cli", 747),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5145,7 +5148,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
     // The same retry-stack cli case: 663 + 1 = 664.
     // And the same pipe-records test, not excluded: 665.
-    ("test.cli_on_host", 665),
+    // And the same untyped-descriptor header test, not excluded: 666.
+    ("test.cli_on_host", 666),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
     // And the same PMU analyze node unit: 1919.
@@ -6077,7 +6081,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unfollowed-route test: 1399.
     // And the same waited-write and real-reopen tests: 1401.
     // And the same two FIFO-access tests: 1403.
-    ("test.hermit_unit_on_host", 1403),
+    // And the same two untyped-descriptor tests: 1405.
+    ("test.hermit_unit_on_host", 1405),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
