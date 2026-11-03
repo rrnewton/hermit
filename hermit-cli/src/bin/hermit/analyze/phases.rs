@@ -94,6 +94,30 @@ fn prefix_report_banner(report: &Report) -> String {
     banner
 }
 
+/// The report's sentence naming the two continuations' recorded schedules,
+/// `with` and `without` the deciding event (file names in the workspace).
+/// The report outlives a workspace `retention` removes (on stdout, in a
+/// `--report-file`), so the sentence then says the files are gone and how to
+/// keep them.
+fn continuation_files_sentence(
+    decision: usize,
+    with: &str,
+    without: &str,
+    retention: Retention,
+) -> String {
+    let gone = match retention {
+        Retention::Keep { .. } => "",
+        Retention::Remove => {
+            " Analyze removes its workspace when it finishes, so run it again with --keep-tmp \
+             to keep these files."
+        }
+    };
+    format!(
+        "Event numbers after #{decision} are positions in each continuation's recorded \
+         schedule, in the workspace: {with} with the event, {without} without it.{gone}\n"
+    )
+}
+
 /// What stack1 and stack2 of a `--prefix-search` report are, given the
 /// thread the target schedule runs at the deciding event (`chosen`) and the
 /// one the scheduler runs there without that event (`instead`, `None` when
@@ -1384,11 +1408,11 @@ impl AnalyzeOpts {
                 .to_string_lossy()
                 .into_owned()
         };
-        header.push_str(&format!(
-            "Event numbers after #{decision} are positions in each continuation's recorded \
-             schedule, in the workspace: {} with the event, {} without it.\n",
-            name(&target_continued_path),
-            name(continued_path),
+        header.push_str(&continuation_files_sentence(
+            decision,
+            &name(&target_continued_path),
+            &name(continued_path),
+            self.workspace_retention(),
         ));
         let context = format!(
             "With event #{decision} replayed:\n{}\nWithout it:\n{}",
