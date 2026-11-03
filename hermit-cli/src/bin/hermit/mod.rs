@@ -2540,7 +2540,7 @@ mod tests {
             );
         }
         let verdict = Error::new(AnalyzeVerdict::reproduced_without_schedule(
-            "no event decides",
+            "reproduced without it",
             None,
         ));
         assert_eq!(failure_exit_code(&verdict), 0);
