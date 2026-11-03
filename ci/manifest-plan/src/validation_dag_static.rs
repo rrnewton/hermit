@@ -3270,7 +3270,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // reports, and parsing its receipts from the read_consumed of that one
     // read, and refusing a strict binder call before that barrier, add
     // five: 3486.
-    ("test.detcore_unit", 3486),
+    // Keeping a record's empty readmissions, marking a replay that leaves
+    // them, following main's records below format 4, ending a strict replay
+    // that leaves them, reading them alike in every loader, and dropping them
+    // from a mixed interpolation add six units: 3486 + 6 = 3492, by nextest
+    // list.
+    ("test.detcore_unit", 3492),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4650,7 +4655,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // host-limited (docs/TESTING_ENVIRONMENTS.md), so none is counted:
     // 797 - 5 = 792, by nextest list.
     // Rebased onto main 77be1fd09: 796 - 2 = 794.
-    ("test.cli", 794),
+    // And a_preemption_replay_that_leaves_its_readmissions_is_marked_or_ends_under_die_on_desync:
+    // 792 + 1 = 793.
+    // On #4742's head on main 77be1fd09: 794 + 1 = 795.
+    ("test.cli", 795),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5309,7 +5317,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three binder review-fix cases: 713 + 3 = 716. The same five
     // binder cases ignored as host-limited: 716 - 5 = 711.
     // Rebased onto main 77be1fd09: 715 - 2 = 713.
-    ("test.cli_on_host", 713),
+    // And the same departed-readmissions test: 712.
+    // On #4742's head on main 77be1fd09: 713 + 1 = 714.
+    ("test.cli_on_host", 714),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5890,7 +5900,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // loss unit: 3472 + 1 = 3473. The same four one-task units: 3477. The
     // same admission-order unit: 3478. The same three task-count units:
     // 3481. The same five exit-report units: 3486.
-    ("test.detcore_unit_on_host", 3486),
+    // And the same six readmission units: 3492.
+    ("test.detcore_unit_on_host", 3492),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
