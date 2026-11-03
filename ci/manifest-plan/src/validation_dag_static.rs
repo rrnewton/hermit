@@ -3326,7 +3326,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the record-format fence for offset rows,
     // instruction_offset_rows_state_a_format_older_hermits_refuse and
     // rows_alone_with_instruction_offsets_follow_format_one_timing: 3486.
-    ("test.detcore_unit", 3486),
+    // And a_record_that_drops_its_background_starts_keeps_its_offsets_format_and_says_so: 3487.
+    // And a_record_that_drops_its_starts_drops_its_stopless_marks_and_keeps_its_offsets: 3488.
+    ("test.detcore_unit", 3488),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5930,7 +5932,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same published-offset unit: 3483.
     // And a_replay_of_instruction_offset_rows_takes_no_stopless_end: 3484.
     // And the same two record-format fence units: 3486.
-    ("test.detcore_unit_on_host", 3486),
+    // And a_record_that_drops_its_background_starts_keeps_its_offsets_format_and_says_so: 3487.
+    // And a_record_that_drops_its_starts_drops_its_stopless_marks_and_keeps_its_offsets: 3488.
+    ("test.detcore_unit_on_host", 3488),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
