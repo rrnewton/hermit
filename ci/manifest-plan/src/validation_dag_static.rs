@@ -3283,7 +3283,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fbf9d5f0c: 3439 + 3 = 3442.
     // Rebased onto main c1f3085da: 3464 + 3 = 3467.
     // Rebased onto main fcd62385f: 3465 + 3 = 3468.
-    ("test.detcore_unit", 3468),
+    // And preemptions::tests::stopless_slice_ends_need_format_5 and
+    // a_record_that_keeps_no_background_starts_keeps_no_stopless_marks (the
+    // same pull request's review), on main fbf9d5f0c: 3442 + 2 = 3444.
+    // Rebased onto main c1f3085da: 3467 + 2 = 3469.
+    // Rebased onto main fcd62385f: 3468 + 2 = 3470.
+    ("test.detcore_unit", 3470),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5856,7 +5861,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fbf9d5f0c: 3439 + 3 = 3442.
     // Rebased onto main c1f3085da: 3464 + 3 = 3467.
     // Rebased onto main fcd62385f: 3465 + 3 = 3468.
-    ("test.detcore_unit_on_host", 3468),
+    // And the same two format units, on main fbf9d5f0c: 3442 + 2 = 3444.
+    // Rebased onto main c1f3085da: 3467 + 2 = 3469.
+    // Rebased onto main fcd62385f: 3468 + 2 = 3470.
+    ("test.detcore_unit_on_host", 3470),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
