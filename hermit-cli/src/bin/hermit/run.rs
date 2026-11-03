@@ -377,7 +377,9 @@ pub(super) fn first_run_rejected_report(
 /// ba3bfc97671666ae946841804624e7a2c355a0e4 in validate run 1819. Prepared
 /// source identity enumerates untracked, non-ignored files:
 ///
-///     git ls-files --others --exclude-standard -z
+/// ```text
+/// git ls-files --others --exclude-standard -z
+/// ```
 ///
 /// (`ci/manifest-plan/src/nextest_binaries.rs` source_identity, and the
 /// byte-identical enumeration in `ci/prepare-rust-scripts.sh` write_state).
