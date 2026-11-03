@@ -339,7 +339,7 @@ mod tests {
         // format, the timing format the recording with them shares.
         let mut good = search_record(vec![batch(20, None), batch(5, None)]);
         good["format_version"] =
-            serde_json::json!(detcore::preemptions::INSTRUCTION_OFFSET_FORMAT - 1);
+            serde_json::json!(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT - 1);
         let bad = search_record(vec![batch(22, Some(offset)), batch(3, None)]);
         assert_eq!(
             bad["format_version"],

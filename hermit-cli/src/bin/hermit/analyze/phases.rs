@@ -3100,7 +3100,11 @@ mod tests {
         let offsets_format = u64::from(detcore::preemptions::INSTRUCTION_OFFSET_FORMAT);
         for (path, expected, carries) in [
             (&failing, offsets_format, true),
-            (&passing, offsets_format - 1, false),
+            (
+                &passing,
+                u64::from(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT - 1),
+                false,
+            ),
             (&trial, offsets_format, true),
         ] {
             let json: serde_json::Value =
@@ -3115,9 +3119,12 @@ mod tests {
         }
 
         // Refused before any trial.
+        // Rows with offsets in format 4, a schedule trace without them: as a
+        // Hermit whose schedule traces did not hold offsets wrote it.
         let rows_only = edited("rows-only", &|json| {
             let object = json.as_object_mut().unwrap();
-            object.remove("format_version");
+            object["format_version"] =
+                serde_json::json!(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT);
             object["global"][0]
                 .as_object_mut()
                 .unwrap()
