@@ -328,20 +328,24 @@ fn choose_continuation(
         .filter(|(_, outcome)| *outcome == Continuation::MeetsTargetAlone)
         .map(|(timeslice, _)| describe_continuation(*timeslice))
         .collect();
+    // Only the empty prefix ran at each of these continuations, and prefix
+    // outcomes need not be monotone: a longer prefix can still miss the
+    // target. So the verdict states what those trials observed, not that no
+    // event or chaos decision matters.
     if let (true, Some(&(first, _))) = (alone.len() == outcomes.len(), outcomes.first()) {
         // A completed analysis, not a failure (`AnalyzeVerdict`).
         return Err(AnalyzeVerdict::reproduced_without_schedule(
             format!(
-                "the target is reproduced without the target schedule: without chaos, the \
-                 scheduler alone, replaying none of the target schedule, meets the target \
-                 criteria {}. A prefix search needs a run that misses the target to start from, \
-                 so it localizes no event here. Only the empty prefix was tried: an interior \
-                 prefix may still miss the target, so this does not show that no event of the \
-                 schedule decides the outcome. Debug that run directly: the reproducer of the \
-                 first trial (prefix_round_001.repro in the workspace) runs it. To bisect against \
-                 a run that misses the target instead, pass --continuation-timeslice with a \
-                 timeslice at which the scheduler alone misses it, or use the default search \
-                 with a passing --run2-seed.",
+                "the target is reproduced without the target schedule: replaying none of the \
+                 target schedule and then scheduling without chaos, the scheduler alone already \
+                 meets the target criteria {}. So no continuation gives the prefix search a miss \
+                 to bisect against, and it localizes no event here. Only that empty prefix was \
+                 tried; a longer prefix may still miss the target. Each such trial reproduces \
+                 the target outcome while replaying nothing: the reproducer of the first one \
+                 (prefix_round_001.repro in the workspace) reruns it. To bisect against a run \
+                 that misses the target instead, pass --continuation-timeslice with a timeslice \
+                 at which the scheduler alone misses it, or use the default search with a \
+                 passing --run2-seed.",
                 alone.join(" and ")
             ),
             first,
@@ -3605,19 +3609,31 @@ mod tests {
                         .expect("a repeated pair certifies the decision");
                     assert_eq!(calls.borrow().len(), 4);
                     if captured {
-                        assert_eq!(report.critical_event1.event_index, 3);
-                        assert_eq!(report.critical_event2.event_index, 2);
+                        assert_eq!(report.critical_event1.as_ref().unwrap().event_index, 3);
+                        assert_eq!(report.critical_event2.as_ref().unwrap().event_index, 2);
                         assert!(same_frames(
-                            report.critical_event1.stack.as_ref().unwrap(),
+                            report
+                                .critical_event1
+                                .as_ref()
+                                .unwrap()
+                                .stack
+                                .as_ref()
+                                .unwrap(),
                             &timing_report_stack(3, 0x30)
                         ));
                         assert!(same_frames(
-                            report.critical_event2.stack.as_ref().unwrap(),
+                            report
+                                .critical_event2
+                                .as_ref()
+                                .unwrap()
+                                .stack
+                                .as_ref()
+                                .unwrap(),
                             &timing_report_stack(3, 0x40)
                         ));
                     } else {
-                        assert_eq!(report.critical_event1.event_index, 4);
-                        assert_eq!(report.critical_event2.event_index, 3);
+                        assert_eq!(report.critical_event1.as_ref().unwrap().event_index, 4);
+                        assert_eq!(report.critical_event2.as_ref().unwrap().event_index, 3);
                     }
                 }
             }
@@ -3693,12 +3709,18 @@ mod tests {
                 3,
                 "two next-thread and one slice-end replay"
             );
-            assert_eq!(report.critical_event1.event_index, ends[0]);
-            assert_eq!(report.critical_event2.event_index, ends[1]);
+            assert_eq!(
+                report.critical_event1.as_ref().unwrap().event_index,
+                ends[0]
+            );
+            assert_eq!(
+                report.critical_event2.as_ref().unwrap().event_index,
+                ends[1]
+            );
             let reused = if target_is_short {
-                &report.critical_event1.stack
+                &report.critical_event1.as_ref().unwrap().stack
             } else {
-                &report.critical_event2.stack
+                &report.critical_event2.as_ref().unwrap().stack
             };
             assert!(same_frames(
                 reused.as_ref().unwrap(),
@@ -4972,12 +4994,11 @@ mod tests {
         );
         let header = verdict.to_string();
         for expected in [
-            "the target is reproduced without the target schedule: without chaos, the scheduler \
-             alone, replaying none of the target schedule, meets the target criteria at a 1000 ns \
-             timeslice",
-            "so it localizes no event here",
-            "an interior prefix may still miss the target, so this does not show that no event \
-             of the schedule decides the outcome",
+            "the target is reproduced without the target schedule: replaying none of the target \
+             schedule and then scheduling without chaos, the scheduler alone already meets the \
+             target criteria at a 1000 ns timeslice",
+            "and it localizes no event here",
+            "Only that empty prefix was tried; a longer prefix may still miss the target",
         ] {
             assert!(header.contains(expected), "no {expected:?} in {header}");
         }
@@ -5289,7 +5310,7 @@ mod tests {
         );
         let message = alone.to_string();
         assert!(
-            message.contains("the scheduler alone, replaying none of the target schedule, meets the target criteria at a 1000 ns timeslice and at a 200000000 ns timeslice"),
+            message.contains("the scheduler alone already meets the target criteria at a 1000 ns timeslice and at a 200000000 ns timeslice"),
             "{message}"
         );
         assert!(
@@ -6294,14 +6315,26 @@ mod tests {
                     let report = result
                         .unwrap()
                         .expect("a repeated pair produces a timing report");
-                    assert_eq!(report.critical_event1.event_index, 3);
-                    assert_eq!(report.critical_event2.event_index, 2);
+                    assert_eq!(report.critical_event1.as_ref().unwrap().event_index, 3);
+                    assert_eq!(report.critical_event2.as_ref().unwrap().event_index, 2);
                     assert!(same_frames(
-                        report.critical_event1.stack.as_ref().unwrap(),
+                        report
+                            .critical_event1
+                            .as_ref()
+                            .unwrap()
+                            .stack
+                            .as_ref()
+                            .unwrap(),
                         &timing_report_stack(3, 0x30)
                     ));
                     assert!(same_frames(
-                        report.critical_event2.stack.as_ref().unwrap(),
+                        report
+                            .critical_event2
+                            .as_ref()
+                            .unwrap()
+                            .stack
+                            .as_ref()
+                            .unwrap(),
                         &timing_report_stack(3, 0x40)
                     ));
                 }
