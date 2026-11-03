@@ -1998,7 +1998,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And minimize's a_minimize_record_states_only_what_its_rows_hold: 1348.
     // And rundata's
     // a_prefix_trial_of_trace_offsets_keeps_its_timing_at_every_length: 1349.
-    ("test.hermit_unit", 1349),
+    // And rundata's rows_alone_restated_in_format_five_still_hold_rows_only:
+    // 1350.
+    ("test.hermit_unit", 1350),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6318,7 +6320,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same offset-rows prefix unit: 1342.
     // And the same minimize-record unit: 1342.
     // And the same trace-offsets prefix-timing unit: 1343.
-    ("test.hermit_unit_on_host", 1343),
+    // And the same marked-rows-in-format-5 unit: 1344.
+    ("test.hermit_unit_on_host", 1344),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

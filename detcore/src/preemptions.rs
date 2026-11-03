@@ -4413,11 +4413,13 @@ pub enum RecordedOffsets {
     /// [`INSTRUCTION_OFFSET_FORMAT`]: in its rows, and in its schedule trace at every batch of
     /// branches such a timer ended. Both replays can arm them.
     Recorded,
-    /// In its rows alone, in a record of [`INSTRUCTION_OFFSET_ROWS_FORMAT`]:
-    /// written by a Hermit whose schedule traces did not hold offsets, or
-    /// rows alone (minimization's candidates, `clone_preemptions_only`). A
-    /// preemption replay can arm them, but a schedule trace, if any, would
-    /// stop each such slice at a branch, so a schedule replay refuses it.
+    /// In its rows alone, in a record of [`INSTRUCTION_OFFSET_ROWS_FORMAT`]
+    /// written by a Hermit whose schedule traces did not hold offsets, or in
+    /// a record marked as rows alone (`PreemptionRecord::rows_alone`:
+    /// minimization's candidates, `clone_preemptions_only`), whatever format
+    /// it states. A preemption replay can arm them, but a schedule trace, if
+    /// any, would stop each such slice at a branch, and rows alone have none
+    /// to follow, so a schedule replay refuses it.
     RowsOnly,
     /// In its schedule trace, in a record whose format cannot hold them: a
     /// malformed record, which loading refuses (`PreemptionRecord::validate`).
@@ -4425,9 +4427,20 @@ pub enum RecordedOffsets {
 }
 
 impl RecordedOffsets {
-    /// Classify a record's offsets from what it holds.
-    fn classify(format: u32, rows: bool, schedule: bool) -> Self {
-        if format >= INSTRUCTION_OFFSET_FORMAT {
+    /// Classify a record's offsets from what it holds. A record marked as
+    /// rows alone holds no schedule trace whatever its format
+    /// (`validate_contents` refuses one beside the mark), so its offsets are
+    /// rows only even in [`INSTRUCTION_OFFSET_FORMAT`].
+    fn classify(format: u32, rows: bool, schedule: bool, rows_alone: bool) -> Self {
+        if rows_alone {
+            if schedule {
+                Self::Malformed
+            } else if rows {
+                Self::RowsOnly
+            } else {
+                Self::None
+            }
+        } else if format >= INSTRUCTION_OFFSET_FORMAT {
             if rows || schedule {
                 Self::Recorded
             } else {
@@ -4452,6 +4465,7 @@ impl PreemptionRecord {
                 .values()
                 .any(ThreadHistory::has_instruction_offsets),
             self.schedule_carries_instruction_offsets(),
+            self.rows_alone,
         )
     }
 }
@@ -4493,6 +4507,8 @@ pub fn read_recorded_offsets(path: &Path) -> Result<RecordedOffsets, String> {
         global: Vec<EventOffsetOnly>,
         #[serde(default)]
         format_version: Option<u32>,
+        #[serde(default)]
+        rows_alone: bool,
     }
     let record = boundary_recording::read_settings::<OffsetsAndFormat>(path)?;
     let rows = record.per_thread.values().any(|history| {
@@ -4509,6 +4525,7 @@ pub fn read_recorded_offsets(path: &Path) -> Result<RecordedOffsets, String> {
         record.format_version.unwrap_or(1),
         rows,
         schedule,
+        record.rows_alone,
     ))
 }
 
