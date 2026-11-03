@@ -551,11 +551,12 @@ outside with `SIGKILL` never has its skipped ends processed.
 Slice ends while two threads can run still stop the guest. This applies to the
 ptrace backend's precise timer, and not where the run records or replays
 preemptions or schedules, or uses `--target-timeslice`,
-`--chaos-per-thread-slowdown`, `--imprecise-timers`, turn-numbered triggers
-(`--stop-after-turn`, `--stop-after-iter`, `--signal-at`), stack traces at
-preemptions or events, manual interrupt points, a happens-before program or
-`--gdbserver` (a debugger stopping the thread between skipped ends would see
-Hermit's slice bookkeeping behind its program counter).
+`--chaos-per-thread-slowdown`, `--imprecise-timers`, strict schedule boundaries,
+turn-numbered triggers (`--stop-after-turn`, `--stop-after-iter`,
+`--signal-at`), stack traces at preemptions or events, manual interrupt points,
+a happens-before program or `--gdbserver` (a debugger stopping the thread
+between skipped ends would see Hermit's slice bookkeeping behind its program
+counter).
 
 Which slice length exposes a race depends on the race: some need a preemption
 in a short window (fine slices), others a long uninterrupted run of one thread
