@@ -943,7 +943,6 @@ pub(crate) async fn wait(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::ExitStatus, detcore::GlobalState), Error> {
-    control.root.set(Some(tracer.guest_pid().as_raw()));
     wait_outcome(tracer, control).await?.into_finished().await
 }
 /// [`wait`], with the guest's output; a terminal outcome keeps the output the
@@ -952,26 +951,31 @@ pub(crate) async fn wait_with_output(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::process::Output, detcore::GlobalState), Error> {
-    control.root.set(Some(tracer.guest_pid().as_raw()));
     wait_with_output_outcome(tracer, control)
         .await?
         .into_finished()
         .await
 }
-/// [`wait`], handing a run `--timeout` stopped back to the caller.
+/// [`wait`], handing a run `--timeout` stopped back to the caller. The root
+/// guest's pid is saved before the run's termination is registered, so a
+/// timeout's survivor report can tell an orphan adopted by Hermit, as the
+/// namespace's init, from the root itself.
 pub(crate) async fn wait_outcome(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<Waited<reverie::ExitStatus>, Error> {
+    control.root.set(Some(tracer.guest_pid().as_raw()));
     control.register(tracer.termination_handle());
     let _unwind = control.unwind_terminal_outcomes();
     consume(tracer.wait_completion().await, control).await
 }
-/// [`wait_with_output`], handing a run `--timeout` stopped back to the caller.
+/// [`wait_with_output`], handing a run `--timeout` stopped back to the
+/// caller, with the root guest's pid saved as [`wait_outcome`] saves it.
 pub(crate) async fn wait_with_output_outcome(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<Waited<reverie::process::Output>, Error> {
+    control.root.set(Some(tracer.guest_pid().as_raw()));
     control.register(tracer.termination_handle());
     let _unwind = control.unwind_terminal_outcomes();
     consume(tracer.wait_with_output_completion().await, control).await
