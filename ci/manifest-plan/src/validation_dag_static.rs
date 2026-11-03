@@ -1973,7 +1973,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured by musetrain's cd856249a9 full validate (1343 executed
     // against the 1341 the old pin expected; both new units PASS).
     // The split retains nine additional core identities: 1335 + 9 = 1344.
-// Train 6 recount (measured by the 1ae7c357e6 full validate):
+    // Train 6 recount (measured by the 1ae7c357e6 full validate):
     // Composed on landed batch main: 1348 + 8 = 1356 (Train 6 delta +8 over 1344).
     ("test.hermit_unit", 1356),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
@@ -3254,7 +3254,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
     // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
     // 216dbc929a full validate.
-// Train 6 recount (measured by the 1ae7c357e6 full validate):
+    // Train 6 recount (measured by the 1ae7c357e6 full validate):
     // Composed on landed batch main: 3386 + 23 = 3409 (Train 6 delta +23 over 3384).
     ("test.detcore_unit", 3409),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
@@ -4628,7 +4628,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // = 780, measured by nextest list.
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds seven cli
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
-// Train 6 recount (measured by the 1ae7c357e6 full validate):
+    // Train 6 recount (measured by the 1ae7c357e6 full validate):
     // Composed on landed batch main: 789 + 3 = 792 (Train 6 delta +3 over 787).
     ("test.cli", 792),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
@@ -5258,7 +5258,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same K8-d cli case: 698 + 1 = 699, measured by nextest list.
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
-// Train 6 recount (same growth as test.cli), composed on landed batch main: 708 + 3 = 711.
+    // Train 6 recount (same growth as test.cli), composed on landed batch main: 708 + 3 = 711.
     ("test.cli_on_host", 711),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
@@ -5813,7 +5813,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
-// Train 6 recount (same growth as test.detcore_unit), composed on landed batch main: 3386 + 23 = 3409.
+    // Train 6 recount (same growth as test.detcore_unit), composed on landed batch main: 3386 + 23 = 3409.
     ("test.detcore_unit_on_host", 3409),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
@@ -6231,7 +6231,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two podman lock-wait units as test.hermit_unit (neither is
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
-// Train 6 recount (same growth as test.hermit_unit), composed on landed batch main: 1342 + 8 = 1350.
+    // Train 6 recount (same growth as test.hermit_unit), composed on landed batch main: 1342 + 8 = 1350.
     ("test.hermit_unit_on_host", 1350),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
