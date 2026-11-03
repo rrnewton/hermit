@@ -52,7 +52,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 
-use crate::container;
+use crate::app::container;
 
 /// The signals a supervisor, a shell or a terminal sends to stop a process.
 const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
