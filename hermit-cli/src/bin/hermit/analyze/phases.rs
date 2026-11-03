@@ -1380,23 +1380,33 @@ impl AnalyzeOpts {
             [critical[0].1.as_ref(), critical[1].1.as_ref()],
         );
         if let Some(ends) = slice_ends {
-            let stack_at = |runname: &str, variant: &PreemptionRecord, end: usize| {
+            let stack_at = |runname: &str,
+                            variant: &PreemptionRecord,
+                            end: usize,
+                            expected: bool|
+             -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
                 if end == decision {
-                    // A slice of one event ends where it starts.
+                    // A slice of one event ends where it starts. Reuse the
+                    // captured deciding stack; no new replay has an outcome
+                    // to compare with the search.
                     Ok((true, deciding.clone()))
                 } else {
-                    stack(runname, variant, end + 1, end)
+                    let (observed, captured) = stack(runname, variant, end + 1, end)?;
+                    require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
+                    Ok((observed, captured))
                 }
             };
             let (_, with_end) = stack_at(
                 "final_target_slice_end_for_stacktraces",
                 &with_record,
                 ends[0],
+                true,
             )?;
             let (_, without_end) = stack_at(
                 "final_baseline_slice_end_for_stacktraces",
                 &without_record,
                 ends[1],
+                false,
             )?;
             match (with_end, without_end) {
                 (Some(with_end), Some(without_end)) => {
@@ -3456,7 +3466,7 @@ mod tests {
         let tmp_dir = format!("--tmp-dir={}", parent.path().display());
         let mut options =
             AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
-        options.phase0_initialize().unwrap();
+        options.phase0_initialize(Retention::Remove).unwrap();
         let branches = |tid: u64, count: u32| {
             serde_json::json!({
                 "dettid": tid, "op": "Branch", "count": count,
@@ -4027,9 +4037,24 @@ mod tests {
             stderr: Vec::new(),
         });
         assert_eq!(missed, ["  Exit code 121 is not what we're looking for."]);
+    }
+
     /// --minimize keeps the observed record and writes normalization only
     /// for reading. Its timing report must still reject an opposite-outcome
     /// slice-end replay before using that replay's diagnostic stack.
+    fn timing_report_stack(thread: i32, ip: u64) -> PrettyBacktrace {
+        serde_json::from_value(serde_json::json!({
+            "thread_id": thread,
+            "thread_name": null,
+            "frames": [{
+                "frame": { "ip": ip, "is_signal": false },
+                "symbol": null,
+                "locations": []
+            }]
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn minimized_timing_reports_check_slice_end_outcomes_on_the_original_record() {
         use std::collections::BTreeMap;
@@ -4058,7 +4083,7 @@ mod tests {
         .unwrap();
         let recorded_path = dir.path().join("minimized.preempts");
         record.write_to_disk(&recorded_path).unwrap();
-        let runopts = crate::run::RunOpts::try_parse_from(["hermit-run", "/bin/true"]).unwrap();
+        let runopts = crate::app::run::RunOpts::try_parse_from(["hermit-run", "/bin/true"]).unwrap();
         let mut minimized = RunData::from_minimize_output(
             &options,
             "minimized".to_owned(),
