@@ -942,7 +942,21 @@ impl RecordVersion {
 // LOCK_UN after a release), a contended blocking flock waits instead of being
 // refused, and a malformed operation is answered without a kernel call. An
 // older recording replayed with this binary desyncs at its first flock.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x199);
+// 0x199 -> 0x19c (reserved for this change in minibeads dh-gxmvo at its
+// rebase onto main c181ec6a4; 0x19a is reserved for release-05's PMU binary
+// epoch and 0x19b for the replayed-MAP_SHARED fix-forward, and land-time
+// numbering still applies): a parent's SIGCHLD that the
+// scheduler defers until no other ordinary work is runnable is re-admitted
+// earlier where the kernel's copy was raised at a point the schedule fixes
+// (a child killed by SIGKILL, or one whose SIGCHLD Linux discards, on a
+// backend that reports child-exit publication): once every thread that was
+// runnable work at the deferral has had a turn. Record and replay both run
+// that rule and replay recomputes it rather than reading it from the stream,
+// so a recording made before it, in which such a delivery waited for
+// quiescence beside busy threads, would replay with an earlier re-admission
+// and fall out of step. It is refused here.
+// https://github.com/rrnewton/hermit/pull/4627
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -967,7 +981,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x199);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x199;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
