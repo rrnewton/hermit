@@ -3262,7 +3262,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_a_finished_runs_summary_requires_its_replay_to_have_ended
     // (https://github.com/rrnewton/hermit/pull/4685): 3384 + 2 = 3386.
     // Rebased onto main e8e0f9a1c: 3386 + 2 = 3388.
-    ("test.detcore_unit", 3388),
+    // And scheduler::callback_history_scheduler_tests'
+    // a_stopped_annotated_replay_summarizes_its_unconsumed_checkpoints (the same
+    // pull request's review): 3386 + 1 = 3387.
+    // Rebased onto main e8e0f9a1c: 3388 + 1 = 3389.
+    ("test.detcore_unit", 3389),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5826,7 +5830,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // And the same two partial-summary units: 3384 + 2 = 3386.
     // Rebased onto main e8e0f9a1c: 3386 + 2 = 3388.
-    ("test.detcore_unit_on_host", 3388),
+    // And the same stopped-annotated-replay unit: 3386 + 1 = 3387.
+    // Rebased onto main e8e0f9a1c: 3388 + 1 = 3389.
+    ("test.detcore_unit_on_host", 3389),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

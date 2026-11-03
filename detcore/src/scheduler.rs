@@ -20776,7 +20776,18 @@ impl Scheduler {
 
         // Legacy EOF policy does not make an unconsumed suffix fatal. Name
         // incomplete callback metadata separately; do not invent guest events.
-        // A stopped run's replay is unfinished by definition.
+        // A stopped run's replay is unfinished by definition, so its summary
+        // names the recorded callback checkpoints it left, which refuse only a
+        // finished run (below).
+        if end == RunEnd::Stopped
+            && let Some(incomplete) = self.priority_history_incomplete()
+        {
+            desync_descrip
+                .get_or_insert_with(String::new)
+                .push_str(&format!(
+                    "INCOMPLETE callback history when the run was stopped: {incomplete}\n"
+                ));
+        }
         if end == RunEnd::Finished {
             for (tid, points) in &self.callback_checkpoints {
                 if !points.is_empty() {
@@ -20879,9 +20890,12 @@ impl Scheduler {
             TerminalOutcome::to_fields(self.terminal_outcome);
 
         // After the record is flushed and each thread's DESYNC line is
-        // logged above: the re-recorded history survives as evidence, and the
-        // run still ends as a refusal, not a summary.
-        if let Some(refusal) = self.priority_history_incomplete() {
+        // logged above: the re-recorded history survives as evidence, and a
+        // finished run still ends as a refusal, not a summary. A stopped run
+        // keeps its partial summary, which names the checkpoints (above).
+        if end == RunEnd::Finished
+            && let Some(refusal) = self.priority_history_incomplete()
+        {
             return Err(crate::PriorityHistoryRefusal(refusal).into());
         }
 
