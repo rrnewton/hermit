@@ -34,7 +34,11 @@
 //!   has an assembler mark data `$d`, so data marked as the ABI says is never
 //!   taken for code. This is the only evidence the default
 //!   ([`StrippedRewrite::Refuse`]) accepts, because it is the only one that
-//!   proves where code is.
+//!   proves where code is. A section that also holds a mapping symbol of
+//!   another kind (AArch32's `$a` or `$t`, or a `$` name this reader does
+//!   not know, such as `$xyz`) is not proved by them: under either policy
+//!   its sequences are left alone as `unsupported-mapping-symbol`, naming
+//!   the symbol.
 //! - No mapping symbols, under the default: nothing. Every exclusive
 //!   sequence in such a section, as in every stripped file, is left alone as
 //!   `no-mapping-symbols`, so the file is left unchanged and named, never
@@ -165,6 +169,17 @@ impl FileReport {
             .copied()
             .unwrap_or(0)
     }
+
+    /// The sequences left alone because their section holds a mapping symbol
+    /// that is neither `$x` nor `$d` (`unsupported-mapping-symbol`).
+    pub fn unsupported(&self) -> usize {
+        self.refused
+            .get(refusal_name(&Refusal::UnsupportedMappingSymbol(
+                String::new(),
+            )))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 fn idiom_name(idiom: Idiom) -> &'static str {
@@ -190,6 +205,7 @@ fn refusal_name(reason: &Refusal) -> &'static str {
         Refusal::LiteralInsideSequence => "literal-inside-the-sequence",
         Refusal::AddressedData => "addressed-data-inside-the-sequence",
         Refusal::NoMappingSymbols => "no-mapping-symbols",
+        Refusal::UnsupportedMappingSymbol(_) => "unsupported-mapping-symbol",
     }
 }
 
@@ -200,6 +216,10 @@ fn refusal_detail(reason: &Refusal) -> String {
                                       ($x, $d); --rewrite-exclusives-stripped=heuristic would \
                                       rewrite it by the stripped-file heuristic"
             .to_string(),
+        Refusal::UnsupportedMappingSymbol(name) => format!(
+            "unsupported-mapping-symbol: `{name}` marks this section, and only `$x` and `$d` \
+             prove where code is"
+        ),
         other => refusal_name(other).to_string(),
     }
 }
@@ -327,15 +347,23 @@ pub fn rewrite_bytes(
                             .collect()
                     });
                 let held = evidence.classify(index, sh.sh_addr, sh.sh_size);
-                // Only mapping symbols prove where code is; by default a
-                // section they do not mark is not read for code at all.
-                let unproven = stripped == StrippedRewrite::Refuse
-                    && held.evidence != Some(mapping::Evidence::MappingSymbols);
+                // Only `$x` and `$d` prove where code is. A section that also
+                // holds a mapping symbol of another kind is not read for code
+                // under either policy, and by default neither is a section no
+                // mapping symbol marks.
+                let unproven = match evidence.unsupported_in(index) {
+                    Some(name) => Some(Refusal::UnsupportedMappingSymbol(name.to_owned())),
+                    None => (stripped == StrippedRewrite::Refuse
+                        && held.evidence != Some(mapping::Evidence::MappingSymbols))
+                    .then_some(Refusal::NoMappingSymbols),
+                };
                 // Under the unwind table alone, code is what control can
                 // reach from the functions' entries: a table a function
                 // branches over, or keeps after its return, is not.
                 let (code, unknown) = match (&words, held.evidence) {
-                    _ if unproven => (Vec::new(), vec![(sh.sh_addr, sh.sh_addr + sh.sh_size)]),
+                    _ if unproven.is_some() => {
+                        (Vec::new(), vec![(sh.sh_addr, sh.sh_addr + sh.sh_size)])
+                    }
                     (Some(words), Some(mapping::Evidence::UnwindTable)) => {
                         let entries = evidence.unwind_entries(sh.sh_addr, sh.sh_size);
                         // Which of those functions can come back, so that a
@@ -515,7 +543,7 @@ pub fn rewrite_bytes(
         // Nothing proves this section's code, so nothing in it is rewritten:
         // each sequence the planner finds is named as left alone for that
         // reason, whatever else it would have said of it.
-        if unproven {
+        if let Some(reason) = unproven {
             let plan = rewrite::plan_with_external_targets(&words, vaddr, &external_targets);
             report.exclusive_instructions += plan.exclusive_instructions;
             let mut sites: Vec<u64> = plan
@@ -526,13 +554,8 @@ pub fn rewrite_bytes(
                 .collect();
             sites.sort_unstable();
             for addr in sites {
-                *report
-                    .refused
-                    .entry(refusal_name(&Refusal::NoMappingSymbols))
-                    .or_default() += 1;
-                report
-                    .refused_sites
-                    .push((addr, refusal_detail(&Refusal::NoMappingSymbols)));
+                *report.refused.entry(refusal_name(&reason)).or_default() += 1;
+                report.refused_sites.push((addr, refusal_detail(&reason)));
             }
             continue;
         }
@@ -615,9 +638,10 @@ struct Section {
     words: Option<Vec<u32>>,
     /// What its code was found by; `None` when nothing speaks for it.
     evidence: Option<mapping::Evidence>,
-    /// Whether it is left alone because no mapping symbol marks it, under
-    /// [`StrippedRewrite::Refuse`].
-    unproven: bool,
+    /// Why it is left alone without being read for code, if it is: no
+    /// mapping symbol marks it, under [`StrippedRewrite::Refuse`], or it
+    /// holds a mapping symbol that is neither `$x` nor `$d`.
+    unproven: Option<Refusal>,
     /// Its code, as sorted, disjoint address ranges.
     code: Vec<(u64, u64)>,
     /// Its bytes neither known code nor marked data, likewise.
@@ -1370,6 +1394,52 @@ mod tests {
         assert_eq!(report.patched_total(), 1, "{report:?}");
         assert_eq!(report.unmarked(), 0, "{report:?}");
         assert_ne!(heuristic, image);
+    }
+
+    /// A mapping symbol that is neither `$x` nor `$d` -- AArch32's `$a` or
+    /// `$t`, an unknown `$q`, or `$xyz` and `$dx`, which only look like them
+    /// -- after a valid `$x` leaves its section unproven under either policy:
+    /// every loop in it is left alone as `unsupported-mapping-symbol`, naming
+    /// the symbol. A suffixed `$x.f` still proves the code after it, and a
+    /// `$d` makes it data.
+    #[test]
+    fn an_unsupported_mapping_symbol_leaves_its_section_unproven() {
+        let words: Vec<u32> = LOOP.iter().chain(LOOP.iter()).copied().collect();
+        let named = |name: &[u8]| {
+            let mut image = elf_image(&words, Some(&[(1, 0, true), (1, 6, false)]));
+            let strtab = b"\0$x\0$d\0abort\0";
+            let at = image
+                .windows(strtab.len())
+                .position(|window| window == strtab)
+                .unwrap();
+            // The second mark's name is the one at offset 4.
+            image[at + 4..at + 4 + name.len()].copy_from_slice(name);
+            image
+        };
+        for name in [&b"$a\0"[..], b"$t\0", b"$q\0", b"$xyz\0", b"$dx\0"] {
+            let shown = std::str::from_utf8(&name[..name.len() - 1]).unwrap();
+            let image = named(name);
+            for stripped in [StrippedRewrite::Refuse, StrippedRewrite::Heuristic] {
+                let (bytes, report) = rewritten_with(&image, stripped);
+                assert_eq!(bytes, image, "{shown} under {stripped:?}");
+                assert_eq!(report.unsupported(), 2, "{shown}: {report:?}");
+                let why = format!("unsupported-mapping-symbol: `{shown}` marks this section");
+                assert!(
+                    report
+                        .refused_sites
+                        .iter()
+                        .all(|(_, detail)| detail.starts_with(&why)),
+                    "{report:?}"
+                );
+            }
+        }
+        let patched = |name: &[u8]| {
+            rewritten_with(&named(name), StrippedRewrite::Refuse)
+                .1
+                .patched_total()
+        };
+        assert_eq!(patched(b"$d\0"), 1);
+        assert_eq!(patched(b"$x.f\0"), 2);
     }
 
     /// A file mapping symbols mark is rewritten by default exactly as the

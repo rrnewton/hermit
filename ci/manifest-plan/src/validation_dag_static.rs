@@ -2011,7 +2011,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // function's entry): 1271, listed.
     // And the stripped-file default and opt-in (nine units): 1280, listed.
     // And the shared-cache unit: 1281, listed.
-    ("test.hermit_unit", 1281),
+    // And the two unsupported-mapping-symbol units: 1283, listed.
+    ("test.hermit_unit", 1283),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6285,7 +6286,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same third round: 1265, listed.
     // The same nine stripped-file units as test.hermit_unit: 1274, listed.
     // And the shared-cache unit: 1275, listed.
-    ("test.hermit_unit_on_host", 1275),
+    // And the two unsupported-mapping-symbol units: 1277, listed.
+    ("test.hermit_unit_on_host", 1277),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

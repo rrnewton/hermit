@@ -426,10 +426,11 @@ pub struct Config {
     #[clap(skip)]
     pub rewrite_exclusives_stripped_heuristic: bool,
 
-    /// aarch64: the files the run's `--rewrite-exclusives` left unchanged
-    /// because they have no ARM mapping symbols, under the default
-    /// (`--rewrite-exclusives-stripped=refuse`). The CLI sets it; the run names
-    /// them in its summary.
+    /// aarch64: the files the run's `--rewrite-exclusives` left unchanged,
+    /// wholly or in part, because no mapping symbol it accepts marks their
+    /// code: none, under the default (`--rewrite-exclusives-stripped=refuse`),
+    /// or one that is neither `$x` nor `$d`, under either policy. The CLI sets
+    /// it; the run names them in its summary.
     #[serde(default)]
     #[clap(skip)]
     pub rewrite_exclusives_unmarked: Vec<std::path::PathBuf>,
