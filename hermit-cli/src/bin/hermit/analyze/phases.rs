@@ -39,7 +39,6 @@ use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
-use crate::app::analyze::types::TrialTimeout;
 use crate::app::container::RunTimeoutMarker;
 use crate::app::global_opts::GlobalOpts;
 use crate::app::logdiff::LogDiffCLIOpts;
