@@ -90,7 +90,7 @@ mod tests {
     /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
     /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
     /// with its row. Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[28, 29, 30, 31, 32, 33];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -223,6 +223,11 @@ mod tests {
         // image returns it (the release-05 pidfd pair, renumbered to 27 at
         // its rebase onto C2's 25 and 26; digest measured at this head).
         (27, "74ceb8dd663f2297", "f013e36743d8d9e6"),
+        // PR #4907's in-memory exclusive-rewrite marker on the global state
+        // (allocated 34 at this rebase: 27 is main's pidfd revision, and
+        // 28-33 are reserved for PRs #4789, #4884, #4728, #4867, #4885
+        // and #4909, none on this base yet).
+        (34, "05a9f7a4ca16cde1", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

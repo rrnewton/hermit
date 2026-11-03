@@ -81,9 +81,9 @@ mod record_envelope;
 mod record_start;
 mod remove;
 mod replay;
-mod rewrite_exclusives;
 #[cfg(test)]
 mod replay_departure_classification_tests;
+mod rewrite_exclusives;
 // The library root owns the shared fixture module; the app is now a module of
 // that library, so it uses the same instance rather than loading it again.
 #[cfg(test)]
@@ -235,7 +235,6 @@ use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 
 use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
-use self::rewrite_exclusives::RewriteExclusivesOpts;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
 use self::container::LogCapExceeded;
@@ -250,6 +249,7 @@ use self::logdiff::LogDiffCLIOpts;
 use self::oci::OciOpts;
 use self::record::RecordOpts;
 use self::replay::ReplayOpts;
+use self::rewrite_exclusives::RewriteExclusivesOpts;
 use self::run::GuestProgramFault;
 use self::run::RunOpts;
 use self::strace::StraceOpts;
