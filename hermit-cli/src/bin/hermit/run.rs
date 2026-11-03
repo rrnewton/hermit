@@ -11847,11 +11847,17 @@ impl RunOpts {
                      backend `{adapter}`, whose syscall interception it has not been checked \
                      against"
                 );
-            } else if self.namespace_only || backend != Backend::Ptrace {
+            } else if self.namespace_only {
                 Some(
                     "a backend other than ptrace, whose syscall interception it has not been \
                      checked against",
                 )
+            } else if let Err(refusal) =
+                hermit::untrap_passthrough_backend_admission(config, backend)
+            {
+                // KVM, LiteInst or in-guest-trap. The rule and its message are
+                // the library's, which every launch checks again.
+                return Err(Error::new(refusal));
             } else if let Err(refusal @ detcore::UntrapPassthroughRefusal::PreemptionRecord) =
                 detcore::untrap_passthrough_admission(config)
             {
@@ -11863,7 +11869,10 @@ impl RunOpts {
                 // Detcore's, which every launch checks again.
                 return Err(Error::new(refusal));
             } else if self.happens_before.is_some() {
-                Some("--happens-before, whose syscall anchors count the calls it untraps")
+                // Resolved into the configuration only at launch, so asked
+                // here by the option; Detcore's admission refuses the resolved
+                // program again with the same message.
+                return Err(Error::new(detcore::UntrapPassthroughRefusal::HappensBefore));
             } else if self.verify_run.is_some() {
                 Some("--verify-run, whose record does not say the calls were untrapped")
             } else {

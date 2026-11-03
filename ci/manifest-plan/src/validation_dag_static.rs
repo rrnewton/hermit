@@ -1267,7 +1267,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's untrap_passthrough_syscalls_is_opt_in_and_round_trips and
     // untrap_passthrough_syscalls_never_enters_the_legacy_form: 1973 + 2 = 1975, listed.
     // Rebased onto main 77be1fd09: 1951 + 2 = 1953.
-    ("test.regular_crates", 1953),
+    // And hermit-run-kvm's untrapping_is_refused_before_the_backend_runs: 1953 + 1 = 1954.
+    ("test.regular_crates", 1954),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1986,7 +1987,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the same pull request's post-facto review): 1337 + 1 = 1338.
     // Rebased onto main 77be1fd09: 1241 + 1 = 1242.
     // And untrap_passthrough_syscalls_is_not_qualified_for_executable_selected_backends: 1242 + 1 = 1243.
-    ("test.hermit_unit", 1243),
+    // And the_library_entry_points_refuse_untrapping_off_ptrace_and_with_happens_before: 1243 + 1 = 1244.
+    ("test.hermit_unit", 1244),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5319,7 +5321,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
     // The same two --untrap-passthrough-syscalls detcore-model units: 1959 + 2 = 1961.
     // Rebased onto main 77be1fd09: 1937 + 2 = 1939.
-    ("test.regular_crates_on_host", 1939),
+    // And the same hermit-run-kvm unit: 1939 + 1 = 1940.
+    ("test.regular_crates_on_host", 1940),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6314,7 +6317,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same library-entry unit: 1331 + 1 = 1332.
     // Rebased onto main 77be1fd09: 1235 + 1 = 1236.
     // And the same adapter refusal case: 1236 + 1 = 1237.
-    ("test.hermit_unit_on_host", 1237),
+    // And the same library untrap refusal case: 1237 + 1 = 1238.
+    ("test.hermit_unit_on_host", 1238),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6555,7 +6559,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
     // And the same two --untrap-passthrough-syscalls detcore-model units: 1959 + 2 = 1961, listed.
     // Rebased onto main 77be1fd09: 1937 + 2 = 1939.
-    ("test.regular_crates_on_host", 1939),
+    // And the same hermit-run-kvm unit: 1939 + 1 = 1940.
+    ("test.regular_crates_on_host", 1940),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
