@@ -33,6 +33,7 @@ use reverie::process::Output;
 use crate::app::analyze::consts::*;
 use crate::app::analyze::rundata::RunData;
 use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::analyze::types::ContinuationTimeslice;
 use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
@@ -47,9 +48,6 @@ use crate::app::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
 use crate::app::schedule_search::NoSingleSwap;
 use crate::app::schedule_search::TrialOutcome;
 use crate::app::schedule_search::search_for_critical_schedule;
-use crate::app::analyze::rundata::TrialEnd;
-use crate::app::analyze::types::ContinuationTimeslice;
->>>>>>> ff512c26c4f (Adopt main's completed-outcome rule for the continuation's endpoint trials)
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
