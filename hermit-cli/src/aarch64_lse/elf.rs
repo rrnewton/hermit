@@ -34,24 +34,36 @@
 //!   taken for code.
 //! - The unwind table alone (a section without mapping symbols, as in every
 //!   stripped file): what control reaches from the entries of the functions
-//!   its FDEs describe, following direct branches and taking every call to
-//!   return. An FDE covers its whole function, so a table the function
-//!   branches over, or keeps after a return, is not reached. A table after a
-//!   call that does not return is reached that way, so whatever the code
-//!   addresses as data (an `LDR` (literal), `ADR` or `ADRP` target) is taken
-//!   for data from there to the next instruction a branch reaches, or the
+//!   its FDEs describe, following direct branches. A call falls through
+//!   only where the callee can be shown to come back: a function here whose
+//!   own body reaches a `RET`, or which tail-calls one that does, worked out
+//!   over all of them until the answer stops growing; a function the image
+//!   names as one that never returns (`exit`, `abort`, a panic entry point,
+//!   reached directly or through its procedure linkage table entry) never
+//!   does. An FDE covers its whole function, so a table the function
+//!   branches over, keeps after a return, or places after a call that does
+//!   not come back is not reached at all.
+//!
+//!   On top of that, whatever the code addresses as data (an `LDR`
+//!   (literal), `ADR` or `ADRP` target, each completion of one `ADRP` being
+//!   followed through an `ADD` into its own register) is taken for data
+//!   from that address to the next instruction a branch reaches, or the
 //!   function's end, and no sequence over it is rewritten
-//!   (`addressed-data-inside-the-sequence`). A pointer the image stores to
-//!   such a table counts as well: a dynamic
-//!   relocation's address, a plain word of a loaded, non-executable section
-//!   in an executable with fixed addresses, or a symbol naming data in an
-//!   executable section. Two things are still taken for code wrongly. Data
-//!   neither the code addresses nor a stored pointer names, which would
-//!   need an address computed from an unrelated base to read. And the rest
-//!   of a table whose first word a branch could reach: a data word before
-//!   the field the code addresses can decode as a branch into the table,
-//!   and the next such target ends the data, so the words after it are read
-//!   as code again.
+//!   (`addressed-data-inside-the-sequence`). An `ADRP` nothing completes
+//!   gives only its page, and every function that page overlaps is taken
+//!   for data. A pointer the image stores to such a table counts as well: a
+//!   dynamic relocation's address, a plain word of a loaded, non-executable
+//!   section in an executable with fixed addresses, or a symbol naming data
+//!   in an executable section.
+//!
+//!   Three things can still be taken for code wrongly, each needing data
+//!   that nothing in the image points at. Data after a call to an imported
+//!   function that never returns and is not among the names this reader
+//!   knows. Data an unresolved `ADRP`'s completion would reach beyond its
+//!   own page (a scaled load reaches 64 KiB, an `ADD` with `LSL #12` reaches
+//!   16 MiB). And the rest of a table whose first word a branch could reach:
+//!   a data word before the field the code addresses can decode as a branch
+//!   into the table, and the next such target ends the data.
 //! - Neither: nothing. Such a section is left alone and reported, and so is
 //!   a whole file with neither mapping symbols nor an unwind table.
 //!
@@ -228,6 +240,8 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             return skip_file("the file has no section headers, so code cannot be told from data");
         }
         let evidence = file_code_evidence(bytes, &elf);
+        // Where a call never comes back ([`never_returning_targets`]).
+        let never_back = never_returning_targets(bytes, &elf);
         if evidence.symbols.is_empty() && evidence.unwind.is_none() {
             return skip_file(
                 "the file has neither mapping symbols ($x, $d) nor an unwind table (.eh_frame), \
@@ -266,11 +280,28 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                 // branches over, or keeps after its return, is not.
                 let (code, unknown) = match (&words, held.evidence) {
                     (Some(words), Some(mapping::Evidence::UnwindTable)) => {
+                        let entries = evidence.unwind_entries(sh.sh_addr, sh.sh_size);
+                        // Which of those functions can come back, so that a
+                        // call to one that cannot (an exit or abort helper)
+                        // does not make the bytes after it code.
+                        let bounds: Vec<(u64, u64)> = evidence
+                            .unwind
+                            .iter()
+                            .flatten()
+                            .filter(|(entry, _)| entries.contains(entry))
+                            .copied()
+                            .collect();
+                        let returning = mapping::returning_functions(words, sh.sh_addr, &bounds);
+                        // A call out of this section, to a function no FDE
+                        // here describes, is taken to return: the ABI's
+                        // ordinary case, unless the image names it as one
+                        // that never does.
+                        let returns = |target: u64| {
+                            !never_back.contains(&target)
+                                && (!entries.contains(&target) || returning.contains(&target))
+                        };
                         let code = mapping::reachable_code(
-                            words,
-                            sh.sh_addr,
-                            &held.code,
-                            &evidence.unwind_entries(sh.sh_addr, sh.sh_size),
+                            words, sh.sh_addr, &held.code, &entries, &returns,
                         );
                         let unknown = complement(&code, sh.sh_addr, sh.sh_addr + sh.sh_size);
                         (code, unknown)
@@ -323,6 +354,7 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     // taken for data from there to the next instruction a branch reaches
     // (`mapping::data_extents`), and no sequence over it is rewritten.
     let extents = {
+        let mut pages: Vec<u64> = Vec::new();
         let mut starts = Vec::new();
         let mut branches = Vec::new();
         for section in &sections {
@@ -332,7 +364,11 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             for (start, end) in &section.code {
                 let first = ((start - section.vaddr) / 4) as usize;
                 let last = (((end - section.vaddr) / 4) as usize).min(words.len());
-                starts.extend(mapping::addressed_starts(&words[first..last], *start));
+                let addressed = mapping::addressed_starts(&words[first..last], *start);
+                starts.extend(addressed.starts);
+                // An `ADRP` this reader cannot complete names only a page.
+                // Every function that page overlaps may hold the data.
+                pages.extend(addressed.unresolved);
                 branches.extend(mapping::direct_branches(&words[first..last], *start));
             }
         }
@@ -346,7 +382,29 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
         };
         starts.extend(pointers.iter().copied());
         starts.retain(unwind_only);
-        mapping::data_extents(&starts, &functions, &branches)
+        // Whole functions the unresolved pages overlap, as data: their
+        // address is somewhere in the page, and which function holds it is
+        // not known.
+        let mut extents = mapping::data_extents(&starts, &functions, &branches);
+        pages.sort_unstable();
+        pages.dedup();
+        for page in pages {
+            // `functions` is sorted by entry, so only the ones starting
+            // before the page ends can overlap it, and of those only the
+            // last few reach into it.
+            let before = functions.partition_point(|(entry, _)| *entry < page + PAGE);
+            extents.extend(
+                functions[..before]
+                    .iter()
+                    .rev()
+                    .take_while(|(_, end)| *end > page)
+                    .filter(|(entry, _)| unwind_only(entry))
+                    .copied(),
+            );
+        }
+        extents.sort_unstable();
+        extents.dedup();
+        extents
     };
     let mut report = FileReport::default();
     if relr_unreadable {
@@ -497,6 +555,139 @@ fn is_exclusive(word: u32) -> bool {
         insn::decode(word),
         insn::Insn::LoadExcl { .. } | insn::Insn::StoreExcl { .. } | insn::Insn::ExclPair
     )
+}
+
+/// The names of functions that never return to their caller: a call to one
+/// of these ends its path, whatever the unwind table says of the bytes
+/// after it. The C library's and C++ runtime's exits, aborts and throws.
+const NEVER_RETURNS: [&str; 26] = [
+    "exit",
+    "_exit",
+    "_Exit",
+    "quick_exit",
+    "abort",
+    "pthread_exit",
+    "longjmp",
+    "_longjmp",
+    "siglongjmp",
+    "__longjmp_chk",
+    "__assert_fail",
+    "__assert_perror_fail",
+    "__stack_chk_fail",
+    "__fortify_fail",
+    "__chk_fail",
+    "err",
+    "errx",
+    "verr",
+    "verrx",
+    "__cxa_throw",
+    "__cxa_rethrow",
+    "__cxa_bad_cast",
+    "__cxa_bad_typeid",
+    "__cxa_throw_bad_array_new_length",
+    "_Unwind_Resume",
+    "_ZSt9terminatev",
+];
+
+/// Name prefixes of the same, for symbols whose names carry a mangled
+/// path: Rust's panic entry points, in both mangling schemes.
+const NEVER_RETURNS_PREFIXES: [&str; 6] = [
+    "_ZN4core9panicking",
+    "_ZN3std9panicking11begin_panic",
+    "_ZN4core6option13expect_failed",
+    "_ZN4core6result13unwrap_failed",
+    "rust_panic",
+    "__rust_start_panic",
+];
+
+/// Whether `name` is a function that never returns.
+fn never_returns(name: &str) -> bool {
+    NEVER_RETURNS.contains(&name)
+        || NEVER_RETURNS_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        // Rust's v0 mangling, whose paths carry the crate and module.
+        || (name.starts_with("_R") && name.contains("9panicking"))
+}
+
+/// The addresses a call to which never comes back: the functions
+/// [`never_returns`] names, wherever the image says they are. A symbol
+/// defined here gives its own address; an imported one is reached through
+/// its procedure linkage table entry, so each entry's `ADRP`+`LDR` of a
+/// global offset table slot is matched with the `R_AARCH64_JUMP_SLOT`
+/// relocation that fills that slot, which names the symbol.
+///
+/// A symbol this does not know is taken to return, the ordinary case; the
+/// residual is an imported function that never returns and is not named
+/// above.
+fn never_returning_targets(bytes: &[u8], elf: &Elf<'_>) -> std::collections::HashSet<u64> {
+    const R_AARCH64_JUMP_SLOT: u32 = 1026;
+    let named = |name: &str| never_returns(name);
+    let mut targets: std::collections::HashSet<u64> = elf
+        .dynsyms
+        .iter()
+        .filter(|symbol| symbol.st_value != 0)
+        .filter(|symbol| elf.dynstrtab.get_at(symbol.st_name).is_some_and(named))
+        .map(|symbol| symbol.st_value)
+        .chain(
+            elf.syms
+                .iter()
+                .filter(|symbol| symbol.st_value != 0)
+                .filter(|symbol| elf.strtab.get_at(symbol.st_name).is_some_and(named))
+                .map(|symbol| symbol.st_value),
+        )
+        .collect();
+    let slots: std::collections::HashSet<u64> = elf
+        .pltrelocs
+        .iter()
+        .filter(|reloc| reloc.r_type == R_AARCH64_JUMP_SLOT)
+        .filter(|reloc| {
+            elf.dynsyms
+                .get(reloc.r_sym)
+                .and_then(|symbol| elf.dynstrtab.get_at(symbol.st_name))
+                .is_some_and(named)
+        })
+        .map(|reloc| reloc.r_offset)
+        .collect();
+    if slots.is_empty() {
+        return targets;
+    }
+    for sh in elf
+        .section_headers
+        .iter()
+        .filter(|sh| sh.sh_flags & u64::from(section_header::SHF_EXECINSTR) != 0)
+    {
+        let start = sh.sh_offset as usize;
+        let Some(words) = usize::try_from(sh.sh_size)
+            .ok()
+            .and_then(|size| bytes.get(start..start.checked_add(size)?))
+            .filter(|_| sh.sh_offset.is_multiple_of(4) && sh.sh_addr.is_multiple_of(4))
+            .map(|section| {
+                section
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| u32::from_le_bytes(*word))
+                    .collect::<Vec<u32>>()
+            })
+        else {
+            continue;
+        };
+        for (index, word) in words.iter().enumerate() {
+            // An entry starts at its `ADRP`, and the slot it loads is
+            // where the pairing puts it.
+            if word & 0x9F00_0000 != 0x9000_0000 {
+                continue;
+            }
+            let at = sh.sh_addr + 4 * index as u64;
+            let reach = words.len().min(index + 4);
+            let addressed = mapping::addressed_starts(&words[index..reach], at);
+            if addressed.starts.iter().any(|slot| slots.contains(slot)) {
+                targets.insert(at);
+            }
+        }
+    }
+    targets
 }
 
 /// The addresses pointers stored in the image hold that fall strictly
@@ -679,6 +870,10 @@ fn refuse_literals(plan: &mut rewrite::Report, targets: &[(u64, u64)]) {
         }
     }
 }
+
+/// The page an `ADRP` names, and so what an unresolved one bounds, less
+/// what a completion could add to it.
+const PAGE: u64 = 4096;
 
 /// Refuse, for `reason`, each rewrite whose sequence overlaps one of
 /// `ranges` (sorted, disjoint).
@@ -868,7 +1063,7 @@ mod tests {
         const TEXT: usize = 0x100;
         let text_len = 4 * words.len();
         let shstrtab = b"\0.text\0.shstrtab\0.symtab\0.strtab\0.eh_frame\0";
-        let strtab = b"\0$x\0$d\0";
+        let strtab = b"\0$x\0$d\0abort\0";
         let symbols: Vec<[u8; 24]> = marks
             .unwrap_or_default()
             .iter()
@@ -1331,7 +1526,7 @@ mod tests {
             let mut words = words;
             words[..2].copy_from_slice(&addressing);
             assert_eq!(
-                mapping::addressed_starts(&words[..3], 0x100),
+                mapping::addressed_starts(&words[..3], 0x100).starts,
                 vec![0x10c],
                 "{how} addresses the table"
             );
@@ -1339,23 +1534,26 @@ mod tests {
             let (bytes, report) = rewritten(&image);
             assert_eq!(bytes, image, "{how}: the table is untouched");
             assert_eq!(report.patched_total(), 0, "{how}: {report:?}");
-            assert_eq!(
-                report.refused,
-                BTreeMap::from([("addressed-data-inside-the-sequence", 1)]),
-                "{how}: {report:?}"
-            );
+            // The callee traps, so nothing reaches the table at all; what
+            // addresses it would refuse it in any case.
+            assert_eq!(report.exclusive_instructions, 0, "{how}: {report:?}");
             // Marked as code, the same words are rewritten: only the unwind
             // table's weaker evidence needs this.
             let marked = elf_image(&words, Some(&[(1, 0, true)]));
             assert_eq!(rewritten(&marked).1.patched_total(), 1, "{how}");
         }
-        // A table the code does not address at all is still reached through
-        // the call, which is the limit stated in this module's
-        // documentation.
+        // Nor is a table the code does not address, now that the call to
+        // a function that cannot return does not fall through.
         let mut unaddressed = words;
         unaddressed[0] = 0xd503_201f;
         unaddressed[1] = 0xd503_201f;
         let image = elf_image_with(&unaddressed, None, Some(&[(0, 9), (9, 10)]));
+        assert_eq!(rewritten(&image).1.patched_total(), 0);
+        // A call to a function that does return falls through as before:
+        // the same file with the callee returning rewrites the loop.
+        let mut returning = unaddressed;
+        returning[9] = 0xd65f_03c0; // ret in place of the trap
+        let image = elf_image_with(&returning, None, Some(&[(0, 9), (9, 10)]));
         assert_eq!(rewritten(&image).1.patched_total(), 1);
     }
 
@@ -1377,18 +1575,14 @@ mod tests {
         words[12] = 0xd65f_03c0; // ret
         words[13] = 0xd420_0000; // brk
         assert_eq!(
-            mapping::addressed_starts(&words[..3], 0x100),
+            mapping::addressed_starts(&words[..3], 0x100).starts,
             vec![0x114, 0x120],
             "both completions of the one ADRP"
         );
         let image = elf_image_with(&words, None, Some(&[(0, 13), (13, 14)]));
         let (bytes, report) = rewritten(&image);
         assert_eq!(bytes, image, "{report:?}");
-        assert_eq!(
-            report.refused,
-            BTreeMap::from([("addressed-data-inside-the-sequence", 1)]),
-            "{report:?}"
-        );
+        assert_eq!(report.patched_total(), 0, "{report:?}");
     }
 
     /// Only a local, untyped symbol is a mapping symbol: an ordinary global
@@ -1470,6 +1664,66 @@ mod tests {
         let mut entry = elf_image_full(&words, None, Some(&functions), &[0]);
         entry[16..18].copy_from_slice(&2u16.to_le_bytes());
         assert_eq!(rewritten(&entry).1.patched_total(), 1);
+    }
+
+    /// A call to a function the image names as one that never returns ends
+    /// its path, so a table after it is not reached. Here the callee is a
+    /// local symbol named `abort`, which is what a stripped library's
+    /// imported one is through its procedure linkage table.
+    #[test]
+    fn a_call_to_a_function_that_never_returns_does_not_fall_through() {
+        // bl <word 6>; the loop-shaped table; ret; the callee, which
+        // returns, so only its name keeps the table from being code.
+        let mut words = [0u32; 8];
+        words[0] = 0x9400_0006; // bl <word 6>
+        words[1..5].copy_from_slice(&[0x885f_fc08, 0x1100_0508, 0x8809_fc08, 0x35ff_ffa9]);
+        words[5] = 0xd65f_03c0; // ret
+        words[6] = 0xd65f_03c0; // the callee: ret
+        words[7] = 0xd503_201f;
+        let functions = [(0, 6), (6, 8)];
+        // A mark at the callee, which the lines below turn into the
+        // symbol that names it.
+        let image = elf_image_with(
+            &words,
+            Some(&[(1, 0, true), (1, 6, true)]),
+            Some(&functions),
+        );
+        // With mapping symbols the table is code, which is the control
+        // for the fixture itself.
+        assert_eq!(rewritten(&image).1.patched_total(), 1);
+
+        // The same words with no mapping symbols: the unwind table alone
+        // speaks, and the callee returns, so the table is reached.
+        let unnamed = elf_image_with(&words, None, Some(&functions));
+        assert_eq!(rewritten(&unnamed).1.patched_total(), 1);
+
+        // Now name the callee `abort`: a global function symbol at its
+        // address, in a file with no mapping symbols.
+        let mark = mapping::tests::symbol(1, 0, 1, 0x100 + 4 * 6);
+        let at = image
+            .windows(mark.len())
+            .position(|window| window == mark)
+            .expect("the mark is in the symbol table");
+        let mut named = image.clone();
+        // Name index 7 is "abort" in the builder's string table; STT_FUNC
+        // with a global binding, as an ordinary symbol is.
+        named[at..at + mark.len()].copy_from_slice(&mapping::tests::symbol(
+            7,
+            0x12,
+            1,
+            0x100 + 4 * 6,
+        ));
+        // And drop the section's other mapping symbol, so only the unwind
+        // table tells its code from its data.
+        let text = mapping::tests::symbol(1, 0, 1, 0x100);
+        let at = named
+            .windows(text.len())
+            .position(|window| window == text)
+            .expect("the first mark is in the symbol table");
+        named[at..at + text.len()].copy_from_slice(&[0u8; 24]);
+        let (bytes, report) = rewritten(&named);
+        assert_eq!(bytes, named, "{report:?}");
+        assert_eq!(report.patched_total(), 0, "{report:?}");
     }
 
     /// A relocatable object's FDE starts are relocations to fill, so its
