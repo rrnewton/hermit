@@ -3298,7 +3298,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main ffe313b16: 3414 + 1 = 3415.
     // Rebased onto main fbf9d5f0c: 3458 + 1 = 3459.
     // Rebased onto main fcd62385f: 3465 + 20 = 3485.
-    ("test.detcore_unit", 3485),
+    // And post_crash's two reused-process-ID tests (revcodex3 F2 on
+    // https://github.com/rrnewton/hermit/pull/4867): 3485 + 2 = 3487.
+    ("test.detcore_unit", 3487),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3410,7 +3412,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // lineage beside another crash; each crashing trial switches; an abort
     // inside a fault handler switches at once): 218.
     // Rebased onto main ffe313b16: 209 + 10 = 219.
-    ("test.detcore_misc", 219),
+    // And post_crash's two terminal-edge negative cases (a killed
+    // handler's and an exited leader's descendant execs; revcodex3 F1):
+    // 219 + 2 = 221.
+    ("test.detcore_misc", 221),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5482,7 +5487,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seventeen SCM_RIGHTS queue tests: 191 + 17 = 208.
     // And the same ten post-crash switch tests: 218.
     // Rebased onto main ffe313b16: 209 + 10 = 219.
-    ("test.detcore_misc_on_host", 219),
+    // And the same two terminal-edge negative cases: 219 + 2 = 221.
+    ("test.detcore_misc_on_host", 221),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5938,7 +5944,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main ffe313b16: 3414 + 1 = 3415.
     // Rebased onto main fbf9d5f0c: 3458 + 1 = 3459.
     // Rebased onto main fcd62385f: 3465 + 20 = 3485.
-    ("test.detcore_unit_on_host", 3485),
+    // And the same two reused-process-ID tests: 3485 + 2 = 3487.
+    ("test.detcore_unit_on_host", 3487),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
