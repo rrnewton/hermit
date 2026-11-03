@@ -2006,7 +2006,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And one for a table a stored pointer names: 1268, listed.
     // And the reader's second round (a call that never returns, an `ADD`
     // into the `ADRP` base, an unresolved `ADRP`): 1269, listed.
-    ("test.hermit_unit", 1269),
+    // And its third round (the never-returning names, a pointer to a
+    // function's entry): 1271, listed.
+    ("test.hermit_unit", 1271),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6274,7 +6276,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same store-pairing unit: 1261, listed.
     // And the same stored-pointer unit: 1262, listed.
     // And the same second round: 1263, listed.
-    ("test.hermit_unit_on_host", 1263),
+    // And the same third round: 1265, listed.
+    ("test.hermit_unit_on_host", 1265),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

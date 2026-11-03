@@ -182,7 +182,8 @@ impl CodeEvidence {
 /// Which of `functions` (sorted by entry, as the FDEs give them) can
 /// return, by [`can_return`] over and over until the answer stops
 /// growing: a function returns if a `RET` is reachable in it, and a call
-/// it makes comes back only if that callee is already known to return.
+/// it makes comes back only if that callee is already known to return and
+/// `never` does not name it as one that cannot.
 /// Each round can only add functions, so a few settle it; the bound keeps
 /// a deep chain from costing more than it is worth, and stopping early
 /// leaves a function unproven, which is the safe side.
@@ -190,6 +191,7 @@ pub fn returning_functions(
     words: &[u32],
     base: u64,
     functions: &[(u64, u64)],
+    never: &dyn Fn(u64) -> bool,
 ) -> std::collections::HashSet<u64> {
     // Chains deeper than this stay unproven.
     const ROUNDS: usize = 8;
@@ -199,10 +201,11 @@ pub fn returning_functions(
         // A call out of this section is taken to return, the ordinary
         // case; one to a function here only where it is already proven.
         let returns = |target: u64| {
-            known.contains(&target)
-                || functions
-                    .binary_search_by_key(&target, |(entry, _)| *entry)
-                    .is_err()
+            !never(target)
+                && (known.contains(&target)
+                    || functions
+                        .binary_search_by_key(&target, |(entry, _)| *entry)
+                        .is_err())
         };
         let grown: Vec<u64> = functions
             .iter()
@@ -220,8 +223,13 @@ pub fn returning_functions(
 
 /// Whether the function `function` (its entry and end, as an FDE gives
 /// them) can return: walking its own words from its entry, some
-/// instruction it reaches is a `RET`, or a direct branch out of it (a tail
-/// call) goes to a function that `returns` says comes back. A function
+/// instruction it reaches is a `RET X30`, or a direct branch out of it (a
+/// tail call) goes to a function that `returns` says comes back. A `RET`
+/// through another register is not a return to this function's caller, and
+/// an `SVC` proves nothing past it, since what the kernel does with it is
+/// not in the file. What this does not check is a write to `X30` before a
+/// `RET X30`, so a function that returns somewhere else through a changed
+/// link register is taken to return to its caller. A function
 /// whose entry is outside `words` is taken to return, which is the
 /// ordinary case for a call out of the section. A function whose every path ends in
 /// a trap or in a syscall that does not come back (an exit or abort
@@ -232,7 +240,12 @@ pub fn can_return(
     function: (u64, u64),
     returns: &dyn Fn(u64) -> bool,
 ) -> bool {
-    const RET: u32 = 0xD65F_0000;
+    // `RET X30`: a return through another register is not a return to
+    // this function's caller.
+    const RET_X30: u32 = 0xD65F_03C0;
+    // `SVC #0`: what the kernel does with it is not in the file, so
+    // nothing past it is proof of anything.
+    const SVC: u32 = 0xD400_0001;
     let (entry, end) = function;
     let index = |addr: u64| -> Option<usize> {
         (entry..end)
@@ -250,8 +263,11 @@ pub fn can_return(
     while let Some(mut at) = pending.pop() {
         while !seen[at - first] {
             seen[at - first] = true;
-            if words[at] & 0xFFFF_FC1F == RET {
+            if words[at] == RET_X30 {
                 return true;
+            }
+            if words[at] == SVC {
+                break;
             }
             let pc = base + 4 * at as u64;
             let (falls_through, target) = flow(words[at], pc);
@@ -718,14 +734,20 @@ pub fn addressed_starts(words: &[u32], base: u64) -> Addressed {
                     }
                 }
                 if writes(*next, register) {
+                    // The base is gone and what it becomes is not in
+                    // this window, so anything the code addresses
+                    // through it afterwards is unknown.
+                    if completions != 0 {
+                        unresolved.push(page);
+                    }
                     break;
                 }
             }
             if completions == 0 {
-                // Nothing in the window completes it, so the address this
-                // `ADRP` names is unknown; the caller is told, and leaves
-                // the section alone.
-                unresolved.push(pc);
+                // Nothing in the window completes it, so all that is known
+                // is the page: the caller takes the functions it overlaps
+                // for data.
+                unresolved.push(page);
             }
         }
     }
@@ -737,10 +759,10 @@ pub fn addressed_starts(words: &[u32], base: u64) -> Addressed {
 pub struct Addressed {
     /// Where data may start, as addresses.
     pub starts: Vec<u64>,
-    /// The address of each `ADRP` nothing in the window completes, whose
-    /// own target is therefore unknown: an `ADD` can place it up to 16 MiB
-    /// from the page, so no range bounds it. A caller that must not take
-    /// data for code leaves such a section alone.
+    /// The page each `ADRP` nothing in the window completes names: its
+    /// target is somewhere from there (an `ADD` can place it up to 16 MiB
+    /// further, which no range bounds). A caller that must not take data
+    /// for code takes the whole page, and says so.
     pub unresolved: Vec<u64>,
 }
 
@@ -1213,7 +1235,7 @@ pub(crate) mod tests {
         assert_eq!(addressed.starts, vec![0x1010, 0x1024, 0x1174, 0x1818]);
         // The last `ADRP` is completed by nothing, so its target is
         // unknown and the caller is told where it is.
-        assert_eq!(addressed.unresolved, vec![0x1018]);
+        assert_eq!(addressed.unresolved, vec![0x1000], "the page it names");
         // The completing instruction must take the ADRP's own register, and
         // is looked for in the eight instructions after it.
         let other = [0x9000_0001, 0x9105_d042]; // adrp x1; add x2, x2, #0x174
