@@ -1011,7 +1011,9 @@ the run only through a pidfd: a process ID it found can be reaped and given to
 another process before the signal goes out. A stop it cannot pass on to the
 run (no file descriptor left to read `/proc`, or a pidfd call that fails) is
 not lost either: analyze says which call failed and dies of the signal as it
-would without its handler, the run dies with it, and the workspace stays.
+would without its handler, the run dies with it, and the workspace and the
+running trial's private temporary directory stay, since such a death unwinds
+nothing.
 `hermit bisect` keeps its workspace and names it when it exits.
 
 A replayed or spliced schedule can leave the guest spinning or waiting indefinitely.
