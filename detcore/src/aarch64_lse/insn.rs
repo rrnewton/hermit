@@ -381,8 +381,11 @@ pub fn decode(word: u32) -> Insn {
             offset: sign_extend((word >> 5) & 0x3fff, 14) * 4,
         };
     }
-    // Conditional branch (immediate): 0101010 o1 imm19 o0 cond.
-    if (word >> 24) & 0xff == 0b0101_0100 && (word >> 4) & 1 == 0 {
+    // Conditional branch (immediate): 0101010 o1 imm19 o0 cond. Bit 4
+    // (o0) set is FEAT_HBC's BC.cond, the same direct branch with the
+    // same signed imm19 target, so both decode as `CondBranch`: an
+    // interior entry by BC.cond is collected like one by B.cond.
+    if (word >> 24) & 0xff == 0b0101_0100 {
         return Insn::CondBranch {
             cond: word & 0xf,
             offset: sign_extend((word >> 5) & 0x7ffff, 19) * 4,
@@ -601,6 +604,21 @@ mod tests {
                 offset: -8
             }
         );
+        assert_eq!(
+            decode(0x5400_0061),
+            Insn::CondBranch {
+                cond: 1,
+                offset: 12
+            }
+        );
+    }
+
+    #[test]
+    fn a_bc_cond_decodes_as_the_conditional_branch_it_is() {
+        // BC.ne .+8 (FEAT_HBC): 01010100 imm19 1 cond, differing from B.cond
+        // only in bit 4, with the same signed imm19 target computation.
+        assert_eq!(decode(0x5400_0051), Insn::CondBranch { cond: 1, offset: 8 });
+        // B.ne .+12 for contrast.
         assert_eq!(
             decode(0x5400_0061),
             Insn::CondBranch {

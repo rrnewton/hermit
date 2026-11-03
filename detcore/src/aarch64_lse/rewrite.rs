@@ -32,12 +32,13 @@
 //!
 //! Only register-only instructions are allowed between the pair, so an
 //! acquire taken at the atomic rather than at the load, and a release taken at
-//! the atomic rather than at the store, order the same memory accesses. The
-//! one place the rewrite is strictly stronger is a comparison that fails:
-//! `CASAL` keeps its release semantics where the original simply never
-//! executed its `STLXR`. Extra ordering cannot create an execution the
-//! original could not have, but it can hide a weak-memory race, which is why
-//! this is opt-in.
+//! the atomic rather than at the store, order the same memory accesses.
+//!
+//! The conditional compare-and-swap loops are not rewritten at all: the
+//! original stores only when its comparison matches, so on a read-only
+//! word a mismatch exits without a store, while a CAS asks for write
+//! permission before it compares and would fault where the original
+//! does not. Those loops keep their native exclusive form.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -90,6 +91,13 @@ pub enum Refusal {
     UnsupportedOperation,
     /// A branch the replacement must move no longer reaches its target.
     BranchOutOfRange,
+    /// A conditional compare-and-swap loop (`CasZero` or `CasCompare`):
+    /// the original stores only when its comparison matches, so on a
+    /// read-only word a mismatch exits without any store, while a CAS
+    /// asks for write permission before it compares and would fault.
+    /// No same-length replacement preserves that, so the loop is left
+    /// as it is.
+    ConditionalCas,
     /// A relocation points into the sequence, so the loader writes those
     /// bytes itself, for the instruction that used to be there.
     Relocated,
@@ -241,8 +249,8 @@ fn match_sequence(
     decoded: &[Insn],
     store: usize,
     base: u64,
-    branches: &[(usize, u64)],
-    external_targets: &HashSet<u64>,
+    _branches: &[(usize, u64)],
+    _external_targets: &HashSet<u64>,
 ) -> Result<Site, Refusal> {
     let (size, store_ord, rs, rv, rn) = match decoded[store] {
         Insn::StoreExcl {
@@ -312,14 +320,6 @@ fn match_sequence(
     };
     let sf = size.is_64();
     let zero_status = insn::mov_reg(false, rs, ZR);
-    // Whether anything outside the sequence can jump straight to its first
-    // instruction. The loop's own backward branch does, and that is the only
-    // entry an argument about what ran BEFORE the loop may ignore.
-    let head = base + 4 * start as u64;
-    let entered_from_outside = external_targets.contains(&head)
-        || branches
-            .iter()
-            .any(|(index, target)| *target == head && (*index < start || *index > close));
     let (idiom, words) = match (store - start, decoded[start + 1]) {
         (1, _) => (Idiom::Swap, swap(size, ord, rs, rt, rv, rn, zero_status)?),
         (2, alu @ Insn::Alu { .. }) => (
@@ -343,30 +343,14 @@ fn match_sequence(
                 nonzero: true,
                 sf: branch_sf,
                 rt: branch_rt,
-                offset: branch_offset,
+                offset: _,
             },
-        ) if branch_rt == rt && branch_sf == sf => (
-            Idiom::CasZero,
-            cas_zero(size, ord, rt, rv, rn, sf, branch_offset, zero_status)?,
-        ),
-        (3, cmp) => (
-            Idiom::CasCompare,
-            cas_compare(
-                cmp,
-                decoded[start + 2],
-                words[start + 1],
-                size,
-                ord,
-                rt,
-                rv,
-                rn,
-                sf,
-                zero_status,
-                (!entered_from_outside)
-                    .then(|| start.checked_sub(1).map(|i| decoded[i]))
-                    .flatten(),
-            )?,
-        ),
+        ) if branch_rt == rt && branch_sf == sf => {
+            return Err(Refusal::ConditionalCas);
+        }
+        (3, Insn::Cmp { .. }) if matches!(decoded[start + 2], Insn::CondBranch { cond: 1, .. }) => {
+            return Err(Refusal::ConditionalCas);
+        }
         _ => return Err(Refusal::NotCanonical),
     };
     Ok(Site {
@@ -407,36 +391,7 @@ fn swap(
 }
 
 /// `LDxXR Rt, [Rn]; CBNZ Rt, out; STxXR Rs, Rv, [Rn]; CBNZ Rs` stores only
-/// into a zero location, which is a compare-and-swap against zero.
-#[allow(clippy::too_many_arguments)]
-fn cas_zero(
-    size: Size,
-    ord: Ordering,
-    rt: Reg,
-    rv: Reg,
-    rn: Reg,
-    sf: bool,
-    branch_offset: i64,
-    zero_status: u32,
-) -> Result<Vec<u32>, Refusal> {
-    if rt == ZR || rv == rt {
-        return Err(Refusal::Registers(
-            "the load destination must carry the expected value",
-        ));
-    }
-    // The kept branch sits one instruction later than it did, so its
-    // displacement shrinks by that instruction to reach the same target.
-    let branch =
-        insn::compare_branch(true, sf, rt, branch_offset - 4).ok_or(Refusal::BranchOutOfRange)?;
-    Ok(vec![
-        insn::mov_reg(sf, rt, ZR),
-        insn::cas(size, ord, rt, rv, rn),
-        branch,
-        zero_status,
-    ])
-}
 
-#[allow(clippy::too_many_arguments)]
 fn rmw(
     alu: Insn,
     alu_word: u32,
@@ -523,78 +478,6 @@ fn rmw(
     ])
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cas_compare(
-    cmp: Insn,
-    branch: Insn,
-    cmp_word: u32,
-    size: Size,
-    ord: Ordering,
-    rt: Reg,
-    rv: Reg,
-    rn: Reg,
-    sf: bool,
-    zero_status: u32,
-    before: Option<Insn>,
-) -> Result<Vec<u32>, Refusal> {
-    let (cmp_sf, cmp_rn, operand) = match cmp {
-        Insn::Cmp { sf, rn, operand } => (sf, rn, operand),
-        _ => return Err(Refusal::NotCanonical),
-    };
-    // B.NE, condition 0b0001.
-    let Insn::CondBranch { cond: 1, offset } = branch else {
-        return Err(Refusal::NotCanonical);
-    };
-    // The kept branch sits one instruction later than it did.
-    let branch_word = insn::cond_branch(1, offset - 4).ok_or(Refusal::BranchOutOfRange)?;
-    if cmp_rn != rt || cmp_sf != sf {
-        return Err(Refusal::NotCanonical);
-    }
-    if rt == ZR || rv == rt {
-        return Err(Refusal::Registers(
-            "the load destination must carry the expected value",
-        ));
-    }
-    let expected = match operand {
-        Operand::Reg(rm) if rm == rt => {
-            return Err(Refusal::Registers("the compared value is the loaded value"));
-        }
-        // A sub-word compare against a register compares the zero-extended
-        // loaded value over the full register, while CASB/CASH compare only
-        // the low bits, so the two disagree whenever the register's high bits
-        // are set -- unless the instruction just before the loop zero-extended
-        // that very register to the access width, which is what the compiler's
-        // own outline-atomics helpers do. That argument needs the extension to
-        // have RUN, so the caller passes it only when nothing outside the
-        // sequence can branch straight to the loop head.
-        Operand::Reg(rm)
-            if !matches!(size, Size::W | Size::X)
-                && !matches!(
-                    before,
-                    Some(Insn::ZeroExtend { bits, rd, .. })
-                        if rd == rm && bits == if matches!(size, Size::B) { 8 } else { 16 }
-                ) =>
-        {
-            let _ = rm;
-            return Err(Refusal::Registers("a sub-word compare against a register"));
-        }
-        Operand::Reg(rm) => insn::mov_reg(sf, rt, rm),
-        Operand::Imm(k) if k >= width_limit(size) => {
-            return Err(Refusal::Registers(
-                "the compared immediate exceeds the access width",
-            ));
-        }
-        Operand::Imm(k) => insn::movz(sf, rt, k),
-    };
-    Ok(vec![
-        expected,
-        insn::cas(size, ord, rt, rv, rn),
-        cmp_word,
-        branch_word,
-        zero_status,
-    ])
-}
-
 fn width_limit(size: Size) -> u32 {
     match size {
         Size::B => 1 << 8,
@@ -662,30 +545,6 @@ mod tests {
             &[0x085ffc20, 0x08027c23, 0x35ffffc2],
             &[0x38a38020, 0x2a1f03e2, 0xd503201f],
         ),
-        (
-            "cas_compare_gcc_x_al",
-            Idiom::CasCompare,
-            &[0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87],
-            &[0xaa0403e6, 0xc8e6fc62, 0xeb0400df, 0x54000061, 0x2a1f03e7],
-        ),
-        (
-            "cas_compare_llvm_status_is_destination",
-            Idiom::CasCompare,
-            &[0xc85ffd4c, 0xeb0b019f, 0x540000a1, 0xc80cfd48, 0x35ffff8c],
-            &[0xaa0b03ec, 0xc8ecfd48, 0xeb0b019f, 0x54000081, 0x2a1f03ec],
-        ),
-        (
-            "cas_compare_immediate_halfword",
-            Idiom::CasCompare,
-            &[0x485ffc20, 0x71001c1f, 0x54000081, 0x4802fc23, 0x35ffff82],
-            &[0x528000e0, 0x48e0fc23, 0x71001c1f, 0x54000061, 0x2a1f03e2],
-        ),
-        (
-            "cas_zero_x_al",
-            Idiom::CasZero,
-            &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2],
-            &[0xaa1f03e0, 0xc8e0fc23, 0xb5000060, 0x2a1f03e2],
-        ),
     ];
 
     /// Sequences that must survive untouched, with the reason they do.
@@ -694,6 +553,26 @@ mod tests {
             "pair",
             &[0xc87f8440, 0xc8238440, 0x35ffffc3],
             Refusal::ExclusivePair,
+        ),
+        (
+            "cas_zero_x_al",
+            &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2],
+            Refusal::ConditionalCas,
+        ),
+        (
+            "cas_compare_gcc_x_al",
+            &[0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87],
+            Refusal::ConditionalCas,
+        ),
+        (
+            "cas_compare_llvm_status_is_destination",
+            &[0xc85ffd4c, 0xeb0b019f, 0x540000a1, 0xc80cfd48, 0x35ffff8c],
+            Refusal::ConditionalCas,
+        ),
+        (
+            "cas_compare_immediate_halfword",
+            &[0x485ffc20, 0x71001c1f, 0x54000081, 0x4802fc23, 0x35ffff82],
+            Refusal::ConditionalCas,
         ),
         (
             "compare_branches_on_equal",
@@ -711,9 +590,9 @@ mod tests {
             Refusal::NotCanonical,
         ),
         (
-            "subword_compare_against_a_register",
+            "subword_compare_against_a_register_is_a_conditional_cas",
             &[0x085ffc20, 0x6b04001f, 0x54000081, 0x0802fc23, 0x35ffff82],
-            Refusal::Registers("a sub-word compare against a register"),
+            Refusal::ConditionalCas,
         ),
         (
             "memory_access_between_the_pair",
@@ -762,6 +641,29 @@ mod tests {
         }
     }
 
+    /// The read-only mismatch oracle: the conditional-CAS loops are
+    /// refused, so a guest whose comparison misses on a read-only word
+    /// keeps its native no-store exit instead of faulting at a CAS that
+    /// demands write permission before comparing. The unconditional
+    /// loops, whose native form always attempts the store, still rewrite.
+    #[test]
+    fn a_conditional_cas_is_refused_so_a_read_only_mismatch_cannot_fault() {
+        let conditional_cas: [&[u32]; 2] = [
+            &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2], // cas-zero
+            &[0xc85ffc66, 0xeb0400df, 0x54000081, 0xc807fc62, 0x35ffff87], // cas-compare
+        ];
+        for words in conditional_cas {
+            let report = plan(words, BASE);
+            assert_eq!(report.patched, vec![]);
+            assert_eq!(
+                report.refused.first().map(|r| r.reason.clone()),
+                Some(Refusal::ConditionalCas)
+            );
+        }
+        let (_, _, rmw, _) = CASES[0];
+        assert_eq!(plan(rmw, BASE).patched.len(), 1);
+    }
+
     #[test]
     fn a_sequence_outside_the_idiom_set_is_left_alone_with_a_reason() {
         for (name, words, reason) in REFUSALS {
@@ -795,8 +697,37 @@ mod tests {
     }
 
     #[test]
+    fn a_bc_cond_into_the_middle_of_a_sequence_refuses_it() {
+        // clrex; bc.ne .+8; ldaxr x4,[x3]; add x4,x4,#1; stlxr w5,x4,[x3];
+        // cbnz w5, .-12; ret. The BC.ne lands on the ADD inside the
+        // canonical loop, so the loop must be refused, exactly as the
+        // same entry by B.ne is.
+        let words = [
+            0xd503_3f5f, // clrex
+            0x5400_0051, // bc.ne .+8
+            0xc85f_fc64, // ldaxr x4, [x3]
+            0x9100_0484, // add x4, x4, #1
+            0xc805_fc64, // stlxr w5, x4, [x3]
+            0x35ff_ffa5, // cbnz w5, .-12
+            0xd65f_03c0, // ret
+        ];
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![]);
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::BranchIntoSequence)
+        );
+
+        // Control: without the interior entry the same loop is rewritten.
+        let mut control = words;
+        control[1] = insn::NOP;
+        let report = plan(&control, BASE);
+        assert_eq!(report.patched.len(), 1);
+    }
+
+    #[test]
     fn a_loop_inside_a_larger_region_is_found_at_its_own_address() {
-        let (_, _, original, expected) = CASES[8];
+        let (_, _, original, expected) = CASES[0];
         let mut words = vec![insn::NOP, insn::NOP];
         words.extend_from_slice(original);
         words.push(insn::NOP);
@@ -837,10 +768,12 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_extension_before_the_loop_admits_a_sub_word_register_compare() {
+    fn a_sub_word_register_compare_is_a_conditional_cas_and_stays_refused() {
         // uxtb w16,w0; ldaxrb w0,[x2]; cmp w0,w16; b.ne out; stlxrb w17,w1,[x2]; cbnz w17
-        // is the compiler's own byte compare-and-swap helper: the zero extension
-        // proves the high bits of w16 are clear, so CASALB compares what CMP does.
+        // is the compiler's own byte compare-and-swap helper. It used to be
+        // rewritten when a zero extension proved the compare's high bits
+        // clear; as a conditional CAS it now stays native like the others,
+        // with or without that proof.
         let loop_words = [
             0x085f_fc40,
             0x6b10_001f,
@@ -848,65 +781,17 @@ mod tests {
             0x0811_fc41,
             0x35ff_ff91,
         ];
-        let mut words = vec![0x5300_1c10];
-        words.extend_from_slice(&loop_words);
-        let report = plan(&words, BASE);
-        assert_eq!(report.refused, vec![], "{report:?}");
-        assert_eq!(
-            report.patched[0].words,
-            vec![
-                0x2a10_03e0,
-                0x08e0_fc41,
-                0x6b10_001f,
-                0x5400_0061,
-                0x2a1f_03f1
-            ]
-        );
-
-        // Without the zero extension the same loop stays refused.
-        let report = plan(&loop_words, BASE);
-        assert_eq!(report.patched, vec![]);
-        assert_eq!(
-            report.refused.first().map(|r| r.reason.clone()),
-            Some(Refusal::Registers("a sub-word compare against a register"))
-        );
-
-        // The reviewer's repro: a direct branch to the loop head skips the
-        // zero extension, so the proof it carries does not hold and the loop
-        // must stay refused. With w16 = 0x141 and the byte in memory 0x41,
-        // the original branches out and leaves memory alone, while a CASALB
-        // comparing only the low byte would store.
-        let mut words = vec![0x1400_0002u32, 0x5300_1c10];
-        words.extend_from_slice(&loop_words);
-        let report = plan(&words, BASE);
-        assert_eq!(report.patched, vec![], "{report:?}");
-        assert_eq!(
-            report.refused.first().map(|r| r.reason.clone()),
-            Some(Refusal::Registers("a sub-word compare against a register"))
-        );
-
-        // A branch to the zero extension itself is what the real helpers do,
-        // and it keeps the proof: the extension still runs.
-        let mut words = vec![0x1400_0001u32, 0x5300_1c10];
-        words.extend_from_slice(&loop_words);
-        let report = plan(&words, BASE);
-        assert_eq!(report.patched.len(), 1, "{report:?}");
-
-        // An outside branch to the head also refuses it when it comes from
-        // another executable section.
-        let mut head_targets = HashSet::new();
-        head_targets.insert(BASE + 4);
-        let mut words = vec![0x5300_1c10u32];
-        words.extend_from_slice(&loop_words);
-        let report = plan_with_external_targets(&words, BASE, &head_targets);
-        assert_eq!(report.patched, vec![], "{report:?}");
-
-        // A zero extension of the wrong width, or of another register, does not.
-        for before in [0x5300_3c10u32, 0x5300_1c13] {
-            let mut words = vec![before];
-            words.extend_from_slice(&loop_words);
+        for words in [loop_words.to_vec(), {
+            let mut w = vec![0x5300_1c10];
+            w.extend_from_slice(&loop_words);
+            w
+        }] {
             let report = plan(&words, BASE);
-            assert_eq!(report.patched, vec![], "{before:#010x}");
+            assert_eq!(report.patched, vec![], "{report:?}");
+            assert_eq!(
+                report.refused.first().map(|r| r.reason.clone()),
+                Some(Refusal::ConditionalCas)
+            );
         }
     }
 

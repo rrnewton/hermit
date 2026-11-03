@@ -96,6 +96,7 @@ fn refusal_name(reason: &Refusal) -> &'static str {
         Refusal::Registers(_) => "register-constraint",
         Refusal::UnsupportedOperation => "unsupported-operation",
         Refusal::BranchOutOfRange => "branch-out-of-range",
+        Refusal::ConditionalCas => "conditional-cas",
         Refusal::Relocated => "relocation-inside-the-sequence",
     }
 }
