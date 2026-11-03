@@ -78,12 +78,12 @@ mod pinned_cpu;
 mod podman_store;
 mod record;
 mod record_envelope;
-mod rewrite_exclusives;
 mod record_start;
 mod remove;
 mod replay;
 #[cfg(test)]
 mod replay_departure_classification_tests;
+mod rewrite_exclusives;
 // The library root owns the shared fixture module; the app is now a module of
 // that library, so it uses the same instance rather than loading it again.
 #[cfg(test)]
@@ -674,7 +674,8 @@ impl Subcommand {
             | Subcommand::Version(_)
             | Subcommand::LogDiff(_)
             | Subcommand::InstructionMap(_)
-            | Subcommand::VerifyInputs(_) | Subcommand::RewriteExclusives(_) => false,
+            | Subcommand::VerifyInputs(_)
+            | Subcommand::RewriteExclusives(_) => false,
         }
     }
 
