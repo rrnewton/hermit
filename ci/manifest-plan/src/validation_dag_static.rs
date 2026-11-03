@@ -3251,7 +3251,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
     // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
     // 216dbc929a full validate.
-    ("test.detcore_unit", 3384),
+    // The counter-read report (PR 4779) adds 2 units: 3384 + 2 = 3386.
+    ("test.detcore_unit", 3386),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5804,7 +5805,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
-    ("test.detcore_unit_on_host", 3384),
+    // Same growth as test.detcore_unit: 3386.
+    ("test.detcore_unit_on_host", 3386),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
