@@ -250,8 +250,10 @@ impl StopSignals {
     /// ([`usable_pidfds`]). Such an analyze dies of the signal, or ignores
     /// it, as before.
     ///
-    /// Call it while analyze runs no other thread: the query and the install
-    /// are two steps.
+    /// Call it while no other thread of analyze can take a stop signal: the
+    /// query and the install are two steps. The memory watchdog may run
+    /// already, as it does when `main` installs this, because it blocks the
+    /// stop signals before it starts.
     pub fn install() -> anyhow::Result<Self> {
         let handler: extern "C" fn(libc::c_int) = on_stop_signal;
         let mut guard = Self {
