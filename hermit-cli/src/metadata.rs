@@ -935,7 +935,19 @@ impl RecordVersion {
 //   read, recorded, to tell whether it is such a file.
 // An older recording that reads any of these is refused here instead of
 // failing mid-replay.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x198);
+// 0x198 -> 0x199 (HIGHEST_SHIPPED+1 at the change's rebase onto main
+// cb9694edf; the lander assigns the final value): a parent's SIGCHLD that the
+// scheduler defers until no other ordinary work is runnable is re-admitted
+// earlier where the kernel's copy was raised at a point the schedule fixes
+// (a child killed by SIGKILL, or one whose SIGCHLD Linux discards, on a
+// backend that reports child-exit publication): once every thread that was
+// runnable work at the deferral has had a turn. Record and replay both run
+// that rule and replay recomputes it rather than reading it from the stream,
+// so a recording made before it, in which such a delivery waited for
+// quiescence beside busy threads, would replay with an earlier re-admission
+// and fall out of step. It is refused here.
+// https://github.com/rrnewton/hermit/pull/4627
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x199);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -960,7 +972,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x198);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x198;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x199;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
