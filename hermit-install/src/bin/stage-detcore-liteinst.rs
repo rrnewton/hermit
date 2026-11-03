@@ -164,20 +164,13 @@ fn run() -> proof::Result<()> {
             artifact.reported_path == target.join("liteinst-runtime/libdetcore_liteinst.so"),
             "Cargo reported a different ordinary runtime output",
         )?;
-        let current_build_sources = if cfg!(feature = "liteinst") {
-            None
-        } else {
-            let build_command = runner
-                .commands
-                .last()
-                .ok_or("ordinary runtime build command was not retained")?;
-            Some(sources.with_current_build(build_command, &artifact.reported_path, &target)?)
-        };
-        let sources = current_build_sources.as_ref().unwrap_or(&sources);
+        // Main's Reverie pin has no current-build rebinding factory: the
+        // resolved verified sources are themselves the qualification context
+        // for both the LiteInst and trap-only builds, as on main.
         let qualification = proof::qualify_detcore_constructor_with_sources(
             &artifact.reported_path,
             &mut runner,
-            sources,
+            &sources,
         )?;
         qualifier_source.verify()?;
         profile_inputs.verify()?;
