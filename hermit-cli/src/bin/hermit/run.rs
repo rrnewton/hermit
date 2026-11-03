@@ -13397,9 +13397,11 @@ impl RunOpts {
     /// any file named by `--rewrite-exclusives-also`) into content-addressed
     /// copies, and overlay each copy on the path the guest loads it from.
     ///
-    /// The rewrite is a pure function of the input bytes, so the cache key is
-    /// the input digest: two runs of one `--verify` pair, and a replay of a
-    /// recording, map identical bytes.
+    /// The rewrite is a pure function of the input bytes and the stripped-file
+    /// policy, and each copy is named by the bytes it holds
+    /// (`aarch64_lse::cached_rewrite`): two runs of one `--verify` pair, and
+    /// a replay of a recording, map identical bytes, and runs that would map
+    /// different bytes never share a copy.
     fn prepare_exclusive_rewrite(&mut self, backend: Backend) -> Result<(), Error> {
         // Every preparation, however it was reached, including a library
         // caller that validated nothing.
@@ -13452,42 +13454,19 @@ impl RunOpts {
         for (guest_path, host_path) in files {
             let input = fs::read(&host_path)
                 .with_context(|| format!("reading {} to rewrite", host_path.display()))?;
-            let digest = detcore::Digest::new(&input);
             let name = host_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "image".to_owned());
-            let output = cache.join(format!(
-                "v{}-{digest}-{name}",
-                hermit::aarch64_lse::REWRITE_FORMAT_VERSION
-            ));
-            // Rewrite into memory first, always: it is the same pure function
-            // of the same bytes, so it is also the check that a cached file
-            // is the one this version of the rewriter would have written. A
-            // cache entry that differs -- an older rewriter's, or anyone
-            // else's -- is replaced rather than mounted.
+            // Rewrite into memory first, always: the cache entry is named by
+            // the bytes it must hold (`aarch64_lse::cached_rewrite`), so a
+            // cached file is mounted only if it is exactly what this rewriter
+            // made of this source under this run's policy.
             let mut rewritten = input.clone();
             let report = hermit::aarch64_lse::elf::rewrite_bytes(
                 &mut rewritten,
                 self.rewrite_exclusives_stripped,
             )?;
-            // The copy the guest maps must also be executable exactly as the
-            // source is: `write_rewritten` gives it the source's
-            // permissions, so a cached copy made when the source had another
-            // mode is replaced like one whose bytes differ.
-            let mode = fs::metadata(&host_path)
-                .with_context(|| format!("reading the permissions of {}", host_path.display()))?
-                .permissions()
-                .mode();
-            let cached_mode = fs::metadata(&output)
-                .ok()
-                .map(|cached| cached.permissions().mode());
-            if report.is_some()
-                && (fs::read(&output).ok().as_deref() != Some(&rewritten)
-                    || cached_mode != Some(mode))
-            {
-                hermit::aarch64_lse::elf::write_rewritten(&output, &rewritten, &host_path)?;
-            }
             let Some(report) = report else {
                 crate::app::tracing::diagnostic_eprintln!(
                     ":: Exclusive-loop rewrite: {} is not an aarch64 ELF image; left unchanged",
@@ -13534,6 +13513,13 @@ impl RunOpts {
                 self.exclusive_rewrite_unmarked.push(guest_path.clone());
             }
             if report.patched_total() != 0 {
+                let output = hermit::aarch64_lse::cached_rewrite(
+                    &cache,
+                    &rewritten,
+                    &host_path,
+                    &name,
+                    self.rewrite_exclusives_stripped,
+                )?;
                 self.validate_executable_overlay_source_visibility(&output)?;
                 self.exclusive_rewrite_overlays
                     .push(ExecutableOverlayMount {

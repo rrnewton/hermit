@@ -68,6 +68,9 @@ impl RewriteExclusivesOpts {
             }
             std::fs::create_dir_all(dir)?;
         }
+        // Which policy decided the files without mapping symbols, so a report
+        // read later says how it was made.
+        println!("files without mapping symbols: {}", self.stripped.as_str());
         let mut incomplete = false;
         for file in &self.files {
             let report = match &self.output_dir {
