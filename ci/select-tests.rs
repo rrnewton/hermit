@@ -159,9 +159,9 @@ struct Footprints {
 impl Footprints {
     fn load(path: &Path) -> Footprints {
         let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("cannot read: {e}")));
         let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| fail(&format!("invalid JSON in {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("invalid JSON: {e}")));
 
         let groups = v["groups"]
             .as_object()
@@ -255,9 +255,9 @@ struct Dag {
 impl Dag {
     fn load(path: &Path) -> Dag {
         let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("cannot read: {e}")));
         let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| fail(&format!("invalid JSON in {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("invalid JSON: {e}")));
         let mut all_nodes = BTreeSet::new();
         let mut deps = BTreeMap::new();
         for s in v["steps"].as_array().unwrap_or(&vec![]) {
@@ -347,9 +347,9 @@ struct Shards {
 impl Shards {
     fn load(path: &Path) -> Shards {
         let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("cannot read: {e}")));
         let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| fail(&format!("invalid JSON in {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("invalid JSON: {e}")));
         let parse = |key: &str| -> Vec<Shard> {
             v[key]
                 .as_array()
@@ -386,9 +386,9 @@ struct Plan {
 impl Plan {
     fn load(path: &Path) -> Plan {
         let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("cannot read: {e}")));
         let v: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| fail(&format!("invalid JSON in {}: {e}", path.display())));
+            .unwrap_or_else(|e| fail_load(path, &format!("invalid JSON: {e}")));
         let cells = v["cells"]
             .as_array()
             .map(|arr| {
@@ -820,6 +820,94 @@ fn fail(msg: &str) -> ! {
     std::process::exit(2);
 }
 
+/// Output format chosen on the command line, recorded before any input file
+/// is loaded so a load failure can still answer in that format.
+static FORMAT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The machine-readable record that means "run everything". Emitted on a
+/// load failure so a consumer that reads only stdout (or `$GITHUB_OUTPUT`)
+/// and ignores the exit code receives `full`, never an empty selection it
+/// could mistake for "run nothing". `human` has no machine record: the
+/// stderr refusal is the record.
+fn full_selection_record(format: &str) -> Option<String> {
+    match format {
+        "json" => Some(
+            serde_json::json!({
+                "decision": "full",
+                "skip": false,
+                "full": true,
+                "node_count": 0,
+                "nodes": [],
+                "shards": [],
+                "shard_matrix": [],
+                "cell_matrix": [],
+                "cell_count": 0,
+                "cells": [],
+                "backends": [],
+                "e2e_all": true,
+                "backend_rules": [],
+                "backend_lanes": [],
+                "build": { "debug": true, "dbt": true, "aux": true },
+                "reasons": ["select-tests: an input file failed to load; failing safe to full"],
+            })
+            .to_string(),
+        ),
+        "github" => Some(
+            "decision=full\nskip=false\nfull=true\nnode_count=0\nnodes=\n\
+             shard_count=0\ncell_count=0\nbuild_debug=true\nbuild_dbt=true\nbuild_aux=true\n\
+             backends=\nbackend_rules=\nshard_matrix=[]\ncell_matrix=[]\n"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Emit `full_selection_record` for `format` to the channel that format's
+/// consumers read (stdout, or `$GITHUB_OUTPUT` for `github`).
+fn emit_full_selection_record(format: &str) {
+    let Some(record) = full_selection_record(format) else {
+        return;
+    };
+    if format == "github" {
+        match std::env::var("GITHUB_OUTPUT") {
+            Ok(path) => {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = f.write_all(record.as_bytes());
+                    return;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    println!("{record}");
+}
+
+/// Refuse a run whose input files cannot be loaded. The exit code stays 2
+/// (an explicit refusal), but a full-selection record is emitted first, so
+/// the failure can never be read downstream as "no selection": a consumer
+/// that honours the exit code stops, and one that reads only the record
+/// runs the full suite.
+fn fail_load(path: &Path, detail: &str) -> ! {
+    let format = FORMAT.get().map_or("human", String::as_str);
+    emit_full_selection_record(format);
+    eprintln!(
+        "select-tests: cannot load {}: {detail}",
+        path.display()
+    );
+    eprintln!(
+        "select-tests: remedy: fix the file, or regenerate it with \
+         `cargo run -p hermit-manifest-plan --bin generate-validation-dag -- --write ci/dag/validate.json`; \
+         refusing (exit 2), with a full-selection record emitted so this refusal cannot be \
+         mistaken for an empty selection"
+    );
+    std::process::exit(2);
+}
+
 /// Parse `git diff --name-status` output, counting BOTH sides of a
 /// rename/copy (a rename's source can be a core path even when its
 /// destination is backend-scoped). Bare path lines pass through.
@@ -1109,6 +1197,7 @@ fn main() {
         }
     }
 
+    let _ = FORMAT.set(format.clone());
     let root = repo_root();
     let fp = Footprints::load(&root.join("ci/test-footprints.json"));
     let dag = Dag::load(&root.join("ci/dag/validate.json"));
@@ -2928,6 +3017,25 @@ fn self_test() {
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("absent from validate.json")),
+    );
+
+    // --- load-failure record: a refusal must never read as "no selection" ---
+    let json_record = full_selection_record("json").expect("json record");
+    let parsed: Value = serde_json::from_str(&json_record).expect("record parses");
+    check(
+        "load failure json record is a full selection",
+        parsed["decision"] == "full" && parsed["full"] == true && parsed["skip"] == false,
+    );
+    let github_record = full_selection_record("github").expect("github record");
+    check(
+        "load failure github record is a full selection",
+        github_record.contains("decision=full")
+            && github_record.contains("full=true")
+            && github_record.contains("skip=false"),
+    );
+    check(
+        "load failure human format has no machine record",
+        full_selection_record("human").is_none(),
     );
 
     historical_selection_bracket(&root, &mut check);
