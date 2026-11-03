@@ -1264,7 +1264,7 @@ mod tests {
     /// without one fails it with the capability named, never a pass.
     #[test]
     fn a_stop_signal_on_a_helper_thread_never_reaches_a_reused_pid() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         // SAFETY: the copy's other thread waits for this test and holds no
@@ -1479,7 +1479,7 @@ mod tests {
     /// dies with it by its parent-death signal.
     #[test]
     fn a_stop_the_handler_cannot_pass_on_ends_analyze_by_its_default_action() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let (ended, stderr, child) = stop_without_descriptors(false);
@@ -1504,7 +1504,7 @@ mod tests {
     /// Now the signal ends it within the bound, and the child with it.
     #[test]
     fn a_stop_ends_analyze_even_when_its_stderr_is_full() {
-        if crate::test_isolation::rerun_alone() {
+        if crate::app::test_isolation::rerun_alone() {
             return;
         }
         let (ended, stderr, child) = stop_without_descriptors(true);
