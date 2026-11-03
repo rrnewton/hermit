@@ -4068,6 +4068,16 @@ mod tests {
 
     #[test]
     fn production_comparison_callers_bind_truthful_side_labels() {
+        // Production code is what precedes a file's top-level `mod tests`.
+        // The last `#[cfg(test)]` is not that boundary: verify.rs keeps
+        // further test modules after `mod tests`, and the needles below are
+        // spelled out inside this test, which a later boundary would count.
+        let production_of = |source: &'static str| -> &'static str {
+            source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .expect("production/test boundary")
+                .0
+        };
         for (name, source, left, right) in [
             ("generic run", include_str!("run.rs"), "run 1", "run 2"),
             ("DBT run", include_str!("backends.rs"), "run 1", "run 2"),
@@ -4078,10 +4088,7 @@ mod tests {
                 "the replay",
             ),
         ] {
-            let production = source
-                .rsplit_once("#[cfg(test)]")
-                .expect("production/test boundary")
-                .0;
+            let production = production_of(source);
             for label in [left, right] {
                 let binding = format!("label: \"{label}\"");
                 assert_eq!(
@@ -4092,10 +4099,7 @@ mod tests {
             }
         }
 
-        let production = include_str!("verify.rs")
-            .rsplit_once("#[cfg(test)]")
-            .expect("production/test boundary")
-            .0;
+        let production = production_of(include_str!("verify.rs"));
         assert!(production.contains("side_labels: compared_labels.clone()"));
         assert_eq!(
             production

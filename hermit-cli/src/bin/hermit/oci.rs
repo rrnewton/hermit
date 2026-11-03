@@ -439,7 +439,7 @@ mod tests {
         ] {
             let mut argv = vec![
                 "hermit",
-                "--backend=dbt",
+                "--backend=liteinst",
                 "oci",
                 "run",
                 "example.invalid/image:tag",
@@ -463,7 +463,7 @@ mod tests {
             // Use the same global selection RunOpts::main installs, without
             // resolving an OCI store or claiming this backend supports images.
             options.run.set_backend(args.global.backend);
-            assert_eq!(options.run.global_backend_arg(), " --backend=dbt");
+            assert_eq!(options.run.global_backend_arg(), " --backend=liteinst");
             let result = options.run.validate_args();
             if refuses {
                 let error = result.unwrap_err();
@@ -475,8 +475,9 @@ mod tests {
                     "{message}"
                 );
                 assert!(
-                    message
-                        .contains("unsupported_preemption: --backend=dbt refuses --max-timeslice"),
+                    message.contains(
+                        "unsupported_preemption: --backend=liteinst refuses --max-timeslice"
+                    ),
                     "{message}"
                 );
                 assert_eq!(
@@ -484,7 +485,28 @@ mod tests {
                     Some(200_000_000)
                 );
             } else {
-                result.unwrap();
+                // The inherited maximum passes the timer check: only an
+                // explicit request is refused for want of a timer. A build
+                // with the in-guest runtime then refuses any maximum on
+                // in-guest LiteInst, in the later in-guest check, which
+                // `in_guest_trap_refuses_the_options_liteinst_refuses` covers.
+                if cfg!(feature = "liteinst") && maximum.is_none() {
+                    let error = result.unwrap_err();
+                    let message = format!("{error:#}");
+                    assert!(
+                        error
+                            .downcast_ref::<crate::app::container::PolicyRefusal>()
+                            .is_some(),
+                        "{message}"
+                    );
+                    assert!(
+                        message.contains("pass --max-timeslice=disabled"),
+                        "{message}"
+                    );
+                    assert!(!message.contains("unsupported_preemption"), "{message}");
+                } else {
+                    result.unwrap();
+                }
                 assert_eq!(
                     options.run.det_opts.det_config.max_timeslice.map(u64::from),
                     if maximum.is_none() {

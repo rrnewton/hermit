@@ -2650,8 +2650,9 @@ mod tests {
     // What DID need restoring from that deletion is the ordering premise
     // immediately below.
 
-    /// Live verification must reach the common owner. Ordinary and saved
-    /// single runs retain the physical DBT launcher before that dispatch.
+    /// Live verification must reach the common owner. Saved and ordinary
+    /// single runs of an executable-selected backend keep their own adapter
+    /// launch before that dispatch.
     #[test]
     fn dbt_verification_joins_the_generic_verify_dispatch() {
         let source = include_str!("run.rs");
@@ -2675,12 +2676,45 @@ mod tests {
             );
             hits[0]
         };
-        let ordinary = sole_offset("if self.application_backend.is_some() && !self.verify");
-        let prepare = sole_offset("let mut session = adapter.prepare(");
+        // A saved (`--verify-run`) single run reaches its own adapter path
+        // first; the ordinary branch follows it. Each needle names its whole
+        // condition, so neither can match the other's prefix.
+        let saved = sole_offset(
+            "if self.application_backend.is_some() && !self.verify \
+             && let Some(directory) = &self.verify_run {",
+        );
+        let saved_call = sole_offset("return self.verify_run_with_adapter(");
+        let ordinary = sole_offset("if self.application_backend.is_some() && !self.verify {");
         let physical = sole_offset("return adapter.execute(");
         let verify =
             sole_offset("self.verify(global, application_stdin, adapter, adapter_options)");
-        assert!(ordinary < prepare && prepare < physical && physical < verify);
+        // Exactly two adapter preparations: the ordinary single run's, between
+        // its branch and its physical execution, and the saved run's, inside
+        // `verify_run_with_adapter`.
+        let saved_owner = sole_offset("fn verify_run_with_adapter<");
+        let prepares: Vec<_> = production
+            .match_indices(&compact("let mut session = adapter.prepare("))
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(prepares.len(), 2, "adapter preparations: {prepares:?}");
+        let prepare = prepares
+            .iter()
+            .copied()
+            .find(|&offset| ordinary < offset && offset < physical)
+            .expect("the ordinary single run prepares its adapter before executing it");
+        assert!(
+            prepares
+                .iter()
+                .any(|&offset| offset != prepare && offset > saved_owner),
+            "the saved run prepares its adapter in verify_run_with_adapter"
+        );
+        assert!(
+            saved < saved_call
+                && saved_call < ordinary
+                && ordinary < prepare
+                && prepare < physical
+                && physical < verify
+        );
         let dispatch = compact(
             source
                 .split_once("    pub(super) fn verify_sharing_ld_so_cache<")
@@ -2722,11 +2756,12 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            source.contains(
-                "self.verify_run_with_adapter(directory, global, adapter, adapter_options)"
-            )
-        );
+        // The saved run hands its adapter the reserved application stdin,
+        // as the ordinary run does.
+        assert!(production.contains(&compact(
+            "self.verify_run_with_adapter(directory, global, application_stdin, adapter, \
+             adapter_options,"
+        )));
     }
 
     /// DBT completion and evidence errors return to the same run-labelled

@@ -7936,6 +7936,9 @@ mod tests {
     /// on ptrace. `reports_kernel_child_exit_signals` is true for ptrace,
     /// e9patch and SaBRe, whose signal callbacks see the kernel's child-exit
     /// SIGCHLD with its siginfo and can suppress or rewrite it.
+    /// `kernel_never_walks_robust_lists` (Reverie 93d3a168), `places_orphans`
+    /// and `publishable_parent_death_signals` (Reverie f614c7c8) arrived with
+    /// the Reverie pin of the first-party split; each is KVM's alone.
     fn golden_backend_capabilities(backend: CapabilityCase) -> serde_json::Value {
         let sabre = backend == CapabilityCase::Sabre;
         let kvm = backend == CapabilityCase::Kvm;
@@ -7956,6 +7959,10 @@ mod tests {
             "virtualizes_guest_sigalrm": in_guest_liteinst,
             "tracks_process_children": !dbt,
             "runs_exit_robust_list": matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
+            // Reverie 93d3a168: KVM runs guest threads on its own vCPUs, so no
+            // Linux task exit walks their robust lists; every other backend
+            // runs each guest thread as a host task whose exit does.
+            "kernel_never_walks_robust_lists": kvm,
             "requires_thread_directed_process_signals": dbt,
             "supports_parked_write_signal_interruption":
                 matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch | CapabilityCase::Kvm),
@@ -8010,6 +8017,13 @@ mod tests {
                     | CapabilityCase::Sabre
                     | CapabilityCase::Dbt
             ),
+            // Reverie f614c7c8: only KVM's process signal control places an
+            // exiting process's orphans and publishes parent-death signals;
+            // on every other backend the kernel does both itself.
+            "places_orphans": kvm,
+            // Signals 1 to 31 but SIGCHLD (17) and SIGSTOP, SIGTSTP, SIGTTIN
+            // and SIGTTOU (19 to 22), as a kernel signal set.
+            "publishable_parent_death_signals": if kvm { 0x7fc2_ffff_u64 } else { 0 },
         })
     }
 

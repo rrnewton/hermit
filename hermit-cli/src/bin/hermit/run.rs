@@ -3454,11 +3454,10 @@ fn a_version_2_spec_is_refused_when_validation_turns_the_timer_off() {
 }
 
 /// The launch-time happens-before refusal keys on the runtime backend:
-/// `--backend=e9patch` rewrites the program and runs it under ptrace, which
-/// enforces count and syscall-occurrence anchors, so neither is refused there.
-/// An in-guest backend never receives the program, so both are refused.
+/// ptrace enforces count and syscall-occurrence anchors, so neither is refused
+/// there. KVM and the in-guest backends do not, so both are refused.
 #[test]
-fn happens_before_refusal_accepts_e9patch_and_refuses_in_guest_backends() {
+fn happens_before_refusal_accepts_ptrace_and_refuses_in_guest_backends() {
     let dir = tempfile::tempdir().unwrap();
     let spec = dir.path().join("spec.json");
     let spec_arg = spec.to_str().unwrap();
@@ -3481,12 +3480,12 @@ fn happens_before_refusal_accepts_e9patch_and_refuses_in_guest_backends() {
             argv.extend(["run", "--happens-before", spec_arg, "fakeprog"]);
             run_opts_for(&argv).refuse_unenforceable_happens_before()
         };
-        for backend in [None, Some("ptrace"), Some("e9patch")] {
+        for backend in [None, Some("ptrace")] {
             if let Err(error) = check(backend) {
                 panic!("{name} anchor refused under {backend:?}: {error:#}");
             }
         }
-        for backend in ["sabre", "kvm", "dbt", "liteinst", "in-guest-trap"] {
+        for backend in ["kvm", "liteinst", "in-guest-trap"] {
             let error = check(Some(backend)).expect_err(backend);
             assert!(
                 error
@@ -3720,12 +3719,9 @@ fn backend_defaults_to_ptrace() {
 fn backend_values_parse_and_round_trip() {
     for (value, expected) in [
         ("ptrace", Some(Backend::Ptrace)),
-        ("dbt", None),
         ("liteinst", Some(Backend::Liteinst)),
         ("in-guest-trap", Some(Backend::InGuestTrap)),
-        ("sabre", None),
         ("kvm", Some(Backend::Kvm)),
-        ("e9patch", None),
     ] {
         let mut ro = run_opts_for(&["hermit", "--backend", value, "run", "fakeprog"]);
         ro.validate_args_with_perf_support(true).unwrap();
@@ -3764,15 +3760,7 @@ fn backend_values_parse_and_round_trip() {
 /// special case fails here by name.
 #[test]
 fn comparator_choice_does_not_depend_on_the_backend() {
-    for value in [
-        "ptrace",
-        "dbt",
-        "liteinst",
-        "in-guest-trap",
-        "sabre",
-        "kvm",
-        "e9patch",
-    ] {
+    for value in ["ptrace", "liteinst", "in-guest-trap", "kvm"] {
         let plain = run_opts_for(&["hermit", "--backend", value, "run", "--verify", "fakeprog"]);
         assert_eq!(plain.execution_backend_name(), value);
         assert_eq!(
@@ -3804,15 +3792,7 @@ fn comparator_choice_does_not_depend_on_the_backend() {
 
 #[test]
 fn verification_always_compares_retained_logs() {
-    for backend in [
-        "ptrace",
-        "dbt",
-        "liteinst",
-        "in-guest-trap",
-        "sabre",
-        "kvm",
-        "e9patch",
-    ] {
+    for backend in ["ptrace", "liteinst", "in-guest-trap", "kvm"] {
         let run = run_opts_for(&[
             "hermit",
             "--backend",
@@ -3830,15 +3810,7 @@ fn verification_always_compares_retained_logs() {
 
 #[test]
 fn every_backend_keeps_io_buffer_checking_on_by_default() {
-    for backend in [
-        "ptrace",
-        "dbt",
-        "liteinst",
-        "in-guest-trap",
-        "sabre",
-        "kvm",
-        "e9patch",
-    ] {
+    for backend in ["ptrace", "liteinst", "in-guest-trap", "kvm"] {
         let run = run_opts_for(&[
             "hermit",
             "--backend",
@@ -3991,14 +3963,10 @@ fn an_adopted_ld_so_cache_role_becomes_the_runs_snapshot() {
 
 #[test]
 fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
-    let mut ro = run_opts_for(&[
-        "hermit",
-        "--backend",
-        "e9patch",
-        "run",
-        "/bin/echo",
-        "hello",
-    ]);
+    // The executable overlay is core launch code that an executable-selected
+    // preprocessing adapter (e9patch, now external) fills in; it is exercised
+    // here on the ptrace runtime such an adapter runs on.
+    let mut ro = run_opts_for(&["hermit", "--backend", "ptrace", "run", "/bin/echo", "hello"]);
     ro.executable_overlay = Some(ExecutableOverlayMount {
         source: PathBuf::from("/cache/patched-echo"),
         target: PathBuf::from("/bin/echo"),
@@ -4208,7 +4176,7 @@ fn mapped_guest_path_is_resolved_before_host_validation() {
     let mut ro = run_opts_for(&[
         "hermit",
         "--backend",
-        "e9patch",
+        "ptrace",
         "run",
         &tmp_arg,
         "-e",
@@ -4245,7 +4213,8 @@ fn non_e9patch_validation_preserves_parent_component_paths() {
 /// The guest environment must be identical across backends. Sanitizer leak
 /// detection is disabled in `guest_command()` (the single backend-independent
 /// place) rather than only in the ptrace tracer, so the out-of-process KVM
-/// backend presents the guest the same environment as ptrace/e9patch/sabre.
+/// backend presents the guest the same environment as ptrace and the
+/// in-guest backends.
 /// Regression test for the KVM-vs-ptrace env divergence, where the guest saw
 /// two fewer variables under KVM.
 #[test]
@@ -4256,7 +4225,7 @@ fn guest_env_disables_sanitizer_leak_detection_on_every_backend() {
 
     // The two variables are present with identical values regardless of the
     // selected backend, so no backend-specific spawn hook is required for parity.
-    for backend in ["ptrace", "kvm", "sabre", "dbt"] {
+    for backend in ["ptrace", "kvm", "liteinst", "in-guest-trap"] {
         let ro = run_opts_for(&["hermit", "--backend", backend, "run", "/bin/echo", "hi"]);
         let envs = ro.guest_command().unwrap().get_captured_envs();
         assert_eq!(
@@ -4370,7 +4339,7 @@ fn e9patch_mount_target_rejects_parent_components() {
     let ro = run_opts_for(&[
         "hermit",
         "--backend",
-        "e9patch",
+        "ptrace",
         "run",
         "--mount=type=tmpfs,target=/tmp/../bin",
         "/bin/echo",
@@ -4391,7 +4360,7 @@ fn e9patch_mount_target_rejects_symlink_components() {
         "--mount=type=tmpfs,target={}",
         link.join("target").display()
     );
-    let ro = run_opts_for(&["hermit", "--backend", "e9patch", "run", &mount, "/bin/echo"]);
+    let ro = run_opts_for(&["hermit", "--backend", "ptrace", "run", &mount, "/bin/echo"]);
     let error = ro.validate_executable_overlay_mount_targets().unwrap_err();
     assert!(error.to_string().contains("mount target traverses symlink"));
 }
@@ -4498,7 +4467,7 @@ fn non_elf_entrypoints_skip_e9patch_preprocessing() {
 
 #[test]
 fn executable_overlay_uses_canonical_target_without_custom_mounts() {
-    let ro = run_opts_for(&["hermit", "--backend", "e9patch", "run", "/bin/echo"]);
+    let ro = run_opts_for(&["hermit", "--backend", "ptrace", "run", "/bin/echo"]);
     assert_eq!(
         ro.resolve_executable_overlay_target(Path::new("/bin/echo"), Path::new("/bin/echo"))
             .unwrap(),
@@ -4520,7 +4489,7 @@ fn e9patch_rejects_symlinked_executables_through_custom_mounts() {
     let ro = run_opts_for(&[
         "hermit",
         "--backend",
-        "e9patch",
+        "ptrace",
         "run",
         &mount,
         "/e9patch-test/link",
@@ -4538,7 +4507,7 @@ fn e9patch_rejects_mounts_that_change_a_symlink_target() {
         "--mount=type=bind,source={},target=/usr",
         directory.path().display()
     );
-    let ro = run_opts_for(&["hermit", "--backend", "e9patch", "run", &mount, "/bin/echo"]);
+    let ro = run_opts_for(&["hermit", "--backend", "ptrace", "run", &mount, "/bin/echo"]);
     let error = ro
         .resolve_executable_overlay_target(Path::new("/bin/echo"), Path::new("/bin/echo"))
         .unwrap_err();
@@ -5287,9 +5256,10 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
         error.contains("--chaos-timeslice-draw=run") && error.contains("usable PMU"),
         "{error}"
     );
-    // A backend that delivers no preemption timer events refuses the draw;
-    // KVM delivers them, so it draws the same maximum as ptrace.
-    for backend in ["--backend=dbt", "--backend=sabre"] {
+    // A backend that delivers no preemption timer events (in-guest LiteInst,
+    // with or without site patching) refuses the draw; KVM delivers them, so it
+    // draws the same maximum as ptrace.
+    for backend in ["--backend=liteinst", "--backend=in-guest-trap"] {
         let mut unavailable = run_opts_for(&["hermit", backend, "run", "--chaos", run, "prog"]);
         let error = format!(
             "{:#}",
@@ -5828,7 +5798,7 @@ fn skid_margin_override_needs_a_timer_delivering_backend() {
     kvm.validate_args_with_perf_support(true)
         .unwrap_or_else(|error| panic!("kvm: {error:#}"));
     assert_eq!(kvm.skid_margin, Some(500));
-    for backend in ["dbt", "sabre"] {
+    for backend in ["liteinst", "in-guest-trap"] {
         let mut opts = run_opts_for(&[
             "hermit",
             &format!("--backend={backend}"),
@@ -5853,8 +5823,8 @@ fn skid_margin_override_needs_a_timer_delivering_backend() {
 
 /// `--futex-wake-yields` parses, is rendered into the reproduce
 /// command and round-trips. It is refused where it cannot apply: without
-/// sequentialized threads, outside the precise futex mode, and with the DBT
-/// backend, whose runtime reads a configuration form that cannot carry it.
+/// sequentialized threads, outside the precise futex mode, and on every
+/// backend but ptrace, where its handoff has not been tested.
 #[test]
 fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--futex-wake-yields", "fakeprog"]);
@@ -5872,22 +5842,6 @@ fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
     default.validate_args_with_perf_support(true).unwrap();
     assert!(!default.det_opts.det_config.futex_wake_yields);
     assert!(!format!("{default}").contains("futex-wake"));
-
-    // e9patch is preprocessing on the ptrace backend, where Detcore and the
-    // handoff run unchanged, so the gate accepts it.
-    let e9patch = [
-        "hermit",
-        "--backend=e9patch",
-        "run",
-        "--futex-wake-yields",
-        "fakeprog",
-    ];
-    if let Err(error) = run_opts_for(&e9patch).validate_args_with_perf_support(true) {
-        assert!(
-            !error.to_string().contains("futex-wake-yields"),
-            "{e9patch:?}: {error}"
-        );
-    }
 
     for (argv, expected) in [
         (
@@ -5913,12 +5867,12 @@ fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
         (
             vec![
                 "hermit",
-                "--backend=dbt",
+                "--backend=liteinst",
                 "run",
                 "--futex-wake-yields",
                 "fakeprog",
             ],
-            "the dbt backend cannot apply --futex-wake-yields",
+            "--futex-wake-yields has been tested only on the ptrace backend",
         ),
         (
             vec![
@@ -5966,7 +5920,7 @@ fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
 /// lost: without sequentialized threads, with `--strace-only` or
 /// `--namespace-only`, with `--image`
 /// (whose root the report would be written into), and on backends other than
-/// ptrace (and e9patch preprocessing, which runs on it).
+/// ptrace.
 #[test]
 fn work_span_report_is_refused_where_there_are_no_turns() {
     let mut accepted = run_opts_for(&["hermit", "run", "--work-span-report=/var/ws.json", "prog"]);
@@ -5995,12 +5949,12 @@ fn work_span_report_is_refused_where_there_are_no_turns() {
         (
             vec![
                 "hermit",
-                "--backend=dbt",
+                "--backend=kvm",
                 "run",
                 "--work-span-report=/var/ws.json",
                 "prog",
             ],
-            "backend `dbt` is refused",
+            "backend `kvm` is refused",
         ),
         (
             vec![
@@ -6233,39 +6187,34 @@ fn a_work_span_report_path_with_a_parent_component_is_refused() {
     plain.validate_work_span_report_visibility().unwrap();
 }
 
-/// `--signal-at` is accepted on the ptrace backend, with or without e9patch
-/// preprocessing, and refused before launch wherever it would not reach the
-/// guest: every other backend (on KVM a host kill reaches the sandbox
-/// monitor), `--namespace-only` and `--lite`, `--strace-only` and
-/// `--no-sequentialize-threads`.
+/// `--signal-at` is accepted on the ptrace backend, and refused before launch
+/// wherever it would not reach the guest: every other backend (on KVM a host
+/// kill reaches the sandbox monitor), `--namespace-only` and `--lite`,
+/// `--strace-only` and `--no-sequentialize-threads`.
 #[test]
 fn signal_at_is_refused_where_it_would_not_reach_the_guest() {
-    for backend in ["ptrace", "e9patch"] {
-        let backend = format!("--backend={backend}");
-        let argv = [
-            "hermit",
-            backend.as_str(),
-            "run",
-            "--signal-at=turn=5:SIGUSR1",
-            "fakeprog",
-        ];
-        if let Err(error) = run_opts_for(&argv).validate_args_with_perf_support(true) {
-            assert!(
-                !error.to_string().contains("signal-at"),
-                "{argv:?}: {error}"
-            );
-        }
+    let argv = [
+        "hermit",
+        "--backend=ptrace",
+        "run",
+        "--signal-at=turn=5:SIGUSR1",
+        "fakeprog",
+    ];
+    if let Err(error) = run_opts_for(&argv).validate_args_with_perf_support(true) {
+        assert!(
+            !error.to_string().contains("signal-at"),
+            "{argv:?}: {error}"
+        );
     }
-    let mut refused: Vec<(Vec<String>, String)> =
-        ["dbt", "liteinst", "in-guest-trap", "sabre", "kvm"]
-            .iter()
-            .map(|backend| {
-                (
-                    vec![format!("--backend={backend}"), "run".to_owned()],
-                    format!("backend `{backend}` is refused"),
-                )
-            })
-            .collect();
+    let mut refused: Vec<(Vec<String>, String)> = ["liteinst", "in-guest-trap", "kvm"]
+        .iter()
+        .map(|backend| {
+            (
+                vec![format!("--backend={backend}"), "run".to_owned()],
+                format!("backend `{backend}` is refused"),
+            )
+        })
+        .collect();
     for (flag, expected) in [
         (
             "--namespace-only",
@@ -6302,8 +6251,8 @@ fn signal_at_is_refused_where_it_would_not_reach_the_guest() {
 /// round-trips, keeping `0` distinct from unset. It is refused wherever it
 /// would be ignored: without sequentialized threads, with `--namespace-only`
 /// (`--lite`) or `--strace-only`, under every `--sched-heuristic` that does
-/// not select by priority (the same predicate the scheduler uses), and with
-/// the DBT backend (https://github.com/rrnewton/hermit/issues/4380).
+/// not select by priority (the same predicate the scheduler uses), and on
+/// every backend but ptrace (https://github.com/rrnewton/hermit/issues/4380).
 #[test]
 fn pipe_wake_latency_parses_round_trips_and_is_refused_where_inert() {
     for value in ["0", "3000000"] {
@@ -6357,12 +6306,12 @@ fn pipe_wake_latency_parses_round_trips_and_is_refused_where_inert() {
         (
             vec![
                 "hermit",
-                "--backend=dbt",
+                "--backend=liteinst",
                 "run",
                 "--pipe-wake-latency=0",
                 "fakeprog",
             ],
-            "the dbt backend cannot apply --pipe-wake-latency",
+            "--pipe-wake-latency has been tested only on the ptrace backend",
         ),
         (
             vec![
@@ -6592,9 +6541,10 @@ fn a_replay_under_another_cap_preemption_charge_is_refused() {
 }
 
 /// `--scheduler-turn-cost` parses, is rendered into the reproduce command and
-/// round-trips; zero and the DBT backend are refused.
+/// round-trips; zero, and a cost the clock multiplier scales below one
+/// nanosecond or past the bound, are refused.
 #[test]
-fn scheduler_turn_cost_parses_round_trips_and_is_refused_for_dbt() {
+fn scheduler_turn_cost_parses_round_trips_and_is_refused_where_out_of_range() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--scheduler-turn-cost=10000", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(
@@ -6650,21 +6600,6 @@ fn scheduler_turn_cost_parses_round_trips_and_is_refused_for_dbt() {
         "fakeprog",
     ]);
     smallest.validate_args_with_perf_support(true).unwrap();
-    let error = run_opts_for(&[
-        "hermit",
-        "--backend=dbt",
-        "run",
-        "--scheduler-turn-cost=10000",
-        "fakeprog",
-    ])
-    .validate_args_with_perf_support(true)
-    .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("the dbt backend cannot apply --scheduler-turn-cost"),
-        "{error}"
-    );
 }
 
 #[test]
@@ -6841,19 +6776,13 @@ fn virtual_timeout_parses_round_trips_and_is_refused_without_the_scheduler() {
             "{argv:?}: {error}"
         );
     }
-    // Fail-closed: only the backends a run of the bound was measured on,
-    // and DBT for its own reason.
+    // Fail-closed: only the backends a run of the bound was measured on.
     for (backend, cause) in [
-        (
-            "dbt",
-            "dbt drives Detcore's scheduler in Hermit's own process",
-        ),
         ("liteinst", "measured only on the ptrace and kvm backends"),
         (
             "in-guest-trap",
             "measured only on the ptrace and kvm backends",
         ),
-        ("sabre", "measured only on the ptrace and kvm backends"),
     ] {
         let flag = format!("--backend={backend}");
         let argv = [
@@ -7027,9 +6956,9 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
 }
 
 /// Only the ptrace backend serves gdb. `--gdbserver` and `--dap-listen` on a
-/// backend without a gdbserver, `--strict` included, and with
-/// `--namespace-only`, are refused naming the remedy; the ptrace and e9patch
-/// backends keep them, and the other backends run without them as before.
+/// backend without a gdbserver (KVM), `--strict` included, and with
+/// `--namespace-only`, are refused naming the remedy; the ptrace backend keeps
+/// them, and the other backends run without them as before.
 #[test]
 fn backends_without_a_gdbserver_refuse_gdbserver_and_dap_listen() {
     let refusal = |argv: &[&str]| {
@@ -7037,7 +6966,7 @@ fn backends_without_a_gdbserver_refuse_gdbserver_and_dap_listen() {
         argv.push("fakeprog");
         run_opts_for(&argv).refuse_gdbserver_without_a_gdbserver()
     };
-    for backend in ["kvm", "dbt", "sabre"] {
+    for backend in ["kvm"] {
         let flag = format!("--backend={backend}");
         for (options, option) in [
             (&["--gdbserver"][..], "--gdbserver"),
@@ -7073,10 +7002,15 @@ fn backends_without_a_gdbserver_refuse_gdbserver_and_dap_listen() {
         error.to_string().contains("drop --namespace-only"),
         "{error:#}"
     );
-    for flag in ["--backend=ptrace", "--backend=e9patch"] {
-        refusal(&["hermit", flag, "run", "--gdbserver"]).unwrap();
-        refusal(&["hermit", flag, "run", "--strict", "--gdbserver"]).unwrap();
-    }
+    refusal(&["hermit", "--backend=ptrace", "run", "--gdbserver"]).unwrap();
+    refusal(&[
+        "hermit",
+        "--backend=ptrace",
+        "run",
+        "--strict",
+        "--gdbserver",
+    ])
+    .unwrap();
     refusal(&["hermit", "run", "--dap-listen=4711"]).unwrap();
     // Argument validation refuses it too, before any other check of the run.
     let mut strict_kvm = run_opts_for(&[
@@ -7165,45 +7099,22 @@ fn log_cap_refusal_for(global: &[&str], options: &[&str]) -> Result<(), Error> {
 /// ends nothing where the guest is not bound to that process.
 #[test]
 fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
-    let refused: [(&[&str], &[&str], &str); 10] = [
+    let refused: [(&[&str], &[&str], &str); 6] = [
         (
             &["--max-log-bytes=4K", "--backend=liteinst"],
             &["--no-namespace", "--max-timeslice=disabled"],
             "--backend=liteinst and --no-namespace",
         ),
         (
-            &["--max-log-bytes=4K", "--backend=dbt"],
-            &[],
-            "--backend=dbt",
-        ),
-        (
-            &["--max-log-bytes=4K", "--backend=dbt"],
-            &["--no-namespace"],
-            "--backend=dbt",
-        ),
-        (
             &["--max-log-bytes=4K", "--backend=kvm"],
             &["--no-namespace"],
             "--backend=kvm and --no-namespace",
         ),
-        // Round-3 review, finding 2: the launcher hands the guest to the
-        // SaBRe worker stopped and untraced, before PTRACE_O_EXITKILL binds it.
-        (
-            &["--max-log-bytes=4K", "--backend=sabre"],
-            &["--no-namespace"],
-            "--backend=sabre and --no-namespace",
-        ),
         // Round-4c review, finding 1: the ptrace tracer sets PTRACE_O_EXITKILL
         // only after it has spawned the guest (and started any GDB server),
-        // and a charged write can cross the cap in between. e9patch's guest
-        // runs on the same ptrace runtime.
+        // and a charged write can cross the cap in between.
         (
             &["--max-log-bytes=4K", "--backend=ptrace"],
-            &["--no-namespace"],
-            "--no-namespace",
-        ),
-        (
-            &["--max-log-bytes=4K", "--backend=e9patch"],
             &["--no-namespace"],
             "--no-namespace",
         ),
@@ -7230,16 +7141,7 @@ fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
             "{global:?} {options:?}: {error:#}"
         );
         let message = error.to_string();
-        let application = ["dbt", "sabre", "e9patch"]
-            .into_iter()
-            .find(|name| global.iter().any(|arg| *arg == format!("--backend={name}")));
-        let expected = application
-            .map(|name| {
-                format!(
-                    "--max-log-bytes is not qualified to stop executable-selected backend `{name}`"
-                )
-            })
-            .unwrap_or_else(|| format!("--max-log-bytes cannot be enforced with {named}: "));
+        let expected = format!("--max-log-bytes cannot be enforced with {named}: ");
         assert!(
             message.starts_with(&expected),
             "{global:?} {options:?}: {message}"
@@ -7252,24 +7154,13 @@ fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
 }
 
 /// Inside hermit's PID namespace, whose death takes every guest process with
-/// it, each backend but DBT is accepted. `--no-namespace` is refused on every
+/// it, each backend is accepted. `--no-namespace` is refused on every
 /// backend (the test above).
 #[test]
 fn log_cap_is_accepted_where_hermit_takes_the_guest_down_with_it() {
     for backend in ["--backend=ptrace", "--backend=kvm", "--backend=liteinst"] {
         log_cap_refusal_for(&["--max-log-bytes=4K", backend], &[])
             .unwrap_or_else(|error| panic!("{backend}: {error:#}"));
-    }
-    // Static adapters retain their existing stricter early cap refusal until
-    // their complete process lifetime is qualified by the common supervisor.
-    for backend in ["--backend=dbt", "--backend=sabre", "--backend=e9patch"] {
-        let error = log_cap_refusal_for(&["--max-log-bytes=4K", backend], &[]).unwrap_err();
-        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
-        assert!(
-            error
-                .to_string()
-                .contains("not qualified to stop executable-selected backend")
-        );
     }
     // LiteInst is accepted inside hermit's PID namespace, whose death takes the
     // untraced in-guest LiteInst guest with it.
@@ -7861,14 +7752,6 @@ fn a_small_max_timeslice_gets_a_notice() {
         assert_eq!(line.matches('\n').count(), 1, "one line: {line:?}");
         assert!(line.ends_with('\n'), "{line:?}");
     }
-    let e9patch = run_opts_for(&[
-        "hermit",
-        "--backend=e9patch",
-        "run",
-        "--max-timeslice=1000",
-        "fakeprog",
-    ]);
-    assert!(e9patch.small_max_timeslice_notice(zen).is_some());
     for (argv, margin) in [
         (vec![], zen as fn() -> u64),
         (vec!["--max-timeslice=1000010"], zen),
@@ -7926,8 +7809,10 @@ fn a_small_max_timeslice_gets_a_notice() {
     assert!(kvm.small_max_timeslice_notice(zen).is_some());
     // A backend without the timer keeps its inherited maximum and steps
     // nothing.
-    let dbt = run_opts_for(&["hermit", "--backend=dbt", "run", "fakeprog"]);
-    assert_eq!(dbt.small_max_timeslice_notice(zen), None);
+    for backend in ["--backend=liteinst", "--backend=in-guest-trap"] {
+        let untimed = run_opts_for(&["hermit", backend, "run", "fakeprog"]);
+        assert_eq!(untimed.small_max_timeslice_notice(zen), None, "{backend}");
+    }
 }
 
 /// `main`'s branch-counter check: a run without `--strict` on a host whose
@@ -8032,7 +7917,7 @@ fn the_inexact_branch_counter_warning_says_what_may_not_reproduce_and_what_to_do
 
 #[test]
 fn strict_refuses_an_inexact_branch_counter_on_the_pmu_backends() {
-    for backend in ["ptrace", "e9patch", "kvm"] {
+    for backend in ["ptrace", "kvm"] {
         let backend_flag = format!("--backend={backend}");
         let mut options = run_opts_for(&["hermit", &backend_flag, "run", "--strict", "fakeprog"]);
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
@@ -8074,7 +7959,7 @@ fn strict_refusal_needs_strict_a_pmu_backend_and_an_inexact_counter() {
         &["hermit", "--backend=ptrace", "run", "--strict", "fakeprog"],
         || None,
     );
-    for backend in ["dbt", "sabre"] {
+    for backend in ["liteinst", "in-guest-trap"] {
         let backend_flag = format!("--backend={backend}");
         check(
             &["hermit", &backend_flag, "run", "--strict", "fakeprog"],
@@ -8088,21 +7973,18 @@ fn strict_refusal_needs_strict_a_pmu_backend_and_an_inexact_counter() {
     // Without a timeslice Detcore uses no branch count, so the relaxed
     // strictness level runs where the counter miscounts
     // (https://github.com/rrnewton/hermit/issues/4291).
-    for backend in ["ptrace", "e9patch"] {
-        let backend_flag = format!("--backend={backend}");
-        check(
-            &[
-                "hermit",
-                &backend_flag,
-                "run",
-                "--strict",
-                "--no-virtualize-cpuid",
-                "--max-timeslice=disabled",
-                "fakeprog",
-            ],
-            unreachable,
-        );
-    }
+    check(
+        &[
+            "hermit",
+            "--backend=ptrace",
+            "run",
+            "--strict",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "fakeprog",
+        ],
+        unreachable,
+    );
 }
 
 #[test]
@@ -8290,35 +8172,6 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
 }
 
 #[test]
-fn dbt_backend_keeps_uts_assumption_with_namespaces() {
-    // The DBT backend launches each physical run through Reverie's
-    // `Container`, as ptrace does, so its guest is in a UTS namespace with the
-    // deterministic hostname (https://github.com/rrnewton/hermit/issues/4009).
-    let mut opts = run_opts_for(&["hermit", "--backend=dbt", "run", "fakeprog"]);
-    opts.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(opts.execution_backend_name(), "dbt");
-    assert!(!opts.no_namespace);
-    assert!(opts.det_opts.det_config.has_uts_namespace);
-}
-
-#[test]
-fn dbt_backend_disables_uts_assumption_without_namespaces() {
-    // `--no-namespace` starts no container, so Detcore's `handle_uname` must
-    // rewrite the nodename instead of leaking the host FQDN.
-    let mut opts = run_opts_for(&[
-        "hermit",
-        "--backend=dbt",
-        "run",
-        "--no-namespace",
-        "fakeprog",
-    ]);
-    opts.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(opts.execution_backend_name(), "dbt");
-    assert!(opts.no_namespace);
-    assert!(!opts.det_opts.det_config.has_uts_namespace);
-}
-
-#[test]
 fn ptrace_backend_keeps_uts_assumption_with_namespaces() {
     // The default (ptrace) backend does launch through Reverie's `Container`,
     // which unshares CLONE_NEWUTS and sets the deterministic hostname, so the
@@ -8382,7 +8235,7 @@ fn image_conflicts_with_no_namespace_with_explanatory_error() {
 fn image_rejects_unqualified_backend_and_namespace_paths() {
     let mut backend = run_opts_for(&[
         "hermit",
-        "--backend=dbt",
+        "--backend=liteinst",
         "run",
         "--image=busybox@sha256:deadbeef",
         "/bin/sh",
@@ -8654,14 +8507,14 @@ fn detlog_anon_is_ptrace_only() {
         validated(&[
             "hermit",
             "--backend",
-            "e9patch",
+            "ptrace",
             "run",
             "--detlog-anon",
             "fakeprog"
         ])
         .is_ok()
     );
-    for backend in ["dbt", "kvm", "liteinst"] {
+    for backend in ["kvm", "liteinst", "in-guest-trap"] {
         let error = validated(&[
             "hermit",
             "--backend",
@@ -17851,6 +17704,26 @@ mod tests {
 
     #[test]
     fn common_capture_drains_actual_socket_before_success_or_error_returns() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        // The malformed source runs before the injected physical failure: a
+        // failed container callback leaves its owner retained for the rest of
+        // the process (`owned_container::run` refuses every later container
+        // here, by design), so that case must be this process's last.
+        let invalid = tempfile::NamedTempFile::new().unwrap();
+        let captured =
+            socket_capture_control(&invalid, None, vec![b"HINFO".to_vec()], false).unwrap();
+        let error = captured
+            .latches
+            .refuse_comparison("actual malformed source")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("determinism loss"));
+        assert!(
+            fs::read_to_string(invalid.path())
+                .unwrap()
+                .contains(FORWARDING_REFUSED_MARKER)
+        );
         for fail in [false, true] {
             let file = tempfile::NamedTempFile::new().unwrap();
             let first = b"INFO detcore: DETLOG [syscall] capture first\n";
@@ -17880,23 +17753,13 @@ mod tests {
             assert!(first_at < second_at, "{text}");
             assert!(!text.contains(FORWARDING_REFUSED_MARKER), "{text}");
         }
-        let invalid = tempfile::NamedTempFile::new().unwrap();
-        let captured =
-            socket_capture_control(&invalid, None, vec![b"HINFO".to_vec()], false).unwrap();
-        let error = captured
-            .latches
-            .refuse_comparison("actual malformed source")
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("determinism loss"));
-        assert!(
-            fs::read_to_string(invalid.path())
-                .unwrap()
-                .contains(FORWARDING_REFUSED_MARKER)
-        );
     }
 
     #[test]
     fn common_capture_charges_one_invocation_budget_across_actual_runs() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let first = tempfile::NamedTempFile::new().unwrap();
         let second = tempfile::NamedTempFile::new().unwrap();
         let record = b"INFO detcore: DETLOG [syscall] shared capture budget\n";

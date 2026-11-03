@@ -1916,7 +1916,7 @@ mod tests {
             (
                 &[
                     "hermit",
-                    "--backend=sabre",
+                    "--backend=liteinst",
                     "analyze",
                     "--",
                     "--strict",
@@ -2028,7 +2028,7 @@ mod tests {
                 (|| None) as fn() -> _,
             ),
             (
-                &["hermit", "--backend=sabre", "analyze", "--", "/bin/true"][..],
+                &["hermit", "--backend=liteinst", "analyze", "--", "/bin/true"][..],
                 unreachable,
             ),
             (
@@ -2648,11 +2648,11 @@ mod tests {
 
     /// A trial keeps the maximum its run arguments request: the inherited one, a
     /// disabled one, or an explicit one where the backend delivers timer events
-    /// (KVM, as ptrace); a backend without the timer (SaBRe) refuses the
-    /// explicit request by name.
+    /// (KVM, as ptrace); a backend without the timer (in-guest LiteInst)
+    /// refuses the explicit request by name.
     #[test]
     fn trial_preemption_keeps_the_explicit_maximum_request() {
-        for (backend, delivers_timer) in [("kvm", true), ("sabre", false)] {
+        for (backend, delivers_timer) in [("kvm", true), ("liteinst", false)] {
             for maximum in [
                 None,
                 Some("--max-timeslice=disabled"),
@@ -2680,6 +2680,23 @@ mod tests {
                     assert!(format!("{error:#}").contains(&format!(
                         "unsupported_preemption: --backend={backend} refuses --max-timeslice"
                     )));
+                } else if cfg!(feature = "liteinst") && !delivers_timer && maximum.is_none() {
+                    // The inherited maximum passes the timer check; a build
+                    // with the in-guest runtime then refuses any maximum on
+                    // in-guest LiteInst in its later in-guest check.
+                    let error = result.err().expect("in-guest LiteInst refuses a maximum");
+                    assert!(
+                        error
+                            .downcast_ref::<crate::app::container::PolicyRefusal>()
+                            .is_some(),
+                        "{error:#}"
+                    );
+                    let message = format!("{error:#}");
+                    assert!(
+                        message.contains("pass --max-timeslice=disabled"),
+                        "{message}"
+                    );
+                    assert!(!message.contains("unsupported_preemption"), "{message}");
                 } else {
                     assert_eq!(
                         result
