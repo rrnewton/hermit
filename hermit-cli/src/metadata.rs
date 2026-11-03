@@ -942,7 +942,14 @@ impl RecordVersion {
 // LOCK_UN after a release), a contended blocking flock waits instead of being
 // refused, and a malformed operation is answered without a kernel call. An
 // older recording replayed with this binary desyncs at its first flock.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x199);
+// 0x199 -> 0x19b (coordinator-assigned; 0x19a is reserved for the PMU
+// change): an Mmap event of a MAP_SHARED file mapping names the mapped file
+// (device, inode, offset) and the mapped descriptor's access mode. Replay
+// maps every shared mapping of one file as a view of one backing, opened
+// with that access mode, instead of making separate anonymous copies. An
+// older reader cannot decode the new field, and an older recording has no
+// identity with which to restore sharing, so it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -967,7 +974,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x199);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x199;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
