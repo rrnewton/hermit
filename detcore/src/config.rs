@@ -221,7 +221,7 @@ mod tests {
         // `GlobalResponse::WithPostCrashBound`
         // (https://github.com/rrnewton/hermit/pull/4867; renumbered to 27
         // above main's 26 at this rebase; digests measured at this head).
-        (27, "c921b041c67fdec2", "f013e36743d8d9e6"),
+        (27, "f037b7ad490c8164", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
