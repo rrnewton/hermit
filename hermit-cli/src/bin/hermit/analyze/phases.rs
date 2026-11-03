@@ -3691,7 +3691,6 @@ mod tests {
         );
     }
 
-
     /// `--target-exit-code` compares the code `hermit run` exits with: the
     /// guest's own, or 128 plus the signal number. Before, it compared the
     /// raw wait status, so `--target-exit-code=121` never matched a run that
