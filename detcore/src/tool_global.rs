@@ -11814,7 +11814,18 @@ pub async fn trace_schedevent_with_access<G, T>(
             }
 
             if let Some(timeslice) = timeslice {
-                install_replayed_timeslice(guest, timeslice);
+                install_replayed_timeslice(guest, timeslice.length);
+                if guest.thread_state().past_global_first_execve {
+                    // The replayer's length is the recorded branch count
+                    // (`LogicalTime::from_rcbs`), which `into_rcbs` gives
+                    // back exactly. Where the clock runs at another rate
+                    // the armed end differs from this count, and the end
+                    // keeps its stop.
+                    let thread_state = guest.thread_state_mut();
+                    stopless_end = timeslice
+                        .stopless
+                        .then(|| thread_state.committed_clock_value + timeslice.length.into_rcbs());
+                }
             }
         }
         _ => {
