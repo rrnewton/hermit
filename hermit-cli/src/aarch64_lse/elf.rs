@@ -56,14 +56,24 @@
 //!   section in an executable with fixed addresses, or a symbol naming data
 //!   in an executable section.
 //!
-//!   Three things can still be taken for code wrongly, each needing data
+//!   A literal or `ADR` that names a function's own entry is a pointer to
+//!   the function, not to data, so an address-taken function's body is
+//!   still code.
+//!
+//!   Several things can still be taken for code wrongly, each needing data
 //!   that nothing in the image points at. Data after a call to an imported
 //!   function that never returns and is not among the names this reader
 //!   knows. Data an unresolved `ADRP`'s completion would reach beyond its
 //!   own page (a scaled load reaches 64 KiB, an `ADD` with `LSL #12` reaches
-//!   16 MiB). And the rest of a table whose first word a branch could reach:
-//!   a data word before the field the code addresses can decode as a branch
-//!   into the table, and the next such target ends the data.
+//!   16 MiB). The rest of a table whose first word a branch could reach: a
+//!   data word before the field the code addresses can decode as a branch
+//!   into the table, and the next such target ends the data. What the code
+//!   addresses through a register after a write that does not carry an
+//!   `ADRP`'s base, since where that register then points is not in the
+//!   window. A function that returns through a changed link register, or
+//!   through an `SVC` the walk cannot follow, taken to return to its
+//!   caller. And a call through a register (`BLR`), whose callee is
+//!   unknown, taken to come back.
 //! - Neither: nothing. Such a section is left alone and reported, and so is
 //!   a whole file with neither mapping symbols nor an unwind table.
 //!
