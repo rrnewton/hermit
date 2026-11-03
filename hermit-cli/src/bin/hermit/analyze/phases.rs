@@ -3321,7 +3321,7 @@ mod tests {
         assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
         let message = format!("{error:#}");
         for expected in [
-            UNATTACHED_CHECKPOINTS,
+            "HERMIT_CONTINUATION_CHECKPOINTS_UNATTACHED",
             path,
             drift,
             "no opposite-outcome pair was established",
@@ -3329,6 +3329,56 @@ mod tests {
         ] {
             assert!(message.contains(expected), "no {expected:?}: {message}");
         }
+    }
+
+    /// Compare all prefix metadata, including each checkpoint's full origin
+    /// and every priority-history row, independently of the continued events.
+    fn assert_prefix_metadata(record: &PreemptionRecord, source: &PreemptionRecord, len: usize) {
+        let prefix = source.schedule_prefix(len);
+        prefix.validate().unwrap();
+        let mut expected = serde_json::to_value(prefix).unwrap();
+        let mut actual = serde_json::to_value(record).unwrap();
+        expected.as_object_mut().unwrap().remove("global");
+        actual.as_object_mut().unwrap().remove("global");
+        assert_eq!(
+            actual, expected,
+            "a continued replay must retain all prefix metadata"
+        );
+    }
+
+    /// Model a completed producer at the existing launch seam, then use the
+    /// production file reader and completed-record admission before reporting.
+    /// This exercises file/admission plumbing; it is not a native guest run.
+    fn recorded_continuation_for_test(
+        options: &AnalyzeOpts,
+        runname: &str,
+        source: &PreemptionRecord,
+        len: usize,
+        met: bool,
+        events: &[SchedEvent],
+    ) -> (CompletedScheduleTrial, PathBuf) {
+        let (completed, path) = options
+            .prefix_continuation(runname, source, len, None, |run| {
+                let input = PreemptionReader::try_new(run.sched_path_in())?.into_inner();
+                input.validate().map_err(anyhow::Error::msg)?;
+                let input = serde_json::to_value(&input).unwrap();
+                let prefix = serde_json::to_value(source.schedule_prefix(len)).unwrap();
+                for field in ["callback_checkpoints", "per_thread"] {
+                    assert_eq!(input[field], prefix[field], "prefix input lost {field}");
+                }
+                run.complete_for_test(met, events)?;
+                assert!(run.has_launched());
+                assert_eq!(run.is_a_match(), met);
+                Ok(run.is_a_match())
+            })
+            .unwrap();
+        let recorded = PreemptionReader::try_new(&path).unwrap().into_inner();
+        recorded.validate().unwrap();
+        RunData::require_complete_record(&recorded, &path).unwrap();
+        assert_eq!(recorded.schedevents(), events);
+        assert_eq!(completed.schedule, events);
+        assert_eq!(completed.target_met, met);
+        (completed, path)
     }
 
     /// A completed continuation can replay its prefix with other counts (a
@@ -3347,9 +3397,12 @@ mod tests {
         // Without event #2 thread 3 runs there instead: the two-thread report.
         let exact = branch_events(&[(3, 10), (5, 4), (3, 5), (7, 1), (7, 1)]);
         let drifted = branch_events(&[(3, 11), (5, 4), (3, 4), (7, 1), (7, 1)]);
-        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         for continued in [&exact, &drifted] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+            options.tmp_dir = Some(dir.path().to_path_buf());
             let mut replays = Vec::new();
+            let mut artifact = None;
             let result = options.phase6_record_prefix_outputs_with(
                 PrefixDecision {
                     schedule: schedule.clone(),
@@ -3361,21 +3414,30 @@ mod tests {
                     replays.push((runname.to_owned(), record.clone()));
                     Ok((runname == "final_target_for_stacktraces", None))
                 },
-                |_, len| {
+                |record, len| {
                     assert_eq!(len, 2);
-                    Ok((
-                        CompletedScheduleTrial {
-                            target_met: false,
-                            schedule: continued.clone(),
-                        },
-                        PathBuf::from("final_baseline_schedule.preempts"),
-                    ))
+                    let (completed, path) = recorded_continuation_for_test(
+                        &options,
+                        "final_baseline_schedule",
+                        record,
+                        len,
+                        false,
+                        continued,
+                    );
+                    artifact = Some((path.clone(), std::fs::read(&path)?));
+                    Ok((completed, path))
                 },
+            );
+            let (path, bytes) = artifact.expect("the baseline continuation was recorded");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "retain completed diagnostics"
             );
             if continued == &drifted {
                 assert_unattached_checkpoints(
                     result,
-                    "final_baseline_schedule.preempts",
+                    path.to_str().unwrap(),
                     "its event #0 is (tid3 cnt=11 Branch), where the prefix has (tid3 cnt=10 \
                      Branch)",
                 );
@@ -3388,6 +3450,7 @@ mod tests {
                 assert_eq!(baseline.schedevents(), &exact);
                 assert_eq!(checkpoint_counts(baseline), [("3".to_owned(), 1)]);
                 assert_eq!(baseline.chaos_timeslice(), Some(4321));
+                assert_prefix_metadata(baseline, &schedule, 2);
                 baseline.validate().unwrap();
             }
         }
@@ -3409,14 +3472,13 @@ mod tests {
         let without = branch_events(&[(3, 10), (5, 4), (7, 1), (3, 5), (7, 1)]);
         let with_drifted = branch_events(&[(3, 10), (5, 5), (7, 1), (7, 1), (3, 5)]);
         let without_drifted = branch_events(&[(3, 11), (5, 4), (7, 1), (3, 4), (7, 1)]);
-        let options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         for (target_continued, continued, refused) in [
             (&with, &without, None),
             (
                 &with_drifted,
                 &without,
                 Some((
-                    "final_target_schedule.preempts",
+                    true,
                     "its event #1 is (tid5 cnt=5 Branch), where the prefix has (tid5 cnt=4 Branch)",
                 )),
             ),
@@ -3424,29 +3486,53 @@ mod tests {
                 &with,
                 &without_drifted,
                 Some((
-                    "final_baseline_schedule.preempts",
+                    false,
                     "its event #0 is (tid3 cnt=11 Branch), where the prefix has (tid3 cnt=10 \
                      Branch)",
                 )),
             ),
+            (
+                &with_drifted,
+                &without_drifted,
+                Some((
+                    true,
+                    "its event #1 is (tid5 cnt=5 Branch), where the prefix has (tid5 cnt=4 Branch)",
+                )),
+            ),
         ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+            options.tmp_dir = Some(dir.path().to_path_buf());
+            let (baseline, baseline_path) = recorded_continuation_for_test(
+                &options,
+                "final_baseline_schedule",
+                &schedule,
+                2,
+                false,
+                continued,
+            );
+            let baseline_bytes = std::fs::read(&baseline_path).unwrap();
+            let mut target_artifact = None;
             let replays = std::cell::RefCell::new(Vec::new());
             let result = options.report_timing_decision_with(
                 &schedule,
                 2,
                 None,
                 (true, &None),
-                (continued, Path::new("final_baseline_schedule.preempts")),
+                (&baseline.schedule, &baseline_path),
                 (
-                    |_, len| {
+                    |record, len| {
                         assert_eq!(len, 3);
-                        Ok((
-                            CompletedScheduleTrial {
-                                target_met: true,
-                                schedule: target_continued.clone(),
-                            },
-                            PathBuf::from("final_target_schedule.preempts"),
-                        ))
+                        let (completed, path) = recorded_continuation_for_test(
+                            &options,
+                            "final_target_schedule",
+                            record,
+                            len,
+                            true,
+                            target_continued,
+                        );
+                        target_artifact = Some((path.clone(), std::fs::read(&path)?));
+                        Ok((completed, path))
                     },
                     |runname, record, _, _| {
                         replays
@@ -3456,9 +3542,22 @@ mod tests {
                     },
                 ),
             );
+            let (target_path, target_bytes) =
+                target_artifact.expect("the target continuation was recorded");
+            for (path, bytes) in [
+                (&target_path, &target_bytes),
+                (&baseline_path, &baseline_bytes),
+            ] {
+                assert_eq!(
+                    &std::fs::read(path).unwrap(),
+                    bytes,
+                    "retain completed diagnostics"
+                );
+            }
             match refused {
-                Some((path, drift)) => {
-                    assert_unattached_checkpoints(result, path, drift);
+                Some((target, drift)) => {
+                    let path = if target { &target_path } else { &baseline_path };
+                    assert_unattached_checkpoints(result, path.to_str().unwrap(), drift);
                     assert!(replays.borrow().is_empty(), "no stack-trace replay may run");
                 }
                 None => {
@@ -3485,6 +3584,8 @@ mod tests {
                         [("3".to_owned(), 1), ("5".to_owned(), 1)]
                     );
                     assert_eq!(checkpoint_counts(without_record), [("3".to_owned(), 1)]);
+                    assert_prefix_metadata(with_record, &schedule, 3);
+                    assert_prefix_metadata(without_record, &schedule, 2);
                     for record in [with_record, without_record] {
                         assert_eq!(record.chaos_timeslice(), Some(4321));
                         record.validate().unwrap();
