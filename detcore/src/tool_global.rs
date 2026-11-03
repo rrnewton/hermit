@@ -8250,8 +8250,9 @@ pub enum SignalScope {
 /// enum, is revision 46, the next revision after 45. 47 adds
 /// `Rewrite::unmarked` to the `StoreExclusive` payload (numbered 42 at
 /// this change's rebase onto main's 41, renumbered to 47, the next
-/// revision after the landed 46), and is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 47;
+/// revision after the landed 46). 48 adds `Rewrite::not_written` to the
+/// `StoreExclusive` payload and is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 48;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

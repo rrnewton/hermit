@@ -104,7 +104,8 @@ mod tests {
     /// `TraceSchedEvent`/`WithWatchOrder` revision, and 46 is
     /// https://github.com/rrnewton/hermit/pull/4769's
     /// `PublishInstructionOffset` revision. 47 is this change's
-    /// `StoreExclusive` payload layout and is current.
+    /// `StoreExclusive` payload layout; 48 adds `Rewrite::not_written`
+    /// and is current.
     /// 42 to 44 are queued or advisory claims at this rebase
     /// (42 on drain/4759, 43 for PR 4627, 44 for kvm-2b-3 in the
     /// allocation table). Remove an entry when its change lands, with
@@ -319,6 +320,10 @@ mod tests {
         // (https://github.com/rrnewton/hermit/pull/4769); digest re-measured
         // at this head.
         (47, "3626cafe4551d074", "f013e36743d8d9e6"),
+        // The `StoreExclusive` payload's `Rewrite` says why loops were not
+        // written (`not_written`); its fields cross the wire positionally.
+        // Carried after main's 47; digest measured by the revision guard.
+        (48, "dfc6b74921701600", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
