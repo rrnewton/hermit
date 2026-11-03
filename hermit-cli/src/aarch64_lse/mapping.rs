@@ -35,6 +35,9 @@
 //! These are pure functions of the file's bytes, which the rewriter
 //! ([`super::elf`]) consults before it plans a single sequence.
 
+use super::insn::Insn;
+use super::insn::decode;
+
 /// `SHT_SYMTAB`: the full symbol table, which keeps local symbols.
 const SHT_SYMTAB: u32 = 2;
 /// `SHT_STRTAB`: a string table.
@@ -176,6 +179,112 @@ impl CodeEvidence {
     }
 }
 
+/// Which of `functions` (sorted by entry, as the FDEs give them) can
+/// return, by [`can_return`] over and over until the answer stops
+/// growing: a function returns if a `RET` is reachable in it, and a call
+/// it makes comes back only if that callee is already known to return.
+/// Each round can only add functions, so a few settle it; the bound keeps
+/// a deep chain from costing more than it is worth, and stopping early
+/// leaves a function unproven, which is the safe side.
+pub fn returning_functions(
+    words: &[u32],
+    base: u64,
+    functions: &[(u64, u64)],
+) -> std::collections::HashSet<u64> {
+    // Chains deeper than this stay unproven.
+    const ROUNDS: usize = 8;
+    let mut returning: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for _ in 0..ROUNDS {
+        let known = returning.clone();
+        // A call out of this section is taken to return, the ordinary
+        // case; one to a function here only where it is already proven.
+        let returns = |target: u64| {
+            known.contains(&target)
+                || functions
+                    .binary_search_by_key(&target, |(entry, _)| *entry)
+                    .is_err()
+        };
+        let grown: Vec<u64> = functions
+            .iter()
+            .filter(|(entry, _)| !returning.contains(entry))
+            .filter(|function| can_return(words, base, **function, &returns))
+            .map(|(entry, _)| *entry)
+            .collect();
+        if grown.is_empty() {
+            break;
+        }
+        returning.extend(grown);
+    }
+    returning
+}
+
+/// Whether the function `function` (its entry and end, as an FDE gives
+/// them) can return: walking its own words from its entry, some
+/// instruction it reaches is a `RET`, or a direct branch out of it (a tail
+/// call) goes to a function that `returns` says comes back. A function
+/// whose entry is outside `words` is taken to return, which is the
+/// ordinary case for a call out of the section. A function whose every path ends in
+/// a trap or in a syscall that does not come back (an exit or abort
+/// helper) cannot, and a call to it does not fall through.
+pub fn can_return(
+    words: &[u32],
+    base: u64,
+    function: (u64, u64),
+    returns: &dyn Fn(u64) -> bool,
+) -> bool {
+    const RET: u32 = 0xD65F_0000;
+    let (entry, end) = function;
+    let index = |addr: u64| -> Option<usize> {
+        (entry..end)
+            .contains(&addr)
+            .then(|| usize::try_from((addr - base) / 4).ok())
+            .flatten()
+            .filter(|index| *index < words.len())
+    };
+    let Some(first) = index(entry) else {
+        return true;
+    };
+    let last = index(end.saturating_sub(4)).unwrap_or(first);
+    let mut seen = vec![false; last - first + 1];
+    let mut pending = vec![first];
+    while let Some(mut at) = pending.pop() {
+        while !seen[at - first] {
+            seen[at - first] = true;
+            if words[at] & 0xFFFF_FC1F == RET {
+                return true;
+            }
+            let pc = base + 4 * at as u64;
+            let (falls_through, target) = flow(words[at], pc);
+            // A call comes back only where `returns` already says so, so
+            // the answer only grows as more functions are known to return
+            // ([`returning_functions`]).
+            let call = matches!(decode(words[at]), Insn::Branch { link: true, .. });
+            let comes_back = !call || target.is_some_and(returns);
+            // A tail call, a direct branch out of this function, returns
+            // to this function's caller when the function it jumps to
+            // returns at all.
+            if !call
+                && let Some(target) = target
+                && index(target).is_none()
+                && returns(target)
+            {
+                return true;
+            }
+            if let Some(target) = target.filter(|_| !call).and_then(index) {
+                pending.push(target);
+            }
+            match (falls_through && comes_back)
+                .then(|| index(pc + 4))
+                .flatten()
+            {
+                Some(next) => at = next,
+                None => break,
+            }
+        }
+    }
+    false
+}
+
 /// The code among `words` (at `base`) that control can reach from
 /// `entries` without leaving `covered` (sorted, disjoint): following each
 /// instruction to the next unless it is an unconditional branch, a return,
@@ -184,14 +293,15 @@ impl CodeEvidence {
 /// whole function, including a constant table the function branches over or
 /// keeps after its return, and those bytes are not reached. Code reached
 /// only through a jump table or an exception landing pad is not either, and
-/// is left alone with them. A call is taken to return, so bytes after a call
-/// that does not are reached too; [`data_extents`] takes back the ones the
-/// code addresses as data.
+/// is left alone with them. A call falls through only where `returns`
+/// proves the callee comes back; [`data_extents`] takes back what the code
+/// addresses as data.
 pub fn reachable_code(
     words: &[u32],
     base: u64,
     covered: &[(u64, u64)],
     entries: &[u64],
+    returns: &dyn Fn(u64) -> bool,
 ) -> Vec<(u64, u64)> {
     let index_of = |addr: u64| -> Option<usize> {
         if addr < base || !addr.is_multiple_of(4) {
@@ -211,7 +321,13 @@ pub fn reachable_code(
         while !seen[index] {
             seen[index] = true;
             let pc = base + 4 * index as u64;
-            let (falls_through, target) = flow(words[index], pc);
+            let (mut falls_through, target) = flow(words[index], pc);
+            // A call comes back only if the function it calls can.
+            if matches!(decode(words[index]), Insn::Branch { link: true, .. })
+                && target.is_some_and(|target| !returns(target))
+            {
+                falls_through = false;
+            }
             if let Some(target) = target.and_then(index_of) {
                 pending.push(target);
             }
@@ -238,10 +354,9 @@ pub fn reachable_code(
 /// does: `B.AL` and `B.NV` always branch, and the zero register makes `CBZ`
 /// and `TBZ` always branch and `CBNZ` and `TBNZ` never.
 fn flow(word: u32, pc: u64) -> (bool, Option<u64>) {
-    use super::insn::Insn;
     const ZR: super::insn::Reg = 31;
     let target = |offset: i64| Some(pc.wrapping_add(offset as u64));
-    match super::insn::decode(word) {
+    match decode(word) {
         Insn::Branch {
             link: false,
             offset,
@@ -563,10 +678,11 @@ pub fn literal_targets(words: &[u32], base: u64) -> Vec<(u64, u64)> {
 /// An `ADRP` nothing completes gives its page, the lowest address it can be
 /// completing. Each is where a table may start: how far it runs is not in
 /// the instruction ([`data_extents`]).
-pub fn addressed_starts(words: &[u32], base: u64) -> Vec<u64> {
+pub fn addressed_starts(words: &[u32], base: u64) -> Addressed {
     // How far after an `ADRP` its completing instruction is looked for.
     const PAIRING_WINDOW: usize = 8;
     let mut starts = Vec::new();
+    let mut unresolved = Vec::new();
     for (index, word) in words.iter().enumerate() {
         let pc = base.wrapping_add(4 * index as u64);
         if word & 0x3B00_0000 == 0x1800_0000 && word >> 30 != 0b11 {
@@ -584,25 +700,48 @@ pub fn addressed_starts(words: &[u32], base: u64) -> Vec<u64> {
             let pages = ((imm << 11) as i32 >> 11) as i64;
             let page = (pc & !0xFFF).wrapping_add((pages << 12) as u64);
             let register = word & 0x1F;
-            // Every completion, up to the instruction that writes the
-            // register itself: after that the page this `ADRP` gave is
-            // gone, and a later instruction with the same base completes
-            // another one.
-            let completions: Vec<u64> = words[index + 1..]
-                .iter()
-                .take(PAIRING_WINDOW)
-                .map(|next| (page_offset(*next, register), writes(*next, register)))
-                .take_while(|(offset, written)| offset.is_some() || !written)
-                .filter_map(|(offset, _)| offset)
-                .collect();
-            if completions.is_empty() {
-                starts.push(page);
-            } else {
-                starts.extend(completions.iter().map(|offset| page.wrapping_add(*offset)));
+            // Every completion, following the register: an `ADD` into the
+            // register itself moves the base the later ones are relative
+            // to, and any other write loses it, so the pairing ends there.
+            let mut base = page;
+            let mut completions = 0usize;
+            for next in words[index + 1..].iter().take(PAIRING_WINDOW) {
+                let offset = page_offset(*next, register);
+                if let Some(offset) = offset {
+                    starts.push(base.wrapping_add(offset));
+                    completions += 1;
+                    // `ADD Xn, Xn, #imm`: from here the register holds
+                    // that address, so a later access is relative to it.
+                    if *next & 0x1F == register && *next & 0xFF80_0000 == 0x9100_0000 {
+                        base = base.wrapping_add(offset);
+                        continue;
+                    }
+                }
+                if writes(*next, register) {
+                    break;
+                }
+            }
+            if completions == 0 {
+                // Nothing in the window completes it, so the address this
+                // `ADRP` names is unknown; the caller is told, and leaves
+                // the section alone.
+                unresolved.push(pc);
             }
         }
     }
-    starts
+    Addressed { starts, unresolved }
+}
+
+/// What [`addressed_starts`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Addressed {
+    /// Where data may start, as addresses.
+    pub starts: Vec<u64>,
+    /// The address of each `ADRP` nothing in the window completes, whose
+    /// own target is therefore unknown: an `ADD` can place it up to 16 MiB
+    /// from the page, so no range bounds it. A caller that must not take
+    /// data for code leaves such a section alone.
+    pub unresolved: Vec<u64>,
 }
 
 /// The offset into an `ADRP`'s page that `word` adds, if it is an `ADD`
@@ -673,10 +812,6 @@ pub fn direct_branches(words: &[u32], base: u64) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// The page an `ADRP` addresses, and so the furthest a page start can lie
-/// below the function whose data it names.
-const PAGE: u64 = 4096;
-
 /// The bytes a function may hold as data, where only the unwind table tells
 /// code from data: from each address the code addresses as data
 /// (`starts`, [`addressed_starts`]) inside a function (`functions`, the
@@ -685,9 +820,7 @@ const PAGE: u64 = 4096;
 /// Control does not run into a table, so the code after one is reached by a
 /// branch, and only a branch that is not itself inside a table counts: a
 /// table word can decode as one. An address at a function's entry is a
-/// pointer to the function, not data. A page-aligned address below a
-/// function and within one page of it is the page an `ADRP` alone gave, and
-/// takes that function whole. The ranges come back sorted and merged.
+/// pointer to the function, not data. The ranges come back sorted and merged.
 pub fn data_extents(
     starts: &[u64],
     functions: &[(u64, u64)],
@@ -696,27 +829,12 @@ pub fn data_extents(
     let mut extents: Vec<(u64, u64)> = starts
         .iter()
         .filter_map(|start| {
-            // A page an `ADRP` alone gives is page-aligned and lies within
-            // one page below the function that holds the code, so take the
-            // data to start where the function does: the whole function is
-            // then data, which is what an address this reader cannot
-            // complete leaves it knowing.
             let after = functions.partition_point(|(entry, _)| entry <= start);
-            if let Some((_, end)) = functions[..after]
+            functions[..after]
                 .iter()
                 .rev()
                 .find(|(entry, end)| entry < start && start < end)
-            {
-                return Some((*start, *end));
-            }
-            if !start.is_multiple_of(PAGE) {
-                return None;
-            }
-            functions
-                .iter()
-                .find(|(entry, end)| start < entry && entry < end)
-                .filter(|(entry, _)| start.saturating_add(PAGE) > *entry)
-                .map(|(entry, end)| (*entry, *end))
+                .map(|(_, end)| (*start, *end))
         })
         .collect();
     extents.sort_unstable();
@@ -1014,17 +1132,17 @@ pub(crate) mod tests {
         ];
         let covered = [(0x100, 0x12c)];
         assert_eq!(
-            reachable_code(&words, 0x100, &covered, &[0x100]),
+            reachable_code(&words, 0x100, &covered, &[0x100], &|_| true),
             vec![(0x100, 0x104), (0x108, 0x11c)]
         );
         // Its own FDE's entry makes the last function code.
         assert_eq!(
-            reachable_code(&words, 0x100, &covered, &[0x100, 0x120]),
+            reachable_code(&words, 0x100, &covered, &[0x100, 0x120], &|_| true),
             vec![(0x100, 0x104), (0x108, 0x11c), (0x120, 0x128)]
         );
         // Nothing outside the covered ranges is reached, entries included.
         assert_eq!(
-            reachable_code(&words, 0x100, &[(0x100, 0x110)], &[0x100, 0x120]),
+            reachable_code(&words, 0x100, &[(0x100, 0x110)], &[0x100, 0x120], &|_| true),
             vec![(0x100, 0x104), (0x108, 0x110)]
         );
     }
@@ -1091,19 +1209,21 @@ pub(crate) mod tests {
             0x9000_0004, // adrp x4, 0x1000, never completed
             0xd503_201f, // nop
         ];
-        assert_eq!(
-            addressed_starts(&words, 0x1000),
-            vec![0x1010, 0x1024, 0x1174, 0x1818, 0x1000]
-        );
+        let addressed = addressed_starts(&words, 0x1000);
+        assert_eq!(addressed.starts, vec![0x1010, 0x1024, 0x1174, 0x1818]);
+        // The last `ADRP` is completed by nothing, so its target is
+        // unknown and the caller is told where it is.
+        assert_eq!(addressed.unresolved, vec![0x1018]);
         // The completing instruction must take the ADRP's own register, and
         // is looked for in the eight instructions after it.
         let other = [0x9000_0001, 0x9105_d042]; // adrp x1; add x2, x2, #0x174
-        assert_eq!(addressed_starts(&other, 0x1000), vec![0x1000]);
+        assert_eq!(addressed_starts(&other, 0x1000).unresolved, vec![0x1000]);
+        assert!(addressed_starts(&other, 0x1000).starts.is_empty());
         let far: Vec<u32> = std::iter::once(0x9000_0001)
             .chain(std::iter::repeat_n(0xd503_201f, 8))
             .chain(std::iter::once(0x9105_d021))
             .collect();
-        assert_eq!(addressed_starts(&far, 0x1000), vec![0x1000]);
+        assert_eq!(addressed_starts(&far, 0x1000).unresolved, vec![0x1000]);
     }
 
     #[test]
@@ -1111,17 +1231,20 @@ pub(crate) mod tests {
         // adrp x1, 0x1000; mov x1, #0 (the page is gone); add x1, x1, #0x40
         // completes nothing of the ADRP.
         let overwritten = [0x9000_0001, 0xd280_0001, 0x9101_0021];
-        assert_eq!(addressed_starts(&overwritten, 0x1000), vec![0x1000]);
+        assert_eq!(
+            addressed_starts(&overwritten, 0x1000).unresolved,
+            vec![0x1000]
+        );
         // The same without the write: the ADD completes it.
         let paired = [0x9000_0001, 0xd503_201f, 0x9101_0021];
-        assert_eq!(addressed_starts(&paired, 0x1000), vec![0x1040]);
+        assert_eq!(addressed_starts(&paired, 0x1000).starts, vec![0x1040]);
         // A write to another register says nothing.
         let other = [0x9000_0001, 0xd280_0002, 0x9101_0021];
-        assert_eq!(addressed_starts(&other, 0x1000), vec![0x1040]);
+        assert_eq!(addressed_starts(&other, 0x1000).starts, vec![0x1040]);
         // The completing instruction may be the one that writes the
         // register, as `ADD Xn, Xn, #imm` and a load through it are.
         let load = [0x9000_0001, 0xf940_0421];
-        assert_eq!(addressed_starts(&load, 0x1000), vec![0x1008]);
+        assert_eq!(addressed_starts(&load, 0x1000).starts, vec![0x1008]);
     }
 
     /// A store through the `ADRP`'s register, or of it, reads the register
@@ -1135,7 +1258,7 @@ pub(crate) mod tests {
         ] {
             let words = [0x9000_0001, store, 0x9101_0021];
             assert_eq!(
-                addressed_starts(&words, 0x1000),
+                addressed_starts(&words, 0x1000).starts,
                 vec![0x1040],
                 "{store:#010x}"
             );
@@ -1143,28 +1266,27 @@ pub(crate) mod tests {
         // A store through the register addresses those bytes as well, and
         // the pairing still reaches the `ADD` after it.
         let through = [0x9000_0001, 0xf900_0021, 0x9101_0021];
-        assert_eq!(addressed_starts(&through, 0x1000), vec![0x1000, 0x1040]);
+        assert_eq!(
+            addressed_starts(&through, 0x1000).starts,
+            vec![0x1000, 0x1040]
+        );
         // A load into the register ends the pairing: the page is gone.
         let load = [0x9000_0001, 0xf940_03e1, 0x9101_0021];
-        assert_eq!(addressed_starts(&load, 0x1000), vec![0x1000]);
+        assert_eq!(addressed_starts(&load, 0x1000).unresolved, vec![0x1000]);
     }
 
+    /// An unresolved `ADRP` is not a data start: its page is handed to
+    /// the caller, which takes the functions the page overlaps.
     #[test]
-    fn an_uncompleted_adrp_takes_the_function_its_page_belongs_to() {
-        // The page is below the function, so the data starts where the
-        // function does rather than being dropped.
-        let functions = [(0x1100, 0x1180)];
+    fn an_uncompleted_adrp_is_not_a_start() {
+        let words = [0x9000_0001, 0xd503_201f];
+        let addressed = addressed_starts(&words, 0x1000);
+        assert!(addressed.starts.is_empty());
+        assert_eq!(addressed.unresolved, vec![0x1000]);
         assert_eq!(
-            data_extents(&[0x1000], &functions, &[]),
-            vec![(0x1100, 0x1180)]
+            data_extents(&addressed.starts, &[(0x1100, 0x1180)], &[]),
+            vec![]
         );
-        // A page further than one page below belongs to another function,
-        // and an address that is not a page start is not a page.
-        assert_eq!(data_extents(&[0x0000], &functions, &[]), vec![]);
-        assert_eq!(data_extents(&[0x1040], &functions, &[]), vec![]);
-        // An address at an entry that is not a page start is a pointer to
-        // the function.
-        assert_eq!(data_extents(&[0x1100], &functions, &[]), vec![]);
     }
 
     #[test]
