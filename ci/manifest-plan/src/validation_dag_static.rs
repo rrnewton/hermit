@@ -3300,7 +3300,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 3465 + 20 = 3485.
     // And post_crash's two reused-process-ID tests (revcodex3 F2 on
     // https://github.com/rrnewton/hermit/pull/4867): 3485 + 2 = 3487.
-    ("test.detcore_unit", 3487),
+    // And its exec-survivor arm-transfer test (revcodex3 delta):
+    // 3487 + 1 = 3488.
+    ("test.detcore_unit", 3488),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5945,7 +5947,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fbf9d5f0c: 3458 + 1 = 3459.
     // Rebased onto main fcd62385f: 3465 + 20 = 3485.
     // And the same two reused-process-ID tests: 3485 + 2 = 3487.
-    ("test.detcore_unit_on_host", 3487),
+    // And the same arm-transfer test: 3487 + 1 = 3488.
+    ("test.detcore_unit_on_host", 3488),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
