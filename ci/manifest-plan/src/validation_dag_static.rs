@@ -1988,7 +1988,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze tests: 1254 + 2 = 1256.
     // And analyze::rundata::tests::every_record_written_for_a_trial_states_the_trials_chosen_ids:
     // 1256 + 1 = 1257.
-    ("test.hermit_unit", 1257),
+    // Drain 5093: this change's bisection-checkpoints unit (the 4641 +1 in
+    // its original stack landed separately and is already in 1257):
+    // 1257 + 1 = 1258, listed.
+    ("test.hermit_unit", 1258),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6336,7 +6339,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // And the same two: 1248 + 2 = 1250.
     // And the same trial-record stamping unit: 1250 + 1 = 1251.
-    ("test.hermit_unit_on_host", 1251),
+    // Drain 5093: the same bisection-checkpoints unit: 1251 + 1 = 1252, listed.
+    ("test.hermit_unit_on_host", 1252),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
