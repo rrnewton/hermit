@@ -2011,7 +2011,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And time_skip_carry's
     // a_source_of_rows_alone_with_instruction_offsets_counts_as_format_one:
     // 1338.
-    ("test.hermit_unit", 1226),
+    // And rundata's
+    // a_prefix_trial_of_offset_rows_keeps_its_timing_at_every_length: 1227.
+    ("test.hermit_unit", 1227),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6360,7 +6362,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main c1f3085da: 1216 + 1 = 1217.
     // And the same two --chaos-instruction-offset run units: 1219.
     // And the same time_skip_carry rows-alone unit: 1220.
-    ("test.hermit_unit_on_host", 1220),
+    // And the same rundata prefix-timing unit: 1221.
+    ("test.hermit_unit_on_host", 1221),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

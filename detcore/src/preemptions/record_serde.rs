@@ -82,6 +82,8 @@ struct RawRecord {
     rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     background_starts: Vec<BackgroundStart>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rows_alone: bool,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
