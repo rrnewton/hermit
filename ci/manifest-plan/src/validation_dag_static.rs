@@ -3298,7 +3298,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_sigchld_linux_never_sends_or_a_call_may_consume_is_not_fenced and
     // a_fenced_sigchld_expires_once_a_thread_that_could_take_it_runs_on_without_it
     // (review of https://github.com/rrnewton/hermit/pull/4627): 3524 + 2 = 3526.
-    ("test.detcore_unit", 3526),
+    // And a_fenced_sigchld_that_a_shared_signalfd_or_a_flush_may_take_leaves_no_bound
+    // (the same review): 3526 + 1 = 3527.
+    ("test.detcore_unit", 3527),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5944,7 +5946,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // And the same three bounded SIGCHLD-deferral units: 3521 + 3 = 3524, listed.
     // And the same two fenced-SIGCHLD units: 3524 + 2 = 3526.
-    ("test.detcore_unit_on_host", 3526),
+    // And the same shared-signalfd and flush unit: 3526 + 1 = 3527.
+    ("test.detcore_unit_on_host", 3527),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
