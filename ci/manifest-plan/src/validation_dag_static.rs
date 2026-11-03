@@ -1975,7 +1975,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1335 + 9 = 1344.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1212 + 1 = 1213 (Train 5 delta +1).
-    ("test.hermit_unit", 1239),
+    // Drain 4766 recount (measured by cargo test --list at the rebased head:
+    // hermit-run lib 1190 on main 77be1fd0, 1191 with this change's
+    // a_runs_skid_overshoots_are_taken_whole test): 1239 + 1 = 1240, listed.
+    ("test.hermit_unit", 1240),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6291,7 +6294,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
-    ("test.hermit_unit_on_host", 1233),
+    // Drain 4766 recount (same +1 lib test as test.hermit_unit): 1233 + 1 = 1234, listed.
+    ("test.hermit_unit_on_host", 1234),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
