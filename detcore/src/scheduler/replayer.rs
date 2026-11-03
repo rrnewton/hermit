@@ -940,7 +940,16 @@ impl Replayer {
         }
     }
 
-    fn check_context_switch(&mut self, observed: &SchedEvent) -> ReplayAction {
+    /// `popped`: the replay popped a recorded event for `observed`, not only
+    /// on an exact match but also on a soft desync (the same operation with
+    /// other counts or times) and on the event a fast-forward resynchronized
+    /// to (`observe_event`). Each leaves the cursor at the recording's event
+    /// after one of this thread's. Only then may the reply let the thread
+    /// take its next end without a stop, and only when that end is the
+    /// observing thread's own next event: a context switch hands the length
+    /// to another thread (or to the grant), and a hard desync, which pops
+    /// nothing, leaves a head that names no end of this thread's.
+    fn check_context_switch(&mut self, observed: &SchedEvent, popped: bool) -> ReplayAction {
         // We run after the pop of any matched action, so the next action in replay represents the
         // FUTURE not the PRESENT/PAST.
         //
@@ -987,7 +996,7 @@ impl Replayer {
                     next_tid,
                     timeslice,
                 )
-            } else {
+            } else if popped {
                 // We're still running the next event.
                 ReplayAction::Continue(timeslice)
             }
@@ -1764,7 +1773,114 @@ mod tests {
         let mut replayer = Replayer::new(schedule.clone());
         assert_eq!(
             replayer.observe_event(&schedule[0]),
-            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+            ReplayAction::Continue(Some(stop_after(123)))
+        );
+    }
+
+    /// A recorded end's RIP is compared exactly unless the recording took
+    /// that end without a stop: a replay that ends a stopped end at another
+    /// instruction is a hard desync naming `end_rip`, while at an end taken
+    /// without a stop, where the recording has no RIP of its own, any RIP
+    /// the replay reads (or none) is not one.
+    #[test]
+    fn a_recorded_end_rip_is_compared_exactly_unless_the_end_was_stopless() {
+        let mut b = builder::SchedTestBuilder::new();
+        let mut recorded = b.branch(100, tid(3));
+        recorded.end_rip = InstructionPointer::new(0x401000);
+        let mut elsewhere = recorded.clone();
+        elsewhere.end_rip = InstructionPointer::new(0x402000);
+        assert!(is_hard_desync(&elsewhere, &recorded));
+        assert_eq!(hard_desync_fields(&elsewhere, &recorded), vec!["end_rip"]);
+        assert!(!is_hard_desync(&recorded.clone(), &recorded));
+
+        let stopless = b.branch(100, tid(3)).taken_without_stop();
+        let mut stopped_there = stopless.clone();
+        stopped_there.stopless = false;
+        stopped_there.end_rip = InstructionPointer::new(0x402000);
+        assert!(!is_hard_desync(&stopped_there, &stopless));
+        assert!(hard_desync_fields(&stopped_there, &stopless).is_empty());
+        assert!(!is_hard_desync(&stopless.clone(), &stopless));
+    }
+
+    /// A lone thread's slice end the recording took without a stop is
+    /// replayed as a slice end, marked so the replay may take it the same
+    /// way, even when its own check-in follows with no branch between: the
+    /// unmarked shape (branches, then the thread's OtherInstructions and its
+    /// syscall) reaches a check-in and gets no end at all.
+    #[test]
+    fn a_stopless_end_is_a_slice_end_whatever_follows() {
+        for stopless in [true, false] {
+            let mut b = builder::SchedTestBuilder::new();
+            let schedule = vec![
+                b.other(SOME_RIP, tid(3)),
+                SchedEvent {
+                    stopless,
+                    ..b.branch(123, tid(3))
+                },
+                b.other(SOME_RIP, tid(3)),
+                b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
+            ];
+            let mut replayer = Replayer::new(schedule.clone());
+            let end = stopless.then_some(ReplayedSliceEnd {
+                length: LogicalTime::from_rcbs(123),
+                stopless: true,
+            });
+            assert_eq!(
+                replayer.observe_event(&schedule[0]),
+                ReplayAction::Continue(end),
+                "stopless: {stopless}"
+            );
+        }
+    }
+
+    /// A replay that stopped at an end its recording took without a stop
+    /// (its thread did not run alone there) matches it: the stop's RIP is
+    /// one the recording could not have. Taking an end without a stop where
+    /// the recording stopped is a desync, because the RIP it checks is gone.
+    #[test]
+    fn a_stop_where_the_recording_had_none_matches_but_not_the_reverse() {
+        let mut b = builder::SchedTestBuilder::new();
+        let stopless = b.branch(100, tid(3)).taken_without_stop();
+        let stopped = SchedEvent {
+            end_rip: std::num::NonZeroUsize::new(SOME_RIP),
+            stopless: false,
+            ..stopless.clone()
+        };
+        assert!(events_match(&stopped, &stopless));
+        assert!(!is_hard_desync(&stopped, &stopless));
+        assert!(hard_desync_fields(&stopped, &stopless).is_empty());
+        assert!(!events_match(&stopless, &stopped));
+        assert_eq!(hard_desync_fields(&stopless, &stopped), vec!["end_rip"]);
+    }
+
+    /// Only the thread whose own next recorded event is a stopless end,
+    /// right after its event matched, may take that end without a stop. A
+    /// context switch hands the end's length to another thread, and an
+    /// unmatched event leaves the cursor at an end this thread may not have
+    /// reached the recording's way: both take the end with a stop.
+    #[test]
+    fn a_stopless_end_goes_only_to_its_own_thread_after_a_match() {
+        let mut b = builder::SchedTestBuilder::new();
+        let switch = vec![
+            b.other(SOME_RIP, tid(5)),
+            b.branch(100, tid(3)).taken_without_stop(),
+        ];
+        let mut replayer = Replayer::new(switch.clone());
+        assert_eq!(
+            replayer.observe_event(&switch[0]),
+            ReplayAction::ContextSwitch(true, tid(3), Some(stop_after(100)))
+        );
+
+        let mut b = builder::SchedTestBuilder::new();
+        let unmatched = vec![
+            b.branch(100, tid(3)).taken_without_stop(),
+            b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(unmatched);
+        let observed = b.syscall_pre(Sysno::read, SOME_RIP, tid(3));
+        assert_eq!(
+            replayer.observe_event(&observed),
+            ReplayAction::Continue(Some(stop_after(100)))
         );
     }
 
