@@ -3198,7 +3198,21 @@ fi
 # and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
 # carries, not runtime equivalence.
-expected_pin=3df91c9c71bdc5c77571974cbabfca20183a08de
+# CARRY TO 47855f265879931a43b1c9e9a5e9b7b572f07611 (2026-11-02): from 3df91c9c71bdc5c77571974cbabfca20183a08de.
+# Interval: Reverie #1153 on 3df91c9c (3db4e927, b010f830, 134321d9, 1028bfc5, 89f9223f, 47855f26), in
+# reverie-kvm/src/preemption_timer.rs, reverie-ptrace/src/timer.rs, its
+# tests/precise_timer_overtaken.rs and its in-crate test module
+# src/offset_step_interruption_tests.rs (src/lib.rs, cfg(test)),
+# reverie/src/pmu_config.rs and that
+# file's LiteInst source-catalog row in reverie-liteinst-artifact/src/lib.rs;
+# it is not on Reverie's main branch yet, and the pin moves to the landed
+# revision once it is. The reverie-dbt tree (3771fc9c), the root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml are unchanged.
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
+# and third-party/ are byte-identical by git object id between the pins
+# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
+# carries, not runtime equivalence.
+expected_pin=47855f265879931a43b1c9e9a5e9b7b572f07611
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
