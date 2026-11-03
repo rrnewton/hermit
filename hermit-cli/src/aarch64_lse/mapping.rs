@@ -42,8 +42,10 @@ const SHT_STRTAB: u32 = 3;
 /// The size of an ELF64 section header and of an ELF64 symbol.
 const SECTION_HEADER_SIZE: usize = 64;
 const SYMBOL_SIZE: usize = 24;
-/// `STT_NOTYPE`, the type every mapping symbol has.
+/// `STT_NOTYPE` and `STB_LOCAL`, the type and binding every mapping symbol
+/// has: the info byte of a mapping symbol is exactly zero.
 const STT_NOTYPE: u8 = 0;
+const STB_LOCAL: u8 = 0;
 /// `SHN_LORESERVE`: section indices from here up are not sections.
 const SHN_LORESERVE: u16 = 0xff00;
 
@@ -817,8 +819,9 @@ pub fn symbol_table(table: &[u8]) -> Option<((u64, u64), (u64, u64))> {
     Some((range(symtab), range(strtab)))
 }
 
-/// The mapping symbols of a symbol table, given the string table it names,
-/// sorted by section and address. Where a `$x` and a `$d` mark the same
+/// The mapping symbols of a symbol table, given the string table it names:
+/// the local, untyped symbols whose names are `$x` or `$d`, sorted by
+/// section and address. Where a `$x` and a `$d` mark the same
 /// address, the `$d` sorts last and so wins: a word that may be data is not
 /// taken for code.
 pub fn mapping_symbols(symtab: &[u8], strtab: &[u8]) -> Vec<MappingSymbol> {
@@ -830,7 +833,17 @@ pub fn mapping_symbols(symtab: &[u8], strtab: &[u8]) -> Vec<MappingSymbol> {
             let name =
                 usize::try_from(u32::from_le_bytes(symbol[0..4].try_into().unwrap())).ok()?;
             let section = u16::from_le_bytes(symbol[6..8].try_into().unwrap());
-            if symbol[4] & 0xf != STT_NOTYPE || section == 0 || section >= SHN_LORESERVE {
+            // A mapping symbol is local and untyped ("ELF for the Arm
+            // 64-bit Architecture", 5.5.4: they are `STT_NOTYPE` and
+            // `STB_LOCAL`, and the `$` names are reserved for local
+            // symbols). A global symbol whose name begins `$x` is an
+            // ordinary label: taking it for a mapping symbol would let one
+            // inside a `$d` table start a code range there.
+            if symbol[4] & 0xf != STT_NOTYPE
+                || symbol[4] >> 4 != STB_LOCAL
+                || section == 0
+                || section >= SHN_LORESERVE
+            {
                 return None;
             }
             let name = strtab.get(name..)?;
@@ -1261,7 +1274,8 @@ pub(crate) mod tests {
             symbol(dq, 0, 2, 0x200),     // ties with $x.1 at 0x200 and wins
             symbol(x, 0, 0, 0x300),      // SHN_UNDEF
             symbol(x, 0, 0xfff1, 0x300), // SHN_ABS
-            symbol(x, 0x10, 1, 0x40),    // STB_GLOBAL, STT_NOTYPE: still a mapping name
+            symbol(x, 0x10, 1, 0x40),    // STB_GLOBAL: an ordinary label, not a mark
+            symbol(x, 0x10, 2, 0x190),   // the same inside section 2's $d range
             symbol(99, 0, 2, 0x100),     // name past the string table
         ]
         .concat();
@@ -1274,12 +1288,16 @@ pub(crate) mod tests {
         assert_eq!(
             symbols,
             vec![
-                at(1, 0x40, true),
                 at(2, 0x100, true),
                 at(2, 0x180, false),
                 at(2, 0x200, true),
                 at(2, 0x200, false),
             ]
+        );
+        // The global `$x` inside the `$d` range does not split it.
+        assert_eq!(
+            code_spans(&symbols, 2, 0x100, 0x100),
+            Some(vec![(0x100, 0x180)])
         );
     }
 
