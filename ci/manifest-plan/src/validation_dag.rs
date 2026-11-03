@@ -6393,6 +6393,9 @@ sys.exit(37)
             // The race finder's.
             "analyze_checks_the_race_candidates_and_says_what_each_edit_moved",
             "analyze_names_the_close_racing_the_reused_descriptor",
+            // The verdict change's.
+            "bisect_exits_2_when_its_good_schedule_meets_the_target",
+            "analyze_reports_a_target_met_without_chaos_as_reproduced_without_the_schedule",
         ] {
             assert!(
                 source.contains(&format!("fn {case}()")),
