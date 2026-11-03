@@ -2038,7 +2038,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_prefix_trial_of_trace_offsets_keeps_its_timing_at_every_length: 1237.
     // And rundata's rows_alone_restated_in_format_five_still_hold_rows_only:
     // 1350.
-    ("test.hermit_unit", 1238),
+    // And schedule_search's
+    // schedules_that_differ_only_in_an_instruction_offset_differ_everywhere_the_search_compares
+    // and bisect_tells_endpoints_apart_by_their_instruction_offsets: 1240.
+    ("test.hermit_unit", 1240),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3377,7 +3380,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_format_this_hermit_does_not_read_survives_the_offsets_cap: 3509.
     // And a_writer_that_noted_an_instruction_offset_cannot_become_a_boundary_writer: 3509.
     // And a_priority_replay_of_an_unread_format_exits_with_the_policy_status: 3509.
-    ("test.detcore_unit", 3509),
+    // And a_trace_offsets_record_keeps_its_format_when_it_drops_its_background_starts: 3510.
+    // And a_stopless_mark_beside_an_instruction_offset_is_refused_everywhere: 3511.
+    ("test.detcore_unit", 3511),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6005,7 +6010,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unread-format cap unit: 3509.
     // And the same boundary-writer offsets unit: 3509.
     // And the same priority-installer refusal unit: 3509.
-    ("test.detcore_unit_on_host", 3509),
+    // And a_trace_offsets_record_keeps_its_format_when_it_drops_its_background_starts: 3510.
+    // And the same stopless-offset refusal unit: 3511.
+    ("test.detcore_unit_on_host", 3511),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6446,7 +6453,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same minimize-record unit: 1230.
     // And the same trace-offsets prefix-timing unit: 1231.
     // And the same marked-rows-in-format-5 unit: 1232.
-    ("test.hermit_unit_on_host", 1232),
+    // And the same offset-comparator schedule-search and bisect units: 1234.
+    ("test.hermit_unit_on_host", 1234),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

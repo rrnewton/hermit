@@ -342,9 +342,10 @@ impl std::hash::Hash for HostObservedCount {
 /// (`PreemptionRecord::forget_stopless_marks_below_their_format`). One that
 /// cannot be lowered keeps its number and marks the earlier feature's data
 /// absent with an explicit flag instead of clearing it: rows with
-/// instruction offsets keep format 6 and say that they note no background
-/// starts (`PreemptionRecord::background_starts_unnoted`), as rows alone say
-/// they hold no schedule trace (`PreemptionRecord::rows_alone`). So a reader
+/// instruction offsets keep format 6, and a record whose schedule trace holds
+/// every offset decision keeps format 7, and each says that it notes no
+/// background starts (`PreemptionRecord::background_starts_unnoted`), as rows
+/// alone say they hold no schedule trace (`PreemptionRecord::rows_alone`). So a reader
 /// decides what a record holds by its format and those flags together
 /// (`PreemptionRecord::notes_background_starts`,
 /// `PreemptionRecord::timing_format`), never by the number alone, and a
@@ -1141,11 +1142,27 @@ impl PreemptionRecord {
     /// `raise_format`), as [`PREEMPTION_RECORD_FORMAT`] describes. Either way
     /// it drops its `stopless` marks, which only a record that notes its
     /// starts holds (`forget_stopless_marks_below_their_format`).
+    ///
+    /// A record of [`INSTRUCTION_OFFSET_FORMAT`] or newer keeps its number
+    /// and says it notes no starts. That format says the schedule trace holds
+    /// every offset decision of the events it holds, which a shorter prefix,
+    /// an edit or a mixed order keeps whatever events it keeps, one that ends
+    /// before the first offset included: lowered, the record would read as
+    /// one whose trace does not hold the offsets (rows only, if its rows hold
+    /// one), which a schedule replay refuses.
     fn forget_background_starts(&mut self) {
         self.background_starts.clear();
         self.background_starts_unnoted = false;
-        self.format_version = format_without_background_starts(self.format_version);
-        self.adopt_offsets_format();
+        if reads_format(self.format_version)
+            && self
+                .format_version
+                .is_some_and(|format| format >= INSTRUCTION_OFFSET_FORMAT)
+        {
+            self.background_starts_unnoted = !self.rows_alone;
+        } else {
+            self.format_version = format_without_background_starts(self.format_version);
+            self.adopt_offsets_format();
+        }
         self.forget_stopless_marks_below_their_format();
     }
 
@@ -3755,6 +3772,66 @@ mod tests {
     /// with offsets states `INSTRUCTION_OFFSET_FORMAT`. An offset that a record's format cannot
     /// hold, on an event other than a batch of branches, or of zero steps, is
     /// refused.
+    /// A record whose schedule trace holds every offset decision
+    /// (`INSTRUCTION_OFFSET_FORMAT`) and that dropped its background starts
+    /// keeps that format, says it notes no starts, drops its `stopless`
+    /// marks (which only a record that notes its starts holds), and still
+    /// reads as recorded with offsets: a prefix of no events, one that ends
+    /// before the first offset, and an edit, through JSON. Lowered, the
+    /// prefixes would read as a trace without offsets (rows only, since the
+    /// rows hold one), which a schedule replay refuses; without the rule in
+    /// `forget_background_starts`, this test fails.
+    #[test]
+    fn a_trace_offsets_record_keeps_its_format_when_it_drops_its_background_starts() {
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let mut writer = PreemptionWriter::new(None).noting_background_starts();
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 10).taken_without_stop());
+        writer.insert_background_start(tid, 1);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(20),
+            20,
+            DEFAULT_PRIORITY,
+            5,
+            Some(offset),
+        );
+        writer
+            .insert_schedevent(SchedEvent::branches(tid, 20).with_instruction_offset(Some(offset)));
+        let run: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        run.validate().unwrap();
+        assert_eq!(run.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert!(run.notes_background_starts());
+        for (what, record) in [
+            ("a prefix of no events", run.schedule_prefix(0)),
+            ("a prefix before the offset", run.schedule_prefix(1)),
+            ("an edit", run.with_latest_preempt_removed()),
+        ] {
+            let back: PreemptionRecord = serde_json::from_str(&record.to_string()).unwrap();
+            back.validate()
+                .unwrap_or_else(|error| panic!("{what}: {error}"));
+            assert_eq!(
+                back.format_version(),
+                Some(INSTRUCTION_OFFSET_FORMAT),
+                "{what}"
+            );
+            assert!(back.background_starts_unnoted, "{what}");
+            assert!(!back.notes_background_starts(), "{what}");
+            assert!(back.background_starts().is_empty(), "{what}");
+            assert!(back.global.iter().all(|event| !event.stopless), "{what}");
+            assert_eq!(back.recorded_offsets(), RecordedOffsets::Recorded, "{what}");
+        }
+        // The whole prefix keeps the starts, the claim and the mark.
+        let whole = run.schedule_prefix(2);
+        assert_eq!(whole.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert!(whole.notes_background_starts());
+        assert!(whole.global[0].stopless);
+    }
+
     #[test]
     fn schedule_offsets_version_the_record_and_ride_its_edits() {
         let tid = DetTid::from_raw(3);
@@ -4891,7 +4968,7 @@ mod tests {
             SchedEvent::branches(tid, 10),
             SchedEvent::branches(tid, 20),
         ]);
-        record.format_version = Some(PREEMPTION_RECORD_FORMAT);
+        record.format_version = Some(BACKGROUND_STARTS_FORMAT);
         record.background_starts.push(BackgroundStart {
             after: 1,
             thread: tid,
