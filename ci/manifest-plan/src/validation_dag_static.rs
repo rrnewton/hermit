@@ -2012,7 +2012,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the root and path-length refusals, stale and held copies) and
     // host_input_change's snapshot-copy unit (PR #4791):
     // 1273 + 12 = 1285.
-    ("test.hermit_unit", 1285),
+    // And property_snapshot's relative-copy-root unit (F4): 1285 + 1 = 1286.
+    ("test.hermit_unit", 1286),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3315,7 +3316,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (wake unit + deferred-SIGCHLD negative arm).
     // And the property snapshot's path rule, content identity and
     // property-service address units (PR #4791): 3534 + 3 = 3537.
-    ("test.detcore_unit", 3537),
+    // And the snapshot-identity replay-comparison unit (F2): 3537 + 1 = 3538.
+    ("test.detcore_unit", 3538),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3429,7 +3431,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/4791): 214 + 2 = 216.
     // And property_snapshot::an_access_mode_3_open_of_a_copied_property_file_runs_as_natively
     // (the same pull request's review): 216 + 1 = 217.
-    ("test.detcore_misc", 217),
+    // And the late-file alias, dirfd-after-chdir and live-mapping cases
+    // (F1/F4): 217 + 3 = 220.
+    ("test.detcore_misc", 220),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5545,7 +5549,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the uncopied-file alias refusal: 213 + 1 = 214.
     // And the same two readable-open refusals: 214 + 2 = 216.
     // And the same access-mode-3 case: 216 + 1 = 217.
-    ("test.detcore_misc_on_host", 217),
+    // And the same three alias/dirfd/mapping cases: 217 + 3 = 220.
+    ("test.detcore_misc_on_host", 220),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5989,7 +5994,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
     // And the same three property snapshot units (PR #4791): 3534 + 3 = 3537.
-    ("test.detcore_unit_on_host", 3537),
+    // And the same snapshot-identity unit: 3537 + 1 = 3538.
+    ("test.detcore_unit_on_host", 3538),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6417,7 +6423,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit (dh-jqhfx, PR 5182): 1262 + 5 = 1267.
     // And the same twelve property snapshot units (PR #4791):
     // 1267 + 12 = 1279.
-    ("test.hermit_unit_on_host", 1279),
+    // And the same relative-copy-root unit: 1279 + 1 = 1280.
+    ("test.hermit_unit_on_host", 1280),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
