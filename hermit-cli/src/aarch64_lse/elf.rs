@@ -1185,6 +1185,38 @@ mod tests {
         assert_eq!(rewritten(&image).1.patched_total(), 1);
     }
 
+    /// One `ADRP` whose register completes two accesses: the table after the
+    /// second call is addressed only by the second, and must keep its bytes.
+    /// (Found reviewing this change against the census's own reader.)
+    #[test]
+    fn a_table_addressed_by_a_second_use_of_one_adrp_is_not_rewritten() {
+        let mut words = [0u32; 14];
+        words[0] = 0x9000_0001; // adrp x1, 0x0
+        words[1] = 0x9104_5022; // add x2, x1, #0x114 (a header word at word 5)
+        words[2] = 0x9104_8023; // add x3, x1, #0x120 (the table at word 8)
+        words[3] = 0xb400_0060; // cbz x0, <word 6>
+        words[4] = 0x9400_0009; // bl <word 13>, which traps
+        words[5] = 0x1234_5678; // the header
+        words[6] = 0xd503_201f; // nop: code again, a branch target
+        words[7] = 0x9400_0006; // bl <word 13>
+        words[8..12].copy_from_slice(&[0x885f_fc08, 0x1100_0508, 0x8809_fc08, 0x35ff_ffa9]);
+        words[12] = 0xd65f_03c0; // ret
+        words[13] = 0xd420_0000; // brk
+        assert_eq!(
+            mapping::addressed_starts(&words[..3], 0x100),
+            vec![0x114, 0x120],
+            "both completions of the one ADRP"
+        );
+        let image = elf_image_with(&words, None, Some(&[(0, 13), (13, 14)]));
+        let (bytes, report) = rewritten(&image);
+        assert_eq!(bytes, image, "{report:?}");
+        assert_eq!(
+            report.refused,
+            BTreeMap::from([("addressed-data-inside-the-sequence", 1)]),
+            "{report:?}"
+        );
+    }
+
     /// A relocatable object's FDE starts are relocations to fill, so its
     /// unwind table is no evidence.
     #[test]
