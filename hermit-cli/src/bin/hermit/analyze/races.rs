@@ -126,7 +126,7 @@ use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::analyze::types::ExitStatusConstraint;
+use crate::app::analyze::types::ExitStatusConstraint;
 
 /// What the target and baseline continuations are compared over.
 #[derive(Debug, Clone, PartialEq, Eq)]
