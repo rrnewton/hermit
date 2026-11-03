@@ -1911,7 +1911,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at b5cacf9ad0fa5e718a71f8e5663ddbafc8465f98 adds exactly
     // phases::tests::an_empty_prefix_that_meets_the_target_claims_nothing_about_longer_ones,
     // retaining all 1328 prior identities: 1329.
-    ("test.hermit_unit", 1329),
+    // Recount at 00e0cf5b2043d6ca996a44ff78a64128275f5351: 13 carried middle-layer
+    // tests and two callback-attachment regressions retain all 1329 names: 1344.
+    // This is the prior middle's 1341 plus the inherited diagnostic and two callbacks.
+    ("test.hermit_unit", 1344),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5979,7 +5982,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3cb2f62f64de85ee7e9a7deabb9802dc9ee250b8: 1322 active names.
     // The same empty-prefix regression at b5cacf9ad0fa5e718a71f8e5663ddbafc8465f98:
     // 1323 active identities; the six original host exclusions are unchanged.
-    ("test.hermit_unit_on_host", 1323),
+    // The same 15 additions at 00e0cf5b2043d6ca996a44ff78a64128275f5351 retain
+    // all 1323 host identities: 1338, with the same six host exclusions.
+    ("test.hermit_unit_on_host", 1338),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
