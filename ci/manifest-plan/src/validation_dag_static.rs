@@ -1259,7 +1259,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And four more of them (the listed view, an incomplete listing, a named backing, the
     // seccomp check) and recorder::mmap::tests::a_descriptors_access_mode_is_read_from_its_fdinfo: 1937.
     // And two more (a read-only hand-off, a link into a chrooted root): 1973 + 10 = 1983.
-    ("test.regular_crates", 1983),
+    // And the two shared-mapping capture units (review of
+    // https://github.com/rrnewton/hermit/pull/4593): 1983 + 2 = 1985.
+    ("test.regular_crates", 1985),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5260,7 +5262,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusions are present exactly once: 1971 - 14 = 1957, by nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    // The ten shared-file backing units and the two shared-mapping capture
+    // units, none hosted-excluded: 1959 + 12 = 1971.
+    ("test.regular_crates_on_host", 1971),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6457,7 +6461,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The three shared-file backing units: 1932 - 14 = 1918.
     // And the same five more units: 1923.
     // And the same two more: 1959 + 10 = 1969.
-    ("test.regular_crates_on_host", 1969),
+    // And the two shared-mapping capture units: 1969 + 2 = 1971.
+    ("test.regular_crates_on_host", 1971),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

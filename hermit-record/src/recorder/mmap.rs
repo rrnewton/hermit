@@ -199,18 +199,63 @@ fn read_readable_runs(mem: &std::fs::File, start: usize, end: usize) -> Vec<(usi
 }
 
 /// The file a `MAP_SHARED` mapping of descriptor `fd` of thread `tid` maps,
-/// the mapping's `offset` in it, and the descriptor's access mode.
-/// `/proc/<tid>` shows that thread's own descriptor table, which is not the
-/// leader's for a thread cloned without `CLONE_FILES`.
-fn shared_mapping(tid: i32, fd: i32, offset: i64) -> Option<SharedMapping> {
-    let metadata = std::fs::metadata(format!("/proc/{tid}/fd/{fd}")).ok()?;
-    let fdinfo = std::fs::read_to_string(format!("/proc/{tid}/fdinfo/{fd}")).ok()?;
-    Some(SharedMapping {
+/// the mapping's `offset` in it, and the descriptor's access mode, or why
+/// they could not be read. `/proc/<tid>` shows that thread's own descriptor
+/// table, which is not the leader's for a thread cloned without
+/// `CLONE_FILES`.
+fn shared_mapping(tid: i32, fd: i32, offset: i64) -> Result<SharedMapping, String> {
+    shared_mapping_under(std::path::Path::new("/proc"), tid, fd, offset)
+}
+
+/// [`shared_mapping`], reading `<proc_root>/<tid>/fd/<fd>` and
+/// `<proc_root>/<tid>/fdinfo/<fd>`.
+fn shared_mapping_under(
+    proc_root: &std::path::Path,
+    tid: i32,
+    fd: i32,
+    offset: i64,
+) -> Result<SharedMapping, String> {
+    let link = proc_root.join(format!("{tid}/fd/{fd}"));
+    let metadata =
+        std::fs::metadata(&link).map_err(|error| format!("{}: {error}", link.display()))?;
+    let info = proc_root.join(format!("{tid}/fdinfo/{fd}"));
+    let fdinfo =
+        std::fs::read_to_string(&info).map_err(|error| format!("{}: {error}", info.display()))?;
+    Ok(SharedMapping {
         device: metadata.dev(),
         inode: metadata.ino(),
-        offset: u64::try_from(offset).ok()?,
-        access: descriptor_access(&fdinfo)?,
+        offset: u64::try_from(offset).map_err(|_| format!("negative offset {offset}"))?,
+        access: descriptor_access(&fdinfo)
+            .ok_or_else(|| format!("{} has no octal flags line", info.display()))?,
     })
+}
+
+/// The shared identity the event of a successful `mmap` of descriptor `fd`
+/// records: none for a mapping that is not `MAP_SHARED` (`captured` is
+/// `None`), the captured identity for one that is. A `MAP_SHARED` mapping
+/// whose identity could not be captured is recorded without one, and the
+/// recording is marked as one replay refuses, with the reason
+/// (`detcore::detlog::record_replay_refusal`): replay would otherwise map it
+/// as a separate copy, which shares no memory with the file's other
+/// mappings, and the replay would diverge silently wherever the guest relies
+/// on that sharing.
+fn recorded_shared(
+    fd: i32,
+    captured: Option<Result<SharedMapping, String>>,
+) -> Option<SharedMapping> {
+    match captured? {
+        Ok(shared) => Some(shared),
+        Err(reason) => {
+            let reason = format!(
+                "the file identity of a MAP_SHARED mapping of descriptor {fd} could not be \
+                 read ({reason}); its replay would share no memory with the file's other \
+                 mappings"
+            );
+            tracing::error!("{reason}");
+            detcore::detlog::record_replay_refusal(&reason);
+            None
+        }
+    }
 }
 
 /// The access mode in a `/proc/<pid>/fdinfo/<fd>` listing: the `O_ACCMODE`
@@ -236,13 +281,15 @@ impl Recorder {
         }
 
         let len = syscall.len();
+        let fd = syscall.fd();
         // Read before the call: the descriptor names the same file then, and a
         // sibling thread could not have closed it, as the call holds the turn.
-        let shared = if syscall.flags().contains(MapFlags::MAP_SHARED) {
-            shared_mapping(guest.tid().as_raw(), syscall.fd(), syscall.offset())
-        } else {
-            None
-        };
+        // A failure to read it matters only if the call succeeds
+        // (`recorded_shared`); a failed call records its own errno.
+        let shared = syscall
+            .flags()
+            .contains(MapFlags::MAP_SHARED)
+            .then(|| shared_mapping(guest.tid().as_raw(), fd, syscall.offset()));
 
         // Do the injection. We need to record the pointer the mapping is at and
         // all of the bytes contained in the mapping. This is very inefficient
@@ -274,7 +321,7 @@ impl Recorder {
                     Ok(SyscallEvent::Mmap(MmapEvent {
                         addr: addr.as_raw(),
                         buf,
-                        shared,
+                        shared: recorded_shared(fd, shared),
                     }))
                 }
                 Err(errno) => Err(errno),
@@ -375,6 +422,70 @@ mod tests {
         assert_eq!(descriptor_access(&fdinfo("0100000")), Some(libc::O_RDONLY));
         assert_eq!(descriptor_access(&fdinfo("02000001")), Some(libc::O_WRONLY));
         assert_eq!(descriptor_access("pos:\t0\n"), None);
+    }
+
+    /// A `MAP_SHARED` mapping's identity is read from the calling thread's
+    /// `fd` link and `fdinfo` listing, and a failure to read either is an
+    /// error that names it, not a mapping without an identity. Here the
+    /// listing is missing, as when opening it fails with EMFILE; then the
+    /// link's target too.
+    #[test]
+    fn a_shared_mappings_identity_is_read_or_its_failure_named() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("mapped");
+        std::fs::write(&file, b"shared").unwrap();
+        std::fs::create_dir_all(root.path().join("7/fd")).unwrap();
+        std::fs::create_dir_all(root.path().join("7/fdinfo")).unwrap();
+        std::os::unix::fs::symlink(&file, root.path().join("7/fd/3")).unwrap();
+        let error = shared_mapping_under(root.path(), 7, 3, 4096).unwrap_err();
+        assert!(error.contains("7/fdinfo/3"), "{error}");
+        std::fs::write(
+            root.path().join("7/fdinfo/3"),
+            "pos:\t0\nflags:\t02100002\nmnt_id:\t25\n",
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&file).unwrap();
+        let shared = shared_mapping_under(root.path(), 7, 3, 4096).unwrap();
+        assert_eq!(
+            (shared.device, shared.inode, shared.offset, shared.access),
+            (metadata.dev(), metadata.ino(), 4096, libc::O_RDWR)
+        );
+        std::fs::remove_file(&file).unwrap();
+        let error = shared_mapping_under(root.path(), 7, 3, 4096).unwrap_err();
+        assert!(error.contains("7/fd/3"), "{error}");
+    }
+
+    /// A successful `MAP_SHARED` mapping whose identity could not be captured
+    /// is recorded without one and leaves the recording marked as one replay
+    /// refuses, naming the descriptor and the failure: replay would map it as
+    /// a separate copy. A captured identity is recorded as is, and a mapping
+    /// that is not `MAP_SHARED` records none; neither marks the recording.
+    #[test]
+    fn a_shared_mapping_without_its_identity_leaves_a_recording_replay_refuses() {
+        let shared = SharedMapping {
+            device: 1,
+            inode: 2,
+            offset: 0,
+            access: libc::O_RDWR,
+        };
+        assert_eq!(recorded_shared(3, None), None);
+        assert_eq!(recorded_shared(3, Some(Ok(shared))), Some(shared));
+        assert_eq!(detcore::detlog::replay_refusal(), None);
+        assert_eq!(
+            recorded_shared(
+                3,
+                Some(Err(
+                    "/proc/7/fdinfo/3: Too many open files (os error 24)".to_owned()
+                ))
+            ),
+            None
+        );
+        let refusal = detcore::detlog::replay_refusal().expect("no replay refusal recorded");
+        assert!(
+            refusal.contains("MAP_SHARED mapping of descriptor 3")
+                && refusal.contains("Too many open files"),
+            "{refusal}"
+        );
     }
 
     const MAPS: &str = "\
