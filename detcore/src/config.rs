@@ -87,10 +87,12 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: none now, since SP2's 25
-    /// (reserved as 22 with its record version) landed beneath PRCTL's 26,
-    /// with its row. Remove an entry when its change lands, with its row.
-    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[];
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 28 to 35, assigned to changes
+    /// pending elsewhere
+    /// (`ignored/drain-20261103/rpc-revisions.tsv` in the dev-hermit
+    /// parent), which 4791's 36 skips. Remove an entry when its change
+    /// lands, with its row.
+    const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[28, 29, 30, 31, 32, 33, 34, 35];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
     /// code of its two enums and its `Resources` payload. A change to any of
@@ -223,6 +225,15 @@ mod tests {
         // image returns it (the release-05 pidfd pair, renumbered to 27 at
         // its rebase onto C2's 25 and 26; digest measured at this head).
         (27, "74ceb8dd663f2297", "f013e36743d8d9e6"),
+        // Adds `HostFileIdentity::content` (JSON key `snapshot_content`),
+        // always encoded, which `GlobalRequest::RecordHostInput` carries in
+        // its `identity`. The digest now also covers that nested type, in
+        // domain 4: its attributes and fields
+        // (https://github.com/rrnewton/hermit/pull/4791; allocated 25 above
+        // main's 24, renumbered to 36 at its rebase onto main's 27,
+        // skipping 28 to 35 reserved for pending changes; digests measured
+        // at this head).
+        (36, "b35a60644caf6ee5", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -268,11 +279,49 @@ mod tests {
         code
     }
 
+    /// The nested types, outside the two enums, whose fields decide a
+    /// message's positional (bincode) layout, in detcore-model's
+    /// host_input.rs: the `HostFileIdentity` that
+    /// `GlobalRequest::RecordHostInput` carries.
+    const HOST_INPUT_WIRE: [&str; 1] = ["pub struct HostFileIdentity {"];
+
+    /// The lines of code of the item `source` declares, unindented, on the
+    /// line `header`: the attributes just above it (its derives and serde
+    /// attributes decide its encoding), the header, and its body through the
+    /// closing brace, without comments, attributes on its fields' doc lines
+    /// or blank lines.
+    fn wire_item(source: &str, header: &str) -> Vec<String> {
+        let lines: Vec<&str> = source.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == header)
+            .unwrap_or_else(|| panic!("{header} is declared"));
+        let attributes = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|line| line.starts_with("#["))
+            .count();
+        let mut code: Vec<String> = lines[at - attributes..=at]
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect();
+        code.extend(
+            lines[at + 1..]
+                .iter()
+                .take_while(|line| **line != "}")
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty() && !line.starts_with("//"))
+                .map(str::to_owned),
+        );
+        code
+    }
+
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
-    /// `source`, and of the StoreExclusive payload's types in `payload`:
-    /// their variants, fields, payload types, order and attributes, not
-    /// their documentation.
-    fn definition_digest(source: &str, payload: &str) -> String {
+    /// `source`, of the StoreExclusive payload's types in `payload`, and of
+    /// the nested wire types in `host_input` (`HOST_INPUT_WIRE`): their
+    /// variants, fields, payload types, order and attributes, not their
+    /// documentation.
+    fn definition_digest(source: &str, payload: &str, host_input: &str) -> String {
         let request = definition(source, "pub enum GlobalRequest {").join("\n");
         let response = definition(source, "pub enum GlobalResponse {").join("\n");
         let payload = STORE_EXCLUSIVE_PAYLOAD
@@ -280,10 +329,16 @@ mod tests {
             .map(|header| nested_definition(payload, header).join("\n"))
             .collect::<Vec<_>>()
             .join("\n");
+        let nested = HOST_INPUT_WIRE
+            .iter()
+            .map(|header| wire_item(host_input, header).join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
             (3, payload.as_bytes()),
+            (4, nested.as_bytes()),
         ])
     }
 
@@ -301,7 +356,8 @@ mod tests {
     fn the_global_rpc_revision_matches_its_definitions() {
         let source = include_str!("tool_global.rs");
         let payload = include_str!("store_exclusive.rs");
-        let digest = definition_digest(source, payload);
+        let host_input = include_str!("../../detcore-model/src/host_input.rs");
+        let digest = definition_digest(source, payload, host_input);
         let resources = include_str!("resources.rs");
         let resources_digest = resources_definition_digest(resources);
         let revision = crate::tool_global::GLOBAL_RPC_REVISION;
@@ -342,13 +398,13 @@ mod tests {
             "pub enum GlobalRequest {\n    /// Documentation only.\n\n",
             1,
         );
-        assert_eq!(definition_digest(&documented, payload), digest);
+        assert_eq!(definition_digest(&documented, payload, host_input), digest);
         let added = source.replacen(
             "pub enum GlobalRequest {\n",
             "pub enum GlobalRequest {\n    Added(u32),\n",
             1,
         );
-        assert_ne!(definition_digest(&added, payload), digest);
+        assert_ne!(definition_digest(&added, payload, host_input), digest);
         // Retype GlobalRequest's VirtualInotifyCookies wherever it sits: later
         // revisions append variants after it.
         let retyped = source.replacen(
@@ -357,7 +413,7 @@ mod tests {
             1,
         );
         assert_ne!(retyped, source);
-        assert_ne!(definition_digest(&retyped, payload), digest);
+        assert_ne!(definition_digest(&retyped, payload, host_input), digest);
         // A field added to a payload type changes it too, as this change's
         // own move from tuples to `ScannedMapping` and `Found` did; its
         // documentation does not.
@@ -367,14 +423,43 @@ mod tests {
             1,
         );
         assert_ne!(grown, payload);
-        assert_ne!(definition_digest(source, &grown), digest);
+        assert_ne!(definition_digest(source, &grown, host_input), digest);
         let documented = payload.replacen(
             "    pub struct Found {\n",
             "    pub struct Found {\n        /// Documentation only.\n",
             1,
         );
         assert_ne!(documented, payload);
-        assert_eq!(definition_digest(source, &documented), digest);
+        assert_eq!(definition_digest(source, &documented, host_input), digest);
+        // The nested `HostFileIdentity`: a field added, or its encoding's
+        // attributes changed, moves the digest; a doc line does not.
+        let documented = host_input.replacen(
+            "pub struct HostFileIdentity {\n",
+            "pub struct HostFileIdentity {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, host_input);
+        assert_eq!(definition_digest(source, payload, &documented), digest);
+        let added = host_input.replacen(
+            "pub struct HostFileIdentity {\n",
+            "pub struct HostFileIdentity {\n    pub added: u32,\n",
+            1,
+        );
+        assert_ne!(definition_digest(source, payload, &added), digest);
+        let renamed = host_input.replacen(
+            "#[serde(default, rename = \"snapshot_content\")]",
+            "#[serde(default)]",
+            1,
+        );
+        assert_ne!(renamed, host_input);
+        assert_ne!(definition_digest(source, payload, &renamed), digest);
+        let rederived = host_input.replacen(
+            "#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]\npub struct HostFileIdentity {",
+            "#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]\npub struct HostFileIdentity {",
+            1,
+        );
+        assert_ne!(rederived, host_input);
+        assert_ne!(definition_digest(source, payload, &rederived), digest);
 
         let documented = resources.replacen(
             "pub struct Resources {\n",
@@ -404,6 +489,13 @@ mod tests {
         assert_ne!(ours, model);
         let other = fingerprint_with_revision(&model, revision + 1);
         assert_ne!(other, ours);
+        // A build at the previous revision, from before the newest wire
+        // change, is refused too.
+        let previous = fingerprint_with_revision(&model, revision - 1);
+        assert!(
+            config_fingerprint_mismatch(std::ffi::OsStr::new(&previous)).is_some(),
+            "the previous revision is a mismatch"
+        );
         assert_eq!(
             config_fingerprint_mismatch(std::ffi::OsStr::new(&ours)),
             None

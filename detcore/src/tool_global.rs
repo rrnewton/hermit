@@ -7905,8 +7905,9 @@ pub enum SignalScope {
 /// Detcore and a coordinator built at different revisions refuse each other
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
-/// fails until it does). That test digests the two enums' bodies and
-/// `Resources`, and refuses a revision whose digests did not change, so no
+/// fails until it does). That test digests the two enums' bodies,
+/// `Resources`, the StoreExclusive payload's types and the nested
+/// `HostFileIdentity`, and refuses a revision whose digests did not change, so no
 /// revision can be appended by hand. A change to another payload type defined
 /// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
 /// is on the wire without changing the digest, so it must either keep every
@@ -7921,8 +7922,10 @@ pub enum SignalScope {
 /// coordinator. The in-guest runtimes, the only peers built apart, never
 /// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
-// `ChildSubreaper` pair.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 27;
+// `ChildSubreaper` pair. 36 appends `HostFileIdentity::content` (PR #4791)
+// after main's 27, skipping 28 to 35 reserved for pending changes
+// (`ignored/drain-20261103/rpc-revisions.tsv` in the dev-hermit parent).
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 36;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
