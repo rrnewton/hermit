@@ -89,6 +89,47 @@ pub fn cache_path() -> PathBuf {
     base.join("exclusive-rewrites")
 }
 
+/// The cache entry holding `rewritten`, the rewrite of `source` under
+/// `stripped`, which the overlay bind-mounts over the path the guest loads
+/// `source` from; written if need be.
+///
+/// The entry is named by everything that decides the bytes the guest maps:
+/// the rewriter's format, the stripped-file policy, a digest of the rewritten
+/// bytes themselves, and the source's permissions, which the copy carries
+/// ([`elf::write_rewritten`]); `name`, the source's file name, is there for a
+/// reader. So two runs that would map different bytes -- a default run and a
+/// heuristic run of one stripped file, or two builds of the rewriter -- never
+/// share an entry, and what one run checked cannot be replaced by another
+/// run's bytes before it mounts it. Nor is an entry ever written in place: a
+/// missing one, or one that does not hold the bytes and the mode its name
+/// promises, is written whole under a temporary name and renamed over the
+/// name, so a run that already mounted the file it replaces keeps that file.
+pub fn cached_rewrite(
+    cache: &Path,
+    rewritten: &[u8],
+    source: &Path,
+    name: &str,
+    stripped: elf::StrippedRewrite,
+) -> anyhow::Result<PathBuf> {
+    let mode = std::fs::metadata(source)
+        .with_context(|| format!("reading the permissions of {}", source.display()))?
+        .permissions()
+        .mode();
+    let entry = cache.join(format!(
+        "v{REWRITE_FORMAT_VERSION}-{}-{}-{:o}-{name}",
+        stripped.as_str(),
+        detcore::Digest::new(rewritten),
+        mode & 0o7777
+    ));
+    let holds_it = std::fs::metadata(&entry)
+        .is_ok_and(|cached| cached.permissions().mode() == mode)
+        && std::fs::read(&entry).is_ok_and(|cached| cached == rewritten);
+    if !holds_it {
+        elf::write_rewritten(&entry, rewritten, source)?;
+    }
+    Ok(entry)
+}
+
 /// Where rewritten images are cached ([`cache_path`]), created private to
 /// this user.
 pub fn cache_dir() -> anyhow::Result<PathBuf> {
@@ -121,4 +162,51 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
         }
     }
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A default run and a heuristic run of one stripped file share one
+    /// cache directory, and each gets only its own bytes: the default run's
+    /// file (the source unchanged) and the heuristic run's rewrite have
+    /// distinct entries, written in either order, and a run that holds one
+    /// entry open still reads its bytes after the other run's write. An entry
+    /// that does not hold what its name promises is replaced by a new file,
+    /// not rewritten in place.
+    #[test]
+    fn each_policy_maps_only_its_own_rewrite_from_one_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let source = directory.path().join("libstripped.so");
+        let original = b"\x7fELF stripped, as the default leaves it".to_vec();
+        let heuristic = b"\x7fELF stripped, as the heuristic rewrites it".to_vec();
+        std::fs::write(&source, &original).unwrap();
+        let entry = |bytes: &[u8], stripped| {
+            cached_rewrite(&cache, bytes, &source, "libstripped.so", stripped).unwrap()
+        };
+        let mapped = entry(&heuristic, elf::StrippedRewrite::Heuristic);
+        let mut held = std::fs::File::open(&mapped).unwrap();
+        let default = entry(&original, elf::StrippedRewrite::Refuse);
+        assert_ne!(default, mapped);
+        assert_eq!(std::fs::read(&mapped).unwrap(), heuristic);
+        assert_eq!(std::fs::read(&default).unwrap(), original);
+        // The same bytes under the other policy have an entry of their own.
+        assert_ne!(entry(&heuristic, elf::StrippedRewrite::Refuse), mapped);
+        // An entry that lost its bytes is replaced by a new file; the one a
+        // run holds keeps what it held.
+        std::fs::remove_file(&mapped).unwrap();
+        std::fs::write(&mapped, b"someone else's bytes").unwrap();
+        let mut stale = std::fs::File::open(&mapped).unwrap();
+        assert_eq!(entry(&heuristic, elf::StrippedRewrite::Heuristic), mapped);
+        assert_eq!(std::fs::read(&mapped).unwrap(), heuristic);
+        let mut read = Vec::new();
+        std::io::Read::read_to_end(&mut stale, &mut read).unwrap();
+        assert_eq!(read, b"someone else's bytes");
+        read.clear();
+        std::io::Read::read_to_end(&mut held, &mut read).unwrap();
+        assert_eq!(read, heuristic);
+    }
 }
