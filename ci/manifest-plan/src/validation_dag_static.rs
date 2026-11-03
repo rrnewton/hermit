@@ -3257,7 +3257,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
     // And scheduler::test::a_prehook_context_switch_leaves_the_switching_thread_its_own_slice: 3464 + 1 = 3465.
-    ("test.detcore_unit", 3465),
+    // And a_prehook_switch_leaves_the_switching_thread_its_own_slice_end (review
+    // of https://github.com/rrnewton/hermit/pull/4747): 3465 + 1 = 3466.
+    ("test.detcore_unit", 3466),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5865,7 +5867,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
     // And scheduler::test::a_prehook_context_switch_leaves_the_switching_thread_its_own_slice: 3464 + 1 = 3465.
-    ("test.detcore_unit_on_host", 3465),
+    // And the same traced-event prehook-switch unit: 3465 + 1 = 3466.
+    ("test.detcore_unit_on_host", 3466),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
