@@ -1928,7 +1928,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // stop::tests::a_stop_signal_on_a_helper_thread_never_reaches_a_reused_pid and
     // memory::tests::the_watchdog_thread_blocks_the_stop_signals: 1317.
     // And stop::tests::a_stop_the_handler_cannot_pass_on_ends_analyze_by_its_default_action: 1318.
-    ("test.hermit_unit", 1318),
+    // And stop::tests::a_stop_ends_analyze_even_when_its_stderr_is_full: 1319.
+    ("test.hermit_unit", 1319),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6001,7 +6002,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eight workspace-cleanup tests: 1309.
     // And the same two stop-handler helper-thread tests: 1311.
     // And the same stop the handler cannot pass on: 1312.
-    ("test.hermit_unit_on_host", 1312),
+    // And the same stop with a full stderr: 1313.
+    ("test.hermit_unit_on_host", 1313),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
