@@ -2004,7 +2004,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze::phases::tests::a_check_keeps_the_checkpoints_of_its_own_runs_prefix: 1269.
     // And analyze::races::tests::a_changed_course_is_ordered_by_its_baseline_counterpart: 1270.
     // And analyze::races::tests::candidates_none_of_which_decides_say_what_that_means: 1271.
-    ("test.hermit_unit", 1271),
+    // And analyze::races::tests::an_output_match_never_joins_output_across_a_gap and
+    // a_deciding_event_between_calls_is_taken_at_its_threads_next_call: 1273.
+    ("test.hermit_unit", 1273),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6327,7 +6329,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eight race-candidate check tests: 1263.
     // And the same changed-course order test: 1264.
     // And the same undecided-candidates test: 1265.
-    ("test.hermit_unit_on_host", 1265),
+    // And the same output-gap and between-calls tests: 1267.
+    ("test.hermit_unit_on_host", 1267),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
