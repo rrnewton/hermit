@@ -1982,7 +1982,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main 77be1fd09: 1239 + 1 = 1240.
     // And run::untrap_passthrough_syscalls_refuses_preemption_records_by_every_route: 1336 + 1 = 1337.
     // Rebased onto main 77be1fd09: 1240 + 1 = 1241.
-    ("test.hermit_unit", 1241),
+    // And tests::the_library_entry_points_refuse_untrapping_without_its_prerequisites
+    // (the same pull request's post-facto review): 1337 + 1 = 1338.
+    // Rebased onto main 77be1fd09: 1241 + 1 = 1242.
+    // And untrap_passthrough_syscalls_is_not_qualified_for_executable_selected_backends: 1242 + 1 = 1243.
+    ("test.hermit_unit", 1243),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3266,7 +3270,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And subscription_tests::untrap_passthrough_syscalls_unsubscribes_exactly_its_list and
     // untrapped_passthrough_syscalls_are_plain_passthroughs: 3384 + 2 = 3386, listed.
     // Rebased onto main 77be1fd09: 3465 + 2 = 3467.
-    ("test.detcore_unit", 3467),
+    // And facility_admission_refuses_untrapping_without_its_prerequisites
+    // (the same pull request's post-facto review): 3386 + 1 = 3387.
+    // Rebased onto main 77be1fd09: 3467 + 1 = 3468.
+    ("test.detcore_unit", 3468),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5880,7 +5887,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
     // And the same two --untrap-passthrough-syscalls subscription units: 3384 + 2 = 3386, listed.
     // Rebased onto main 77be1fd09: 3465 + 2 = 3467.
-    ("test.detcore_unit_on_host", 3467),
+    // And the same admission unit: 3386 + 1 = 3387.
+    // Rebased onto main 77be1fd09: 3467 + 1 = 3468.
+    ("test.detcore_unit_on_host", 3468),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6302,7 +6311,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main 77be1fd09: 1233 + 1 = 1234.
     // And the same preemption-record refusal unit: 1330 + 1 = 1331.
     // Rebased onto main 77be1fd09: 1234 + 1 = 1235.
-    ("test.hermit_unit_on_host", 1235),
+    // And the same library-entry unit: 1331 + 1 = 1332.
+    // Rebased onto main 77be1fd09: 1235 + 1 = 1236.
+    // And the same adapter refusal case: 1236 + 1 = 1237.
+    ("test.hermit_unit_on_host", 1237),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

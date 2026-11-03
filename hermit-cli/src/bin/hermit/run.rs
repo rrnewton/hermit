@@ -4797,6 +4797,41 @@ fn untrap_passthrough_syscalls_is_an_opt_in_refused_where_its_calls_are_counted(
     assert!(message.contains("RCB time"), "{message}");
 }
 
+/// Every launch through an executable-selected adapter refuses
+/// `--untrap-passthrough-syscalls` by the adapter's name before reading any
+/// input (`refuse_unqualified_application_options`): e9patch preprocessing,
+/// which runs on the ptrace runtime, as well as DBT and SaBRe. Without the
+/// flag the same adapters pass that check.
+#[test]
+fn untrap_passthrough_syscalls_is_not_qualified_for_executable_selected_backends() {
+    for name in ["e9patch", "dbt", "sabre"] {
+        let selector = format!("--backend={name}");
+        let refuse = |untrap: bool| {
+            let mut argv = vec!["hermit", selector.as_str(), "run"];
+            if untrap {
+                argv.push("--untrap-passthrough-syscalls");
+            }
+            argv.extend(["--", "fakeprog"]);
+            let opts = run_opts_for(&argv);
+            assert_eq!(opts.application_backend, Some(name));
+            opts.refuse_unqualified_application_options(
+                <super::core_adapter::CoreApplicationAdapter as
+                    super::backend_hook::BackendAdapter>::NONDEFAULT_CPU_PROFILE_REFUSAL,
+            )
+        };
+        let error = refuse(true).expect_err("refused");
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "--untrap-passthrough-syscalls is not qualified for executable-selected \
+                 backend `{name}`"
+            ),
+        );
+        refuse(false).unwrap();
+    }
+}
+
 /// A preemption record holds a callback for each trapped call the recorded run
 /// made, `getppid` among them, with its charge and its preemption point. With
 /// `--untrap-passthrough-syscalls` those calls never reach Detcore, so a replay
@@ -9939,6 +9974,16 @@ impl RunOpts {
             (self.happens_before.is_some(), "--happens-before"),
             (config.futex_wake_yields, "--futex-wake-yields"),
             (config.cap_preemption_charge, "--cap-preemption-charge"),
+            // Untrapping changes only the ptrace backend's seccomp filter. An
+            // adapter's rewritten sites never reach it: under e9patch
+            // preprocessing each one stops in the tracer, which runs an
+            // unsubscribed call there by injection. Detcore's own admission
+            // reads the backend's capabilities, never its name, so the
+            // adapter is refused here, where every adapter's launch passes.
+            (
+                config.untrap_passthrough_syscalls,
+                "--untrap-passthrough-syscalls",
+            ),
             (config.signal_at.is_some(), "--signal-at"),
             (config.pipe_wake_latency.is_some(), "--pipe-wake-latency"),
             (config.work_span_report.is_some(), "--work-span-report"),
@@ -11807,17 +11852,16 @@ impl RunOpts {
                     "a backend other than ptrace, whose syscall interception it has not been \
                      checked against",
                 )
-            } else if config.record_preemptions
-                || config.record_preemptions_to.is_some()
-                || config.replay_preemptions_from.is_some()
-                || config.replay_schedule_from.is_some()
+            } else if let Err(refusal @ detcore::UntrapPassthroughRefusal::PreemptionRecord) =
+                detcore::untrap_passthrough_admission(config)
             {
                 // Recording one, or replaying one: a record made without the
                 // flag holds the untrapped calls' callbacks, their charges and
                 // their preemption points, which a replay with it never
                 // reaches, so its checkpoints and priority changes would land
-                // at different guest progress.
-                Some("a preemption record, whose callback history counts the calls it untraps")
+                // at different guest progress. The rule and its message are
+                // Detcore's, which every launch checks again.
+                return Err(Error::new(refusal));
             } else if self.happens_before.is_some() {
                 Some("--happens-before, whose syscall anchors count the calls it untraps")
             } else if self.verify_run.is_some() {
@@ -11952,15 +11996,11 @@ impl RunOpts {
         // are the only progress of virtual time and trapped syscalls the only
         // points where a thread yields, so a loop on the calls this untraps
         // would never yield or let virtual time advance. Checked once a host
-        // without usable performance counters has turned the timer off.
-        if config.untrap_passthrough_syscalls && !config.use_rcb_time() {
-            anyhow::bail!(
-                "--untrap-passthrough-syscalls needs the preemption timer and RCB time \
-                 (not --max-timeslice=disabled, --no-rcb-time, or a host without usable \
-                 performance counters): without them a loop on the calls it untraps would \
-                 never yield or let virtual time advance"
-            );
-        }
+        // without usable performance counters has turned the timer off. The
+        // rule and its message are Detcore's
+        // (`detcore::untrap_passthrough_admission`), which every launch,
+        // the library's included, checks again in `facility_admission`.
+        detcore::untrap_passthrough_admission(config).map_err(Error::new)?;
 
         // `--chaos-timeslice-draw=run` draws from the effective scheduler seed,
         // which `--seed-from` has just settled, unless a replayed record gave
