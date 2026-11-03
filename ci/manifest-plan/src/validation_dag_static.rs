@@ -3265,7 +3265,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // for main's RawRecord remote: 3400 + 2 = 3402.
     // And post_crash's the_switch_is_refused_by_name_where_handler_masks_cannot_be_read
     // (review of https://github.com/rrnewton/hermit/pull/4867): 3402 + 1 = 3403.
-    ("test.detcore_unit", 3403),
+    // And tool_local's a_switched_thread_draws_no_slice_mean_from_the_chaos_timeslice_range
+    // (the same review): 3403 + 1 = 3404.
+    ("test.detcore_unit", 3404),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5830,7 +5832,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same prefix-record unit: 3295.
     // And the same two record-serde round-trip units: 3400 + 2 = 3402.
     // And the same post-crash admission unit: 3402 + 1 = 3403.
-    ("test.detcore_unit_on_host", 3403),
+    // And the same switched-range unit: 3403 + 1 = 3404.
+    ("test.detcore_unit_on_host", 3404),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
