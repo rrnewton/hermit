@@ -1981,7 +1981,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Drain 4641 recount: hermit-run lib measured 1206 on main 2baafbdf,
     // 1207 at this head (a_target_exit_code_is_the_one_hermit_run_exits_with):
     // 1249 + 1 = 1250, listed.
-    ("test.hermit_unit", 1250),
+    // Drain 5093 recount (hermit-run lib 1207 at drain/4641, 1208 here):
+    // 1250 + 1 = 1251, listed.
+    ("test.hermit_unit", 1251),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6288,7 +6290,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // Drain 4641 recount (same +1 as test.hermit_unit): 1243 + 1 = 1244, listed.
-    ("test.hermit_unit_on_host", 1244),
+    // Drain 5093 recount (same +1 as test.hermit_unit): 1244 + 1 = 1245, listed.
+    ("test.hermit_unit_on_host", 1245),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
