@@ -40,26 +40,26 @@ use detcore_model::schedule::SyscallPhase;
 use reverie::PrettyBacktrace;
 use reverie::syscalls::Sysno;
 
-use crate::analyze::phases::Departure;
-use crate::analyze::phases::departure;
-use crate::analyze::phases::stack_thread;
-use crate::analyze::races::CandidateCheck;
-use crate::analyze::races::CheckVerdict;
-use crate::analyze::races::CrossedThread;
-use crate::analyze::races::MovedEvents;
-use crate::analyze::races::Outcome;
-use crate::analyze::races::OutcomeCriteria;
-use crate::analyze::races::RaceCandidate;
-use crate::analyze::races::RaceStatus;
-use crate::analyze::races::RacingAccess;
-use crate::analyze::races::RacingAccesses;
-use crate::analyze::races::Window;
-use crate::analyze::races::find_racing_accesses;
-use crate::analyze::races::outcome;
-use crate::analyze::races::uncounted_signal_outcome;
-use crate::analyze::rundata::RunData;
-use crate::analyze::types::AnalyzeOpts;
-use crate::container::RunTimeoutMarker;
+use crate::app::analyze::phases::Departure;
+use crate::app::analyze::phases::departure;
+use crate::app::analyze::phases::stack_thread;
+use crate::app::analyze::races::CandidateCheck;
+use crate::app::analyze::races::CheckVerdict;
+use crate::app::analyze::races::CrossedThread;
+use crate::app::analyze::races::MovedEvents;
+use crate::app::analyze::races::Outcome;
+use crate::app::analyze::races::OutcomeCriteria;
+use crate::app::analyze::races::RaceCandidate;
+use crate::app::analyze::races::RaceStatus;
+use crate::app::analyze::races::RacingAccess;
+use crate::app::analyze::races::RacingAccesses;
+use crate::app::analyze::races::Window;
+use crate::app::analyze::races::find_racing_accesses;
+use crate::app::analyze::races::outcome;
+use crate::app::analyze::races::uncounted_signal_outcome;
+use crate::app::analyze::rundata::RunData;
+use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::container::RunTimeoutMarker;
 
 /// Events before the deciding event each traced replay records, so the trace
 /// shows the state the window starts from (who opened a descriptor, who last
@@ -476,7 +476,7 @@ impl AnalyzeOpts {
 fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
     error.chain().count() == 1
         && error
-            .downcast_ref::<crate::container::PolicyRefusal>()
+            .downcast_ref::<crate::app::container::PolicyRefusal>()
             .is_some()
 }
 
@@ -1362,7 +1362,7 @@ mod tests {
         let access = |i: usize| RacingAccess {
             thread: DetTid::from_raw(3 + i as i32),
             nth: 1,
-            at: crate::analyze::races::AccessPoint::Entry,
+            at: crate::app::analyze::races::AccessPoint::Entry,
             event: target[i],
             baseline_event: baseline[i],
             call: "read(3, 0x1000, 8)".to_string(),
@@ -1375,7 +1375,7 @@ mod tests {
         RaceCandidate {
             resource: None,
             accesses: [access(0), access(1)],
-            order: crate::analyze::races::RaceOrder {
+            order: crate::app::analyze::races::RaceOrder {
                 target: [0, 1],
                 baseline: [1, 0],
             },
@@ -1516,7 +1516,7 @@ mod tests {
              meets it (racing_candidate_1.repro in the workspace), and no other checked \
              candidate's reversal changes the outcome"
         );
-        let text = crate::analyze::races::render_racing_accesses(&one);
+        let text = crate::app::analyze::races::render_racing_accesses(&one);
         assert!(
             text.starts_with("Racing accesses, found by intervention, not as an order the two runs show: reversing")
                 && text.contains("Candidates checked:\n  1. the evidence; not shown to decide.")

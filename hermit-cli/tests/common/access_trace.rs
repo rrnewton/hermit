@@ -18,8 +18,6 @@ use std::sync::OnceLock;
 use detcore_model::access_trace::Access;
 use detcore_model::access_trace::AccessTrace;
 use detcore_model::access_trace::ChannelId;
-use detcore_model::access_trace::EdgeKind;
-use detcore_model::access_trace::EdgeRecord;
 use detcore_model::access_trace::ChannelKind;
 use detcore_model::access_trace::EdgeKind;
 use detcore_model::access_trace::EdgeRecord;

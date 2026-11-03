@@ -2033,7 +2033,6 @@ impl Config {
             }
     }
 
-<<<<<<< HEAD
     /// Whether a queued plain sleep is registered as a timed waiter at the first quiescent pass
     /// that finds it queued (`--sleep-registration`): the explicit value, or by default outside
     /// race search (`--chaos`, or a `--sched-heuristic` that does not select by priority) where
@@ -2059,7 +2058,8 @@ impl Config {
                         && self.reads_sleeper_signal_state()
                 }
             }
-=======
+    }
+
     /// The settings of this run under which Detcore can record a descriptor
     /// without its file type, by their option names: without metadata
     /// virtualization it keeps no stat of a descriptor it opens, which is what
@@ -2071,7 +2071,6 @@ impl Config {
             settings.push("--no-virtualize-metadata".to_string());
         }
         settings
->>>>>>> 775e8af8723 (Give no pipe edge in a trace recorded without descriptor types, and name the setting in its header)
     }
 
     /// Should we convert sockets to SOCK_NONBLOCK?

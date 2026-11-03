@@ -21,9 +21,9 @@ use serde::Deserialize;
 use serde::Serialize;
 use tracing::metadata::LevelFilter;
 
-use crate::analyze::races::RacingAccesses;
-use crate::analyze::verdict::Verdict;
-use crate::analyze::verdict::VerdictReason;
+use crate::app::analyze::races::RacingAccesses;
+use crate::app::analyze::verdict::Verdict;
+use crate::app::analyze::verdict::VerdictReason;
 
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///

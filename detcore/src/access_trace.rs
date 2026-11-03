@@ -1020,21 +1020,12 @@ struct EdgeState {
     last_event: BTreeMap<DetTid, EventIndex>,
     /// The process of each thread, from its syscalls.
     process_of: BTreeMap<DetTid, DetPid>,
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     /// Threads whose first event no clone's return has claimed yet: one
     /// that ran before its parent's clone returned, or the first thread.
     first_unclaimed: BTreeSet<DetTid>,
     /// The first event of each such thread that is gone, kept for its
     /// parent's clone return (see [`AccessTraceWriter::note_thread_gone`]).
     gone_first: BTreeMap<DetTid, EventIndex>,
-<<<<<<< HEAD
-=======
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     /// The latest event of any thread of each process.
     process_last: BTreeMap<DetPid, EventRef>,
     /// Edges that end at their waiter's next posthook: a futex wake, a
@@ -1044,10 +1035,6 @@ struct EdgeState {
     at_first_event: BTreeMap<DetTid, PendingEdge>,
     /// Signals sent and not yet delivered, in send order.
     signals: Vec<PendingSignal>,
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     /// The sends and arms the cap evicted (see [`MAX_PENDING_SIGNALS`]),
     /// one per distinct target, signal and sender. A delivery one of them
     /// could have caused gets no edge from then on: its cause may be the
@@ -1060,11 +1047,6 @@ struct EdgeState {
     /// The open syscalls of threads that are gone, which no posthook will
     /// end, written with the open records when the trace finishes.
     orphaned: Vec<SyscallRecord>,
-<<<<<<< HEAD
-=======
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
 }
 
 /// An edge whose `to` end is not recorded yet.
@@ -1082,18 +1064,9 @@ struct PendingEdge {
 struct PendingSignal {
     from: EventRef,
     sender: DetPid,
-<<<<<<< HEAD
-<<<<<<< HEAD
     /// The call that sent it, which decides the `si_code` its delivery
     /// carries.
     kind: SendKind,
-=======
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
-    /// The call that sent it, which decides the `si_code` its delivery
-    /// carries.
-    kind: SendKind,
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     signo: i32,
     target: Task,
     /// For a timer: its id. A timer's expiry carries it as `si_tid`.
@@ -1115,10 +1088,6 @@ struct PendingSignal {
 /// of the run.
 const MAX_PENDING_SIGNALS: usize = 4096;
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
 /// How a pending signal was sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendKind {
@@ -1179,12 +1148,6 @@ impl PendingSignal {
             && (self.kind != SendKind::Queue || self.from.tid == other.from.tid)
     }
 
-<<<<<<< HEAD
-=======
-impl PendingSignal {
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     /// Whether a group send has reached every member listed at its posthook.
     fn reached_all(&self) -> bool {
         self.members
@@ -1233,17 +1196,11 @@ impl AccessTraceWriter {
         Ok(writer)
     }
 
-<<<<<<< HEAD
-    /// Write the header of a trace to `out`.
-    pub(crate) fn new(
-        mut out: Box<dyn Write + Send>,
-=======
     /// Write the header of a trace to `out`, of a run that records every
     /// descriptor's type.
     #[cfg(test)]
     pub(crate) fn new(
         out: Box<dyn Write + Send>,
->>>>>>> 775e8af8723 (Give no pipe edge in a trace recorded without descriptor types, and name the setting in its header)
         from: EventIndex,
         max_records: Option<u64>,
         max_bytes: Option<u64>,
@@ -1379,22 +1336,11 @@ impl AccessTraceWriter {
         if let std::collections::btree_map::Entry::Vacant(first) = self.edges.first_event.entry(tid)
         {
             first.insert(index);
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
             self.edges.gone_first.remove(&tid);
             if let Some(edge) = self.edges.at_first_event.remove(&tid) {
                 self.write_edge(edge, to);
             } else {
                 self.edges.first_unclaimed.insert(tid);
-<<<<<<< HEAD
-=======
-            if let Some(edge) = self.edges.at_first_event.remove(&tid) {
-                self.write_edge(edge, to);
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
             }
         }
         self.edges.last_event.insert(tid, index);
@@ -1437,33 +1383,18 @@ impl AccessTraceWriter {
             event: record.pre,
         };
         match record.sysno {
-<<<<<<< HEAD
             sysno if creates_a_task(sysno) && result > 0 => {
-=======
-            Sysno::clone | Sysno::clone3 | Sysno::fork | Sysno::vfork if result > 0 => {
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
                 let child = DetTid::from_raw(result as i32);
                 let edge = PendingEdge {
                     kind: EdgeKind::Create,
                     from,
                     object: SyncObject::Thread(child),
                 };
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
                 // The child may have run before its parent's clone returned,
                 // and even be gone.
                 self.edges.first_unclaimed.remove(&child);
                 let first = self.edges.first_event.get(&child).copied();
                 match first.or_else(|| self.edges.gone_first.remove(&child)) {
-<<<<<<< HEAD
-=======
-                // The child may have run before its parent's clone returned.
-                match self.edges.first_event.get(&child).copied() {
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
                     Some(first) if first > record.pre => self.write_edge(
                         edge,
                         EventRef {
@@ -1559,15 +1490,7 @@ impl AccessTraceWriter {
     /// of the group sends still waiting for it.
     fn forget_reaped(&mut self, child: DetPid) {
         let process_of = &self.edges.process_of;
-<<<<<<< HEAD
-<<<<<<< HEAD
         let mut reaches = |signal: &mut PendingSignal| match signal.target {
-=======
-        self.edges.signals.retain_mut(|signal| match signal.target {
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
-        let mut reaches = |signal: &mut PendingSignal| match signal.target {
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
             _ if signal.timer.is_some() => signal.sender != child,
             Task::Process(target) => target != child,
             Task::Thread(thread) => process_of.get(&thread) != Some(&child),
@@ -1577,10 +1500,6 @@ impl AccessTraceWriter {
                 }
                 !signal.reached_all()
             }
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
         };
         self.edges.signals.retain_mut(&mut reaches);
         self.edges.evicted.retain_mut(&mut reaches);
@@ -1615,32 +1534,6 @@ impl AccessTraceWriter {
         let to_it = |signal: &PendingSignal| signal.target == Task::Thread(tid);
         edges.signals.retain(|signal| !to_it(signal));
         edges.evicted.retain(|signal| !to_it(signal));
-<<<<<<< HEAD
-    }
-
-    /// `former` exec'd from a thread other than its process's leader and
-    /// goes on as `leader`. Linux keeps the exec caller's task and gives it
-    /// the leader's thread id, and the signals pending for that task alone
-    /// stay queued on it. So the sends to `former` alone, pending or
-    /// evicted, now target `leader`. The scheduler calls this after it has
-    /// retired the old leader, whose own sends Linux discards with it, and
-    /// before it retires `former`'s id ([`Self::note_thread_gone`]), which
-    /// would otherwise drop them: a sigqueue send to itself that keeps its
-    /// process's deliveries of that signal without an edge
-    /// (`SendKind::Queue`), and a tkill whose delivery to the leader it
-    /// causes.
-    pub fn rekey_thread(&mut self, former: DetTid, leader: DetTid) {
-        let edges = &mut self.edges;
-        for signal in edges.signals.iter_mut().chain(edges.evicted.iter_mut()) {
-            if signal.target == Task::Thread(former) {
-                signal.target = Task::Thread(leader);
-            }
-        }
-=======
-        });
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     }
 
     /// `former` exec'd from a thread other than its process's leader and
@@ -1671,10 +1564,6 @@ impl AccessTraceWriter {
             .position(|signal| signal.deleted)
             .or_else(|| signals.iter().position(|signal| signal.timer.is_none()))
             .unwrap_or(0);
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
         let evicted = self.edges.signals.remove(victim);
         let edges = &mut self.edges;
         if !edges.evicted.iter().any(|known| known.same_key(&evicted)) {
@@ -1684,27 +1573,13 @@ impl AccessTraceWriter {
                 edges.evicted.push(evicted);
             }
         }
-<<<<<<< HEAD
-=======
-        self.edges.signals.remove(victim);
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     }
 
     /// Note a signal a syscall entry sends, or a timer it arms.
     fn note_signal_send(&mut self, from: EventRef, entry: &SyscallEntry) {
         let raw = |i: usize| entry.args[i] as i32;
         let pid = DetPid::from_raw;
-<<<<<<< HEAD
-<<<<<<< HEAD
         let (target, signo, timer, kind) = match entry.sysno {
-=======
-        let (target, signo, timer) = match entry.sysno {
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
-        let (target, signo, timer, kind) = match entry.sysno {
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
             Sysno::kill => {
                 let target = match raw(0) {
                     p if p > 0 => Task::Process(pid(p)),
@@ -1712,8 +1587,6 @@ impl AccessTraceWriter {
                     -1 => return,
                     p => Task::ProcessGroup(pid(p.wrapping_neg())),
                 };
-<<<<<<< HEAD
-<<<<<<< HEAD
                 (target, raw(1), None, SendKind::Kill)
             }
             Sysno::tkill => (Task::Thread(pid(raw(0))), raw(1), None, SendKind::Tkill),
@@ -1723,24 +1596,6 @@ impl AccessTraceWriter {
             // The expiry's signal comes from the sigevent timer_create
             // named, so a timer arm matches any signal carrying its id.
             Sysno::timer_settime => (Task::Process(entry.pid), 0, Some(raw(0)), SendKind::Timer),
-=======
-                (target, raw(1), None)
-=======
-                (target, raw(1), None, SendKind::Kill)
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
-            }
-            Sysno::tkill => (Task::Thread(pid(raw(0))), raw(1), None, SendKind::Tkill),
-            Sysno::tgkill => (Task::Thread(pid(raw(1))), raw(2), None, SendKind::Tkill),
-            Sysno::rt_tgsigqueueinfo => (Task::Thread(pid(raw(1))), raw(2), None, SendKind::Queue),
-            Sysno::rt_sigqueueinfo => (Task::Process(pid(raw(0))), raw(1), None, SendKind::Queue),
-            // The expiry's signal comes from the sigevent timer_create
-            // named, so a timer arm matches any signal carrying its id.
-<<<<<<< HEAD
-            Sysno::timer_settime => (Task::Process(entry.pid), 0, Some(raw(0))),
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
-            Sysno::timer_settime => (Task::Process(entry.pid), 0, Some(raw(0)), SendKind::Timer),
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
             _ => return,
         };
         if signo == 0 && timer.is_none() {
@@ -1752,14 +1607,7 @@ impl AccessTraceWriter {
         self.edges.signals.push(PendingSignal {
             from,
             sender: entry.pid,
-<<<<<<< HEAD
-<<<<<<< HEAD
             kind,
-=======
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
-            kind,
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
             signo,
             target,
             timer,
@@ -1773,10 +1621,6 @@ impl AccessTraceWriter {
     /// The send that caused `note`'s delivery to `tid`, if one is pending.
     ///
     /// A candidate is a send of that signal, to that thread, its process or
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     /// its group, by the call the delivery's `si_code` names, from the
     /// process `si_pid` names: a kill for `SI_USER`, a tkill or tgkill for
     /// `SI_TKILL`. A delivery with any other code, or one to a process a
@@ -1787,15 +1631,6 @@ impl AccessTraceWriter {
     /// delivery takes the earliest candidate and uses up that one alone (a
     /// group send only for this process, until it has reached every member
     /// listed at its posthook). That holds for standard signals too, whose sends merge:
-<<<<<<< HEAD
-=======
-    /// its group, from the process `si_pid` names. The delivery takes the
-    /// earliest candidate and uses up that one alone (a group send only for
-    /// this process, until it has reached every member listed at its
-    /// posthook). That holds for standard signals too, whose sends merge:
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     /// the k-th delivery is never matched with a send later than the
     /// latest cause among the first k deliveries, so no edge claims more
     /// order than the run had. Taking the latest send instead is unsound:
@@ -1825,10 +1660,6 @@ impl AccessTraceWriter {
         tid: DetTid,
         groups: &dyn ProcessGroups,
     ) -> Option<EventRef> {
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
         let edges = &mut self.edges;
         if edges.evictions_overflowed {
             return None;
@@ -1836,7 +1667,6 @@ impl AccessTraceWriter {
         let process = edges.process_of.get(&tid).copied();
         let signals = &mut edges.signals;
         let evicted = &edges.evicted;
-<<<<<<< HEAD
         if let Some(timer) = note.timer {
             let process = process?;
             let arm =
@@ -1844,21 +1674,6 @@ impl AccessTraceWriter {
             if evicted.iter().any(arm) {
                 return None;
             }
-=======
-        let process = self.edges.process_of.get(&tid).copied();
-        let signals = &mut self.edges.signals;
-        if let Some(timer) = note.timer {
-            let process = process?;
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
-        if let Some(timer) = note.timer {
-            let process = process?;
-            let arm =
-                |signal: &PendingSignal| signal.timer == Some(timer) && signal.sender == process;
-            if evicted.iter().any(arm) {
-                return None;
-            }
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
             let arms: Vec<usize> = (0..signals.len())
                 .filter(|&i| signals[i].timer == Some(timer) && signals[i].sender == process)
                 .collect();
@@ -1871,10 +1686,6 @@ impl AccessTraceWriter {
             }
             return Some(from);
         }
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
         // Only kill's SI_USER and tkill's SI_TKILL carry a sender the kernel
         // filled in, and not even those while a thread of the receiving
         // process has queued the signal (see [`SendKind::Queue`]).
@@ -1886,11 +1697,6 @@ impl AccessTraceWriter {
         {
             return None;
         }
-<<<<<<< HEAD
-=======
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
         let sender = note.sender?.pid;
         let group = process.and_then(|p| groups.group_of(p));
         let candidate = |signal: &PendingSignal| {
@@ -1902,15 +1708,7 @@ impl AccessTraceWriter {
             };
             signal.timer.is_none()
                 && signal.signo == note.signo
-<<<<<<< HEAD
-<<<<<<< HEAD
                 && signal.fits(note.code, sender)
-=======
-                && signal.sender == sender
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
-                && signal.fits(note.code, sender)
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
                 && match target {
                     Task::Thread(thread) => thread == tid,
                     Task::Process(target) => Some(target) == process,
@@ -1920,20 +1718,11 @@ impl AccessTraceWriter {
                     }
                 }
         };
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
         // An evicted send is older than every pending one, so it would be
         // the earliest candidate.
         if evicted.iter().any(&candidate) {
             return None;
         }
-<<<<<<< HEAD
-=======
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
         let candidates: Vec<usize> = (0..signals.len())
             .filter(|&i| candidate(&signals[i]))
             .collect();
@@ -3394,10 +3183,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     /// A child that runs and is gone before its parent's clone returns (a
     /// forked child that exits at once) keeps its creation edge: the writer
     /// holds its first event for that return, though it forgets the rest of
@@ -3432,11 +3217,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
-=======
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     #[test]
     fn an_exit_wake_ends_at_the_joiners_wait_return() {
         let (mut writer, bytes) = in_memory_writer();
@@ -3721,25 +3501,11 @@ mod tests {
             &Groups,
         );
         writer.finish(8).unwrap();
-<<<<<<< HEAD
-<<<<<<< HEAD
         // The delivery's code names the call: SI_TKILL the tgkill, SI_USER
         // the kill, whichever came first.
         assert_eq!(
             signal_edges(&bytes),
             vec![(at(3, 4), at(4, 6)), (at(3, 2), at(4, 7))]
-=======
-        assert_eq!(
-            signal_edges(&bytes),
-            vec![(at(3, 2), at(4, 6)), (at(3, 4), at(4, 7))]
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
-        // The delivery's code names the call: SI_TKILL the tgkill, SI_USER
-        // the kill, whichever came first.
-        assert_eq!(
-            signal_edges(&bytes),
-            vec![(at(3, 4), at(4, 6)), (at(3, 2), at(4, 7))]
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
         );
     }
 
@@ -3906,10 +3672,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     /// The cap evicts the oldest send. A later delivery of that signal to
     /// that target from that sender may be the evicted send's, so it gets no
     /// edge, where the next pending send would have claimed more order than
@@ -4123,11 +3885,6 @@ mod tests {
         assert_eq!(waits, vec![(3, None), (2, None)]);
     }
 
-<<<<<<< HEAD
-=======
->>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
-=======
->>>>>>> 41cd36c2261 (Keep sync edges sound past the cap, forged senders and reused thread IDs)
     /// Reaping a member takes it out of a group send still waiting for it,
     /// and drops the sends to it.
     #[test]

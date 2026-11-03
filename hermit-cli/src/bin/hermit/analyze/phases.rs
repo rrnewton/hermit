@@ -34,6 +34,9 @@ use reverie::process::ExitStatus;
 use reverie::process::Output;
 
 use crate::app::analyze::consts::*;
+use crate::app::analyze::race_report::TracedReplay;
+use crate::app::analyze::races::RacingAccesses;
+use crate::app::analyze::races::render_racing_accesses;
 use crate::app::analyze::rundata::RunData;
 use crate::app::analyze::stop;
 use crate::app::analyze::stop::StopSignals;
@@ -44,6 +47,13 @@ use crate::app::analyze::types::ExitStatusConstraint;
 use crate::app::analyze::types::Report;
 use crate::app::analyze::types::ReportCriticalEvent;
 use crate::app::analyze::types::TrialTimeout;
+use crate::app::analyze::verdict::AlternativeTiming;
+use crate::app::analyze::verdict::AnalyzeFailure;
+use crate::app::analyze::verdict::AnalyzePrecondition;
+use crate::app::analyze::verdict::AnalyzeVerdict;
+use crate::app::analyze::verdict::PreconditionClass;
+use crate::app::analyze::verdict::TimingSetting;
+use crate::app::analyze::verdict::Verdict;
 use crate::app::analyze::workspace::Retention;
 use crate::app::analyze::workspace::Workspace;
 use crate::app::analyze::workspace::note;
@@ -57,18 +67,6 @@ use crate::app::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
 use crate::app::schedule_search::NoSingleSwap;
 use crate::app::schedule_search::TrialOutcome;
 use crate::app::schedule_search::search_for_critical_schedule;
-use crate::app::analyze::race_report::TracedReplay;
-use crate::app::analyze::races::RacingAccesses;
-use crate::app::analyze::races::render_racing_accesses;
-use crate::app::analyze::verdict::AnalyzeFailure;
-use crate::app::analyze::verdict::AnalyzePrecondition;
-use crate::app::analyze::verdict::AnalyzeVerdict;
-use crate::app::analyze::verdict::PreconditionClass;
-use crate::app::analyze::verdict::Verdict;
-use crate::app::analyze::rundata::Stop;
-use crate::app::analyze::rundata::TrialEnd;
-use crate::app::analyze::verdict::AlternativeTiming;
-use crate::app::analyze::verdict::TimingSetting;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -624,7 +622,7 @@ fn check_prefix_len(len: usize, role: &str, unchanged: usize) -> usize {
 /// not fit the edited events, never replayed as a bare schedule: without them
 /// the unchanged events would not end their slices where the run did, and the
 /// check would measure another run than the one it names. The refusal is a
-/// [`PolicyRefusal`](crate::container::PolicyRefusal) named
+/// [`PolicyRefusal`](crate::app::container::PolicyRefusal) named
 /// `HERMIT_CANDIDATE_CHECK_CHECKPOINTS` (docs/ERROR_CATALOG.md); it is the
 /// check's error, which its report names, and the analysis goes on.
 fn candidate_check_record(
@@ -636,7 +634,7 @@ fn candidate_check_record(
         .schedule_prefix(unchanged)
         .with_schedule(edited.to_vec())
         .ok_or_else(|| {
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "HERMIT_CANDIDATE_CHECK_CHECKPOINTS: the callback checkpoints of the recording's \
                  first {unchanged} events do not fit the edited schedule, and replaying it without \
                  them would not follow the run it checks"
@@ -2991,12 +2989,12 @@ impl AnalyzeOpts {
             Err(error) => {
                 let ended = if error.downcast_ref::<RunTimeoutMarker>().is_some()
                     || error
-                        .downcast_ref::<crate::container::LogCapExceeded>()
+                        .downcast_ref::<crate::app::container::LogCapExceeded>()
                         .is_some()
                 {
                     "was stopped by its bound"
                 } else if error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some()
                 {
                     "was refused by Hermit"
@@ -3006,7 +3004,7 @@ impl AnalyzeOpts {
                 AlternativeTiming::Untried {
                     why: format!(
                         "the trial with them ({trial} in the workspace) {ended}: {error:#} ({})",
-                        crate::classify_failure(&error)
+                        crate::app::classify_failure(&error)
                     ),
                 }
             }
@@ -4784,7 +4782,7 @@ mod tests {
         let error = candidate_check_record(&recorded, 2, &[event(branches(5, 4))]).unwrap_err();
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -5351,9 +5349,9 @@ mod tests {
             Some("no-prefix-continuation"),
             "{replay:#}"
         );
-        assert_eq!(crate::failure_exit_code(&replay), 2);
+        assert_eq!(crate::app::failure_exit_code(&replay), 2);
         assert_eq!(
-            crate::classify_failure(&replay),
+            crate::app::classify_failure(&replay),
             "HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation"
         );
     }
@@ -5643,9 +5641,9 @@ mod tests {
             .err()
             .unwrap();
         assert!(!searched);
-        assert_eq!(crate::failure_exit_code(&error), 2, "{error:#}");
+        assert_eq!(crate::app::failure_exit_code(&error), 2, "{error:#}");
         assert_eq!(
-            crate::classify_failure(&error),
+            crate::app::classify_failure(&error),
             "HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced"
         );
         assert!(error.to_string().contains("Try --search"), "{error}");
@@ -5728,9 +5726,9 @@ mod tests {
                 message.contains("--selfcheck") && message.contains("`hermit host-capabilities`"),
                 "{message}"
             );
-            assert_eq!(crate::failure_exit_code(&error), 2);
+            assert_eq!(crate::app::failure_exit_code(&error), 2);
             assert_eq!(
-                crate::classify_failure(&error),
+                crate::app::classify_failure(&error),
                 format!("HERMIT_ANALYZE_PRECONDITION class={class}")
             );
         }
@@ -5764,9 +5762,9 @@ mod tests {
                     && error.to_string().contains("hermit host-capabilities"),
                 "{error}"
             );
-            assert_eq!(crate::failure_exit_code(&error), 125);
+            assert_eq!(crate::app::failure_exit_code(&error), 125);
             assert_eq!(
-                crate::classify_failure(&error),
+                crate::app::classify_failure(&error),
                 "HERMIT_INTERNAL_FAILURE class=replay-not-reproducible"
             );
         }
