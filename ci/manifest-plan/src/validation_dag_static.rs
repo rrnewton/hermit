@@ -1999,7 +1999,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And two for the `ADRP` pairing's bounds (a write to its register
     // ends it; an uncompleted one takes the function its page belongs to):
     // 1264, listed.
-    ("test.hermit_unit", 1264),
+    // And two more for the review of those: a table addressed by a second
+    // use of one `ADRP`, and a global symbol named like a mapping symbol:
+    // 1266, listed.
+    ("test.hermit_unit", 1266),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6263,7 +6266,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three addressed-data units: 1255, listed.
     // And the same refusal-at-every-entry unit: 1256, listed.
     // And the same two `ADRP` pairing units: 1258, listed.
-    ("test.hermit_unit_on_host", 1258),
+    // And the same two review units: 1260, listed.
+    ("test.hermit_unit_on_host", 1260),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
