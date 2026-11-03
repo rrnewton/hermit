@@ -228,7 +228,7 @@ mod tests {
         // types (this change), appended as revision 33 on drain/4909
         // (skipping reserved 28-32; payload unchanged; digest placeholder
         // until measure).
-        (33, "0000000000000000", "f013e36743d8d9e6"),
+        (33, "560e9389d00d97b6", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
