@@ -2028,13 +2028,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_selfcheck_difference_is_replay_not_reproducing,
     // a_success_exit_code_that_means_something_else_is_refused} and
     // tests::analyze_conclusions_have_their_own_exit_codes_and_class_lines: 1292.
+    // Less phases::tests::an_empty_prefix_that_meets_the_target_is_a_verdict,
+    // which adopting main's completed-outcome rule drops: 1291.
+    // And analyze::phases::tests::a_target_met_without_the_schedule_is_reported_as_only_that: 1292.
     // And analyze::verdict::tests::
     // a_verdict_under_timing_settings_says_what_the_trial_showed and
     // analyze::phases::tests::a_trial_under_another_setting_drops_the_option and
     // the_alternative_timing_trial_decides_the_cause_by_how_it_ends: 1295.
-    // Less phases::tests::an_empty_prefix_that_meets_the_target_is_a_verdict,
-    // which adopting main's completed-outcome rule drops: 1238.
-    // And analyze::phases::tests::a_target_met_without_the_schedule_is_reported_as_only_that: 1239.
     ("test.hermit_unit", 1295),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
@@ -6367,9 +6367,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five output-alias tests: 1274.
     // And the same no-gap open test: 1275.
     // And the same eleven verdict and precondition tests: 1286.
+    // Less the same empty-prefix verdict test: 1285.
+    // And the same scoped-verdict test: 1286.
     // And the same three timing-semantics verdict tests: 1289.
-    // Less the same empty-prefix verdict test: 1232.
-    // And the same scoped-verdict test: 1233.
     ("test.hermit_unit_on_host", 1289),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
