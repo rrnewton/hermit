@@ -957,7 +957,8 @@ impl RecordVersion {
 // 0x19a -> 0x19b (HIGHEST_SHIPPED+1 at the rebase onto main f76f9b8c,
 // after PR 4885 took 0x19a): an Mmap event of a MAP_SHARED file mapping
 // names the mapped file
-// (device, inode, offset) and the mapped descriptor's access mode. Replay
+// (device, inode, offset; for /dev/zero, the new shmem object the mapping
+// made) and the mapped descriptor's access mode. Replay
 // maps every shared mapping of one file as a view of one backing, opened
 // with that access mode, instead of making separate anonymous copies. An
 // older reader cannot decode the new field, and an older recording has no
