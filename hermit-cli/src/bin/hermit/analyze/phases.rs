@@ -1487,16 +1487,14 @@ impl AnalyzeOpts {
                             end: usize,
                             expected: bool|
              -> anyhow::Result<Option<PrettyBacktrace>> {
-                if end == decision {
-                    // A slice of one event ends where it starts. Reuse the
-                    // captured deciding stack; no new replay has an outcome
-                    // to compare with the search.
-                    Ok(deciding.clone())
-                } else {
-                    let (observed, captured) = stack(runname, variant, end + 1, end)?;
-                    require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
-                    Ok(captured)
-                }
+                // Even a one-event slice has this continuation's endpoint:
+                // its operation batch can differ from the target event's,
+                // including after a soft count mismatch in the target
+                // continuation itself. Capture it from its own record and
+                // check the outcome even when no stack was captured.
+                let (observed, captured) = stack(runname, variant, end + 1, end)?;
+                require_repeated_outcomes(&[(runname, expected, observed)], runname)?;
+                Ok(captured)
             };
             let with_end = stack_at(
                 "final_target_slice_end_for_stacktraces",
