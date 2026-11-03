@@ -3288,7 +3288,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // same pull request's review), on main fbf9d5f0c: 3442 + 2 = 3444.
     // Rebased onto main c1f3085da: 3467 + 2 = 3469.
     // Rebased onto main fcd62385f: 3468 + 2 = 3470.
-    ("test.detcore_unit", 3470),
+    // And replayer::tests::a_recorded_end_rip_is_compared_exactly_unless_the_end_was_stopless
+    // and stopless_end_permission_tests::a_replay_allows_a_stopless_end_only_where_its_record_does
+    // (the same pull request's review): 3390 + 2 = 3392.
+    // Rebased onto main ffe313b16: 3399 + 2 = 3401.
+    // Rebased onto main fbf9d5f0c: 3444 + 2 = 3446.
+    // Rebased onto main c1f3085da: 3469 + 2 = 3471.
+    // Rebased onto main fcd62385f: 3470 + 2 = 3472.
+    ("test.detcore_unit", 3472),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5864,7 +5871,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two format units, on main fbf9d5f0c: 3442 + 2 = 3444.
     // Rebased onto main c1f3085da: 3467 + 2 = 3469.
     // Rebased onto main fcd62385f: 3468 + 2 = 3470.
-    ("test.detcore_unit_on_host", 3470),
+    // And the same two stopless-end units: 3390 + 2 = 3392.
+    // Rebased onto main ffe313b16: 3399 + 2 = 3401.
+    // Rebased onto main fbf9d5f0c: 3444 + 2 = 3446.
+    // Rebased onto main c1f3085da: 3469 + 2 = 3471.
+    // Rebased onto main fcd62385f: 3470 + 2 = 3472.
+    ("test.detcore_unit_on_host", 3472),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
