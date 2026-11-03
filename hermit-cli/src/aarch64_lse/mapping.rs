@@ -648,14 +648,17 @@ fn writes(word: u32, register: u32) -> bool {
     }
     // ADR and ADRP; ADD/SUB (immediate and shifted register); MOV (wide
     // immediate) and ORR (shifted register), which `MOV` register is; and
-    // the loads, whose destination is also bits 4:0.
+    // the loads, whose destination is also bits 4:0. A store in those two
+    // classes reads that register instead (`STR Xt, [SP]` spilling the
+    // page), and `PRFM` loads nothing, so neither ends a pairing.
+    let loads = |opc: u32| opc != 0b00 && opc != 0b11;
     word & 0x1F00_0000 == 0x1000_0000
         || word & 0x1F00_0000 == 0x1100_0000
         || word & 0x1F00_0000 == 0x0B00_0000
         || word & 0x1F80_0000 == 0x1280_0000
         || word & 0x1F00_0000 == 0x0A00_0000
-        || word & 0x3B00_0000 == 0x3900_0000
-        || word & 0x3B00_0000 == 0x1800_0000
+        || (word & 0x3B00_0000 == 0x3900_0000 && (word >> 22) & 1 == 1)
+        || (word & 0x3B00_0000 == 0x1800_0000 && loads(word >> 30))
 }
 
 /// Every direct branch of `words` (at `base`), as (its address, its target).
@@ -670,6 +673,10 @@ pub fn direct_branches(words: &[u32], base: u64) -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// The page an `ADRP` addresses, and so the furthest a page start can lie
+/// below the function whose data it names.
+const PAGE: u64 = 4096;
+
 /// The bytes a function may hold as data, where only the unwind table tells
 /// code from data: from each address the code addresses as data
 /// (`starts`, [`addressed_starts`]) inside a function (`functions`, the
@@ -681,10 +688,6 @@ pub fn direct_branches(words: &[u32], base: u64) -> Vec<(u64, u64)> {
 /// pointer to the function, not data. A page-aligned address below a
 /// function and within one page of it is the page an `ADRP` alone gave, and
 /// takes that function whole. The ranges come back sorted and merged.
-/// The page an `ADRP` addresses, and so the furthest a page start can lie
-/// below the function whose data it names.
-const PAGE: u64 = 4096;
-
 pub fn data_extents(
     starts: &[u64],
     functions: &[(u64, u64)],
@@ -1119,6 +1122,31 @@ pub(crate) mod tests {
         // register, as `ADD Xn, Xn, #imm` and a load through it are.
         let load = [0x9000_0001, 0xf940_0421];
         assert_eq!(addressed_starts(&load, 0x1000), vec![0x1008]);
+    }
+
+    /// A store through the `ADRP`'s register, or of it, reads the register
+    /// rather than writing it, so the pairing runs on: spilling the page to
+    /// the stack between the `ADRP` and its `ADD` must not lose the table.
+    #[test]
+    fn a_store_does_not_end_an_adrp_pairing() {
+        for store in [
+            0xf900_03e1_u32, // str x1, [sp]: the page spilled, x1 unchanged
+            0xd503_201f,     // nop, as the control
+        ] {
+            let words = [0x9000_0001, store, 0x9101_0021];
+            assert_eq!(
+                addressed_starts(&words, 0x1000),
+                vec![0x1040],
+                "{store:#010x}"
+            );
+        }
+        // A store through the register addresses those bytes as well, and
+        // the pairing still reaches the `ADD` after it.
+        let through = [0x9000_0001, 0xf900_0021, 0x9101_0021];
+        assert_eq!(addressed_starts(&through, 0x1000), vec![0x1000, 0x1040]);
+        // A load into the register ends the pairing: the page is gone.
+        let load = [0x9000_0001, 0xf940_03e1, 0x9101_0021];
+        assert_eq!(addressed_starts(&load, 0x1000), vec![0x1000]);
     }
 
     #[test]
