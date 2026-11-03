@@ -1275,7 +1275,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dh-4a61v): 1951 - 1 = 1950.
     // And the departed shell py_hello replay (dh-9r2mg): 1950 - 1 = 1949.
     // PR 4920 (3): two model/config units: 1955 + 2 = 1957.
-    ("test.regular_crates", 1957),
+    // drain/4709: main + this change's detcore-model cpu_profile test (+1).
+    ("test.regular_crates", 1958),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3299,7 +3300,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler a_replayed_switch_wakes_its_due_target, restored from
     // https://github.com/rrnewton/hermit/pull/4889: 3492 + 2 = 3494
     // (wake unit + deferred-SIGCHLD negative arm).
-    ("test.detcore_unit", 3524),
+    // drain/4709: main + this change's Detcore tests (+10, incl. the strict-scan case): 3524 + 10 = 3534.
+    ("test.detcore_unit", 3534),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4680,7 +4682,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // no_namespace_minimize_replays_its_candidate_records: 795 + 2 = 797.
     // And analyze_replays_a_recorded_target_instead_of_panicking: 797 + 1 = 798.
     // PR 4920 (3): prefix-stack and fatal-time-skip cases: 798 + 2 = 800.
-    ("test.cli", 800),
+    // drain/4709: main + this change's CLI tests (+16): 800 + 16 = 816.
+    ("test.cli", 816),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5365,7 +5368,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 714 + 2 = 716.
     // And the same recorded-target regression test: 716 + 1 = 717.
     // PR 4920 (3): the same two cases: 717 + 2 = 719.
-    ("test.cli_on_host", 719),
+    // drain/4709: main + this change's CLI tests (+16, same growth as test.cli): 719 + 16 = 735.
+    ("test.cli_on_host", 735),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5379,7 +5383,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    // drain/4709: main + this change's detcore-model cpu_profile test (+1).
+    ("test.regular_crates_on_host", 1944),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5956,7 +5961,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unit (same growth as test.detcore_unit, PR #4926): 3469 + 1 = 3470.
     // PR #4751: the same twelve units (same growth as test.detcore_unit): 3482.
     // And the same two replayed-switch wake units: 3492 + 2 = 3494.
-    ("test.detcore_unit_on_host", 3524),
+    // drain/4709: main + this change's Detcore tests (+10, same growth as test.detcore_unit): 3524 + 10 = 3534.
+    ("test.detcore_unit_on_host", 3534),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6622,7 +6628,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same departed blocking-sigsuspend (dh-4a61v) and shell py_hello
     // (dh-9r2mg) named losses: 1937 - 2 = 1935.
     // PR 4920 (3): the same two units: 1941 + 2 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    // drain/4709: main + this change's detcore-model cpu_profile test (+1).
+    ("test.regular_crates_on_host", 1944),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
