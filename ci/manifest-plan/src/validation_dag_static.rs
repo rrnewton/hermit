@@ -1991,7 +1991,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1239 + 10 = 1249, measured by nextest list.
     // PR #4741: the racing-access report, candidate checks and output-matching units
     // add 29 (nextest identity delta of its top stack over the landed 4729 base): 1281.
-    ("test.hermit_unit", 1281),
+    // PR #4746: verdict, budget/resume and partial-report units add 51: 1281 + 51 = 1332.
+    ("test.hermit_unit", 1332),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6312,7 +6313,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // PR #4741: the same 29 units (same growth as test.hermit_unit): 1275.
-    ("test.hermit_unit_on_host", 1275),
+    // PR #4746: the same 51 units (same growth as test.hermit_unit): 1326.
+    ("test.hermit_unit_on_host", 1326),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
