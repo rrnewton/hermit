@@ -286,6 +286,13 @@ mod tests {
         // `ThreadDeregistration`, `CpuPublication`, `TaskCpuTimes`), as row
         // 32 extended it to its own. Digest measured at this head.
         (41, "604a16eb9b7bfd1a", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::RecordExecStrings` and
+        // `GlobalRequest::ProcessExecStrings` and their responses, which
+        // carry an image's argument and environment strings (`ExecStrings`,
+        // package K item 2b slice 2b-3, the next revision after 2b-1's). The
+        // digest covers that payload type too (domain 7). Digest measured at
+        // this head.
+        (42, "0671347d3a6de076", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -356,6 +363,11 @@ mod tests {
     ];
     const TASK_CPU_TIMES_WIRE: [&str; 1] = ["pub struct TaskCpuTimes {"];
 
+    /// The payload type package K item 2b slice 2b-3 added, which
+    /// `RecordExecStrings` and `ProcessExecStrings`'s response carry, in
+    /// tool_global.rs.
+    const EXEC_STRINGS_WIRE: [&str; 1] = ["pub struct ExecStrings {"];
+
     /// The lines of code of the item `source` declares, unindented, on the
     /// line `header`: the attributes just above it (its derives and serde
     /// attributes decide its encoding), the header, and its body through
@@ -398,8 +410,8 @@ mod tests {
     /// A digest of the code of `GlobalRequest` and `GlobalResponse` in
     /// `source`, of the StoreExclusive payload's types in `payload`, of the
     /// scheduled event's wire items in `schedule`, and of the trace reply's
-    /// wire items in `source` and `replayer`, and of 2b-1's payload types in
-    /// `source` and `task_stat`: their variants, fields, payload types, order
+    /// wire items in `source` and `replayer`, of 2b-1's payload types in
+    /// `source` and `task_stat`, and of 2b-3's in `source`: their variants, fields, payload types, order
     /// and attributes, not their documentation.
     fn definition_digest(
         source: &str,
@@ -426,6 +438,7 @@ mod tests {
             wire_items(task_stat, &TASK_CPU_TIMES_WIRE),
         ]
         .join("\n");
+        let exec_strings = wire_items(source, &EXEC_STRINGS_WIRE);
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
@@ -433,6 +446,7 @@ mod tests {
             (4, event.as_bytes()),
             (5, reply.as_bytes()),
             (6, procfs.as_bytes()),
+            (7, exec_strings.as_bytes()),
         ])
     }
 
@@ -632,6 +646,34 @@ mod tests {
         let documented = source.replacen(
             "pub struct CpuPublication {\n",
             "pub struct CpuPublication {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, source);
+        assert_eq!(
+            definition_digest(&documented, payload, schedule, replayer, task_stat),
+            digest
+        );
+        // And 2b-3's: a field added to `ExecStrings` or one retyped changes
+        // the digest; a doc line does not.
+        let grown = source.replacen(
+            "pub struct ExecStrings {\n",
+            "pub struct ExecStrings {\n    pub added: u32,\n",
+            1,
+        );
+        assert_ne!(grown, source);
+        assert_ne!(
+            definition_digest(&grown, payload, schedule, replayer, task_stat),
+            digest
+        );
+        let retyped = source.replacen("    pub envp: Vec<u8>,\n", "    pub envp: String,\n", 1);
+        assert_ne!(retyped, source);
+        assert_ne!(
+            definition_digest(&retyped, payload, schedule, replayer, task_stat),
+            digest
+        );
+        let documented = source.replacen(
+            "pub struct ExecStrings {\n",
+            "pub struct ExecStrings {\n    /// Documentation only.\n",
             1,
         );
         assert_ne!(documented, source);
