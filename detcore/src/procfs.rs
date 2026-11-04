@@ -10582,6 +10582,7 @@ total_commit_ms 0\n"
             rsslim: task_stat::RLIM_INFINITY,
             processor: 0,
             cpu: task_stat::TaskCpuTimes::default(),
+            permitted: true,
         }
     }
 
