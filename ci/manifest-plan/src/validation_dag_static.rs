@@ -3903,7 +3903,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validate.
     // The MAP_FIXED_NOREPLACE fix for https://github.com/rrnewton/hermit/pull/5120
     // adds five placement tests: 250 + 5 = 255.
-    ("test.record_replay", 255),
+    // The /dev/zero sharing fix adds four record/replay tests: 255 + 4 = 259.
+    ("test.record_replay", 259),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
