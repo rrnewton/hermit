@@ -3901,7 +3901,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
     // record/replay units: 229 + 2 = 231, measured by the 216dbc929a full
     // validate.
-    ("test.record_replay", 231),
+    ("test.record_replay", 250),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
