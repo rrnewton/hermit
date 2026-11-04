@@ -329,6 +329,8 @@ static PARKED_WAIT_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_READ_SIGNAL_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_DESYNC_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CHAOS_REPLAY_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CHAOS_CALLBACK_SLOWDOWN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3537,6 +3539,58 @@ fn replay_desync_spinner_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "replay-desync-spinner guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn chaos_replay_new_thread_guest() -> &'static Path {
+    CHAOS_REPLAY_NEW_THREAD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("chaos-replay-new-thread");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the chaos-replay-new-thread guest directory");
+        let guest = build_root.join("chaos_replay_new_thread");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/chaos_replay_new_thread.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the chaos-replay-new-thread guest");
+        assert!(
+            output.status.success(),
+            "chaos-replay-new-thread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn chaos_callback_slowdown_guest() -> &'static Path {
+    CHAOS_CALLBACK_SLOWDOWN_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("chaos-callback-slowdown");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the chaos-callback-slowdown guest directory");
+        let guest = build_root.join("chaos_callback_slowdown");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/chaos_callback_slowdown.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the chaos-callback-slowdown guest");
+        assert!(
+            output.status.success(),
+            "chaos-callback-slowdown guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -25299,6 +25353,133 @@ fn a_draw_without_a_range_draws_from_the_recommended_range() {
     assert!(record(&plain_record).get("chaos_timeslice").is_none());
 }
 
+/// Records tests/c/chaos_replay_new_thread.c (with `guest_args`) under
+/// `--chaos` and 100 us slices at each seed, replays each record with
+/// `--replay-schedule-from` and the recorded run's guest seeds
+/// (`--rng-seed`, `--fuzz-seed`, as `hermit analyze` replays), with `--chaos`
+/// when `replay_chaos`, and returns each seed whose replay printed another
+/// line or exited with another status than its recording, with both outcomes.
+/// The scheduler seed stays at its default; with these options a replay
+/// draws nothing from it. The
+/// guest prints virtual times, so a replay that adds a scheduler turn the
+/// record does not have changes the line even where the winner stays.
+fn chaos_schedule_replay_divergences(
+    guest_args: &[&str],
+    replay_chaos: bool,
+    seeds: &[u64],
+) -> Vec<(u64, String, String)> {
+    let _guard = hermit_run_guard();
+    let guest = chaos_replay_new_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let common = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--max-timeslice=100000",
+    ];
+    let outcome = |output: &Output| format!("{:?} {:?}", output.status.code(), stdout(output));
+    let mut divergences = Vec::new();
+    for seed in seeds {
+        let schedule = directory.path().join(format!("seed{seed}.json"));
+        let record_to = format!("--record-preemptions-to={}", schedule.display());
+        let seed_arg = format!("--seed={seed}");
+        let mut record_args: Vec<&str> = common.to_vec();
+        record_args.extend(["--chaos", &seed_arg, &record_to, "--"]);
+        record_args.push(guest);
+        record_args.extend(guest_args);
+        let record = hermit(&record_args);
+        assert!(
+            matches!(record.status.code(), Some(0 | 1)),
+            "{record_args:?}: {}",
+            stderr(&record)
+        );
+
+        let replay_from = format!("--replay-schedule-from={}", schedule.display());
+        let rng_seed = format!("--rng-seed={seed}");
+        let fuzz_seed = format!("--fuzz-seed={seed}");
+        let mut replay_args: Vec<&str> = common.to_vec();
+        if replay_chaos {
+            replay_args.push("--chaos");
+        }
+        replay_args.extend([&rng_seed, &fuzz_seed, &replay_from, "--"]);
+        replay_args.push(guest);
+        replay_args.extend(guest_args);
+        let replay = hermit(&replay_args);
+        if outcome(&replay) != outcome(&record) {
+            divergences.push((*seed, outcome(&record), outcome(&replay)));
+        }
+    }
+    divergences
+}
+
+/// Asserts that the recording of tests/c/chaos_replay_new_thread.c (with
+/// `guest_args`) under `--chaos` at `seed` replays to the same outcome
+/// (`chaos_schedule_replay_divergences`). Each seed is a test of its own, so
+/// that each fits nextest's 57-second wall bound on a loaded host, as for the
+/// heavy tests split in https://github.com/rrnewton/hermit/issues/4783.
+fn assert_chaos_schedule_replay_follows(guest_args: &[&str], replay_chaos: bool, seed: u64) {
+    let divergences = chaos_schedule_replay_divergences(guest_args, replay_chaos, &[seed]);
+    assert!(
+        divergences.is_empty(),
+        "(seed, record, replay): {divergences:?}"
+    );
+}
+
+/// A schedule replay under `--chaos` follows its recording. The schedule
+/// decides where a replayed slice ends and which thread runs next; chaos
+/// used to draw slice ends and priorities as well, so the replay ended
+/// slices the record does not have, and each extra scheduler turn moved the
+/// virtual clock. Before, 9 of the first 10 seeds' replays printed other
+/// times than their recordings, while the same replays without `--chaos`
+/// followed them; `hermit analyze` makes such replays, so it refused its
+/// endpoints. Seeds 1, 2 and 3, one test each.
+#[test]
+fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_1() {
+    assert_chaos_schedule_replay_follows(&[], true, 1);
+}
+
+/// Seed 2 of `a_schedule_replay_under_chaos_follows_its_recording_at_seed_1`.
+#[test]
+fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_2() {
+    assert_chaos_schedule_replay_follows(&[], true, 2);
+}
+
+/// Seed 3 of `a_schedule_replay_under_chaos_follows_its_recording_at_seed_1`.
+#[test]
+fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_3() {
+    assert_chaos_schedule_replay_follows(&[], true, 3);
+}
+
+/// A schedule replay ends each recorded slice once. With the guest's
+/// syscalls, slices also end where a syscall's virtual time crosses the
+/// slice end; the record marks those with callback checkpoints. A replay
+/// ended a timer-preempted slice twice, at the recorded branch count in the
+/// timer's pre-hook and again at its checkpoint in the post-hook, and after a
+/// checkpoint that kept the slice it counted the `--max-timeslice` backstop
+/// from the slice's old start, so it ended the next slice early. Either adds
+/// a scheduler turn, and each turn moves the virtual clock. Before, none of
+/// the first 12 seeds' replays printed their recordings' times. Seeds 1, 2
+/// and 3, one test each.
+#[test]
+fn a_schedule_replay_ends_each_recorded_slice_once_at_seed_1() {
+    assert_chaos_schedule_replay_follows(&["syscalls"], false, 1);
+}
+
+/// Seed 2 of `a_schedule_replay_ends_each_recorded_slice_once_at_seed_1`.
+#[test]
+fn a_schedule_replay_ends_each_recorded_slice_once_at_seed_2() {
+    assert_chaos_schedule_replay_follows(&["syscalls"], false, 2);
+}
+
+/// Seed 3 of `a_schedule_replay_ends_each_recorded_slice_once_at_seed_1`.
+#[test]
+fn a_schedule_replay_ends_each_recorded_slice_once_at_seed_3() {
+    assert_chaos_schedule_replay_follows(&["syscalls"], false, 3);
+}
+
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn
 /// either: 90 ms before, 4 ms now.
 #[test]
@@ -30139,6 +30320,157 @@ fn run_schedule_replay_ends_check_in_slices_where_the_record_did() {
         "{summary}"
     );
     assert_eq!(summary["schedevent_desynced"], 0, "{summary}");
+
+    // Keep the original callback/check-in scenario above, then require the
+    // slowdown and no-slowdown scenarios under this same PMU-owned identity.
+    check_schedule_callback_slowdown_and_control();
+}
+
+// Called with HERMIT_RUN_LOCK held. Each row requires a strict record and
+// replay of the unchanged reviewer guest: four additional guest invocations,
+// with no new test identity, exclusion or bound.
+fn check_schedule_callback_slowdown_and_control() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = chaos_callback_slowdown_guest().to_str().unwrap();
+    for slowdown in [true, false] {
+        let label = if slowdown { "slowdown" } else { "no-slowdown" };
+        let record = directory.path().join(format!("{label}-record.json"));
+        let recording_summary = directory
+            .path()
+            .join(format!("{label}-record-summary.json"));
+        let replay_summary = directory
+            .path()
+            .join(format!("{label}-replay-summary.json"));
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let recording_summary_arg = format!("--summary-json={}", recording_summary.display());
+        let replay_summary_arg = format!("--summary-json={}", replay_summary.display());
+        let mut common = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--chaos",
+            "--seed=3",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--max-timeslice=5000000",
+            "--target-timeslice=1000",
+        ];
+        if slowdown {
+            common.extend([
+                "--chaos-per-thread-slowdown",
+                "--chaos-epoch-length-ns=1000",
+                "--chaos-slowdown-max-factor=4",
+            ]);
+        }
+        let mut recording_args = common.clone();
+        recording_args.extend([
+            record_arg.as_str(),
+            recording_summary_arg.as_str(),
+            "--",
+            guest,
+        ]);
+        let recorded = hermit_test::hermit_output(
+            &format!("callback {label} record"),
+            hermit_command(&recording_args)
+                .env_remove("HERMIT_EPOCH")
+                .stdin(Stdio::null()),
+        );
+        assert_success(&recorded, &recording_args);
+        let output = stdout(&recorded);
+        assert_eq!(output.lines().count(), 24, "{label}: {output}");
+        for (round, line) in output.lines().enumerate() {
+            assert!(line.starts_with(&format!("{round} ")), "{label}: {line}");
+        }
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        let events = json["global"].as_array().expect("recorded global events");
+        let rcbs: u64 = events
+            .iter()
+            .filter(|event| event["op"] == "Branch")
+            .map(|event| event["count"].as_u64().expect("recorded branch count"))
+            .sum();
+        assert!(
+            rcbs > 0,
+            "{label}: the required active RCB clock recorded no branches"
+        );
+        let checkpoints: Vec<_> = json["callback_checkpoints"]
+            .as_object()
+            .expect("recorded callback checkpoints")
+            .values()
+            .flat_map(|rows| rows.as_array().unwrap())
+            .collect();
+        assert!(!checkpoints.is_empty(), "{label}: no callback-ended slice");
+        let epochs: Vec<_> = json["per_thread"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|thread| thread["chaos_epochs"].as_array().unwrap())
+            .collect();
+        if slowdown {
+            let exec = checkpoints
+                .iter()
+                .find(|point| {
+                    point["origin"]["callback"] == "Exec" && point["origin"]["site"] == "Prehook"
+                })
+                .expect("recorded exec callback slice end");
+            assert!(
+                epochs.iter().any(|epoch| {
+                    epoch["logical_time"] == exec["origin"]["time"]
+                        && epoch["epoch"].as_u64().unwrap() > 0
+                        && epoch["factor"] != epochs[0]["factor"]
+                }),
+                "{label}: the exec callback did not change the slowdown epoch"
+            );
+        } else {
+            assert!(
+                epochs.is_empty(),
+                "the control unexpectedly enabled slowdown"
+            );
+        }
+        let mut replay_args = common;
+        replay_args.extend([
+            replay_arg.as_str(),
+            replay_summary_arg.as_str(),
+            "--die-on-desync",
+            "--",
+            guest,
+        ]);
+        let replayed = hermit_test::hermit_output(
+            &format!("callback {label} replay"),
+            hermit_command(&replay_args)
+                .env_remove("HERMIT_EPOCH")
+                .stdin(Stdio::null()),
+        );
+        assert_success(&replayed, &replay_args);
+        assert_eq!(
+            stdout(&replayed),
+            output,
+            "{label}: callback replay changed guest clocks"
+        );
+        let recording_summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(recording_summary).unwrap()).unwrap();
+        let replay_summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(replay_summary).unwrap()).unwrap();
+        assert_eq!(
+            replay_summary["schedevent_replayed"].as_u64().unwrap(),
+            u64::try_from(events.len()).unwrap(),
+            "{label}: {replay_summary}"
+        );
+        assert_eq!(
+            replay_summary["schedevent_desynced"], 0,
+            "{label}: {replay_summary}"
+        );
+        assert!(
+            replay_summary["desync_descrip"].is_null(),
+            "{label}: {replay_summary}"
+        );
+        for field in ["virttime_elapsed", "virttime_final"] {
+            assert_eq!(
+                replay_summary[field].as_u64().unwrap(),
+                recording_summary[field].as_u64().unwrap(),
+                "{label}: {field}"
+            );
+        }
+    }
 }
 
 /// A `--replay-schedule-from` run that has left its recorded schedule (a hard

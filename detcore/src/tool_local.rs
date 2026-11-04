@@ -6620,6 +6620,16 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub lone_replay_unsound: bool,
 
+    /// Under a schedule replay, the slice end `next_timeslice` installed as
+    /// the backstop, `--max-timeslice` after the slice began; see
+    /// `restart_replay_backstop`. Installing a slice end the schedule decides
+    /// (`install_schedule_deadline`) clears it, even when that deadline falls
+    /// on the same nanosecond: a recorded slice end can coincide with the
+    /// backstop, and it is still the schedule's. It is also the backstop only
+    /// while it is still `end_of_timeslice`.
+    #[serde(default)]
+    pub replay_backstop: Option<LogicalTime>,
+
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
     pub(crate) past_global_first_execve: bool,
@@ -7454,6 +7464,7 @@ impl<T> ThreadState<T> {
             lone_slice_end: None,
             replaying_lone_slice_end: None,
             lone_replay_unsound: false,
+            replay_backstop: None,
             record_or_replay,
             preemption_points: None,
             past_global_first_execve: false,
@@ -9177,6 +9188,68 @@ impl<T> ThreadState<T> {
         );
     }
 
+    /// Refresh the slowdown at a consumed slice boundary without choosing a
+    /// deadline, drawing a priority or resetting slice statistics. A precise
+    /// priority-history replay uses its previous recorded endpoint, even when
+    /// the PMU checked in one RCB early. A schedule callback supplies its actual
+    /// boundary instead of a future deadline already installed by its cursor.
+    /// Ambient slowdown always follows the current elapsed logical time.
+    pub(crate) fn refresh_chaos_epoch(&mut self, cfg: &Config, recorded_boundary: LogicalTime) {
+        let current_ns = self.thread_logical_time.as_nanos();
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1151)
+        // Redraw only at scheduler commit boundaries, keyed to elapsed
+        // deterministic logical time. Replay artifacts take precedence and
+        // restore the exact recorded Q32 factor even without ambient flags.
+        let replay_has_epochs = self
+            .preemption_points
+            .as_ref()
+            .is_some_and(ThreadHistoryIterator::has_chaos_epochs);
+        if replay_has_epochs {
+            // Precise PMU replay deliberately checks in up to one RCB
+            // before the recorded logical boundary. The new slice still
+            // begins at that recorded boundary, so install its factor
+            // against the prior slice's exact target rather than the
+            // slightly-early observed clock. Otherwise a short epoch can
+            // be skipped and the following RCBs receive the wrong weight.
+            let transition = self
+                .preemption_points
+                .as_mut()
+                .and_then(|history| history.advance_chaos_epoch(recorded_boundary));
+            if let Some(transition) = transition {
+                self.install_chaos_epoch(transition, false);
+            }
+        } else if cfg.chaos && cfg.chaos_per_thread_slowdown {
+            let elapsed_ns = self.thread_logical_time.without_starting().as_nanos();
+            let epoch = elapsed_ns
+                .checked_div(cfg.chaos_epoch_length_ns)
+                .unwrap_or(0);
+            let factor = chaos_per_thread_slowdown_factor(
+                cfg.sched_seed(),
+                self.dettid,
+                epoch,
+                cfg.chaos_slowdown_max_factor,
+            );
+            if epoch != self.chaos_epoch {
+                self.install_chaos_epoch(
+                    ChaosEpochTransition {
+                        logical_time: current_ns,
+                        epoch,
+                        factor,
+                    },
+                    true,
+                );
+            } else {
+                self.chaos_slowdown_factor = factor;
+                self.chaos_slowdown_active = true;
+            }
+        } else {
+            self.chaos_slowdown_factor = RcbTimeMultiplier::ONE;
+            self.chaos_slowdown_active = false;
+            self.pending_chaos_epochs.clear();
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     /// `bound`, a configured slice bound, raised to the post-crash bound once
     /// the run has switched to it (`crate::post_crash`). A bound already
@@ -9195,6 +9268,7 @@ impl<T> ThreadState<T> {
     ///
     /// Returns: an optional new priority.
     pub fn next_timeslice(&mut self, cfg: &Config) -> Option<Priority> {
+        self.replay_backstop = None;
         let logical_timeslice = cfg
             .target_timeslice
             .or(cfg.max_timeslice)
@@ -9202,59 +9276,8 @@ impl<T> ThreadState<T> {
         if let Some(timeout_ns) = logical_timeslice {
             let current_ns = self.thread_logical_time.as_nanos();
 
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-1151)
-            // Redraw only at scheduler commit boundaries, keyed to elapsed
-            // deterministic logical time. Replay artifacts take precedence and
-            // restore the exact recorded Q32 factor even without ambient flags.
-            let replay_has_epochs = self
-                .preemption_points
-                .as_ref()
-                .is_some_and(ThreadHistoryIterator::has_chaos_epochs);
-            if replay_has_epochs {
-                // Precise PMU replay deliberately checks in up to one RCB
-                // before the recorded logical boundary. The new slice still
-                // begins at that recorded boundary, so install its factor
-                // against the prior slice's exact target rather than the
-                // slightly-early observed clock. Otherwise a short epoch can
-                // be skipped and the following RCBs receive the wrong weight.
-                let transition_time = self.end_of_timeslice.unwrap_or(current_ns);
-                let transition = self
-                    .preemption_points
-                    .as_mut()
-                    .and_then(|history| history.advance_chaos_epoch(transition_time));
-                if let Some(transition) = transition {
-                    self.install_chaos_epoch(transition, false);
-                }
-            } else if cfg.chaos && cfg.chaos_per_thread_slowdown {
-                let elapsed_ns = self.thread_logical_time.without_starting().as_nanos();
-                let epoch = elapsed_ns
-                    .checked_div(cfg.chaos_epoch_length_ns)
-                    .unwrap_or(0);
-                let factor = chaos_per_thread_slowdown_factor(
-                    cfg.sched_seed(),
-                    self.dettid,
-                    epoch,
-                    cfg.chaos_slowdown_max_factor,
-                );
-                if epoch != self.chaos_epoch {
-                    self.install_chaos_epoch(
-                        ChaosEpochTransition {
-                            logical_time: current_ns,
-                            epoch,
-                            factor,
-                        },
-                        true,
-                    );
-                } else {
-                    self.chaos_slowdown_factor = factor;
-                    self.chaos_slowdown_active = true;
-                }
-            } else {
-                self.chaos_slowdown_factor = RcbTimeMultiplier::ONE;
-                self.chaos_slowdown_active = false;
-                self.pending_chaos_epochs.clear();
-            }
+            let recorded_boundary = self.end_of_timeslice.unwrap_or(current_ns);
+            self.refresh_chaos_epoch(cfg, recorded_boundary);
 
             let mut result = None;
             self.replay_rcb_end = None;
@@ -9363,17 +9386,18 @@ impl<T> ThreadState<T> {
                     self.end_of_timeslice = Some(LogicalTime::MAX);
                     result = Some(thi.final_priority())
                 }
-            } else if !cfg.chaos {
+            } else if !cfg.chaos_draws_schedule() {
                 if self.follows_replayed_schedule(cfg) {
-                    if cfg.no_rcb_time {
-                        let max_timeslice = self.after_post_crash(
-                            cfg.max_timeslice
-                                .expect("schedule replay with PMU requires a maximum"),
-                        );
+                    if cfg.no_rcb_time
+                        && let Some(max_timeslice) = cfg.max_timeslice
+                    {
+                        let max_timeslice = self.after_post_crash(max_timeslice);
                         self.end_of_timeslice =
                             Some(current_ns + Duration::from_nanos(u64::from(max_timeslice)));
                     } else {
-                        // Branch-event replay will overwrite this deadline when needed.
+                        // The schedule's events and callback checkpoints decide
+                        // the slice end. A cooperative target without a PMU
+                        // maximum does not manufacture a replay backstop.
                         debug!(
                             "[dtid {}] next timeslice (T{}), in replay mode setting timeslice to max (current time {})",
                             self.dettid,
@@ -9508,6 +9532,9 @@ impl<T> ThreadState<T> {
             {
                 self.end_of_timeslice = Some(max_end);
             }
+            if cfg.replay_schedule_from.is_some() && self.preemption_points.is_none() {
+                self.replay_backstop = self.end_of_timeslice;
+            }
 
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
@@ -9521,6 +9548,49 @@ impl<T> ThreadState<T> {
             self.last_rcb_timer_is_max = false;
             None
         }
+    }
+
+    /// Restart a schedule replay's backstop deadline from now, at a recorded
+    /// slice end that a callback checkpoint replays without closing the slice
+    /// (an administrative turn).
+    ///
+    /// A schedule replay ends a slice where its record does. Beyond that it
+    /// keeps the slice end `next_timeslice` installs, `--max-timeslice` after
+    /// the slice began, as the recorded run did (`replay_backstop`). The
+    /// recorded run began a new slice at this checkpoint, so its next slice
+    /// end comes at most `--max-timeslice` after it. A backstop counted from
+    /// the slice the administrative turn kept would end the replayed slice
+    /// early, at a point the record does not have, and the extra scheduler
+    /// turn would move the virtual clock the guest reads. Any other slice end,
+    /// a deadline the replayed schedule set above all, stays.
+    pub(crate) fn restart_replay_backstop(&mut self, cfg: &Config) {
+        let Some(max_timeslice) = cfg.max_timeslice else {
+            return;
+        };
+        if self.end_of_timeslice.is_none() || self.end_of_timeslice != self.replay_backstop {
+            return;
+        }
+        let end =
+            self.thread_logical_time.as_nanos() + Duration::from_nanos(u64::from(max_timeslice));
+        self.end_of_timeslice = Some(end);
+        self.max_timeslice_end = Some(end);
+        self.replay_backstop = Some(end);
+        self.last_rcb_timer = None;
+        self.last_rcb_timer_is_max = false;
+    }
+
+    /// Install a slice end the replayed schedule decides: the replayer's
+    /// deadline for this thread's next recorded event (`trace_schedevent`), the
+    /// deadline an exec's continuation resumes, or the no-RCB-time fallback
+    /// past a replayed maximum. It bounds the PMU maximum too when one is
+    /// configured, and it is no backstop, whatever its value
+    /// (`replay_backstop`).
+    pub(crate) fn install_schedule_deadline(&mut self, deadline: LogicalTime, max_timeslice: bool) {
+        self.end_of_timeslice = Some(deadline);
+        if max_timeslice {
+            self.max_timeslice_end = Some(deadline);
+        }
+        self.replay_backstop = None;
     }
 
     /// Close the current logical-timeslice statistics without selecting a new
@@ -11475,6 +11545,130 @@ mod timeslice_tests {
             longest > 2_000,
             "slices are drawn around the post-crash bound"
         );
+    }
+
+    /// A schedule replay under `--chaos` draws no slice end: the slice runs to
+    /// the backstop, `--max-timeslice` from now, unless the replayed schedule
+    /// ends it first, exactly as without `--chaos`, and the thread's chaos
+    /// generator is left as it was.
+    #[test]
+    fn chaos_schedule_replay_draws_no_slice_end() {
+        let replay = |chaos| Config {
+            chaos,
+            max_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut plain = ThreadState::new(DetPid::from_raw(1), &replay(false), ());
+        let mut chaos = ThreadState::new(DetPid::from_raw(1), &replay(true), ());
+        let generator = chaos.chaos_prng.clone();
+
+        assert_eq!(plain.next_timeslice(&replay(false)), None);
+        assert_eq!(chaos.next_timeslice(&replay(true)), None);
+
+        let backstop = chaos.thread_logical_time.as_nanos() + Duration::from_nanos(100_000);
+        assert_eq!(chaos.end_of_timeslice, Some(backstop));
+        assert_eq!(chaos.end_of_timeslice, plain.end_of_timeslice);
+        assert_eq!(chaos.max_timeslice_end, plain.max_timeslice_end);
+        assert_eq!(chaos.chaos_prng, generator);
+    }
+
+    /// Disabling the PMU maximum does not disable the cooperative target or
+    /// forbid its schedule replay. Replayed checkpoints own its slice ends;
+    /// after EOF the same configured target owns ordinary slices again.
+    #[test]
+    fn target_only_chaos_schedule_replay_keeps_recorded_boundaries_without_a_pmu_maximum() {
+        for (replay, no_rcb_time) in [(false, true), (true, false), (true, true)] {
+            let mut config = Config {
+                chaos: true,
+                no_rcb_time,
+                max_timeslice: None,
+                target_timeslice: nz(100_000),
+                replay_schedule_from: replay.then(|| "schedule.json".into()),
+                ..Default::default()
+            };
+            config.validate();
+            assert_eq!(config.max_timeslice, None);
+            assert_eq!(config.target_timeslice, nz(100_000));
+            let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+            let generator = state.chaos_prng.clone();
+            assert_eq!(state.next_timeslice(&config), None);
+            assert_eq!(state.max_timeslice_end, None);
+            if replay {
+                assert_eq!(state.end_of_timeslice, Some(LogicalTime::MAX));
+                assert_eq!(state.chaos_prng, generator);
+                state.schedule_replay_over = true;
+                state.next_timeslice(&config);
+                assert_eq!(
+                    state.end_of_timeslice,
+                    Some(state.thread_logical_time.as_nanos() + Duration::from_nanos(100_000))
+                );
+                assert_eq!(state.max_timeslice_end, None);
+                assert_eq!(state.chaos_prng, generator);
+            } else {
+                assert!(state.end_of_timeslice > Some(state.thread_logical_time.as_nanos()));
+            }
+        }
+    }
+
+    /// At a checkpoint turn that keeps the slice, a schedule replay counts its
+    /// backstop from now, as the recorded run's new slice did, unless another
+    /// slice end, such as the replayed schedule's deadline, replaced it.
+    #[test]
+    fn a_kept_replay_slice_restarts_only_the_backstop() {
+        let config = Config {
+            max_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(1000);
+        let now = state.thread_logical_time.as_nanos();
+        assert!(state.end_of_timeslice < Some(now + Duration::from_nanos(100_000)));
+
+        state.restart_replay_backstop(&config);
+        let backstop = Some(now + Duration::from_nanos(100_000));
+        assert_eq!(state.end_of_timeslice, backstop);
+        assert_eq!(state.max_timeslice_end, backstop);
+
+        let scheduled = now + Duration::from_nanos(10);
+        state.install_schedule_deadline(scheduled, true);
+        state.restart_replay_backstop(&config);
+        assert_eq!(state.end_of_timeslice, Some(scheduled));
+        assert_eq!(state.max_timeslice_end, Some(scheduled));
+
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(1000);
+        state.restart_replay_backstop(&config);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(state.thread_logical_time.as_nanos() + Duration::from_nanos(100_000))
+        );
+    }
+
+    /// A slice end the replayed schedule installs stays one even on the
+    /// backstop's nanosecond. A recorded slice end can fall there by chance
+    /// (a chaos draw of 9 branches that ended 90 ns after a checkpoint, where
+    /// the kept slice's backstop also ran out); restarting the backstop there
+    /// moved the schedule's slice end 1000 ns later.
+    #[test]
+    fn a_schedule_deadline_on_the_backstop_keeps_its_place() {
+        let config = Config {
+            max_timeslice: nz(1_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+        let backstop = state.replay_backstop.expect("a schedule replay's backstop");
+        state.thread_logical_time.add_rcbs(91);
+        state.install_schedule_deadline(backstop, true);
+
+        state.restart_replay_backstop(&config);
+        assert_eq!(state.end_of_timeslice, Some(backstop));
+        assert_eq!(state.max_timeslice_end, Some(backstop));
+        assert_eq!(state.replay_backstop, None);
     }
 
     #[test]
