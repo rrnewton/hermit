@@ -1317,6 +1317,13 @@ pub(crate) struct ProcfsFile {
     schedstat_thread: Option<DetTid>,
     #[serde(default)]
     timer_slack_identity: Option<(u64, u64)>,
+    /// For a per-process file opened by a spelling of its task directory, the
+    /// path `readlink` of its descriptor link gives, with the opener's
+    /// `self` and `thread-self` resolved as the lookup resolved them
+    /// ([`ProcfsFile::bind_link_name`]): the name of a file the backend keeps
+    /// itself and does not name (`Detcore::readlink_own_descriptor_fact`).
+    #[serde(default)]
+    link_name: Option<PathBuf>,
     /// Detcore renders this file without the backend opening it: the guest's
     /// descriptor is a placeholder and no kernel bytes exist to capture (see
     /// [`ProcfsFile::rendered_path`]).
@@ -1950,6 +1957,7 @@ impl ProcfsFile {
             bound_thread_identity: None,
             schedstat_thread: None,
             timer_slack_identity: None,
+            link_name: None,
             rendered: false,
             guest_numbers: None,
             mount_view_kernel: None,
@@ -2889,6 +2897,18 @@ impl ProcfsFile {
             }
             _ => unreachable!("non-binding procfs kind requested an opener identity"),
         }
+    }
+
+    /// Record the path `readlink` of this file's descriptor link gives
+    /// (`ProcfsFile::link_name`).
+    pub(crate) fn bind_link_name(&mut self, name: PathBuf) {
+        self.link_name = Some(name);
+    }
+
+    /// The path `readlink` of this file's descriptor link gives, if recorded
+    /// at its open ([`Self::bind_link_name`]).
+    pub(crate) fn link_name(&self) -> Option<&Path> {
+        self.link_name.as_deref()
     }
 
     /// Returns true when this snapshot consumes deterministic random bytes.
