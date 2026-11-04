@@ -27478,7 +27478,7 @@
         "HERMIT_FORBID_SKIPS": "1",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "134",
+        "NEXTEST_EXPECTED_EXECUTED": "135",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -32230,7 +32230,7 @@
         "HERMIT_FORBID_SKIPS": "1",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "134",
+        "NEXTEST_EXPECTED_EXECUTED": "135",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -42407,7 +42407,7 @@
         "HERMIT_FORBID_SKIPS": "1",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "134",
+        "NEXTEST_EXPECTED_EXECUTED": "135",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-execution-tests\",\"--lib\",\"--test\",\"cli\"]"
       },
       "networkonly": false,

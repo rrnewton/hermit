@@ -5002,7 +5002,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_another_processs_stat_and_comm_answer_as_linux: 132 + 1 = 133.
     // And slice 2b-2's run_kvm_another_processs_status_answers_as_linux:
     // 133 + 1 = 134.
-    ("privileged-test.cli_kvm", 134),
+    // And slice 2b-3's
+    // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 135.
+    ("privileged-test.cli_kvm", 135),
     // The required tests of hermit-cli/tests/deadline_slice_cap.rs on KVM: the
     // suite's 42 tests less the rows of its known-gap ledger
     // (hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv), measured on Hermit
@@ -5465,7 +5467,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_another_processs_stat_and_comm_answer_as_linux: 132 + 1 = 133.
     // And slice 2b-2's run_kvm_another_processs_status_answers_as_linux:
     // 133 + 1 = 134.
-    ("privileged-only-test.cli_kvm", 134),
+    // And slice 2b-3's
+    // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 135.
+    ("privileged-only-test.cli_kvm", 135),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     // And the KVM unreadable futex word test: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.
@@ -5524,7 +5528,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_another_processs_stat_and_comm_answer_as_linux: 132 + 1 = 133.
     // And slice 2b-2's run_kvm_another_processs_status_answers_as_linux:
     // 133 + 1 = 134.
-    ("privileged-only-test.cli_kvm_on_host", 134),
+    // And slice 2b-3's
+    // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 135.
+    ("privileged-only-test.cli_kvm_on_host", 135),
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
